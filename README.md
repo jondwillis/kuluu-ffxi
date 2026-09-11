@@ -200,11 +200,18 @@ cargo xtask game --download             # official US client; prompts first
 cargo xtask game --download --region eu
 ```
 
-Complete the installer GUI. That installs Square Enix's 2019 base image; run
-PlayOnline Viewer once and let it patch FINAL FANTASY XI to the current version
-(the update step needs no account), then `cargo xtask game` to wire it up. (This
-is official-client only — HorizonXI and other flavors must be obtained through
-their own launchers.)
+Complete the installer GUI. That installs Square Enix's 2019 base image; the
+update step is PlayOnline Viewer patching FINAL FANTASY XI to the current
+version (no account needed), which `--update` launches for you, native on
+Windows and via Wine on Linux/macOS:
+
+```bash
+cargo xtask game --update "/path/to/PlayOnline/SquareEnix/FINAL FANTASY XI"
+cargo xtask game --target retail "/path/to/PlayOnline/SquareEnix/FINAL FANTASY XI"
+```
+
+(This is official-client only — HorizonXI and other flavors must be obtained
+through their own launchers.)
 
 Or do it by hand — drop/symlink your install at `vendor/game-files/`, or just
 point the client at an existing copy:
@@ -232,7 +239,7 @@ To keep more than one client around, wire each as a named target and pick it
 with an env var; the default `vendor/game-files/` install is left untouched:
 
 ```bash
-cargo xtask game --target retail "/Volumes/[C] Windows 11/Program Files (x86)/PlayOnline/SquareEnix/FINAL FANTASY XI"
+cargo xtask game --target retail "/path/to/PlayOnline/SquareEnix/FINAL FANTASY XI"
 cargo xtask game --list
 FFXI_CLIENT_TARGET=retail cargo run -p kuluu -- play
 cargo run -p ffxi-dat --example dat-client-profile -- "/path/to/FINAL FANTASY XI"

@@ -18,7 +18,8 @@
 //! Opt-in (and confirmation-gated): download Square Enix's official FFXI client
 //! installer from the public PlayOnline CDN and launch it. The installer is an
 //! interactive GUI (run via Wine on macOS/Linux) and installs SE's 2019 base
-//! image; PlayOnline Viewer's updater then patches it to the current client.
+//! image; `cargo xtask game --update` then launches PlayOnline Viewer, which
+//! patches it to the current client (native on Windows, via Wine elsewhere).
 //! Re-run `cargo xtask game` to wire the result into `vendor/game-files/`.
 //! Downloading the client is free; a registration code / subscription is
 //! needed to *play*.
@@ -94,6 +95,7 @@ fn usage() {
     eprintln!(
         "usage: cargo xtask game [PATH] [--target NAME] [--copy] [--force]\n\
          \x20      cargo xtask game --list\n\
+         \x20      cargo xtask game --update [PATH | --target NAME]\n\
          \x20      cargo xtask game --download [--region us|eu] [--yes]\n\
          \x20      cargo xtask install-hooks [--check]\n\
          \n\
@@ -102,6 +104,8 @@ fn usage() {
          --target    wire under vendor/game-files/targets/NAME/ instead of the\n\
          \x20           default; select it at runtime with FFXI_CLIENT_TARGET=NAME\n\
          --list      show the default install and every named target\n\
+         --update    launch PlayOnline Viewer (native, or via wine) to patch the\n\
+         \x20           install to the current retail version\n\
          --copy      copy the install instead of symlinking it\n\
          --force     replace an existing vendor/game-files link\n\
          --download  download SE's official client installer and launch it\n\
@@ -121,6 +125,7 @@ fn cmd_game(args: &[String]) -> Result<(), String> {
     let mut force = false;
     let mut download = false;
     let mut list = false;
+    let mut update = false;
     let mut yes = false;
     let mut region = String::from("us");
     let mut target: Option<String> = None;
@@ -131,6 +136,7 @@ fn cmd_game(args: &[String]) -> Result<(), String> {
             "--force" => force = true,
             "--download" => download = true,
             "--list" => list = true,
+            "--update" => update = true,
             "--yes" | "-y" => yes = true,
             "--target" => {
                 let name = it.next().ok_or("--target needs a NAME")?;
@@ -170,6 +176,16 @@ fn cmd_game(args: &[String]) -> Result<(), String> {
         None => game_files.join(SQUARE_ENIX),
     };
     let dest = dest_se.join(FFXI);
+
+    if update {
+        let root = match explicit {
+            Some(p) => find_ffxi_root(&p, SEARCH_DEPTH)
+                .ok_or_else(|| format!("no FFXI install found at or under {}", p.display()))?,
+            None if is_ffxi_root(&dest) => dest,
+            None => return Err(format!("{} holds no install to update", show(&dest))),
+        };
+        return run_pol_updater(&root);
+    }
 
     // Already wired up and valid? Nothing to do.
     if is_ffxi_root(&dest) {
@@ -254,6 +270,59 @@ fn cmd_game(args: &[String]) -> Result<(), String> {
     }
     println!("OK: {} is ready.", show(&dest_se));
     print_env_hint(&dest, target.as_deref());
+    Ok(())
+}
+
+/// PlayOnline Viewer, installed by SE's installer as a sibling of
+/// `FINAL FANTASY XI/` under `SquareEnix/`, is the only thing that patches a
+/// retail client to the current version.
+const POL_VIEWER_EXE: &str = "PlayOnlineViewer/pol.exe";
+
+fn run_pol_updater(root: &Path) -> Result<(), String> {
+    let root = std::fs::canonicalize(root).map_err(|e| format!("{}: {e}", root.display()))?;
+    let game_dir = root
+        .parent()
+        .ok_or_else(|| format!("{} has no SquareEnix parent directory", root.display()))?;
+    let pol = game_dir.join(POL_VIEWER_EXE);
+    if !pol.is_file() {
+        return Err(format!(
+            "{} not found; this install has no PlayOnline Viewer (HorizonXI and other \
+             private-server trees ship without it and are patched by their own launchers)",
+            pol.display()
+        ));
+    }
+    println!(
+        "Launching {}.\nIn the viewer choose FINAL FANTASY XI -> Check Files / Update and let it \
+         finish (no account is needed for the update step), then quit.",
+        pol.display()
+    );
+    let mut cmd = if cfg!(target_os = "windows") {
+        Command::new(&pol)
+    } else {
+        require_tool("wine").map_err(|_| {
+            "wine not found — PlayOnline Viewer is a Windows executable. Install Wine and \
+             re-run, or launch PlayOnlineViewer/pol.exe yourself."
+                .to_string()
+        })?;
+        let mut c = Command::new("wine");
+        c.arg(&pol);
+        c
+    };
+    cmd.current_dir(pol.parent().unwrap_or(game_dir));
+    let status = cmd
+        .status()
+        .map_err(|e| format!("launching PlayOnline Viewer: {e}"))?;
+    if !status.success() {
+        return Err(format!("PlayOnline Viewer exited with {status}"));
+    }
+    println!(
+        "PlayOnline Viewer exited. If it reported 'Cannot open registry key for install path' \
+         (ID=1000), this tree is not registered with Windows/Wine: only SE's installer writes \
+         those keys, and HorizonXI ships DONTTOUCH_Registry.exe for its own tree.\n\
+         Identify the patched build with:\n  \
+         cargo run -p ffxi-dat --example dat-client-profile -- \"{}\"",
+        root.display()
+    );
     Ok(())
 }
 
@@ -526,6 +595,26 @@ fn no_install_help() -> String {
 
 /// SE's public PlayOnline CDN for the full client installer. part1 is a
 /// self-extracting exe; part2..5 are its rar volumes (must sit beside it).
+const SETUP_EXE: &str = "FFXISetup.exe";
+
+/// Matches the local file against the CDN's Content-Length so a re-run after
+/// the extractor or installer fails does not refetch ~7 GB.
+fn is_complete_download(url: &str, dest: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(dest) else {
+        return false;
+    };
+    let Ok(out) = Command::new("curl").args(["-sIL", url]).output() else {
+        return false;
+    };
+    let head = String::from_utf8_lossy(&out.stdout);
+    head.lines()
+        .filter_map(|l| l.split_once(':'))
+        .filter(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+        .filter_map(|(_, v)| v.trim().parse::<u64>().ok())
+        .next_back()
+        .is_some_and(|len| len == meta.len())
+}
+
 fn download_official(region: &str, yes: bool, workspace: &Path) -> Result<(), String> {
     let (tag, sub) = match region {
         "us" => ("FFXIFullSetup_US", "us"),
@@ -559,19 +648,39 @@ fn download_official(region: &str, yes: bool, workspace: &Path) -> Result<(), St
     for name in &parts {
         let url = format!("{base}/{name}");
         let dest = dir.join(name);
+        if is_complete_download(&url, &dest) {
+            println!("Already downloaded {name}");
+            continue;
+        }
         println!("Downloading {name} ...");
         curl(&url, &dest)?;
     }
 
-    let entry = dir.join(&parts[0]);
-    println!("\nLaunching installer: {}", entry.display());
-    launch_installer(&entry)?;
+    // part1.exe is a WinRAR self-extractor, not the installer: it unpacks
+    // `<tag>/FFXISetup.exe` plus the PlayOnline and FINAL_FANTASY_XI .msi trees.
+    let setup = dir.join(tag).join(SETUP_EXE);
+    if !setup.is_file() {
+        let entry = dir.join(&parts[0]);
+        println!("\nExtracting installer: {}", entry.display());
+        launch_installer(&entry)?;
+        if !setup.is_file() {
+            return Err(format!(
+                "extraction finished but {} is missing; extract {} by hand",
+                setup.display(),
+                entry.display()
+            ));
+        }
+    }
+    println!("\nLaunching installer: {}", setup.display());
+    launch_installer(&setup)?;
 
     println!(
         "\nComplete the installer's GUI (DirectX -> PlayOnline Viewer -> FINAL FANTASY XI).\n\
          This is SE's 2019 base image: launch PlayOnline Viewer and let it patch FINAL\n\
-         FANTASY XI to the current version (no account needed for the update step),\n\
-         then wire the result up with:\n  cargo xtask game --target retail"
+         FANTASY XI to the current version (no account needed for the update step):\n  \
+         cargo xtask game --update \"<install dir>\"\n\
+         then wire the result up with:\n  cargo xtask game --target retail \"<install dir>\"\n\
+         (under Wine the install lands in the prefix, e.g. ~/.wine/drive_c/Program Files (x86)/PlayOnline/...)"
     );
     Ok(())
 }
