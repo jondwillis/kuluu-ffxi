@@ -1249,12 +1249,17 @@ fn talknumwork_resolves_key_item_marker_from_zone_text() {
     assert_eq!(line.sender, "");
 }
 
-/// Zone-230 KEYITEM_OBTAINED for the client era the default install
-/// carries — LSB text ids are identity DAT entry indexes (LandSandBoat
-/// b3af49c62ae2 IDs.lua pinned 6437 when its sync matched this DAT era;
-/// newer pins say 6438 only because SE inserted entries in later clients —
-/// see ffxi-dat dmsg::tests::real_zone230_keyitem_obtained_decodes_marker).
+/// Zone-230 KEYITEM_OBTAINED for the client era LSB's text-id sync matched —
+/// LSB text ids are identity DAT entry indexes (LandSandBoat b3af49c62ae2
+/// IDs.lua pinned 6437; newer pins say 6438 only because SE inserted entries
+/// in later clients — see ffxi-dat
+/// dmsg::tests::real_zone230_keyitem_obtained_decodes_marker). The physical
+/// index drifts per install (retail and HorizonXI sit at different patch
+/// levels), so it anchors a search window rather than being asserted.
 const ZONE230_KEYITEM_OBTAINED_MAY2023: u16 = 6437;
+const ZONE230_KEYITEM_SEARCH_BELOW: u16 = 256;
+const ZONE230_KEYITEM_SEARCH_ABOVE: u16 = 512;
+const ZONE230_KEYITEM_OBTAINED_PREFIX: &str = "Obtained key item:";
 
 fn test_dat_root() -> Option<ffxi_dat::DatRoot> {
     if let Ok(root) = ffxi_dat::DatRoot::from_env() {
@@ -1279,15 +1284,28 @@ fn talknumwork_composes_real_keyitem_line_from_zone_dat() {
     };
     let mut ds =
         crate::event_dialog::DialogSession::new(Some(std::sync::Arc::new(root)), "Tester".into());
-    let zone_text = ds.zone_text(230, ZONE230_KEYITEM_OBTAINED_MAY2023 as usize);
-    assert!(zone_text.is_some(), "zone 230 string DAT must load");
+    assert!(
+        ds.zone_text(230, ZONE230_KEYITEM_OBTAINED_MAY2023 as usize)
+            .is_some(),
+        "zone 230 string DAT must load"
+    );
+    let lo = ZONE230_KEYITEM_OBTAINED_MAY2023.saturating_sub(ZONE230_KEYITEM_SEARCH_BELOW);
+    let hi = ZONE230_KEYITEM_OBTAINED_MAY2023 + ZONE230_KEYITEM_SEARCH_ABOVE;
+    let found = (lo..hi).find_map(|i| {
+        let text = ds.zone_text(230, i as usize)?;
+        text.starts_with(ZONE230_KEYITEM_OBTAINED_PREFIX)
+            .then_some((i, text))
+    });
+    let Some((index, zone_text)) = found else {
+        panic!(
+            "no {ZONE230_KEYITEM_OBTAINED_PREFIX:?} entry in {lo}..{hi}; \
+             install patch skew beyond the window ({ZONE230_KEYITEM_OBTAINED_MAY2023} holds {:?})",
+            ds.zone_text(230, ZONE230_KEYITEM_OBTAINED_MAY2023 as usize)
+        );
+    };
     let line = zone_message_chat_line(
-        &tnw(
-            ZONE230_KEYITEM_OBTAINED_MAY2023 | decode::MESNUM_HIDE_NAME_FLAG,
-            [1, 0, 0, 0],
-            "",
-        ),
-        zone_text,
+        &tnw(index | decode::MESNUM_HIDE_NAME_FLAG, [1, 0, 0, 0], ""),
+        Some(zone_text),
         "Tester",
     );
     assert_eq!(line.text, "Obtained key item: Zeruhn Report.");
