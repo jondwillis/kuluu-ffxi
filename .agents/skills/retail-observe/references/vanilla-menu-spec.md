@@ -1,5 +1,16 @@
 # Vanilla menu & target-interaction spec (retail FFXI, observed on HorizonXI)
 
+## Contents
+- Target-action contextual menu
+- Trade window
+- Item detail / tooltip panel
+- `/check` on a player -> wares + gear
+- Main menu ("Commands")
+- Status submenu / profile panel
+- Items menu (from main menu) + sort
+- NPC interaction range
+- Door / zone-transition interaction
+
 Observed 2026-06-04 via a ~31-minute walkthrough recorded as a level-5 Black Mage
 in a Mog House. Reference client: HorizonXI (classic-era jobs only — White/Black
 Magic, Songs, Summoning, Blue Magic; no newer job categories).

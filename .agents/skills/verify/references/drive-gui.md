@@ -1,5 +1,14 @@
 # GUI drive: native window + agent socket
 
+## Contents
+- Hold the display awake FIRST
+- Launch with the agent socket
+- What is focus-free (almost everything) — driving NPC events without
+  keystrokes, why GM `!cs <id>` cannot verify a cutscene, capture, native
+  window video when screenshots fail, talking to the socket
+- What still needs focus
+- Gotchas
+
 For changes observable only in pixels/audio: rendering, HUD, camera, minimap,
 materials, input-driven movement.
 

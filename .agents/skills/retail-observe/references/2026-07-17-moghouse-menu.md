@@ -1,5 +1,15 @@
 # Retail Mog House menu — observed on HorizonXI (75-era), 2026-07-17
 
+## Contents
+- How the menu opens
+- Main menu (7 entries, exact order)
+- Storage submenu (15 entries, exact order)
+- Delivery Box submenu — send flow, receive flow
+- Change Jobs submenu
+- Gardening
+- Home-nation Mog House — including Delivery Box receive in the has-mail state
+- Capture index
+
 Character: Oldman (Elvaan BST47/THF), inside his **rent-a-room** in Upper Jeuno
 (zone name stays "Upper Jeuno" inside the MH — confirms kuluu MH-lifecycle note).
 Game runs under Ashita v4.2.0.1 in the Parallels VM; captures in this directory.

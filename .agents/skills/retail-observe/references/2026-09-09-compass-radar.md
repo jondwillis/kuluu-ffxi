@@ -1,5 +1,12 @@
 # Compass radar evidence, 2026-09-09
 
+## Contents
+- Primary sources and visible output
+- Installed DAT evidence
+- Coordinate and camera interpretation
+- Unresolved rules
+- Opacity follow-up
+
 This record separates observed retail output, authored DAT data, and unresolved
 runtime rules. It establishes the standing compass radar as vanilla HUD behavior;
 it does not establish that the upper-right terrain minimap in the user reference

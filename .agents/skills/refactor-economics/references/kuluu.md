@@ -1,5 +1,13 @@
 # Applying this in Kuluu
 
+## Contents
+- Gates
+- The LSB boundary is the thing to be careful about
+- Repo rules that constrain a refactor
+- Rust specifics that bite here
+- Tracking
+- Runtime verification
+
 Repo-specific bindings for the portable method in `SKILL.md`. The rules below
 come from `AGENTS.md`; where they conflict with anything here, `AGENTS.md` wins.
 

@@ -1,5 +1,13 @@
 # Auction House spec (retail FFXI, observed on HorizonXI)
 
+## Contents
+- Wire architecture (LSB, authoritative) — including why catalog paging is
+  pull-based
+- Category tree
+- Screens and layout — sell flow, Sales Status, bid (browse) flow
+- Interaction model
+- Open questions (pin live before implementing the detail)
+
 Observed 2026-08-05 via two user-driven recordings at the Bastok Mines AH counter
 (character "Atti", windowed Parallels VM):
 

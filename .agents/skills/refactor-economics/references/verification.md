@@ -1,5 +1,12 @@
 # Proving behaviour was preserved
 
+## Contents
+- Choosing an oracle
+- Validate the oracle before trusting it
+- Recipes (before/after capture)
+- The adversarial checklist
+- Runtime verification
+
 "It compiles" and "tests pass" are necessary and nowhere near sufficient. A
 relocation can compile, pass, and still have dropped a bounds check that only
 fires on malformed input.

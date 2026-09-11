@@ -1,5 +1,13 @@
 # The rubric: what actually pays, and what only looks like it does
 
+## Contents
+- Where this comes from, and how much to trust it
+- Ranked techniques
+- Zero-value and negative-value moves
+- The catalogue of disguised behaviour changes
+- The ordering law, and its honest status
+- What the study says about agents doing this work
+
 ## Where this comes from, and how much to trust it
 
 Everything labelled MEASURED traces to one experiment: Edwards-Alexander, *The
