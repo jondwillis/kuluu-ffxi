@@ -40,7 +40,7 @@ pub fn ability_file_id(ability_id: u32, animation: Option<u16>) -> Option<u32> {
 
 // research/xim MobAbilityTable.kt getFileTableOffset - a mob skill's animation id (LSB
 // mob_skills.mob_anim_id, carried per result in s2c 0x028 category 11) is an FTABLE index with a
-// range-dependent base. The DAT at that index holds the skill's `main` routine, whose 0x05 stage
+// range-dependent base. The DAT at that index holds the skill's `main` routine, whose Motion stage
 // names the caster's own `sp??` clip. Pet skills (category 13) share the table.
 // (exclusive upper bound of the animation range, file-table base) per band.
 pub const MOB_SKILL_FILE_TABLE_BANDS: [(u32, u32); 4] = [

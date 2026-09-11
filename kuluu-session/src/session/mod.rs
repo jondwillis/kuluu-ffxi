@@ -1221,9 +1221,8 @@ fn handle_sub_packet(
                     && special_wire_log_enabled()
                 {
                     if let Some(ns) = decode::NpcState::decode_char_npc(sub.data) {
-                        // 0x04 is the spawn flag LSB ORs into animationsub (see NpcState docs);
-                        // stripping it leaves a nonzero selector exactly when the sub byte names
-                        // a routine (sub 5 wraps to ini1, FFXiMain.dll).
+                        // Stripping LSB's spawn flag leaves a nonzero selector exactly when the
+                        // sub byte names a routine (sub 5 wraps to ini1, FFXiMain.dll).
                         if ns.status == 3
                             || (ns.animationsub & !decode::NpcState::ANIMATIONSUB_SPAWN_FLAG) != 0
                         {

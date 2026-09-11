@@ -190,7 +190,7 @@ pub struct LoadedActor {
     /// CLIP_WARN line's `model=` field.
     model_dat: String,
 
-    /// The model's 0x45 Info chunk when its primary DAT carries one (vekien/xi-model-viewer
+    /// The model's Cib Info chunk when its primary DAT carries one (vekien/xi-model-viewer
     /// ui/js/dat/inspect.js parseInspectInfo). Mounts are None on purpose: their Info layout is
     /// the `mount` variant, whose +0x0A byte is a pose type, not a scale (research/xim
     /// resource/InfoSection.kt readMountDefinition).
@@ -306,7 +306,7 @@ pub struct PreparedActor {
     parts: PreparedParts,
 
     /// The model's transform scale, resolved once at load time. 1.0 for PCs and mounts;
-    /// the 0x45 Info `scale` byte divided by 100 for NPC models (see kick_load_actor_tasks).
+    /// the Cib Info `scale` byte divided by 100 for NPC models (see kick_load_actor_tasks).
     pub scale: f32,
 }
 
@@ -1218,7 +1218,7 @@ pub struct FfxiRenderActor {
 
     pub scale: f32,
 
-    /// The model's 0x45 Info movement byte (Unset when the DAT carries no CIB). Gates whether
+    /// The model's Cib Info movement byte (Unset when the DAT carries no CIB). Gates whether
     /// the wire AnimationSpeed stride scale applies to locomotion clip playback.
     movement_type: MovementType,
 
@@ -1261,7 +1261,7 @@ impl FfxiRenderActor {
         self.current_clip.as_ref().map(|(id, _)| id)
     }
 
-    /// The 0x45 Info movement byte this model was loaded with (Unset when the DAT carries no
+    /// The Cib Info movement byte this model was loaded with (Unset when the DAT carries no
     /// CIB); gates the wire stride scale on locomotion clip playback.
     pub fn movement_type(&self) -> MovementType {
         self.movement_type
@@ -1401,7 +1401,7 @@ enum RestPlayback {
 }
 
 impl LoadedActor {
-    /// The model's 0x45 Info chunk when its primary DAT carries one (None for mounts and
+    /// The model's Cib Info chunk when its primary DAT carries one (None for mounts and
     /// any DAT without an Info section).
     pub fn cib(&self) -> Option<&Cib> {
         self.cib.as_ref()
@@ -2824,7 +2824,7 @@ pub fn kick_load_actor_tasks(
             continue;
         }
         let subject = req.subject.clone();
-        // Retail applies the 0x45 Info `scale` byte to NPC models only: NpcModel.getScale
+        // Retail applies the Cib Info `scale` byte to NPC models only: NpcModel.getScale
         // divides it by 100 (research/xim poc/Model.kt NpcModel.getScale), PcModel drops the
         // byte entirely (PcModel.getMovementInfo) and the mount layout has no scale field at all.
         // The same value
@@ -3419,7 +3419,7 @@ pub fn tick_live_ffxi_actors(
             continue;
         };
         // Insert-or-push like the other dispatchers: a pop-up `init` alongside a still-running
-        // dig `ini1` (or vice versa) runs concurrently in retail; each carries the 0x5F that
+        // dig `ini1` (or vice versa) runs concurrently in retail; each carries the StopRoutine that
         // stops the other, so the overlap resolves through StopRoutine. The push path leaves the
         // first writer's ActionAssets/ActionTarget alone.
         crate::scheduler_runtime::enqueue_routine(&mut commands, wire_e, active);
@@ -3641,10 +3641,10 @@ pub fn tick_live_ffxi_actors(
             // the authored rate; only chase-owned moving entities get a non-unity scale, and
             // advance_actor_pose applies it to the locomotion tier alone.
             //
-            // The stride scale matches a ground stride: the 0x45 Info movement byte (vekien/
+            // The stride scale matches a ground stride: the Cib Info movement byte (vekien/
             // xi-model-viewer ui/js/dat/inspect.js MOVEMENT_TYPE) says Flying and
             // Sliding mobs have no walk/run stride to match, so their locomotion clips play at
-            // the authored rate. Walking/Large carry the wire scale; Unset (no CIB or 0xFF)
+            // the authored rate. Walking/Large carry the wire scale; Unset (no CIB or CIB_UNSET)
             // and an out-of-table byte keep today's behavior.
             let playback_rate = if moving_flag {
                 snap.and_then(|s| s.wire_gait)

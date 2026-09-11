@@ -86,10 +86,10 @@ impl PosHead {
     // `Flags0.MovTime`: the low 13 bits of the POS block's moving u16. LSB writes
     // `ref<uint16>(0x18) = PEntity->loc.p.moving` (vendor/server/src/map/packets/
     // entity_update.cpp CEntityUpdatePacket::updateWith), and the pathfinder advances that
-    // counter per step:
-    // `+= 0x35`, or `0x28` on a speed change, mod 0x2000 (vendor/server/src/map/ai/helpers/
-    // pathfind.cpp StepTo). So the delta between two POS updates counts server steps since
-    // the last one. XiPackets world/server/0x000E: UpdateMoveTime(Flags0 & 0x1FFF); retail
+    // counter by a fixed amount per step (a different one on a speed change), wrapping at
+    // the 13-bit width (vendor/server/src/map/ai/helpers/pathfind.cpp StepTo). So the delta
+    // between two POS updates counts server steps since the last one. XiPackets
+    // world/server/0x000E UpdateMoveTime reads the same 13 bits; retail
     // phases walk/run cycles off it so foot timing matches, instead of re-deriving a phase
     // from position deltas.
     const MOV_TIME_MASK: u32 = 0x1FFF;
@@ -1514,23 +1514,28 @@ mod pos_head_tests {
     fn pos_head_mov_time_is_flags0_low_13_bits() {
         // LSB's moving u16 (entity_update.cpp CEntityUpdatePacket::updateWith) carries MovTime
         // in its low 13 bits;
-        // the counter wraps mod 0x2000, so a value at the top of the range must decode
-        // without bleeding into facetarget (bits 17..31).
+        // a value at the top of the counter's range must decode without bleeding into
+        // facetarget.
+        const FACETARGET_SAMPLE: u32 = 0x01A2;
+        // vendor/server/src/map/ai/helpers/pathfind.cpp StepTo: the per-step MovTime increment.
+        const PATHFIND_STEP_MOV_TIME: u32 = 0x35;
         let mut buf = vec![0u8; PosHead::SIZE];
-        let flags0 = (0x01A2u32 << 17) | 0x1FFF;
+        let flags0 = (FACETARGET_SAMPLE << PosHead::FACETARGET_SHIFT) | PosHead::MOV_TIME_MASK;
         buf[20..24].copy_from_slice(&flags0.to_le_bytes());
         let h = PosHead::decode(&buf).unwrap();
-        assert_eq!(h.mov_time(), 0x1FFF);
+        assert_eq!(u32::from(h.mov_time()), PosHead::MOV_TIME_MASK);
         assert_eq!(
-            h.facetarget(),
-            0x01A2,
+            u32::from(h.facetarget()),
+            FACETARGET_SAMPLE,
             "MovTime must not bleed into facetarget"
         );
 
-        // A step delta the pathfinder would produce: 0x35 per step (pathfind.cpp StepTo).
         let mut buf = vec![0u8; PosHead::SIZE];
-        buf[20..24].copy_from_slice(&0x35u32.to_le_bytes());
-        assert_eq!(PosHead::decode(&buf).unwrap().mov_time(), 0x35);
+        buf[20..24].copy_from_slice(&PATHFIND_STEP_MOV_TIME.to_le_bytes());
+        assert_eq!(
+            u32::from(PosHead::decode(&buf).unwrap().mov_time()),
+            PATHFIND_STEP_MOV_TIME
+        );
     }
 
     #[test]

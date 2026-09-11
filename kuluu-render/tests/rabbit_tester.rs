@@ -3,7 +3,7 @@
 //! Drives a deterministic Bevy app with the real `SchedulerRuntimePlugin` plus the pose path,
 //! feeds hand-packed BATTLE2 bytes through the real session decoder, and asserts what the
 //! retail DATs say should happen: swing clips on the attacker, victim reactions AT the inlined
-//! 0x2B impact frame (not packet arrival), flinch on idle hosts (dfm? for PCs / dfi? for mobs,
+//! DamageCallback impact frame (not packet arrival), flinch on idle hosts (dfm? for PCs / dfi? for mobs,
 //! D3/D4), death fall-over on Defeated (D5), and limb selection from BATTLE2's animation field
 //! with the ati0 fallback (D6).
 //!
@@ -327,7 +327,7 @@ fn load_nolda() -> Option<LoadedActor> {
     load_model(NOLDA_FILE)
 }
 
-/// The inlined 0x2B DamageCallback of ati0 lands at routine frame 36 (dada @32 + 4 delay); a
+/// The inlined DamageCallback of ati0 lands at routine frame 36 (dada @32 + 4 delay); a
 /// reaction earlier than this fired on packet arrival, not at the callback.
 const IMPACT_FRAME_MIN: u32 = 30;
 
@@ -540,11 +540,11 @@ fn s4_run_gait_selects_run_clip() {
 }
 
 // ---------------------------------------------------------------------------
-// S5/S5b - swing impact hands off to the victim reaction AT the inlined-0x2B frame
+// S5/S5b - swing impact hands off to the victim reaction AT the inlined DamageCallback frame
 // ---------------------------------------------------------------------------
 
 /// Rarab swings RightAttack at HumeM (Hit, dist=0, kb=0). Expect: at0? on the attacker from
-/// ~frame 1; at the inlined-0x2B impact (~36 for ati0) HumeM runs `damg` (it ships no sdam of
+/// ~frame 1; at the inlined DamageCallback impact (~36 for ati0) HumeM runs `damg` (it ships no sdam of
 /// its own - the reaction table falls through to damg) and its flinch stage starts dfm? on the PC host.
 #[test]
 fn s5_swing_impact_runs_damg_and_flinches_the_pc() {
@@ -565,7 +565,7 @@ fn s5_swing_impact_runs_damg_and_flinches_the_pc() {
     });
     assert!(swing_at.is_some(), "attacker plays the at0? swing clip");
 
-    // Impact: damg queued on the victim AND its flinch stage started dfm?. The inlined 0x2B
+    // Impact: damg queued on the victim AND its flinch stage started dfm?. The inlined DamageCallback
     // fires at routine frame 36 (ati0 calls dada @32, +4 delay); allow dispatch slack.
     let (impact_at, _) = watch(&mut app, 45, |_i, w| {
         routines(w, vic_parent).contains(b"damg")
@@ -600,7 +600,7 @@ fn s5b_mob_victim_normal_hit_runs_damg_and_flinches() {
         impact_at.is_some_and(|f| f >= IMPACT_FRAME_MIN),
         "normal hit runs damg + dfi? flinch on the mob victim"
     );
-    // The attacker still swung (sanity: the chain armed from this swing's 0x2B).
+    // The attacker still swung (sanity: the chain armed from this swing's DamageCallback).
     assert!(active_clip(app.world(), atk_child).is_some());
 }
 
@@ -634,7 +634,7 @@ fn s6_crit_runs_ldam_and_flinches_the_pc() {
 
     let sway = routines(app.world(), vic_parent).contains(b"sway");
     assert!(!sway, "kb=0 adds no sway alongside the crit reaction");
-    // The attacker still swung (sanity: the chain armed from this swing's 0x2B).
+    // The attacker still swung (sanity: the chain armed from this swing's DamageCallback).
     assert!(active_clip(app.world(), atk_child).is_some());
 }
 
@@ -658,7 +658,7 @@ fn s6b_crit_flinches_the_mob_with_dfi() {
         impact_at.is_some_and(|f| f >= IMPACT_FRAME_MIN),
         "crit flinches the mob victim with dfi?"
     );
-    // The attacker still swung (sanity: the chain armed from this swing's 0x2B).
+    // The attacker still swung (sanity: the chain armed from this swing's DamageCallback).
     assert!(active_clip(app.world(), atk_child).is_some());
 }
 
@@ -690,7 +690,7 @@ fn s6c_crit_without_ldam_falls_back_to_damg() {
         "crit on a no-ldam victim runs the damg fallback at the impact frame, not an \
          unresolvable ldam"
     );
-    // The attacker still swung (sanity: the chain armed from this swing's 0x2B).
+    // The attacker still swung (sanity: the chain armed from this swing's DamageCallback).
     assert!(active_clip(app.world(), atk_child).is_some());
 }
 
@@ -721,7 +721,7 @@ fn s6d_medium_hit_without_ldam_still_runs_damg() {
 }
 
 // ---------------------------------------------------------------------------
-// S8 - the 0x45 Info chunk through the live load pipeline: model scale and movement type
+// S8 - the Cib Info chunk through the live load pipeline: model scale and movement type
 // ---------------------------------------------------------------------------
 
 /// The (scale, movement_type) of an entity's LIVE render root, or None while the placeholder
@@ -740,7 +740,7 @@ fn live_root_probe(
     Some((actor.scale, actor.movement_type()))
 }
 
-/// S8: the 0x45 Info chunk drives two live-pipeline decisions. The bat's scale byte (85) must
+/// S8: the Cib Info chunk drives two live-pipeline decisions. The bat's scale byte (85) must
 /// reach its render root as a 0.85 multiplier and its movement byte (3 = Flying) must land on
 /// the actor; the walker's scale byte (100) must leave it at exactly 1.0 with Walking.
 #[test]

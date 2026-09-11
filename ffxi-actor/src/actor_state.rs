@@ -920,7 +920,8 @@ mod tests {
 
     #[test]
     fn special_pose_spawn_flag_zero_is_plain() {
-        // A bare 0x04 is spawn-flagged zero: no active special, nothing triggered.
+        // The spawn flag alone (LSB ORs it into animationsub) is a zero selector: no active
+        // special, nothing triggered.
         let s = step(&SpecialPose::default(), 0, 0b100);
         assert_eq!(s.pose.active_routine, None);
         assert_eq!(s.triggered, None);

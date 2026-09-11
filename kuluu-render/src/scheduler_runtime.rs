@@ -158,7 +158,7 @@ impl ActiveScheduler {
 
     // research/xim Actor.kt displayAutoAttack — one swing enqueues TWO routines on the attacker: the
     // self-targeted voice routine (`atk0`) and the weapon swing (`ati0`/`bti0`/…). Their timelines
-    // are merged into one entry so the swing's 0x2B DamageCallback reports a single scheduler
+    // are merged into one entry so the swing's DamageCallback reports a single scheduler
     // name - the value PendingHitReaction arms with.
     pub fn effects_only_merged(lookup: &RoutineLookup, names: &[[u8; 4]]) -> Option<Self> {
         let first = *names.iter().find(|n| lookup.get(n).is_some())?;
@@ -209,7 +209,7 @@ impl ActiveScheduler {
         (self.elapsed * ROUTINE_FPS) as u32
     }
 
-    /// True while this routine's AnimationLock interval covers `frame`: any 0x07/0x59 stage with
+    /// True while this routine's AnimationLock interval covers `frame`: any AnimationLock stage with
     /// `stage.frame <= frame < stage.frame + duration_frames`. A routine with no
     /// lock stage never locks.
     pub fn locks_at(&self, frame: u32) -> bool {
@@ -266,9 +266,9 @@ impl ActiveSchedulers {
         self.routines.iter().any(|r| r.locks_at(r.current_frame()))
     }
 
-    /// 0x5F StopRoutine: drop every entry named `name`. xim stops each matching sequence on the
+    /// StopRoutine: drop every entry named `name`. xim stops each matching sequence on the
     /// same actor (EffectRoutineInstance.kt handleStopRoutineEffect); stop() just clears the remaining queue - it
-    /// does not run the stopped routine's 0x2D StopParticle stages, so no particle
+    /// does not run the stopped routine's StopParticle stages, so no particle
     /// cleanup happens here either.
     pub fn remove_routine_named(&mut self, name: &[u8; 4]) {
         self.routines.retain(|r| r.name != *name);
@@ -355,10 +355,10 @@ pub fn tick_active_schedulers(
     }
 }
 
-// 0x5F StopRoutine - the worm's dig (`ini1`) stops `init` and its pop-up stops `ini1` this way
+// StopRoutine - the worm's dig (`ini1`) stops `init` and its pop-up stops `ini1` this way
 //. xim stops every sequence named by the stage on the same actor; here that is a plain
 // removal from the vec. The stopped routine's remaining stages simply never fire - including any
-// 0x2D StopParticle, which retail does not run for a stopped sequence either
+// StopParticle, which retail does not run for a stopped sequence either
 // (EffectRoutineInstance.kt stop).
 pub fn dispatch_stop_routine_stages(
     mut events: MessageReader<SchedulerStageEvent>,
@@ -490,7 +490,7 @@ impl ActionAssets {
 const MAX_SUBROUTINE_DEPTH: usize = 6;
 
 // The global effect dir's `dada` is the swing impact carrier: every melee swing calls it at its
-// impact frame, and it holds the 0x2B DamageCallback that hands off to the victim reaction.
+// impact frame, and it holds the DamageCallback that hands off to the victim reaction.
 // When flattening cannot inline it (the global dir degraded to empty), the CALL survives as a
 // marker stage so `dispatch_damage_callback_stages` still fires on that frame instead of never
 //.
@@ -567,7 +567,7 @@ fn flatten_routine(
                 // mutually exclusive additional-effect branches); inlining it would run every
                 // branch. Callers that know the condition dispatch the branch itself - but the
                 // CALL still survives flattening as a marker stage: `dada`, the swing's impact
-                // carrier, tail-calls such switches, and with a degraded global dir its 0x2B
+                // carrier, tail-calls such switches, and with a degraded global dir its DamageCallback
                 // would otherwise vanish from the timeline entirely.
                 match lookup.get(&t.stage.id) {
                     Some(c) if c.has_control_flow() => out.push(TimedStage {
@@ -1186,7 +1186,7 @@ pub fn dispatch_flinch_stages(
     for ev in events.read() {
         let host = match ev.stage.stage.kind {
             StageKind::FlinchOnCaster => Some(ev.actor),
-            // 0x25 flinches the target; no target, nothing to flinch.
+            // FlinchOnTarget with no target: nothing to flinch.
             StageKind::FlinchOnTarget => q_target.get(ev.actor).ok().and_then(|t| t.0),
             _ => continue,
         };
@@ -1562,7 +1562,7 @@ pub fn settle_dead_from_action(
 // the ranged chain `ldad` uses `daml` instead). Its cases select on `context.hitTypeFlag`
 // (research/xim EffectRoutineInstance.kt resolveControlFlowVariable) and their branch order is byte-for-byte the
 // ActionResolution values in vendor/server/src/map/enums/action/resolution.h. The Hit branches
-// are `damh`/`damg`, and BOTH carry a 0x21 FlinchOnCaster stage (ROM/0/0.DAT: damh = chih + sdam
+// are `damh`/`damg`, and BOTH carry a FlinchOnCaster stage (ROM/0/0.DAT: damh = chih + sdam
 // + flinch + vdam; damg = chit + sdam + flinch + vdam) - retail ALWAYS flinches on a hit. `sdam`
 // is never a top-level reaction choice: it is only the internal sound call inside dam*/ldam, so
 // picking it for models that ship it (as this table used to) made normal hits sound-only with no
@@ -1594,7 +1594,7 @@ pub fn hit_reaction_routine(
         ActionResolution::Block => *b"gur1",
     };
     let mut routines = vec![out];
-    // Retail plays the swy1..3 voice + 0x5E knockback stage alongside the damage reaction
+    // Retail plays the swy1..3 voice + Knockback stage alongside the damage reaction
     // whenever a knockback level is set.
     if outcome.knockback > 0 && out != *b"sway" {
         routines.push(*b"sway");
@@ -1817,9 +1817,9 @@ pub fn dispatch_damage_callback_stages(
     mut commands: Commands,
 ) {
     for ev in events.read() {
-        // The 0x2B itself, or a surviving call to `dada` - the impact marker that stands in
+        // The DamageCallback itself, or a surviving call to `dada` - the impact marker that stands in
         // when flattening kept the call instead of inlining it (degraded global dir,
-        // /D2). Steady state is unchanged: an inlined dada contributes its 0x2B
+        // /D2). Steady state is unchanged: an inlined dada contributes its DamageCallback
         // and no marker, so exactly one stage fires per swing.
         let stage = &ev.stage.stage;
         if !(stage.kind == StageKind::DamageCallback
@@ -1908,7 +1908,7 @@ pub fn dispatch_target_routine_stages(
     q_render: Query<&crate::ffxi_actor_render::FfxiRenderActor>,
     mut q_active: Query<&mut ActiveSchedulers>,
     // Same-batch insert buffer for hosts without ActiveSchedulers yet (see run_routine_on);
-    // flushed after the event loop so several 0x09 links landing on one fresh host in a frame
+    // flushed after the event loop so several SubRoutineOnTarget links landing on one fresh host in a frame
     // merge into one component instead of overwriting each other.
     mut pending_inserts: Local<HashMap<Entity, Vec<ActiveScheduler>>>,
     global: Option<Res<GlobalEffectDir>>,
@@ -2265,7 +2265,7 @@ impl Plugin for SchedulerRuntimePlugin {
                     // Chained between the routine inserters and the stage consumers so a
                     // routine's frame-0 stages fire on the frame it is inserted, and every
                     // stage is consumed the same frame it is written. StopRoutine removal runs
-                    // right after the tick that emits its 0x5F stage.
+                    // right after the tick that emits its StopRoutine stage.
                     tick_active_schedulers,
                     dispatch_stop_routine_stages,
                     crate::particle_sim::spawn_actor_auto_run_particles,
@@ -2667,7 +2667,7 @@ mod tests {
         assert!(!app.world().entity(actor).contains::<ActiveSchedulers>());
     }
 
-    // 0x5F StopRoutine drops the named entry and only that one (xim EffectRoutineInstance.kt:
+    // StopRoutine drops the named entry and only that one (xim EffectRoutineInstance.kt:
     // 910-915 stops each matching sequence on the same actor).
     #[test]
     fn stop_routine_stage_removes_only_the_named_entry() {
@@ -2700,7 +2700,7 @@ mod tests {
         );
     }
 
-    // The lock test is per-routine and interval-based: a routine with no 0x07/0x59 stage never
+    // The lock test is per-routine and interval-based: a routine with no AnimationLock stage never
     // locks, and an overlapping second routine keeps the entity locked past either one's
     // own interval end - the refcount>0 behaviour retail measured on ActionTimer1.
     #[test]
@@ -3534,7 +3534,7 @@ mod tests {
 
     // /D2 - a control-flow child survives flattening as a marker stage at its call
     // frame: with a degraded global dir, `call dada` (the impact carrier) must still fire the
-    // reaction instead of vanishing. The inlined 0x2B and the dam0 marker both land at call +
+    // reaction instead of vanishing. The inlined DamageCallback and the dam0 marker both land at call +
     // delay; no branch of the switch is taken.
     #[test]
     fn control_flow_call_survives_flattening_as_a_marker() {
@@ -3932,13 +3932,14 @@ mod tests {
         assert_eq!(swing_routine(AttackAnimation::Throw), None);
     }
 
-    // Retail-DAT guard (skips without an install): the Carrion Worm's dig (`ini1`) locks for 112
-    // ticks and its pop-up (`init`) for 188 - the retail-measured intervals that the
-    // pose-pass hold keys on. Each also carries the 0x5F that stops the other (the worm
-    // dig stops `init`, the pop stops `ini1`), so both halves of StopRoutine are exercised by one
-    // file. Read straight off disk: which VTABLE app claims the file id is not the point here.
+    // Retail-DAT guard (skips without an install): the Carrion Worm's dig (`ini1`) and pop-up
+    // (`init`) each carry the AnimationLock the pose-pass hold keys on and the StopRoutine
+    // that stops the other, so both halves of StopRoutine are exercised by one file. Read
+    // straight off disk: which VTABLE app claims the file id is not the point here.
     #[test]
     fn real_dat_worm_dig_and_pop_carry_their_locks_and_stops() {
+        const WORM_DIG_LOCK_TICKS: u16 = 112;
+        const WORM_POP_LOCK_TICKS: u16 = 188;
         let Some(root) = ffxi_dat::archive::open_test_install() else {
             return;
         };
@@ -3949,7 +3950,10 @@ mod tests {
         };
         let (schedulers, _) = parse_action_bytes(&bytes);
 
-        for (name, lock_dur, stops) in [(*b"ini1", 112u16, *b"init"), (*b"init", 188, *b"ini1")] {
+        for (name, lock_dur, stops) in [
+            (*b"ini1", WORM_DIG_LOCK_TICKS, *b"init"),
+            (*b"init", WORM_POP_LOCK_TICKS, *b"ini1"),
+        ] {
             let routine = schedulers
                 .iter()
                 .find(|s| s.name == name)

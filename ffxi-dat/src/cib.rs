@@ -2,9 +2,13 @@ use crate::{DatError, Result};
 
 pub const CIB_LEN: usize = 15;
 
-/// The movement byte of the 0x45 Info chunk (vekien/xi-model-viewer ui/js/dat/inspect.js
+/// The Info byte value every field treats as "not set" (research/xim resource/InfoSection.kt
+/// nullIf0xFF).
+pub const CIB_UNSET: u8 = 0xFF;
+
+/// The movement byte of the Cib Info chunk (vekien/xi-model-viewer ui/js/dat/inspect.js
 /// MOVEMENT_TYPE). A byte outside the table is kept as `Unknown` so it stays distinguishable
-/// from a shipped 0xFF.
+/// from a shipped `CIB_UNSET`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MovementType {
     Walking,
@@ -36,13 +40,13 @@ impl MovementType {
             1 => Self::Sliding,
             2 => Self::Large,
             3 => Self::Flying,
-            0xFF => Self::Unset,
+            CIB_UNSET => Self::Unset,
             other => Self::Unknown(other),
         }
     }
 }
 
-/// The range-type byte of the 0x45 Info chunk (vekien/xi-model-viewer ui/js/dat/inspect.js
+/// The range-type byte of the Cib Info chunk (vekien/xi-model-viewer ui/js/dat/inspect.js
 /// RANGE_TYPE). xim documents the gaps explicitly ("no 0x07 / no 0x08 / no 0x09",
 /// research/xim resource/InfoSection.kt) and reads them as Unset; retail does ship 0x08 CIBs,
 /// so an out-of-table byte is kept as `Unknown` rather than folded into Unset.
@@ -73,13 +77,13 @@ impl RangeType {
             0x06 => Self::Archery,
             0x0a => Self::HandbellIndi,
             0x0b => Self::HandbellGeo,
-            0xFF => Self::Unset,
+            CIB_UNSET => Self::Unset,
             other => Self::Unknown(other),
         }
     }
 }
 
-/// The weapon-anim-style byte of the 0x45 Info chunk (viewer WEAPON_ANIM_STYLE).
+/// The weapon-anim-style byte of the Cib Info chunk (viewer WEAPON_ANIM_STYLE).
 /// Interpretation only: the loader still reads the raw `motion_index` byte as a DAT offset.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -142,7 +146,7 @@ pub struct Cib {
     pub body_armour_waist: u8,
 
     /// Model scale in percent (viewer parseInspectInfo b[10], "Scale"). Retail divides by 100
-    /// with only 0xFF meaning default (research/xim poc/Model.kt NpcModel.getScale).
+    /// with only `CIB_UNSET` meaning default (research/xim poc/Model.kt NpcModel.getScale).
     pub scale: u8,
 
     /// Scale in percent for static NPCs that are not sitting in a chair; retail swaps it in
@@ -151,7 +155,7 @@ pub struct Cib {
     pub unknown7: u8,
     pub unknown8: u8,
 
-    /// The Info range byte at 0x0E (viewer parseInspectInfo b[14]).
+    /// The Info range byte (viewer parseInspectInfo b[14]).
     pub range_type: RangeType,
 }
 
@@ -184,12 +188,12 @@ impl Cib {
         })
     }
 
-    /// The Info `scale` byte as a model multiplier. Retail divides by 100 with only 0xFF
+    /// The Info `scale` byte as a model multiplier. Retail divides by 100 with only `CIB_UNSET`
     /// meaning "default" (research/xim poc/Model.kt NpcModel.getScale, poc/Actor.kt getScale;
     /// xim's nullIf0xFF in research/xim resource/InfoSection.kt). 100 therefore lands on 1.0 by
     /// the division itself, and a shipped 0 renders at zero size exactly as retail would.
     pub fn scale_factor(&self) -> f32 {
-        if self.scale == 0xFF {
+        if self.scale == CIB_UNSET {
             1.0
         } else {
             self.scale as f32 / 100.0
@@ -212,9 +216,9 @@ mod tests {
         assert_eq!(c.footstep_size, 0x01);
         assert_eq!(c.motion_index, 0x05);
         assert_eq!(c.scale, 0x80);
-        // 0x10 is outside the viewer's MOVEMENT_TYPE table; xim would throw, we keep the byte.
+        // The movement byte is outside the viewer's MOVEMENT_TYPE table; xim would throw, we keep it.
         assert_eq!(c.movement_type, MovementType::Unknown(0x10));
-        // 0x07 is one of xim's documented range gaps ("no 0x07"); xim reads it as Unset.
+        // The range byte is one of xim's documented gaps; xim reads it as Unset.
         assert_eq!(c.range_type, RangeType::Unknown(0x07));
     }
 
