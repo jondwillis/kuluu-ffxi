@@ -139,7 +139,10 @@ def fetch_issues(repo: str) -> dict[str, dict]:
     by_id: dict[str, dict] = {}
     for issue in json.loads(out or "[]"):
         body = issue.get("body") or ""
-        i = body.find("<!-- beads-id:")
+        # rfind, not find: project_body appends the real marker last, so a bead
+        # whose own description quotes the marker syntax would otherwise index
+        # under that literal and get republished as a duplicate every run.
+        i = body.rfind("<!-- beads-id:")
         if i == -1:
             continue
         j = body.find("-->", i)
