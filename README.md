@@ -200,8 +200,10 @@ cargo xtask game --download             # official US client; prompts first
 cargo xtask game --download --region eu
 ```
 
-Complete the installer GUI, then run `cargo xtask game` to wire it up. (This is
-official-client only — HorizonXI and other flavors must be obtained through
+Complete the installer GUI. That installs Square Enix's 2019 base image; run
+PlayOnline Viewer once and let it patch FINAL FANTASY XI to the current version
+(the update step needs no account), then `cargo xtask game` to wire it up. (This
+is official-client only — HorizonXI and other flavors must be obtained through
 their own launchers.)
 
 Or do it by hand — drop/symlink your install at `vendor/game-files/`, or just

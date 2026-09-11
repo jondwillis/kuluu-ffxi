@@ -17,9 +17,11 @@
 //!
 //! Opt-in (and confirmation-gated): download Square Enix's official FFXI client
 //! installer from the public PlayOnline CDN and launch it. The installer is an
-//! interactive GUI (run via Wine on macOS/Linux); once it finishes, re-run
-//! `cargo xtask game` to wire the result into `vendor/game-files/`. Downloading
-//! the client is free; a registration code / subscription is needed to *play*.
+//! interactive GUI (run via Wine on macOS/Linux) and installs SE's 2019 base
+//! image; PlayOnline Viewer's updater then patches it to the current client.
+//! Re-run `cargo xtask game` to wire the result into `vendor/game-files/`.
+//! Downloading the client is free; a registration code / subscription is
+//! needed to *play*.
 //!
 //! ## `cargo xtask install-hooks [--check]`
 //!
@@ -566,8 +568,10 @@ fn download_official(region: &str, yes: bool, workspace: &Path) -> Result<(), St
     launch_installer(&entry)?;
 
     println!(
-        "\nComplete the installer's GUI (DirectX -> PlayOnline Viewer -> FINAL FANTASY XI),\n\
-         then wire the result up with:\n  cargo xtask game"
+        "\nComplete the installer's GUI (DirectX -> PlayOnline Viewer -> FINAL FANTASY XI).\n\
+         This is SE's 2019 base image: launch PlayOnline Viewer and let it patch FINAL\n\
+         FANTASY XI to the current version (no account needed for the update step),\n\
+         then wire the result up with:\n  cargo xtask game --target retail"
     );
     Ok(())
 }
