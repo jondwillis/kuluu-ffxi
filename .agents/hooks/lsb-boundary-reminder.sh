@@ -37,7 +37,7 @@ if grep -qE '(vendor/server|research/Phoenix)/' "$file" 2>/dev/null; then
 [lsb-boundary-reminder] '$file' cites vendor/server/ or research/Phoenix/ — this is LSB-boundary code.
 Before merging, verify the change still matches LSB's authoritative source. Existing citations in this file:
 $(grep -nE '(vendor/server|research/Phoenix)/' "$file" | head -3 | sed 's/^/  /')
-Use /lsb-mirror-check if you're unsure which LSB symbol to compare against.
+Use /lsb-mirror-check to locate the LSB symbol to compare against.
 MSG
 fi
 

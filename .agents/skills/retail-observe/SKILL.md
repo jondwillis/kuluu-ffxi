@@ -303,7 +303,7 @@ Logout: main menu (`-` key) → Log Out → confirm dialog **defaults to No** �
 - The colored in-game chat font is **not OCR-readable** via `hxi.sh ocr` under any observed condition.
 - The chat log **fully clears/fades ~30s after the last message**. Capture item-use confirmation lines within a few seconds of the action, or skip chat and verify via the inventory list / item tooltip (stack count, recast timer) instead.
 
-## Subagent delegation (REQUIRED)
+## Subagent delegation
 
 Observation loops are screenshot-heavy and burn main-agent context. Delegate them:
 

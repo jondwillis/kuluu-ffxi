@@ -150,7 +150,7 @@ mode, a better drive recipe, a lifted blocker — fold it into the matching
 reference file in the same commit as the fix or finding. This skill rots
 fastest at the env-gotcha layer.
 
-## Subagent delegation (REQUIRED)
+## Subagent delegation
 
 Verification runs (headless captures, GUI drives, retail comparisons) should run in subagents to keep the main context clean:
 

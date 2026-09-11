@@ -239,6 +239,18 @@ run_harness() {
     | sed -E -n 's/^(100644|100755|120000) ([0-9a-f]+) [0-3]'$'\t''/\2 /p' \
     | git cat-file --batch-check='%(objectsize) %(rest)')
 
+  # 7. ffxi-agent/ ships as a plugin (plugin.yaml, .claude-plugin/,
+  #    .codex-plugin/), so its root instruction file is a real copy per harness
+  #    name rather than the symlink the rest of the tree uses — an install path
+  #    that drops symlinks would otherwise hand a consumer an empty playbook.
+  #    A copy only stays honest if something compares it, so pin the pair.
+  if ! cmp -s ffxi-agent/AGENTS.md ffxi-agent/CLAUDE.md; then
+    echo "checks: harness — ffxi-agent/AGENTS.md and ffxi-agent/CLAUDE.md have drifted" >&2
+    echo "checks:   they ship as byte-identical copies (plugin installs may not keep symlinks);" >&2
+    echo "checks:   edit AGENTS.md, then: cp ffxi-agent/AGENTS.md ffxi-agent/CLAUDE.md" >&2
+    bad=1
+  fi
+
   # Cargo records path overrides that no longer match the resolved dependency
   # graph here. Fail before an engine upgrade can silently bypass a required
   # vendor fix while leaving its [patch.crates-io] declaration in place.
