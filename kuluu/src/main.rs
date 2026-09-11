@@ -52,6 +52,12 @@ struct Args {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Manage which FFXI client install kuluu loads.
+    FfxiClient {
+        #[command(subcommand)]
+        action: kuluu::ffxi_client::cli::Action,
+    },
+
     Provision {
         user: String,
         password: String,
@@ -159,7 +165,18 @@ fn main() -> Result<()> {
         .with_env_filter(env_filter)
         .init();
 
-    kuluu::launcher_store::load().settings.apply_to_env();
+    if let Command::FfxiClient { action } = &args.command {
+        return kuluu::ffxi_client::cli::run(action).map_err(|e| anyhow::anyhow!(e));
+    }
+
+    match kuluu::ffxi_client::export(&kuluu::launcher_store::load().settings) {
+        Ok(located) => tracing::info!(
+            path = %located.path.display(),
+            source = %located.source,
+            "FFXI client install selected"
+        ),
+        Err(unresolved) => tracing::warn!(%unresolved, "no FFXI client install selected"),
+    }
 
     let auth = auth_client::AuthClient::with_flavor_and_version(
         args.server.clone(),
@@ -237,6 +254,7 @@ fn resolve_dat_root(require_dat: bool) -> Result<Option<std::sync::Arc<ffxi_dat:
 
 async fn run_command_async(args: Args, auth: auth_client::AuthClient) -> Result<()> {
     match args.command {
+        Command::FfxiClient { .. } => unreachable!("handled before the runtime starts"),
         Command::Provision { user, password } => {
             auth.ensure_account(&user, &password)
                 .await

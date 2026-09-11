@@ -88,6 +88,10 @@ pub struct KnownClient {
     /// image ships without `patch.cfg`.
     pub patch_version: Option<&'static str>,
     pub item_layout: ItemBlockLayout,
+    /// Square Enix's own lineage, which the PlayOnline patch server can bring
+    /// forward. A private server's pinned client is not, and patching it
+    /// toward retail breaks it.
+    pub retail: bool,
 }
 
 pub const KNOWN_CLIENTS: &[KnownClient] = &[
@@ -96,6 +100,7 @@ pub const KNOWN_CLIENTS: &[KnownClient] = &[
         ffximain_sha256: "f4f90fbd080c05448aab3f866b127d7c1675b3cc15c8beaa57bfc584064b7e7c",
         patch_version: Some("30230905_0"),
         item_layout: ItemBlockLayout::Legacy,
+        retail: false,
     },
     // FFXIFullSetup_US from gdl.square-enix.com (CDN Last-Modified 2019-05-10),
     // unpacked by ffxi-install; the unpatched starting point of every retail
@@ -105,6 +110,7 @@ pub const KNOWN_CLIENTS: &[KnownClient] = &[
         ffximain_sha256: "3da0a1e0dc897294880c0a4bf9ea0e9c580786b2d05698290e588c761a802835",
         patch_version: None,
         item_layout: ItemBlockLayout::Legacy,
+        retail: true,
     },
     // retail-2019-base patched by `cargo xtask ffxi-client update` (ffxi-install's
     // PlayOnline patch client) to the server's 2026-09-04 release.
@@ -113,6 +119,7 @@ pub const KNOWN_CLIENTS: &[KnownClient] = &[
         ffximain_sha256: "f2245d1c9d06e02c36624942483913f5120c0d40777fc1bb8703c6f4bda823e4",
         patch_version: Some("30260904_1"),
         item_layout: ItemBlockLayout::Retail2026,
+        retail: true,
     },
 ];
 

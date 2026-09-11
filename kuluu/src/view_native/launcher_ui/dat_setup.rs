@@ -244,7 +244,7 @@ fn try_continue(
     if let Err(e) = launcher_store::save(&store) {
         tracing::warn!(error = %e, "launcher_store: dat_path save failed");
     }
-    store.settings.apply_to_env();
+    crate::ffxi_client::export(&store.settings).ok();
 
     match ffxi_dat::DatRoot::from_env_or_default() {
         Ok(root) => {

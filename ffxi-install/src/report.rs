@@ -76,7 +76,7 @@ pub fn print_progress(p: Progress) {
 /// needs day precision.
 pub fn unix_date(secs: u32) -> String {
     const DAY: u64 = 86_400;
-    let is_leap = |y: u64| (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let is_leap = |y: u64| (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400);
     let days = secs as u64 / DAY;
     let (mut y, mut rem) = (1970u64, days);
     loop {

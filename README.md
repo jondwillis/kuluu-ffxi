@@ -164,8 +164,10 @@ points; the launcher remembers the install you pick, and
 
 Get an install one of these ways:
 
-- **Square Enix's official client:** the launcher's "Download official client"
-  button, or `cargo xtask ffxi-client download`. Free to download; a
+- **Square Enix's official client:** `kuluu ffxi-client setup` (or the
+  launcher's "Get the official client" button, or `cargo xtask ffxi-client
+  setup` for the checkout) downloads, patches and selects it in one shot,
+  asking before each step unless told otherwise. Free to download; a
   registration code / subscription is needed to play on the official service.
 - **HorizonXI launcher (Windows):** install via <https://horizonxi.com>; its
   launcher downloads a full FFXI + Ashita tree.
@@ -207,10 +209,15 @@ as the viewer would), verifies each one, and writes the manifest as
 platform:
 
 ```bash
-cargo xtask ffxi-client download                        # official US client -> targets/retail, patched to current
-cargo xtask ffxi-client download --region eu --target retail-eu
+cargo xtask ffxi-client setup                           # asks: name (retail), region (us), then downloads, patches, offers to make it the default
+cargo xtask ffxi-client setup --target retail-eu --region eu --yes --default   # the same, unattended
 cargo xtask ffxi-client update --target retail          # re-patch later (--verify re-checks every file)
+cargo xtask ffxi-client default hxi                     # switch what the checkout loads by default (a symlink swap)
 ```
+
+`setup` reuses a target that already carries the name rather than downloading
+over it, and `default` refuses to replace a real directory, so neither can
+destroy an install you already have.
 
 `update` never touches the unnamed default install implicitly: that is
 usually a private server's pinned client, which retail patches would break.
@@ -242,14 +249,19 @@ To keep more than one client around, give each a name. Named clients live in
 two places that are searched together: `vendor/game-files/targets/NAME/` in a
 checkout (what `cargo xtask ffxi-client` manages) and the per-user client
 directory the launcher downloads into (`~/Library/Application Support/kuluu/clients/NAME`
-on macOS, `~/.local/share/kuluu/clients/NAME` on Linux). Pick the active one
-once and every entry point honours it; a shell env var still wins for
-one-off runs and tests:
+on macOS, `~/.local/share/kuluu/clients/NAME` on Linux). Two pointers pick the
+active one: the checkout default (a symlink into `targets/`, which is what
+tests, examples and a bare `cargo run` load) and the launcher's saved choice
+in `launcher.json` (what `kuluu play` and the launcher load). A shell env var
+still wins over both for one-off runs unless the launcher's choice has its
+Override tick set; `which` says which one applied:
 
 ```bash
 cargo xtask ffxi-client link --target retail "/path/to/PlayOnline/SquareEnix/FINAL FANTASY XI"
 cargo xtask ffxi-client list                       # the checkout's installs
+cargo xtask ffxi-client default retail             # what cargo run / cargo test load with no override
 cargo run -p kuluu -- ffxi-client list             # every install kuluu can see, with its client profile
+cargo run -p kuluu -- ffxi-client setup            # download, patch and select the official client
 cargo run -p kuluu -- ffxi-client use retail       # persist the choice (launcher.json)
 cargo run -p kuluu -- ffxi-client which            # what will load, and why
 FFXI_CLIENT_TARGET=retail cargo run -p kuluu -- play   # one-off override by name

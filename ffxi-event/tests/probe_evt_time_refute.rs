@@ -7,7 +7,6 @@
 //! against the proposed "elapsed_seconds * 60, clamp 20" host mapping.
 
 use std::collections::BTreeMap;
-use std::path::Path;
 
 use ffxi_dat::event_dat::EventDat;
 use ffxi_dat::DatRoot;
@@ -23,16 +22,7 @@ const REFERENCE_FLAG: u32 = 0x8000;
 const REFERENCE_INDEX_MASK: u32 = 0x7FFF;
 
 fn install() -> Option<DatRoot> {
-    if let Ok(r) = DatRoot::from_env() {
-        return Some(r);
-    }
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("vendor/game-files/SquareEnix/FINAL FANTASY XI");
-    dir.join("VTABLE.DAT")
-        .exists()
-        .then(|| DatRoot::open(dir).ok())
-        .flatten()
+    DatRoot::from_env_or_default().ok()
 }
 
 #[test]

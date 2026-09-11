@@ -4343,6 +4343,7 @@ dependencies = [
  "bevy_framepace",
  "clap",
  "ffxi-dat",
+ "ffxi-install",
  "ffxi-nav-recast",
  "ffxi-proto",
  "ffxi-vocab",

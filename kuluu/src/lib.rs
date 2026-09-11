@@ -1,5 +1,6 @@
 #![allow(clippy::type_complexity, clippy::too_many_arguments)]
 
+pub mod ffxi_client;
 pub mod launcher;
 pub mod launcher_store;
 pub mod secret_store;

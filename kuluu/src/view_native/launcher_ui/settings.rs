@@ -365,7 +365,7 @@ fn persist_and_reload(
         }
     };
 
-    settings.apply_to_env();
+    crate::ffxi_client::export(&settings).ok();
 
     let root = ffxi_dat::DatRoot::from_env_or_default()
         .map_err(|e| format!("DAT path rejected: {e}. Settings saved but assets not reloaded."))?;

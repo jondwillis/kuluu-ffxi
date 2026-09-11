@@ -9,6 +9,8 @@ use crate::{DatError, Result};
 
 const MAX_ROM_INDEX: u8 = 19;
 
+pub const DAT_PATH_ENV: &str = "FFXI_DAT_PATH";
+
 pub const DEFAULT_INSTALL_DIR: &str = "vendor/game-files/SquareEnix/FINAL FANTASY XI";
 
 /// Named installs live side by side here so one checkout can target several
@@ -23,6 +25,46 @@ pub const INSTALL_SUBDIR: &str = "SquareEnix/FINAL FANTASY XI";
 
 pub fn target_install_dir(targets_dir: &Path, name: &str) -> PathBuf {
     targets_dir.join(name).join(INSTALL_SUBDIR)
+}
+
+fn is_install(dir: &Path) -> bool {
+    dir.join("VTABLE.DAT").exists()
+}
+
+/// Workspace-relative paths are tried against the cwd first; cargo runs each
+/// test binary with cwd set to its own package root, so the workspace root
+/// resolved from this crate's manifest dir is the fallback (absent in a
+/// shipped binary, which is why cwd is still tried first).
+fn workspace_bases() -> Vec<PathBuf> {
+    let mut bases = vec![PathBuf::new()];
+    if let Some(root) = Path::new(env!("CARGO_MANIFEST_DIR")).parent() {
+        bases.push(root.to_path_buf());
+    }
+    bases
+}
+
+/// The checkout's [`TARGETS_DIR`], if the checkout is reachable.
+pub fn workspace_targets_dir() -> Option<PathBuf> {
+    workspace_bases()
+        .into_iter()
+        .map(|b| b.join(TARGETS_DIR))
+        .find(|p| p.is_dir())
+}
+
+/// The named checkout target, if it holds an install.
+pub fn workspace_target(name: &str) -> Option<PathBuf> {
+    workspace_bases()
+        .into_iter()
+        .map(|b| target_install_dir(&b.join(TARGETS_DIR), name))
+        .find(|p| is_install(p))
+}
+
+/// The checkout's [`DEFAULT_INSTALL_DIR`], if it holds an install.
+pub fn workspace_default() -> Option<PathBuf> {
+    workspace_bases()
+        .into_iter()
+        .map(|b| b.join(DEFAULT_INSTALL_DIR))
+        .find(|p| is_install(p))
 }
 
 /// Overlay roots searched before the base install, in order, separated by the
@@ -45,9 +87,18 @@ const PIVOT_INI: &str = "config/pivot/pivot.ini";
 const PIVOT_DAT_DIR: &str = "polplugins/DATs";
 
 /// The game directory holding Pivot's config and overlays, given a DAT root of
-/// `<game>/SquareEnix/FINAL FANTASY XI`.
-fn game_dir(install_root: &Path) -> Option<&Path> {
-    install_root.parent()?.parent()
+/// `<game>/SquareEnix/FINAL FANTASY XI`. A root that is itself a symlink (the
+/// checkout default pointing into a named target) is followed first, since
+/// the config sits beside the real tree, not the link.
+fn game_dir(install_root: &Path) -> Option<PathBuf> {
+    let real = match std::fs::read_link(install_root) {
+        Ok(target) => install_root
+            .parent()
+            .map(|p| p.join(&target))
+            .unwrap_or(target),
+        Err(_) => install_root.to_path_buf(),
+    };
+    real.parent()?.parent().map(Path::to_path_buf)
 }
 
 /// Overlay directory names from a `pivot.ini`, ordered by their `[overlays]`
@@ -255,43 +306,28 @@ impl DatRoot {
     }
 
     pub fn from_env() -> Result<Self> {
-        let root = env::var_os("FFXI_DAT_PATH").ok_or(DatError::EnvMissing)?;
+        let root = env::var_os(DAT_PATH_ENV).ok_or(DatError::EnvMissing)?;
         Self::open(PathBuf::from(root))
     }
 
+    /// `FFXI_DAT_PATH`, else the checkout target named by `FFXI_CLIENT_TARGET`,
+    /// else the checkout default. Product-side sources (the launcher's saved
+    /// choice, the per-user client directory) are settled into `FFXI_DAT_PATH`
+    /// by kuluu before this runs.
     pub fn from_env_or_default() -> Result<Self> {
-        if let Some(root) = env::var_os("FFXI_DAT_PATH") {
+        if let Some(root) = env::var_os(DAT_PATH_ENV) {
             return Self::open(PathBuf::from(root));
         }
-        // DEFAULT_INSTALL_DIR is workspace-relative, but cargo runs each test binary with cwd set
-        // to its own package root, so the cwd probe alone silently misses under `cargo test` and
-        // every real-DAT guard vacuously skips. Fall back to the workspace root resolved from this
-        // crate's manifest dir (absent in a shipped binary, which is why cwd is still tried first).
-        let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR")).parent();
-        let bases = [Some(PathBuf::new()), workspace_root.map(Path::to_path_buf)];
         if let Some(name) = env::var_os(CLIENT_TARGET_ENV) {
             let name = name.to_string_lossy();
-            let candidates = bases
-                .iter()
-                .flatten()
-                .map(|b| target_install_dir(&b.join(TARGETS_DIR), &name));
-            return match candidates
-                .into_iter()
-                .find(|p| p.join("VTABLE.DAT").exists())
-            {
+            return match workspace_target(&name) {
                 Some(p) => Self::open(p),
                 None => Err(DatError::TargetMissing {
                     name: name.into_owned(),
                 }),
             };
         }
-        let fallback = bases
-            .iter()
-            .flatten()
-            .map(|b| b.join(DEFAULT_INSTALL_DIR))
-            .find(|p| p.join("VTABLE.DAT").exists())
-            .ok_or(DatError::EnvMissing)?;
-        Self::open(fallback)
+        Self::open(workspace_default().ok_or(DatError::EnvMissing)?)
     }
 
     pub fn root(&self) -> &Path {
@@ -626,6 +662,21 @@ redirect_fopens=true
         let (game, install) = synth_pivot_install(REAL_PIVOT_INI, &["xiview"]);
         assert_eq!(
             discover_overlays(&install),
+            vec![game.path().join(PIVOT_DAT_DIR).join("xiview")]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_follows_a_symlinked_install_root_to_the_real_game_dir() {
+        let (game, install) = synth_pivot_install(REAL_PIVOT_INI, &["xiview"]);
+        let link_home = tempfile::tempdir().unwrap();
+        let link_parent = link_home.path().join("SquareEnix");
+        fs::create_dir_all(&link_parent).unwrap();
+        let link = link_parent.join("FINAL FANTASY XI");
+        std::os::unix::fs::symlink(&install, &link).unwrap();
+        assert_eq!(
+            discover_overlays(&link),
             vec![game.path().join(PIVOT_DAT_DIR).join("xiview")]
         );
     }

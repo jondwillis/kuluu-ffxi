@@ -115,6 +115,7 @@ ffxi-vocab = { path = "../ffxi-vocab" }
 kuluu-nav = { path = "../kuluu-nav" }
 ffxi-nav-recast = { path = "../ffxi-nav-recast" }
 ffxi-dat = { path = "../ffxi-dat" }
+ffxi-install = { path = "../ffxi-install" }
 
 anyhow.workspace = true
 clap.workspace = true

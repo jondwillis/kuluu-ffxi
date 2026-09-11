@@ -41,7 +41,7 @@ cargo run -p kuluu -- play                          # native window (default)
 cargo run -p kuluu --no-default-features -- play --headless  # JSON event-stream agent session, no Bevy
 ```
 
-`cargo xtask ffxi-client link|list|download|update` manages the installs under `vendor/game-files/` (detect/validate/symlink, official-client download, PlayOnline patching); `kuluu ffxi-client which|use|list|download|update` is the product-side view, which also knows the launcher's saved choice and the per-user client directory.
+`cargo xtask ffxi-client setup|link|default|list|update` manages the installs under `vendor/game-files/` (official-client download + PlayOnline patching, wiring an existing install, switching the default symlink); `kuluu ffxi-client setup|which|use|list|update` is the product-side view, which also knows the launcher's saved choice and the per-user client directory.
 
 ## Issue tracking (beads)
 

@@ -322,7 +322,6 @@ mod tests {
     use super::*;
     use ffxi_dat::event_dat::{EventDat, ZONE_PLAYER_ACTOR};
     use ffxi_dat::DatRoot;
-    use std::path::Path;
 
     /// The session ticks the runner unconditionally every 100ms, including
     /// while a frame is displayed awaiting the player. That tick must be a
@@ -533,16 +532,7 @@ mod tests {
     }
 
     fn install() -> Option<DatRoot> {
-        if let Ok(r) = DatRoot::from_env() {
-            return Some(r);
-        }
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("vendor/game-files/SquareEnix/FINAL FANTASY XI");
-        dir.join("VTABLE.DAT")
-            .exists()
-            .then(|| DatRoot::open(dir).ok())
-            .flatten()
+        DatRoot::from_env_or_default().ok()
     }
 
     /// Run real event bytecode from the install through the VM + dialog DAT and
