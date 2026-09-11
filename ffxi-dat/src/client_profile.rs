@@ -9,6 +9,12 @@ pub const FFXIMAIN_DLL: &str = "FFXiMain.dll";
 /// The item DAT whose block ids tell the two known layouts apart.
 const ITEM_LAYOUT_PROBE_DAT: &str = "ROM/118/106.DAT";
 
+/// PlayOnline's per-file patch history. Every applied version update appears
+/// as a `YYYYMMDD_n`-style stamp (`3` prefixed; e.g. `30230905_0` is the
+/// 2023-09-05 update) at the start of a line, so the largest stamp is the
+/// version this install was last patched to.
+const PATCH_CFG: &str = "patch.cfg";
+
 /// Per-byte obfuscation shared by every item DAT. POLUtils
 /// Wiki/FFXIDATFileEncryption.wiki: a fixed rotate for item data.
 pub(crate) const ITEM_BYTE_SHIFT: u32 = 5;
@@ -78,12 +84,14 @@ impl ItemBlockLayout {
 pub struct KnownClient {
     pub name: &'static str,
     pub ffximain_sha256: &'static str,
+    pub patch_version: &'static str,
     pub item_layout: ItemBlockLayout,
 }
 
 pub const KNOWN_CLIENTS: &[KnownClient] = &[KnownClient {
     name: "horizonxi-2023",
     ffximain_sha256: "f4f90fbd080c05448aab3f866b127d7c1675b3cc15c8beaa57bfc584064b7e7c",
+    patch_version: "30230905_0",
     item_layout: ItemBlockLayout::Legacy,
 }];
 
@@ -95,7 +103,27 @@ pub struct ClientProfile {
     pub known: Option<&'static KnownClient>,
     pub ffximain_sha256: Option<String>,
     pub ffximain_len: Option<u64>,
+    pub patch_version: Option<String>,
     pub item_layout: Option<ItemBlockLayout>,
+}
+
+pub fn latest_patch_version(patch_cfg: &str) -> Option<String> {
+    patch_cfg
+        .lines()
+        .filter_map(|line| line.split_ascii_whitespace().next())
+        .filter(|tok| is_patch_stamp(tok))
+        .max()
+        .map(str::to_owned)
+}
+
+fn is_patch_stamp(tok: &str) -> bool {
+    let Some((date, seq)) = tok.split_once('_') else {
+        return false;
+    };
+    date.len() == 8
+        && date.bytes().all(|b| b.is_ascii_digit())
+        && !seq.is_empty()
+        && seq.bytes().all(|b| b.is_ascii_digit())
 }
 
 impl ClientProfile {
@@ -110,10 +138,14 @@ impl ClientProfile {
             .and_then(|hash| KNOWN_CLIENTS.iter().find(|k| k.ffximain_sha256 == hash));
         let item_layout = ItemBlockLayout::probe_file(&root.join(ITEM_LAYOUT_PROBE_DAT))
             .or(known.map(|k| k.item_layout));
+        let patch_version = std::fs::read_to_string(root.join(PATCH_CFG))
+            .ok()
+            .and_then(|cfg| latest_patch_version(&cfg));
         ClientProfile {
             known,
             ffximain_sha256,
             ffximain_len,
+            patch_version,
             item_layout,
         }
     }
@@ -134,6 +166,10 @@ impl fmt::Display for ClientProfile {
             write!(f, " ffximain={}", &hash[..12])?;
         } else {
             write!(f, " ffximain=missing")?;
+        }
+        match &self.patch_version {
+            Some(v) => write!(f, " patch={v}")?,
+            None => write!(f, " patch=unknown")?,
         }
         match self.item_layout {
             Some(layout) => write!(f, " items={}", layout.name()),
@@ -208,12 +244,26 @@ mod tests {
     }
 
     #[test]
+    fn latest_patch_version_is_the_largest_leading_stamp() {
+        let cfg =
+            "file patch.txt {\n30020917_0 1 2 3 x\n30230905_0 1 2 3 y\n30230801_1 1 2 3 z\n}\n\
+                   file ROM/0/0.DAT {\n30210706_0 5 6 7 w\n}\n";
+        assert_eq!(latest_patch_version(cfg).as_deref(), Some("30230905_0"));
+        assert_eq!(latest_patch_version("file x {\n}\n"), None);
+    }
+
+    #[test]
     fn vendored_install_is_a_known_client() {
         let Some(root) = crate::archive::open_test_install() else {
             return;
         };
         let profile = ClientProfile::probe(root.root());
         assert_eq!(profile.item_layout, Some(ItemBlockLayout::Legacy));
+        assert_eq!(
+            profile.patch_version.as_deref(),
+            profile.known.map(|k| k.patch_version),
+            "{profile}"
+        );
         assert!(
             profile.is_known(),
             "vendored install is not in KNOWN_CLIENTS: {profile}"

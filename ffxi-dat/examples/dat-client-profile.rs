@@ -30,6 +30,10 @@ fn main() {
             .unwrap_or_else(|| "missing".into())
     );
     println!(
+        "patch version:   {}",
+        profile.patch_version.as_deref().unwrap_or("unknown")
+    );
+    println!(
         "item layout:     {}",
         profile.item_layout.map(|l| l.name()).unwrap_or("unprobed")
     );
