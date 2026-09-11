@@ -636,7 +636,7 @@ mod tests {
     }
 
     // research/xim EffectRoutineParser.kt parseFlinchEffect: the flinch payload is
-    // f32, f32, u32, f32, **f32 animationDuration**, u32, u32 after delay/duration - a 9-dword
+    // f32, f32, u32, f32, f32 animationDuration, u32, u32 after delay/duration - a 9-dword
     // stage. The bytes mirror Rarab's `damg` flinch (ROM/4/109.DAT): delay 2, duration 10.0.
     #[test]
     fn flinch_stage_captures_animation_duration_at_offset_24() {

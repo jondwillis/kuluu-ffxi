@@ -36,7 +36,7 @@ pub enum RestKind {
 
 pub const LOAD_ROUTINE: [u8; 4] = *b"init";
 
-/// Retail's sub->routine table (the F37 entry in
+/// Retail's sub->routine table ("Sub-to-routine dispatch" in
 /// .agents/skills/retail-observe/references/2026-09-08-worm-burrow-routines.md): the raw
 /// animationsub byte indexes [init, ini1, ini2, ini3] with a
 /// mod-4 wrap that absorbs LSB's spawn flag. The client plays the named routine from the model

@@ -3832,7 +3832,7 @@ mod tests {
             .find(|t| t.stage.kind == StageKind::FlinchOnCaster)
             .expect("damg carries the 0x21 flinch stage");
         // Raw bytes (ROM/4/109.DAT, damg and ldam identical): payload after delay/duration is
-        // f32,f32,u32(=2),f32,**f32 animationDuration = 24.0**,u32,u32 - the fifth value at +24.
+        // f32,f32,u32(=2),f32,f32 animationDuration = 24.0,u32,u32 - the fifth value at +24.
         assert_eq!(
             flinch.stage.flinch_duration,
             Some(24.0),
@@ -3933,8 +3933,8 @@ mod tests {
     }
 
     // Retail-DAT guard (skips without an install): the Carrion Worm's dig (`ini1`) locks for 112
-    // ticks and its pop-up (`init`) for 188 - the retail-measured intervals, which
-    // patch 3's pose-pass hold keys on. Each also carries the 0x5F that stops the other (the worm
+    // ticks and its pop-up (`init`) for 188 - the retail-measured intervals that the
+    // pose-pass hold keys on. Each also carries the 0x5F that stops the other (the worm
     // dig stops `init`, the pop stops `ini1`), so both halves of StopRoutine are exercised by one
     // file. Read straight off disk: which VTABLE app claims the file id is not the point here.
     #[test]

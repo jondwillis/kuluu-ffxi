@@ -664,7 +664,7 @@ fn s6b_crit_flinches_the_mob_with_dfi() {
 
 /// S6c: crit on a victim whose DAT ships no `ldam` of its own (ROM/172/67.DAT), with the global
 /// effect dir removed so ROM/0/0.DAT's ldam cannot rescue it. The crit guard must fall back to
-/// the normal `damg` reaction instead of arming an unresolvable ldam, which post Step 1 falls
+/// the normal `damg` reaction instead of arming an unresolvable ldam, which would fall
 /// through to nothing. All eight retail PC skeletons ship their own ldam (verified against the
 /// install), so this fallback is reachable only on mob victims; S6 covers the PC side of the
 /// matrix.
