@@ -1,13 +1,17 @@
 //! Project automation, invoked via the `cargo xtask` alias (.cargo/config.toml).
 //!
-//! ## `cargo xtask game [PATH] [--copy] [--force]`
+//! ## `cargo xtask game [PATH] [--target NAME] [--copy] [--force]`
 //!
 //! Wire a retail FFXI install into `vendor/game-files/` so the client finds it
 //! by default (it reads `vendor/game-files/SquareEnix/FINAL FANTASY XI`, or
 //! wherever `FFXI_DAT_PATH` points). Detects an existing install (HorizonXI /
-//! Lutris / Wine / CrossOver / PlayOnline), validates it, and symlinks it into
-//! place. Pass an explicit PATH to skip detection; `--copy` to copy instead of
-//! symlink; `--force` to replace an existing link.
+//! Lutris / Wine / CrossOver / PlayOnline / a Parallels shared drive),
+//! validates it, and symlinks it into place. Pass an explicit PATH to skip
+//! detection; `--copy` to copy instead of symlink; `--force` to replace an
+//! existing link. `--target NAME` wires it as a named install under
+//! `vendor/game-files/targets/NAME/` instead, leaving the default alone; the
+//! client selects it with `FFXI_CLIENT_TARGET=NAME`. `--list` shows the
+//! default and every named target.
 //!
 //! ## `cargo xtask game --download [--region us|eu] [--yes]`
 //!
@@ -39,6 +43,10 @@ use std::process::{Command, ExitCode};
 /// The install layout the client expects under `vendor/game-files/`.
 const SQUARE_ENIX: &str = "SquareEnix";
 const FFXI: &str = "FINAL FANTASY XI";
+const GAME_FILES: &str = "vendor/game-files";
+/// Named installs, mirrored by `ffxi_dat::archive::TARGETS_DIR`.
+const TARGETS: &str = "targets";
+const CLIENT_TARGET_ENV: &str = "FFXI_CLIENT_TARGET";
 /// File that proves a directory is the FFXI client DAT root.
 const MARKER: &str = "VTABLE.DAT";
 /// How deep to descend under each detection root looking for the marker.
@@ -82,12 +90,16 @@ fn main() -> ExitCode {
 
 fn usage() {
     eprintln!(
-        "usage: cargo xtask game [PATH] [--copy] [--force]\n\
+        "usage: cargo xtask game [PATH] [--target NAME] [--copy] [--force]\n\
+         \x20      cargo xtask game --list\n\
          \x20      cargo xtask game --download [--region us|eu] [--yes]\n\
          \x20      cargo xtask install-hooks [--check]\n\
          \n\
          Wire a retail FFXI install into vendor/game-files/.\n\
          PATH        an install dir to use (skips auto-detection)\n\
+         --target    wire under vendor/game-files/targets/NAME/ instead of the\n\
+         \x20           default; select it at runtime with FFXI_CLIENT_TARGET=NAME\n\
+         --list      show the default install and every named target\n\
          --copy      copy the install instead of symlinking it\n\
          --force     replace an existing vendor/game-files link\n\
          --download  download SE's official client installer and launch it\n\
@@ -106,15 +118,31 @@ fn cmd_game(args: &[String]) -> Result<(), String> {
     let mut copy = false;
     let mut force = false;
     let mut download = false;
+    let mut list = false;
     let mut yes = false;
     let mut region = String::from("us");
+    let mut target: Option<String> = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--copy" => copy = true,
             "--force" => force = true,
             "--download" => download = true,
+            "--list" => list = true,
             "--yes" | "-y" => yes = true,
+            "--target" => {
+                let name = it.next().ok_or("--target needs a NAME")?;
+                if name.is_empty()
+                    || !name
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                {
+                    return Err(format!(
+                        "--target `{name}` must be [A-Za-z0-9_-]+ (it becomes a directory name)"
+                    ));
+                }
+                target = Some(name.clone());
+            }
             "--region" => {
                 region = it
                     .next()
@@ -131,16 +159,24 @@ fn cmd_game(args: &[String]) -> Result<(), String> {
     if download {
         return download_official(&region, yes, &workspace);
     }
-    let dest_se = workspace.join("vendor/game-files").join(SQUARE_ENIX);
+    if list {
+        return list_installs(&workspace);
+    }
+    let game_files = workspace.join(GAME_FILES);
+    let dest_se = match &target {
+        Some(name) => game_files.join(TARGETS).join(name).join(SQUARE_ENIX),
+        None => game_files.join(SQUARE_ENIX),
+    };
     let dest = dest_se.join(FFXI);
 
     // Already wired up and valid? Nothing to do.
     if is_ffxi_root(&dest) {
         println!(
-            "vendor/game-files already has a valid install:\n  {}",
+            "{} already has a valid install:\n  {}",
+            show(&dest_se),
             show(&dest)
         );
-        print_env_hint(&dest);
+        print_env_hint(&dest, target.as_deref());
         return Ok(());
     }
 
@@ -214,8 +250,43 @@ fn cmd_game(args: &[String]) -> Result<(), String> {
             dest.display()
         ));
     }
-    println!("OK: vendor/game-files is ready.");
-    print_env_hint(&dest);
+    println!("OK: {} is ready.", show(&dest_se));
+    print_env_hint(&dest, target.as_deref());
+    Ok(())
+}
+
+fn list_installs(workspace: &Path) -> Result<(), String> {
+    let game_files = workspace.join(GAME_FILES);
+    let describe = |dir: &Path| -> String {
+        if is_ffxi_root(dir) {
+            match std::fs::read_link(dir) {
+                Ok(link) => format!("-> {}", link.display()),
+                Err(_) => "(directory)".to_string(),
+            }
+        } else {
+            "(missing)".to_string()
+        }
+    };
+    let default = game_files.join(SQUARE_ENIX).join(FFXI);
+    println!("default   {}  {}", show(&default), describe(&default));
+    let targets = game_files.join(TARGETS);
+    let mut names: Vec<String> = match std::fs::read_dir(&targets) {
+        Ok(rd) => rd
+            .flatten()
+            .filter(|e| e.path().is_dir())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    names.sort();
+    for name in names {
+        let dir = targets.join(&name).join(SQUARE_ENIX).join(FFXI);
+        println!("{name:<9} {}  {}", show(&dir), describe(&dir));
+    }
+    println!(
+        "\nSelect a named target with {CLIENT_TARGET_ENV}=NAME; identify a build with\n  \
+         cargo run -p ffxi-dat --example dat-client-profile -- <install dir>"
+    );
     Ok(())
 }
 
@@ -361,6 +432,29 @@ fn find_ffxi_root(start: &Path, depth: usize) -> Option<PathBuf> {
     None
 }
 
+/// Parallels Desktop mounts a guest's drives as `/Volumes/[C] <VM name>`; the
+/// retail PlayOnline tree inside one is the usual way a macOS host reaches a
+/// current retail client.
+fn parallels_shared_drives() -> Vec<PathBuf> {
+    let Ok(rd) = std::fs::read_dir("/Volumes") else {
+        return Vec::new();
+    };
+    rd.flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with('['))
+        })
+        .flat_map(|p| {
+            [
+                p.join("Program Files (x86)/PlayOnline"),
+                p.join("Program Files (x86)/HorizonXI"),
+                p.join("Program Files (x86)/SquareEnix"),
+            ]
+        })
+        .collect()
+}
+
 /// Platform-specific likely install locations that actually exist on disk.
 fn detect() -> Vec<PathBuf> {
     let mut roots: Vec<PathBuf> = Vec::new();
@@ -389,6 +483,7 @@ fn detect() -> Vec<PathBuf> {
         roots.push(home.join(".local/share/lutris"));
         roots.push(home.join("Library/Application Support/HorizonXI"));
     }
+    roots.extend(parallels_shared_drives());
 
     let mut hits = Vec::new();
     for r in roots {
@@ -401,12 +496,18 @@ fn detect() -> Vec<PathBuf> {
     hits
 }
 
-fn print_env_hint(dest: &Path) {
-    println!(
-        "\nThe client uses vendor/game-files by default. To point elsewhere, set:\n  \
-         export FFXI_DAT_PATH=\"{}\"",
-        dest.display()
-    );
+fn print_env_hint(dest: &Path, target: Option<&str>) {
+    match target {
+        Some(name) => println!(
+            "\nThe client uses vendor/game-files by default. To use this target instead, set:\n  \
+             export {CLIENT_TARGET_ENV}={name}"
+        ),
+        None => println!(
+            "\nThe client uses vendor/game-files by default. To point elsewhere, set:\n  \
+             export FFXI_DAT_PATH=\"{}\"",
+            dest.display()
+        ),
+    }
 }
 
 fn no_install_help() -> String {

@@ -214,6 +214,31 @@ export FFXI_DAT_PATH="/path/to/.../SquareEnix/FINAL FANTASY XI"
 `FFXI_DAT_PATH` also overrides at runtime and can be set from the launcher's
 settings UI, so you never have to move a large install to use it.
 
+### Client versions
+
+Retail keeps changing its DAT formats (the September 2026 update, for one,
+grew every item block from 0xC00 to 0x1400 bytes), and private servers pin
+older clients. **The latest retail client is the primary target**; other
+generations stay usable through the same mechanism, not through parallel code
+paths. Kuluu identifies an install at startup (`ffxi_dat::ClientProfile`: the
+FFXiMain.dll hash against `KNOWN_CLIENTS`, plus per-format probes such as the
+item block layout) and logs it. Parsers that differ between generations
+dispatch on those probed layouts, so an unmeasured build still gets the right
+decoder or fails closed instead of reading garbage.
+
+To keep more than one client around, wire each as a named target and pick it
+with an env var; the default `vendor/game-files/` install is left untouched:
+
+```bash
+cargo xtask game --target retail "/Volumes/[C] Windows 11/Program Files (x86)/PlayOnline/SquareEnix/FINAL FANTASY XI"
+cargo xtask game --list
+FFXI_CLIENT_TARGET=retail cargo run -p kuluu -- play
+cargo run -p ffxi-dat --example dat-client-profile -- "/path/to/FINAL FANTASY XI"
+```
+
+When you measure a new build, add its row to `KNOWN_CLIENTS` and cite that
+row's name (not a date) next to any offset or constant verified on it.
+
 ## AI-generated code
 
 Kuluu is, to a first approximation, **written by AI coding agents.** The large
