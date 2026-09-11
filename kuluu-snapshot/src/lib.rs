@@ -427,6 +427,8 @@ pub struct Entity {
 // Public so the renderer can hide models on INVISIBLE without re-declaring
 // the byte (single source of truth).
 pub mod status_type {
+    pub const NORMAL: u8 = 0;
+    pub const UPDATE: u8 = 1;
     pub const DISAPPEAR: u8 = 2;
     pub const INVISIBLE: u8 = 3;
     pub const STATUS_4: u8 = 4;
@@ -558,16 +560,34 @@ impl Entity {
     /// A server-side door NPC. Doors classify to `EntityKind::Other` but are
     /// interactable: retail sends a Talk (0x01A, action 0x00) on the door's
     /// act_index and the door's onTrigger lua drives open/confirm/zone-change.
-    /// LSB gates doors on `look.size == 0x02`
-    /// (vendor/server/src/map/packets/c2s/0x01a_action.cpp GP_CLI_COMMAND_ACTION::process); size 3/4 decode
-    /// to `Transport` (elevators/airships), which stay non-interactable.
+    /// `look.size == 0x02` identifies a door; the only place LSB reads it is
+    /// the Monstrosity guard in `GP_CLI_COMMAND_ACTION::process`
+    /// (`GP_CLI_COMMAND_ACTION_ACTIONID::Talk`, vendor/server/src/map/packets/c2s/0x01a_action.cpp),
+    /// which lets a MON use doors and nothing else. The general Talk path
+    /// applies no size filter: any NPC within range that `IsSpawned()` with
+    /// `status == STATUS_TYPE::NORMAL` (or the player in a Mog House) is
+    /// triggered. Limiting `EntityKind::Other` to doors is this client's own
+    /// choice; size 3/4 decode to `Transport` (elevators/airships), which stay
+    /// non-interactable.
     pub fn is_door(&self) -> bool {
         matches!(self.look, Some(EntityLook::Door { .. }))
     }
 
+    /// The server-side precondition for a door Talk to do anything: LSB's
+    /// general trigger path (`GP_CLI_COMMAND_ACTION::process`,
+    /// vendor/server/src/map/packets/c2s/0x01a_action.cpp) requires
+    /// `status == STATUS_TYPE::NORMAL` (vendor/server/src/map/entities/baseentity.h)
+    /// and silently drops the Talk otherwise. Doors carry no other legitimate
+    /// status, so unlike the fail-open blacklist for PCs/mobs/NPCs this is an
+    /// exact match.
+    pub fn is_door_triggerable(&self) -> bool {
+        self.is_door() && self.status == status_type::NORMAL
+    }
+
     /// Selectable by click / `<t>`. Dead players stay selectable so a healer can
     /// target them to Raise; dead mobs/NPCs do not. `Other` entities are not
-    /// selectable except doors, whose Talk interaction is the retail door flow.
+    /// selectable except doors, whose Talk interaction is the retail door flow
+    /// and which the server only answers while [`Entity::is_door_triggerable`].
     /// Targetability authority is the server's untargetable bit (flags1
     /// TargetOffFlag = LSB m_flags FLAG_UNTARGETABLE for NPC/MOB) — namevis
     /// never gates targeting upstream.
@@ -579,6 +599,9 @@ impl Entity {
             return false;
         }
         if matches!(self.kind, EntityKind::Other) && !self.is_door() {
+            return false;
+        }
+        if self.is_door() && !self.is_door_triggerable() {
             return false;
         }
         !self.is_dead() || matches!(self.kind, EntityKind::Pc)
@@ -2069,6 +2092,27 @@ mod tests {
         assert!(
             door.is_targetable() && door.is_cycle_candidate(),
             "doors (Other + Door look) are interactable targets"
+        );
+        assert_eq!(door.status, status_type::NORMAL);
+        assert!(door.is_door_triggerable());
+
+        let door_updating = Entity {
+            status: status_type::UPDATE,
+            ..door.clone()
+        };
+        assert!(
+            !door_updating.is_door_triggerable() && !door_updating.is_targetable(),
+            "LSB drops the Talk on a door whose status is not NORMAL"
+        );
+
+        let npc_updating = Entity {
+            kind: EntityKind::Npc,
+            status: status_type::UPDATE,
+            ..base.clone()
+        };
+        assert!(
+            npc_updating.is_targetable(),
+            "the exact-NORMAL gate is door-only; NPCs keep the fail-open blacklist"
         );
 
         let transport = Entity {
