@@ -1861,9 +1861,9 @@ fn handle_sub_packet(
                 let _ = event_tx.send(AgentEvent::ChatLine {
                     line: ChatLine {
                         spans: Vec::new(),
-                        channel: ChatChannel::System,
+                        channel: ChatChannel::Debug,
                         sender: "client".into(),
-                        text: format!("📦 Bag capacities: {}", summary.join(", ")),
+                        text: format!("Bag capacities: {}", summary.join(", ")),
                         server_ts: 0,
                     },
                 });

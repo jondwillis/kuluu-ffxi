@@ -4123,3 +4123,29 @@ fn mog_transition_lines_are_devhud_only() {
     }
     assert_eq!(texts.len(), 2, "an unchanged state announces nothing");
 }
+
+#[test]
+fn bag_capacity_line_is_devhud_only() {
+    const MAIN_BAG_WIRE_CAP: u8 = 31;
+    // vendor/server/src/map/packets/s2c/0x01c_item_max.cpp GP_SERV_COMMAND_ITEM_MAX
+    const ITEM_MAX_BODY_LEN: usize = 96;
+
+    let mut body = vec![0u8; ITEM_MAX_BODY_LEN];
+    body[0] = MAIN_BAG_WIRE_CAP;
+
+    let lines: Vec<_> = sub_packet_events(ffxi_proto::map::s2c::ITEM_MAX, &body)
+        .into_iter()
+        .filter_map(|e| match e {
+            AgentEvent::ChatLine { line } => Some(line),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0].channel, ChatChannel::Debug);
+    assert_eq!(
+        lines[0].text,
+        format!("Bag capacities: c0={}", MAIN_BAG_WIRE_CAP - 1)
+    );
+    assert!(lines[0].text.is_ascii(), "{}", lines[0].text);
+}
