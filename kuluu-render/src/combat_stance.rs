@@ -225,11 +225,9 @@ pub struct WalkMode {
 }
 
 impl WalkMode {
-    pub const WALK_SCALE: f32 = 0.25;
-
     pub fn scale(self) -> f32 {
         if self.walking {
-            Self::WALK_SCALE
+            kuluu_snapshot::speed::WALK_SPEED_SCALE
         } else {
             1.0
         }

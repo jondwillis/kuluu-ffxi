@@ -138,8 +138,9 @@ pub fn model_radius(kind: EntityKind) -> f32 {
 // kuluu-session at runtime) and the session reactor share one source of truth; re-exported here
 // for the existing `kuluu_session::state::{...}` call sites.
 pub use kuluu_snapshot::speed::{
-    move_speed_ratio, move_speed_yps, AUTHORED_ANIM_RATE, BASE_PACKET_SPEED, MAX_MOVE_SPEED_YPS,
-    MOUNTED_SPEED_MULTIPLIER, SPEED_TO_YPS,
+    move_speed_ratio, move_speed_yps, walk_speed_yps, AUTHORED_ANIM_RATE, BASE_PACKET_SPEED,
+    MAX_MOVE_SPEED_YPS, MOUNTED_SPEED_MULTIPLIER, SPEED_TO_YPS, WALK_SPEED_DIVISOR,
+    WALK_SPEED_SCALE,
 };
 
 fn merge_kind(existing: EntityKind, incoming: EntityKind) -> EntityKind {

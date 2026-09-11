@@ -485,6 +485,19 @@ pub mod speed {
         move_speed_yps(packet_speed, mounted) / move_speed_yps(BASE_PACKET_SPEED, false)
     }
 
+    // research/XIClient/src/XIClient/source/World/Actor/ControllableActor.cpp ControllableActor::AdjustAnalogKeyLength
+    // research/XIClient/src/XIClient/source/World/Actor/BaseActor.cpp BaseActor::GetWalkSpeed
+    pub const WALK_SPEED_DIVISOR: f32 = 3.0;
+
+    /// The walk-lock multiplier on a run speed: the analog walk band's length.
+    pub const WALK_SPEED_SCALE: f32 = 1.0 / WALK_SPEED_DIVISOR;
+
+    /// BaseActor::GetWalkSpeed: the raw packet speed over three, with neither the mount doubling
+    /// nor the clamp `move_speed_yps` applies.
+    pub const fn walk_speed_yps(packet_speed: u8) -> f32 {
+        packet_speed as f32 * SPEED_TO_YPS / WALK_SPEED_DIVISOR
+    }
+
     /// Walk/run clip playback scale for a decoded animationSpeed byte, relative to the authored
     /// rate. Retail's AnimationSpeed = SpeedBase * 0.1 yps (research/XiPackets world/server/0x000E)
     /// and the clips are authored at AUTHORED_ANIM_RATE, so the ratio is the playback multiplier:

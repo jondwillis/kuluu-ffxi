@@ -105,7 +105,7 @@ const PITCH_STEP_HELD: f32 = 0.015;
 const STRAFE_CANCEL_MS: u64 = 300;
 
 use kuluu_session::state::{
-    ground_correction_matches, move_speed_yps, GROUND_CORRECTION_XY_EPSILON_YALMS, SPEED_TO_YPS,
+    ground_correction_matches, move_speed_yps, walk_speed_yps, GROUND_CORRECTION_XY_EPSILON_YALMS,
 };
 
 // Retail's movement tick: StepControl turns the actor's yalms/second speed into
@@ -125,10 +125,6 @@ const LOCKED_SIDE_STEP_DIVISOR_MOUNTED: f32 = 8.0;
 // StepControl's run speed is.
 const LOCKED_BACK_STEP_DIVISOR: f32 = 60.0;
 const LOCKED_BACK_STEP_DIVISOR_MOUNTED: f32 = 30.0;
-// BaseActor::GetWalkSpeed() is the raw packet speed over three
-// (research/XIClient/src/XIClient/source/World/Actor/BaseActor.cpp,
-// BaseActor::GetWalkSpeed).
-const WALK_SPEED_DIVISOR: f32 = 3.0;
 
 // A stick pulled this far toward the camera cancels autorun, like a tapped S;
 // gentler deflections only carve (retail autorun is steerable).
@@ -336,8 +332,7 @@ pub fn move_step_speed_yps(
             } else {
                 LOCKED_BACK_STEP_DIVISOR
             };
-            (packet_speed as f32 * SPEED_TO_YPS / WALK_SPEED_DIVISOR) * RETAIL_MOVE_TICKS_PER_SEC
-                / divisor
+            walk_speed_yps(packet_speed) * RETAIL_MOVE_TICKS_PER_SEC / divisor
         }
     }
 }
@@ -345,7 +340,7 @@ pub fn move_step_speed_yps(
 /// Rate the walker paces its vertical merge with, in yalms/second. It is
 /// normally the run/walk speed, but the locked-on side and backward steps are
 /// absolute lengths that can exceed it (walk-locked strafing is 3.75 y/s of
-/// feet against a 1.25 y/s merge), and a merge slower than the feet travel
+/// feet against a 1.67 y/s merge), and a merge slower than the feet travel
 /// leaves them behind the floor on a staircase.
 pub fn ground_merge_pace_yps(move_yps: f32, step_yps: f32) -> f32 {
     move_yps.max(step_yps)
@@ -2860,15 +2855,35 @@ mod tests {
                 "the locked-on {dir:?} step is the only one retail slows"
             );
         }
-        // Walk lock is the one thing that still slows a free run: a quarter of
-        // the 5 y/s run.
-        let walk = kuluu_render::combat_stance::WalkMode::WALK_SCALE;
-        assert_eq!(move_step_speed_yps(None, BASE_SPEED, walk, false), 1.25);
+        let walk = WALK_LOCK.scale();
+        assert!(close(
+            move_step_speed_yps(None, BASE_SPEED, walk, false),
+            BASE_RUN_YPS / 3.0
+        ));
+    }
+
+    const WALK_LOCK: kuluu_render::combat_stance::WalkMode =
+        kuluu_render::combat_stance::WalkMode { walking: true };
+
+    /// The forward walk-lock and the locked-on backpedal are both retail's
+    /// GetWalkSpeed, a third of the raw packet speed; the two paths through
+    /// `move_step_speed_yps` must not drift into two walk speeds.
+    #[test]
+    fn walk_lock_forward_and_locked_backpedal_share_one_walk_speed() {
+        for speed in [BASE_SPEED, 80, 255] {
+            let forward = move_step_speed_yps(None, speed, WALK_LOCK.scale(), false);
+            let backpedal = move_step_speed_yps(Some(MoveDirId::Backward), speed, 1.0, false);
+            let want = move_speed_yps(speed, false) / 3.0;
+            assert!(
+                close(forward, backpedal) && close(forward, want),
+                "speed {speed}: forward walk {forward}, backpedal {backpedal}, want {want}"
+            );
+        }
     }
 
     #[test]
     fn locked_steps_pace_the_vertical_merge_when_they_outrun_the_walk() {
-        let walk = kuluu_render::combat_stance::WalkMode::WALK_SCALE;
+        let walk = WALK_LOCK.scale();
         let merge = BASE_RUN_YPS * walk;
         let side = move_step_speed_yps(Some(MoveDirId::Side), BASE_SPEED, walk, false);
         assert!(
