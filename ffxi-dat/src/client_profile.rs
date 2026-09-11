@@ -106,6 +106,14 @@ pub const KNOWN_CLIENTS: &[KnownClient] = &[
         patch_version: None,
         item_layout: ItemBlockLayout::Legacy,
     },
+    // retail-2019-base patched by `cargo xtask game --update` (ffxi-install's
+    // PlayOnline patch client) to the server's 2026-09-04 release.
+    KnownClient {
+        name: "retail-2026-09",
+        ffximain_sha256: "f2245d1c9d06e02c36624942483913f5120c0d40777fc1bb8703c6f4bda823e4",
+        patch_version: Some("30260904_1"),
+        item_layout: ItemBlockLayout::Retail2026,
+    },
 ];
 
 /// What an install actually is, measured from its files. `known` is `Some`
@@ -263,6 +271,31 @@ mod tests {
                    file ROM/0/0.DAT {\n30210706_0 5 6 7 w\n}\n";
         assert_eq!(latest_patch_version(cfg).as_deref(), Some("30230905_0"));
         assert_eq!(latest_patch_version("file x {\n}\n"), None);
+    }
+
+    /// The `retail` named target, when a developer has downloaded and updated
+    /// it; skips otherwise.
+    #[test]
+    fn retail_target_is_a_known_client() {
+        let targets = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join(crate::archive::TARGETS_DIR);
+        let root = crate::archive::target_install_dir(&targets, "retail");
+        if !root.join(FFXIMAIN_DLL).is_file() {
+            return;
+        }
+        let profile = ClientProfile::probe(&root);
+        assert!(
+            profile.is_known(),
+            "retail target is not in KNOWN_CLIENTS: {profile}"
+        );
+        let known = profile.known.unwrap();
+        assert_eq!(profile.item_layout, Some(known.item_layout), "{profile}");
+        assert_eq!(
+            profile.patch_version.as_deref(),
+            known.patch_version,
+            "{profile}"
+        );
     }
 
     #[test]
