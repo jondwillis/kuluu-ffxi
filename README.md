@@ -203,9 +203,12 @@ cargo xtask game --download             # official US client -> targets/retail; 
 cargo xtask game --download --region eu --target retail-eu
 ```
 
-That is Square Enix's 2019 base image. Patching it to the current version is
-still PlayOnline Viewer's job (no account needed for the update step), which
-`--update` launches for you, native on Windows and via Wine elsewhere:
+That is Square Enix's 2019 base image. `--update` brings it (or any retail
+install) to the current version by speaking the PlayOnline patch protocol
+itself: it asks `pc001.pol.com` for the manifest, fetches only the files whose
+checksums differ (whole images or delta chains, as the viewer would), verifies
+each one, and writes the manifest as `patch.cfg`. No viewer, no Wine, no
+account:
 
 ```bash
 cargo xtask game --update --target retail

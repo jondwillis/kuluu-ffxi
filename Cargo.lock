@@ -3238,6 +3238,8 @@ name = "ffxi-install"
 version = "0.6.0"
 dependencies = [
  "cab",
+ "flate2",
+ "md-5",
  "msi",
  "unrar",
 ]

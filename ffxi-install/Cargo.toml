@@ -7,5 +7,7 @@ description = "Fetch and unpack Square Enix's official FFXI client installer nat
 
 [dependencies]
 cab = "0.6"
+flate2.workspace = true
+md-5.workspace = true
 msi = "0.10"
 unrar = "0.5"

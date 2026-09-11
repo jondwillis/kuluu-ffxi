@@ -20,8 +20,8 @@
 //! `ffxi-install` crate reads the RAR volumes, MSIs and cabinets itself; no
 //! Wine, no installer GUI) into `vendor/game-files/targets/NAME/` (default
 //! `retail`). That is SE's 2019 base image; `cargo xtask game --update` then
-//! launches PlayOnline Viewer, which patches it to the current client (native
-//! on Windows, via Wine elsewhere). Downloading the client is free; a
+//! patches it to the current client by speaking the PlayOnline patch protocol
+//! itself (no viewer, no Wine). Downloading the client is free; a
 //! registration code / subscription is needed to *play*.
 //!
 //! ## `cargo xtask install-hooks [--check]`
@@ -34,7 +34,7 @@
 //! repo auto-enable its own hooks. `--check` only verifies (non-zero exit when
 //! inactive) so the README / CI / a setup doctor can assert the gate is live.
 //!
-//! HTTP goes through `curl`; PlayOnline Viewer runs through `wine` off Windows.
+//! HTTP goes through `curl`.
 
 mod dlss;
 
@@ -105,8 +105,8 @@ fn usage() {
          --target    wire under vendor/game-files/targets/NAME/ instead of the\n\
          \x20           default; select it at runtime with FFXI_CLIENT_TARGET=NAME\n\
          --list      show the default install and every named target\n\
-         --update    launch PlayOnline Viewer (native, or via wine) to patch the\n\
-         \x20           install to the current retail version\n\
+         --update    patch the install to the current retail version over the\n\
+         \x20           PlayOnline patch protocol (--force re-verifies every file)\n\
          --copy      copy the install instead of symlinking it\n\
          --force     replace an existing vendor/game-files link\n\
          --download  download SE's official client installer and unpack it natively\n\
@@ -191,7 +191,7 @@ fn cmd_game(args: &[String]) -> Result<(), String> {
             None if is_ffxi_root(&dest) => dest,
             None => return Err(format!("{} holds no install to update", show(&dest))),
         };
-        return run_pol_updater(&root);
+        return update_install(&root, force);
     }
 
     // Already wired up and valid? Nothing to do.
@@ -280,141 +280,24 @@ fn cmd_game(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// PlayOnline Viewer, installed by SE's installer as a sibling of
-/// `FINAL FANTASY XI/` under `SquareEnix/`, is the only thing that patches a
-/// retail client to the current version.
-const POL_VIEWER_EXE: &str = "PlayOnlineViewer/pol.exe";
-
-fn run_pol_updater(root: &Path) -> Result<(), String> {
-    let root = std::fs::canonicalize(root).map_err(|e| format!("{}: {e}", root.display()))?;
-    let game_dir = root
-        .parent()
-        .ok_or_else(|| format!("{} has no SquareEnix parent directory", root.display()))?;
-    let pol = game_dir.join(POL_VIEWER_EXE);
-    if !pol.is_file() {
-        return Err(format!(
-            "{} not found; this install has no PlayOnline Viewer (HorizonXI and other \
-             private-server trees ship without it and are patched by their own launchers)",
-            pol.display()
-        ));
-    }
-    if !cfg!(target_os = "windows") {
-        require_tool("wine").map_err(|_| {
-            "wine not found — PlayOnline Viewer is a Windows executable. Install Wine and \
-             re-run, or launch PlayOnlineViewer/pol.exe yourself."
-                .to_string()
-        })?;
-    }
-    register_install(game_dir, &root)?;
-    println!(
-        "Launching {}.\nIn the viewer choose FINAL FANTASY XI -> Check Files / Update and let it \
-         finish (no account is needed for the update step), then quit.",
-        pol.display()
-    );
-    let mut cmd = if cfg!(target_os = "windows") {
-        Command::new(&pol)
-    } else {
-        let mut c = Command::new("wine");
-        c.arg(&pol);
-        c
-    };
-    cmd.current_dir(pol.parent().unwrap_or(game_dir));
-    let status = cmd
-        .status()
-        .map_err(|e| format!("launching PlayOnline Viewer: {e}"))?;
-    if !status.success() {
-        return Err(format!("PlayOnline Viewer exited with {status}"));
+/// Patch an install to the current retail version by speaking the
+/// PlayOnline patch protocol directly (`ffxi_install::update`); nothing of
+/// SE's viewer runs.
+fn update_install(root: &Path, force: bool) -> Result<(), String> {
+    let options = ffxi_install::update::Options { force };
+    match ffxi_install::update::run(root, options, &print_progress)? {
+        None => println!("already at the server's version; pass --force to re-verify every file"),
+        Some(outcome) => println!(
+            "now at {} ({} file(s) fetched, {} MB)",
+            outcome.version,
+            outcome.fetched,
+            outcome.bytes / 1_000_000
+        ),
     }
     println!(
-        "PlayOnline Viewer exited. If it reported 'Cannot open registry key for install path' \
-         (ID=1000), this tree is not registered with Windows/Wine: only SE's installer writes \
-         those keys, and HorizonXI ships DONTTOUCH_Registry.exe for its own tree.\n\
-         Identify the patched build with:\n  \
+        "Identify the patched build with:\n  \
          cargo run -p ffxi-dat --example dat-client-profile -- \"{}\"",
         root.display()
-    );
-    Ok(())
-}
-
-/// The registry state SE's installer leaves behind and PlayOnline Viewer
-/// refuses to run without (its ID=1000 error is the missing viewer entry).
-/// Mirrors the `Switch_Horizon.bat` HorizonXI ships for the same purpose:
-/// `InstallFolder` values 0001 (FFXI), 0002 (TetraMaster), 1000 (the viewer),
-/// `Interface\0001 = "0"`, plus COM registration of the three FFXi DLLs.
-const POL_INSTALL_FOLDER_KEY: &str = "HKLM\\SOFTWARE\\PlayOnlineUS\\InstallFolder";
-const POL_INTERFACE_KEY: &str = "HKLM\\SOFTWARE\\PlayOnlineUS\\Interface";
-const POL_REGSVR_DLLS: [&str; 3] = ["FFXi.dll", "FFXiMain.dll", "FFXiVersions.dll"];
-
-fn windows_command(program: &str) -> Command {
-    if cfg!(target_os = "windows") {
-        Command::new(program)
-    } else {
-        let mut c = Command::new("wine");
-        c.arg(program);
-        c
-    }
-}
-
-/// A host path as the Windows side sees it (`winepath -w` under Wine).
-fn windows_path(p: &Path) -> Result<String, String> {
-    if cfg!(target_os = "windows") {
-        return Ok(p.display().to_string());
-    }
-    let out = Command::new("winepath")
-        .arg("-w")
-        .arg(p)
-        .output()
-        .map_err(|e| format!("running winepath: {e}"))?;
-    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if !out.status.success() || s.is_empty() {
-        return Err(format!("winepath -w failed for {}", p.display()));
-    }
-    Ok(s)
-}
-
-fn quiet(cmd: &mut Command) -> Result<(), String> {
-    let status = cmd
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map_err(|e| format!("{cmd:?}: {e}"))?;
-    if !status.success() {
-        return Err(format!("{cmd:?} exited with {status}"));
-    }
-    Ok(())
-}
-
-fn register_install(se_dir: &Path, ffxi_root: &Path) -> Result<(), String> {
-    let entries = [
-        (POL_INSTALL_FOLDER_KEY, "0001", windows_path(ffxi_root)?),
-        (
-            POL_INSTALL_FOLDER_KEY,
-            "0002",
-            windows_path(&se_dir.join("TetraMaster"))?,
-        ),
-        (
-            POL_INSTALL_FOLDER_KEY,
-            "1000",
-            windows_path(&se_dir.join("PlayOnlineViewer"))?,
-        ),
-        (POL_INTERFACE_KEY, "0001", "0".to_string()),
-    ];
-    for (key, name, value) in &entries {
-        quiet(windows_command("reg").args(["add", key, "/v", name, "/d", value, "/f"]))?;
-    }
-    for dll in POL_REGSVR_DLLS {
-        let path = ffxi_root.join(dll);
-        if path.is_file() {
-            quiet(
-                windows_command("regsvr32")
-                    .arg("/s")
-                    .arg(windows_path(&path)?),
-            )?;
-        }
-    }
-    println!(
-        "Registered {} under {POL_INSTALL_FOLDER_KEY}",
-        show(ffxi_root)
     );
     Ok(())
 }
@@ -752,7 +635,85 @@ fn print_progress(p: ffxi_install::Progress) {
         Finished { files, target_root } => {
             println!("unpacked {files} file(s) into {}", target_root.display())
         }
+        UpdateVersion {
+            local,
+            server,
+            release_unix,
+        } => println!(
+            "server version {server} (released {}); local {}",
+            unix_date(release_unix),
+            local.as_deref().unwrap_or("unversioned")
+        ),
+        UpdateScanning { done, total } => println!("checking local files: {done}/{total}"),
+        UpdatePlanned {
+            files,
+            current,
+            to_fetch,
+            bytes,
+        } => println!(
+            "{files} file(s) in manifest: {current} current, {to_fetch} to fetch ({} MB)",
+            bytes / 1_000_000
+        ),
+        UpdateFile {
+            index,
+            count,
+            path,
+            bytes,
+        } => println!("[{}/{count}] {path} ({bytes} bytes)", index + 1),
+        UpdateBytes { done, total } => {
+            print!("\r  {} / {} MB", done / 1_000_000, total / 1_000_000);
+            std::io::stdout().flush().ok();
+        }
+        UpdateFinished {
+            version,
+            fetched,
+            bytes,
+            root,
+        } => println!(
+            "\nupdated {} to {version}: {fetched} file(s), {} MB",
+            root.display(),
+            bytes / 1_000_000
+        ),
     }
+}
+
+fn unix_date(secs: u32) -> String {
+    const DAY: u64 = 86_400;
+    let days = secs as u64 / DAY;
+    let (mut y, mut rem) = (1970u64, days);
+    loop {
+        let len = if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 {
+            366
+        } else {
+            365
+        };
+        if rem < len {
+            break;
+        }
+        rem -= len;
+        y += 1;
+    }
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let months = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    let mut m = 0;
+    while rem >= months[m] {
+        rem -= months[m];
+        m += 1;
+    }
+    format!("{y}-{:02}-{:02}", m + 1, rem + 1)
 }
 
 fn confirm(prompt: &str) -> Result<bool, String> {

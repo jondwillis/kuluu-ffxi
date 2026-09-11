@@ -7,6 +7,12 @@
 //! staged members under `SquareEnix/`. Progress goes to a caller-supplied
 //! sink so a CLI and the launcher UI render the same events.
 
+pub mod lz;
+pub mod manifest;
+pub mod patch_client;
+pub mod polp;
+pub mod update;
+
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
@@ -74,6 +80,37 @@ pub enum Progress {
     Finished {
         files: usize,
         target_root: PathBuf,
+    },
+    UpdateVersion {
+        local: Option<String>,
+        server: String,
+        release_unix: u32,
+    },
+    UpdateScanning {
+        done: usize,
+        total: usize,
+    },
+    UpdatePlanned {
+        files: usize,
+        current: usize,
+        to_fetch: usize,
+        bytes: u64,
+    },
+    UpdateFile {
+        index: usize,
+        count: usize,
+        path: String,
+        bytes: u64,
+    },
+    UpdateBytes {
+        done: u64,
+        total: u64,
+    },
+    UpdateFinished {
+        version: String,
+        fetched: usize,
+        bytes: u64,
+        root: PathBuf,
     },
 }
 
