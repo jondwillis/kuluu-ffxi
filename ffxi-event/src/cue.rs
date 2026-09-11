@@ -84,7 +84,7 @@ pub const SCHEDULER_TAG_FADE_IN: FourCc = *b"fdi0";
 pub const SCHEDULER_DURATION_FROM_DAT: u16 = 0;
 
 /// `GameStatus` values opcode 0x7E writes to the target's `StatusEvent`
-/// (research/XIClient .../World/Actor/GameStatus.h; the case-to-value mapping is
+/// (research/XIClient/src/XIClient/include/World/Actor/GameStatus.h; the case-to-value mapping is
 /// research/XiEvents/OpCodes/0x007E.md).
 pub const STATUS_EVENT_IDLE: u8 = 0;
 pub const STATUS_EVENT_CHOCOBO: u8 = 5;
@@ -148,6 +148,56 @@ pub enum EventCue {
         status_event: u8,
         mount_id: Option<u16>,
     },
+}
+
+impl EventCue {
+    pub(crate) fn resolve_event_actor(self, actor: ActorLookup) -> Self {
+        let resolve = |target: ActorLookup| {
+            if target.is_event_entity() {
+                actor
+            } else {
+                target
+            }
+        };
+        match self {
+            Self::ActorMotion {
+                actor1,
+                actor2,
+                key,
+            } => Self::ActorMotion {
+                actor1: resolve(actor1),
+                actor2: resolve(actor2),
+                key,
+            },
+            Self::Scheduler {
+                dat_id,
+                actor1,
+                actor2,
+                tag,
+                duration,
+            } => Self::Scheduler {
+                dat_id,
+                actor1: resolve(actor1),
+                actor2: resolve(actor2),
+                tag,
+                duration,
+            },
+            Self::ActorHide { target, hide } => Self::ActorHide {
+                target: resolve(target),
+                hide,
+            },
+            Self::Mount {
+                target,
+                status_event,
+                mount_id,
+            } => Self::Mount {
+                target: resolve(target),
+                status_event,
+                mount_id,
+            },
+            other => other,
+        }
+    }
 }
 
 #[cfg(test)]

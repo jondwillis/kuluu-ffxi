@@ -52,14 +52,14 @@ impl CharStatus {
     /// @0x30..0x34, Flags2 @0x34 — the "Flags3 starts at 0x38" comment there is
     /// struct-relative. Retail's 0x037.h static_asserts the same word at body
     /// 0x30 (`MoreFlags`) and its handler reads `AUDIT_1FF = MoreFlags.dummy & 0xFF`
-    /// (research/XIClient .../Game/Net/Packets/s2c/0x037.cpp).
+    /// (research/XIClient/src/XIClient/source/Game/Net/Packets/s2c/0x037.cpp).
     pub(crate) const FLAGS2_OFFSET: usize = 0x30;
     /// `BallistaFlg`'s position inside the Flags2 word (bits 21..28),
     /// char_status.cpp `flags2_t`.
     pub(crate) const BALLISTA_FLG_SHIFT: u32 = 21;
     pub(crate) const BALLISTA_FLG_MASK: u32 = 0xFF;
     /// `field_57`, the byte the disassembly's own struct puts right before
-    /// `Field58Flags` (research/XIClient .../Game/Net/Packets/s2c/0x037.h
+    /// `Field58Flags` (research/XIClient/src/XIClient/include/Game/Net/Packets/s2c/0x037.h
     /// static_asserts), which LSB fills from the mount effect's power.
     pub(crate) const MOUNT_ID_OFFSET: usize = 0x57;
     pub(crate) const SPEED_MASK: u16 = 0x0FFF;
@@ -132,7 +132,7 @@ const _: () = assert!(CharStatus::FLAGS2_OFFSET + 4 <= CharStatus::MIN_LEN);
 /// AGI, INT, MND, CHR in order; `bp_adj` is the signed gear/buff delta retail shows
 /// as the "+N" beside each stat. `def_elem` is Fire, Ice, Wind, Earth, Lightning,
 /// Water, Light, Dark. The struct declares `atk`/`def` as int16_t, but they are
-/// sourced from the non-negative ATT()/DEF() (.cpp:63-64), so we read them as u16.
+/// sourced from the non-negative ATT()/DEF() calls in the packer, so we read them as u16.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CliStatus {
     pub hp_max: u32,
@@ -195,7 +195,7 @@ impl CliStatus {
 
 /// s2c 0x01B GP_SERV_COMMAND_JOB_INFO — per-job levels + unlocked-jobs bitmask for
 /// the self character. Body offsets follow the GP_MYROOM_DANCER struct in
-/// vendor/server/src/map/packets/s2c/0x01b_job_info.h GP_MYROOM_DANCER (filled in .cpp:30-57).
+/// vendor/server/src/map/packets/s2c/0x01b_job_info.h GP_MYROOM_DANCER (filled in 0x01b_job_info.cpp).
 /// `job_levels` reads `job_lev2` (the full `jobs.job[24]` memcpy, index = JOBTYPE);
 /// the legacy `job_lev[16]` @0x0C truncates at 16 jobs and is skipped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -7,7 +7,9 @@ use bevy::prelude::*;
 use bevy::ui::{ComputedNode, Overflow, ScrollPosition};
 use bevy::ui_widgets::{Activate, ControlOrientation, Scrollbar, ScrollbarThumb};
 
-use kuluu_render::{GraphicsField, GraphicsSettings, DLSS_CONFIG_FIELDS, GRAPHICS_FIELDS};
+use kuluu_render::{
+    GraphicsField, GraphicsSettings, CONFIG_FIELDS, DLSS_CONFIG_FIELDS, GRAPHICS_FIELDS,
+};
 
 use super::common::{
     hint, panel_node_capped, row, screen_root, spawn_breadcrumb, title, Crumb, ScrollRegion,
@@ -569,6 +571,42 @@ pub(super) fn update_scrollbar_visibility(
             node.display = want;
         }
     }
+}
+
+pub(super) fn spawn_config_ui(
+    mut commands: Commands,
+    settings: Res<GraphicsSettings>,
+    server: Res<ServerInfo>,
+) {
+    commands
+        .spawn((GraphicsRoot, screen_root()))
+        .with_children(|root| {
+            spawn_breadcrumb(root, &server, &[Crumb::Other("Config".to_string())]);
+            root.spawn(panel_node_capped(PANEL_WIDTH, Val::Vh(PANEL_MAX_VH)))
+                .with_children(|panel| {
+                    panel.spawn(title("Config"));
+                    panel.spawn(hint(
+                        "Interface preferences. Changes are saved automatically.",
+                    ));
+                    for &field in CONFIG_FIELDS {
+                        spawn_field_row(panel, field, &settings, RowGroup::Main, false, false);
+                    }
+                    panel
+                        .spawn(button_bundle(
+                            ButtonBundleProps {
+                                variant: ButtonVariant::Primary,
+                                ..default()
+                            },
+                            (),
+                            Spawn((Text::new("Back"), ThemedText)),
+                        ))
+                        .observe(
+                            |_ev: On<Activate>, mut next: ResMut<NextState<LauncherState>>| {
+                                next.set(LauncherState::ServerSelect);
+                            },
+                        );
+                });
+        });
 }
 
 pub(super) fn despawn_ui(mut commands: Commands, q: Query<Entity, With<GraphicsRoot>>) {

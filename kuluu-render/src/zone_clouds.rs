@@ -518,6 +518,7 @@ fn drive_zone_clouds(
     time: Res<Time>,
     vana_clock: Res<crate::vana_time::VanaClock>,
     mut materials: ResMut<Assets<FfxiZoneMaterial>>,
+    mut touched: ResMut<crate::ffxi_zone_material::ZoneMaterialTouched>,
     mut commands: Commands,
     mut state: ResMut<ZoneCloudState>,
     cam_q: Query<&Transform, (With<crate::camera::OperatorCamera>, Without<CloudLayer>)>,
@@ -556,6 +557,7 @@ fn drive_zone_clouds(
             // TextureCoordinateUpdater integrates UV velocity over elapsed frames.
             let uv = layer.uv_scroll * frames;
             material.uv_offset = Vec4::new(uv.x, uv.y, 0.0, 0.0);
+            touched.mark(mat.0.id());
         }
     }
 }

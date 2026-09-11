@@ -1,3 +1,6 @@
+#![deny(unused_must_use)]
+
+pub(crate) mod event_transport;
 use anyhow::{anyhow, Context, Result};
 use ffxi_proto::{decode, framing};
 use tokio::sync::{broadcast, mpsc};
@@ -398,7 +401,7 @@ async fn run_map_session(
     let mut mog = SelfMogState::default();
 
     let mut flood_zone_messages: Vec<(u16, Vec<u8>)> = Vec::new();
-    drain_zone_flood(
+    let self_login_received = drain_zone_flood(
         map,
         flood_deadline,
         false,
@@ -435,15 +438,11 @@ async fn run_map_session(
         self_pos_seeded,
         "zone-in flood drained"
     );
-    if !self_pos_seeded {
-        tracing::warn!(
-            iteration,
-            current_zone_id,
-            "zone-in flood ended without a self-position seed (no 0x00A LOGIN \
-             for self before deadline) — outbound POS suppressed until a \
-             CHAR_PC for self lands"
-        );
-    }
+    // vendor/server/src/map/packets/c2s/0x00a_login.cpp GP_CLI_COMMAND_LOGIN::process.
+    anyhow::ensure!(
+        self_login_received && self_pos_seeded,
+        "map bootstrap failed: required self LOGIN/position missing (login={self_login_received}, position={self_pos_seeded}, received_subpackets={total_subs}, server_sync={server_last_seq})"
+    );
 
     let mut sub_seq: u16 = map_client::BOOTSTRAP_SUB_SYNC.wrapping_add(1);
 
@@ -605,17 +604,17 @@ async fn run_map_session(
 /// vendor/server/scripts/zones/Attohwa_Chasm/Zone.lua).
 const FLOOD_ZONE_MESSAGE_MAX: usize = 32;
 
-/// Whether the zone-in flood drain should stop on an idle recv window. Unconditional
-/// when `break_on_idle` (the short post-send quiescence drains), otherwise only once
-/// the self position seed has landed — so the pre-GAMEOK drain keeps reading until it
-/// holds our authoritative spawn before letting the next c2s fire.
-fn should_break_flood(break_on_idle: bool, self_pos_seeded: bool) -> bool {
-    break_on_idle || self_pos_seeded
+fn should_break_flood(
+    break_on_idle: bool,
+    self_pos_seeded: bool,
+    self_login_received: bool,
+) -> bool {
+    break_on_idle || (self_pos_seeded && self_login_received)
 }
 
 /// Drains and processes zone-in traffic until `deadline`, or earlier once the
 /// socket has been idle for one recv window: unconditionally when
-/// `break_on_idle`, otherwise only after the self position seed has landed.
+/// `break_on_idle`, otherwise only after self LOGIN and its position have landed.
 /// When `ack_at_send` is Some (post-send quiescence), also breaks as soon as a
 /// datagram stamped differently from that ack arrives — the server's id only
 /// advances when it accepts one of our c2s, so any post-acceptance stamp is
@@ -654,7 +653,8 @@ async fn drain_zone_flood(
     mog: &mut SelfMogState,
     zoneline_spawn_fallback: Option<Vec3>,
     flood_zone_messages: &mut Vec<(u16, Vec<u8>)>,
-) {
+) -> bool {
+    let mut self_login_received = false;
     while std::time::Instant::now() < deadline {
         match tokio::time::timeout(std::time::Duration::from_millis(500), map.recv_decrypted())
             .await
@@ -674,6 +674,10 @@ async fn drain_zone_flood(
                             );
                         }
                         continue;
+                    }
+                    if sub.opcode == ffxi_proto::map::s2c::LOGIN {
+                        self_login_received |= decode::ServerLogin::decode(sub.data)
+                            .is_ok_and(|login| login.unique_no == self_char_id);
                     }
                     handle_sub_packet(
                         &sub,
@@ -713,12 +717,13 @@ async fn drain_zone_flood(
             Ok(Err(_)) => break,
 
             Err(_) => {
-                if should_break_flood(break_on_idle, *self_pos_seeded) {
+                if should_break_flood(break_on_idle, *self_pos_seeded, self_login_received) {
                     break;
                 }
             }
         }
     }
+    self_login_received
 }
 
 fn classify_char_npc(
@@ -730,7 +735,7 @@ fn classify_char_npc(
     let dynamic_targid = (0x700..=0x8FF).contains(&act_index);
     match look_size {
         // Standard monster meshes split mob/NPC the same way the retail client
-        // does: Flags1.MonsterFlag (see research/XiPackets .../0x000E). LSB has
+        // does: Flags1.MonsterFlag (see research/XiPackets/world/server/0x000E). LSB has
         // no literal flag — vendor/server/src/map/packets/entity_update.cpp writes
         // the STATUS_TYPE enum into that byte, so the bit reads set for mobs
         // (allegiance MOB spawn as STATUS_TYPE::UPDATE) and clear for NPCs
@@ -783,14 +788,8 @@ fn first_decode_err(opcode: u16) -> bool {
         .unwrap_or(true)
 }
 
-/// Gated special-pose wire diagnostics (`KULUU_SPECIAL_LOG=1`, same switch as the render-side
-/// state log): raw status/sub observations for every CHAR_NPC update that could drive a
-/// special-pose transition. Off by default; read once.
 fn special_wire_log_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        matches!(std::env::var("KULUU_SPECIAL_LOG").as_deref(), Ok(v) if !v.is_empty() && v != "0")
-    })
+    tracing::enabled!(target: "special", tracing::Level::DEBUG)
 }
 
 fn handle_sub_packet(
@@ -891,6 +890,17 @@ fn handle_sub_packet(
                     myroom: mog.myroom,
                     mog_zone_flag: mog.mog_zone_flag,
                 });
+
+                if let Some(v) = login.voyage {
+                    let _ = event_tx.send(AgentEvent::VoyageSynced {
+                        voyage: kuluu_snapshot::Voyage {
+                            start: v.start,
+                            duration: v.duration,
+                            reverse: v.reverse,
+                            route: v.route,
+                        },
+                    });
+                }
 
                 // After ZoneChanged, which clears it: the renderer's sub-area
                 // latch seeds from this so a character who logged out inside a
@@ -1203,7 +1213,7 @@ fn handle_sub_packet(
                 }
                 .unwrap_or(0);
 
-                // Special-pose wire probe (KULUU_SPECIAL_LOG=1): raw status/sub for every update
+                // Special-pose wire probe (RUST_LOG=special=debug): raw status/sub for every update
                 // that could drive a transition: sub set while visible, buried ticks (status
                 // INVISIBLE), resurface/settle. Answers "what does the server actually send?"
                 if op == s2c::CHAR_NPC
@@ -1213,8 +1223,10 @@ fn handle_sub_packet(
                     if let Some(ns) = decode::NpcState::decode_char_npc(sub.data) {
                         // 0x04 is the spawn flag LSB ORs into animationsub (see NpcState docs);
                         // stripping it leaves a nonzero selector exactly when the sub byte names
-                        // a routine (sub 5 wraps to ini1, FFXiMain.dll F37/F47).
-                        if ns.status == 3 || (ns.animationsub & !0b100) != 0 {
+                        // a routine (sub 5 wraps to ini1, FFXiMain.dll).
+                        if ns.status == 3
+                            || (ns.animationsub & !decode::NpcState::ANIMATIONSUB_SPAWN_FLAG) != 0
+                        {
                             tracing::info!(
                                 target: "special",
                                 id = head.unique_no,
@@ -1362,10 +1374,8 @@ fn handle_sub_packet(
         }
         s2c::SHOP_OPEN => {}
         s2c::BATTLE2 => {
-            if combat_log_enabled() {
-                battle2_debug_dump(sub.data);
-            }
             if let Some(h) = decode_battle2_header(sub.data) {
+                tracing::debug!(target: "combat", header = ?h, "BATTLE2");
                 let _ = event_tx.send(AgentEvent::ActionStarted {
                     actor_id: h.actor_id,
                     action_id: h.action_id,
@@ -1373,10 +1383,7 @@ fn handle_sub_packet(
                     target_id: h.primary_target_id,
                     result: h.first_result,
                     animation: h.animation,
-                    info: h.first_info,
-                    hit_distortion: h.first_hit_distortion,
-                    knockback: h.first_knockback,
-                    kind: h.first_kind,
+                    outcome: h.first_outcome,
                 });
             }
             for line in decode_battle2_action(sub.data, name_cache, kind_cache) {
@@ -2522,9 +2529,12 @@ async fn keepalive_loop(
                         // EndPara; the server script decides what it means
                         // (OnEventFinish result, vendor/server/src/map/packets/
                         // c2s/0x05b_eventend.cpp GP_CLI_COMMAND_EVENTEND::process).
-                        } else if let Some((u, a, n)) = dialog_session.active_end() {
-                            let advance = dialog_session.cancel();
-                            for cue in dialog_session.take_cues() {
+                        } else if let Some(step) = event_transport::prepare(
+                                &mut dialog_session, event_transport::Drive::Cancel, current_zone_id,
+                                &mut pending_event_end, &mut sub_seq, &mut self_pos, &event_tx,
+                            ) {
+                            let (advance, cues) = step.send(map, server_last_seq).await?;
+                            for cue in cues {
                                 cutscene.push(cue, &event_tx);
                             }
                             match advance {
@@ -2532,14 +2542,7 @@ async fn keepalive_loop(
                                     emit_event_speech_to_chat(&event_tx, &dialog);
                                     let _ = event_tx.send(AgentEvent::EventDialog { dialog });
                                 }
-                                crate::event_dialog::Advance::Ended { end_para } => {
-                                    if take_pending_event_end(&mut pending_event_end, u, n) {
-                                        let payload = build_subpacket_event_end(sub_seq, u, a, current_zone_id, n, end_para);
-                                        sub_seq = sub_seq.wrapping_add(1);
-                                        if let Err(e) = map.send_encrypted(&payload, datagram_header_id(sub_seq), server_last_seq).await {
-                                            tracing::warn!(error = %e, "EVENT_END (vm) send failed");
-                                        }
-                                    }
+                                crate::event_dialog::Advance::Ended { .. } => {
                                     cutscene.end(crate::event_dialog::EventSessionExit::Cancelled, &event_tx);
                                     let _ = event_tx.send(AgentEvent::EventEnded);
                                 }
@@ -2693,9 +2696,12 @@ async fn keepalive_loop(
                             }
                         // VM-driven event: feed the selection to the script and
                         // advance; only send EVENT_END once it ends.
-                        } else if let Some((u, a, n)) = dialog_session.active_end() {
-                            let advance = dialog_session.advance(Some(choice));
-                            for cue in dialog_session.take_cues() {
+                        } else if let Some(step) = event_transport::prepare(
+                                &mut dialog_session, event_transport::Drive::Choice(choice), current_zone_id,
+                                &mut pending_event_end, &mut sub_seq, &mut self_pos, &event_tx,
+                            ) {
+                            let (advance, cues) = step.send(map, server_last_seq).await?;
+                            for cue in cues {
                                 cutscene.push(cue, &event_tx);
                             }
                             match advance {
@@ -2703,14 +2709,7 @@ async fn keepalive_loop(
                                     emit_event_speech_to_chat(&event_tx, &dialog);
                                     let _ = event_tx.send(AgentEvent::EventDialog { dialog });
                                 }
-                                crate::event_dialog::Advance::Ended { end_para } => {
-                                    if take_pending_event_end(&mut pending_event_end, u, n) {
-                                        let payload = build_subpacket_event_end(sub_seq, u, a, current_zone_id, n, end_para);
-                                        sub_seq = sub_seq.wrapping_add(1);
-                                        if let Err(e) = map.send_encrypted(&payload, datagram_header_id(sub_seq), server_last_seq).await {
-                                            tracing::warn!(error = %e, "EVENT_END (vm choice) send failed");
-                                        }
-                                    }
+                                crate::event_dialog::Advance::Ended { .. } => {
                                     cutscene.end(crate::event_dialog::EventSessionExit::ScriptEnded, &event_tx);
                                     let _ = event_tx.send(AgentEvent::EventEnded);
                                 }
@@ -3833,9 +3832,12 @@ async fn keepalive_loop(
                 // Carry a scene holding on a timed wait (0x1C/0x6F). Without
                 // this the VM runs a cutscene to its end in the tick the player
                 // answers, and every cue lands on one frame.
-                if let Some((u, a, n)) = dialog_session.active_end() {
-                    let advance = dialog_session.tick(SESSION_TICK_PERIOD.as_secs_f32());
-                    for cue in dialog_session.take_cues() {
+                if let Some(step) = event_transport::prepare(
+                        &mut dialog_session, event_transport::Drive::Tick(SESSION_TICK_PERIOD.as_secs_f32()), current_zone_id,
+                        &mut pending_event_end, &mut sub_seq, &mut self_pos, &event_tx,
+                    ) {
+                    let (advance, cues) = step.send(map, server_last_seq).await?;
+                    for cue in cues {
                         cutscene.push(cue, &event_tx);
                     }
                     match advance {
@@ -3843,14 +3845,7 @@ async fn keepalive_loop(
                             emit_event_speech_to_chat(&event_tx, &dialog);
                             let _ = event_tx.send(AgentEvent::EventDialog { dialog });
                         }
-                        crate::event_dialog::Advance::Ended { end_para } => {
-                            if take_pending_event_end(&mut pending_event_end, u, n) {
-                                let payload = build_subpacket_event_end(sub_seq, u, a, current_zone_id, n, end_para);
-                                sub_seq = sub_seq.wrapping_add(1);
-                                if let Err(e) = map.send_encrypted(&payload, datagram_header_id(sub_seq), server_last_seq).await {
-                                    tracing::warn!(error = %e, "EVENT_END (vm wait) send failed");
-                                }
-                            }
+                        crate::event_dialog::Advance::Ended { .. } => {
                             cutscene.end(crate::event_dialog::EventSessionExit::ScriptEnded, &event_tx);
                             let _ = event_tx.send(AgentEvent::EventEnded);
                         }
@@ -3939,7 +3934,8 @@ async fn keepalive_loop(
                     let dz = self_pos.pos.z - anchor.z;
                     (dx * dx + dy * dy + dz * dz).sqrt()
                 });
-                let walked_away = should_release_on_walkaway(user_driven_events, walk_dist);
+                let walked_away = !dialog_session.controls_player_position()
+                    && should_release_on_walkaway(user_driven_events, walk_dist);
 
                 let mut payload = Vec::new();
 
@@ -3955,6 +3951,7 @@ async fn keepalive_loop(
 
                 if zone_transition_sent {
                     if let Some(ev) = mog.zone_in_event.take() {
+                        dialog_session.set_player_position(event_transport::event_position(self_pos));
                         begin_server_event(
                             &mut dialog_session,
                             EventTrigger {
@@ -4339,6 +4336,7 @@ async fn keepalive_loop(
                                                 .lookup(unique_no)
                                                 .map(|s| s.replace('_', " "))
                                         });
+                                    dialog_session.set_player_position(event_transport::event_position(self_pos));
                                     begin_server_event(
                                         &mut dialog_session,
                                         trigger,
@@ -4351,12 +4349,7 @@ async fn keepalive_loop(
                                 }
                             }
 
-                            if sub.opcode == ffxi_proto::map::s2c::EVENTUCOFF
-                                && eventucoff_mode_of(sub.data)
-                                    == Some(ffxi_proto::map::eventucoff_mode::CANCEL_EVENT)
-                            {
-                                dialog_session.clear();
-                            }
+                            event_transport::receive(&mut dialog_session, &sub, self_char_id, self_pos);
 
                             // Keep the LOC_INVENTORY mirror for the delivery-box
                             // item picker current (category 0; index 0 is Gil).
@@ -5008,6 +5001,7 @@ impl<'a> BattleBitReader<'a> {
 // resultCount(4). Only the first target is read: walking the rest requires re-walking the
 // variable-length result blocks, and XIM likewise attaches to `context.primaryTargetId`
 // (ParticleGeneratorAttachment.kt updateAssociatedPosition sourceActor).
+#[derive(Debug, Clone, Copy)]
 pub struct Battle2Header {
     pub actor_id: u32,
     pub action_id: u32,
@@ -5028,62 +5022,9 @@ pub struct Battle2Header {
     // is what the client resolves against its file table rather than the action id.
     pub animation: Option<u16>,
 
-    // vendor/server/src/map/packets/s2c/0x028_battle2.cpp GP_SERV_COMMAND_BATTLE2::pack - the first
-    // result block's outcome bits, read for EVERY category
-    // (unlike `first_result`, which is gated to basic attacks): info(5) carries Defeated /
-    // CriticalHit (enums/action/info.h), hitDistortion(2) and knockback(3) drive the victim's
-    // reaction choice. Zero when no result block was read.
-    pub first_info: u8,
-    pub first_hit_distortion: u8,
-    pub first_knockback: u8,
-    pub first_kind: u8,
-}
-
-// KULUU_COMBAT_LOG=1 - ground-truth trace of BATTLE2 packets for the kuluu-df9t patch-7 live
-// check: re-reads the header bits independently (same order as vendor/server/src/map/packets/
-// s2c/0x028_battle2.cpp) so "the packet carries no result block" is distinguishable from
-// "our parser dropped it". Read-only; no behaviour change.
-fn combat_log_enabled() -> bool {
-    static ONCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ONCE.get_or_init(|| {
-        matches!(
-            std::env::var("KULUU_COMBAT_LOG").as_deref(),
-            Ok(v) if !v.is_empty() && v != "0"
-        )
-    })
-}
-
-fn battle2_debug_dump(data: &[u8]) {
-    let mut br = BattleBitReader::new(data, 8);
-    let actor_id = br.read(32).map(|v| v as u32);
-    let trg_sum = br.read(6);
-    let _res_sum = br.read(4);
-    let kind = br.read(4);
-    let action_id = br.read(32).map(|v| v as u32);
-    let _info = br.read(32);
-    let target = br.read(32).map(|v| v as u32);
-    let nres = br.read(4);
-    let first = (nres.unwrap_or(0) > 0).then(|| {
-        (
-            br.read(3),  // resolution
-            br.read(2),  // kind
-            br.read(12), // animation
-            br.read(5),  // info
-            br.read(2),  // hitDistortion
-            br.read(3),  // knockback
-        )
-    });
-    println!(
-        "COMBAT_B2 len={} actor={:?} trg_sum={:?} kind={:?} actid={:?} target={:?} nres={:?} first=(res,kind,anim,info,dist,kb)={:?}",
-        data.len(),
-        actor_id,
-        trg_sum,
-        kind,
-        action_id,
-        target,
-        nres,
-        first
-    );
+    // The first result block's outcome bits, read for every category (unlike `first_result`,
+    // which is gated to basic attacks). Absent when no result block was read.
+    pub first_outcome: Option<ffxi_proto::melee::ResultOutcome>,
 }
 
 pub fn decode_battle2_header(data: &[u8]) -> Option<Battle2Header> {
@@ -5100,49 +5041,34 @@ pub fn decode_battle2_header(data: &[u8]) -> Option<Battle2Header> {
     let primary_target_id = br.read(32).filter(|_| trg_sum > 0).map(|id| id as u32);
     // vendor/server/src/map/packets/s2c/0x028_battle2.cpp GP_SERV_COMMAND_BATTLE2::pack -
     // resolution(3), kind(2), animation(12), info(5), hitDistortion(2), knockback(3) in LSB write
-    // order. The old reader stopped after `animation`; the chat path lumped the last two into one
-    // 5-bit "scale" - split them (finding F58).
+    // order.
     let first = primary_target_id
         .and_then(|_| br.read(4))
         .filter(|count| *count > 0)
         .and_then(|_| {
             let resolution = br.read(3)? as u8;
-            let kind = br.read(2)? as u8;
+            let _kind = br.read(2)?;
             let animation = br.read(12)? as u16;
             let info = br.read(5)? as u8;
             let hit_distortion = br.read(2)? as u8;
             let knockback = br.read(3)? as u8;
-            Some((resolution, kind, animation, info, hit_distortion, knockback))
+            let outcome =
+                ffxi_proto::melee::ResultOutcome::from_wire(info, hit_distortion, knockback);
+            Some((resolution, animation, outcome))
         });
     let first_result = first
         .filter(|_| action_kind == ffxi_proto::melee::CATEGORY_BASIC_ATTACK)
-        .and_then(
-            |(resolution, kind, animation, info, hit_distortion, knockback)| {
-                ffxi_proto::melee::MeleeResult::from_wire(
-                    resolution,
-                    animation,
-                    info,
-                    hit_distortion,
-                    knockback,
-                    kind,
-                )
-            },
-        );
+        .and_then(|(resolution, animation, _)| {
+            ffxi_proto::melee::MeleeResult::from_wire(resolution, animation)
+        });
     Some(Battle2Header {
         actor_id,
         action_id,
         action_kind,
         primary_target_id,
         first_result,
-        animation: first.map(|(_, _, animation, ..)| animation),
-        first_info: first.map(|(_, _, _, info, ..)| info).unwrap_or(0),
-        first_hit_distortion: first
-            .map(|(_, _, _, _, hit_distortion, ..)| hit_distortion)
-            .unwrap_or(0),
-        first_knockback: first
-            .map(|(_, _, _, _, _, knockback)| knockback)
-            .unwrap_or(0),
-        first_kind: first.map(|(_, kind, ..)| kind).unwrap_or(0),
+        animation: first.map(|(_, animation, _)| animation),
+        first_outcome: first.map(|(_, _, outcome)| outcome),
     })
 }
 
@@ -6460,7 +6386,7 @@ fn face_target_for(target_index: u16, self_act_index: Option<u16>) -> u16 {
 
 /// Also the resolution a cutscene's timed waits are served at, so it bounds how
 /// far a fade can overrun its authored duration.
-const SESSION_TICK_PERIOD: std::time::Duration = std::time::Duration::from_millis(100);
+pub const SESSION_TICK_PERIOD: std::time::Duration = std::time::Duration::from_millis(100);
 
 const MOVE_EMISSION_PERIOD: std::time::Duration = std::time::Duration::from_millis(100);
 
@@ -6564,10 +6490,8 @@ struct EventEndFlush {
 ///
 /// The drained 0x05B ends the event server-side, so only the walk-away path —
 /// where the player abandoned the frame — clears the VM session that owns it.
-/// Every other path (notably `!user_driven`: agent_io, agent_socket, kuluu-mcp,
-/// headless) keeps the session alive so the consumer can still walk the dialog
-/// tree locally; [`take_pending_event_end`] is what stops that walk from
-/// sending a second EVENT_END.
+/// A live VM retains the server event until its script finishes, including in
+/// headless sessions; EVENTENDXZY validation requires that event to remain active.
 fn flush_pending_event_end(
     inputs: EventEndFlushInputs,
     pending_event_end: &mut Vec<(u32, u16, u16)>,
@@ -6577,7 +6501,7 @@ fn flush_pending_event_end(
 ) -> Option<EventEndFlush> {
     let dialog_open = active_dialog.is_some();
     let flush =
-        !inputs.user_driven || inputs.walked_away || (inputs.watchdog_fires && !dialog_open);
+        inputs.walked_away || ((!inputs.user_driven || inputs.watchdog_fires) && !dialog_open);
     if !flush || pending_event_end.is_empty() {
         return None;
     }

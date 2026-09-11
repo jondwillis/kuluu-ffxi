@@ -2,9 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
-// v26: ViewerEvent::ActionStarted.{info, hit_distortion, knockback, kind} - the first
-// result's per-result outcome bits (GP_SERV_COMMAND_BATTLE2::pack): Defeated/CriticalHit flags,
-// the hit-distortion level and the knockback level that drive the victim's reaction routine.
+// v26: ViewerEvent::ActionStarted.outcome - the first result's (info, hitDistortion,
+// knockback) bits (GP_SERV_COMMAND_BATTLE2::pack) that drive the victim's reaction routine.
 // v25: ViewerEvent::TargetChanged - the server-pushed retarget (s2c 0x058 ASSIST).
 // Nothing in the snapshot carries the server's chosen target, so /assist and
 // auto-target-after-kill had no way to move the client's target cursor.
@@ -198,8 +197,7 @@ pub enum EntityKind {
     Other,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntityLook {
     Standard {
         modelid: u16,
@@ -225,12 +223,59 @@ pub enum EntityLook {
         /// `BlockID` of the leaves those routines swing, so it is the only
         /// join from this entity to its geometry. `None` when the server sent
         /// an all-zero id (`DoorId::new`'s reject).
-        #[serde(default)]
         door_id: Option<[u8; 4]>,
     },
     Transport {
         size: u16,
+        model_id: Option<u32>,
+        animation_start: Option<u32>,
     },
+}
+
+macro_rules! entity_look_codecs {
+    ($($variants:tt)*) => {
+        #[derive(Serialize, Deserialize)]
+        #[serde(remote = "EntityLook", tag = "kind", rename_all = "snake_case")]
+        enum HumanEntityLook { $($variants)* }
+
+        #[derive(Serialize, Deserialize)]
+        #[serde(remote = "EntityLook")]
+        enum BinaryEntityLook { $($variants)* }
+    };
+}
+
+entity_look_codecs! {
+    Standard { modelid: u16 },
+    Equipped {
+        face: u8, race: u8, head: u16, body: u16, hands: u16, legs: u16,
+        feet: u16, main: u16, sub: u16, ranged: u16,
+    },
+    Door { size: u16, #[serde(default)] door_id: Option<[u8; 4]> },
+    Transport {
+        size: u16,
+        #[serde(default)] model_id: Option<u32>,
+        #[serde(default)] animation_start: Option<u32>,
+    },
+}
+
+impl Serialize for EntityLook {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if serializer.is_human_readable() {
+            HumanEntityLook::serialize(self, serializer)
+        } else {
+            BinaryEntityLook::serialize(self, serializer)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for EntityLook {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        if deserializer.is_human_readable() {
+            HumanEntityLook::deserialize(deserializer)
+        } else {
+            BinaryEntityLook::deserialize(deserializer)
+        }
+    }
 }
 
 /// Scene-side mirror of `ffxi_proto::decode::CharFlags` — the 0x0D/0x0E
@@ -404,7 +449,7 @@ pub mod speed {
     // The server does not send a faster speed to a mounted player; LSB caps its mount speed at
     // map.MOUNT_SPEED/2 = 40, below the 50 it sends on foot (vendor/server/src/map/entities/
     // battleentity.cpp CBattleEntity::UpdateSpeed). Retail makes up the difference in the client,
-    // doubling the decoded speed while mounted and then clamping (research/XIClient .../World/
+    // doubling the decoded speed while mounted and then clamping (research/XIClient/src/XIClient/source/World/
     // Actor/ControllableActor.cpp ControllableActor::StepControl). Taking the packet at face value
     // therefore makes mounting slower.
     pub const MOUNTED_SPEED_MULTIPLIER: f32 = 2.0;
@@ -443,8 +488,12 @@ pub mod speed {
     /// Walk/run clip playback scale for a decoded animationSpeed byte, relative to the authored
     /// rate. Retail's AnimationSpeed = SpeedBase * 0.1 yps (research/XiPackets world/server/0x000E)
     /// and the clips are authored at AUTHORED_ANIM_RATE, so the ratio is the playback multiplier:
-    /// a slower base walks in slow motion, a faster one in fast forward.
+    /// a slower base walks in slow motion, a faster one in fast forward. A zero base (LSB ships
+    /// NPCs with speedsub 0) carries no authored rate, so it plays at 1.0 instead of freezing.
     pub const fn anim_rate_scale(speed_base: u8) -> f32 {
+        if speed_base == 0 {
+            return 1.0;
+        }
         (speed_base as f32 * SPEED_TO_YPS) / AUTHORED_ANIM_RATE
     }
 }
@@ -470,6 +519,8 @@ impl Entity {
     /// already gated by [`Entity::status_selectable`].
     pub fn is_invisible(&self) -> bool {
         self.status == status_type::INVISIBLE
+            || (self.status == status_type::DISAPPEAR
+                && matches!(self.look, Some(EntityLook::Transport { .. })))
     }
 
     /// LSB `Flags1.InvisFlag` (bit 29): player-invisibility — a GM hiding
@@ -850,6 +901,8 @@ pub struct SceneSnapshot {
     /// renderer's sub-area latch seeds from. `None` until a login lands.
     #[serde(default)]
     pub sub_area: Option<u16>,
+    #[serde(default)]
+    pub voyage: Option<Voyage>,
 
     /// Job-emote unlock bitfield from s2c 0x11A (bit = job id - 1, bit 0 =
     /// WAR); `None` until the server answers a 0x119 request. Gates the
@@ -1528,15 +1581,11 @@ pub enum ViewerEvent {
         /// First result's raw `animation` index, for every category — the file-table key of
         /// the caster's effect DAT. Absent on a result-less or truncated body.
         animation: Option<u16>,
-        /// First result's outcome bits (vendor/server/src/map/packets/s2c/0x028_battle2.cpp
-        /// GP_SERV_COMMAND_BATTLE2::pack), read for every category:
-        /// `info` carries Defeated/CriticalHit (vendor/server enums/action/info.h - bit 1 /
-        /// bit 2), `hit_distortion` 0..3 and `knockback` 0..7 pick the victim's reaction
-        /// routine, `kind` is uninterpreted. Zero when no result block was read.
-        info: u8,
-        hit_distortion: u8,
-        knockback: u8,
-        kind: u8,
+        /// First result's `(info, hit_distortion, knockback)` bits
+        /// (vendor/server/src/map/packets/s2c/0x028_battle2.cpp GP_SERV_COMMAND_BATTLE2::pack),
+        /// read for every category; absent when the body carries no result block. `info` is
+        /// only meaningful for a basic attack (vendor/server/src/map/enums/action/info.h).
+        outcome: Option<(u8, u8, u8)>,
     },
 
     /// One-shot emote broadcast (s2c 0x05A MOTIONMES): `emote_id` is the wire
@@ -1906,6 +1955,7 @@ mod tests {
             }),
             mh_2f_unlocked: None,
             sub_area: None,
+            voyage: None,
             emote_jobs: None,
             emote_chairs: None,
             check: None,
@@ -2010,7 +2060,11 @@ mod tests {
 
         let transport = Entity {
             kind: EntityKind::Other,
-            look: Some(EntityLook::Transport { size: 3 }),
+            look: Some(EntityLook::Transport {
+                size: 3,
+                model_id: None,
+                animation_start: None,
+            }),
             ..base.clone()
         };
         assert!(
@@ -2040,6 +2094,95 @@ mod tests {
                 "STATUS_TYPE {status} must not be targetable"
             );
         }
+    }
+
+    #[test]
+    fn entity_look_codecs_preserve_every_variant() {
+        const TRANSPORT_POSTCARD: &[u8] = &[3, 4, 1, 14, 1, 192, 196, 7];
+        let variants = [
+            (EntityLook::Standard { modelid: 321 }, "standard"),
+            (
+                EntityLook::Equipped {
+                    face: 1,
+                    race: 2,
+                    head: 3,
+                    body: 4,
+                    hands: 5,
+                    legs: 6,
+                    feet: 7,
+                    main: 8,
+                    sub: 9,
+                    ranged: 10,
+                },
+                "equipped",
+            ),
+            (
+                EntityLook::Door {
+                    size: 2,
+                    door_id: Some(*b"_6ww"),
+                },
+                "door",
+            ),
+            (
+                EntityLook::Transport {
+                    size: 4,
+                    model_id: Some(14),
+                    animation_start: Some(123_456),
+                },
+                "transport",
+            ),
+        ];
+        for (look, tag) in variants {
+            let json = serde_json::to_value(look).unwrap();
+            assert_eq!(json["kind"], tag);
+            assert_eq!(serde_json::from_value::<EntityLook>(json).unwrap(), look);
+            let bytes = postcard::to_allocvec(&look).unwrap();
+            assert_eq!(postcard::from_bytes::<EntityLook>(&bytes).unwrap(), look);
+            if matches!(look, EntityLook::Transport { .. }) {
+                assert_eq!(bytes, TRANSPORT_POSTCARD);
+            }
+        }
+    }
+
+    #[test]
+    fn ferry_protocol_26_preserves_transport_and_voyage_fields() {
+        const VERSION: u32 = 26;
+        const STAMP: u32 = 0x1200_3400;
+        assert_eq!(PROTOCOL_VERSION, VERSION);
+        let mut snapshot = sample_snapshot();
+        snapshot.voyage = Some(Voyage {
+            start: STAMP,
+            duration: 897,
+            reverse: true,
+            route: 2,
+        });
+        snapshot.entities[0].look = Some(EntityLook::Transport {
+            size: 4,
+            model_id: Some(14),
+            animation_start: Some(STAMP),
+        });
+        let bytes = postcard::to_allocvec(&snapshot).unwrap();
+        let decoded: SceneSnapshot = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.voyage, snapshot.voyage);
+        assert_eq!(decoded.entities[0].look, snapshot.entities[0].look);
+        let mut legacy = serde_json::to_value(&snapshot).unwrap();
+        legacy.as_object_mut().unwrap().remove("voyage");
+        assert_eq!(
+            serde_json::from_value::<SceneSnapshot>(legacy)
+                .unwrap()
+                .voyage,
+            None
+        );
+        let old_look: EntityLook =
+            serde_json::from_value(serde_json::json!({"kind": "transport", "size": 4})).unwrap();
+        assert_eq!(
+            old_look,
+            EntityLook::Transport {
+                size: 4,
+                model_id: None,
+                animation_start: None
+            }
+        );
     }
 
     #[test]
@@ -2330,6 +2473,7 @@ mod tests {
             "myroom",
             "mh_2f_unlocked",
             "sub_area",
+            "voyage",
             "emote_jobs",
             "emote_chairs",
             "check",
@@ -2341,7 +2485,7 @@ mod tests {
         assert_eq!(got, want, "SceneSnapshot fields changed: additive-only, update this pin deliberately and rebuild relay consumers together");
     }
 
-    const SNAPSHOT_DEFAULT_POSTCARD_HEX: &str = "000000000000000000000000000000001919000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
+    const SNAPSHOT_DEFAULT_POSTCARD_HEX: &str = "00000000000000000000000000000000191900000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
 
     /// Postcard is positional, not self-describing: field ORDER and TYPES are
     /// the wire format. Any reorder/retype (and any append) changes these
@@ -2368,8 +2512,16 @@ mod tests {
         assert!((speed::anim_rate_scale(25) - 0.5).abs() < 1e-6);
         assert!(speed::anim_rate_scale(75) > speed::anim_rate_scale(50));
         assert!(
-            speed::anim_rate_scale(1) > 0.0,
+            speed::anim_rate_scale(1) > 0.0 && speed::anim_rate_scale(0) == 1.0,
             "a nonzero base keeps a positive scale"
         );
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Voyage {
+    pub start: u32,
+    pub duration: u16,
+    pub reverse: bool,
+    pub route: u8,
 }

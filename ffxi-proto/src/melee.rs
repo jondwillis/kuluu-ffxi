@@ -1,11 +1,47 @@
 // vendor/server/src/map/enums/action/category.h ActionCategory BasicAttack — `action.cmd_no`, 4 bits.
 pub const CATEGORY_BASIC_ATTACK: u8 = 1;
 
-// vendor/server/src/map/enums/action/info.h - the per-result `info` bits. Defeated means the
-// action killed the target (retail flips StatusServer on the same frame as the HP packet, F49);
-// CriticalHit is the crit flag that pairs with hitDistortion Heavy.
+// vendor/server/src/map/enums/action/info.h ActionInfo - the per-result `info` bits of a basic
+// attack. Other categories overload the same bits (Dancer step levels, Rune Fencer runes), so
+// only read them behind a CATEGORY_BASIC_ATTACK gate.
 pub const INFO_DEFEATED: u8 = 1;
 pub const INFO_CRITICAL_HIT: u8 = 2;
+
+// The outcome bits that follow `animation` in every result block of
+// vendor/server/src/map/packets/s2c/0x028_battle2.cpp GP_SERV_COMMAND_BATTLE2::pack:
+// info(5), hitDistortion(2), knockback(3). `hit_distortion` is the damage as a share of the
+// target's max HP (vendor/server/src/map/action/action.cpp action_result_t::recordDamage), not
+// the crit flag: a crit is `info & INFO_CRITICAL_HIT`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct ResultOutcome {
+    pub info: u8,
+    /// vendor/server/src/map/enums/action/hit_distortion.h HitDistortion, 0..=3.
+    pub hit_distortion: u8,
+    /// vendor/server/src/map/enums/action/knockback.h Knockback, 0..=7.
+    pub knockback: u8,
+}
+
+impl ResultOutcome {
+    pub const fn from_wire(info: u8, hit_distortion: u8, knockback: u8) -> Self {
+        Self {
+            info,
+            hit_distortion,
+            knockback,
+        }
+    }
+
+    pub const fn to_wire(self) -> (u8, u8, u8) {
+        (self.info, self.hit_distortion, self.knockback)
+    }
+
+    pub const fn is_critical(self) -> bool {
+        self.info & INFO_CRITICAL_HIT != 0
+    }
+
+    pub const fn defeated(self) -> bool {
+        self.info & INFO_DEFEATED != 0
+    }
+}
 
 // vendor/server/src/map/enums/action/resolution.h — `result.resolution`, 3 bits in
 // vendor/server/src/map/packets/s2c/0x028_battle2.cpp GP_SERV_COMMAND_BATTLE2::pack.
@@ -84,36 +120,13 @@ impl AttackAnimation {
 pub struct MeleeResult {
     pub resolution: ActionResolution,
     pub animation: AttackAnimation,
-    /// vendor/server/src/map/enums/action/info.h - bit 1 `Defeated` (the action killed the
-    /// target), bit 2 `CriticalHit`. Retail flips StatusServer on the same frame as the HP
-    /// packet when Defeated is set; finding F49.
-    pub info: u8,
-    /// vendor/server/src/map/enums/action/hit_distortion.h - 0 None, 1 Light, 2 Medium,
-    /// 3 Heavy (the crit case; drives `ldam`, F54).
-    pub hit_distortion: u8,
-    /// vendor/server/src/map/enums/action/knockback.h - 0 none .. 7 level 7. Any non-zero
-    /// level plays `sway` alongside the damage reaction; finding F52.
-    pub knockback: u8,
-    /// The result's `kind` bits, uninterpreted.
-    pub kind: u8,
 }
 
 impl MeleeResult {
-    pub fn from_wire(
-        resolution: u8,
-        animation: u16,
-        info: u8,
-        hit_distortion: u8,
-        knockback: u8,
-        kind: u8,
-    ) -> Option<Self> {
+    pub fn from_wire(resolution: u8, animation: u16) -> Option<Self> {
         Some(Self {
             resolution: ActionResolution::from_wire(resolution)?,
             animation: AttackAnimation::from_wire(animation)?,
-            info,
-            hit_distortion,
-            knockback,
-            kind,
         })
     }
 
@@ -130,26 +143,27 @@ mod tests {
     fn wire_roundtrips_through_melee_result() {
         for resolution in 0..=4u8 {
             for animation in 0..=4u16 {
-                let r = MeleeResult::from_wire(resolution, animation, 0, 0, 0, 0)
-                    .expect("in-range bits");
+                let r = MeleeResult::from_wire(resolution, animation).expect("in-range bits");
                 assert_eq!(r.to_wire(), (resolution, animation));
             }
         }
-        assert_eq!(MeleeResult::from_wire(5, 0, 0, 0, 0, 0), None);
-        assert_eq!(MeleeResult::from_wire(0, 5, 0, 0, 0, 0), None);
+        assert_eq!(MeleeResult::from_wire(5, 0), None);
+        assert_eq!(MeleeResult::from_wire(0, 5), None);
     }
 
     // The outcome bits ride through unvalidated: the bit reader already bounds them to their
-    // field widths (info 5, hitDistortion 2, knockback 3, kind 2).
+    // field widths (info 5, hitDistortion 2, knockback 3).
     #[test]
-    fn outcome_bits_roundtrip() {
-        let r = MeleeResult::from_wire(0, 1, 2, 3, 2, 1).expect("in-range bits");
-        assert_eq!(r.resolution, ActionResolution::Hit);
-        assert_eq!(r.animation, AttackAnimation::LeftAttack);
-        assert_eq!(r.info, 2, "CriticalHit bit");
-        assert_eq!(r.hit_distortion, 3, "Heavy");
-        assert_eq!(r.knockback, 2, "level 2");
-        assert_eq!(r.kind, 1);
+    fn outcome_bits_roundtrip_and_flags() {
+        let o = ResultOutcome::from_wire(INFO_CRITICAL_HIT, 3, 2);
+        assert_eq!(o.to_wire(), (INFO_CRITICAL_HIT, 3, 2));
+        assert!(o.is_critical());
+        assert!(!o.defeated());
+        // recordDamage sets hitDistortion from the damage share alone: Heavy without the flag
+        // is not a crit, and a crit can land Light.
+        assert!(!ResultOutcome::from_wire(0, 3, 0).is_critical());
+        assert!(ResultOutcome::from_wire(INFO_CRITICAL_HIT, 1, 0).is_critical());
+        assert!(ResultOutcome::from_wire(INFO_DEFEATED, 0, 0).defeated());
     }
 
     #[test]

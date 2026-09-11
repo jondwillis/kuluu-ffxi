@@ -68,6 +68,15 @@ impl SubAreaActivation {
         self.active
     }
 
+    pub fn unloaded_interior_at(&self, native: [f32; 3]) -> bool {
+        self.latch.as_ref().is_some_and(|latch| {
+            latch
+                .shells()
+                .iter()
+                .any(|shell| Some(shell.id) != self.active && shell.contains_inflated(native, 0.0))
+        })
+    }
+
     pub fn is_armed(&self) -> bool {
         self.latch.is_some()
     }
@@ -268,6 +277,22 @@ mod tests {
         activation.forget_zone();
         assert!(!activation.is_armed());
         assert_eq!(activation.active(), None);
+    }
+
+    #[test]
+    fn unloaded_shell_query_tracks_activation_replacement_and_reset() {
+        let mut activation = armed_activation();
+        assert!(activation.unloaded_interior_at(DEEP_INSIDE));
+        assert!(!activation.unloaded_interior_at(OUT_IN_THE_STREET));
+        activation.active = Some(SUB_AREA);
+        assert!(!activation.unloaded_interior_at(DEEP_INSIDE));
+        activation.active = None;
+        assert!(activation.unloaded_interior_at(DEEP_INSIDE));
+        activation.forget_zone();
+        assert!(!activation.unloaded_interior_at(DEEP_INSIDE));
+        activation = armed_activation();
+        activation.install_zone(zone_file_id(), &[], Vec::new(), Vec::new());
+        assert!(!activation.unloaded_interior_at(DEEP_INSIDE));
     }
 
     #[test]

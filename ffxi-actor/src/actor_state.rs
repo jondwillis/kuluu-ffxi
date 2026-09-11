@@ -34,31 +34,44 @@ pub enum RestKind {
     Kneel,
 }
 
-/// Retail's sub->routine table @RVA 0x35AF60 (.data, FFXiMain.dll; finding F37): the raw
-/// animationsub byte indexes [init, ini1, ini2, ini3] with a mod-4 wrap that absorbs LSB's
-/// spawn flag (finding F47). The client plays the named routine from the model DAT through its generic
-/// named-play slots (finding F44); a model that does not ship it simply gets nothing. No interpretation
-/// of what any particular model does with a sub value lives in the engine: the DAT decides.
-pub const SPECIAL_ROUTINE_TABLE: [&str; 8] = [
-    "init", "ini1", "ini2", "ini3", "init", "ini1", "ini2", "ini3",
+pub const LOAD_ROUTINE: [u8; 4] = *b"init";
+
+/// Retail's sub->routine table (the F37 entry in
+/// .agents/skills/retail-observe/references/2026-09-08-worm-burrow-routines.md): the raw
+/// animationsub byte indexes [init, ini1, ini2, ini3] with a
+/// mod-4 wrap that absorbs LSB's spawn flag. The client plays the named routine from the model
+/// DAT through its generic named-play slots; a model that does not ship it simply gets nothing.
+/// No interpretation of what any particular model does with a sub value lives in the engine:
+/// the DAT decides.
+pub const SPECIAL_ROUTINE_TABLE: [[u8; 4]; 8] = [
+    LOAD_ROUTINE,
+    *b"ini1",
+    *b"ini2",
+    *b"ini3",
+    LOAD_ROUTINE,
+    *b"ini1",
+    *b"ini2",
+    *b"ini3",
 ];
+
+const SPECIAL_ROUTINE_INDEX_MASK: u8 = SPECIAL_ROUTINE_TABLE.len() as u8 - 1;
 
 /// The active special-pose routine for a raw animationsub byte. Sub 0 (and the spawn-flagged 4)
 /// means no active special: 'init' is the load routine, not an override.
-pub fn special_routine(animationsub: u8) -> Option<&'static str> {
-    let name = SPECIAL_ROUTINE_TABLE[(animationsub & 0b111) as usize];
-    (name != "init").then_some(name)
+pub fn special_routine(animationsub: u8) -> Option<[u8; 4]> {
+    let name = SPECIAL_ROUTINE_TABLE[(animationsub & SPECIAL_ROUTINE_INDEX_MASK) as usize];
+    (name != LOAD_ROUTINE).then_some(name)
 }
 
-/// The wire state retail's special-pose mechanism consumes (FFXiMain.dll F37/F44): the raw
-/// animationsub byte, whether status hides the actor, and which routine was last triggered.
+/// The wire state retail's special-pose mechanism consumes: the raw animationsub byte, whether
+/// status hides the actor, and which routine was last triggered.
 /// No per-mob interpretation: what a sub value does is defined by the model DAT's routine of
 /// that name if it ships one at all (worms use ini1/init for their dig/pop special poses; other
 /// models may point sp?? clips at entirely different things, or ship nothing).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct SpecialPose {
     /// Raw animationsub byte as last seen on the wire. Retail indexes its table with the raw
-    /// 3-bit value and lets the mod-4 wrap absorb the spawn flag (finding F47), so no masking here.
+    /// 3-bit value and lets the mod-4 wrap absorb the spawn flag, so no masking here.
     pub sub: u8,
 
     /// status == INVISIBLE(3): the actor is hidden. Retail destroys it; we keep one hidden
@@ -83,11 +96,11 @@ pub struct SpecialPoseStep {
 
     /// The routine to fire this frame. A sub change while visible plays table[sub] on the model;
     /// a hidden->visible transition is an actor create in retail and runs the load routine 'init'.
-    pub triggered: Option<&'static str>,
+    pub triggered: Option<[u8; 4]>,
 }
 
 /// Advance one entity's special-pose state from last frame to this snapshot, mirroring retail's
-/// two triggers (FFXiMain.dll F37/F44):
+/// two triggers:
 ///   * animationsub changing while the actor is visible plays table[sub] on that model;
 ///   * a hidden->visible transition runs 'init' (the DAT's load routine).
 ///     A sub change to zero settles back to locomotion. While hidden nothing triggers: retail has no
@@ -105,48 +118,41 @@ pub struct SpecialPoseStep {
 /// destroyed" and the resurface's 'init' runs on our kept-hidden actor.
 pub fn next_special_pose(prev: &SpecialPose, status: u8, animationsub: u8) -> SpecialPoseStep {
     let hidden = status == INVISIBLE_STATUS;
-    let mut pose = SpecialPose {
-        sub: animationsub,
-        hidden,
-        active_routine: prev.active_routine,
-    };
-    let triggered = if !hidden && prev.hidden {
+    let (active_routine, triggered) = if hidden {
+        (prev.active_routine, None)
+    } else if prev.hidden {
         // Resurfaced: retail constructs a fresh actor and runs its load routine. This wins over
         // any sub change in the same frame: the create path is what retail runs, and the worm's
         // settle window keeps the sub set without re-triggering its special.
-        pose.active_routine = Some(*b"init");
-        Some("init")
-    } else if !hidden && animationsub != prev.sub {
+        (Some(LOAD_ROUTINE), Some(LOAD_ROUTINE))
+    } else if animationsub != prev.sub {
         // Visible and the sub byte changed: retail's change detector plays table[sub]. A zero
         // (or spawn-flagged zero) settles; anything else triggers that model's special routine.
-        match special_routine(animationsub) {
-            Some(name) => {
-                // F37 table names are fourccs (init/iniN); the checked cast turns a bad name
-                // into a loud panic instead of a silent truncation.
-                pose.active_routine = Some(name.as_bytes().try_into().unwrap());
-                Some(name)
-            }
-            None => {
-                pose.active_routine = None;
-                None
-            }
-        }
-    } else if !hidden && prev.active_routine.is_some() && special_routine(animationsub).is_none() {
-        // Visible with the sub settled to zero while an override was active: back to locomotion.
-        pose.active_routine = None;
-        None
+        let routine = special_routine(animationsub);
+        (routine, routine)
+    } else if special_routine(animationsub).is_none() {
+        // Visible with the sub settled to zero: back to locomotion.
+        (None, None)
     } else {
-        None
+        (prev.active_routine, None)
     };
-    SpecialPoseStep { pose, triggered }
+    SpecialPoseStep {
+        pose: SpecialPose {
+            sub: animationsub,
+            hidden,
+            active_routine,
+        },
+        triggered,
+    }
 }
 
 /// Gait from the wire speed bytes. LSB's UpdateSpeed(run) multiplies `speed` only and never
 /// touches animationSpeed (vendor/server/src/map/entities/battleentity.cpp), so a speed byte
-/// above the base means the server is running this entity; at or below it, walking. One rule for
-/// Mob/Pet/Npc/Pc: no kind-specific branch, no base-speed constant.
+/// above the base means the server is running this entity; at or below it, walking. Applies to
+/// server-paced kinds (Mob/Pet/Npc): a PC's walk toggle rides the 0x00D RunMode bit and its
+/// speed bytes stay at base either way.
 pub fn wire_walking(speed: u8, speed_base: u8) -> bool {
-    !(speed > speed_base)
+    speed <= speed_base
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -864,22 +870,30 @@ mod tests {
         next_special_pose(prev, status, animationsub)
     }
 
-    fn fourcc(s: &str) -> [u8; 4] {
-        s.as_bytes().try_into().unwrap()
-    }
-
     #[test]
     fn special_routine_table_matches_retail() {
-        // F37's table @0x35AF60 verbatim: sub 4..7 wraps mod-4, which is what absorbs LSB's
-        // spawn flag (finding F47) without any client-side masking.
+        // Retail's table verbatim: sub 4..7 wraps mod-4, which is what absorbs LSB's spawn
+        // flag without any client-side masking.
         assert_eq!(special_routine(0), None);
-        assert_eq!(special_routine(1), Some("ini1"));
-        assert_eq!(special_routine(2), Some("ini2"));
-        assert_eq!(special_routine(3), Some("ini3"));
+        assert_eq!(special_routine(1), Some(*b"ini1"));
+        assert_eq!(special_routine(2), Some(*b"ini2"));
+        assert_eq!(special_routine(3), Some(*b"ini3"));
         assert_eq!(special_routine(4), None, "spawn-flagged zero is plain");
-        assert_eq!(special_routine(5), Some("ini1"), "spawn flag wraps to ini1");
-        assert_eq!(special_routine(6), Some("ini2"));
-        assert_eq!(special_routine(7), Some("ini3"));
+        assert_eq!(
+            special_routine(5),
+            Some(*b"ini1"),
+            "spawn flag wraps to ini1"
+        );
+        assert_eq!(special_routine(6), Some(*b"ini2"));
+        assert_eq!(special_routine(7), Some(*b"ini3"));
+        // LSB pools ship animationsub 8/16/20 as ordinary spawn values
+        // (vendor/server/sql/mob_pools.sql): above the table they wrap to the same 3-bit index.
+        for sub in [8u8, 12, 16, 20] {
+            assert_eq!(special_routine(sub), None, "sub {sub}");
+        }
+        for sub in [9u8, 13, 17, 21] {
+            assert_eq!(special_routine(sub), Some(*b"ini1"), "sub {sub}");
+        }
     }
 
     #[test]
@@ -892,16 +906,16 @@ mod tests {
 
     #[test]
     fn special_pose_sub_change_triggers_the_named_routine() {
-        // A sub change while visible plays table[sub] on the model (F37's change detector).
-        for (sub, name) in [(1u8, "ini1"), (2, "ini2"), (3, "ini3")] {
+        // A sub change while visible plays table[sub] on the model (change detector).
+        for (sub, name) in [(1u8, *b"ini1"), (2, *b"ini2"), (3, *b"ini3")] {
             let s = step(&SpecialPose::default(), 0, sub);
-            assert_eq!(s.pose.active_routine, Some(fourcc(name)));
+            assert_eq!(s.pose.active_routine, Some(name));
             assert_eq!(s.triggered, Some(name));
         }
-        // Spawn-flagged selector: the raw byte indexes the table; no masking (finding F47).
+        // Spawn-flagged selector: the raw byte indexes the table; no masking.
         let s = step(&SpecialPose::default(), 0, 5);
         assert_eq!(s.pose.active_routine, Some(*b"ini1"));
-        assert_eq!(s.triggered, Some("ini1"));
+        assert_eq!(s.triggered, Some(*b"ini1"));
     }
 
     #[test]
@@ -941,14 +955,14 @@ mod tests {
         let s = step(&buried, 0, 1);
         assert!(!s.pose.hidden);
         assert_eq!(s.pose.active_routine, Some(*b"init"));
-        assert_eq!(s.triggered, Some("init"));
+        assert_eq!(s.triggered, Some(*b"init"));
 
         // Re-hidden mid-settle and resurfaced again: 'init' replays (retail rebuilds the
         // actor every time).
         let s2 = step(&s.pose, INVISIBLE_STATUS, 1);
         assert_eq!(s2.triggered, None);
         let s3 = step(&s2.pose, 0, 1);
-        assert_eq!(s3.triggered, Some("init"));
+        assert_eq!(s3.triggered, Some(*b"init"));
     }
 
     #[test]
@@ -995,7 +1009,7 @@ mod tests {
 
         // Server starts the dig: sub set while still visible -> ini1 fires once.
         let s = step(&pose, 0, 1);
-        assert_eq!(s.triggered, Some("ini1"));
+        assert_eq!(s.triggered, Some(*b"ini1"));
         pose = s.pose;
 
         // Visible dig window: hold the override, no re-fire.
@@ -1014,7 +1028,7 @@ mod tests {
         // not a re-fire of ini1.
         let s = step(&pose, 0, 1);
         assert!(!s.pose.hidden);
-        assert_eq!(s.triggered, Some("init"));
+        assert_eq!(s.triggered, Some(*b"init"));
         pose = s.pose;
 
         // ~2s later the sub clears and it settles back to locomotion.

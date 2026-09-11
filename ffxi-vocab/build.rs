@@ -59,9 +59,11 @@ mod floor {
     pub const ITEM_USABLE: usize = scrape_floor(3075);
     pub const WEAPON_SKILL: usize = scrape_floor(4681);
     pub const EMOTE: usize = scrape_floor(51);
+    pub const TRANSPORT: usize = scrape_floor(29);
 }
 
 fn main() -> Result<()> {
+    scrape_transport()?;
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed={LSB_MSG_BASIC_H}");
     println!("cargo:rerun-if-changed={LSB_MSG_LUA}");
@@ -1021,4 +1023,57 @@ fn parse_sql_weapon_skill_rows(src: &str) -> Result<Vec<(u16, u8)>> {
         );
     }
     Ok(out)
+}
+
+fn scrape_transport() -> Result<()> {
+    const SOURCE: &str = "../vendor/server/sql/transport.sql";
+    println!("cargo:rerun-if-changed={SOURCE}");
+    let source = fs::read_to_string(SOURCE)?;
+    let mut output = String::from("pub const SCHEDULES: &[Schedule] = &[\n");
+    let mut count = 0;
+    for line in source.lines() {
+        let Some(rest) = line.trim().strip_prefix("INSERT INTO `transport` VALUES (") else {
+            continue;
+        };
+        let (tuple, _) =
+            split_sql_tuple(rest).ok_or_else(|| anyhow::anyhow!("malformed transport row"))?;
+        let fields = split_sql_fields(tuple);
+        anyhow::ensure!(fields.len() == 17, "transport column count changed");
+        let n = |i: usize| fields[i].trim().parse::<u32>();
+        let (zone, npc, boundary, offset, interval, arrival, waiting, departure) =
+            (n(16)?, n(2)?, n(8)?, n(11)?, n(12)?, n(13)?, n(14)?, n(15)?);
+        output.push_str(&format!("Schedule {{ voyage_zone: {zone}, npc_id: {npc}, boundary: {boundary}, offset: {offset}, interval: {interval}, arrival: {arrival}, waiting: {waiting}, departure: {departure} }},\n"));
+        count += 1;
+    }
+    check_scrape_count("transport schedules", SOURCE, count, floor::TRANSPORT)?;
+    output.push_str("];\n");
+    const TIMER_SOURCE: &str = "../vendor/server/src/map/transport.cpp";
+    println!("cargo:rerun-if-changed={TIMER_SOURCE}");
+    let timer = fs::read_to_string(TIMER_SOURCE)?;
+    let lead = timer
+        .split_once("zoneIterator->timeArriveDock - xi::vanadiel_clock::minutes(")
+        .and_then(|(_, tail)| tail.split_once(')'))
+        .context("transport eviction expression changed")?
+        .0
+        .trim()
+        .parse::<u16>()?;
+    output.push_str(&format!(
+        "pub const EVICTION_LEAD_VANA_MINUTES: u16 = {lead};\n"
+    ));
+    const MODEL_SOURCE: &str = "../vendor/server/src/map/packets/entity_update.h";
+    println!("cargo:rerun-if-changed={MODEL_SOURCE}");
+    let model_types =
+        lsb_scrape::parse_cpp_plain_enum(&fs::read_to_string(MODEL_SOURCE)?, "MODELTYPE")?;
+    for name in ["MODEL_ELEVATOR", "MODEL_SHIP"] {
+        let (value, _) = model_types
+            .iter()
+            .find(|(_, key)| key == name)
+            .with_context(|| format!("missing {name} in MODELTYPE"))?;
+        output.push_str(&format!("pub const {name}: u16 = {value};\n"));
+    }
+    fs::write(
+        PathBuf::from(std::env::var("OUT_DIR")?).join("transport_table.rs"),
+        output,
+    )?;
+    Ok(())
 }

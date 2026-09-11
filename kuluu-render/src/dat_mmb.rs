@@ -14,7 +14,7 @@ use ffxi_dat::mmb::{parse_models, MmbHeader};
 use ffxi_dat::texture::{decode_texture, DecodedTexture};
 use ffxi_dat::{mmb, walk, ChunkKind, DatRoot};
 
-use crate::ffxi_zone_material::FfxiZoneMaterial;
+use crate::ffxi_zone_material::{FfxiZoneMaterial, ZoneMaterialTouched};
 use crate::graphics_settings::GraphicsSettings;
 use crate::look_resolver::dispatch_look_driven_models;
 use crate::scene::TrackedEntities;
@@ -115,6 +115,7 @@ pub struct GenWater {
 
 #[derive(Message, Debug, Clone, Copy)]
 pub struct LoadMmbRequest {
+    pub voyage_backdrop: bool,
     pub file_id: u32,
     pub chunk_idx: usize,
 
@@ -154,6 +155,7 @@ pub fn scroll_gen_water_uv(
     time: Res<Time>,
     q: Query<&GenWaterScroll>,
     mut materials: ResMut<Assets<FfxiZoneMaterial>>,
+    mut touched: ResMut<ZoneMaterialTouched>,
 ) {
     // The generator's 0x27/0x28 velocity is UV per retail frame, not per second
     // (research/xim TextureCoordinateUpdater; same convention as zone_clouds
@@ -166,6 +168,33 @@ pub fn scroll_gen_water_uv(
             let u = (gw.uv_scroll.x * t).fract();
             let v = (gw.uv_scroll.y * t).fract();
             mat.uv_offset = Vec4::new(u, v, 0.0, 0.0);
+            touched.mark(gw.material.id());
+        }
+    }
+}
+
+/// Keeps static placements out of the sun's shadow pass unless
+/// `GraphicsSettings::zone_shadow_cast` opts them in. Runs on settings edits
+/// only; the spawn path stamps new placements itself.
+pub fn apply_zone_shadow_cast(
+    settings: Res<GraphicsSettings>,
+    mut commands: Commands,
+    q: Query<
+        (Entity, Has<bevy::light::NotShadowCaster>),
+        (With<MmbOverlay>, With<crate::components::CameraOccluder>),
+    >,
+) {
+    if !settings.is_changed() {
+        return;
+    }
+    for (e, blocked) in &q {
+        if settings.zone_shadow_cast == blocked {
+            let mut ec = commands.entity(e);
+            if blocked {
+                ec.remove::<bevy::light::NotShadowCaster>();
+            } else {
+                ec.insert(bevy::light::NotShadowCaster);
+            }
         }
     }
 }
@@ -375,6 +404,9 @@ fn is_zone_placement(req: &LoadMmbRequest) -> bool {
 }
 
 fn mmb_dist_sq_xz(req: &LoadMmbRequest, self_pos: Vec3) -> f32 {
+    if req.voyage_backdrop {
+        return 0.0;
+    }
     let p = req
         .world_transform
         .map(|m| m.w_axis.truncate())
@@ -605,6 +637,12 @@ pub fn process_load_mmb_requests(
                     );
                 }
 
+                if req
+                    .entity_id
+                    .is_some_and(|id| !tracked.by_id.contains_key(&id))
+                {
+                    continue;
+                }
                 let is_static_placement = req
                     .entity_id
                     .and_then(|id| tracked.by_id.get(&id))
@@ -615,16 +653,6 @@ pub fn process_load_mmb_requests(
                         bevy_e
                     }
                     None => {
-                        if let Some(missing) = req.entity_id {
-                            push_system_msg(
-                                &mut toasts,
-                                format!(
-                            "/load_mmb_on {missing} {} {}: no tracked entity for id {missing} \
-                             — spawning at world_pos instead",
-                            req.file_id, req.chunk_idx,
-                        ),
-                            );
-                        }
                         let parent_transform = match req.world_transform {
                             Some(m) => Transform::from_matrix(m),
                             None => Transform::from_translation(req.world_pos),
@@ -646,6 +674,11 @@ pub fn process_load_mmb_requests(
                             if req.sub_area_link != 0 {
                                 e.insert(crate::dat_mzb::ZoneSubAreaLink(req.sub_area_link));
                             }
+                        }
+                        if req.voyage_backdrop {
+                            e.insert(crate::transport::VoyageBackdrop(
+                                req.world_transform.unwrap_or(Mat4::IDENTITY),
+                            ));
                         }
                         if let Some(lod) = req.lod {
                             e.insert(lod);
@@ -791,6 +824,9 @@ pub fn process_load_mmb_requests(
                     }
 
                     if is_static_placement {
+                        if !settings.zone_shadow_cast {
+                            child.insert(bevy::light::NotShadowCaster);
+                        }
                         child.insert((
                             crate::components::CameraOccluder,
                             // Static world geometry also renders to the minimap's
@@ -1019,6 +1055,7 @@ mod tests {
             door: None,
             slot: crate::dat_mzb::ZONE_SLOT_MAIN,
             sub_area_link: NO_SUB_AREA_LINK,
+            voyage_backdrop: false,
         }
     }
 
@@ -1034,6 +1071,7 @@ mod tests {
             door: None,
             slot: crate::dat_mzb::ZONE_SLOT_MAIN,
             sub_area_link: NO_SUB_AREA_LINK,
+            voyage_backdrop: false,
         }
     }
 
@@ -1122,5 +1160,53 @@ mod tests {
                 "raw {raw} should saturate to 255"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod zone_shadow_cast_tests {
+    use super::*;
+    use bevy::light::NotShadowCaster;
+
+    fn app_with(zone_shadow_cast: bool) -> (App, Entity, Entity) {
+        let mut app = App::new();
+        app.insert_resource(GraphicsSettings {
+            zone_shadow_cast,
+            ..GraphicsSettings::default()
+        });
+        app.add_systems(Update, apply_zone_shadow_cast);
+        let placement = app
+            .world_mut()
+            .spawn((MmbOverlay, crate::components::CameraOccluder))
+            .id();
+        let actor_model = app.world_mut().spawn(MmbOverlay).id();
+        (app, placement, actor_model)
+    }
+
+    #[test]
+    fn placements_stay_out_of_the_shadow_pass_by_default() {
+        let (mut app, placement, actor_model) = app_with(false);
+        app.update();
+        assert!(app.world().get::<NotShadowCaster>(placement).is_some());
+        assert!(
+            app.world().get::<NotShadowCaster>(actor_model).is_none(),
+            "only static placements are gated; models on actors keep their own rule"
+        );
+    }
+
+    #[test]
+    fn opting_in_and_out_flips_existing_placements() {
+        let (mut app, placement, _) = app_with(false);
+        app.update();
+        app.world_mut()
+            .resource_mut::<GraphicsSettings>()
+            .zone_shadow_cast = true;
+        app.update();
+        assert!(app.world().get::<NotShadowCaster>(placement).is_none());
+        app.world_mut()
+            .resource_mut::<GraphicsSettings>()
+            .zone_shadow_cast = false;
+        app.update();
+        assert!(app.world().get::<NotShadowCaster>(placement).is_some());
     }
 }

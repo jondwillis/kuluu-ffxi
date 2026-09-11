@@ -2,6 +2,7 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
+use crate::client_profile::ClientProfile;
 use crate::ftable::{FTable, SubPath};
 use crate::vtable::VTable;
 use crate::{DatError, Result};
@@ -9,6 +10,20 @@ use crate::{DatError, Result};
 const MAX_ROM_INDEX: u8 = 19;
 
 pub const DEFAULT_INSTALL_DIR: &str = "vendor/game-files/SquareEnix/FINAL FANTASY XI";
+
+/// Named installs live side by side here so one checkout can target several
+/// client generations; `cargo xtask game --target <name>` wires them.
+pub const TARGETS_DIR: &str = "vendor/game-files/targets";
+
+/// Selects a named install under [`TARGETS_DIR`]. `FFXI_DAT_PATH` wins when
+/// both are set, so an explicit path is never silently redirected.
+pub const CLIENT_TARGET_ENV: &str = "FFXI_CLIENT_TARGET";
+
+pub const INSTALL_SUBDIR: &str = "SquareEnix/FINAL FANTASY XI";
+
+pub fn target_install_dir(targets_dir: &Path, name: &str) -> PathBuf {
+    targets_dir.join(name).join(INSTALL_SUBDIR)
+}
 
 /// Overlay roots searched before the base install, in order, separated by the
 /// platform path separator. A startup override; see [`discover_overlays`] for
@@ -152,6 +167,7 @@ struct AppTables {
 #[derive(Debug)]
 pub struct DatRoot {
     root: PathBuf,
+    profile: ClientProfile,
     apps: Vec<AppTables>,
     /// Behind a lock because the renderer shares one `Arc<DatRoot>`: swapping
     /// overlays must be visible through that handle without rebuilding the root
@@ -191,8 +207,10 @@ impl DatRoot {
         }
 
         let overlays = RwLock::new(discover_overlays(&root));
+        let profile = ClientProfile::probe(&root);
         Ok(Self {
             root,
+            profile,
             apps,
             overlays,
         })
@@ -250,19 +268,38 @@ impl DatRoot {
         // every real-DAT guard vacuously skips. Fall back to the workspace root resolved from this
         // crate's manifest dir (absent in a shipped binary, which is why cwd is still tried first).
         let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR")).parent();
-        let fallback = [
-            Some(PathBuf::from(DEFAULT_INSTALL_DIR)),
-            workspace_root.map(|w| w.join(DEFAULT_INSTALL_DIR)),
-        ]
-        .into_iter()
-        .flatten()
-        .find(|p| p.join("VTABLE.DAT").exists())
-        .ok_or(DatError::EnvMissing)?;
+        let bases = [Some(PathBuf::new()), workspace_root.map(Path::to_path_buf)];
+        if let Some(name) = env::var_os(CLIENT_TARGET_ENV) {
+            let name = name.to_string_lossy();
+            let candidates = bases
+                .iter()
+                .flatten()
+                .map(|b| target_install_dir(&b.join(TARGETS_DIR), &name));
+            return match candidates
+                .into_iter()
+                .find(|p| p.join("VTABLE.DAT").exists())
+            {
+                Some(p) => Self::open(p),
+                None => Err(DatError::TargetMissing {
+                    name: name.into_owned(),
+                }),
+            };
+        }
+        let fallback = bases
+            .iter()
+            .flatten()
+            .map(|b| b.join(DEFAULT_INSTALL_DIR))
+            .find(|p| p.join("VTABLE.DAT").exists())
+            .ok_or(DatError::EnvMissing)?;
         Self::open(fallback)
     }
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    pub fn profile(&self) -> &ClientProfile {
+        &self.profile
     }
 
     pub fn app_summary(&self) -> Vec<(String, u32, u32)> {

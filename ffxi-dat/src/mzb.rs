@@ -147,7 +147,7 @@ pub const MZB_SUB_BLOCK_SIZE: u32 = 4;
 /// live offset.
 const QUADTREE_MIN_VERSION: u8 = 21;
 
-/// ZoneRenderer.cpp ZoneRenderer::OpenMzb and :518-523 — the header's lighting section and the
+/// ZoneRenderer.cpp ZoneRenderer::OpenMzb — the header's lighting section and the
 /// per-placement `LightReferences` only exist from version 18 on; older files
 /// get zeroed references.
 const LIGHT_BINDING_MIN_VERSION: u8 = 18;

@@ -64,7 +64,7 @@ impl WallSource for Walls<'_> {
                 continue;
             }
             for (v, n) in &d.tris {
-                // The 60 degree rule: an up-facing door face (a drawbridge deck)
+                // The 45 degree rule: an up-facing door face (a drawbridge deck)
                 // is a floor, not a wall — the column probe owns it.
                 if n.y >= FLOOR_COS {
                     continue;
@@ -340,8 +340,12 @@ pub fn step(
             y_new = feet_y + vy * dt;
 
             // Landing: a floor entered the swept band [y_new, feet_y] under the
-            // footprint. Set y to it, mode by input, vy = 0.
-            match landing_floor(&sampler, new_xz, y_new, feet_y) {
+            // footprint. Set y to it, mode by input, vy = 0. A bank too steep to
+            // stand on still stops the fall at the feet column: retail's sphere
+            // query collides with every polygon, so nothing is ever fallen through.
+            match landing_floor(&sampler, new_xz, y_new, feet_y)
+                .or_else(|| geom.highest_up_facing_hit_in_slab(new_xz, y_new, feet_y))
+            {
                 Some(floor) => {
                     y_new = floor;
                     state.mode = if want_len > 1e-6 {

@@ -63,12 +63,7 @@ pub fn shadow_min_elevation() -> f32 {
     SHADOW_ELEVATION_SIN_ARG.sin().atan()
 }
 
-/// Snap `to_light` to retail's shadow elevation, leaving the LIT direction
-/// (`ZoneDirectionalLighting`) alone — this feeds only the cascade the sun entity casts.
-///
-/// The test is on ANGLE_PI_OVER_3 but the rewrite lands at `shadow_min_elevation()`, so a sun
-/// between the two is *flattened*, not steepened; ShadowRenderer.cpp ShadowRenderer::Init has one predicate
-/// and one assignment, not a clamp.
+/// Ground-projected shadow direction; unsuitable for depth-map self-shadowing.
 pub fn shadow_cast_direction(to_light: Vec3) -> Vec3 {
     let horizontal = Vec2::new(to_light.x, to_light.z).length();
     if to_light.y.atan2(horizontal) >= SHADOW_ELEVATION_SIN_ARG {
@@ -194,7 +189,7 @@ pub struct MoonTransitionState {
     // writes until the target moves beyond a small epsilon. Asset ids are
     // cached so a zone-reload material swap invalidates the cache.
     pub sun_light_written: Option<(Vec3, f32, Vec3, bool)>,
-    pub moon_light_written: Option<(Vec3, f32, Vec3)>,
+    pub moon_light_written: Option<(Vec3, f32, Vec3, bool)>,
     pub sun_disc_written: Option<(AssetId<StandardMaterial>, Vec3)>,
     pub moon_disc_written: Option<(
         AssetId<crate::moon_material::MoonMaterial>,
@@ -226,7 +221,7 @@ pub fn spawn_sun_and_moon(
         IsSun,
         DirectionalLight {
             illuminance: 0.0,
-            shadow_maps_enabled: true,
+            shadow_maps_enabled: false,
             shadow_depth_bias: 0.2,
 
             shadow_normal_bias: 0.6,
@@ -247,6 +242,7 @@ pub fn spawn_sun_and_moon(
             shadow_normal_bias: 1.0,
             ..default()
         },
+        cascade_config_from_settings(settings),
         bevy::light::VolumetricLight,
         Transform::from_xyz(0.0, -LIGHT_DISTANCE, 0.0).looking_at(Vec3::ZERO, Vec3::Y),
     ));
@@ -709,11 +705,10 @@ pub fn sun_moon_system(
         for (mut light, mut xf) in q_sun.iter_mut() {
             light.color = sun_color;
             light.illuminance = sun_lux;
-            light.shadow_maps_enabled = !indoors;
-            // The zone/actor shaders take their lit direction from ZoneDirectionalLighting
-            // whenever the zone ships 0x2F records, so steepening here reaches only the
-            // shadow cascade (and the synthetic no-record fallback).
-            *xf = Transform::from_translation(shadow_cast_direction(sun_to_dir) * LIGHT_DISTANCE)
+            light.shadow_maps_enabled = !indoors && sun_lux > 0.0;
+            // A depth map used for self-shadowing must follow the illuminating light;
+            // retail's ground-projected shadow direction is not an occlusion ray.
+            *xf = Transform::from_translation(sun_to_dir * LIGHT_DISTANCE)
                 .looking_at(Vec3::ZERO, Vec3::Y);
         }
         *sun_light_written = Some((sun_rgb_lin, sun_lux, sun_to_dir, indoors));
@@ -739,17 +734,19 @@ pub fn sun_moon_system(
         let c = moon_color.to_linear();
         Vec3::new(c.red, c.green, c.blue)
     };
-    if moon_light_written.is_none_or(|(rgb, lux, dir)| {
+    if moon_light_written.is_none_or(|(rgb, lux, dir, prev_indoors)| {
         rgb.distance(moon_rgb_lin) > CELESTIAL_COLOR_EPS
             || celestial_scalar_changed(lux, moon_lux)
             || dir.distance(moon_dir) > CELESTIAL_DIR_EPS
+            || prev_indoors != indoors
     }) {
         for (mut light, mut xf) in q_moon.iter_mut() {
             light.color = moon_color;
             light.illuminance = moon_lux;
+            light.shadow_maps_enabled = !indoors && moon_lux > 0.0;
             *xf = Transform::from_translation(moon_pos).looking_at(Vec3::ZERO, Vec3::Y);
         }
-        *moon_light_written = Some((moon_rgb_lin, moon_lux, moon_dir));
+        *moon_light_written = Some((moon_rgb_lin, moon_lux, moon_dir, indoors));
     }
 
     // Publish the entity(model) + landscape(terrain) split for the actor- and
@@ -1063,6 +1060,80 @@ mod tests {
     // them anchors the clock instead of letting `VanaClock::default()` read the
     // wall clock.
     const NOON_VANA_HOUR: f32 = 12.0;
+
+    #[test]
+    fn celestial_shadow_maps_follow_the_active_light_through_day_night_and_indoors() {
+        const MORNING_HOUR: f32 = 7.0;
+        const NIGHT_HOUR: f32 = 2.0;
+        const DIFFUSE: [f32; 4] = [0.6, 0.6, 0.6, 1.0];
+        const AMBIENT: [f32; 4] = [0.2, 0.2, 0.2, 1.0];
+        const DIRECTION_EPSILON: f32 = 1e-4;
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, AssetPlugin::default()))
+            .init_asset::<StandardMaterial>()
+            .init_asset::<crate::moon_material::MoonMaterial>()
+            .add_message::<crate::snapshot::ToastEvent>()
+            .init_resource::<VanaSky>()
+            .init_resource::<crate::graphics_settings::GraphicsSettings>()
+            .init_resource::<crate::moon_material::MoonSpriteFrames>()
+            .init_resource::<crate::moon_material::CelestialColorTables>()
+            .init_resource::<crate::weather::ZoneWeather>()
+            .init_resource::<crate::weather::ZoneDirectionalLighting>()
+            .init_resource::<DatCelestials>()
+            .add_systems(Update, sun_moon_system);
+        let sun = app
+            .world_mut()
+            .spawn((IsSun, DirectionalLight::default(), Transform::default()))
+            .id();
+        let moon = app
+            .world_mut()
+            .spawn((IsMoon, DirectionalLight::default(), Transform::default()))
+            .id();
+        for (hour, indoors) in [
+            (MORNING_HOUR, false),
+            (NIGHT_HOUR, false),
+            (NIGHT_HOUR, true),
+            (NIGHT_HOUR, false),
+            (NOON_VANA_HOUR, false),
+        ] {
+            let mut rec = terrain_rec(DIFFUSE, DIFFUSE, AMBIENT);
+            rec.sunlight_diffuse_entity = DIFFUSE;
+            rec.moonlight_diffuse_entity = DIFFUSE;
+            rec.indoors = indoors;
+            app.world_mut()
+                .resource_mut::<crate::weather::ZoneWeather>()
+                .current = Some(rec);
+            app.insert_resource(crate::vana_time::VanaClock::anchored_at_hour(hour));
+            app.update();
+            let sky = app.world().resource::<VanaSky>();
+            let sun_light = app.world().get::<DirectionalLight>(sun).unwrap();
+            let moon_light = app.world().get::<DirectionalLight>(moon).unwrap();
+            assert_eq!(
+                sun_light.shadow_maps_enabled,
+                !indoors && sky.sun_altitude > 0.0
+            );
+            assert_eq!(
+                moon_light.shadow_maps_enabled,
+                !indoors && sky.moon_altitude > 0.0
+            );
+            if !indoors {
+                let model_dir = app
+                    .world()
+                    .resource::<crate::weather::ZoneDirectionalLighting>()
+                    .model_dir;
+                let active = if sun_light.shadow_maps_enabled {
+                    sun
+                } else {
+                    moon
+                };
+                let to_light = app.world().get::<Transform>(active).unwrap().back();
+                assert!(
+                    to_light.distance(model_dir) < DIRECTION_EPSILON,
+                    "hour {hour}: model light {model_dir:?} and shadow ray {to_light:?} disagree"
+                );
+            }
+        }
+    }
 
     fn terrain_rec(sun: [f32; 4], moon: [f32; 4], ambient: [f32; 4]) -> WeatherRecord {
         WeatherRecord {

@@ -897,6 +897,10 @@ fn despawn_ingame_entities(
         ResMut<MzbCollisionGeometry>,
         ResMut<ZoneAreaMap>,
         ResMut<ZoneChunkLightMap>,
+        ResMut<kuluu_render::transport::VoyageState>,
+        ResMut<kuluu_render::zone_point_lights::ZonePointLights>,
+        ResMut<kuluu_render::zone_point_lights::ActiveSceneLights>,
+        ResMut<kuluu_render::zone_doors::ZoneDoors>,
     ),
     mut last_zone: ResMut<LastAutoLoadedZone>,
     mut last_atmo: ResMut<LastAtmosphereZone>,
@@ -925,6 +929,10 @@ fn despawn_ingame_entities(
     *zone_geom.0 = MzbCollisionGeometry::default();
     *zone_geom.1 = ZoneAreaMap::default();
     *zone_geom.2 = ZoneChunkLightMap::default();
+    *zone_geom.3 = kuluu_render::transport::VoyageState::default();
+    *zone_geom.4 = kuluu_render::zone_point_lights::ZonePointLights::default();
+    *zone_geom.5 = kuluu_render::zone_point_lights::ActiveSceneLights::default();
+    *zone_geom.6 = kuluu_render::zone_doors::ZoneDoors::default();
     last_zone.file_id = None;
     last_atmo.file_id = None;
 
@@ -1185,6 +1193,10 @@ mod zone_teardown_tests {
         world.init_resource::<super::MzbCollisionGeometry>();
         world.init_resource::<super::ZoneAreaMap>();
         world.init_resource::<super::ZoneChunkLightMap>();
+        world.init_resource::<kuluu_render::transport::VoyageState>();
+        world.init_resource::<kuluu_render::zone_point_lights::ZonePointLights>();
+        world.init_resource::<kuluu_render::zone_point_lights::ActiveSceneLights>();
+        world.init_resource::<kuluu_render::zone_doors::ZoneDoors>();
         world.init_resource::<super::LastAutoLoadedZone>();
         world.init_resource::<super::LastAtmosphereZone>();
         world.init_resource::<super::BgmSlots>();
@@ -1196,6 +1208,33 @@ mod zone_teardown_tests {
         world.init_resource::<kuluu_render::combat_stance::EntityMotion>();
         world.init_resource::<kuluu_render::combat_stance::AnimationBlends>();
         world
+    }
+
+    #[test]
+    fn teardown_clears_zone_and_interior_lights() {
+        use kuluu_render::zone_point_lights::{ActiveSceneLights, ZonePointLight, ZonePointLights};
+        let mut world = world_with_teardown_resources();
+        let light = ZonePointLight {
+            light_id: u32::from_le_bytes(*b"l_01"),
+            world_pos: Vec3::ZERO,
+            color: Vec3::ONE,
+            range: 10.0,
+            attenuation: 1.0,
+        };
+        world.insert_resource(ZonePointLights {
+            file_id: Some(348),
+            sub_area_file_id: Some(585),
+            lights: vec![light],
+        });
+        world.insert_resource(ActiveSceneLights {
+            lights: vec![light],
+        });
+        world.run_system_once(despawn_ingame_entities).unwrap();
+        let sources = world.resource::<ZonePointLights>();
+        assert_eq!(sources.file_id, None);
+        assert_eq!(sources.sub_area_file_id, None);
+        assert!(sources.lights.is_empty());
+        assert!(world.resource::<ActiveSceneLights>().lights.is_empty());
     }
 
     #[test]

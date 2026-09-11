@@ -92,9 +92,6 @@ impl PosHead {
     // the last one. XiPackets world/server/0x000E: UpdateMoveTime(Flags0 & 0x1FFF); retail
     // phases walk/run cycles off it so foot timing matches, instead of re-deriving a phase
     // from position deltas.
-    //
-    // Reserved accessor for that follow-up (phasing the walk/run cycle off the delta);
-    // nothing consumes it yet, and it is deliberately not threaded through the snapshot.
     const MOV_TIME_MASK: u32 = 0x1FFF;
 
     pub fn mov_time(&self) -> u16 {
@@ -507,6 +504,10 @@ pub enum LookData {
 
     Transport {
         size: u16,
+        #[serde(default)]
+        model_id: Option<u32>,
+        #[serde(default)]
+        animation_start: Option<u32>,
     },
 }
 
@@ -560,7 +561,20 @@ impl LookData {
                 size,
                 door_id: Self::door_id(body),
             }),
-            3 | 4 => Some(LookData::Transport { size }),
+            ffxi_vocab::transport::MODEL_ELEVATOR | ffxi_vocab::transport::MODEL_SHIP => {
+                // vendor/server/src/map/packets/entity_update.cpp getTransportNPCName
+                const MODEL_OFFSET: usize = 0x30;
+                const TIME_OFFSET: usize = 0x34;
+                let word = |offset| {
+                    body.get(offset..offset + 4)
+                        .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+                };
+                Some(LookData::Transport {
+                    size,
+                    model_id: word(MODEL_OFFSET),
+                    animation_start: word(TIME_OFFSET),
+                })
+            }
             _ => None,
         }
     }
@@ -644,6 +658,9 @@ impl NpcState {
     pub(crate) const ANIMATION_OFFSET: usize = 0x1B;
     pub(crate) const STATUS_OFFSET: usize = 0x1C;
     pub(crate) const ANIMATIONSUB_OFFSET: usize = 0x26;
+    /// LSB writes `4 | animationsub` on spawn (vendor/server/src/map/packets/entity_update.cpp
+    /// CEntityUpdatePacket::updateWith); consumers mask this off to read the selector.
+    pub const ANIMATIONSUB_SPAWN_FLAG: u8 = 0x04;
 
     /// Decode the appearance-state bytes from a `CHAR_NPC` (0x0E) body. Returns
     /// `None` if the body is too short to reach `animationsub` (the furthest of
@@ -1327,16 +1344,15 @@ mod npc_state_tests {
 
     #[test]
     fn npc_state_matches_fireworks_effect_npc() {
-        const SPAWN_FLAG: u8 = 0x04;
         let mut body = vec![0u8; 0x48];
         body[NpcState::ANIMATION_OFFSET] = 0;
         body[NpcState::STATUS_OFFSET] = 2;
-        body[NpcState::ANIMATIONSUB_OFFSET] = SPAWN_FLAG | 1;
+        body[NpcState::ANIMATIONSUB_OFFSET] = NpcState::ANIMATIONSUB_SPAWN_FLAG | 1;
         let st = NpcState::decode_char_npc(&body).expect("decode");
         assert_eq!(st.animation, 0);
         assert_eq!(st.status, 2);
         assert_ne!(st.animationsub, 0);
-        assert_eq!(st.animationsub & !SPAWN_FLAG, 1);
+        assert_eq!(st.animationsub & !NpcState::ANIMATIONSUB_SPAWN_FLAG, 1);
     }
 
     #[test]
@@ -1799,5 +1815,49 @@ mod pet_sync_tests {
             PetSync::decode(&buf),
             Err(DecodeError::Truncated(_, _))
         ));
+    }
+}
+
+#[cfg(test)]
+mod transport_tests {
+    use super::LookData;
+
+    #[test]
+    fn transport_binary_words_preserve_zero_and_partial_presence() {
+        const MODEL: usize = 44;
+        const SELECTOR: usize = 48;
+        const START: usize = 52;
+        const FULL: usize = 56;
+        const STAMP: u32 = 0x1200_3400;
+        for size in [3u16, 4] {
+            let mut body = [0u8; FULL];
+            body[MODEL..MODEL + 2].copy_from_slice(&size.to_le_bytes());
+            body[SELECTOR] = 14;
+            body[START..].copy_from_slice(&STAMP.to_le_bytes());
+            for length in 0..=FULL {
+                let decoded = LookData::decode_char_npc(&body[..length]);
+                if length < SELECTOR {
+                    assert_eq!(decoded, None);
+                } else {
+                    assert_eq!(
+                        decoded,
+                        Some(LookData::Transport {
+                            size,
+                            model_id: (length >= START).then_some(14),
+                            animation_start: (length == FULL).then_some(STAMP),
+                        })
+                    );
+                }
+            }
+            body[SELECTOR..].fill(0);
+            assert_eq!(
+                LookData::decode_char_npc(&body),
+                Some(LookData::Transport {
+                    size,
+                    model_id: Some(0),
+                    animation_start: Some(0),
+                })
+            );
+        }
     }
 }

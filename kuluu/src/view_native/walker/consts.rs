@@ -5,8 +5,9 @@
 /// Single definition in `dat_mzb::MAX_GROUND_STEP_UP`, re-exported here.
 pub const STEP_MAX: f32 = kuluu_render::dat_mzb::MAX_GROUND_STEP_UP;
 
-/// 60 degree floor/wall rule: a face is FLOOR if its normal.y >= FLOOR_COS,
-/// otherwise it's a WALL. Single definition in `dat_mzb::FLOOR_NORMAL_MIN`.
+/// Retail's 45 degree floor/wall rule: a face is FLOOR if its normal.y >=
+/// FLOOR_COS, otherwise it's a WALL. Single definition in
+/// `dat_mzb::FLOOR_NORMAL_MIN`.
 pub const FLOOR_COS: f32 = kuluu_render::dat_mzb::FLOOR_NORMAL_MIN;
 
 /// Total height range under which the window carries no ramp at all (poof):

@@ -36,7 +36,10 @@ pub enum Advance {
     Frame(DialogState),
     /// The event is over — the caller sends EVENT_END with `end_para` as the
     /// 0x05B `EndPara` (the VM's `Work_Zone[1]`, or a cancel sentinel).
-    Ended { end_para: u32 },
+    Ended {
+        end_para: u32,
+        final_position: Option<ffxi_event::vm::scene::EventPosition>,
+    },
     /// The scene is holding on a timed wait: no frame to show, and the event
     /// stays open. The caller must not send EVENT_END on this.
     Waiting,
@@ -115,7 +118,9 @@ pub struct DialogSession {
     player_name: String,
     loaded_event_zone: Option<u16>,
     loaded_string_zone: Option<u16>,
-    event_dat: Option<EventDat>,
+    event_dat: Option<Arc<EventDat>>,
+    player_position: Option<ffxi_event::vm::scene::EventPosition>,
+    scene_actions: Vec<ffxi_event::vm::scene::SceneAction>,
     strings: Option<StringDat>,
     runner: Option<DialogRunner>,
     active: Option<ActiveEvent>,
@@ -136,6 +141,8 @@ impl DialogSession {
             loaded_event_zone: None,
             loaded_string_zone: None,
             event_dat: None,
+            player_position: None,
+            scene_actions: Vec::new(),
             strings: None,
             runner: None,
             active: None,
@@ -165,7 +172,7 @@ impl DialogSession {
             return;
         }
         self.loaded_event_zone = Some(zone);
-        self.event_dat = load_event_dat(self.dat_root.as_deref(), zone);
+        self.event_dat = load_event_dat(self.dat_root.as_deref(), zone).map(Arc::new);
     }
 
     fn ensure_strings(&mut self, zone: u16) {
@@ -178,6 +185,7 @@ impl DialogSession {
 
     /// Begin a VM-driven event for a server trigger.
     pub fn begin(&mut self, trigger: EventTrigger) -> Begin {
+        self.clear();
         let EventTrigger {
             event_zone,
             text_zone,
@@ -199,7 +207,8 @@ impl DialogSession {
         let Some(dat) = self.event_dat.as_ref() else {
             return undriveable(UndriveableReason::NoEventDat);
         };
-        let Some((block, source)) = dat.block_for_event(unique_no, event_id) else {
+        let Some((block, source)) = ffxi_event::EventVm::driving_block(dat, unique_no, event_id)
+        else {
             return undriveable(UndriveableReason::NoEventEntry);
         };
         if source != EventBlockSource::OwnBlock {
@@ -208,13 +217,17 @@ impl DialogSession {
                 unique_no = format!("0x{unique_no:08X}"),
                 event_id,
                 ?source,
-                "event id is not on the entity's own block; resolved elsewhere"
+                "event program resolved on another participating actor"
             );
         }
         let Some(mut runner) = DialogRunner::start(block, event_id, act_index, params) else {
             return undriveable(UndriveableReason::NoEventEntry);
         };
+        if let Some(position) = self.player_position {
+            runner.attach_scene(dat.clone(), block.actor, position);
+        }
         let step = runner.advance(None, strings);
+        self.scene_actions.extend(runner.take_scene_actions());
         self.cues.extend(
             runner
                 .take_cues()
@@ -236,11 +249,11 @@ impl DialogSession {
                 Begin::Frame(dialog)
             }
             DialogStep::Ended { end_para } => {
-                self.clear();
+                self.finish();
                 Begin::Ended { end_para }
             }
             DialogStep::Stopped(op) => {
-                self.clear();
+                self.finish();
                 Begin::Undriveable {
                     stopped_op: Some(op),
                     reason: UndriveableReason::StoppedOnOpcode,
@@ -254,19 +267,33 @@ impl DialogSession {
         }
     }
 
+    pub(crate) fn step(
+        &mut self,
+        drive: crate::session::event_transport::Drive,
+        _permit: &crate::session::event_transport::DrivePermit,
+    ) -> Advance {
+        use crate::session::event_transport::Drive;
+        match drive {
+            Drive::Cancel => self.cancel(),
+            Drive::Choice(choice) => self.advance(Some(choice)),
+            Drive::Tick(seconds) => self.tick(seconds),
+        }
+    }
+
     /// Apply the player's response (dismiss, or `Some(index)` choice) and return
     /// the next frame or [`Advance::Ended`]. Call only while [`active_end`] is
     /// `Some`.
     ///
     /// [`active_end`]: Self::active_end
-    pub fn advance(&mut self, choice: Option<u32>) -> Advance {
+    fn advance(&mut self, choice: Option<u32>) -> Advance {
         self.drive(|runner, strings| runner.advance(choice, strings))
     }
 
     /// Cancel the in-progress event from any frame (the Esc path): the VM
     /// reports the frame's cancel result and ends with
     /// [`ffxi_event::EVENT_CANCELLED_END_PARA`].
-    pub fn cancel(&mut self) -> Advance {
+    fn cancel(&mut self) -> Advance {
+        self.scene_actions.clear();
         self.drive(|runner, strings| runner.cancel(strings))
     }
 
@@ -276,7 +303,7 @@ impl DialogSession {
     /// desynced call releases the event rather than wedging it open.
     ///
     /// [`active_end`]: Self::active_end
-    pub fn tick(&mut self, dt_secs: f32) -> Advance {
+    fn tick(&mut self, dt_secs: f32) -> Advance {
         self.drive(|runner, strings| runner.tick(dt_secs, strings))
     }
 
@@ -286,11 +313,16 @@ impl DialogSession {
             self.runner.as_mut(),
             self.active.as_ref(),
         ) else {
-            self.clear();
-            return Advance::Ended { end_para: 0 };
+            self.finish();
+            return Advance::Ended {
+                end_para: 0,
+                final_position: None,
+            };
         };
         let event_entity = active.unique_no;
         let outcome = step(runner, strings);
+        let final_position = runner.controlled_position();
+        self.scene_actions.extend(runner.take_scene_actions());
         let cues: Vec<ResolvedCue> = runner
             .take_cues()
             .into_iter()
@@ -300,24 +332,74 @@ impl DialogSession {
             DialogStep::Frame(frame) => {
                 Advance::Frame(frame_to_dialog(active, frame, &self.player_name))
             }
-            DialogStep::Ended { end_para } => Advance::Ended { end_para },
+            DialogStep::Ended { end_para } => Advance::Ended {
+                end_para,
+                final_position,
+            },
             DialogStep::Stopped(op) => {
                 tracing::warn!(
                     op = format!("0x{op:02X}"),
                     "event VM stopped mid-dialog; releasing with end_para 0"
                 );
-                Advance::Ended { end_para: 0 }
+                Advance::Ended {
+                    end_para: 0,
+                    final_position: None,
+                }
             }
             DialogStep::Waiting => Advance::Waiting,
         };
         self.cues.extend(cues);
         if matches!(advance, Advance::Ended { .. }) {
-            self.clear();
+            self.finish();
         }
         advance
     }
 
+    pub fn set_player_position(&mut self, position: ffxi_event::vm::scene::EventPosition) {
+        self.player_position = Some(position);
+    }
+
+    pub fn controls_player_position(&self) -> bool {
+        self.runner
+            .as_ref()
+            .is_some_and(|r| r.controls_player_position())
+    }
+
+    pub(crate) fn drain_scene_actions(
+        &mut self,
+        _permit: &crate::session::event_transport::DrivePermit,
+    ) -> Vec<ffxi_event::vm::scene::SceneAction> {
+        self.take_scene_actions()
+    }
+
+    fn take_scene_actions(&mut self) -> Vec<ffxi_event::vm::scene::SceneAction> {
+        std::mem::take(&mut self.scene_actions)
+    }
+
+    pub fn acknowledge_position(&mut self, position: ffxi_event::vm::scene::EventPosition) {
+        if let Some(runner) = &mut self.runner {
+            runner.acknowledge_position(position);
+        }
+    }
+
+    pub fn reject_position(&mut self) {
+        if let Some(runner) = &mut self.runner {
+            runner.reject_position();
+        }
+    }
+
+    pub fn acknowledge_event(&mut self) {
+        if let Some(runner) = &mut self.runner {
+            runner.acknowledge_event();
+        }
+    }
+
     pub fn clear(&mut self) {
+        self.scene_actions.clear();
+        self.finish();
+    }
+
+    fn finish(&mut self) {
         self.runner = None;
         self.active = None;
     }
@@ -680,11 +762,33 @@ fn resolve_fishing(
     let unknown = |candidates: Option<Vec<u16>>| -> (FishingChat, ServerBase) {
         let mut verified = Vec::new();
         for base in [install_base, pin_base] {
+            if candidates.as_ref().is_some_and(|c| !c.contains(&base)) {
+                continue;
+            }
             if verified.iter().any(|&(b, _, _)| b == base) {
                 continue;
             }
             if let Some((offset, text)) = hypothesis(base) {
                 verified.push((base, offset, text));
+            }
+        }
+        // Catch opcodes distinguish the sparse catch entries; TALKNUM's dense
+        // status entries cannot identify an adjacent text-table revision.
+        // vendor/server/src/map/utils/fishingutils.cpp CatchFish
+        if verified.is_empty() && opcode == ffxi_proto::map::s2c::TALKNUMWORK2 {
+            for base in [install_base, pin_base].into_iter().flat_map(|base| {
+                [base.checked_sub(1), base.checked_add(1)]
+                    .into_iter()
+                    .flatten()
+            }) {
+                if verified.iter().any(|&(b, _, _)| b == base)
+                    || candidates.as_ref().is_some_and(|c| !c.contains(&base))
+                {
+                    continue;
+                }
+                if let Some((offset, text)) = hypothesis(base) {
+                    verified.push((base, offset, text));
+                }
             }
         }
         if verified.len() == 1 {
@@ -1038,7 +1142,7 @@ fn load_strings(root: Option<&DatRoot>, zone: u16) -> Option<StringDat> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// A miniature fishing block: offsets relative to a base, mirroring the
@@ -1116,6 +1220,34 @@ mod tests {
             PIN,
             INSTALL,
             PIN + kind::NOCATCH as u16,
+            s2c::TALKNUM,
+            server,
+        );
+        assert_eq!(line_text(&chat), Some("You didn't catch anything."));
+    }
+
+    #[test]
+    fn ferry_catch_from_adjacent_server_revision_resolves_before_local_fishing() {
+        const FERRY_PIN: u16 = 7250;
+        const FERRY_INSTALL: u16 = 7241;
+        const FERRY_SERVER: u16 = 7249;
+        const REPORTED_CATCH: u16 = 7288;
+        let dat = FakeDat::new();
+        let (chat, server) = resolve_fishing(
+            &dat.printable(),
+            FERRY_PIN,
+            FERRY_INSTALL,
+            REPORTED_CATCH,
+            s2c::TALKNUMWORK2,
+            ServerBase::Unknown,
+        );
+        assert_eq!(line_text(&chat), Some("{ChocoboName:0} caught  {Item:0}!"));
+        assert!(matches!(server, ServerBase::Known(FERRY_SERVER)));
+        let (chat, _) = resolve_fishing(
+            &dat.printable(),
+            FERRY_PIN,
+            FERRY_INSTALL,
+            FERRY_SERVER + u16::from(kind::NOCATCH),
             s2c::TALKNUM,
             server,
         );
@@ -1276,6 +1408,106 @@ mod tests {
             buf.extend(e.iter().map(|b| b ^ STRING_DAT_TEXT_XOR));
         }
         buf
+    }
+
+    pub(crate) fn contract_session(
+        dat: EventDat,
+        event_zone: u16,
+        text_zone: u16,
+    ) -> DialogSession {
+        let mut session = DialogSession::new(None, "Test".into());
+        session.loaded_event_zone = Some(event_zone);
+        session.loaded_string_zone = Some(text_zone);
+        session.event_dat = Some(Arc::new(dat));
+        session.strings = Some(
+            StringDat::parse(&synth_dat(&[
+                b"Balance {Num:0}, fare {Num:1}\0",
+                b"Accepted: {Num:0}, fare {Num:1}\0",
+                b"Insufficient: {Num:0}, fare {Num:1}\0",
+            ]))
+            .unwrap(),
+        );
+        session
+    }
+
+    fn position_update_session() -> (DialogSession, EventTrigger) {
+        const ZONE: u16 = 248;
+        const ACTOR: u32 = 17_793_078;
+        const EVENT: u16 = 221;
+        let block = ffxi_dat::event_dat::EventBlock {
+            actor: ACTOR,
+            event_ids: vec![EVENT],
+            event_offsets: vec![0],
+            references: vec![33_762, (-31_432i32) as u32, (-2_558i32) as u32, 0],
+            event_data: vec![0x47, 0, 0, 0x80, 1, 0x80, 2, 0x80, 3, 0x80, 0x47, 1, 0x21],
+        };
+        let mut session = DialogSession::new(None, "Test".into());
+        session.loaded_event_zone = Some(ZONE);
+        session.loaded_string_zone = Some(ZONE);
+        session.event_dat = Some(Arc::new(EventDat {
+            blocks: vec![block],
+        }));
+        session.strings = Some(StringDat::parse(&synth_dat(&[b"test"])).unwrap());
+        session.set_player_position(ffxi_event::vm::scene::EventPosition::default());
+        let trigger = EventTrigger {
+            event_zone: ZONE,
+            text_zone: ZONE,
+            unique_no: ACTOR,
+            act_index: 54,
+            event_id: EVENT,
+            params: vec![],
+            npc_name: None,
+        };
+        (session, trigger)
+    }
+
+    #[test]
+    fn position_update_resumes_only_after_both_server_acknowledgements() {
+        let (mut session, trigger) = position_update_session();
+        assert!(matches!(session.begin(trigger), Begin::Waiting));
+        let actions = session.take_scene_actions();
+        let [ffxi_event::vm::scene::SceneAction::PositionUpdate { position, .. }] =
+            actions.as_slice()
+        else {
+            panic!("{actions:?}")
+        };
+        session.acknowledge_position(*position);
+        assert!(matches!(session.tick(0.2), Advance::Waiting));
+        session.acknowledge_event();
+        assert!(matches!(
+            session.tick(0.2),
+            Advance::Ended {
+                end_para: 0,
+                final_position: Some(final_position)
+            } if final_position == *position
+        ));
+        assert!(session.active_end().is_none());
+    }
+
+    #[test]
+    fn companion_program_keeps_the_trigger_identity_for_server_replies() {
+        let (mut session, trigger) = position_update_session();
+        let original = (trigger.unique_no, trigger.act_index, trigger.event_id);
+        let dat = Arc::make_mut(session.event_dat.as_mut().unwrap());
+        let mut companion = dat.blocks[0].clone();
+        companion.actor += 1;
+        dat.blocks[0].event_data = vec![0];
+        dat.blocks.push(companion);
+        assert!(matches!(session.begin(trigger), Begin::Waiting));
+        assert_eq!(session.active_end(), Some(original));
+        assert_eq!(session.take_scene_actions().len(), 1);
+    }
+
+    #[test]
+    fn clear_and_cancel_discard_unsent_position_updates() {
+        let (mut session, trigger) = position_update_session();
+        assert!(matches!(session.begin(trigger), Begin::Waiting));
+        session.clear();
+        assert!(session.take_scene_actions().is_empty());
+        let (mut session, trigger) = position_update_session();
+        assert!(matches!(session.begin(trigger), Begin::Waiting));
+        assert!(matches!(session.cancel(), Advance::Ended { .. }));
+        assert!(session.take_scene_actions().is_empty());
     }
 
     /// The landmark scan must find the block at its shifted position and

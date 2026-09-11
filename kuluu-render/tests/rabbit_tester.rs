@@ -7,15 +7,15 @@
 //! D3/D4), death fall-over on Defeated (D5), and limb selection from BATTLE2's animation field
 //! with the ati0 fallback (D6).
 //!
-//! Ground truth: retail DATs under `C:\PhoenixXI\SquareEnix\FINAL FANTASY XI` - Rarab = 1569 =
+//! Ground truth: the retail DATs - Rarab = 1569 =
 //! ROM/4/109.DAT (zone 115 entity 17248272, no weapon; ships dfi?/dfm?, wlk0/idl0/run0/ded0/cor0,
 //! routines ati0..2/atf0/dead/corp/damg/sdam/ldam/gurd/pary/sway + degenerate `init`); HumeM
 //! skeleton 7072 (ROM/27/82.DAT) with main-hand weapon 8392 whose motion base is 9672
 //! (ROM/32/13.DAT - ships ati0..2, NO bti0). XIM: EffectRoutineInterpolatedEffects.kt
 //! FlinchAnimationInstance, poc/Actor.kt onDisplayDeath. LSB: vendor/server/src/map/packets/
 //! s2c/0x028_battle2.cpp GP_SERV_COMMAND_BATTLE2::pack (wire layout), attack.h AttackAnimation
-//! (limb). Scenarios S1–S10 per
-//! artifacts/rabbit_tester/plan.md §4; assertions are ordering/ranges, not exact frames.
+//! (limb). Assertions are
+//! ordering/ranges, not exact frames.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -165,10 +165,7 @@ fn action_event(bytes: &[u8]) -> ViewerEvent {
         target_id: h.primary_target_id,
         result: h.first_result.map(|r| r.to_wire()),
         animation: h.animation,
-        info: h.first_info,
-        hit_distortion: h.first_hit_distortion,
-        knockback: h.first_knockback,
-        kind: h.first_kind,
+        outcome: h.first_outcome.map(|o| o.to_wire()),
     }
 }
 
@@ -311,17 +308,28 @@ fn spawn_actor(
     (parent, child)
 }
 
+/// None only when there is no retail install (the guard prints its skip); a model that exists
+/// but fails to load is a failure, not a skip.
+fn load_model(file: u32) -> Option<LoadedActor> {
+    install()?;
+    Some(load_npc(file).unwrap_or_else(|e| panic!("model DAT {file} failed to load: {e:?}")))
+}
+
 fn load_rarab() -> Option<LoadedActor> {
-    install().and_then(|_| load_npc(RARAB_FILE).ok())
+    load_model(RARAB_FILE)
 }
 
 fn load_worm() -> Option<LoadedActor> {
-    install().and_then(|_| load_npc(WORM_FILE).ok())
+    load_model(WORM_FILE)
 }
 
 fn load_nolda() -> Option<LoadedActor> {
-    install().and_then(|_| load_npc(NOLDA_FILE).ok())
+    load_model(NOLDA_FILE)
 }
+
+/// The inlined 0x2B DamageCallback of ati0 lands at routine frame 36 (dada @32 + 4 delay); a
+/// reaction earlier than this fired on packet arrival, not at the callback.
+const IMPACT_FRAME_MIN: u32 = 30;
 
 /// HumeM skeleton with a main-hand weapon: the armed-race base whose motion DAT ships ati0..2
 /// but no bti0/cti0/dti0 (the D6 fallback case).
@@ -537,7 +545,7 @@ fn s4_run_gait_selects_run_clip() {
 
 /// Rarab swings RightAttack at HumeM (Hit, dist=0, kb=0). Expect: at0? on the attacker from
 /// ~frame 1; at the inlined-0x2B impact (~36 for ati0) HumeM runs `damg` (it ships no sdam of
-/// its own - F54 table falls through to damg) and its flinch stage starts dfm? on the PC host.
+/// its own - the reaction table falls through to damg) and its flinch stage starts dfm? on the PC host.
 #[test]
 fn s5_swing_impact_runs_damg_and_flinches_the_pc() {
     let (Some(rarab), Some(humem)) = (load_rarab(), load_humem()) else {
@@ -564,7 +572,7 @@ fn s5_swing_impact_runs_damg_and_flinches_the_pc() {
             && active_clip(w, vic_child).is_some_and(|c| c.starts_with("dfm"))
     });
     assert!(
-        impact_at.is_some(),
+        impact_at.is_some_and(|f| f >= IMPACT_FRAME_MIN),
         "victim reaction (damg + dfm? flinch) fired at the inlined-0x2B frame (~36), not on \
          packet arrival"
     );
@@ -589,7 +597,7 @@ fn s5b_mob_victim_normal_hit_runs_damg_and_flinches() {
             && active_clip(w, vic_child).is_some_and(|c| c.starts_with("dfi"))
     });
     assert!(
-        impact_at.is_some(),
+        impact_at.is_some_and(|f| f >= IMPACT_FRAME_MIN),
         "normal hit runs damg + dfi? flinch on the mob victim"
     );
     // The attacker still swung (sanity: the chain armed from this swing's 0x2B).
@@ -600,7 +608,7 @@ fn s5b_mob_victim_normal_hit_runs_damg_and_flinches() {
 // S6/S6b - crits: ldam + flinch, no sway at kb=0
 // ---------------------------------------------------------------------------
 
-/// S6: Hit with hit_distortion=3 (Heavy = the crit case, F54) runs `ldam` on HumeM and its
+/// S6: Hit with info=CriticalHit runs `ldam` on HumeM and its
 /// flinch stage starts dfm?; kb=0 adds no sway.
 #[test]
 fn s6_crit_runs_ldam_and_flinches_the_pc() {
@@ -613,14 +621,14 @@ fn s6_crit_runs_ldam_and_flinches_the_pc() {
     step_n(&mut app, 10);
 
     // res=Hit(0), anim=RightAttack(0), info=0, dist=3 (Heavy/crit), kb=0.
-    push_battle2(&mut app, RARAB_W, 1, Some(HUMEM_W), Some((0, 0, 0, 3, 0)));
+    push_battle2(&mut app, RARAB_W, 1, Some(HUMEM_W), Some((0, 0, 2, 3, 0)));
 
     let (impact_at, _) = watch(&mut app, 45, |_i, w| {
         routines(w, vic_parent).contains(b"ldam")
             && active_clip(w, vic_child).is_some_and(|c| c.starts_with("dfm"))
     });
     assert!(
-        impact_at.is_some(),
+        impact_at.is_some_and(|f| f >= IMPACT_FRAME_MIN),
         "crit runs ldam + dfm? flinch at the impact frame"
     );
 
@@ -640,14 +648,14 @@ fn s6b_crit_flinches_the_mob_with_dfi() {
     let (vic_parent, vic_child) = spawn_actor(&mut app, RARAB2_W, EntityKind::Mob, &rarab);
     step_n(&mut app, 10);
 
-    push_battle2(&mut app, RARAB_W, 1, Some(RARAB2_W), Some((0, 0, 0, 3, 0)));
+    push_battle2(&mut app, RARAB_W, 1, Some(RARAB2_W), Some((0, 0, 2, 3, 0)));
 
     let (impact_at, _) = watch(&mut app, 45, |_i, w| {
         routines(w, vic_parent).contains(b"ldam")
             && active_clip(w, vic_child).is_some_and(|c| c.starts_with("dfi"))
     });
     assert!(
-        impact_at.is_some(),
+        impact_at.is_some_and(|f| f >= IMPACT_FRAME_MIN),
         "crit flinches the mob victim with dfi?"
     );
     // The attacker still swung (sanity: the chain armed from this swing's 0x2B).
@@ -655,7 +663,7 @@ fn s6b_crit_flinches_the_mob_with_dfi() {
 }
 
 /// S6c: crit on a victim whose DAT ships no `ldam` of its own (ROM/172/67.DAT), with the global
-/// effect dir removed so ROM/0/0.DAT's ldam cannot rescue it. The F54 guard must fall back to
+/// effect dir removed so ROM/0/0.DAT's ldam cannot rescue it. The crit guard must fall back to
 /// the normal `damg` reaction instead of arming an unresolvable ldam, which post Step 1 falls
 /// through to nothing. All eight retail PC skeletons ship their own ldam (verified against the
 /// install), so this fallback is reachable only on mob victims; S6 covers the PC side of the
@@ -672,13 +680,13 @@ fn s6c_crit_without_ldam_falls_back_to_damg() {
     drop_global_effect_dir(&mut app);
 
     // res=Hit(0), anim=RightAttack(0), info=0, dist=3 (Heavy/crit), kb=0.
-    push_battle2(&mut app, RARAB_W, 1, Some(NOLDA_W), Some((0, 0, 0, 3, 0)));
+    push_battle2(&mut app, RARAB_W, 1, Some(NOLDA_W), Some((0, 0, 2, 3, 0)));
 
     let (impact_at, _) = watch(&mut app, 45, |_i, w| {
         routines(w, vic_parent).contains(b"damg") && !routines(w, vic_parent).contains(b"ldam")
     });
     assert!(
-        impact_at.is_some(),
+        impact_at.is_some_and(|f| f >= IMPACT_FRAME_MIN),
         "crit on a no-ldam victim runs the damg fallback at the impact frame, not an \
          unresolvable ldam"
     );
@@ -706,7 +714,7 @@ fn s6d_medium_hit_without_ldam_still_runs_damg() {
         routines(w, vic_parent).contains(b"damg")
     });
     assert!(
-        impact_at.is_some(),
+        impact_at.is_some_and(|f| f >= IMPACT_FRAME_MIN),
         "non-crit hits on a no-ldam victim still run damg (the crit guard does not leak into \
          dist 0/1/2)"
     );
@@ -851,7 +859,7 @@ fn s7a_miss_runs_sway() {
         routines(w, vic_parent).contains(b"sway")
     });
     assert!(
-        impact_at.is_some(),
+        impact_at.is_some_and(|f| f >= IMPACT_FRAME_MIN),
         "miss runs sway on the victim at the impact frame"
     );
 }
@@ -873,7 +881,7 @@ fn s7b_guard_plays_gud_clip() {
             && active_clip(w, vic_child).is_some_and(|c| c.starts_with("gud"))
     });
     assert!(
-        impact_at.is_some(),
+        impact_at.is_some_and(|f| f >= IMPACT_FRAME_MIN),
         "guard plays the gud? clip via gurd's Motion stage"
     );
 }
@@ -895,12 +903,12 @@ fn s7c_parry_plays_gud_clip() {
             && active_clip(w, vic_child).is_some_and(|c| c.starts_with("gud"))
     });
     assert!(
-        impact_at.is_some(),
+        impact_at.is_some_and(|f| f >= IMPACT_FRAME_MIN),
         "parry plays the gud? clip via pary's Motion stage"
     );
 }
 
-/// S7d: Hit with knockback level 2 runs the damage reaction AND `sway` alongside (finding F52). The
+/// S7d: Hit with knockback level 2 runs the damage reaction AND `sway` alongside. The
 /// victim is fresh - no ActiveSchedulers yet - so both routines land in one same-batch insert;
 /// this pins the merge fix that kept the sway insert from overwriting the damage reaction.
 #[test]
@@ -918,20 +926,20 @@ fn s7d_knockback_adds_sway_alongside_the_damage_reaction() {
         routines(w, vic_parent).contains(b"damg") && routines(w, vic_parent).contains(b"sway")
     });
     assert!(
-        impact_at.is_some(),
+        impact_at.is_some_and(|f| f >= IMPACT_FRAME_MIN),
         "kb>0 runs the damage reaction and sway together (F52)"
     );
 }
 
 // ---------------------------------------------------------------------------
-// S8 - stun: observation only
+// S8b - stun: observation only
 // ---------------------------------------------------------------------------
 
-/// S8: BATTLE2 carries no stun payload - the status byte path is untraced in LSB, so this
+/// S8b: BATTLE2 carries no stun payload - the status byte path is untraced in LSB, so this
 /// scenario documents what the snapshot carries instead of asserting a DAT-driven stun clip.
 /// A result-less body must not arm any reaction and must not panic.
 #[test]
-fn s8_resultless_body_arms_nothing() {
+fn s8b_resultless_body_arms_nothing() {
     let Some(rarab) = load_rarab() else { return };
     let mut app = build_app();
     spawn_actor(&mut app, RARAB_W, EntityKind::Mob, &rarab);
@@ -943,7 +951,7 @@ fn s8_resultless_body_arms_nothing() {
     step_n(&mut app, 60);
 
     // The only routine the victim may carry is `init`, the create-time load routine: first
-    // observation takes the hidden->visible resurface path (finding F53) and every model that ships an
+    // observation takes the hidden->visible resurface path and every model that ships an
     // init runs it on spawn, Rarab's degenerate one included. That is not a reaction to this
     // BATTLE2; anything else would be.
     let got = routines(app.world(), vic_parent);
@@ -960,7 +968,7 @@ fn s8_resultless_body_arms_nothing() {
 // S9 - Defeated: the dead routine falls over instead of popping to a corpse
 // ---------------------------------------------------------------------------
 
-/// S9: Hit with info=Defeated on a Rarab victim. The `dead` routine runs immediately (finding F49):
+/// S9: Hit with info=Defeated on a Rarab victim. The `dead` routine runs immediately:
 /// ded? fall-over at its first Motion stage, and the pose pass holds idle across the gap -
 /// never flashing cor? before ded? owns the pose (D5). build_app pins the pose pass between
 /// dispatch_melee_action_started and tick_active_schedulers so the D5 hold path runs on the
@@ -978,7 +986,7 @@ fn s9_defeated_runs_dead_routine_and_holds_idle_across_the_gap() {
     // res=Hit(0), info bit1 = Defeated.
     push_battle2(&mut app, RARAB_W, 1, Some(RARAB2_W), Some((0, 0, 1, 0, 0)));
 
-    // The dead routine is queued on the event's frame (F49: same-frame death path).
+    // The dead routine is queued on the event's frame (same-frame death path).
     let (queued_at, _) = watch(&mut app, 3, |i, w| {
         i >= 1 && routines(w, vic_parent).contains(b"dead")
     });
@@ -989,18 +997,17 @@ fn s9_defeated_runs_dead_routine_and_holds_idle_across_the_gap() {
 
     // No cor? flash across the gap: from the event through the fall-over start the pose stays
     // off the corpse clip, and the ded? fall-over starts within a few frames.
-    let (ded_at, samples) = watch(&mut app, 12, |_i, w| {
+    let mut cor_flashed = false;
+    let (ded_at, _) = watch(&mut app, 12, |_i, w| {
+        cor_flashed |= pose_clip(w, vic_child).is_some_and(|c| c.starts_with("cor"));
         active_clip(w, vic_child).is_some_and(|c| c.starts_with("ded"))
     });
     assert!(
         ded_at.is_some(),
         "the ded? fall-over clip starts within a few frames"
     );
-    let no_cor_flash = samples
-        .iter()
-        .all(|_| !pose_clip(app.world(), vic_child).is_some_and(|c| c.starts_with("cor")));
     assert!(
-        no_cor_flash,
+        !cor_flashed,
         "the pose pass held idle across the fall-over gap - no cor? flash"
     );
 }
@@ -1079,8 +1086,8 @@ fn s10b_left_attack_with_bti0_plays_the_limb_clip() {
 // ---------------------------------------------------------------------------
 
 /// S11: the frozen-mob regression. A nonzero animationsub names a special routine on the wire
-/// (sub 1 -> `ini1`, FFXiMain.dll F37); retail plays that name on the model and no-ops when the
-/// model does not ship it (finding F44). Rarab's DAT ships no `ini1` routine, so the special tier must
+/// (sub 1 -> `ini1`, FFXiMain.dll); retail plays that name on the model and no-ops when the
+/// model does not ship it. Rarab's DAT ships no `ini1` routine, so the special tier must
 /// fall through to locomotion instead of pinning current_clip: a not-moving mob idles on idl?
 /// and keeps animating. Before the fall-through fix the miss registered the idle fallback as a
 /// one-shot, which held its end frame forever (the spawn-pose freeze).
@@ -1096,9 +1103,9 @@ fn s11_missing_routine_falls_through_on_a_model_without_ini1() {
     let mut app = build_app();
     let (_, child) = spawn_actor(&mut app, RARAB_W, EntityKind::Mob, &loaded);
 
-    // First observation at sub 0: retail's create path runs 'init' on the new actor (finding F53).
+    // First observation at sub 0: retail's create path runs 'init' on the new actor.
     // Rarab ships no usable init motion, so the pose stays on idle; stepping also establishes
-    // the prev state that makes the sub change below a genuine F37 trigger instead of another
+    // the prev state that makes the sub change below a genuine table trigger instead of another
     // create.
     step_n(&mut app, 2);
 
@@ -1145,7 +1152,7 @@ fn s11_missing_routine_falls_through_on_a_model_without_ini1() {
 // ---------------------------------------------------------------------------
 
 /// S12: the full special-pose lifecycle on a model that ships both routines (ROM/5/64.DAT).
-/// First observation is a retail actor create and runs 'init' (finding F53): the pop-up sp0? plays once
+/// First observation is a retail actor create and runs 'init': the pop-up sp0? plays once
 /// and holds its end frame while the wire state stays up, with the model root visible throughout.
 /// Retail hides only on status INVISIBLE, never on clip completion. A sub change then fires ini1
 /// (dig-down sp1?), the buried window hides on status, resurface replays init instead of re-firing

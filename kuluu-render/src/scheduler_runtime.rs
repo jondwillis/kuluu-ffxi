@@ -116,7 +116,7 @@ pub enum MotionStages {
 
 // One running routine. Not a component on its own anymore: an entity can run several routines at
 // once - retail runs a hit reaction alongside the swing that caused it (ActionTimer1 counted 2 and
-// 3, F49/F52) - so the runtime keeps them in `ActiveSchedulers`, one entry per routine with its own
+// 3) - so the runtime keeps them in `ActiveSchedulers`, one entry per routine with its own
 // frame clock.
 #[derive(Debug, Clone)]
 pub struct ActiveScheduler {
@@ -210,7 +210,7 @@ impl ActiveScheduler {
     }
 
     /// True while this routine's AnimationLock interval covers `frame`: any 0x07/0x59 stage with
-    /// `stage.frame <= frame < stage.frame + duration_frames` (findings F49/F55/F57). A routine with no
+    /// `stage.frame <= frame < stage.frame + duration_frames`. A routine with no
     /// lock stage never locks.
     pub fn locks_at(&self, frame: u32) -> bool {
         self.stages.iter().any(|t| {
@@ -220,15 +220,21 @@ impl ActiveScheduler {
         })
     }
 
+    /// The routine timeline ends when its last stage ends, not when it starts: a trailing
+    /// AnimationLock must keep the routine alive for its whole `duration_frames`.
     pub fn last_frame(&self) -> u32 {
-        self.stages.last().map(|t| t.frame).unwrap_or(0)
+        self.stages
+            .iter()
+            .map(|t| t.frame + t.stage.duration_frames as u32)
+            .max()
+            .unwrap_or(0)
     }
 }
 
-/// The routines an entity is running right now - one entry per routine (F49/F52). Retail's
-// AnimationLock is a refcount across overlapping routines, so the lock test is "any entry holds
-// its interval at its own current frame" rather than a separate counter. Stripped with
-// `ActionAssets`/`ActionTarget` when the last entry finishes.
+/// The routines an entity is running right now - one entry per routine. Retail's
+/// AnimationLock is a refcount across overlapping routines, so the lock test is "any entry holds
+/// its interval at its own current frame" rather than a separate counter. Stripped with
+/// `ActionAssets`/`ActionTarget` when the last entry finishes.
 #[derive(Component, Debug, Clone, Default)]
 pub struct ActiveSchedulers {
     routines: Vec<ActiveScheduler>,
@@ -249,13 +255,13 @@ impl ActiveSchedulers {
         Self { routines: entries }
     }
 
-    /// Enqueue a routine alongside the running ones instead of replacing them (F49/F52).
+    /// Enqueue a routine alongside the running ones instead of replacing them.
     pub fn push(&mut self, active: ActiveScheduler) {
         self.routines.push(active);
     }
 
     /// True while any entry's AnimationLock interval covers its own current frame - the refcount>0
-    /// test itself (ActionTimer1 reached 2 and 3 when a hit reaction overlapped a swing, F49/F57).
+    /// test itself (ActionTimer1 reached 2 and 3 when a hit reaction overlapped a swing).
     pub fn is_locked_now(&self) -> bool {
         self.routines.iter().any(|r| r.locks_at(r.current_frame()))
     }
@@ -282,7 +288,7 @@ impl ActiveSchedulers {
     /// True while an entry named `dead` has a Motion stage in its timeline but none has fired
     /// yet (the cursor has not passed the first one): the gap between the Defeated latch and
     /// the ded? fall-over starting. The pose pass holds idle across that window instead of
-    /// flashing cor? (kuluu-df9t D5). A `dead` routine with no Motion stage never reports.
+    /// flashing cor?. A `dead` routine with no Motion stage never reports.
     pub fn dead_fall_over_pending(&self) -> bool {
         self.routines.iter().any(|r| {
             r.name == *b"dead"
@@ -350,7 +356,7 @@ pub fn tick_active_schedulers(
 }
 
 // 0x5F StopRoutine - the worm's dig (`ini1`) stops `init` and its pop-up stops `ini1` this way
-// (findings F46/F57). xim stops every sequence named by the stage on the same actor; here that is a plain
+//. xim stops every sequence named by the stage on the same actor; here that is a plain
 // removal from the vec. The stopped routine's remaining stages simply never fire - including any
 // 0x2D StopParticle, which retail does not run for a stopped sequence either
 // (EffectRoutineInstance.kt stop).
@@ -487,7 +493,7 @@ const MAX_SUBROUTINE_DEPTH: usize = 6;
 // impact frame, and it holds the 0x2B DamageCallback that hands off to the victim reaction.
 // When flattening cannot inline it (the global dir degraded to empty), the CALL survives as a
 // marker stage so `dispatch_damage_callback_stages` still fires on that frame instead of never
-// (kuluu-df9t D1/D2).
+//.
 const DADA_IMPACT_MARKER: [u8; 4] = *b"dada";
 
 // Knuth's MMIX LCG. Every DAT-driven choice the format leaves unauthored (random routine
@@ -548,7 +554,7 @@ fn flatten_routine(
     for t in &s.stages {
         if let Some(g) = t.stage.random_group {
             let i = index_in_group.entry(g).or_insert(0);
-            let is_pick = chosen.get(&g) == Some(i);
+            let is_pick = chosen.get(&g) == Some(&*i);
             *i += 1;
             if !is_pick {
                 continue;
@@ -562,7 +568,7 @@ fn flatten_routine(
                 // branch. Callers that know the condition dispatch the branch itself - but the
                 // CALL still survives flattening as a marker stage: `dada`, the swing's impact
                 // carrier, tail-calls such switches, and with a degraded global dir its 0x2B
-                // would otherwise vanish from the timeline entirely (kuluu-df9t D1/D2).
+                // would otherwise vanish from the timeline entirely.
                 match lookup.get(&t.stage.id) {
                     Some(c) if c.has_control_flow() => out.push(TimedStage {
                         frame,
@@ -914,7 +920,6 @@ fn apply_action_dispatch(
     global: Option<&GlobalEffectDir>,
     actor_entity: Entity,
     target_entity: Option<Entity>,
-    q_scheds: &mut Query<&mut ActiveSchedulers>,
     commands: &mut Commands,
 ) {
     // A spell DAT's `main` links the caster's own finish routine (0x3C `shbk`), which in turn
@@ -935,17 +940,12 @@ fn apply_action_dispatch(
     let Some(active) = active else { return };
     // A completion effect alongside a running cast (or vice versa) is normal retail behaviour -
     // push instead of replacing. The first writer's ActionAssets/ActionTarget stay put, matching
-    // the old try_insert semantics when the component was already present.
-    match q_scheds.get_mut(actor_entity) {
-        Ok(mut scheds) => scheds.push(active),
-        Err(_) => {
-            commands
-                .entity(actor_entity)
-                .insert(ActiveSchedulers::one(active))
-                .try_insert(parsed.assets.clone())
-                .try_insert(ActionTarget(target_entity));
-        }
-    }
+    // the `_if_new` inserts keep them when the component was already present.
+    enqueue_routine(commands, actor_entity, active);
+    commands
+        .entity(actor_entity)
+        .try_insert_if_new(parsed.assets.clone())
+        .try_insert_if_new(ActionTarget(target_entity));
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -954,7 +954,6 @@ fn apply_emote_dispatch(
     routine: &[u8; 4],
     actor_entity: Entity,
     target_entity: Option<Entity>,
-    q_scheds: &mut Query<&mut ActiveSchedulers>,
     commands: &mut Commands,
 ) -> bool {
     let Some(active) = ActiveScheduler::from_main(&parsed.schedulers, routine) else {
@@ -962,16 +961,11 @@ fn apply_emote_dispatch(
     };
     // Same insert-or-push as apply_action_dispatch: an emote mid-cast (or a cast mid-emote)
     // runs alongside the other instead of replacing it.
-    match q_scheds.get_mut(actor_entity) {
-        Ok(mut scheds) => scheds.push(active),
-        Err(_) => {
-            commands
-                .entity(actor_entity)
-                .insert(ActiveSchedulers::one(active))
-                .try_insert(parsed.assets.clone())
-                .try_insert(ActionTarget(target_entity));
-        }
-    };
+    enqueue_routine(commands, actor_entity, active);
+    commands
+        .entity(actor_entity)
+        .try_insert_if_new(parsed.assets.clone())
+        .try_insert_if_new(ActionTarget(target_entity));
     true
 }
 
@@ -999,7 +993,6 @@ pub fn poll_action_dat_tasks(
     q_children: Query<&Children>,
     mut q_actors: Query<&mut crate::ffxi_actor_render::FfxiRenderActor>,
     global: Option<Res<GlobalEffectDir>>,
-    mut q_scheds: Query<&mut ActiveSchedulers>,
     mut commands: Commands,
 ) {
     use bevy::tasks::futures_lite::future;
@@ -1045,7 +1038,6 @@ pub fn poll_action_dat_tasks(
                     global.as_deref(),
                     actor_entity,
                     target_entity,
-                    &mut q_scheds,
                     &mut commands,
                 );
             }
@@ -1063,7 +1055,6 @@ pub fn poll_action_dat_tasks(
                     &routine,
                     actor_entity,
                     target_entity,
-                    &mut q_scheds,
                     &mut commands,
                 ) {
                     play_local_emote_clip(&routine, actor_entity, &q_children, &mut q_actors);
@@ -1182,7 +1173,7 @@ pub fn dispatch_motion_stages(
 // model's flinch clip ONCE (dfm? for PCs, dfi? otherwise), overwriting idle clips only and
 // skipping when the model is animation-locked. This is the visual half of a hit reaction: the
 // victim's `damg`/`ldam` routines are sound-only, so without this consumer a hit lands as SE +
-// attacker-side sparks while the victim stands still (kuluu-df9t D3).
+// attacker-side sparks while the victim stands still.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn dispatch_flinch_stages(
     mut events: MessageReader<SchedulerStageEvent>,
@@ -1203,9 +1194,7 @@ pub fn dispatch_flinch_stages(
         // XIM skips the flinch when the model is animation-locked or not currentlyIdle - a
         // swing/cast/death clip owns the pose then, and overwriting it would fight the lock.
         if q_scheds.get(host).is_ok_and(|s| s.is_locked_now()) {
-            if combat_log_enabled() {
-                println!("COMBAT_FLINCH host={} skip-locked", host.index());
-            }
+            tracing::debug!(target: "combat", "COMBAT_FLINCH host={} skip-locked", host.index());
             continue;
         }
         let pc = q_kind
@@ -1219,27 +1208,20 @@ pub fn dispatch_flinch_stages(
                 continue;
             };
             if !actor.is_pose_idle() {
-                if combat_log_enabled() {
-                    println!("COMBAT_FLINCH host={} skip-not-idle", host.index());
-                }
+                tracing::debug!(target: "combat", "COMBAT_FLINCH host={} skip-not-idle", host.index());
                 continue;
             }
             let Some(clip) = actor.flinch_clip(pc) else {
-                if combat_log_enabled() {
-                    println!("COMBAT_FLINCH host={} no-flinch-clip pc={pc}", host.index());
-                }
+                tracing::debug!(target: "combat", "COMBAT_FLINCH host={} no-flinch-clip pc={pc}", host.index());
                 continue;
             };
             // animationDuration drives the transition in/out - half-frame u16 units, so passing
-            // it whole yields XIM's animationDuration/2 frames each side; None payload → 0 s.
+            // it whole yields XIM's animationDuration/2 frames each side; no payload means no
+            // transition window.
             let anim_dur = ev.stage.stage.flinch_duration.unwrap_or(0.0).max(0.0);
-            if combat_log_enabled() {
-                println!(
-                    "COMBAT_FLINCH host={} clip={} pc={pc} dur={anim_dur}",
+            tracing::debug!(target: "combat", "COMBAT_FLINCH host={} clip={} pc={pc} dur={anim_dur}",
                     host.index(),
-                    clip.as_str()
-                );
-            }
+                    clip.as_str());
             actor.begin_completion_motion(
                 clip,
                 crate::ffxi_actor_render::CompletionMotion {
@@ -1273,7 +1255,7 @@ pub fn action_dat_file_id(
         6 => ffxi_vocab::action_anim::ability_file_id(action_id, animation),
         // research/xim MobAbilityTable.kt getFileTableOffset - mob skills (category 11) and pet
         // skills (category 13) key the effect DAT by the result's animation index with a range-
-        // dependent base; that DAT's `main` plays the caster's own sp?? clip (findings F51/F58).
+        // dependent base; that DAT's `main` plays the caster's own sp?? clip.
         11 | 13 => Some(ffxi_vocab::action_anim::mob_skill_file_id(animation?)),
         _ => None,
     }
@@ -1353,7 +1335,6 @@ pub fn dispatch_action_started(
     global: Option<Res<GlobalEffectDir>>,
     dll: Option<Res<ActionMainDll>>,
     mut cache: ResMut<ActionDatCache>,
-    mut q_scheds: Query<&mut ActiveSchedulers>,
     mut commands: Commands,
     mut last_seen: Local<u64>,
 ) {
@@ -1399,7 +1380,6 @@ pub fn dispatch_action_started(
                     global.as_deref(),
                     actor_entity,
                     target_entity,
-                    &mut q_scheds,
                     &mut commands,
                 );
             }
@@ -1454,7 +1434,6 @@ pub fn dispatch_cast_routine_started(
     q_cast: Query<&CastRoutine>,
     mut sim: ResMut<crate::particle_sim::ParticleSimulator>,
     mut spell_suffix: ResMut<crate::ffxi_actor_render::SpellSuffixCache>,
-    mut q_scheds: Query<&mut ActiveSchedulers>,
     mut commands: Commands,
     mut last_seen: Local<u64>,
 ) {
@@ -1517,14 +1496,7 @@ pub fn dispatch_cast_routine_started(
         };
         // A cast alongside a running completion effect (or vice versa) runs concurrently in
         // retail; the push path leaves the first writer's ActionTarget alone.
-        match q_scheds.get_mut(actor_entity) {
-            Ok(mut scheds) => scheds.push(active),
-            Err(_) => {
-                commands
-                    .entity(actor_entity)
-                    .insert(ActiveSchedulers::one(active));
-            }
-        }
+        enqueue_routine(&mut commands, actor_entity, active);
         commands
             .entity(actor_entity)
             .try_insert(CastRoutine {
@@ -1540,28 +1512,51 @@ pub fn dispatch_cast_routine_started(
 // The victim reaction the attacker's routine will hand off at its 0x2B DamageCallback stage.
 // Held on the attacker between the swing dispatch and that stage so the flinch, the impact SE
 // and the hurt grunt land on the frame retail invokes the damage callback, not on packet
-// arrival (research/xim EffectRoutineInstance.kt handleDamageCallbackRoutine). The outcome bits are stored raw
-// because the reaction is only fully decidable at callback time - `shld`/`gur1` selection
-// depends on what the VICTIM's model ships, which is not known until then (findings F54/F58).
+// arrival (research/xim EffectRoutineInstance.kt handleDamageCallbackRoutine). The outcome is
+// stored raw because the reaction is only decidable at callback time: `shld`/`gur1` selection
+// depends on what the VICTIM's model ships.
 #[derive(Component, Debug, Clone, Copy)]
 pub struct PendingHitReaction {
     pub resolution: ffxi_proto::melee::ActionResolution,
-    // GP_SERV_COMMAND_BATTLE2::pack - hitDistortion(2): 3 (Heavy) is the crit case; knockback(3):
-    // any non-zero level adds `sway` alongside the damage reaction.
-    pub hit_distortion: u8,
-    pub knockback: u8,
+    pub outcome: ffxi_proto::melee::ResultOutcome,
     // The scheduler whose DamageCallback stage is allowed to fire this reaction. Every completion
     // routine ends in a 0x2B (a spell's `mdam`), so an unqualified pending reaction would be
     // consumed by whichever routine happened to reach its callback first.
     pub armed_by: [u8; 4],
 }
 
-// F49 - when the result's info bit carries Defeated, retail flips StatusServer on the same frame
-// as the HP packet: the victim's death path starts immediately instead of waiting for the next
-// 0x0E to report hp_pct 0. Latched on the render-actor child (the pose pass reads it there); it
-// dies with the model on despawn/zone change, which is when a fresh `init` would run anyway.
+// A Defeated result starts the victim's death path on this frame instead of waiting for the
+// next 0x0E to report hp_pct 0. Latched on the render-actor child (the pose pass reads it
+// there) and cleared once the snapshot reports the entity alive again.
 #[derive(Component, Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct DeadFromAction;
+pub struct DeadFromAction {
+    /// Set once the snapshot has caught up (hp_pct 0); the latch is released when the snapshot
+    /// then reports the entity alive again (a Raise), so a revived actor stands back up.
+    pub snapshot_confirmed: bool,
+}
+
+pub fn settle_dead_from_action(
+    state: Res<crate::snapshot::SceneState>,
+    q_world: Query<&crate::components::WorldEntity>,
+    mut q_dead: Query<(Entity, &ChildOf, &mut DeadFromAction)>,
+    mut commands: Commands,
+) {
+    for (child, child_of, mut latch) in &mut q_dead {
+        let Ok(world) = q_world.get(child_of.parent()) else {
+            continue;
+        };
+        let Some(snap) = state.snapshot.entities.iter().find(|e| e.id == world.id) else {
+            continue;
+        };
+        match (snap.hp_pct == Some(0), latch.snapshot_confirmed) {
+            (true, false) => latch.snapshot_confirmed = true,
+            (false, true) => {
+                commands.entity(child).remove::<DeadFromAction>();
+            }
+            _ => {}
+        }
+    }
+}
 
 // The global effect dir's `dam0` chunk is the MELEE hit-reaction switch (`dada` tail-calls it;
 // the ranged chain `ldad` uses `daml` instead). Its cases select on `context.hitTypeFlag`
@@ -1573,42 +1568,35 @@ pub struct DeadFromAction;
 // picking it for models that ship it (as this table used to) made normal hits sound-only with no
 // flinch - the "animations not playing" symptom. research/xim leaves the `damh`-vs-`damg`
 // selector (var 0x3B) unhandled (EffectRoutineInstance.kt resolveControlFlowVariable warns and defaults to 0),
-// which is the `damg` branch - so every non-crit Hit routes to `damg`. A crit (hitDistortion
-// Heavy) routes to `ldam` when the lookup resolves it, else back to `damg`; lookup still
-// resolves victim-own-first, then global.
+// which is the `damg` branch - so every non-crit Hit routes to `damg`. A crit routes to `ldam`
+// when the lookup resolves it, else back to `damg`; lookup still resolves victim-own-first,
+// then global.
 pub fn hit_reaction_routine(
     resolution: ffxi_proto::melee::ActionResolution,
-    hit_distortion: u8,
-    knockback: u8,
+    outcome: ffxi_proto::melee::ResultOutcome,
     model_has: impl Fn(&[u8; 4]) -> bool,
 ) -> Vec<[u8; 4]> {
     use ffxi_proto::melee::ActionResolution;
     let out = match resolution {
-        // F54 - the hitDistortion level splits the Hit case. Heavy (3) is the crit and plays
-        // `ldam` when the lookup resolves it, else falls back to the normal `damg` reaction
-        // (same pattern as Block -> shld/gur1). The crit flag is LSB's CBattleEntity::OnAttack
-        // (vendor/server/src/map/entities/battleentity.cpp): on attack.IsCritical() the server sets
-        // actionResult.info |= CriticalHit AND recordDamage(isCritical=true), which writes
-        // hitDistortion = Heavy(3); both come from the same bool, so hit_distortion == 3 IS the crit.
-        // It rides the VICTIM's result block; wire order per GP_SERV_COMMAND_BATTLE2::pack
-        // (vendor/server/src/map/packets/s2c/0x028_battle2.cpp): resolution(3) kind(2)
-        // animation(12) info(5) hitDistortion(2) knockback(3) param(17) messageID(10)
-        // modifier(31). None/Light/Medium all play `damg` per retail's dam0 branch table - never
-        // sdam, which flinches nothing on its own.
-        ActionResolution::Hit if hit_distortion == 3 && model_has(b"ldam") => *b"ldam",
+        // The crit rides the VICTIM's result block as `info & CriticalHit`
+        // (vendor/server/src/map/entities/battleentity.cpp CBattleEntity::OnAttack). LSB's
+        // hitDistortion is the damage share of max HP (action.cpp action_result_t::recordDamage),
+        // so it cannot stand in for the flag. None/Light/Medium/Heavy non-crits all play `damg`
+        // per retail's dam0 branch table - never sdam, which flinches nothing on its own.
+        ActionResolution::Hit if outcome.is_critical() && model_has(b"ldam") => *b"ldam",
         ActionResolution::Hit => *b"damg",
         ActionResolution::Miss => *b"sway",
         ActionResolution::Guard => *b"gurd",
         ActionResolution::Parry => *b"pary",
-        // F58 - `shld` is the model's block reaction; `gur1` (the PC gear variant) is the
-        // fallback when it is absent.
+        // `shld` is the model's block reaction; `gur1` (the PC gear variant) is the fallback
+        // when it is absent.
         ActionResolution::Block if model_has(b"shld") => *b"shld",
         ActionResolution::Block => *b"gur1",
     };
     let mut routines = vec![out];
-    // F52 - retail plays the swy1..3 voice + 0x5E knockback stage alongside the damage reaction
+    // Retail plays the swy1..3 voice + 0x5E knockback stage alongside the damage reaction
     // whenever a knockback level is set.
-    if knockback > 0 && out != *b"sway" {
+    if outcome.knockback > 0 && out != *b"sway" {
         routines.push(*b"sway");
     }
     routines
@@ -1636,31 +1624,8 @@ pub fn swing_routine(animation: ffxi_proto::melee::AttackAnimation) -> Option<[u
 // voice routine research/xim Actor.kt displayAutoAttack enqueues alongside the swing.
 const MELEE_VOICE_ROUTINE: [u8; 4] = *b"atk0";
 
-// KULUU_COMBAT_LOG=1 - live trace for kuluu-df9t patch-7: which BATTLE2 results reach the
-// render, what gets armed on the attacker, whether the DamageCallback fires and where the
-// victim's reaction routine resolves. Read-only; no state, no behaviour change (same pattern
-// as KULUU_MOTION_LOG).
-fn combat_log_enabled() -> bool {
-    static ONCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ONCE.get_or_init(|| {
-        matches!(
-            std::env::var("KULUU_COMBAT_LOG").as_deref(),
-            Ok(v) if !v.is_empty() && v != "0"
-        )
-    })
-}
-
-/// Printable form of a FourCC for COMBAT_ log lines.
 fn fourcc(name: [u8; 4]) -> String {
-    name.iter()
-        .map(|b| {
-            if b.is_ascii_alphanumeric() {
-                *b as char
-            } else {
-                '.'
-            }
-        })
-        .collect()
+    ffxi_dat::datid::DatId::from_name(&name).as_str()
 }
 
 // A basic attack's routines live in the attacker's own battle/equipment dirs and the global effect
@@ -1670,12 +1635,12 @@ fn fourcc(name: [u8; 4]) -> String {
 // but it is the same constant for every swing, so it selects nothing.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn dispatch_melee_action_started(
+    mut q_scheds: Query<&mut ActiveSchedulers>,
     events: Res<crate::snapshot::EventLog>,
     tracked: Res<crate::scene::TrackedEntities>,
     q_children: Query<&Children>,
     q_render: Query<&crate::ffxi_actor_render::FfxiRenderActor>,
     global: Option<Res<GlobalEffectDir>>,
-    mut q_scheds: Query<&mut ActiveSchedulers>,
     // Same-batch insert buffer for entities without ActiveSchedulers yet (see run_routine_on);
     // flushed after the event loop so a Defeated `dead` and anything else queued this frame
     // merge into one component instead of overwriting each other.
@@ -1695,34 +1660,29 @@ pub fn dispatch_melee_action_started(
             action_kind,
             target_id,
             result,
-            info,
-            hit_distortion,
-            knockback,
+            outcome,
             ..
         } = *ev
         else {
             continue;
         };
-        if combat_log_enabled() {
-            println!(
-                "COMBAT_ACT kind={} actor={} target={:?} result={:?} info={} dist={} kb={}",
-                action_kind, actor_id, target_id, result, info, hit_distortion, knockback
-            );
-        }
+        let outcome = outcome
+            .map(|(info, hit_distortion, knockback)| {
+                ffxi_proto::melee::ResultOutcome::from_wire(info, hit_distortion, knockback)
+            })
+            .unwrap_or_default();
+        tracing::debug!(target: "combat", "COMBAT_ACT kind={} actor={} target={:?} result={:?} outcome={:?}",
+                action_kind, actor_id, target_id, result, outcome);
         if action_kind != ffxi_proto::melee::CATEGORY_BASIC_ATTACK {
             continue;
         }
         let Some(&actor_entity) = tracked.by_id.get(&actor_id) else {
-            if combat_log_enabled() {
-                println!("COMBAT_DROP actor={} not-tracked", actor_id);
-            }
+            tracing::debug!(target: "combat", "COMBAT_DROP actor={} not-tracked", actor_id);
             continue;
         };
         let Some(actor_routines) = actor_render_routines(actor_entity, &q_children, &q_render)
         else {
-            if combat_log_enabled() {
-                println!("COMBAT_DROP actor={} no-actor-routines", actor_id);
-            }
+            tracing::debug!(target: "combat", "COMBAT_DROP actor={} no-actor-routines", actor_id);
             continue;
         };
         let mut lookup = RoutineLookup::new().with_actor(actor_routines);
@@ -1732,7 +1692,7 @@ pub fn dispatch_melee_action_started(
         // An off-hand/kick routine is absent from some weapon-motion DATs; the main-hand swing
         // is the only routine every armed race base is known to carry. The event carries the
         // outcome bits (info/hitDistortion/knockback) separately from the (resolution,
-        // animation) pair - F54/F58.
+        // animation) pair.
         let raw_result = result;
         let result = raw_result.and_then(|(resolution, animation)| {
             Some((
@@ -1740,11 +1700,9 @@ pub fn dispatch_melee_action_started(
                 ffxi_proto::melee::AttackAnimation::from_wire(animation)?,
             ))
         });
-        if combat_log_enabled() && result.is_none() {
-            println!(
-                "COMBAT_DROP actor={} result-none raw={:?}",
-                actor_id, raw_result
-            );
+        if result.is_none() {
+            tracing::debug!(target: "combat", "COMBAT_DROP actor={} result-none raw={:?}",
+                actor_id, raw_result);
         }
         let resolution = result.map(|(r, _)| r);
         let swing = result
@@ -1753,27 +1711,16 @@ pub fn dispatch_melee_action_started(
             .unwrap_or(*b"ati0");
         let merged = [MELEE_VOICE_ROUTINE, swing];
         let Some(active) = ActiveScheduler::effects_only_merged(&lookup, &merged) else {
-            if combat_log_enabled() {
-                println!(
-                    "COMBAT_DROP actor={} merged-none swing={}",
+            tracing::debug!(target: "combat", "COMBAT_DROP actor={} merged-none swing={}",
                     actor_id,
-                    fourcc(swing)
-                );
-            }
+                    fourcc(swing));
             continue;
         };
         let armed_by = active.name();
         // A swing alongside a running cast/completion effect runs concurrently in retail
-        // (ActionTimer1 refcount, F49/F52); the push path leaves the first writer's
+        // (ActionTimer1 refcount); the push path leaves the first writer's
         // ActionTarget alone.
-        match q_scheds.get_mut(actor_entity) {
-            Ok(mut scheds) => scheds.push(active),
-            Err(_) => {
-                commands
-                    .entity(actor_entity)
-                    .insert(ActiveSchedulers::one(active));
-            }
-        }
+        enqueue_routine(&mut commands, actor_entity, active);
         let victim = target_id.and_then(|id| tracked.by_id.get(&id).copied());
         let mut entity = commands.entity(actor_entity);
         entity.try_insert(ActionTarget(victim));
@@ -1781,8 +1728,7 @@ pub fn dispatch_melee_action_started(
             Some(resolution) => {
                 entity.try_insert(PendingHitReaction {
                     resolution,
-                    hit_distortion,
-                    knockback,
+                    outcome,
                     armed_by,
                 });
             }
@@ -1790,28 +1736,21 @@ pub fn dispatch_melee_action_started(
                 entity.remove::<PendingHitReaction>();
             }
         }
-        if combat_log_enabled() && resolution.is_some() {
-            println!(
-                "COMBAT_ARM actor={} target={:?} dist={} kb={} swing={} armed_by={}",
+        if resolution.is_some() {
+            tracing::debug!(target: "combat", "COMBAT_ARM actor={} target={:?} outcome={:?} swing={} armed_by={}",
                 actor_id,
                 victim,
-                hit_distortion,
-                knockback,
+                outcome,
                 fourcc(swing),
-                fourcc(armed_by)
-            );
+                fourcc(armed_by));
         }
-        // F49 - info bit 1 (Defeated): retail flips StatusServer on the same frame as the HP
-        // packet, so start the victim's death path now instead of waiting for the next 0x0E.
-        if (info & ffxi_proto::melee::INFO_DEFEATED) != 0 {
-            if combat_log_enabled() {
-                println!(
-                    "COMBAT_DEAD actor={} target={:?} info=0x{:X}",
-                    actor_id, victim, info
-                );
-            }
+        // Retail flips StatusServer on the same frame as the HP packet, so start the victim's
+        // death path now instead of waiting for the next 0x0E.
+        if outcome.defeated() {
+            tracing::debug!(target: "combat", "COMBAT_DEAD actor={} target={:?} info=0x{:X}",
+                    actor_id, victim, outcome.info);
             latch_dead_from_action(victim, &q_children, &q_render, &mut commands);
-            // kuluu-df9t D5 - XIM's onDisplayDeath enqueues the model's `dead` routine with
+            // XIM's onDisplayDeath enqueues the model's `dead` routine with
             // displayDead=true on the Defeated frame: ded? fall-over at its first Motion stage,
             // cor0 hold after. Play mode so those Motion stages fire through
             // dispatch_motion_stages; models without a `dead` routine keep today's
@@ -1851,12 +1790,12 @@ fn latch_dead_from_action(
     let mut latched = false;
     for &child in children {
         if q_render.get(child).is_ok() {
-            commands.entity(child).insert(DeadFromAction);
+            commands.entity(child).insert(DeadFromAction::default());
             latched = true;
         }
     }
-    if combat_log_enabled() && latched {
-        println!("COMBAT_DEAD_LATCH victim={}", victim.index());
+    if latched {
+        tracing::debug!(target: "combat", "COMBAT_DEAD_LATCH victim={}", victim.index());
     }
 }
 
@@ -1880,7 +1819,7 @@ pub fn dispatch_damage_callback_stages(
     for ev in events.read() {
         // The 0x2B itself, or a surviving call to `dada` - the impact marker that stands in
         // when flattening kept the call instead of inlining it (degraded global dir,
-        // kuluu-df9t D1/D2). Steady state is unchanged: an inlined dada contributes its 0x2B
+        // /D2). Steady state is unchanged: an inlined dada contributes its 0x2B
         // and no marker, so exactly one stage fires per swing.
         let stage = &ev.stage.stage;
         if !(stage.kind == StageKind::DamageCallback
@@ -1892,63 +1831,43 @@ pub fn dispatch_damage_callback_stages(
             continue;
         }
         let Ok((pending, target)) = q_pending.get(ev.actor) else {
-            if combat_log_enabled() {
-                println!(
-                    "COMBAT_CB actor={} sched={} no-pending",
+            tracing::debug!(target: "combat", "COMBAT_CB actor={} sched={} no-pending",
                     ev.actor.index(),
-                    fourcc(ev.scheduler)
-                );
-            }
+                    fourcc(ev.scheduler));
             continue;
         };
         if pending.armed_by != ev.scheduler {
-            if combat_log_enabled() {
-                println!(
-                    "COMBAT_CB actor={} sched={} armed_by={} mismatch",
+            tracing::debug!(target: "combat", "COMBAT_CB actor={} sched={} armed_by={} mismatch",
                     ev.actor.index(),
                     fourcc(ev.scheduler),
-                    fourcc(pending.armed_by)
-                );
-            }
+                    fourcc(pending.armed_by));
             continue;
         }
         commands.entity(ev.actor).remove::<PendingHitReaction>();
         let Some(victim) = target.0 else {
-            if combat_log_enabled() {
-                println!("COMBAT_CB actor={} no-victim", ev.actor.index());
-            }
+            tracing::debug!(target: "combat", "COMBAT_CB actor={} no-victim", ev.actor.index());
             continue;
         };
-        // The reaction is decided against the VICTIM's model (F54/F58): `shld` is only picked
+        // The reaction is decided against the VICTIM's model: `shld` is only picked
         // when that DAT ships it, and a knockback level adds `sway` alongside.
         let Some(victim_routines) = actor_render_routines(victim, &q_children, &q_render) else {
-            if combat_log_enabled() {
-                println!("COMBAT_CB victim={} no-victim-routines", victim.index());
-            }
+            tracing::debug!(target: "combat", "COMBAT_CB victim={} no-victim-routines", victim.index());
             continue;
         };
         let mut lookup = RoutineLookup::new().with_actor(victim_routines);
         if let Some(g) = global.as_ref() {
             lookup = lookup.with_dat(&g.schedulers);
         }
-        let chosen = hit_reaction_routine(
-            pending.resolution,
-            pending.hit_distortion,
-            pending.knockback,
-            |name| lookup.get(name).is_some(),
-        );
+        let chosen = hit_reaction_routine(pending.resolution, pending.outcome, |name| {
+            lookup.get(name).is_some()
+        });
         for routine in &chosen {
-            if combat_log_enabled() {
-                println!(
-                    "COMBAT_RX victim={} res={:?} dist={} kb={} routine={} found={}",
+            tracing::debug!(target: "combat", "COMBAT_RX victim={} res={:?} outcome={:?} routine={} found={}",
                     victim.index(),
                     pending.resolution,
-                    pending.hit_distortion,
-                    pending.knockback,
+                    pending.outcome,
                     fourcc(*routine),
-                    lookup.get(routine).is_some()
-                );
-            }
+                    lookup.get(routine).is_some());
             run_routine_on(
                 victim,
                 routine,
@@ -2039,7 +1958,7 @@ fn run_routine_on(
         return;
     };
     // A victim mid-routine gets the reaction pushed alongside it: retail runs both (the
-    // ActionTimer1 lock counted 2 and 3 when a hit reaction overlapped a swing, F49/F52). The old
+    // ActionTimer1 lock counted 2 and 3 when a hit reaction overlapped a swing). The old
     // single-slot guard dropped the lower-priority routine instead. When the entity has no
     // ActiveSchedulers yet the insert is a deferred command - a second routine queued on the same
     // entity in this batch would overwrite it (last insert wins), so buffer it and let the caller
@@ -2063,6 +1982,17 @@ fn run_routine_on(
 // system, so within one batch only our own buffered inserts can change the answer between the
 // call and this flush.
 #[cfg(not(target_arch = "wasm32"))]
+/// Queue a routine on an entity through commands so two routines landing on a not-yet-scheduled
+/// entity in one system both survive: a deferred `insert(ActiveSchedulers::one)` would let the
+/// second overwrite the first. Commands apply in order, so the push always sees the component.
+pub fn enqueue_routine(commands: &mut Commands, entity: Entity, active: ActiveScheduler) {
+    commands
+        .entity(entity)
+        .entry::<ActiveSchedulers>()
+        .or_default()
+        .and_modify(move |mut scheds| scheds.push(active));
+}
+
 fn flush_pending_routine_inserts(
     pending: &mut HashMap<Entity, Vec<ActiveScheduler>>,
     q_active: &mut Query<&mut ActiveSchedulers>,
@@ -2188,7 +2118,6 @@ pub fn dispatch_entity_emoted(
     mut q_actors: Query<&mut crate::ffxi_actor_render::FfxiRenderActor>,
     dll: Option<Res<ActionMainDll>>,
     mut cache: ResMut<ActionDatCache>,
-    mut q_scheds: Query<&mut ActiveSchedulers>,
     mut commands: Commands,
     mut last_seen: Local<u64>,
 ) {
@@ -2241,7 +2170,6 @@ pub fn dispatch_entity_emoted(
                             &routine,
                             actor_entity,
                             tracked.by_id.get(&target_id).copied(),
-                            &mut q_scheds,
                             &mut commands,
                         ) {
                             continue;
@@ -2349,7 +2277,7 @@ impl Plugin for SchedulerRuntimePlugin {
                     dispatch_sound_stages,
                     dispatch_motion_stages,
                     dispatch_flinch_stages,
-                    dispatch_damage_callback_stages,
+                    (dispatch_damage_callback_stages, settle_dead_from_action).chain(),
                     dispatch_target_routine_stages,
                 )
                     .chain()
@@ -2605,6 +2533,7 @@ mod tests {
                 random_group: None,
                 local_dir: ffxi_dat::scheduler::NO_LOCAL_DIR,
                 model_transform: None,
+                follow_points: None,
                 screen_color: None,
                 actor_fade: None,
                 idle_transition_time: None,
@@ -2666,8 +2595,8 @@ mod tests {
     }
 
     // The whole point of the vec: a hit reaction that lands mid-swing runs on the same entity
-    // without touching the swing's cursor or frame (retail's ActionTimer1 counted 2 and 3, F49/
-    // F52). Each entry keeps its own clock; entries retire on their OWN finish+TTL, so a short
+    // without touching the swing's cursor or frame (retail's ActionTimer1 counted 2 and 3).
+    // Each entry keeps its own clock; entries retire on their OWN finish+TTL, so a short
     // reaction can lapse while the swing still runs.
     #[test]
     fn concurrent_routines_keep_separate_cursors_and_strip_together() {
@@ -2772,8 +2701,8 @@ mod tests {
     }
 
     // The lock test is per-routine and interval-based: a routine with no 0x07/0x59 stage never
-    // locks (finding F55), and an overlapping second routine keeps the entity locked past either one's
-    // own interval end - the refcount>0 behaviour retail measured on ActionTimer1 (F49/F57).
+    // locks, and an overlapping second routine keeps the entity locked past either one's
+    // own interval end - the refcount>0 behaviour retail measured on ActionTimer1.
     #[test]
     fn animation_lock_is_refcounted_across_concurrent_routines() {
         let lock_stage = |frame: u32, raw: u8, dur: u16| -> TimedStage {
@@ -2816,6 +2745,25 @@ mod tests {
         }
     }
 
+    // A routine's timeline ends when its last stage ends: a trailing AnimationLock longer than
+    // the post-finish TTL must not be retired (and its lock released) while it still holds.
+    #[test]
+    fn last_frame_covers_a_trailing_lock_duration() {
+        let mut lock = stage(0, StageKind::AnimationLock, 0x07, *b"    ");
+        lock.stage.duration_frames = 300;
+        let held = ActiveScheduler::from_scheduler(&make_scheduler(
+            *b"ini1",
+            vec![
+                stage(0, StageKind::SoundOnCaster, 0x53, *b"snd1"),
+                lock,
+                stage(40, StageKind::SoundOnCaster, 0x53, *b"snd2"),
+            ],
+        ));
+        assert_eq!(held.last_frame(), 300);
+        assert!(held.locks_at(299));
+        assert!(!held.locks_at(300));
+    }
+
     // Every completion routine ends in a 0x2B DamageCallback (a spell's `mdam`), so a melee
     // reaction armed by the swing must not be consumed by an unrelated routine reaching its
     // callback first. The DamageCallback dispatcher gates on this pairing.
@@ -2823,8 +2771,7 @@ mod tests {
     fn pending_hit_reaction_is_bound_to_the_scheduler_that_armed_it() {
         let pending = PendingHitReaction {
             resolution: ffxi_proto::melee::ActionResolution::Hit,
-            hit_distortion: 0,
-            knockback: 0,
+            outcome: ffxi_proto::melee::ResultOutcome::default(),
             armed_by: *b"atk0",
         };
         assert_eq!(pending.armed_by, *b"atk0");
@@ -2834,7 +2781,7 @@ mod tests {
         );
     }
 
-    // kuluu-df9t D5 - the fall-over window: pending from insertion until the first Motion
+    // the fall-over window: pending from insertion until the first Motion
     // stage fires, never reported for routines without one (instant-corpse fallback models)
     // or under any other name.
     #[test]
@@ -2878,76 +2825,90 @@ mod tests {
         );
     }
 
-    // F54/F58 - the outcome bits split the Hit case; a knockback level adds sway alongside.
     #[test]
     fn hit_reaction_routine_table() {
         use ffxi_proto::melee::ActionResolution as R;
+        use ffxi_proto::melee::{ResultOutcome, INFO_CRITICAL_HIT};
         let has = |names: Vec<[u8; 4]>| move |name: &[u8; 4]| names.iter().any(|n| n == name);
+        let o = |info: u8, hit_distortion: u8, knockback: u8| {
+            ResultOutcome::from_wire(info, hit_distortion, knockback)
+        };
+        let crit = |knockback: u8| o(INFO_CRITICAL_HIT, 3, knockback);
 
-        // Heavy distortion is the crit case: ldam when the lookup resolves it...
+        // The crit flag picks ldam when the lookup resolves it...
         assert_eq!(
-            hit_reaction_routine(R::Hit, 3, 0, has(vec![*b"ldam"])),
+            hit_reaction_routine(R::Hit, crit(0), has(vec![*b"ldam"])),
             vec![*b"ldam"]
         );
         // ...and back to damg when nothing in the lookup ships ldam (the pre-global fallback).
         assert_eq!(
-            hit_reaction_routine(R::Hit, 3, 0, has(vec![])),
+            hit_reaction_routine(R::Hit, crit(0), has(vec![])),
             vec![*b"damg"]
+        );
+        // hitDistortion is the damage share of max HP, not the flag: a Heavy non-crit stays on
+        // damg and a Light crit still plays ldam.
+        assert_eq!(
+            hit_reaction_routine(R::Hit, o(0, 3, 0), has(vec![*b"ldam"])),
+            vec![*b"damg"]
+        );
+        assert_eq!(
+            hit_reaction_routine(R::Hit, o(INFO_CRITICAL_HIT, 1, 0), has(vec![*b"ldam"])),
+            vec![*b"ldam"]
         );
         // None/Light/Medium all route to damg per retail's dam0 branch table - never sdam, even
         // when the model ships it: ROM/0/0.DAT's damh/damg both carry the 0x21 flinch stage,
         // while sdam is sound-only (kuluu-df9t: the old sdam preference made normal hits on
         // sdam-shipping models invisible).
         assert_eq!(
-            hit_reaction_routine(R::Hit, 0, 0, has(vec![*b"sdam"])),
+            hit_reaction_routine(R::Hit, o(0, 0, 0), has(vec![*b"sdam"])),
             vec![*b"damg"]
         );
         assert_eq!(
-            hit_reaction_routine(R::Hit, 1, 0, has(vec![*b"sdam"])),
+            hit_reaction_routine(R::Hit, o(0, 1, 0), has(vec![*b"sdam"])),
             vec![*b"damg"]
         );
         // ...and damg when the model ships nothing; Medium stays on damg.
         assert_eq!(
-            hit_reaction_routine(R::Hit, 0, 0, has(vec![])),
+            hit_reaction_routine(R::Hit, o(0, 0, 0), has(vec![])),
             vec![*b"damg"]
         );
         assert_eq!(
-            hit_reaction_routine(R::Hit, 2, 0, has(vec![*b"sdam"])),
+            hit_reaction_routine(R::Hit, o(0, 2, 0), has(vec![*b"sdam"])),
             vec![*b"damg"]
         );
         // The guard/parry/block cases; block prefers shld when present.
         assert_eq!(
-            hit_reaction_routine(R::Guard, 0, 0, has(vec![])),
+            hit_reaction_routine(R::Guard, o(0, 0, 0), has(vec![])),
             vec![*b"gurd"]
         );
         assert_eq!(
-            hit_reaction_routine(R::Parry, 0, 0, has(vec![])),
+            hit_reaction_routine(R::Parry, o(0, 0, 0), has(vec![])),
             vec![*b"pary"]
         );
         assert_eq!(
-            hit_reaction_routine(R::Block, 0, 0, has(vec![*b"shld"])),
+            hit_reaction_routine(R::Block, o(0, 0, 0), has(vec![*b"shld"])),
             vec![*b"shld"]
         );
         assert_eq!(
-            hit_reaction_routine(R::Block, 0, 0, has(vec![])),
+            hit_reaction_routine(R::Block, o(0, 0, 0), has(vec![])),
             vec![*b"gur1"]
         );
         // Miss is sway; a knockback level adds sway alongside the damage routine but never twice.
         assert_eq!(
-            hit_reaction_routine(R::Miss, 0, 0, has(vec![])),
+            hit_reaction_routine(R::Miss, o(0, 0, 0), has(vec![])),
             vec![*b"sway"]
         );
         assert_eq!(
-            hit_reaction_routine(R::Miss, 0, 2, has(vec![])),
+            hit_reaction_routine(R::Miss, o(0, 0, 2), has(vec![])),
             vec![*b"sway"]
         );
         assert_eq!(
-            hit_reaction_routine(R::Hit, 3, 1, has(vec![*b"ldam"])),
+            hit_reaction_routine(R::Hit, crit(1), has(vec![*b"ldam"])),
             vec![*b"ldam", *b"sway"]
         );
         // ...and the fallback keeps sway alongside damg.
         assert_eq!(
-            hit_reaction_routine(R::Hit, 3, 1, has(vec![])),
+            hit_reaction_routine(R::Hit, crit(1), has(vec![])),
             vec![*b"damg", *b"sway"]
         );
     }
@@ -3571,7 +3532,7 @@ mod tests {
         );
     }
 
-    // kuluu-df9t D1/D2 - a control-flow child survives flattening as a marker stage at its call
+    // /D2 - a control-flow child survives flattening as a marker stage at its call
     // frame: with a degraded global dir, `call dada` (the impact carrier) must still fire the
     // reaction instead of vanishing. The inlined 0x2B and the dam0 marker both land at call +
     // delay; no branch of the switch is taken.
@@ -3624,7 +3585,7 @@ mod tests {
         );
     }
 
-    // kuluu-df9t D1/D2 - with the global dir degraded to empty, `call dada` cannot resolve; the
+    // /D2 - with the global dir degraded to empty, `call dada` cannot resolve; the
     // call still survives as a marker so dispatch_damage_callback_stages fires at the impact
     // frame instead of never.
     #[test]
@@ -3692,7 +3653,7 @@ mod tests {
             ActionResolution::Block,
         ]
         .into_iter()
-        .map(|r| hit_reaction_routine(r, 0, 0, |_| false))
+        .map(|r| hit_reaction_routine(r, ffxi_proto::melee::ResultOutcome::default(), |_| false))
         .collect();
         assert_eq!(
             order,
@@ -3840,7 +3801,7 @@ mod tests {
         );
     }
 
-    // kuluu-df9t D3 (skips without an install): Rarab's `damg` flinch stage carries the
+    // (skips without an install): Rarab's `damg` flinch stage carries the
     // retail-authored animationDuration, and dispatch_flinch_stages plays it on a pose-idle
     // host - dfi? for the mob itself, dfm? when the same model is tracked as a PC. Before this
     // consumer existed the stage was parsed and dropped: hits landed as sound while the victim
@@ -3972,7 +3933,7 @@ mod tests {
     }
 
     // Retail-DAT guard (skips without an install): the Carrion Worm's dig (`ini1`) locks for 112
-    // ticks and its pop-up (`init`) for 188 - the retail-measured intervals F46/F57 pin, which
+    // ticks and its pop-up (`init`) for 188 - the retail-measured intervals, which
     // patch 3's pose-pass hold keys on. Each also carries the 0x5F that stops the other (the worm
     // dig stops `init`, the pop stops `ini1`), so both halves of StopRoutine are exercised by one
     // file. Read straight off disk: which VTABLE app claims the file id is not the point here.

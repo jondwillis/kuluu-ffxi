@@ -83,7 +83,6 @@ pub mod weather_particles;
 pub mod zone_clouds;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod zone_doors;
-pub mod zone_lights;
 pub mod zone_lines;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod zone_particles;
@@ -109,8 +108,8 @@ pub use cutscene::{CutsceneMode, CutscenePlugin, ScreenFade};
 pub use entity_table::{EntityRecord, EntityTable};
 pub use graphics_settings::{
     AaMode, CharacterRenderPath, DlssQuality, DynamicLights, GraphicsField, GraphicsSettings,
-    MinimapRadar, QualityPreset, TextureFiltering, ZoneLineDisplay, DLSS_CONFIG_FIELDS,
-    GRAPHICS_FIELDS,
+    MinimapRadar, QualityPreset, TextureFiltering, ZoneLineDisplay, CONFIG_FIELDS,
+    DLSS_CONFIG_FIELDS, GRAPHICS_FIELDS,
 };
 pub use hud::{add_hud_spawners, HudPlugin};
 pub use input_mode::{
@@ -184,7 +183,7 @@ impl<S: SceneSource + Resource + Component<Mutability = bevy::ecs::component::Mu
         app.set_error_handler(tolerate_command_entity_despawn);
 
         #[cfg(not(target_arch = "wasm32"))]
-        app.add_plugins(dat_mmb::DatOverlayPlugin);
+        app.add_plugins((dat_mmb::DatOverlayPlugin, transport::TransportPlugin));
 
         #[cfg(not(target_arch = "wasm32"))]
         app.add_plugins(audio::AudioPlugin);
@@ -219,8 +218,6 @@ impl<S: SceneSource + Resource + Component<Mutability = bevy::ecs::component::Mu
 
         // Nameplates: final in-view pass (replaces the retired overlay camera).
         app.add_plugins(nameplate_final_pass::NameplateFinalPassPlugin);
-
-        app.add_plugins(zone_lights::ZoneLightsPlugin);
 
         #[cfg(not(target_arch = "wasm32"))]
         app.add_plugins(zone_point_lights::ZonePointLightsPlugin);
@@ -394,6 +391,9 @@ impl<S: SceneSource + Resource + Component<Mutability = bevy::ecs::component::Mu
         app.add_systems(Update, ffxi_actor_render::apply_character_shadow_cast);
 
         #[cfg(not(target_arch = "wasm32"))]
+        app.add_systems(Update, dat_mmb::apply_zone_shadow_cast);
+
+        #[cfg(not(target_arch = "wasm32"))]
         app.add_systems(
             PostUpdate,
             ffxi_actor_render::update_actor_mesh_aabbs
@@ -410,7 +410,6 @@ impl<S: SceneSource + Resource + Component<Mutability = bevy::ecs::component::Mu
 
         app.init_resource::<combat_stance::EntityMotion>();
         app.init_resource::<combat_stance::EntityPrediction>();
-        app.insert_resource(combat_stance::MotionProbe::init());
         app.init_resource::<combat_stance::RestStance>();
         app.init_resource::<combat_stance::AnimationBlends>();
         app.init_resource::<combat_stance::WalkMode>();
@@ -558,3 +557,6 @@ impl<S: SceneSource + Resource + Component<Mutability = bevy::ecs::component::Mu
         );
     }
 }
+
+#[cfg(not(target_arch = "wasm32"))]
+pub mod transport;

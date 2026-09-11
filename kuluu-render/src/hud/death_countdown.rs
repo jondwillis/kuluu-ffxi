@@ -4,7 +4,7 @@
 //! Retail surfaces the home-point menu and no visible clock, per the dated
 //! observation in `.agents/skills/retail-observe/references/death-ko-behavior.md`.
 //! The XIClient decompile parks the server's death deadline in zone state
-//! (research/XIClient .../Game/State/GC_ZONE.h `field_40D6C`) and leaves its one
+//! (research/XIClient/src/XIClient/include/Game/State/GC_ZONE.h `field_40D6C`) and leaves its one
 //! read site unimplemented, so it corroborates nothing either way. This readout
 //! is addon-style and opt-in; the timer it renders is the real server value.
 

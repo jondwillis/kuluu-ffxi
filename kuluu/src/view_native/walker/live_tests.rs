@@ -1102,7 +1102,7 @@ fn ramp_40_degrees_walks_up_free() {
     }
 }
 
-/// A 65 degree face is a wall under the 60 degree rule: it blocks, and the
+/// A 65 degree face is a wall under the 45 degree rule: it blocks, and the
 /// walker never climbs it.
 #[test]
 fn steep_65_degree_face_blocks() {
@@ -1120,6 +1120,68 @@ fn steep_65_degree_face_blocks() {
     let (x, _y, z) = t.last().unwrap().0;
     assert!(x < 2.5, "steep held: x={x:.2}");
     assert!(-z < 0.5, "did not climb: h={:.2}", -z);
+}
+
+/// Retail's cutoff sits at 45 degrees (`CollisionManager::InterpolatePosition`,
+/// |normal.y| <= 0.708 is a wall): a 50 degree face blocks like the 65 degree one.
+#[test]
+fn face_just_past_45_degrees_blocks_like_a_wall() {
+    let top = 4.0 * (50f32.to_radians().tan());
+    let g = ramp(2.0, 6.0, top);
+    let t = walk(
+        &g,
+        &ObstacleSet::default(),
+        (-2.0, 0.0, 0.0),
+        (1.0, 0.0),
+        8.0,
+        60.0,
+        RUN,
+    );
+    let (x, _y, z) = t.last().unwrap().0;
+    assert!(x < 2.5, "50 degree face held: x={x:.2}");
+    assert!(-z < 0.5, "did not climb: h={:.2}", -z);
+}
+
+/// Walking off a floor onto a bank too steep to stand on (the south edge of
+/// Selbina's dock stairs, normal.y 0.35..0.6): the sweep does not stop the
+/// body, because the face is below the feet, and the support probe finds no
+/// floor-class hit, so the walker goes airborne. It must ride the bank down to
+/// the floor below, never passing through it.
+#[test]
+fn steep_bank_descent_never_tunnels() {
+    let deg = 55f32;
+    let drop = 4.0 * deg.to_radians().tan();
+    let g = ramp(0.0, 4.0, -drop);
+    let t = walk(
+        &g,
+        &ObstacleSet::default(),
+        (-2.0, 0.0, 0.0),
+        (1.0, 0.0),
+        6.0,
+        60.0,
+        RUN,
+    );
+    for ((x, _y, z), decision) in &t {
+        let surface_h = if *x <= 0.0 {
+            0.0
+        } else if *x >= 4.0 {
+            -drop
+        } else {
+            -x * deg.to_radians().tan()
+        };
+        assert!(
+            -z >= surface_h - 1e-3,
+            "below the bank at x={x:.2}: h={:.3} surface={surface_h:.3} ({decision:?})",
+            -z
+        );
+    }
+    let (x, _y, z) = t.last().unwrap().0;
+    assert!(x > 4.5, "reached the lower floor: x={x:.2}");
+    assert!(
+        (-z - -drop).abs() < 0.05,
+        "standing on the lower floor: h={:.2}",
+        -z
+    );
 }
 
 /// A 30 degree oblique wall: the slide keeps full speed along it — no stall,

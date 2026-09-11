@@ -9,7 +9,8 @@ use bevy::asset::RenderAssetUsages;
 use bevy::image::ImageSampler;
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
-use ffxi_dat::ui_element::{ui_sprite, UiSprite};
+use ffxi_dat::texture::TexFormat;
+use ffxi_dat::ui_element::{crop_sprite, find_texture, find_ui_element_group, ui_sprite, UiSprite};
 use ffxi_dat::DatRoot;
 
 // The four "static resource" menu UI DATs. XIM hardcodes their ROM paths
@@ -34,6 +35,9 @@ pub fn read_ui_dats(root: &DatRoot) -> Vec<(u32, Vec<u8>)> {
 const FRAMES_JP: &str = "menu    frames  ";
 const FRAMES_US: &str = "menu    framesus";
 
+// research/XIClient/src/XIClient/source/UI/UIManager.cpp UIManager::InitDraw.
+const UI_ALPHA_MODULATE_2X: f32 = 2.0;
+
 #[derive(Resource, Default, Clone)]
 pub struct UiElementDatRoot(pub Option<Arc<DatRoot>>);
 
@@ -43,9 +47,72 @@ pub struct UiElementAtlas {
     loaded: bool,
     unavailable: bool,
     sprites: HashMap<(String, usize), Option<Handle<Image>>>,
+    elements: HashMap<(String, usize), Option<Vec<UiElementQuad>>>,
+}
+
+#[derive(Clone)]
+pub struct UiElementQuad {
+    pub image: Handle<Image>,
+    pub rect: Rect,
+    pub color: Color,
 }
 
 impl UiElementAtlas {
+    pub fn ensure_element(
+        &mut self,
+        group: &str,
+        index: usize,
+        dat_root: &UiElementDatRoot,
+        images: &mut Assets<Image>,
+    ) -> Option<Vec<UiElementQuad>> {
+        let key = (group.to_string(), index);
+        if let Some(slot) = self.elements.get(&key) {
+            return slot.clone();
+        }
+        let quads = self.ensure_dats(dat_root).iter().find_map(|bytes| {
+            let resource = find_ui_element_group(bytes, group)?;
+            resource
+                .elements
+                .get(index)?
+                .components
+                .iter()
+                .map(|component| {
+                    let texture = find_texture(bytes, &component.texture_ref)?;
+                    let mut sprite = crop_sprite(
+                        &texture,
+                        component.uv_offset_x,
+                        component.uv_offset_y,
+                        component.uv_width,
+                        component.uv_height,
+                        component.flip_mode,
+                    )?;
+                    let mut color = crate::nameplate_color::quad_color(component.colors[0]);
+                    if texture.format_tag == TexFormat::Dxt3 {
+                        modulate_dxt3_ui_alpha(&mut sprite, color.alpha());
+                        color.set_alpha(1.0);
+                    }
+                    let points = component
+                        .positions
+                        .map(|(x, y)| Vec2::new(f32::from(x), f32::from(y)));
+                    Some(UiElementQuad {
+                        image: upload_sprite(sprite, images),
+                        rect: Rect::from_corners(
+                            points
+                                .into_iter()
+                                .fold(Vec2::splat(f32::INFINITY), Vec2::min),
+                            points
+                                .into_iter()
+                                .fold(Vec2::splat(f32::NEG_INFINITY), Vec2::max),
+                        ),
+                        color,
+                    })
+                })
+                .collect::<Option<Vec<_>>>()
+        });
+        self.elements.insert(key, quads.clone());
+        quads
+    }
+
     pub fn ensure(
         &mut self,
         group: &str,
@@ -81,6 +148,16 @@ impl UiElementAtlas {
         self.loaded = true;
         self.unavailable = self.dats.is_empty();
         &self.dats
+    }
+}
+
+fn modulate_dxt3_ui_alpha(sprite: &mut UiSprite, vertex_alpha: f32) {
+    // DXT3 decoding preserves raw alpha; palette decoding already doubles it.
+    // Clamp after modulation so partially transparent vertices retain bright texels.
+    for pixel in sprite.rgba.chunks_exact_mut(4) {
+        pixel[3] = (f32::from(pixel[3]) * vertex_alpha * UI_ALPHA_MODULATE_2X)
+            .round()
+            .min(f32::from(u8::MAX)) as u8;
     }
 }
 
@@ -125,6 +202,24 @@ impl Plugin for UiElementAtlasPlugin {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn dxt3_ui_alpha_modulates_before_saturating() {
+        let mut sprite = UiSprite {
+            width: 4,
+            height: 1,
+            rgba: vec![
+                20, 40, 60, 0, 20, 40, 60, 85, 20, 40, 60, 136, 20, 40, 60, 255,
+            ],
+        };
+        let vertex_alpha = crate::nameplate_color::quad_color([127; 4]).alpha();
+        modulate_dxt3_ui_alpha(&mut sprite, vertex_alpha);
+        assert_eq!(
+            sprite.rgba,
+            [20, 40, 60, 0, 20, 40, 60, 128, 20, 40, 60, 205, 20, 40, 60, 255],
+            "transparent texels stay clear, RGB is untouched, and alpha saturates after modulation"
+        );
+    }
 
     fn test_dat_root() -> Option<UiElementDatRoot> {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))

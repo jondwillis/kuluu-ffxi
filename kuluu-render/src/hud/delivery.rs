@@ -331,7 +331,7 @@ impl BtnId {
     }
 
     /// Retail's Receive panel labels the send-back button "Return"
-    /// (artifacts/retail/moghouse-menu-notes.md); the wire command behind it is
+    /// (.agents/skills/retail-observe/references/2026-07-17-moghouse-menu.md); the wire command behind it is
     /// PBX Reject.
     fn caption(self) -> &'static str {
         match self {
@@ -910,7 +910,7 @@ fn text_value(
             }
         }
         // Retail shows Current Gil on both panels, comma-grouped with a " G"
-        // suffix (artifacts/retail/moghouse-menu-notes.md).
+        // suffix (.agents/skills/retail-observe/references/2026-07-17-moghouse-menu.md).
         Role::GilLine => (
             format!("Current Gil  {} G", ffxi_vocab::gil::group_digits(gil)),
             if matches!(screen.focus, DeliveryFocus::Gil) {

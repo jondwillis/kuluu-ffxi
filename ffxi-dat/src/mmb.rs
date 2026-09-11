@@ -463,6 +463,11 @@ pub struct MmbModel {
 // interleaved when the section's vertex-blend config is set (48).
 const VERTEX_STRIDE_PLAIN: usize = 36;
 const VERTEX_STRIDE_VERTEX_BLEND: usize = 48;
+// research/XIClient/src/XIClient/source/World/Zone/Terrain/MeshBlockManager.cpp MeshBlockManager::AddFromData;
+// FFXiMain.dll SHA-256 f4f90fbd080c05448aab3f866b127d7c1675b3cc15c8beaa57bfc584064b7e7c.
+// RVA 0x16D14B reads the type independently of the signature.
+const MESH_TYPE_OFFSET: usize = 4;
+const MESH_TYPE_STATIC_STRIP: u8 = 1;
 const CONFIG_VERTEX_BLEND: u8 = 2;
 
 fn vertex_stride(config: u8) -> usize {
@@ -481,9 +486,7 @@ pub fn parse_models(decrypted: &[u8]) -> Vec<MmbModel> {
         return Vec::new();
     }
 
-    let is_v1 = &decrypted[0..3] == b"MMB";
-
-    let d3 = if is_v1 { 0 } else { decrypted[4] };
+    let d3 = decrypted[MESH_TYPE_OFFSET];
     let vertex_stride = vertex_stride(d3);
 
     let header_off = SMMB_HEAD_SIZE;
@@ -618,7 +621,11 @@ pub fn parse_models(decrypted: &[u8]) -> Vec<MmbModel> {
                     ]),
                 ];
 
-                let normal_base = if d3 == 2 { vo + 24 } else { vo + 12 };
+                let normal_base = if d3 == CONFIG_VERTEX_BLEND {
+                    vo + 24
+                } else {
+                    vo + 12
+                };
                 let normal = [
                     f32::from_le_bytes([
                         decrypted[normal_base],
@@ -672,7 +679,7 @@ pub fn parse_models(decrypted: &[u8]) -> Vec<MmbModel> {
             off += 4;
 
             let mut indices: Vec<u16> = Vec::new();
-            let is_list = is_v1 || d3 == 2;
+            let is_list = d3 != MESH_TYPE_STATIC_STRIP;
             if off + num_indices * 2 > decrypted.len() {
                 break;
             }
@@ -707,7 +714,7 @@ pub fn parse_models(decrypted: &[u8]) -> Vec<MmbModel> {
                     texture_name,
                     blending,
                     render_state: MmbRenderState::from_blending(blending),
-                    vertex_blend_enabled: d3 == 2,
+                    vertex_blend_enabled: d3 == CONFIG_VERTEX_BLEND,
                     vertices,
                     indices,
                 });
@@ -1072,6 +1079,7 @@ mod tests {
         const NUM_VERTS: u16 = 3;
         let mut b = vec![0u8; PIECE_OFF];
         b[0..4].copy_from_slice(b"SMMB");
+        b[MESH_TYPE_OFFSET] = MESH_TYPE_STATIC_STRIP;
         b[HEAD + 16..HEAD + 20].copy_from_slice(&1u32.to_le_bytes());
         b[HEAD + 44..HEAD + 48].copy_from_slice(&(PIECE_OFF as u32).to_le_bytes());
 
@@ -1144,5 +1152,158 @@ mod tests {
         let full = vertex_color_to_linear([255, 255, 255, 255]);
         assert_eq!(full[0], 1.0);
         assert_eq!(full[3], 2.0);
+    }
+    const LEGACY_MMB_VERSION: u8 = 4;
+    const LEGACY_FIXTURE_VERTICES: u16 = 8;
+    const STATIC_BUMP_TYPE: u8 = 3;
+    const JOINED_STRIP: [u16; 10] = [0, 1, 2, 3, 3, 4, 4, 5, 6, 7];
+    const JOINED_TRIANGLES: [u16; 12] = [0, 1, 2, 2, 1, 3, 4, 5, 6, 6, 5, 7];
+
+    fn legacy_mmb(mesh_type: u8, indices: &[u16]) -> Vec<u8> {
+        const PIECE_OFFSET: usize = 64;
+        const PIECE_COUNT_OFFSET: usize = 32;
+        const PIECE_POINTER_OFFSET: usize = 60;
+        const PIECE_HEADER_PADDING: usize = 28;
+        let mut bytes = vec![0; PIECE_OFFSET];
+        bytes[..3].copy_from_slice(b"MMB");
+        bytes[3] = LEGACY_MMB_VERSION;
+        bytes[MESH_TYPE_OFFSET] = mesh_type;
+        bytes[PIECE_COUNT_OFFSET..PIECE_COUNT_OFFSET + 4].copy_from_slice(&1u32.to_le_bytes());
+        bytes[PIECE_POINTER_OFFSET..PIECE_POINTER_OFFSET + 4]
+            .copy_from_slice(&(PIECE_OFFSET as u32).to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&[0; PIECE_HEADER_PADDING]);
+        bytes.extend_from_slice(b"cloud   canopy  ");
+        bytes.extend_from_slice(&LEGACY_FIXTURE_VERTICES.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        for index in 0..LEGACY_FIXTURE_VERTICES {
+            let position = [f32::from(index / 2), 0.0, f32::from(index % 2)];
+            let vertex = plain_vertex(position, AUTHORED_ARGB, [0.0, 0.0]);
+            if mesh_type == CONFIG_VERTEX_BLEND {
+                const POSITION_BYTES: usize = 12;
+                bytes.extend_from_slice(&vertex[..POSITION_BYTES]);
+                bytes.extend_from_slice(&[0; POSITION_BYTES]);
+                bytes.extend_from_slice(&vertex[POSITION_BYTES..]);
+            } else {
+                bytes.extend(vertex);
+            }
+        }
+        bytes.extend_from_slice(&(indices.len() as u16).to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        for index in indices {
+            bytes.extend_from_slice(&index.to_le_bytes());
+        }
+        if !indices.len().is_multiple_of(2) {
+            bytes.extend_from_slice(&0u16.to_le_bytes());
+        }
+        bytes
+    }
+
+    #[test]
+    fn legacy_mmb_static_canopy_preserves_strip_connectivity_and_winding() {
+        let decoded = parse_models(&legacy_mmb(MESH_TYPE_STATIC_STRIP, &JOINED_STRIP));
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(
+            decoded[0].vertices.len(),
+            usize::from(LEGACY_FIXTURE_VERTICES)
+        );
+        assert_eq!(decoded[0].indices, JOINED_TRIANGLES);
+        assert!(!decoded[0].vertex_blend_enabled);
+        assert_eq!(decoded[0].vertices[0].rgba, EXPECTED_RGBA);
+    }
+
+    #[test]
+    fn legacy_mmb_type_selects_list_topology_and_animated_stride() {
+        const LIST: [u16; 6] = [0, 1, 2, 3, 4, 5];
+        for mesh_type in [CONFIG_VERTEX_BLEND, STATIC_BUMP_TYPE] {
+            let decoded = parse_models(&legacy_mmb(mesh_type, &LIST));
+            assert_eq!(decoded.len(), 1);
+            assert_eq!(decoded[0].indices, LIST);
+            assert_eq!(
+                decoded[0].vertices.len(),
+                usize::from(LEGACY_FIXTURE_VERTICES)
+            );
+            assert_eq!(decoded[0].vertices[7].pos, [3.0, 0.0, 1.0]);
+            assert_eq!(decoded[0].vertices[7].normal, [0.0, 1.0, 0.0]);
+            assert_eq!(decoded[0].vertices[7].rgba, EXPECTED_RGBA);
+            assert_eq!(
+                decoded[0].vertex_blend_enabled,
+                mesh_type == CONFIG_VERTEX_BLEND
+            );
+        }
+    }
+
+    #[test]
+    fn real_dat_ferry_sunny_canopy_has_complete_static_strips() {
+        const FERRY_FILE: u32 = 328;
+        const SUNNY_CANOPY_CHUNK: usize = 410;
+        const EXPECTED_TRIANGLES: [usize; 2] = [116, 552];
+        const EXPECTED_VERTEX_COUNTS: [usize; 2] = [117, 493];
+        let Some(root) = crate::archive::open_test_install() else {
+            return;
+        };
+        let location = root.resolve(FERRY_FILE).unwrap();
+        let bytes = std::fs::read(location.path_under(&root)).unwrap();
+        let chunk = crate::chunk::walk(&bytes)
+            .nth(SUNNY_CANOPY_CHUNK)
+            .unwrap()
+            .unwrap();
+        assert_eq!(chunk.name, *b"suny");
+        assert_eq!(chunk.kind, crate::kind::ChunkKind::Mmb as u8);
+        let bytes = decrypt(chunk.data).unwrap();
+        assert_eq!(&bytes[..3], b"MMB");
+        assert_eq!(bytes[MESH_TYPE_OFFSET], MESH_TYPE_STATIC_STRIP);
+        let models = parse_models(&bytes);
+        assert_eq!(models.len(), EXPECTED_TRIANGLES.len());
+        for (index, model) in models.iter().enumerate() {
+            assert_eq!(model.indices.len(), EXPECTED_TRIANGLES[index] * 3);
+            assert_eq!(model.vertices.len(), EXPECTED_VERTEX_COUNTS[index]);
+            let used: std::collections::BTreeSet<_> = model.indices.iter().copied().collect();
+            assert_eq!(used.len(), model.vertices.len());
+            assert!(model
+                .indices
+                .chunks_exact(3)
+                .all(|t| t[0] != t[1] && t[1] != t[2] && t[0] != t[2]));
+        }
+        assert_eq!(&models[0].indices[..6], &[0, 1, 2, 2, 1, 3]);
+    }
+
+    #[test]
+    fn real_dat_docked_ferry_reaches_its_authored_triangle_count() {
+        const DOCK_FILE: u32 = 31008;
+        const FERRY_CHUNK: usize = 16;
+        const PIECE_POINTER_OFFSET: usize = 60;
+        const PIECE_TRIANGLE_COUNT_OFFSET: usize = 28;
+        let Some(root) = crate::archive::open_test_install() else {
+            return;
+        };
+        let location = root.resolve(DOCK_FILE).unwrap();
+        let bytes = std::fs::read(location.path_under(&root)).unwrap();
+        let chunk = crate::chunk::walk(&bytes)
+            .nth(FERRY_CHUNK)
+            .unwrap()
+            .unwrap();
+        assert_eq!(chunk.name, *b"fune");
+        let bytes = decrypt(chunk.data).unwrap();
+        assert_eq!(&bytes[..3], b"MMB");
+        assert_eq!(bytes[MESH_TYPE_OFFSET], MESH_TYPE_STATIC_STRIP);
+        let piece = u32::from_le_bytes(
+            bytes[PIECE_POINTER_OFFSET..PIECE_POINTER_OFFSET + 4]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let count_offset = piece + PIECE_TRIANGLE_COUNT_OFFSET;
+        let authored =
+            u32::from_le_bytes(bytes[count_offset..count_offset + 4].try_into().unwrap()) as usize;
+        let models = parse_models(&bytes);
+        assert!(authored > 0);
+        assert_eq!(
+            models.iter().map(|m| m.indices.len() / 3).sum::<usize>(),
+            authored
+        );
+        assert!(models
+            .iter()
+            .flat_map(|m| m.indices.chunks_exact(3))
+            .all(|t| t[0] != t[1] && t[1] != t[2] && t[0] != t[2]));
     }
 }

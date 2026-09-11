@@ -38,6 +38,116 @@ fn sub_packet_events(opcode: u16, body: &[u8]) -> Vec<AgentEvent> {
     out
 }
 
+#[test]
+// vendor/server/src/map/packets/entity_update.cpp CEntityUpdatePacket::updateWith
+// vendor/server/src/map/packets/s2c/0x00a_login.h GP_SERV_COMMAND_LOGIN
+pub(super) fn ferry_packet_state_contract() {
+    use crate::state::SessionState;
+    use crate::wire_translate::state_to_snapshot;
+    use kuluu_snapshot::{EntityLook, Voyage};
+
+    const SHIP: u32 = 17_793_088;
+    const SHIP_INDEX: u16 = 64;
+    const BODY_LEN: usize = 68;
+    const SEND_FLAGS: usize = 6;
+    const UPDATE_COMBAT: u8 = 7;
+    const STATUS: usize = 28;
+    const ANIMATION: usize = 27;
+    const LOOK: usize = 44;
+    const SELECTOR: usize = 48;
+    const ANIMATION_START: usize = 52;
+    const SHIP_MODEL: u16 = 4;
+    const SELECTOR_VALUE: u32 = 14;
+    const TIMESTAMP: u32 = 0x1200_3400;
+    const ARRIVE: u8 = 18;
+    const DEPART: u8 = 19;
+    const DISAPPEAR: u8 = 2;
+    const LOGIN_LEN: usize = 122;
+    const LOGIN_ZONE: usize = 44;
+    const VOYAGE_START: usize = 116;
+    const VOYAGE_DURATION: usize = 120;
+    const VOYAGE_FLAGS: usize = 35;
+    const ROUTE_FLAGS: usize = 38;
+    const REVERSE: u8 = 4;
+    const ROUTE: u8 = 2;
+    const ROUTE_SHIFT: u8 = 3;
+    const JOURNEY_ZONE: u32 = 228;
+    const DURATION: u16 = 897;
+
+    let mut body = [0u8; BODY_LEN];
+    body[..4].copy_from_slice(&SHIP.to_le_bytes());
+    body[4..6].copy_from_slice(&SHIP_INDEX.to_le_bytes());
+    body[SEND_FLAGS] = UPDATE_COMBAT;
+    body[LOOK..LOOK + 2].copy_from_slice(&SHIP_MODEL.to_le_bytes());
+    body[SELECTOR..SELECTOR + 4].copy_from_slice(&SELECTOR_VALUE.to_le_bytes());
+    let mut state = SessionState::default();
+    for (animation, status, timestamp) in
+        [(ARRIVE, 0, TIMESTAMP), (DEPART, DISAPPEAR, TIMESTAMP + 1)]
+    {
+        body[ANIMATION] = animation;
+        body[STATUS] = status;
+        body[ANIMATION_START..ANIMATION_START + 4].copy_from_slice(&timestamp.to_le_bytes());
+        let events = sub_packet_events(ffxi_proto::map::s2c::CHAR_NPC, &body);
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::EntityRemoved { .. })));
+        for event in events {
+            state.apply_event(&event);
+        }
+        let snapshot = state_to_snapshot(&state);
+        let ship = snapshot
+            .entities
+            .iter()
+            .find(|entity| entity.id == SHIP)
+            .unwrap();
+        assert_eq!(
+            ship.look,
+            Some(EntityLook::Transport {
+                size: SHIP_MODEL,
+                model_id: Some(SELECTOR_VALUE),
+                animation_start: Some(timestamp),
+            })
+        );
+        assert_eq!(ship.animation, animation);
+        assert_eq!(ship.is_invisible(), status == DISAPPEAR);
+    }
+
+    let mut login = [0u8; LOGIN_LEN];
+    login[LOGIN_ZONE..LOGIN_ZONE + 4].copy_from_slice(&JOURNEY_ZONE.to_le_bytes());
+    login[VOYAGE_START..VOYAGE_START + 4].copy_from_slice(&TIMESTAMP.to_le_bytes());
+    login[VOYAGE_DURATION..VOYAGE_DURATION + 2].copy_from_slice(&DURATION.to_le_bytes());
+    login[VOYAGE_FLAGS] = REVERSE;
+    login[ROUTE_FLAGS] = ROUTE << ROUTE_SHIFT;
+    let events = sub_packet_events(ffxi_proto::map::s2c::LOGIN, &login);
+    let zone_at = events
+        .iter()
+        .position(|event| matches!(event, AgentEvent::ZoneChanged { .. }))
+        .unwrap();
+    let voyage_at = events
+        .iter()
+        .position(|event| matches!(event, AgentEvent::VoyageSynced { .. }))
+        .unwrap();
+    assert!(voyage_at > zone_at);
+    for event in events {
+        state.apply_event(&event);
+    }
+    assert_eq!(
+        state_to_snapshot(&state).voyage,
+        Some(Voyage {
+            start: TIMESTAMP,
+            duration: DURATION,
+            reverse: true,
+            route: ROUTE,
+        })
+    );
+    assert!(state.entities.iter().all(|entity| entity.id != SHIP));
+    login[VOYAGE_START..].fill(0);
+    for event in sub_packet_events(ffxi_proto::map::s2c::LOGIN, &login) {
+        state.apply_event(&event);
+    }
+    assert_eq!(state_to_snapshot(&state).voyage, None);
+}
+
 /// s2c 0x058 ASSIST is the server's retarget push (`/assist`, engage,
 /// auto-target-after-kill); the dispatch must turn `AssistNo` into the client's
 /// new target (vendor/server/src/map/packets/s2c/0x058_assist.h).
@@ -783,7 +893,10 @@ fn grace_watchdog_spares_a_dialog_the_player_is_reading() {
 
     for active in [None, open] {
         for watchdog in [false, true] {
-            assert!(flushes(flush_inputs(!USER, watchdog, !WALKED), active));
+            assert_eq!(
+                flushes(flush_inputs(!USER, watchdog, !WALKED), active),
+                active.is_none()
+            );
         }
     }
 
@@ -799,34 +912,22 @@ fn grace_watchdog_spares_a_dialog_the_player_is_reading() {
 }
 
 #[test]
-fn agent_mode_auto_release_keeps_the_vm_dialog_walkable() {
+fn agent_mode_keeps_the_server_event_until_the_vm_finishes() {
     let mut pending = vec![PINNED_EVENT];
-    let flush = flush_pending_event_end(
+    assert!(flush_pending_event_end(
         flush_inputs(false, false, false),
         &mut pending,
         Some(PINNED_EVENT),
         FLUSH_ZONE,
         FLUSH_SEQ,
     )
-    .expect("a non-user-driven session auto-releases the pinned event");
-
-    assert!(
-        !flush.clear_dialog,
-        "agent/headless dialog must survive the auto-release so frames 2..N still play"
-    );
-    assert_eq!(flush.released, 1);
-    assert_eq!(flush.next_sub_seq, FLUSH_SEQ.wrapping_add(1));
-    assert!(pending.is_empty());
-
-    let (unique_no, act_index, event_id) = PINNED_EVENT;
-    let expected =
-        build_subpacket_event_end(FLUSH_SEQ, unique_no, act_index, FLUSH_ZONE, event_id, 0);
-    assert_eq!(flush.payload, expected);
-
-    assert!(
-        !take_pending_event_end(&mut pending, unique_no, event_id),
-        "the surviving VM session must not resend the 0x05B the flush already sent"
-    );
+    .is_none());
+    assert_eq!(pending, vec![PINNED_EVENT]);
+    assert!(take_pending_event_end(
+        &mut pending,
+        PINNED_EVENT.0,
+        PINNED_EVENT.2
+    ));
 }
 
 #[test]
@@ -926,16 +1027,18 @@ fn should_emit_pos_bypasses_rate_limit_on_heading_change() {
 fn flood_drain_waits_for_self_pos_seed() {
     // Pre-GAMEOK drain (break_on_idle=false): keep reading until the seed lands.
     assert!(
-        !should_break_flood(false, false),
+        !should_break_flood(false, false, false)
+            && !should_break_flood(false, true, false)
+            && !should_break_flood(false, false, true),
         "unseeded pre-GAMEOK drain must wait"
     );
     assert!(
-        should_break_flood(false, true),
+        should_break_flood(false, true, true),
         "seeded pre-GAMEOK drain may break on idle"
     );
     // Quiescence drains (break_on_idle=true): stop on idle regardless of seed.
     assert!(
-        should_break_flood(true, false),
+        should_break_flood(true, false, false),
         "quiescence drain breaks on idle unconditionally"
     );
 }
@@ -1170,17 +1273,6 @@ fn test_dat_root() -> Option<ffxi_dat::DatRoot> {
 /// Self-skips without game files.
 #[test]
 fn talknumwork_composes_real_keyitem_line_from_zone_dat() {
-    // This dev box's retail install is a different client era than the pinned 6437 ID (its
-    // zone-230 entry 6437 is an unrelated recycle-bin line), so the assertion can never hold
-    // here - and its panic unwinds into a machine-specific access violation that kills the whole
-    // test binary. Cow_doc at the repo root marks this box; skip when it exists.
-    let cow_doc = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("Cow_doc");
-    if cow_doc.exists() {
-        eprintln!("skipping: Cow_doc present (retail install is a different DAT era)");
-        return;
-    }
     let Some(root) = test_dat_root() else {
         eprintln!("skipping: no FFXI install");
         return;
@@ -1433,6 +1525,68 @@ fn talknumwork2_substitutes_the_caught_item() {
         "surrounding text stays plain: {:?}",
         line.spans
     );
+}
+
+#[test]
+#[ignore = "requires the installed retail dialog DATs"]
+fn ferry_fishing_chat_replays_reported_catches_with_installed_dat() {
+    const FERRY_ZONE: u16 = 220;
+    const REPORTED_CATCH: u16 = 7288;
+    const SERVER_BASE: u16 = 7249;
+    const NUM1_START: usize = 12;
+    const STRING1_START: usize = 28;
+    const MESNUM_START: usize = 6;
+    let root = std::sync::Arc::new(ffxi_dat::DatRoot::from_env_or_default().unwrap());
+    let mut dialog = crate::event_dialog::DialogSession::new(Some(root), "Observer".into());
+    let (tx, mut rx) = broadcast::channel(16);
+    for (item, name) in [(4451i32, "Silver Shark"), (5128, "Cone Calamary")] {
+        let mut body = vec![0; decode::TalkNumWork2::SIZE];
+        body[MESNUM_START..MESNUM_START + 2].copy_from_slice(
+            &(REPORTED_CATCH | decode::TalkNumWork::MESNUM_HIDE_NAME_FLAG).to_le_bytes(),
+        );
+        body[NUM1_START..NUM1_START + 4].copy_from_slice(&item.to_le_bytes());
+        body[NUM1_START + 4..NUM1_START + 8].copy_from_slice(&1i32.to_le_bytes());
+        body[STRING1_START..STRING1_START + 6].copy_from_slice(b"Angler");
+        emit_zone_message_chat(
+            ffxi_proto::map::s2c::TALKNUMWORK2,
+            &body,
+            &mut dialog,
+            FERRY_ZONE,
+            "Observer",
+            &tx,
+        );
+        let AgentEvent::ChatLine { line } = rx.try_recv().unwrap() else {
+            panic!("catch must emit chat")
+        };
+        assert!(line.text.starts_with("Angler caught "), "{}", line.text);
+        assert!(line.text.contains(name), "{}", line.text);
+        assert!(!line.text.contains('{'), "{}", line.text);
+        assert!(line
+            .spans
+            .iter()
+            .any(|s| s.kind == crate::state::ChatSpanKind::Item));
+        println!("{}", line.text);
+    }
+    let crate::event_dialog::FishingChat::Line { text, .. } = dialog.fishing_chat(
+        FERRY_ZONE,
+        SERVER_BASE + u16::from(ffxi_proto::fishing_messages::kind::KEEN_ANGLERS_SENSE),
+        ffxi_proto::map::s2c::TALKNUMWORK,
+    ) else {
+        panic!("keen angler message must use the learned server base")
+    };
+    let line = zone_message_chat_line(
+        &ZoneMessage {
+            message_index: SERVER_BASE,
+            speaker: None,
+            actor: None,
+            nums: vec![4451, 3, 3, 3],
+        },
+        Some(text),
+        "Observer",
+    );
+    assert!(line.text.contains("Silver Shark"), "{}", line.text);
+    assert!(!line.text.contains('{'), "{}", line.text);
+    println!("{}", line.text);
 }
 
 /// The Esc cancel EndPara crosses the wire exactly as LSB's
@@ -2269,10 +2423,6 @@ const BATTLE2_PARRIED_LEFT_ATTACK: ffxi_proto::melee::MeleeResult =
     ffxi_proto::melee::MeleeResult {
         resolution: ffxi_proto::melee::ActionResolution::Parry,
         animation: ffxi_proto::melee::AttackAnimation::LeftAttack,
-        info: 0,
-        hit_distortion: 0,
-        knockback: 0,
-        kind: 0,
     };
 
 fn battle2_single_result_body() -> Vec<u8> {
@@ -2303,7 +2453,7 @@ fn battle2_basic_attack_reports_resolution_and_swing_animation() {
     assert_eq!(h.first_result, Some(BATTLE2_PARRIED_LEFT_ATTACK));
 }
 
-// F58 - the outcome bits after animation(12): info(5), hitDistortion(2), knockback(3) in LSB
+// the outcome bits after animation(12): info(5), hitDistortion(2), knockback(3) in LSB
 // write order. A hand-packed critical left-attack with level-2 knockback must come back split,
 // not lumped into one 5-bit "scale".
 #[test]
@@ -2330,17 +2480,14 @@ fn battle2_result_outcome_bits_roundtrip() {
     w.write(0, 1); // no reaction block
 
     let h = decode_battle2_header(&w.into_bytes()).unwrap();
-    assert_eq!(h.first_info, 2, "CriticalHit bit");
-    assert_eq!(h.first_hit_distortion, 3, "Heavy");
-    assert_eq!(h.first_knockback, 2, "level 2");
-    assert_eq!(h.first_kind, 1);
+    let outcome = h
+        .first_outcome
+        .expect("a result block decodes its outcome bits");
+    assert_eq!(outcome.to_wire(), (2, 3, 2), "CriticalHit, Heavy, level 2");
+    assert!(outcome.is_critical());
     let r = h.first_result.expect("a basic-attack result decodes");
     assert_eq!(r.resolution, ffxi_proto::melee::ActionResolution::Hit);
     assert_eq!(r.animation, ffxi_proto::melee::AttackAnimation::LeftAttack);
-    assert_eq!(
-        (r.info, r.hit_distortion, r.knockback, r.kind),
-        (2, 3, 2, 1)
-    );
 }
 
 // A non-basic-attack category whose result block happens to carry low resolution/animation
@@ -3658,4 +3805,237 @@ fn system_message_executing_logout_full_line() {
         line.text
     );
     assert!(matches!(line.channel, ChatChannel::System));
+}
+
+#[test]
+pub(super) fn bootstrap_acceptance_contract() {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            for scenario in [
+                BootstrapReply::Silent,
+                BootstrapReply::MalformedLogin,
+                BootstrapReply::OtherLoginWithSelfPosition,
+                BootstrapReply::SelfPositionOnly,
+                BootstrapReply::SelfLogin,
+                BootstrapReply::DelayedSelfLogin,
+            ] {
+                bootstrap_scenario(scenario).await;
+            }
+        });
+}
+
+#[derive(Debug, Clone, Copy)]
+enum BootstrapReply {
+    Silent,
+    MalformedLogin,
+    OtherLoginWithSelfPosition,
+    SelfPositionOnly,
+    SelfLogin,
+    DelayedSelfLogin,
+}
+
+async fn bootstrap_scenario(scenario: BootstrapReply) {
+    use ffxi_proto::map::s2c;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use std::time::Duration;
+
+    const PLAYER: u32 = 17_455_719;
+    const SEED: [u8; 20] = [0; 20];
+    const LOGIN_BODY_LEN: usize = 48;
+    const SEND_FLAGS: usize = 6;
+    const POSITION_X: usize = 8;
+    const POSITION_HEIGHT: usize = 12;
+    const POSITION_NORTH: usize = 16;
+    const POSITION: [f32; 3] = [2.15, -2.1, 3.25];
+    const EXPECTED_BOOTSTRAPS: usize = 2;
+    const CASE_TIMEOUT: Duration = Duration::from_secs(20);
+    const DELAYED_LOGIN: Duration = Duration::from_millis(900);
+
+    fn packet(opcode: u16, body: &[u8]) -> Vec<u8> {
+        let words = framing::subpacket_size_words(body.len() + framing::SUBPACKET_HEADER_SIZE);
+        let mut out = build_subpacket_header(opcode, words, 1).to_vec();
+        out.extend(body);
+        out
+    }
+    let accepted = matches!(
+        scenario,
+        BootstrapReply::SelfLogin | BootstrapReply::DelayedSelfLogin
+    );
+    let mut self_body = vec![0; LOGIN_BODY_LEN];
+    self_body[..4].copy_from_slice(&PLAYER.to_le_bytes());
+    self_body[SEND_FLAGS] = 1;
+    for (offset, value) in [POSITION_X, POSITION_HEIGHT, POSITION_NORTH]
+        .into_iter()
+        .zip(POSITION)
+    {
+        self_body[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    let login = packet(s2c::LOGIN, &self_body);
+    let self_position = packet(s2c::CHAR_PC, &self_body);
+    let initial = match scenario {
+        BootstrapReply::Silent => None,
+        BootstrapReply::MalformedLogin => Some(packet(s2c::LOGIN, &[0; 4])),
+        BootstrapReply::OtherLoginWithSelfPosition => {
+            let mut wrong = self_body.clone();
+            wrong[..4].copy_from_slice(&(PLAYER + 1).to_le_bytes());
+            let mut payload = packet(s2c::LOGIN, &wrong);
+            payload.extend(&self_position);
+            Some(payload)
+        }
+        BootstrapReply::SelfPositionOnly | BootstrapReply::DelayedSelfLogin => Some(self_position),
+        BootstrapReply::SelfLogin => Some(login.clone()),
+    };
+    let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let address = server.local_addr().unwrap();
+    let outgoing = Arc::new(AtomicUsize::new(0));
+    let observed = outgoing.clone();
+    let fake = tokio::spawn(async move {
+        let mut bytes = vec![0; ffxi_proto::map::MAX_DATAGRAM];
+        let mut peer = None;
+        loop {
+            let (size, client) = server.recv_from(&mut bytes).await.unwrap();
+            let count = observed.fetch_add(1, Ordering::SeqCst) + 1;
+            if count <= EXPECTED_BOOTSTRAPS {
+                assert_eq!(size, map_client::BOOTSTRAP_DATAGRAM_SIZE);
+                let payload = &bytes[framing::FFXI_HEADER_SIZE
+                    ..framing::FFXI_HEADER_SIZE + map_client::GP_CLI_LOGIN_SIZE];
+                let sent = framing::walk_sub_packets(payload).next().unwrap().unwrap();
+                assert_eq!(sent.opcode, ffxi_proto::map::c2s::LOGIN);
+            }
+            if count == 1 {
+                peer = Some(MapClient::connect(client, SEED).await.unwrap());
+                if let Some(ref payload) = initial {
+                    peer.as_ref()
+                        .unwrap()
+                        .send_encrypted(payload, 1, 0)
+                        .await
+                        .unwrap();
+                }
+                if matches!(scenario, BootstrapReply::DelayedSelfLogin) {
+                    tokio::time::sleep(DELAYED_LOGIN).await;
+                    peer.as_ref()
+                        .unwrap()
+                        .send_encrypted(&login, 2, 0)
+                        .await
+                        .unwrap();
+                }
+            } else if !matches!(scenario, BootstrapReply::Silent) {
+                if accepted {
+                    peer.as_ref()
+                        .unwrap()
+                        .send_encrypted(&[], count as u16 + 1, 0)
+                        .await
+                        .unwrap();
+                } else {
+                    server.send_to(&[0], client).await.unwrap();
+                }
+            }
+        }
+    });
+    let mut map = MapClient::connect(address, SEED).await.unwrap();
+    let cfg = Config {
+        server: "127.0.0.1".into(),
+        map_host_override: None,
+        auth_port: 0,
+        data_port: 0,
+        view_port: 0,
+        user: "bootstrap-fixture".into(),
+        password: String::new(),
+        char_selection: CharSelection::Id(PLAYER),
+        initial_state: None,
+        user_driven_events: true,
+        dat_root: None,
+    };
+    let auth = crate::auth_client::AuthSession {
+        account_id: 1,
+        session_hash: [0; 16],
+    };
+    let bootstrap = BootstrapArgs {
+        char_id: PLAYER,
+        char_name: "Bootstrap",
+        account_name: "bootstrap-fixture",
+        ticket: [0; 16],
+        version: 0,
+        platform: *b"WIN\0",
+        cli_lang: 0,
+    };
+    let (commands, mut command_rx) = mpsc::channel(1);
+    commands.send(AgentCommand::Disconnect).await.unwrap();
+    let (events, mut event_rx) = broadcast::channel(256);
+    let outcome = tokio::time::timeout(
+        CASE_TIMEOUT,
+        run_map_session(
+            &cfg,
+            &auth,
+            &bootstrap,
+            &mut map,
+            None,
+            1,
+            None,
+            &mut command_rx,
+            &events,
+            None,
+        ),
+    )
+    .await
+    .expect("bootstrap must complete within its bounded deadline");
+    tokio::task::yield_now().await;
+    fake.abort();
+    assert!(
+        fake.await.unwrap_err().is_cancelled(),
+        "fake map server panicked"
+    );
+    assert_eq!(outcome.is_ok(), accepted, "{scenario:?}: {outcome:?}");
+    let mut saw_in_zone = false;
+    let mut saw_accepted = false;
+    let mut saw_seed = false;
+    while let Ok(event) = event_rx.try_recv() {
+        match event {
+            AgentEvent::StageChanged {
+                stage: Stage::InZone,
+            } => saw_in_zone = true,
+            AgentEvent::Diagnostics { diagnostics } => {
+                saw_accepted |= diagnostics.blowfish_status == Some(BlowfishStatus::Accepted);
+            }
+            AgentEvent::EntityUpserted {
+                entity,
+                pos_present: true,
+            } if entity.id == PLAYER => {
+                saw_seed |= entity.pos
+                    == Vec3 {
+                        x: POSITION[0],
+                        y: POSITION[2],
+                        z: POSITION[1],
+                    };
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(saw_in_zone, accepted, "{scenario:?}");
+    assert_eq!(saw_accepted, accepted, "{scenario:?}");
+    if matches!(
+        scenario,
+        BootstrapReply::OtherLoginWithSelfPosition | BootstrapReply::SelfPositionOnly
+    ) {
+        assert!(
+            saw_seed,
+            "{scenario:?}: CHAR_PC fixture must seed a position without granting acceptance"
+        );
+    }
+    if accepted {
+        assert!(saw_seed, "{scenario:?}: missing authoritative position");
+        assert!(outgoing.load(Ordering::SeqCst) > EXPECTED_BOOTSTRAPS);
+    } else {
+        assert_eq!(
+            outgoing.load(Ordering::SeqCst),
+            EXPECTED_BOOTSTRAPS,
+            "{scenario:?}: no post-bootstrap packet may precede self LOGIN"
+        );
+    }
 }

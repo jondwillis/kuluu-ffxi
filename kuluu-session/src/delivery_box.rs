@@ -152,7 +152,7 @@ impl DeliveryBoxSession {
                 if let Some(item) = item_of(r).or_else(|| self.slots[slot as usize].clone()) {
                     // Retail wording, observed on HorizonXI 2026-07-18: "You
                     // take the <item> out of delivery slot <n>." — 1-based
-                    // slot (artifacts/retail/moghouse-menu-notes.md).
+                    // slot (.agents/skills/retail-observe/references/2026-07-17-moghouse-menu.md).
                     out.notices.push(format!(
                         "You take the {} out of delivery slot {}.",
                         parcel_name(&item),

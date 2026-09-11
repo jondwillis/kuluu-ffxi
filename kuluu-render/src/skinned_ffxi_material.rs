@@ -651,6 +651,8 @@ pub struct FfxiMaterialPlugin;
 
 impl Plugin for FfxiMaterialPlugin {
     fn build(&self, app: &mut App) {
+        bevy::shader::load_shader_library!(app, "directional_shadow.wgsl");
+        bevy::shader::load_shader_library!(app, "point_shadow.wgsl");
         embedded_asset!(app, "skinned_ffxi.wgsl");
         embedded_asset!(app, "skinned_ffxi_prepass.wgsl");
         app.add_plugins(MaterialPlugin::<FfxiSkinnedMaterial>::default());
@@ -695,6 +697,27 @@ mod tests {
             include_str!("skinned_ffxi.wgsl").contains(&format!("i < {MAX_POINT_LIGHTS}u")),
             "skinned_ffxi.wgsl must loop `i < {MAX_POINT_LIGHTS}u` over the per-actor point slots"
         );
+    }
+
+    // A per-actor slot knows its light only by world position, so the shared module
+    // must resolve the clusterable id by position match before it can sample the cube
+    // map; the skinned loop has to route every slot through it, gated by the same
+    // receive flag as the sun.
+    #[test]
+    fn point_slots_receive_shadows_through_the_shared_module() {
+        let skinned = include_str!("skinned_ffxi.wgsl");
+        assert!(skinned.contains("#import kuluu_render::point_shadow::point_shadow_factor"));
+        assert!(skinned.contains(
+            "point_shadow_factor(p, n, skins[si].lighting.point_pos[i].xyz, frag_coord)"
+        ));
+        assert!(skinned.contains("if (point_shadows) {"));
+        assert!(skinned.contains("shadow_scale, receive_shadows, in.clip_position.xy)"));
+
+        let module = include_str!("point_shadow.wgsl");
+        assert!(module.contains("#define_import_path kuluu_render::point_shadow"));
+        assert!(module.contains("POINT_LIGHT_FLAGS_SHADOWS_ENABLED_BIT) == 0u"));
+        assert!(module.contains("distance((*light).position_radius.xyz, light_pos)"));
+        assert!(module.contains("return fetch_point_shadow(light_id, vec4<f32>(world_pos, 1.0)"));
     }
 
     // The storage structs are an ABI contract with both WGSL modules: same

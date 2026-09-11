@@ -1,7 +1,7 @@
 // The named-but-unparsed variants (Route, WeightedMesh, PointList, SpellList, Path,
 // AbilityList, WeaponTrace, BumpMap, Blur, UiMenu, UiElementGroup) exist so CLIP_WARN and
 // the loader's rejected-chunk lists can name a chunk instead of printing an unknown code.
-// Their names follow vekien/xi-model-viewer ui/js/dat/inspect.js SECTION_TYPE_NAMES :17-26;
+// Their names follow vekien/xi-model-viewer ui/js/dat/inspect.js SECTION_TYPE_NAMES;
 // ffxi-dat deliberately ships no parser for them yet.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

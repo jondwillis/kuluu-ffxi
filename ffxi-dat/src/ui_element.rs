@@ -186,7 +186,7 @@ fn texture_section_name(body: &[u8]) -> Option<String> {
     Some(normalize_name(body.get(1..1 + NAME_LEN)?))
 }
 
-fn find_texture(dat_bytes: &[u8], name: &str) -> Option<DecodedTexture> {
+pub fn find_texture(dat_bytes: &[u8], name: &str) -> Option<DecodedTexture> {
     walk(dat_bytes)
         .flatten()
         .filter(|c| c.kind == TEXTURE_KIND)
@@ -228,9 +228,18 @@ pub fn crop_sprite(
 }
 
 pub fn ui_sprite(dat_bytes: &[u8], group_name: &str, index: usize) -> Option<UiSprite> {
+    ui_component_sprite(dat_bytes, group_name, index, 0)
+}
+
+pub fn ui_component_sprite(
+    dat_bytes: &[u8],
+    group_name: &str,
+    index: usize,
+    component_index: usize,
+) -> Option<UiSprite> {
     let group = find_ui_element_group(dat_bytes, group_name)?;
     let element = group.elements.get(index)?;
-    let component = element.components.first()?;
+    let component = element.components.get(component_index)?;
     let tex = find_texture(dat_bytes, &component.texture_ref)?;
     crop_sprite(
         &tex,
@@ -485,18 +494,6 @@ mod tests {
     fn real_dat_framesus_blend_factor_counts() {
         const FRAMESUS_QUADS: usize = 2433;
         const FRAMESUS_ZERO_SOURCE_QUADS: usize = 163;
-
-        // This dev box's retail install is a different client era than the kuluu-hjr6 pin
-        // (its framesus sheet has 2464 quads, not 2433), and its panic unwinds into a
-        // machine-specific access violation that kills the whole test binary. Cow_doc at
-        // the repo root marks this box; skip when it exists.
-        let cow_doc = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("Cow_doc");
-        if cow_doc.exists() {
-            eprintln!("skipping: Cow_doc present (retail install is a different DAT era)");
-            return;
-        }
 
         let Some(root) = crate::archive::open_test_install() else {
             return;

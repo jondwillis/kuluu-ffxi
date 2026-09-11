@@ -170,16 +170,21 @@ fn build_ui(commands: &mut Commands, form: &SettingsForm, server: &ServerInfo) {
                     ))
                     .observe(save_observer);
 
-                    r.spawn(button_bundle(
-                        ButtonBundleProps::default(),
-                        (),
-                        Spawn((Text::new("Graphics"), ThemedText)),
-                    ))
-                    .observe(
-                        |_ev: On<Activate>, mut next: ResMut<NextState<LauncherState>>| {
-                            next.set(LauncherState::Graphics);
-                        },
-                    );
+                    for (label, destination) in [
+                        ("Config", LauncherState::Config),
+                        ("Graphics", LauncherState::Graphics),
+                    ] {
+                        r.spawn(button_bundle(
+                            ButtonBundleProps::default(),
+                            (),
+                            Spawn((Text::new(label), ThemedText)),
+                        ))
+                        .observe(
+                            move |_ev: On<Activate>, mut next: ResMut<NextState<LauncherState>>| {
+                                next.set(destination.clone());
+                            },
+                        );
+                    }
 
                     r.spawn(button_bundle(
                         ButtonBundleProps::default(),

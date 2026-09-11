@@ -7,8 +7,8 @@
 # the *exact* fmt/clippy invocation CI will, and vice versa.
 #
 # Usage: scripts/checks.sh <stage>...
-#   stage ∈ {harness, comments, fmt, clippy, style, test, enhanced, build, wasm, doc}
-#   scripts/checks.sh harness comments fmt clippy  # pre-push default
+#   stage ∈ {harness, comments, fmt, clippy, style, contracts, test, enhanced, build, wasm, doc}
+#   scripts/checks.sh harness comments fmt contracts clippy  # pre-push default
 #   COMMENTS_DIFF=staged scripts/checks.sh comments  # pre-commit (staged hunks)
 #   scripts/checks.sh harness fmt clippy test # the CI gate (ci.yml runs these)
 #   scripts/checks.sh enhanced                # the opt-in feature family (CI)
@@ -310,13 +310,17 @@ run_comments() {
         [ -d "$root" ] && [ -n "$(ls -A "$root" 2>/dev/null)" ] || continue ;;
     esac
     case "$path" in *..*) continue ;; esac
-    [ -e "$path" ] && continue
     # A path wrapped at a line break, or one with spaces in it, reaches here
-    # truncated; accept it when the truncation is a prefix of a real entry.
-    [ -z "$(ls -d "$path"* 2>/dev/null)" ] || continue
+    # truncated, so a prefix match of a real entry is accepted too. Outside
+    # the submodule roots the entry has to be tracked: an untracked local
+    # note passes a filesystem test on its author's machine and nowhere else.
+    case "$path" in
+      vendor/*|research/*) [ -n "$(ls -d "$path"* 2>/dev/null)" ] && continue ;;
+      *) [ -n "$(git ls-files -- "$path*" 2>/dev/null)" ] && continue ;;
+    esac
     missing+="  $path"$'\n'
   done < <(printf '%s\n' "$comments" \
-    | grep -oE '(^|[^A-Za-z0-9._/-])(vendor|research|docs|\.agents)/[A-Za-z0-9._/-]+' \
+    | grep -oE '(^|[^A-Za-z0-9._/-])(vendor|research|docs|artifacts|\.agents)/[A-Za-z0-9._/-]+' \
     | sed -E 's#^[^A-Za-z0-9._/-]##' | sort -u)
   if [ -n "$missing" ]; then
     echo "checks: comments - cited path does not exist in this tree (moved upstream, a private note, or the retired docs/ tree); fix or drop the citation:" >&2
@@ -346,7 +350,41 @@ run_comments() {
   return $bad
 }
 
+run_contracts() {
+  local contract="session::event_transport::contracts::event_state_contract" listing
+  listing=$(cargo test -p kuluu-session --lib --locked -- --list)
+  if ! grep -Fxq "$contract: test" <<< "$listing"; then
+    echo "checks: contracts — mandatory event state contract is missing" >&2
+    return 1
+  fi
+  cargo test -p kuluu-session --lib --locked "$contract" -- --exact --include-ignored
+  listing=$(cargo test -p kuluu-render -p kuluu --lib --locked "${FEATURES[@]}" -- --list)
+  for contract in \
+    transport::tests::transport_state_contract \
+    view_native::input::tests::scripted_walk_render_contract \
+    view_native::walker::obstacles::tests::transport_dock_collision_contract \
+    view_native::navmesh_overlay::tests::remote_passenger_keeps_reported_height_under_unloaded_interior_shell \
+    zone_point_lights::tests::active_interior_lights_join_main_and_leave_on_deactivation_or_disconnect; do
+    if ! grep -Fxq "$contract: test" <<< "$listing"; then
+      echo "checks: contracts — mandatory transport render contract is missing: $contract" >&2
+      return 1
+    fi
+    cargo test -p kuluu-render -p kuluu --lib --locked "${FEATURES[@]}" "$contract" -- --exact --include-ignored
+  done
+  listing=$(cargo test -p ffxi-dat --lib --locked -- --list)
+  for contract in \
+    mmb::tests::legacy_mmb_static_canopy_preserves_strip_connectivity_and_winding \
+    vehicle::tests::nonuniform_spline_matches_retail_weighted_basis_and_endpoint_extension; do
+    if ! grep -Fxq "$contract: test" <<< "$listing"; then
+      echo "checks: contracts — mandatory vehicle DAT contract is missing: $contract" >&2
+      return 1
+    fi
+    cargo test -p ffxi-dat --lib --locked "$contract" -- --exact --include-ignored
+  done
+}
+
 run_test() {
+  run_contracts
   # Integration tests that need a live LSB server self-skip when unreachable,
   # so this is safe on a network-isolated runner.
   #
@@ -414,7 +452,7 @@ run_doc() {
 }
 
 if [[ $# -eq 0 ]]; then
-  echo "checks: no stage given (expected one or more of: fmt clippy style harness test enhanced build wasm doc)" >&2
+  echo "checks: no stage given (expected one or more of: fmt clippy style harness contracts test enhanced build wasm doc)" >&2
   exit 2
 fi
 
@@ -425,6 +463,7 @@ for stage in "$@"; do
     style)  echo "checks: style";  run_style ;;
     comments) echo "checks: comments"; run_comments ;;
     harness) echo "checks: harness"; run_harness ;;
+    contracts) echo "checks: contracts"; run_contracts ;;
     test)   echo "checks: test";   run_test ;;
     enhanced) echo "checks: enhanced"; run_enhanced ;;
     build)  echo "checks: build";  run_build ;;

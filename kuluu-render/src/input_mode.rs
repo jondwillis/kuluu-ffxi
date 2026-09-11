@@ -203,6 +203,8 @@ pub enum MenuKind {
 
     Config,
 
+    Controls,
+
     Debug,
 
     Graphics,

@@ -541,7 +541,7 @@ pub fn dialog_mode_sync_system(
 /// grid), so without this the cursor keeps the parent row's index — which is
 /// why "Delivery Box" (row 2) opened onto "Send" (row 2) instead of "Receive".
 /// Retail opens each menu on its first row and restores the row a menu was left
-/// on when Esc backs out (artifacts/retail/moghouse-menu-notes.md).
+/// on when Esc backs out (.agents/skills/retail-observe/references/2026-07-17-moghouse-menu.md).
 #[derive(Default)]
 pub struct DialogCursors {
     open: Option<u64>,

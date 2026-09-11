@@ -47,14 +47,14 @@ CR_RE_VERSIONED='[0-9]+\.[0-9]+\.[0-9]+'
 # survives upstream edits and is greppable; a line number is a promise the
 # submodule pin does not keep. Matched BEFORE the allow-list strip, since the
 # allow-list is what would otherwise exempt these.
-CR_RE_CITE_LINE='(^|[^A-Za-z0-9_])[A-Za-z0-9_.-]+\.(cpp|h|hpp|c|cs|lua|sql|py|rs|xml|json|kt|md):[0-9]+'
+CR_RE_CITE_LINE='(^|[^A-Za-z0-9_])[A-Za-z0-9_.-]*\.(cpp|h|hpp|c|cc|cs|lua|sql|py|rs|xml|json|kt|js|md)([[:space:]]+[A-Za-z0-9_:.]+){0,3}[[:space:]]*\(?:[0-9]+'
 
 # Citations nobody in this tree can open. An elided `.../` path can't be
 # checked for existence, and a `(F37)`-style finding id points at a note that
 # lives outside the repo; both are what a handoff written against private
 # research produces. scripts/checks.sh comments hard-fails on these.
-CR_RE_ELIDED_PATH='(vendor|research)/[A-Za-z0-9._-]+/\.\.\./'
-CR_RE_FINDING_ID='\(F[0-9]{1,3}([,;][[:space:]]?F[0-9]{1,3})*\)'
+CR_RE_ELIDED_PATH='(vendor|research)/[A-Za-z0-9._-]+[[:space:]]*/?\.\.\./'
+CR_RE_FINDING_ID='(finding(s)?[[:space:]]+F[0-9]{1,3}|\(F[0-9]{1,3}([,;/][[:space:]]?F[0-9]{1,3})*\)|\bF[0-9]{1,3}[-/]F[0-9]{1,3}\b|FFXiMain\.dll[,;)]?[[:space:]]+F[0-9]{1,3}\b)'
 
 # Narrative / session-history / temporal — describes how the code got
 # here or a passing moment, not what is true now.

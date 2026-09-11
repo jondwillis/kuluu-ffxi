@@ -1,6 +1,35 @@
 use super::*;
 
 #[test]
+fn voyage_disconnect_clears_snapshot_and_legacy_state_deserializes() {
+    let voyage = kuluu_snapshot::Voyage {
+        start: 123_456,
+        duration: 897,
+        reverse: true,
+        route: 2,
+    };
+    let mut state = SessionState::default();
+    state.apply_event(&AgentEvent::VoyageSynced { voyage });
+    assert_eq!(
+        crate::wire_translate::state_to_snapshot(&state).voyage,
+        Some(voyage)
+    );
+    assert!(state.apply_event(&AgentEvent::Disconnected {
+        reason: "test".into()
+    }));
+    assert_eq!(
+        crate::wire_translate::state_to_snapshot(&state).voyage,
+        None
+    );
+    let mut old = serde_json::to_value(SessionState::default()).unwrap();
+    old.as_object_mut().unwrap().remove("voyage");
+    assert_eq!(
+        serde_json::from_value::<SessionState>(old).unwrap().voyage,
+        None
+    );
+}
+
+#[test]
 fn weather_fold_sets_and_zone_change_clears() {
     let mut s = SessionState::default();
     assert_eq!(s.current_weather, None);
@@ -2197,6 +2226,7 @@ fn _agentevent_is_additive_only(x: &AgentEvent) {
         AgentEvent::StageChanged { .. } => (),
         AgentEvent::ZoneChanged { .. } => (),
         AgentEvent::SubAreaSynced { .. } => (),
+        AgentEvent::VoyageSynced { .. } => (),
         AgentEvent::PositionChanged { .. } => (),
         AgentEvent::CharStatsUpdated { .. } => (),
         AgentEvent::EntityUpserted { .. } => (),

@@ -11,8 +11,6 @@ md-5.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 
-[dev-dependencies]
-# map.rs pins its hand-declared emote ids against the scraped table.
 ffxi-vocab = { path = "../ffxi-vocab" }
 
 [build-dependencies]

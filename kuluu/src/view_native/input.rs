@@ -424,6 +424,47 @@ pub struct LocalPlayerPrediction {
     pub pos: Vec3,
     pub initialized: bool,
     snapshot_driven: bool,
+    dialog_walk: Option<DialogWalk>,
+}
+
+#[derive(Clone, Copy)]
+struct DialogWalk {
+    from: Vec3,
+    target: Vec3,
+    elapsed: f32,
+}
+
+impl DialogWalk {
+    fn new(position: Vec3) -> Self {
+        Self {
+            from: position,
+            target: position,
+            elapsed: 0.0,
+        }
+    }
+
+    // research/XiEvents/OpCodes/0x001F.md CodeMOVE advances with frame delay.
+    fn advance(&mut self, current: Vec3, target: Vec3, dt: f32) -> (Vec3, f32) {
+        if current.distance(target) > PREDICTION_RESYNC_YALMS {
+            *self = Self::new(target);
+            return (target, 0.0);
+        }
+        if self.target != target {
+            self.from = current;
+            self.target = target;
+            self.elapsed = 0.0;
+        }
+        let period = kuluu_session::session::SESSION_TICK_PERIOD.as_secs_f32();
+        self.elapsed = (self.elapsed + dt).min(period);
+        let position = self.from.lerp(self.target, self.elapsed / period);
+        let horizontal = (position - current).truncate().length();
+        let speed = if dt > 0.0 && horizontal > f32::EPSILON {
+            horizontal / dt
+        } else {
+            0.0
+        };
+        (position, speed)
+    }
 }
 
 #[derive(Resource, Default)]
@@ -753,9 +794,11 @@ pub fn sync_target_lock_system(
 pub fn reset_local_movement(
     mut prediction: ResMut<LocalPlayerPrediction>,
     mut locals: ResMut<DispatchLocals>,
+    mut move_intent: ResMut<kuluu_render::combat_stance::SelfMoveIntent>,
 ) {
     *prediction = LocalPlayerPrediction::default();
     *locals = DispatchLocals::default();
+    *move_intent = kuluu_render::combat_stance::SelfMoveIntent::default();
 }
 
 fn snapshot_drives_movement(goal: Option<&kuluu_snapshot::ReactorGoal>) -> bool {
@@ -815,13 +858,32 @@ pub fn dispatch_movement_system(
         return;
     }
 
-    let snapshot_driven = snapshot_drives_movement(state.snapshot.current_goal.as_ref());
+    let dialog_driven = matches!(*mode, InputMode::Dialog(_));
+    let snapshot_driven =
+        snapshot_drives_movement(state.snapshot.current_goal.as_ref()) || dialog_driven;
     if snapshot_driven || prediction.snapshot_driven {
-        prediction.pos = Vec3::new(
+        let target = Vec3::new(
             state.snapshot.self_pos.pos.x,
             state.snapshot.self_pos.pos.y,
             state.snapshot.self_pos.pos.z,
         );
+        if dialog_driven && prediction.initialized {
+            let current = prediction.pos;
+            let walk = prediction
+                .dialog_walk
+                .get_or_insert_with(|| DialogWalk::new(current));
+            let (position, speed) = walk.advance(current, target, time.delta_secs());
+            prediction.pos = position;
+            **move_intent = kuluu_render::combat_stance::SelfMoveIntent {
+                moving: speed > f32::EPSILON,
+                forward: 1.0,
+                scripted_speed: Some(speed),
+                ..default()
+            };
+        } else {
+            prediction.pos = target;
+            prediction.dialog_walk = None;
+        }
         prediction.initialized = true;
         locals.walker = super::walker::Walker::default();
     }
@@ -1231,6 +1293,7 @@ pub fn dispatch_movement_system(
         moving,
         forward: intent_forward,
         strafe: intent_strafe,
+        ..default()
     };
 
     let mut heading = self_pos.heading;
@@ -2021,6 +2084,134 @@ mod tests {
     }
 
     #[test]
+    fn scripted_walk_render_contract() {
+        use kuluu_render::combat_stance::SelfMoveIntent;
+        use kuluu_render::{CurrRenderPos, PrevRenderPos};
+        const FIXED_HZ: f32 = 60.0;
+        const SPEED: f32 = 1.3;
+        const STEPS: usize = 60;
+        const EPSILON: f32 = 0.00001;
+        let dt = Duration::from_secs_f32(1.0 / FIXED_HZ);
+        let source_period = kuluu_session::session::SESSION_TICK_PERIOD.as_secs_f32();
+        let frames_per_sample = (source_period * FIXED_HZ).round() as usize;
+        let (mut app, mut commands) = movement_app();
+        app.insert_resource(Time::<Fixed>::from_hz(FIXED_HZ as f64));
+        let actor = app
+            .world_mut()
+            .spawn((IsSelf, PrevRenderPos(Vec3::ZERO), CurrRenderPos(Vec3::ZERO)))
+            .id();
+        app.add_systems(
+            Update,
+            apply_self_prediction_system.after(dispatch_movement_system),
+        );
+        app.update();
+        app.insert_resource(InputMode::Dialog(kuluu_render::DialogCursor::default()));
+        let mut previous = 0.0;
+        let mut target = 0.0;
+        for frame in 0..STEPS {
+            if frame % frames_per_sample == 0 {
+                target += SPEED * source_period;
+                app.world_mut()
+                    .resource_mut::<SceneState>()
+                    .snapshot
+                    .self_pos
+                    .pos
+                    .x = target;
+            }
+            app.world_mut().resource_mut::<Time<Fixed>>().advance_by(dt);
+            app.world_mut().run_schedule(Update);
+            let rendered = app.world().get::<CurrRenderPos>(actor).unwrap().0.x;
+            let delta = rendered - previous;
+            assert!(
+                (delta - SPEED / FIXED_HZ).abs() < EPSILON,
+                "frame {frame}: scripted movement must advance every render tick, delta={delta}"
+            );
+            assert!(rendered <= target + EPSILON);
+            assert_eq!(
+                app.world().resource::<SceneState>().snapshot.self_pos.pos.x,
+                target
+            );
+            let intent = app.world().resource::<SelfMoveIntent>();
+            assert!(
+                intent.moving,
+                "frame {frame}: scripted movement must animate"
+            );
+            assert!(
+                intent.walking(false),
+                "event speed must select walk even with the run toggle"
+            );
+            assert_eq!(intent.strafe, 0.0);
+            assert!(
+                commands.try_recv().is_err(),
+                "render interpolation must not send player movement"
+            );
+            previous = rendered;
+        }
+        for _ in 0..frames_per_sample {
+            app.world_mut().resource_mut::<Time<Fixed>>().advance_by(dt);
+            app.world_mut().run_schedule(Update);
+        }
+        assert!(!app.world().resource::<SelfMoveIntent>().moving);
+        assert!(!app.world().resource::<SelfMoveIntent>().walking(true));
+        assert!((app.world().get::<CurrRenderPos>(actor).unwrap().0.x - target).abs() < EPSILON);
+
+        target += SPEED * source_period;
+        app.world_mut()
+            .resource_mut::<SceneState>()
+            .snapshot
+            .self_pos
+            .pos
+            .x = target;
+        app.world_mut().resource_mut::<Time<Fixed>>().advance_by(dt);
+        app.world_mut().run_schedule(Update);
+        assert!(app.world().resource::<LocalPlayerPrediction>().pos.x < target);
+        app.insert_resource(InputMode::World);
+        app.world_mut().run_schedule(Update);
+        let prediction = app.world().resource::<LocalPlayerPrediction>();
+        assert_eq!(
+            prediction.pos.x, target,
+            "event exit preserves the authoritative terminal position"
+        );
+        assert!(prediction.dialog_walk.is_none());
+        assert_eq!(
+            app.world().resource::<SelfMoveIntent>().scripted_speed,
+            None
+        );
+        assert!(commands.try_recv().is_err());
+
+        app.insert_resource(InputMode::Dialog(kuluu_render::DialogCursor::default()));
+        let discontinuity = target + PREDICTION_RESYNC_YALMS * 2.0;
+        app.world_mut()
+            .resource_mut::<SceneState>()
+            .snapshot
+            .self_pos
+            .pos
+            .x = discontinuity;
+        app.world_mut().run_schedule(Update);
+        assert_eq!(
+            app.world().resource::<LocalPlayerPrediction>().pos.x,
+            discontinuity
+        );
+        assert!(!app.world().resource::<SelfMoveIntent>().moving);
+        {
+            let mut scene = app.world_mut().resource_mut::<SceneState>();
+            scene.snapshot.zone_generation += 1;
+            scene.snapshot.self_pos.pos.x = target;
+        }
+        app.world_mut().run_schedule(Update);
+        assert_eq!(
+            app.world().resource::<LocalPlayerPrediction>().pos.x,
+            target
+        );
+        assert!(app
+            .world()
+            .resource::<LocalPlayerPrediction>()
+            .dialog_walk
+            .is_none());
+        assert!(commands.try_recv().is_err());
+    }
+
+    #[test]
     fn same_zone_generation_change_resets_short_warp_and_fall_state() {
         let (mut app, _) = movement_app();
         app.insert_resource(slab_collision(0.0));
@@ -2059,16 +2250,32 @@ mod tests {
     fn movement_exit_clears_prediction_and_walker_state() {
         let mut app = App::new();
         app.init_resource::<DispatchLocals>()
+            .insert_resource(kuluu_render::combat_stance::SelfMoveIntent {
+                moving: true,
+                scripted_speed: Some(1.3),
+                ..default()
+            })
             .insert_resource(LocalPlayerPrediction {
                 pos: Vec3::ONE,
                 initialized: true,
                 snapshot_driven: true,
+                dialog_walk: Some(DialogWalk::new(Vec3::ONE)),
             })
             .add_systems(Update, reset_local_movement);
         app.world_mut().resource_mut::<DispatchLocals>().walker.mode =
             super::super::walker::WalkMode::Airborne { vy: -20.0 };
         app.update();
         assert!(!app.world().resource::<LocalPlayerPrediction>().initialized);
+        assert!(app
+            .world()
+            .resource::<LocalPlayerPrediction>()
+            .dialog_walk
+            .is_none());
+        assert_eq!(
+            *app.world()
+                .resource::<kuluu_render::combat_stance::SelfMoveIntent>(),
+            default()
+        );
         assert!(matches!(
             app.world().resource::<DispatchLocals>().walker.mode,
             super::super::walker::WalkMode::Stopped
@@ -2166,7 +2373,7 @@ mod tests {
             }
         });
         let mut in_flight = LoadMzbInFlight::default();
-        in_flight.tasks.insert((0, None), (Vec::new(), task));
+        in_flight.tasks.insert((0, None, None), (Vec::new(), task));
         in_flight
     }
 

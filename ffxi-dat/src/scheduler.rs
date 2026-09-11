@@ -118,6 +118,17 @@ fn effect_section_start(body: &[u8]) -> usize {
 // the same `clos` value of 0,0,0, and parks Mea's `_pmd` lift at the world origin. XIClient's
 // HandleTag0x0C/0x0D are undecompiled, so the DAT is the authority here, not the disassembly.
 // `subchunk` selects one placement of the routine directory's BlockID group.
+const FOLLOW_POINTS_PAYLOAD_LEN: usize = 40;
+const FOLLOW_POINTS_FLAGS_OFFSET: usize = 16;
+const FOLLOW_POINTS_ROTATION_OFFSET: usize = 24;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FollowPoints {
+    pub flags: u32,
+    pub easing: u32,
+    pub rotation: f32,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ModelTransform {
     pub final_value: [f32; 3],
@@ -146,6 +157,7 @@ pub struct SchedulerStage {
     // generic decoder reads `id` from; `id` is `NO_STAGE_ID` on those stages so a consumer can
     // never take rotation.x for a DatId.
     pub model_transform: Option<ModelTransform>,
+    pub follow_points: Option<FollowPoints>,
 
     // `Some` exactly for `ScreenColorDrive`: research/XIClient HandleTag0x0F reads
     // destination{Red,Green,Blue,Alpha} out of the dword the generic decoder takes `id` from,
@@ -224,19 +236,19 @@ pub enum StageKind {
     /// 0x07 / 0x59 - AnimationLock for `duration_frames` ticks (SE: `BondageActor` /
     /// `LockCasterMagic`; xim treats both as AnimationLockEffect). Retail's ActionTimer1
     /// lock; refcounted across overlapping routines, and a routine without a lock stage does
-    /// not lock (findings F49/F55/F57).
+    /// not lock.
     AnimationLock,
 
     /// 0x5F - StopRoutine: stop the running routine named by `id` (xim EffectRoutineParser.kt
-    /// parseSection2). The worm's `ini1` stops `init` and `init` stops `ini1` this way (findings F46/F57).
+    /// parseSection2). The worm's `ini1` stops `init` and `init` stops `ini1` this way.
     StopRoutine,
 
     /// 0x21 (caster) / 0x25 (target) - flinch; SE `GetDamageDirId` picks the dfi/dbi/dfm/dbm
-    /// front/back clip by hit direction (finding F57).
+    /// front/back clip by hit direction.
     FlinchOnCaster,
     FlinchOnTarget,
 
-    /// 0x5E / 0xBF - knockback (xim EffectRoutineParser.kt parseSection2, SE tag table; F57).
+    /// 0x5E / 0xBF - knockback (xim EffectRoutineParser.kt parseSection2, SE tag table).
     Knockback,
 
     /// 0x78 - DisplayDeadRoutine (xim EffectRoutineParser.kt parseSection2): the actor is
@@ -253,6 +265,7 @@ pub enum StageKind {
     ActorFadeOnCaster,
     ActorFadeOnTarget,
 
+    FollowPoints,
     Unknown,
 }
 
@@ -278,6 +291,7 @@ impl StageKind {
             0x0C if length_words * 4 >= MODEL_TRANSFORM_PAYLOAD_LEN => Self::ModelTranslation,
             0x0D if length_words * 4 >= MODEL_TRANSFORM_PAYLOAD_LEN => Self::ModelRotation,
             0x0F => Self::ScreenColorDrive,
+            0x27 if length_words * 4 >= FOLLOW_POINTS_PAYLOAD_LEN => Self::FollowPoints,
             // research/xim EffectRoutineParser.kt parseSection2 — StopParticleGeneratorRoutine, id =
             // the generator DatId to stop (ROM/0/0.DAT `stbk` stops the cast aura's gn10..gn13).
             0x2D => Self::StopParticle,
@@ -288,11 +302,11 @@ impl StageKind {
             // research/xim EffectRoutineParser.kt parseSection2, opcodes 0x07/0x59 -
             // AnimationLockEffect; SE `BondageActor` / `LockCasterMagic`, xim treats both as
             // the same lock. Retail's ActionTimer1 animation lock, refcounted across
-            // overlapping routines; findings F49/F55/F57. 0x07 carries a zero dword after
+            // overlapping routines. 0x07 carries a zero dword after
             // delay/duration; 0x59 is argument-less.
             0x07 | 0x59 => Self::AnimationLock,
             // research/xim EffectRoutineParser.kt parseSection2 - FlinchRoutine (SE `GetDamageDirId`
-            // picks the dfi/dbi/dfm/dbm front/back clip by hit direction, F57). 0x21 flinches
+            // picks the dfi/dbi/dfm/dbm front/back clip by hit direction). 0x21 flinches
             // the caster, 0x25 the target.
             0x21 => Self::FlinchOnCaster,
             0x25 => Self::FlinchOnTarget,
@@ -304,12 +318,12 @@ impl StageKind {
             // tint the worm's `init` fades back to. 0x29 on the caster, 0x2A on the target.
             0x29 => Self::ActorFadeOnCaster,
             0x2A => Self::ActorFadeOnTarget,
-            // research/xim EffectRoutineParser.kt parseSection2 - KnockBackEffect (SE tag table, F57);
+            // research/xim EffectRoutineParser.kt parseSection2 - KnockBackEffect (SE tag table);
             // 0xBF dispatches the same payload.
             0x5E | 0xBF => Self::Knockback,
             // research/xim EffectRoutineParser.kt parseSection2 - StopRoutineEffect: stop the running
             // routine named by `id`. The worm's `ini1` stops `init` and `init` stops `ini1`
-            // this way; findings F46/F57.
+            // this way.
             0x5F => Self::StopRoutine,
             // research/xim EffectRoutineParser.kt parseSection2 - DisplayDeadRoutine: the actor is
             // dead from this stage on.
@@ -500,6 +514,11 @@ impl Scheduler {
                         max_loops,
                         transition_in,
                         transition_out,
+                        follow_points: (kind == StageKind::FollowPoints).then(|| FollowPoints {
+                            flags: read_u32(FOLLOW_POINTS_FLAGS_OFFSET),
+                            easing: read_u32(FOLLOW_POINTS_FLAGS_OFFSET + 4),
+                            rotation: f32::from_bits(read_u32(FOLLOW_POINTS_ROTATION_OFFSET)),
+                        }),
                         model_transform,
                         screen_color,
                         actor_fade,
@@ -616,7 +635,7 @@ mod tests {
         assert_eq!(st.transition_out, 0);
     }
 
-    // research/xim EffectRoutineParser.kt parseFlinchEffect (:571-580): the flinch payload is
+    // research/xim EffectRoutineParser.kt parseFlinchEffect: the flinch payload is
     // f32, f32, u32, f32, **f32 animationDuration**, u32, u32 after delay/duration - a 9-dword
     // stage. The bytes mirror Rarab's `damg` flinch (ROM/4/109.DAT): delay 2, duration 10.0.
     #[test]
@@ -1423,7 +1442,7 @@ mod tests {
     #[test]
     fn mob_routine_opcodes_decode_lock_stop_and_fade() {
         let mut body = vec![0u8; SCHEDULER_HEADER_LEN];
-        // 0x07, 3 words: AnimationLock for 112 ticks (the worm's dig hold, F49/F57).
+        // 0x07, 3 words: AnimationLock for 112 ticks (the worm's dig hold).
         body.extend(timed_stage_bytes(0x07, 0x03, 0, 0x70));
         body.extend_from_slice(&0u32.to_le_bytes()); // xim expectZero32
                                                      // 0x5F, 4 words: stop the running routine named `init`.
@@ -1688,5 +1707,69 @@ mod tests {
 
     fn global_effect_schedulers() -> Option<Vec<Scheduler>> {
         schedulers_in_file(0)
+    }
+}
+
+#[cfg(test)]
+mod vehicle_contract_tests {
+    use super::*;
+
+    const FOLLOW_POINTS_TAG: u8 = 0x27;
+    const ABSOLUTE_FORWARD_HEADING: u32 = 11;
+    const COSINE_EASING: u32 = 2;
+    const NEXT_STAGE_DELAY: u16 = 600;
+    const PATH_DURATION: u16 = 1800;
+
+    fn stage() -> Vec<u8> {
+        let mut bytes = vec![0; FOLLOW_POINTS_PAYLOAD_LEN];
+        bytes[0] = FOLLOW_POINTS_TAG;
+        bytes[1] = (FOLLOW_POINTS_PAYLOAD_LEN / 4) as u8;
+        bytes[DELAY_OFFSET..DELAY_OFFSET + 2].copy_from_slice(&NEXT_STAGE_DELAY.to_le_bytes());
+        bytes[DURATION_OFFSET..DURATION_OFFSET + 2].copy_from_slice(&PATH_DURATION.to_le_bytes());
+        bytes[ID_OFFSET..ID_OFFSET + 4].copy_from_slice(b"pat1");
+        bytes[FOLLOW_POINTS_FLAGS_OFFSET..FOLLOW_POINTS_FLAGS_OFFSET + 4]
+            .copy_from_slice(&ABSOLUTE_FORWARD_HEADING.to_le_bytes());
+        bytes[FOLLOW_POINTS_FLAGS_OFFSET + 4..FOLLOW_POINTS_FLAGS_OFFSET + 8]
+            .copy_from_slice(&COSINE_EASING.to_le_bytes());
+        bytes[FOLLOW_POINTS_ROTATION_OFFSET..FOLLOW_POINTS_ROTATION_OFFSET + 4]
+            .copy_from_slice(&(-std::f32::consts::FRAC_PI_2).to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn follow_points_preserves_direction_easing_rotation_and_prior_delay_timing() {
+        let mut bytes = vec![0; SCHEDULER_HEADER_LEN];
+        bytes.extend(stage());
+        bytes.extend(stage());
+        let scheduler = Scheduler::parse(*b"seq1", &bytes).unwrap();
+        assert_eq!(scheduler.stages.len(), 2);
+        assert_eq!(scheduler.stages[0].frame, 0);
+        assert_eq!(scheduler.stages[1].frame, u32::from(NEXT_STAGE_DELAY));
+        for stage in scheduler.stages {
+            assert_eq!(stage.stage.kind, StageKind::FollowPoints);
+            assert_eq!(stage.stage.id, *b"pat1");
+            assert_eq!(stage.stage.duration_frames, PATH_DURATION);
+            assert_eq!(
+                stage.stage.follow_points,
+                Some(FollowPoints {
+                    flags: ABSOLUTE_FORWARD_HEADING,
+                    easing: COSINE_EASING,
+                    rotation: -std::f32::consts::FRAC_PI_2,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn short_follow_points_payload_cannot_become_a_motion_command() {
+        let mut bytes = vec![0; SCHEDULER_HEADER_LEN];
+        let mut short = stage();
+        short.truncate(FOLLOW_POINTS_ROTATION_OFFSET);
+        short[1] = (short.len() / 4) as u8;
+        bytes.extend(short);
+        let scheduler = Scheduler::parse(*b"seq1", &bytes).unwrap();
+        assert_eq!(scheduler.stages.len(), 1);
+        assert_eq!(scheduler.stages[0].stage.kind, StageKind::Unknown);
+        assert_eq!(scheduler.stages[0].stage.follow_points, None);
     }
 }

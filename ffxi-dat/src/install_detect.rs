@@ -42,6 +42,27 @@ pub fn find_ffxi_root(start: &Path, depth: usize) -> Option<PathBuf> {
     None
 }
 
+/// Parallels Desktop mounts a guest's drives as `/Volumes/[C] <VM name>`.
+fn parallels_shared_drives() -> Vec<PathBuf> {
+    let Ok(rd) = std::fs::read_dir("/Volumes") else {
+        return Vec::new();
+    };
+    rd.flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with('['))
+        })
+        .flat_map(|p| {
+            [
+                p.join("Program Files (x86)/PlayOnline"),
+                p.join("Program Files (x86)/HorizonXI"),
+                p.join("Program Files (x86)/SquareEnix"),
+            ]
+        })
+        .collect()
+}
+
 pub fn detect() -> Vec<PathBuf> {
     let mut roots: Vec<PathBuf> = Vec::new();
     let home = std::env::var_os("HOME").map(PathBuf::from);
@@ -68,6 +89,7 @@ pub fn detect() -> Vec<PathBuf> {
         roots.push(home.join(".local/share/lutris"));
         roots.push(home.join("Library/Application Support/HorizonXI"));
     }
+    roots.extend(parallels_shared_drives());
 
     let mut hits = Vec::new();
     for r in roots {

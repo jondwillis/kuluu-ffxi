@@ -159,6 +159,37 @@ fn main() -> Result<()> {
     )?;
 
     check_map_opcodes_against_lsb(&s2c_names, &c2s_names)?;
+    let event_position_opcode = c2s_names
+        .iter()
+        .find(|(_, name)| name == "EVENTENDXZY")
+        .context("EVENTENDXZY opcode")?
+        .0;
+    let mut event_wire = format!("pub const OPCODE: u16 = {event_position_opcode};\n");
+    for (path, enum_name, member, constant) in [
+        (
+            "../vendor/server/src/map/packets/c2s/0x05b_eventend.h",
+            "GP_CLI_COMMAND_EVENTEND_MODE",
+            "UpdatePending",
+            "UPDATE_PENDING",
+        ),
+        (
+            "../vendor/server/src/map/packets/s2c/0x052_eventucoff.h",
+            "GP_SERV_COMMAND_EVENTUCOFF_MODE",
+            "EventRecvPending",
+            "EVENT_RECV_PENDING",
+        ),
+    ] {
+        println!("cargo:rerun-if-changed={path}");
+        let source = fs::read_to_string(path)?;
+        let values = lsb_scrape::parse_cpp_enum_class(&source, enum_name)?;
+        let value = values
+            .iter()
+            .find(|(_, name)| name == member)
+            .context(member)?
+            .0;
+        event_wire.push_str(&format!("pub const {constant}: u32 = {value};\n"));
+    }
+    fs::write(out_dir.join("event_position_wire.rs"), event_wire)?;
 
     let auth_session_src = fs::read_to_string(LSB_AUTH_SESSION_H)
         .with_context(|| format!("reading {LSB_AUTH_SESSION_H}"))?;

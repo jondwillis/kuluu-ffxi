@@ -3,8 +3,8 @@
 # that crate's lib tests so an assertion regression surfaces on the next turn
 # instead of at the next push.
 #
-# Scope: only `--lib` tests of the one crate. Integration tests and full builds
-# are too slow for a per-edit hook.
+# Event, protocol, DAT, session and viewer edits run shared state contracts; other crates
+# run their lib tests. Full builds stay outside this per-edit hook.
 #
 # WHY `-p <crate>` with no --features, even though checks.sh warns that a
 # mismatched feature set forks the dependency graph: measured here, the fork is
@@ -45,7 +45,7 @@ file=$(printf '%s' "$payload" | /usr/bin/python3 -c \
 # terminates the s/// early and BSD sed aborts with "parentheses not balanced",
 # leaving $crate empty so the hook silently no-ops. It shipped that way and
 # never once ran on macOS.
-crate=$(printf '%s' "$file" | sed -nE 's#.*/(ffxi-[^/]+)/(src|tests)/.*#\1#p')
+crate=$(printf '%s' "$file" | sed -nE 's#.*/((ffxi|kuluu)-[^/]+|kuluu)/(src|tests)/.*#\1#p')
 [ -n "$crate" ] || exit 0
 
 repo=$(git -C "$(dirname "$file")" rev-parse --show-toplevel 2>/dev/null) || exit 0
@@ -63,10 +63,19 @@ if [ -f "$stamp" ]; then
 fi
 printf '%s' "$now_secs" > "$stamp"
 
-output=$(CARGO_GUARD_TIMEOUT=$HOOK_TIMEOUT_SECS \
-         CARGO_GUARD_STALL=$HOOK_STALL_SECS \
-         "$guard" test -p "$crate" --lib --quiet 2>&1)
-status=$?
+case "$crate" in
+  ffxi-event|ffxi-proto|ffxi-dat|ffxi-vocab|kuluu-session|kuluu-render|kuluu-snapshot|kuluu)
+    output=$(cd "$repo" && CARGO_GUARD_TIMEOUT=$HOOK_TIMEOUT_SECS \
+      CARGO_GUARD_STALL=$HOOK_STALL_SECS scripts/checks.sh contracts 2>&1)
+    status=$?
+    ;;
+  *)
+    output=$(CARGO_GUARD_TIMEOUT=$HOOK_TIMEOUT_SECS \
+      CARGO_GUARD_STALL=$HOOK_STALL_SECS \
+      "$guard" test -p "$crate" --lib --quiet 2>&1)
+    status=$?
+    ;;
+esac
 
 case "$status" in
   124)
@@ -83,12 +92,10 @@ MSG
     ;;
   0) ;;
   *)
-    if printf '%s' "$output" | grep -qE 'FAILED|test result: FAILED|^error'; then
-      cat >&2 <<MSG
-[affected-crate-tests] $crate lib tests failed after edit to $file:
+    cat >&2 <<MSG
+[affected-crate-tests] $crate checks failed after edit to $file:
 $(printf '%s' "$output" | tail -10)
 MSG
-    fi
     ;;
 esac
 

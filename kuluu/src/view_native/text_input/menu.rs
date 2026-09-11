@@ -38,8 +38,9 @@ fn apply_graphics_dlss_cycle(
 }
 
 fn resolve_menu_entry(kind: MenuKind, label: &str) -> MenuDispatch {
-    use kuluu_render::hud::menu::{COMM_EMOTE_LIST, ROOT_LOG_OUT, ROOT_SHUT_DOWN};
+    use kuluu_render::hud::menu::{COMM_EMOTE_LIST, CONFIG_CONTROLS, ROOT_LOG_OUT, ROOT_SHUT_DOWN};
     match (kind, label) {
+        (MenuKind::Config, CONFIG_CONTROLS) => MenuDispatch::OpenSubmenu(MenuKind::Controls),
         (MenuKind::Communication, l) if l == COMM_EMOTE_LIST => {
             MenuDispatch::OpenSubmenu(MenuKind::EmoteList)
         }
@@ -85,19 +86,19 @@ fn resolve_menu_entry(kind: MenuKind, label: &str) -> MenuDispatch {
             "Equipment — pending Stage 1 (s2c 0x050 equip_list)".into(),
         ),
 
-        (MenuKind::Config, "Standard") => {
+        (MenuKind::Controls, "Standard") => {
             MenuDispatch::KeybindUpdate(KeybindUpdate::Preset(Preset::Standard))
         }
-        (MenuKind::Config, "Compact 1") => {
+        (MenuKind::Controls, "Compact 1") => {
             MenuDispatch::KeybindUpdate(KeybindUpdate::Preset(Preset::Compact1))
         }
-        (MenuKind::Config, "Compact 2") => {
+        (MenuKind::Controls, "Compact 2") => {
             MenuDispatch::KeybindUpdate(KeybindUpdate::Preset(Preset::Compact2))
         }
-        (MenuKind::Config, "Reset to defaults") => {
+        (MenuKind::Controls, "Reset to defaults") => {
             MenuDispatch::KeybindUpdate(KeybindUpdate::Reset)
         }
-        (MenuKind::Config, "Show current bindings") => {
+        (MenuKind::Controls, "Show current bindings") => {
             MenuDispatch::KeybindUpdate(KeybindUpdate::List)
         }
         (_, other) => MenuDispatch::NotImplemented(other.to_string()),
@@ -198,6 +199,13 @@ pub(super) fn confirm_menu_at_cursor(
         }
         return None;
     }
+    if kind == MenuKind::Config {
+        if let Some(&field) = kuluu_render::CONFIG_FIELDS.get(cursor) {
+            graphics.cycle(field, 1);
+            return None;
+        }
+    }
+
     if matches!(kind, MenuKind::Graphics) {
         let dlss_supported = graphics.dlss_supported;
         if cursor == kuluu_render::hud::menu::graphics_reset_slot(dlss_supported) {
@@ -688,6 +696,19 @@ pub(super) fn handle_menu_key(
         }
     }
 
+    if kind == MenuKind::Config {
+        if let Some(&field) = kuluu_render::CONFIG_FIELDS.get(cursor) {
+            if bindings.matches_logical(Action::NavLeft, key) {
+                graphics.cycle(field, -1);
+                return None;
+            }
+            if bindings.matches_logical(Action::NavRight, key) {
+                graphics.cycle(field, 1);
+                return None;
+            }
+        }
+    }
+
     if matches!(kind, MenuKind::Graphics) {
         if bindings.matches_logical(Action::NavLeft, key) {
             apply_graphics_cycle(cursor, -1, graphics);
@@ -928,6 +949,37 @@ mod menu_key_tests {
         world.insert_resource(MapMarkers::default());
         world.clear_trackers();
         world
+    }
+
+    #[test]
+    fn config_keys_cycle_radar_and_open_controls_without_changing_bindings() {
+        use kuluu_render::{MinimapRadar, CONFIG_FIELDS};
+        let mut harness = Harness::new();
+        let mut world = marker_world();
+        let mut stack = MenuStack::root();
+        stack.push(MenuKind::Config);
+        for (key, code, expected) in [
+            (Key::ArrowRight, KeyCode::ArrowRight, MinimapRadar::Enhanced),
+            (Key::ArrowLeft, KeyCode::ArrowLeft, MinimapRadar::Vanilla),
+            (Key::Enter, KeyCode::Enter, MinimapRadar::Enhanced),
+        ] {
+            harness.key(&key, code, &mut stack, world.resource_mut::<MapMarkers>());
+            assert_eq!(harness.graphics.minimap_radar, expected);
+            assert_eq!(stack.current().unwrap().cursor, 0);
+            assert_eq!(stack.current().unwrap().kind, MenuKind::Config);
+        }
+        stack.current_mut().unwrap().cursor = CONFIG_FIELDS.len();
+        harness.key(
+            &Key::Enter,
+            KeyCode::Enter,
+            &mut stack,
+            world.resource_mut::<MapMarkers>(),
+        );
+        assert_eq!(stack.current().unwrap().kind, MenuKind::Controls);
+        assert_eq!(
+            resolve_menu_entry(MenuKind::Controls, "Compact 1"),
+            MenuDispatch::KeybindUpdate(KeybindUpdate::Preset(Preset::Compact1))
+        );
     }
 
     /// kuluu-ce6z: the cursor is read from `stack.current()`, so writes must go

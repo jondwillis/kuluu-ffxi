@@ -3,17 +3,16 @@ use crate::{DatError, Result};
 pub const CIB_LEN: usize = 15;
 
 /// The movement byte of the 0x45 Info chunk (vekien/xi-model-viewer ui/js/dat/inspect.js
-/// MOVEMENT_TYPE :1348-1350). Retail ships only 0/1/2/3/0xFF in this install's ROMs (full
-/// scan: 1102/50/178/304/16494 CIBs), so the out-of-table fallback below is unreachable for
-/// shipped data; it keeps a parse from failing on an odd byte.
-#[repr(u8)]
+/// MOVEMENT_TYPE). A byte outside the table is kept as `Unknown` so it stays distinguishable
+/// from a shipped 0xFF.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MovementType {
-    Walking = 0,
-    Sliding = 1,
-    Large = 2,
-    Flying = 3,
-    Unset = 0xFF,
+    Walking,
+    Sliding,
+    Large,
+    Flying,
+    Unset,
+    Unknown(u8),
 }
 
 impl std::fmt::Display for MovementType {
@@ -24,46 +23,47 @@ impl std::fmt::Display for MovementType {
             Self::Large => "Large",
             Self::Flying => "Flying",
             Self::Unset => "Unset",
+            Self::Unknown(b) => return write!(f, "Unknown({b:#04x})"),
         };
         f.write_str(name)
     }
 }
 
 impl MovementType {
-    pub fn from_u8(b: u8) -> Option<Self> {
-        Some(match b {
+    pub fn from_u8(b: u8) -> Self {
+        match b {
             0 => Self::Walking,
             1 => Self::Sliding,
             2 => Self::Large,
             3 => Self::Flying,
             0xFF => Self::Unset,
-            _ => return None,
-        })
+            other => Self::Unknown(other),
+        }
     }
 }
 
-/// The range-type byte of the 0x45 Info chunk (viewer RANGE_TYPE :1351-1354). xim documents
-/// the gaps explicitly ("no 0x07 / no 0x08 / no 0x09", research/xim resource/InfoSection.kt)
-/// and reads an out-of-table byte as Unset; this install's ROMs carry seven 0x08 CIBs, so the
-/// fallback is live data, not just a guard.
-#[repr(u8)]
+/// The range-type byte of the 0x45 Info chunk (vekien/xi-model-viewer ui/js/dat/inspect.js
+/// RANGE_TYPE). xim documents the gaps explicitly ("no 0x07 / no 0x08 / no 0x09",
+/// research/xim resource/InfoSection.kt) and reads them as Unset; retail does ship 0x08 CIBs,
+/// so an out-of-table byte is kept as `Unknown` rather than folded into Unset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RangeType {
-    None = 0x00,
-    Wind = 0x01,
-    String = 0x02,
-    Marksmanship = 0x03,
-    ThrowingWeapon = 0x04,
-    ThrowingAmmo = 0x05,
-    Archery = 0x06,
-    HandbellIndi = 0x0a,
-    HandbellGeo = 0x0b,
-    Unset = 0xFF,
+    None,
+    Wind,
+    String,
+    Marksmanship,
+    ThrowingWeapon,
+    ThrowingAmmo,
+    Archery,
+    HandbellIndi,
+    HandbellGeo,
+    Unset,
+    Unknown(u8),
 }
 
 impl RangeType {
-    pub fn from_u8(b: u8) -> Option<Self> {
-        Some(match b {
+    pub fn from_u8(b: u8) -> Self {
+        match b {
             0x00 => Self::None,
             0x01 => Self::Wind,
             0x02 => Self::String,
@@ -74,12 +74,12 @@ impl RangeType {
             0x0a => Self::HandbellIndi,
             0x0b => Self::HandbellGeo,
             0xFF => Self::Unset,
-            _ => return None,
-        })
+            other => Self::Unknown(other),
+        }
     }
 }
 
-/// The weapon-anim-style byte of the 0x45 Info chunk (viewer WEAPON_ANIM_STYLE :1344-1347).
+/// The weapon-anim-style byte of the 0x45 Info chunk (viewer WEAPON_ANIM_STYLE).
 /// Interpretation only: the loader still reads the raw `motion_index` byte as a DAT offset.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -152,7 +152,7 @@ pub struct Cib {
     pub unknown8: u8,
 
     /// The Info range byte at 0x0E (viewer parseInspectInfo b[14]).
-    pub motion_range_index: RangeType,
+    pub range_type: RangeType,
 }
 
 impl Cib {
@@ -166,7 +166,7 @@ impl Cib {
         }
         Ok(Self {
             name,
-            movement_type: MovementType::from_u8(body[0x00]).unwrap_or(MovementType::Unset),
+            movement_type: MovementType::from_u8(body[0x00]),
             footstep_material: body[0x01],
             footstep_size: body[0x02],
             motion_index: body[0x03],
@@ -180,13 +180,13 @@ impl Cib {
             static_npc_scale: body[0x0B],
             unknown7: body[0x0C],
             unknown8: body[0x0D],
-            motion_range_index: RangeType::from_u8(body[0x0E]).unwrap_or(RangeType::Unset),
+            range_type: RangeType::from_u8(body[0x0E]),
         })
     }
 
     /// The Info `scale` byte as a model multiplier. Retail divides by 100 with only 0xFF
     /// meaning "default" (research/xim poc/Model.kt NpcModel.getScale, poc/Actor.kt getScale;
-    /// xim's nullIf0FF in research/xim resource/InfoSection.kt). 100 therefore lands on 1.0 by
+    /// xim's nullIf0xFF in research/xim resource/InfoSection.kt). 100 therefore lands on 1.0 by
     /// the division itself, and a shipped 0 renders at zero size exactly as retail would.
     pub fn scale_factor(&self) -> f32 {
         if self.scale == 0xFF {
@@ -212,10 +212,10 @@ mod tests {
         assert_eq!(c.footstep_size, 0x01);
         assert_eq!(c.motion_index, 0x05);
         assert_eq!(c.scale, 0x80);
-        // 0x10 is outside the viewer's MOVEMENT_TYPE table; xim would throw, we read Unset.
-        assert_eq!(c.movement_type, MovementType::Unset);
-        // 0x07 is one of xim's documented range gaps ("no 0x07"); it reads as Unset there too.
-        assert_eq!(c.motion_range_index, RangeType::Unset);
+        // 0x10 is outside the viewer's MOVEMENT_TYPE table; xim would throw, we keep the byte.
+        assert_eq!(c.movement_type, MovementType::Unknown(0x10));
+        // 0x07 is one of xim's documented range gaps ("no 0x07"); xim reads it as Unset.
+        assert_eq!(c.range_type, RangeType::Unknown(0x07));
     }
 
     #[test]
@@ -253,7 +253,7 @@ mod tests {
         assert_eq!(c.movement_type, MovementType::Flying);
         assert_eq!(c.scale, 85);
         assert_eq!(c.static_npc_scale, 100);
-        assert_eq!(c.motion_range_index, RangeType::Unset);
+        assert_eq!(c.range_type, RangeType::Unset);
         assert!((c.scale_factor() - 0.85).abs() < f32::EPSILON);
     }
 
@@ -271,19 +271,19 @@ mod tests {
 
     #[test]
     fn enums_cover_the_viewer_tables() {
-        assert_eq!(MovementType::from_u8(0), Some(MovementType::Walking));
-        assert_eq!(MovementType::from_u8(1), Some(MovementType::Sliding));
-        assert_eq!(MovementType::from_u8(2), Some(MovementType::Large));
-        assert_eq!(MovementType::from_u8(3), Some(MovementType::Flying));
-        assert_eq!(MovementType::from_u8(0xFF), Some(MovementType::Unset));
-        assert_eq!(MovementType::from_u8(4), None);
+        assert_eq!(MovementType::from_u8(0), MovementType::Walking);
+        assert_eq!(MovementType::from_u8(1), MovementType::Sliding);
+        assert_eq!(MovementType::from_u8(2), MovementType::Large);
+        assert_eq!(MovementType::from_u8(3), MovementType::Flying);
+        assert_eq!(MovementType::from_u8(0xFF), MovementType::Unset);
+        assert_eq!(MovementType::from_u8(4), MovementType::Unknown(4));
 
-        assert_eq!(RangeType::from_u8(0x06), Some(RangeType::Archery));
-        assert_eq!(RangeType::from_u8(0x0a), Some(RangeType::HandbellIndi));
-        assert_eq!(RangeType::from_u8(0x0b), Some(RangeType::HandbellGeo));
+        assert_eq!(RangeType::from_u8(0x06), RangeType::Archery);
+        assert_eq!(RangeType::from_u8(0x0a), RangeType::HandbellIndi);
+        assert_eq!(RangeType::from_u8(0x0b), RangeType::HandbellGeo);
         // The documented gaps read as out-of-table, not Unset.
-        assert_eq!(RangeType::from_u8(0x07), None);
-        assert_eq!(RangeType::from_u8(0x08), None);
+        assert_eq!(RangeType::from_u8(0x07), RangeType::Unknown(0x07));
+        assert_eq!(RangeType::from_u8(0x08), RangeType::Unknown(0x08));
 
         assert_eq!(
             WeaponAnimStyle::from_u8(0),

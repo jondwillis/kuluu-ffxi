@@ -42,7 +42,7 @@ display must be woken, not merely kept awake from that point on.
 ```
 
 That is the whole launch. It uses the local GM drive account, passes
-`--unfocused --mute`, waits for map traffic, and prints the agent socket path.
+`--unfocused --mute`, waits for an in-zone snapshot from its own socket, and prints that socket path. Readiness must not depend on `sub_opcodes`: that debug log can be suppressed while a session is healthy. Socket existence alone proves IPC availability, not zone-in.
 Export `FFXI_VERIFY_SOUND=1` to keep audio on when the change under test is
 audio; `FFXI_VERIFY_USER`/`_PASS`/`_CHAR` override the character.
 
@@ -57,6 +57,11 @@ The dev profile is Cranelift with no optimisation; measured on this repo it
 zones in at **0.5-0.6 fps with 1.5-2.5s frame spikes**. Anything short-lived —
 a cutscene fade, a cast bar, a hit flash, a weather transition — is then
 unsamplable, and you will misread "I never caught it" as "it never happened".
+Native viewer tests live in the `kuluu` library: use `cargo test -p kuluu
+--lib --features native-window <filter>`. `--bin kuluu` can report zero tests.
+For renderer tests with that feature set, select both `-p kuluu-render -p kuluu`;
+`native-window` belongs to `kuluu`, not `kuluu-render`.
+
 The longer one-off release build pays for itself in the first drive. Set
 `FFXI_VERIFY_PROFILE=debug` only when the check genuinely needs
 `debug_assertions` or a dev-only feature.
@@ -198,25 +203,25 @@ Recording permission, never raises the window, and cannot hand back the stale
 cached frame the window server keeps for a background window. Output is the raw
 client frame at backing resolution — no macOS title bar to crop around.
 
-The write is async, so the script waits for the file, then **asserts the frame
-isn't blank**. A fully occluded (or `Hide`-den) client renders nothing and the
-readback is solid black — a perfectly valid PNG of nothing, which is exactly
-the kind of silent failure that gets cited as evidence by mistake. On a blank
-frame it raises the client once, re-captures, and hands focus straight back,
+The write is async, so the script waits for the file and checks for blank pixels.
+A black readback is not proof of occlusion: it can also occur with an unlocked
+console and a visible, rendering window. Pass the known socket when clients run
+in parallel; the fallback derives its PID from that socket (or accepts an
+explicit third argument for custom socket names). It raises only that process,
+re-captures, and restores the prior process by PID,
 logging `FOCUS WILL BLIP` so you know the human was interrupted. Correct
 evidence beats zero disruption; a ~1s blip is cheaper than a black PNG being
-cited as proof. If it is *still* blank after raising, the console is probably
-locked — that exits 2 and no artifact from it is citable.
+cited as proof. If it remains blank after raising, the helper exits 2. Check console lock and
+window state, then use the native video fallback below; the black artifact is
+not citable.
 
 Launching unfocused makes this fallback more likely, since nothing guarantees
 the window ends up visible. Leaving the client somewhere it stays partly
-on screen (a free corner, a second display) avoids the blip entirely.
+on screen (a free corner, a second display) reduces the need to raise it.
 
-A **minimized** window (AXMinimized=true — launch.sh's focus-restore can leave
-it that way) defeats the raise-and-retry: `frontmost` does not unminimize, so
-captures stay black and keystrokes go nowhere. Recover with an explicit
-System Events `AXRaise` action on the window (or `set value of attribute
-"AXMinimized" to false`), then resend any keystrokes sent while minimized.
+Setting `frontmost` alone does not unminimize a window. The capture helper
+clears `AXMinimized` and applies `AXRaise` on retry. For manual drives, do the
+same before resending any input issued while the window was minimized.
 
 Read every PNG back with the Read tool before citing it. A guard reporting
 `lit=100%` only proves the GPU drew *something*.
@@ -247,6 +252,58 @@ from PIL import Image
 im = Image.open(p).convert("L").resize((160, 100))
 px = list(im.getdata()); print(p, sum(px) / len(px))
 ```
+
+### Native window video when screenshots fail
+
+In the 2026-09-09 Selbina movement verification, GPU screenshots were black
+and `screencapture -l` stills were frozen while socket snapshots reported moving
+actors. Native window-only video captured the actual motion. Do not repeatedly
+retry stills or treat non-black pixels as proof of a current frame.
+
+Resolve the window for the **known test PID**, not the first process named kuluu:
+
+```bash
+osascript -l JavaScript -e '
+function run(argv) {
+  ObjC.import("CoreGraphics");
+  ObjC.bindFunction("CFMakeCollectable", ["id", ["void *"]]);
+  const windows = ObjC.deepUnwrap($.CFMakeCollectable(
+    $.CGWindowListCopyWindowInfo(0, $.kCGNullWindowID))) || [];
+  return JSON.stringify(windows.filter(w =>
+    w.kCGWindowOwnerPID === Number(argv[0]) && w.kCGWindowLayer === 0 &&
+    w.kCGWindowBounds.Width > 200 && w.kCGWindowBounds.Height > 200));
+}' "$client_pid"
+```
+
+Select that process's main game window from the returned IDs and bounds.
+After checking `screencapture -h` for support, record a bounded window-only clip:
+
+```bash
+screencapture -v -V 20 -l "$window_id" artifacts/verify/movement.mov
+```
+
+If it needs foreground capture, warn the user, raise/unminimize only that
+process, and restore the previous foreground PID afterward. Keep capture and
+the movement driver in the same long-running invocation, with the recorder in
+a subprocess and the driver on an independent monotonic schedule. Serial
+screenshots can otherwise throttle a requested 5 Hz move stream. Save command
+timestamps; inspect frame count, changing actor poses, and the relevant motion
+intervals before calling the recording evidence. A protocol trace alone cannot
+prove rendered motion. Stop visual retries if the bounded video is also stale.
+
+For remote movement, vary both speed and packet spacing: include ordinary
+running steps larger than any correction/snap threshold, sparse updates, stops,
+and stairs. Record received position-change intervals as well as sent commands;
+server coalescing can change the cadence. Inspect travel and gait throughout
+each interval, not just endpoints: repeated run/walk/idle selection can restart
+the animation even when position stays within confirmed bounds. Pair the video
+with frame-level regressions that bound displacement and count gait changes.
+
+For two-PC checks, use two separate local fixtures and retain both process IDs
+and sockets. Disconnect only those sessions during teardown. A readiness
+failure is not a failed login: disconnect through an already-created socket
+before terminating the process, or the next login may hit the documented
+`lpkt_next_login (view)` ghost-session timeout.
 
 ### Talking to the socket
 
@@ -337,8 +394,8 @@ input-driven bugs; use `debug_drive` for those.
   navmesh's nearest valid vertex — position telemetry echoes what you asked for
   while the rendered transform snaps back. Vary `x` as well as `z` if a teleport
   looks stuck.
-- One GUI client at a time — it holds the char's session, and a parallel
-  headless login with the same char fights it.
+- One session per character. A GUI observer and a headless mover need distinct
+  characters. Keep each session's PID and socket explicit when another client is open.
 - **Don't run `scripts/checks.sh test` while a GUI session is live** — the
   `agent_session` integration test logs into the same LSB and kicks the running
   session mid-verify. Gate first, then launch.

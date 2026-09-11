@@ -18,7 +18,7 @@ use bevy::render::renderer::{RenderDevice, RenderQueue};
 use bevy::render::texture::{FallbackImage, GpuImage};
 use bevy::render::{Extract, ExtractSchedule, RenderApp};
 use bevy::shader::ShaderRef;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::skinned_ffxi_material::{write_uniform, FfxiLightingUniform, FfxiMaterialFlags};
@@ -196,6 +196,60 @@ struct ZoneInstanceBuffers {
     last_uv: Vec4,
 }
 
+/// Zone materials whose instance buffers need (re)writing, gathered per frame
+/// in the main world: the tracked asset events plus the untracked tint/uv
+/// writers (`scroll_gen_water_uv`, `scroll_water_uv`, `drive_zone_clouds`) that
+/// skip `Assets::get_mut` to keep their bind groups. The extract-side upload
+/// visits only these instead of every material in the zone.
+#[derive(Resource, Default)]
+pub struct ZoneMaterialTouched {
+    marks: Vec<AssetId<FfxiZoneMaterial>>,
+    pending: Vec<AssetId<FfxiZoneMaterial>>,
+    dropped: Vec<u64>,
+    instance_of: HashMap<AssetId<FfxiZoneMaterial>, u64>,
+}
+
+impl ZoneMaterialTouched {
+    pub fn mark(&mut self, id: AssetId<FfxiZoneMaterial>) {
+        self.marks.push(id);
+    }
+}
+
+/// Folds this frame's marks and asset events into the list the next extract
+/// uploads; runs after `AssetEventSystems` so a material added this frame has
+/// its buffers before its bind group is prepared.
+fn collect_zone_material_touched(
+    mut events: MessageReader<AssetEvent<FfxiZoneMaterial>>,
+    materials: Res<Assets<FfxiZoneMaterial>>,
+    mut touched: ResMut<ZoneMaterialTouched>,
+) {
+    let touched = &mut *touched;
+    touched.dropped.clear();
+    touched.pending.clear();
+    touched.pending.append(&mut touched.marks);
+    for ev in events.read() {
+        match ev {
+            AssetEvent::Added { id } | AssetEvent::Modified { id } => {
+                let Some(mat) = materials.get(*id) else {
+                    continue;
+                };
+                if let Some(previous) = touched.instance_of.insert(*id, mat.instance_id) {
+                    if previous != mat.instance_id {
+                        touched.dropped.push(previous);
+                    }
+                }
+                touched.pending.push(*id);
+            }
+            AssetEvent::Removed { id } | AssetEvent::Unused { id } => {
+                if let Some(instance) = touched.instance_of.remove(id) {
+                    touched.dropped.push(instance);
+                }
+            }
+            AssetEvent::LoadedWithDependencies { .. } => {}
+        }
+    }
+}
+
 #[derive(Resource)]
 pub struct ZoneMaterialBuffers {
     lighting: Buffer,
@@ -220,11 +274,15 @@ impl FromWorld for ZoneMaterialBuffers {
 fn upload_zone_material_buffers(
     lighting: Extract<Res<ZoneGlobalLighting>>,
     materials: Extract<Res<Assets<FfxiZoneMaterial>>>,
+    touched: Extract<Res<ZoneMaterialTouched>>,
     device: Res<RenderDevice>,
     queue: Res<RenderQueue>,
     mut cache: ResMut<ZoneMaterialBuffers>,
 ) {
     write_uniform(&queue, &cache.lighting, &lighting.0);
+    for instance in &touched.dropped {
+        cache.instances.remove(instance);
+    }
 
     let uniform_buffer = |label: &'static str, size: std::num::NonZeroU64| {
         device.create_buffer(&BufferDescriptor {
@@ -235,9 +293,10 @@ fn upload_zone_material_buffers(
         })
     };
 
-    let mut live: HashSet<u64> = HashSet::with_capacity(materials.len());
-    for (_id, mat) in materials.iter() {
-        live.insert(mat.instance_id);
+    for id in &touched.pending {
+        let Some(mat) = materials.get(*id) else {
+            continue;
+        };
         match cache.instances.entry(mat.instance_id) {
             std::collections::hash_map::Entry::Occupied(mut e) => {
                 let inst = e.get_mut();
@@ -272,7 +331,6 @@ fn upload_zone_material_buffers(
             }
         }
     }
-    cache.instances.retain(|id, _| live.contains(id));
 }
 
 impl AsBindGroup for FfxiZoneMaterial {
@@ -596,6 +654,7 @@ pub struct FfxiZoneMaterialPlugin;
 
 impl Plugin for FfxiZoneMaterialPlugin {
     fn build(&self, app: &mut App) {
+        bevy::shader::load_shader_library!(app, "directional_shadow.wgsl");
         embedded_asset!(app, "zone_ffxi.wgsl");
         embedded_asset!(app, "zone_ffxi_prepass.wgsl");
         app.add_plugins(MaterialPlugin::<FfxiZoneMaterial>::default())
@@ -604,8 +663,13 @@ impl Plugin for FfxiZoneMaterialPlugin {
             // (zone-render-headless) add only this plugin, and
             // update_zone_material_lighting reads the resource unconditionally.
             .init_resource::<crate::weather::ZoneDirectionalLighting>()
+            .init_resource::<ZoneMaterialTouched>()
             .add_systems(Update, update_zone_material_lighting)
-            .add_systems(Update, update_zone_material_time);
+            .add_systems(Update, update_zone_material_time)
+            .add_systems(
+                PostUpdate,
+                collect_zone_material_touched.after(bevy::asset::AssetEventSystems),
+            );
         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
             render_app.add_systems(ExtractSchedule, upload_zone_material_buffers);
         }
@@ -621,6 +685,85 @@ impl Plugin for FfxiZoneMaterialPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn bare_material() -> FfxiZoneMaterial {
+        FfxiZoneMaterial::new(
+            None,
+            FfxiMaterialFlags { flags: Vec4::ZERO },
+            Vec4::ONE,
+            Vec4::ZERO,
+            AlphaMode::Opaque,
+            FfxiZoneMaterialKey::default(),
+        )
+    }
+
+    fn touched_app() -> App {
+        bevy::tasks::IoTaskPool::get_or_init(bevy::tasks::TaskPool::default);
+        let mut app = App::new();
+        app.add_plugins(bevy::asset::AssetPlugin::default())
+            .init_asset::<FfxiZoneMaterial>()
+            .init_resource::<ZoneMaterialTouched>()
+            .add_systems(
+                PostUpdate,
+                collect_zone_material_touched.after(bevy::asset::AssetEventSystems),
+            );
+        app
+    }
+
+    #[test]
+    fn touched_list_carries_asset_events_and_untracked_marks_for_one_frame() {
+        let mut app = touched_app();
+        let handle = app
+            .world_mut()
+            .resource_mut::<Assets<FfxiZoneMaterial>>()
+            .add(bare_material());
+        let instance = app
+            .world()
+            .resource::<Assets<FfxiZoneMaterial>>()
+            .get(&handle)
+            .unwrap()
+            .instance_id;
+
+        app.update();
+        let touched = app.world().resource::<ZoneMaterialTouched>();
+        assert_eq!(
+            touched.pending,
+            vec![handle.id()],
+            "Added lands on the list"
+        );
+        assert!(touched.dropped.is_empty());
+
+        app.update();
+        assert!(
+            app.world()
+                .resource::<ZoneMaterialTouched>()
+                .pending
+                .is_empty(),
+            "a quiet frame uploads nothing"
+        );
+
+        app.world_mut()
+            .resource_mut::<ZoneMaterialTouched>()
+            .mark(handle.id());
+        app.update();
+        assert_eq!(
+            app.world().resource::<ZoneMaterialTouched>().pending,
+            vec![handle.id()],
+            "an untracked writer's mark lands on the list"
+        );
+
+        drop(handle);
+        let mut dropped_seen = false;
+        for _ in 0..3 {
+            app.update();
+            dropped_seen |= app
+                .world()
+                .resource::<ZoneMaterialTouched>()
+                .dropped
+                .contains(&instance);
+        }
+        assert!(dropped_seen, "the last handle drop retires the instance");
+    }
 
     #[test]
     fn fog_flag_maps_the_generator_bit() {

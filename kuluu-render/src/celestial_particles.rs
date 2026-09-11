@@ -215,7 +215,7 @@ fn sync_celestial_particles(
     );
 }
 
-// research/cexi-viewer ui/js/particle/runtime.js:517-524 (xim ParticleGeneratorAttachment):
+// research/cexi-viewer ui/js/particle/runtime.js updateAssociatedPosition (xim ParticleGeneratorAttachment):
 // a Sun/Moon-attached generator's position is the body's position plus the camera's, so the
 // sky stays a fixed distance ahead however far the player walks.
 fn track_celestial_bodies(

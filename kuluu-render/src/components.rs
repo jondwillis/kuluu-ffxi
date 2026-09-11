@@ -30,8 +30,7 @@ pub struct Nameplate {
 pub struct HpIndicator;
 
 /// Which MMB submesh a zone-geometry mesh entity came from. Attached by
-/// `dat_mmb` at spawn; read by the `hud::mesh_debug` hover panel and by
-/// `zone_lights` diagnostics.
+/// `dat_mmb` at spawn; read by the `hud::mesh_debug` hover panel.
 #[derive(Component, Debug, Clone)]
 pub struct MmbDebugInfo {
     pub file_id: u32,

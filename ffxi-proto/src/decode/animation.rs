@@ -9,7 +9,7 @@ pub const HEALING: u8 = 33;
 pub const SIT: u8 = 47;
 
 /// A door's swing state. Retail keeps the same value as the door actor's
-/// `GameStatus` (research/XIClient .../World/Actor/GameStatus.h, `D_OPEN` /
+/// `GameStatus` (research/XIClient/src/XIClient/include/World/Actor/GameStatus.h, `D_OPEN` /
 /// `D_CLOSE`), so this one byte is the whole of what the server says about a
 /// door — the swing itself is the client's, driven from the zone DAT's per-door
 /// `open`/`clos` routines (`enum ANIMATIONTYPE`,

@@ -150,14 +150,8 @@ fn parse_graphics_settings(bytes: &[u8]) -> Result<GraphicsSettings> {
     if let Some(x) = take::<DynamicLights>(&v, "dynamic_lights") {
         s.dynamic_lights = x;
     }
-    if let Some(x) = take(&v, "light_threshold") {
-        s.light_threshold = x;
-    }
-    if let Some(x) = take(&v, "light_intensity") {
-        s.light_intensity = x;
-    }
-    if let Some(x) = take(&v, "light_range") {
-        s.light_range = x;
+    if let Some(x) = take(&v, "shadowed_lights") {
+        s.shadowed_lights = x;
     }
     if let Some(x) = take(&v, "light_flicker") {
         s.light_flicker = x;
@@ -177,6 +171,9 @@ fn parse_graphics_settings(bytes: &[u8]) -> Result<GraphicsSettings> {
     }
     if let Some(x) = take(&v, "character_shadow_cast") {
         s.character_shadow_cast = x;
+    }
+    if let Some(x) = take(&v, "zone_shadow_cast") {
+        s.zone_shadow_cast = x;
     }
     if let Some(x) = take(&v, "depth_of_field") {
         s.depth_of_field = x;

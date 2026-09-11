@@ -208,8 +208,16 @@ fn resolve_dat_root(require_dat: bool) -> Result<Option<std::sync::Arc<ffxi_dat:
             tracing::info!(
                 source = %root.root().display(),
                 overlays = root.overlays().len(),
-                "loaded FFXI DAT install for NPC name lookup"
+                client = %root.profile(),
+                "loaded FFXI DAT install"
             );
+            if !root.profile().is_known() {
+                tracing::warn!(
+                    client = %root.profile(),
+                    "FFXI client build is not in ffxi_dat::client_profile::KNOWN_CLIENTS; \
+                     DAT layouts are probed, not verified"
+                );
+            }
             Ok(Some(std::sync::Arc::new(root)))
         }
         Err(err) if require_dat => Err(anyhow::anyhow!(

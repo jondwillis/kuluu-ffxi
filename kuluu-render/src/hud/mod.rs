@@ -159,9 +159,6 @@ pub fn spawn_bottom_left_stack(
                     #[cfg(not(target_arch = "wasm32"))]
                     crate::minimap::spawn_minimap_as_child(col, &mut images);
 
-                    // Sole CompassLabel spawn on every target: update_compass
-                    // resolves it with single_mut(), which a second chip would
-                    // break.
                     compass::spawn_compass_as_child(col);
 
                     col.spawn(Node {
@@ -312,6 +309,8 @@ impl Plugin for HudPlugin {
                 shop::update_shop_panel_system,
                 (
                     compass::update_compass,
+                    compass::update_compass_art,
+                    compass::update_compass_dots,
                     #[cfg(not(target_arch = "wasm32"))]
                     compass::update_compass_track_pointer,
                 ),
@@ -540,15 +539,19 @@ mod tests {
     use bevy::ecs::system::RunSystemOnce;
 
     #[test]
-    fn bottom_left_stack_spawns_exactly_one_compass_label() {
+    fn bottom_left_stack_spawns_one_compass_with_four_cardinals() {
         let mut world = World::new();
         #[cfg(not(target_arch = "wasm32"))]
         world.init_resource::<Assets<bevy::image::Image>>();
         world.run_system_once(spawn_bottom_left_stack).unwrap();
 
         assert_eq!(
-            world.query::<&compass::CompassLabel>().iter(&world).count(),
+            world.query::<&compass::CompassPanel>().iter(&world).count(),
             1
+        );
+        assert_eq!(
+            world.query::<&compass::CompassLabel>().iter(&world).count(),
+            4
         );
     }
 }

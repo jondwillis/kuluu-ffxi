@@ -1,3 +1,5 @@
+pub mod scene;
+
 use ffxi_dat::event_dat::EventBlock;
 
 use crate::cue::{
@@ -221,6 +223,10 @@ const CHOCOBO_UNMOUNT_ID: u16 = 0;
 const WORK_LOCAL_LEN: usize = 80;
 const WORK_ZONE_LEN: usize = 96;
 const WORK_ZONE_BASE: u32 = 4096;
+// Selbina's Lucia event 221 reads num[0] as Work_Zone[2]; Southern San d'Oria
+// event 599 reads num[1..2] as Work_Zone[3..4]. Both are retail event DATs.
+const EVENT_PARAM_WORK_BASE: usize = 2;
+const EVENT_PARAM_COUNT: usize = 8;
 const JUMP_STACK_LEN: usize = 8;
 // References-table index marker; low bits index it (XiEvents Event VM Functions.md).
 const REFERENCE_FLAG: u32 = 0x8000;
@@ -239,6 +245,9 @@ const OPCODE_BUDGET_PER_STEP: u32 = 100_000;
 /// flow (the full 16-entry priority `ReqStack` is a Stage 2 concern). Mirrors the
 /// fields the implemented opcodes touch.
 pub struct EventVm {
+    scene: Option<scene::Scene>,
+    scene_cancelled: bool,
+    scene_actions: Vec<scene::SceneAction>,
     event_data: Vec<u8>,
     references: Vec<u32>,
     work_local: [u32; WORK_LOCAL_LEN],
@@ -247,9 +256,7 @@ pub struct EventVm {
     jump_table: [u16; JUMP_STACK_LEN],
     jump_index: usize,
     speaker_index: u16,
-    /// Event numeric parameters from the trigger packet — see
-    /// [`EventMessage::params`].
-    params: Vec<i32>,
+    param_len: usize,
     /// `CliEventMessOpenFlag`: 0 none, 1 awaiting dismissal, 2 invalid.
     message_open: u8,
     pending_message: Option<EventMessage>,
@@ -301,16 +308,72 @@ impl EventVm {
         params: Vec<i32>,
     ) -> Option<Self> {
         let exec_pointer = block.event_entry(event_id)?;
-        Some(Self {
+        Some(Self::start_at(block, exec_pointer, speaker_index, params))
+    }
+
+    pub fn driving_block(
+        dat: &ffxi_dat::event_dat::EventDat,
+        actor: u32,
+        event_id: u16,
+    ) -> Option<(&EventBlock, ffxi_dat::event_dat::EventBlockSource)> {
+        let resolved = dat.block_for_event(actor, event_id)?;
+        let entry = resolved.0.event_entry(event_id)?;
+        if resolved.0.event_data.get(entry) != Some(&OP_END) {
+            return Some(resolved);
+        }
+        // research/XiEvents/Event VM Functions.md InitEvent2 initializes all
+        // participants. A sole non-END participant can drive an otherwise empty trigger.
+        let mut driver = None;
+        for block in &dat.blocks {
+            let Some(entry) = block.event_entry(event_id) else {
+                continue;
+            };
+            match block.event_data.get(entry) {
+                Some(&OP_END) => {}
+                Some(_) if block.event_entry_exact(event_id).is_some() && driver.is_none() => {
+                    driver = Some(block)
+                }
+                _ => return Some(resolved),
+            }
+        }
+        Some(
+            driver
+                .map(|block| {
+                    (
+                        block,
+                        ffxi_dat::event_dat::EventBlockSource::SoleOwnerElsewhere,
+                    )
+                })
+                .unwrap_or(resolved),
+        )
+    }
+
+    fn start_at(
+        block: &EventBlock,
+        exec_pointer: usize,
+        speaker_index: u16,
+        params: Vec<i32>,
+    ) -> Self {
+        let mut work_zone = [0; WORK_ZONE_LEN];
+        for (slot, value) in work_zone[EVENT_PARAM_WORK_BASE..][..EVENT_PARAM_COUNT]
+            .iter_mut()
+            .zip(&params)
+        {
+            *slot = *value as u32;
+        }
+        Self {
+            scene: None,
+            scene_cancelled: false,
+            scene_actions: Vec::new(),
             event_data: block.event_data.clone(),
             references: block.references.clone(),
             work_local: [0; WORK_LOCAL_LEN],
-            work_zone: [0; WORK_ZONE_LEN],
+            work_zone,
             exec_pointer,
             jump_table: [0; JUMP_STACK_LEN],
             jump_index: 0,
             speaker_index,
-            params,
+            param_len: params.len().min(EVENT_PARAM_COUNT),
             message_open: MESSAGE_OPEN_NONE,
             pending_message: None,
             pending_choice: None,
@@ -320,18 +383,31 @@ impl EventVm {
             ran_past_end: false,
             wait: None,
             oob_reads: std::cell::Cell::new(0),
-        })
+        }
+    }
+
+    fn params(&self) -> Vec<i32> {
+        self.work_zone[EVENT_PARAM_WORK_BASE..][..self.param_len]
+            .iter()
+            .map(|&value| value as i32)
+            .collect()
     }
 
     /// Clear the open-dialog flag after the player dismisses a message, so the
     /// next [`step`](Self::step) advances past MESWAIT.
     pub fn dismiss_message(&mut self) {
+        self.dismiss_child_message();
         self.message_open = MESSAGE_OPEN_NONE;
     }
 
     /// Mark the open message invalid so the next MESWAIT force-cancels the
     /// event (XiEvents OpCodes/0x0023.md) — the Esc-on-message path.
     pub fn cancel_message(&mut self) {
+        if self.scene_waiting() {
+            self.scene = None;
+            self.scene_actions.clear();
+            self.scene_cancelled = true;
+        }
         self.message_open = MESSAGE_OPEN_INVALID;
     }
 
@@ -340,6 +416,7 @@ impl EventVm {
     /// opcodes branch on — so the next [`step`](Self::step) advances past
     /// QUERYWAIT.
     pub fn select_choice(&mut self, index: Option<u32>) {
+        self.select_child_choice(index);
         self.work_zone[0] = index.unwrap_or(CHOICE_CANCELLED);
         self.selection_made = true;
     }
@@ -353,7 +430,14 @@ impl EventVm {
     /// several), so the host drains after each step rather than reading a
     /// per-step return value.
     pub fn take_cues(&mut self) -> Vec<EventCue> {
-        std::mem::take(&mut self.cues)
+        let cues = std::mem::take(&mut self.cues);
+        if let Some(scene) = &self.scene {
+            cues.into_iter()
+                .map(|cue| cue.resolve_event_actor(ActorLookup(scene.actor)))
+                .collect()
+        } else {
+            cues
+        }
     }
 
     /// True if the program counter ran off the end of the bytecode without an
@@ -390,6 +474,7 @@ impl EventVm {
     /// wait still costs a tick — which is what keeps a scene's cues from all
     /// landing together.
     pub fn tick(&mut self, dt_secs: f32) {
+        self.tick_scene(dt_secs);
         let Some(wait) = self.wait.as_mut() else {
             return;
         };
@@ -401,19 +486,26 @@ impl EventVm {
     }
 
     pub fn is_waiting(&self) -> bool {
-        self.wait.is_some()
+        self.wait.is_some() || self.scene_waiting()
     }
 
     /// Run opcodes until the VM yields (one `EventIdle` tick).
     pub fn step(&mut self) -> StepResult {
+        if self.scene_cancelled {
+            return StepResult::Cancelled;
+        }
         if self.finished {
             return StepResult::Done;
         }
         if self.wait.is_some() {
             return StepResult::Waiting;
         }
+        self.resume_scene();
         let mut budget = OPCODE_BUDGET_PER_STEP;
         loop {
+            if let Some(result) = self.step_child() {
+                return result;
+            }
             let Some(&op) = self.event_data.get(self.exec_pointer) else {
                 // Retail reads 0 (== OP_END) here, so ending is faithful; flag
                 // it because a well-formed event always terminates via
@@ -443,6 +535,12 @@ impl EventVm {
                      on state this VM does not model"
                 );
                 return StepResult::Spun(op);
+            }
+            if self.handles_scene_opcode(op) {
+                if let Some(result) = self.scene_opcode(op) {
+                    return result;
+                }
+                continue;
             }
             match op {
                 OP_END => {
@@ -618,7 +716,7 @@ impl EventVm {
                         message_id: self.getworkofs(1, 0) as u32,
                         speaker_index: self.speaker_index,
                         default_index: self.getworkofs(3, 0) as u32,
-                        params: self.params.clone(),
+                        params: self.params(),
                     });
                     self.selection_made = false;
                     self.exec_pointer += 7;
@@ -808,7 +906,7 @@ impl EventVm {
         self.pending_message = Some(EventMessage {
             message_id,
             speaker_index,
-            params: self.params.clone(),
+            params: self.params(),
         });
     }
 
@@ -913,6 +1011,9 @@ impl EventVm {
     /// is wired (Stage 2). Returns a signed value (the VM treats work as `int`).
     fn getworkofs(&self, index: usize, shift: i32) -> i32 {
         let val = (self.eventgetcode(index) as i32).wrapping_add(shift) as u32;
+        if let Some(value) = self.scene_operand(val) {
+            return value;
+        }
         if val & REFERENCE_FLAG != 0 {
             return self
                 .references
@@ -948,7 +1049,11 @@ impl EventVm {
             return;
         }
         if (WORK_ZONE_BASE..WORK_ZONE_BASE + WORK_ZONE_LEN as u32).contains(&val) {
-            self.work_zone[(val - WORK_ZONE_BASE) as usize] = value as u32;
+            let index = (val - WORK_ZONE_BASE) as usize;
+            self.work_zone[index] = value as u32;
+            if (EVENT_PARAM_WORK_BASE..EVENT_PARAM_WORK_BASE + EVENT_PARAM_COUNT).contains(&index) {
+                self.param_len = self.param_len.max(index - EVENT_PARAM_WORK_BASE + 1);
+            }
         }
     }
 
@@ -1046,6 +1151,41 @@ mod tests {
 
     fn vm(event_data: Vec<u8>, references: Vec<u32>) -> EventVm {
         EventVm::start(&block(event_data, references), 7, 5, vec![]).unwrap()
+    }
+
+    #[test]
+    fn empty_actor_entry_uses_only_an_unambiguous_executable_participant() {
+        use ffxi_dat::event_dat::{EventBlockSource, EventDat};
+        let mut empty = block(vec![OP_END], vec![]);
+        empty.actor = 1;
+        let mut driver = block(vec![OP_MESSAGE, 0, 0x80, OP_END], vec![0]);
+        driver.actor = 2;
+        let mut dat = EventDat {
+            blocks: vec![empty, driver.clone()],
+        };
+        let (chosen, source) = EventVm::driving_block(&dat, 1, 7).unwrap();
+        assert_eq!(chosen.actor, 2);
+        assert_eq!(source, EventBlockSource::SoleOwnerElsewhere);
+        driver.actor = 3;
+        dat.blocks.push(driver);
+        assert_eq!(EventVm::driving_block(&dat, 1, 7).unwrap().0.actor, 1);
+        dat.blocks.last_mut().unwrap().event_data.clear();
+        assert_eq!(EventVm::driving_block(&dat, 1, 7).unwrap().0.actor, 1);
+    }
+
+    #[test]
+    fn trigger_params_seed_all_eight_work_slots_without_overwriting_results() {
+        let params = vec![1_300_000, 100, -1, i32::MIN, i32::MAX, 17, 29, 41];
+        let event = EventVm::start(&block(vec![OP_END], vec![]), 7, 5, params.clone()).unwrap();
+        assert_eq!(event.work_zone(0), 0);
+        assert_eq!(event.work_zone(1), 0);
+        for (index, expected) in params.iter().enumerate() {
+            assert_eq!(event.work_zone(index + EVENT_PARAM_WORK_BASE), *expected);
+        }
+        assert_eq!(
+            event.work_zone(EVENT_PARAM_WORK_BASE + EVENT_PARAM_COUNT),
+            0
+        );
     }
 
     /// Operand selecting `work_zone[0]`, little-endian.

@@ -70,6 +70,7 @@ impl ServerLoginMyroom {
 
 #[derive(Debug, Clone, Copy)]
 pub struct ServerLogin {
+    pub voyage: Option<ZoneInVoyage>,
     pub unique_no: u32,
     pub act_index: u16,
     pub zone_no: u16,
@@ -173,6 +174,36 @@ pub struct ZoneInEvent {
     pub event_mode: u16,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ZoneInVoyage {
+    pub start: u32,
+    pub duration: u16,
+    pub reverse: bool,
+    pub route: u8,
+}
+
+impl ZoneInVoyage {
+    // vendor/server/src/map/packets/s2c/0x00a_login.h GP_SERV_COMMAND_LOGIN ShipStart/ShipEnd
+    // FFXiMain.dll (2026-09-09 install) VA 0x100FA0F7 reconstructs end = start + duration.
+    pub fn decode(body: &[u8]) -> Option<Self> {
+        const START: usize = 0x74;
+        const DURATION: usize = 0x78;
+        const REVERSE: usize = 0x23;
+        const ROUTE: usize = 0x26;
+        const REVERSE_MASK: u8 = 4;
+        const ROUTE_SHIFT: u8 = 3;
+        const ROUTE_MASK: u8 = 3;
+        let start = u32::from_le_bytes(body.get(START..START + 4)?.try_into().ok()?);
+        let duration = u16::from_le_bytes(body.get(DURATION..DURATION + 2)?.try_into().ok()?);
+        (start != 0 && duration != 0).then_some(Self {
+            start,
+            duration,
+            reverse: body[REVERSE] & REVERSE_MASK != 0,
+            route: (body[ROUTE] >> ROUTE_SHIFT) & ROUTE_MASK,
+        })
+    }
+}
+
 impl ServerLogin {
     pub(crate) const SIZE: usize = 48;
 
@@ -193,7 +224,7 @@ impl ServerLogin {
     pub(crate) const EVENT_NUM_OFFSET: usize = 0x5E;
     pub(crate) const EVENT_PARA_OFFSET: usize = 0x60;
     pub(crate) const EVENT_MODE_OFFSET: usize = 0x62;
-    // vendor/server/src/map/packets/s2c/0x00A_login.h — WeatherNumber,
+    // vendor/server/src/map/packets/s2c/0x00a_login.h — WeatherNumber,
     // WeatherNumber2, WeatherTime, WeatherTime2, WeatherOffsetTime, immediately
     // after EventMode. The offset chain is pinned at both ends by constants this
     // decoder already uses: MusicNum[5] at 0x52 runs to SubMapNumber at 0x5C,
@@ -299,6 +330,7 @@ impl ServerLogin {
             }
         });
         Ok(Self {
+            voyage: ZoneInVoyage::decode(body),
             unique_no: pos_head.unique_no,
             act_index: pos_head.act_index,
             zone_no: zone_u32 as u16,
@@ -365,7 +397,7 @@ impl ServerLogout {
 #[cfg(test)]
 mod server_login_tests {
     // The weather block sits between EventMode and ShipStart in
-    // vendor/server/src/map/packets/s2c/0x00A_login.h GP_SERV_COMMAND_LOGIN WeatherNumber. Pin the offsets
+    // vendor/server/src/map/packets/s2c/0x00a_login.h GP_SERV_COMMAND_LOGIN WeatherNumber. Pin the offsets
     // against the two constants that bracket it, so a future field insertion
     // cannot silently slide weather onto the ship or event fields.
     #[test]
@@ -775,5 +807,56 @@ mod server_logout_tests {
         assert!(l.is_zone_change());
         assert_eq!(l.new_server_port, 54230);
         assert_eq!(l.new_server_ip, 0x6F00_A8C0);
+    }
+}
+
+#[cfg(test)]
+mod voyage_tests {
+    use super::{ServerLogin, ZoneInVoyage};
+
+    #[test]
+    fn voyage_fields_decode_independently_and_reject_incomplete_timing() {
+        const START: usize = 116;
+        const DURATION: usize = 120;
+        const FLAGS: usize = 35;
+        const ROUTE: usize = 38;
+        const FULL: usize = 122;
+        const START_VALUE: u32 = 0x1200_3400;
+        const DURATION_VALUE: u16 = 897;
+        const ALL_FLAGS: u8 = u8::MAX;
+        const OTHER_REVERSE_FLAGS: u8 = 0xFB;
+        const OTHER_ROUTE_FLAGS: u8 = 0xE7;
+        const ROUTE_SHIFT: u8 = 3;
+        const ROUTE_COUNT: u8 = 4;
+        let mut body = [0u8; FULL];
+        body[START..START + 4].copy_from_slice(&START_VALUE.to_le_bytes());
+        body[DURATION..].copy_from_slice(&DURATION_VALUE.to_le_bytes());
+        for reverse in [false, true] {
+            for route in 0..ROUTE_COUNT {
+                body[FLAGS] = if reverse {
+                    ALL_FLAGS
+                } else {
+                    OTHER_REVERSE_FLAGS
+                };
+                body[ROUTE] = OTHER_ROUTE_FLAGS | route << ROUTE_SHIFT;
+                let expected = Some(ZoneInVoyage {
+                    start: START_VALUE,
+                    duration: DURATION_VALUE,
+                    reverse,
+                    route,
+                });
+                assert_eq!(ZoneInVoyage::decode(&body), expected);
+                assert_eq!(ServerLogin::decode(&body).unwrap().voyage, expected);
+            }
+        }
+        for length in 0..FULL {
+            assert_eq!(ZoneInVoyage::decode(&body[..length]), None);
+        }
+        body[DURATION..].fill(0);
+        assert_eq!(ZoneInVoyage::decode(&body), None);
+        body[DURATION..].copy_from_slice(&DURATION_VALUE.to_le_bytes());
+        body[START..START + 4].fill(0);
+        assert_eq!(ZoneInVoyage::decode(&body), None);
+        assert_eq!(ZoneInVoyage::decode(&[0; FULL]), None);
     }
 }

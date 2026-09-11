@@ -316,7 +316,36 @@ pub struct ParticleGeneratorDef {
     // payload+0; only 0x03 (gravity) affects the visible arc. [0,0]/None = static.
     pub uv_scroll: [f32; 2],
     pub accel: Option<[f32; 3]>,
+
+    // Section 1 (body[0x70]) generator-level updater 0x0A, research/xim
+    // ParticleGeneratorParser.kt sec1Handler GeneratorCullUpdater.
+    pub emit_cull: Option<EmitCull>,
 }
+
+// research/XIClient/src/XIClient/source/World/Generator/CYyGenerator.cpp CYyGenerator::Idle case 0x0A —
+// each frame the camera-eye distance to the generator is tested against `fpos[1]` (0 defers to
+// XiZone::GetDrawDistance) and `fpos[2]`; out of range, the rest of the generator's update
+// script (its emission among it) is skipped for the frame, and with `pos[3] & 1` the generator
+// unlinks for good.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EmitCull {
+    pub max_distance: f32,
+    pub min_distance: f32,
+    pub unlink_out_of_range: bool,
+}
+
+impl EmitCull {
+    pub fn out_of_range(&self, distance: f32, zone_draw_distance: f32) -> bool {
+        let max = if self.max_distance == 0.0 {
+            zone_draw_distance
+        } else {
+            self.max_distance
+        };
+        distance > max || distance < self.min_distance
+    }
+}
+
+const SEC1_OPCODE_EMIT_CULL: u8 = 0x0A;
 
 impl ParticleGeneratorDef {
     pub fn parse(body: &[u8]) -> Result<Option<Self>> {
@@ -554,6 +583,34 @@ impl ParticleGeneratorDef {
             }
         }
 
+        // Section 1 (body[0x70]) — generator-level per-frame updaters, the same block framing.
+        let mut emit_cull = None;
+        let sec1_raw = u32_le(body, 0x70) as usize;
+        if sec1_raw >= CHUNK_HEADER_LEN && sec1_raw - CHUNK_HEADER_LEN < body.len() {
+            let mut cursor = sec1_raw - CHUNK_HEADER_LEN;
+            while cursor + 4 <= body.len() {
+                let cfg = u32_le(body, cursor);
+                let opcode = (cfg & OPCODE_MASK) as u8;
+                let size_words = ((cfg >> 8) & u32::from(SIZE_WORDS_MASK)) as usize;
+                if opcode == OPCODE_END || size_words == 0 {
+                    break;
+                }
+                let block_len = size_words * 4;
+                let payload = cursor + 4;
+                if cursor + block_len > body.len() {
+                    break;
+                }
+                if opcode == SEC1_OPCODE_EMIT_CULL && payload + 12 <= body.len() {
+                    emit_cull = Some(EmitCull {
+                        max_distance: f32_le(body, payload),
+                        min_distance: f32_le(body, payload + 4),
+                        unlink_out_of_range: u32_le(body, payload + 8) & 1 != 0,
+                    });
+                }
+                cursor += block_len;
+            }
+        }
+
         Ok(Some(Self {
             frames_per_emission,
             particles_per_emission,
@@ -592,6 +649,7 @@ impl ParticleGeneratorDef {
             moon_phase_sprite,
             uv_scroll,
             accel,
+            emit_cull,
         }))
     }
 
@@ -1437,6 +1495,67 @@ mod tests {
             ParticleGeneratorDef::parse(&body).unwrap().is_none(),
             "a sound generator must never reach the particle sim"
         );
+    }
+
+    fn with_sec1(mut body: Vec<u8>, sec1: &[u8]) -> Vec<u8> {
+        let at = body.len();
+        body[0x70..0x74].copy_from_slice(&((at + 0x10) as u32).to_le_bytes());
+        body.extend_from_slice(sec1);
+        body
+    }
+
+    #[test]
+    fn emit_cull_reads_max_then_min_then_unlink_bit_from_section_1() {
+        let mut setup = op(0x01, 12, &[]);
+        setup[4 + 29] = LINKED_DATA_STATIC_MESH;
+        let mut p = Vec::new();
+        p.extend_from_slice(&40.0f32.to_le_bytes());
+        p.extend_from_slice(&(-1.0f32).to_le_bytes());
+        p.extend_from_slice(&1u32.to_le_bytes());
+        let mut sec1 = op(0x04, 2, &[0, 0, 0, 0]);
+        sec1.extend(op(SEC1_OPCODE_EMIT_CULL, 4, &p));
+        sec1.extend(op(OPCODE_END, 0, &[]));
+
+        let body = with_sec1(build(&setup, 1, GEN_FLAG_AUTO_RUN | 1), &sec1);
+        let def = ParticleGeneratorDef::parse(&body).unwrap().unwrap();
+        assert_eq!(
+            def.emit_cull,
+            Some(EmitCull {
+                max_distance: 40.0,
+                min_distance: -1.0,
+                unlink_out_of_range: true,
+            })
+        );
+
+        let plain = ParticleGeneratorDef::parse(&build(&setup, 1, GEN_FLAG_AUTO_RUN | 1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(plain.emit_cull, None, "no section 1: never culled");
+    }
+
+    #[test]
+    fn emit_cull_zero_max_defers_to_the_zone_draw_distance() {
+        let authored = EmitCull {
+            max_distance: 40.0,
+            min_distance: -1.0,
+            unlink_out_of_range: false,
+        };
+        assert!(!authored.out_of_range(40.0, 80.0));
+        assert!(authored.out_of_range(40.5, 80.0));
+
+        let zone = EmitCull {
+            max_distance: 0.0,
+            ..authored
+        };
+        assert!(!zone.out_of_range(79.0, 80.0));
+        assert!(zone.out_of_range(81.0, 80.0));
+
+        let near = EmitCull {
+            min_distance: 5.0,
+            ..authored
+        };
+        assert!(near.out_of_range(4.0, 80.0), "inside the near band");
+        assert!(!near.out_of_range(5.0, 80.0));
     }
 
     #[test]

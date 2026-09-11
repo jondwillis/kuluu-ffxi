@@ -1,34 +1,80 @@
-//! Dynamic obstacles (plan §2.5): closed door leaves as world-baked triangles,
-//! mobs as horizontal circles. Rebuilt every fixed tick into [`ObstacleSet`]
-//! before dispatch — the slot the avian collider syncs used; `step` is pure
-//! over it. Bevy space throughout: xz horizontal, y up.
-//!
-//! Doors: the MZB gives door groups no collision by authorial intent (retail
-//! door solidity is dynamic), so a closed leaf's mesh — baked through its
-//! AUTHORED pose, which is the closed one — is the solid geometry: walls for
-//! the sweep AND floors for the column probe (a closed drawbridge). Any swing
-//! displacement means open or mid-swing and the leaf drops out of the set.
-//!
-//! Mobs: horizontal circles in xz from the model AABB's wider ground-plane
-//! half-extent, with the old body-block rules — `EntityKind::Other` never
-//! blocks, undrawn actors never block, self is never in the set.
+//! RID door boxes follow server animation independently of visible leaves.
+//! research/XIClient/src/XIClient/source/World/Zone/Triggers/RidManager.cpp RidManager::InitUnderscoreRid.
 
 use bevy::prelude::*;
+use ffxi_dat::zone_interaction::ZoneInteraction;
+use ffxi_proto::decode::animation;
 use kuluu_render::{
     components::{IsSelf, WorldEntity},
     zone_doors::{DoorPose, ZoneDoorLeaf, ZoneDoors},
 };
+use kuluu_snapshot::{Entity as WireEntity, EntityLook};
+
+// FFXiMain.dll SHA-256 f4f90fbd080c05448aab3f866b127d7c1675b3cc15c8beaa57bfc584064b7e7c.
+// DoorOpen RVA 0xAC5E0 / DoorClose RVA 0xAC670 toggle RID collision through RVA 0x177F20
+// independently of visual schedulers.
+fn rid_door_closed(rect: &ZoneInteraction, entities: &[WireEntity]) -> bool {
+    !entities.iter().any(|entity| {
+        matches!(entity.look, Some(EntityLook::Door { door_id: Some(id), .. })
+            if id == rect.source_id.0)
+            && entity.animation == animation::OPEN_DOOR
+    })
+}
+
+fn rid_obstacle(rect: &ZoneInteraction) -> DoorObstacle {
+    const HALF: f32 = 0.5;
+    const CORNERS: [[f32; 3]; 8] = [
+        [-HALF, -HALF, -HALF],
+        [HALF, -HALF, -HALF],
+        [-HALF, HALF, -HALF],
+        [HALF, HALF, -HALF],
+        [-HALF, -HALF, HALF],
+        [HALF, -HALF, HALF],
+        [-HALF, HALF, HALF],
+        [HALF, HALF, HALF],
+    ];
+    const FACES: [[usize; 4]; 6] = [
+        [0, 2, 3, 1],
+        [4, 5, 7, 6],
+        [0, 4, 6, 2],
+        [1, 3, 7, 5],
+        [0, 1, 5, 4],
+        [2, 6, 7, 3],
+    ];
+    // research/XIClient/src/XIClient/source/World/Zone/Triggers/RidManager.cpp RidManager::InitUnderscoreRid.
+    let matrix = kuluu_render::dat_mzb::placement_bevy_transform(
+        Vec3::from_array(rect.size).abs(),
+        Vec3::new(0.0, rect.orientation[1], 0.0),
+        Vec3::from_array(rect.position),
+    );
+    let vertices = CORNERS.map(|v| matrix.transform_point3(Vec3::from_array(v)));
+    let mut tris = Vec::new();
+    for [a, b, c, d] in FACES {
+        for [a, b, c] in [[a, b, c], [a, c, d]] {
+            let v = [vertices[a], vertices[b], vertices[c]];
+            let n = (v[1] - v[0]).cross(v[2] - v[0]).normalize_or_zero();
+            if n != Vec3::ZERO {
+                tris.push((v, n));
+            }
+        }
+    }
+    DoorObstacle {
+        tris,
+        min: vertices.into_iter().fold(Vec3::INFINITY, Vec3::min),
+        max: vertices.into_iter().fold(Vec3::NEG_INFINITY, Vec3::max),
+    }
+}
 
 /// One tick's dynamic obstacle set (bevy space: xz horizontal, y up).
 #[derive(Resource, Default)]
 pub struct ObstacleSet {
-    /// Closed door leaves: walls for the sweep AND floors for the column probe.
+    /// Enabled RID boxes and fallback leaves, in Bevy space.
     pub doors: Vec<DoorObstacle>,
     /// Mobs that body-block this tick: circle-vs-circle in xz (plan §2.5).
     pub mobs: Vec<MobObstacle>,
 }
 
-/// A closed door leaf's solid geometry.
+/// An enabled door's solid geometry.
 pub struct DoorObstacle {
     /// World-space triangles through the authored (closed) pose, each with its
     /// winding-derived face normal (world space, bevy up).
@@ -129,6 +175,7 @@ fn drawn_mesh_in(
 /// Rebuild [`ObstacleSet`] for this tick. Runs in FixedUpdate before dispatch.
 pub fn rebuild_obstacles_system(
     doors_res: Res<ZoneDoors>,
+    scene: Res<kuluu_render::snapshot::SceneState>,
     meshes: Res<Assets<Mesh>>,
     leaf_q: Query<(&ZoneDoorLeaf, &Children)>,
     mesh_children: Query<&Mesh3d>,
@@ -149,8 +196,20 @@ pub fn rebuild_obstacles_system(
     // Doors: bake the closed leaves' triangles through the authored pose. The
     // verts are mirror-correct via the full matrix and independent of the
     // current swing; only the CLOSED-ness gate is live state (old toggle pass).
-    let mut doors = Vec::new();
+    let mut doors: Vec<_> = doors_res
+        .collision_rects()
+        .iter()
+        .filter(|rect| rid_door_closed(rect, &scene.snapshot.entities))
+        .map(rid_obstacle)
+        .collect();
     for (leaf, kids) in leaf_q.iter() {
+        if doors_res
+            .collision_rects()
+            .iter()
+            .any(|rect| rect.rect_id() == leaf.four_cc)
+        {
+            continue;
+        }
         if doors_res.dir(leaf.four_cc).is_none() {
             continue; // not a door-routine group: MZB-only
         }
@@ -231,4 +290,164 @@ pub fn rebuild_obstacles_system(
 
     set.doors = doors;
     set.mobs = mobs;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kuluu_render::{dat_mzb::MzbCollisionGeometry, snapshot::SceneState};
+
+    const GATE: [u8; 4] = *b"_6ww";
+    const DOCK_POSITION: [f32; 3] = [18.000645, -2.385981, -59.55436];
+    const DOCK_SIZE: [f32; 3] = [5.350002, 8.300005, 0.20000018];
+
+    fn dock_dat(yaw: f32, rect_class: u32, size_sign: f32) -> Vec<u8> {
+        const CHUNK_HEADER: usize = 16;
+        const RID_TABLE: usize = 0x30;
+        const TABLE_HEADER: usize = 16;
+        const ENTRY_SIZE: usize = 64;
+        const POSITION: usize = 0;
+        const CLASS: usize = 0x0C;
+        const YAW: usize = 0x10;
+        const SIZE: usize = 0x18;
+        const SOURCE: usize = 0x24;
+        const TERRAIN: usize = 0x30;
+        const CAMERA_SKIP: u16 = 0x100;
+        let mut body = vec![0u8; RID_TABLE + TABLE_HEADER + ENTRY_SIZE];
+        body[..4].copy_from_slice(b"RID\0");
+        body[0x10..0x14].copy_from_slice(&(RID_TABLE as u32).to_le_bytes());
+        body[RID_TABLE..RID_TABLE + 4].copy_from_slice(&1u32.to_le_bytes());
+        let entry = &mut body[RID_TABLE + TABLE_HEADER..];
+        for (base, values) in [
+            (POSITION, DOCK_POSITION),
+            (SIZE, DOCK_SIZE.map(|v| v * size_sign)),
+        ] {
+            for (i, value) in values.into_iter().enumerate() {
+                entry[base + i * 4..base + (i + 1) * 4].copy_from_slice(&value.to_le_bytes());
+            }
+        }
+        entry[CLASS..CLASS + 4].copy_from_slice(&rect_class.to_le_bytes());
+        entry[YAW..YAW + 4].copy_from_slice(&yaw.to_le_bytes());
+        entry[SOURCE..SOURCE + 4].copy_from_slice(&GATE);
+        entry[TERRAIN..TERRAIN + 2].copy_from_slice(&CAMERA_SKIP.to_le_bytes());
+        let mut dat = vec![0u8; CHUNK_HEADER];
+        dat[..4].copy_from_slice(b"test");
+        let units = ((CHUNK_HEADER + body.len()) / CHUNK_HEADER) as u32;
+        dat[4..8].copy_from_slice(&((units << 7) | ffxi_dat::ChunkKind::Rid as u32).to_le_bytes());
+        dat.extend(body);
+        dat
+    }
+
+    fn gate_entity(state: u8) -> WireEntity {
+        WireEntity {
+            id: 17_793_087,
+            act_index: 63,
+            kind: kuluu_snapshot::EntityKind::Other,
+            name: None,
+            pos: kuluu_snapshot::Vec3::default(),
+            heading: 0,
+            hp_pct: None,
+            bt_target_id: 0,
+            face_target: 0,
+            claim_id: 0,
+            speed: 0,
+            speed_base: 0,
+            look: Some(EntityLook::Door {
+                size: 2,
+                door_id: Some(GATE),
+            }),
+            animation: state,
+            animationsub: 0,
+            mount: None,
+            status: 0,
+            char_flags: kuluu_snapshot::CharFlags::default(),
+            monstrosity: false,
+            name_vis: None,
+        }
+    }
+
+    fn walk_past_gate(obstacles: &ObstacleSet, yaw: f32) -> f32 {
+        const STEP: f32 = 0.1;
+        const TICKS: usize = 100;
+        const START_OFFSET: f32 = 2.5;
+        const DT: f32 = 1.0 / 60.0;
+        let outward = Vec2::new(yaw.sin(), yaw.cos());
+        let center = Vec2::new(DOCK_POSITION[0], DOCK_POSITION[2]);
+        let mut pos = center + outward * START_OFFSET;
+        let mut walker = super::super::Walker::default();
+        let geom = MzbCollisionGeometry::default();
+        for _ in 0..TICKS {
+            let result = super::super::step::step(
+                &geom,
+                obstacles,
+                &mut walker,
+                pos.x,
+                pos.y,
+                DOCK_POSITION[1],
+                -outward.x * STEP,
+                -outward.y * STEP,
+                STEP / DT,
+                DT,
+                false,
+                false,
+            );
+            pos += Vec2::new(result.dx, result.dy);
+        }
+        (pos - center).dot(outward)
+    }
+
+    #[test]
+    fn transport_dock_collision_contract() {
+        for (yaw, class, sign) in [
+            (0.0, 0, 1.0),
+            (std::f32::consts::FRAC_PI_2, 0, 1.0),
+            (0.71, 500, -1.0),
+        ] {
+            let doors = ZoneDoors::from_dat(&dock_dat(yaw, class, sign));
+            assert!(
+                doors.dir(u32::from_le_bytes(GATE)).is_none(),
+                "gate has no visual routine"
+            );
+            assert_eq!(doors.collision_rects().len(), 1);
+            let mut app = App::new();
+            app.insert_resource(doors)
+                .init_resource::<SceneState>()
+                .init_resource::<Assets<Mesh>>()
+                .init_resource::<ObstacleSet>()
+                .add_systems(Update, rebuild_obstacles_system);
+            for state in [
+                None,
+                Some(animation::CLOSE_DOOR),
+                Some(animation::OPEN_DOOR),
+                Some(animation::CLOSE_DOOR),
+            ] {
+                app.world_mut()
+                    .resource_mut::<SceneState>()
+                    .snapshot
+                    .entities = state.map(gate_entity).into_iter().collect();
+                app.update();
+                let obstacles = app.world().resource::<ObstacleSet>();
+                let position = walk_past_gate(obstacles, yaw);
+                if state == Some(animation::OPEN_DOOR) {
+                    assert!(obstacles.doors.is_empty());
+                    assert!(
+                        position < -5.0,
+                        "open gate must permit boarding: {position}"
+                    );
+                } else {
+                    assert_eq!(obstacles.doors.len(), 1);
+                    assert_eq!(obstacles.doors[0].tris.len(), 12);
+                    for (tri, normal) in &obstacles.doors[0].tris {
+                        if normal.y > 0.9 {
+                            assert!((tri[0].y - obstacles.doors[0].max.y).abs() < 0.0001, "the upper face must remain upward-facing with signed source extents");
+                        }
+                    }
+                    assert!(position > 0.0, "closed gate must stop boarding: {position}");
+                }
+            }
+            app.insert_resource(ZoneDoors::default());
+            app.update();
+            assert!(app.world().resource::<ObstacleSet>().doors.is_empty());
+        }
+    }
 }

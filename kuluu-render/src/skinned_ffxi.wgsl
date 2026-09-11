@@ -23,11 +23,13 @@
 
 #import bevy_pbr::{
     mesh_functions,
-    view_transformations::{position_world_to_clip, position_world_to_view},
+    view_transformations::position_world_to_clip,
     mesh_view_bindings as view_bindings,
     mesh_view_types,
-    shadows,
 }
+
+#import kuluu_render::directional_shadow::directional_shadow_factor
+#import kuluu_render::point_shadow::point_shadow_factor
 
 // Distance fog — see zone_ffxi.wgsl for the rationale. Applied so a distant
 // actor fades into the same horizon backdrop as the terrain behind it; near
@@ -142,19 +144,12 @@ fn vertex(v: Vertex) -> VertexOutput {
     return out;
 }
 
-// Scene irradiance at a surface: ambient sky fill + 2 directional (sun/moon)
-// + 4 point lights, all sourced from the actor's lighting record in the shared
-// skins storage array (indexed, not copied — the record is ~52 vec4s). `wrap`
-// softens the N·L terminator (0 = hard Lambert). `sun_scale` attenuates ONLY
-// the primary directional (sun/dir0) term so a cast-shadow factor can darken
-// the sun contribution while leaving the moon/ambient/point fill intact (1.0 =
-// fully lit). Shared by both shading models below.
-fn scene_irradiance(si: u32, n: vec3<f32>, p: vec3<f32>, wrap: f32, sun_scale: f32) -> vec3<f32> {
+fn scene_irradiance(si: u32, n: vec3<f32>, p: vec3<f32>, wrap: f32, shadow_scale: vec2<f32>, point_shadows: bool, frag_coord: vec2<f32>) -> vec3<f32> {
     var rgb = skins[si].lighting.ambient.rgb;
     let nl0 = max((dot(n, -skins[si].lighting.dir0_dir.xyz) + wrap) / (1.0 + wrap), 0.0);
-    rgb += sun_scale * nl0 * skins[si].lighting.dir0_color.rgb * skins[si].lighting.dir0_color.w;
+    rgb += shadow_scale.x * nl0 * skins[si].lighting.dir0_color.rgb * skins[si].lighting.dir0_color.w;
     let nl1 = max((dot(n, -skins[si].lighting.dir1_dir.xyz) + wrap) / (1.0 + wrap), 0.0);
-    rgb += nl1 * skins[si].lighting.dir1_color.rgb * skins[si].lighting.dir1_color.w;
+    rgb += shadow_scale.y * nl1 * skins[si].lighting.dir1_color.rgb * skins[si].lighting.dir1_color.w;
     // 16 = MAX_POINT_LIGHTS (skinned_ffxi_material.rs); empty slots have range 0.
     for (var i = 0u; i < 16u; i = i + 1u) {
         // `.w` of the color carries the light's range; <= 0 means an empty slot.
@@ -172,35 +167,18 @@ fn scene_irradiance(si: u32, n: vec3<f32>, p: vec3<f32>, wrap: f32, sun_scale: f
                 let denom = a.x + a.y * dist + a.z * dist * dist;
                 let dist_factor = select(1.0 / denom, 0.0, denom <= 0.0);
                 let nl = max(dot(n, to_light / max(dist, 1e-5)), 0.0);
-                rgb += nl * dist_factor * skins[si].lighting.point_color[i].rgb;
+                // Enhanced Dynamic Lights: the slot's light may carry a cube shadow map
+                // (zone_point_lights.rs select_shadowed_zone_lights); no floor, matching
+                // zone_ffxi.wgsl so the shadow reads the same on the character and the deck.
+                var shadow = 1.0;
+                if (point_shadows) {
+                    shadow = point_shadow_factor(p, n, skins[si].lighting.point_pos[i].xyz, frag_coord);
+                }
+                rgb += shadow * nl * dist_factor * skins[si].lighting.point_color[i].rgb;
             }
         }
     }
     return rgb;
-}
-
-// Directional cast-shadow factor for the primary sun term (dir0). Bevy owns the
-// real directional lights + cascade shadow maps at group(0) (the mesh-view bind
-// group the main material pass binds); this loops them, takes the minimum
-// shadow factor over the shadow-enabled ones, and returns it (1 = lit, 0 = fully
-// occluded). Matches StandardMaterial's usage in pbr_functions.wgsl. We do NOT
-// gate on a per-mesh SHADOW_RECEIVER flag (our VertexOutput carries no mesh
-// flags) — every FFXI character receives. When the scene has no shadow-enabled
-// directional light (e.g. the live FfxiLighting-only path, or a headless capture
-// without `--shadowtest`), the loop finds none and this returns 1.0, a no-op.
-fn sun_shadow_factor(world_pos: vec3<f32>, world_normal: vec3<f32>, frag_coord_xy: vec2<f32>) -> f32 {
-    let view_z = position_world_to_view(world_pos).z;
-    let n = view_bindings::lights.n_directional_lights;
-    var factor = 1.0;
-    for (var i = 0u; i < n; i = i + 1u) {
-        let lflags = view_bindings::lights.directional_lights[i].flags;
-        if ((lflags & mesh_view_types::DIRECTIONAL_LIGHT_FLAGS_SHADOWS_ENABLED_BIT) == 0u) {
-            continue;
-        }
-        factor = min(factor, shadows::fetch_directional_shadow(
-            i, vec4<f32>(world_pos, 1.0), world_normal, view_z, frag_coord_xy));
-    }
-    return factor;
 }
 
 // Fade a lit fragment toward the fog colour by view distance (see
@@ -232,7 +210,7 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let has_texture = rec.flags.x > 0.5;
     // flags.y selects the realistic (Bevy-scene-driven) lighting model.
     let realistic = rec.flags.y > 0.5;
-    // flags.z gates directional cast-shadow / self-shadow RECEIVE (the
+    // flags.z gates shadow RECEIVE from the sun/moon and from Enhanced point lights (the
     // "Model Shadow Receiving" graphics setting). When off, both branches light the
     // model with no shadow attenuation (sun term at full strength).
     let receive_shadows = rec.flags.z > 0.5;
@@ -251,18 +229,14 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     let n = normalize(in.world_normal);
+    var shadow_scale = vec2<f32>(1.0);
+    if (receive_shadows) {
+        shadow_scale = vec2<f32>(
+            directional_shadow_factor(in.world_position, n, -skins[si].lighting.dir0_dir.xyz, in.clip_position.xy),
+            directional_shadow_factor(in.world_position, n, -skins[si].lighting.dir1_dir.xyz, in.clip_position.xy),
+        );
+    }
     if (realistic) {
-        // Cast-shadow attenuation for the sun term. The realistic model is
-        // energy-conserving (AMBIENT_FLOOR + EXPOSURE), so a fully-shadowed
-        // fragment fades to the ambient floor, never pure black — it can take
-        // the full 0..1 shadow factor. Gated by the Model Shadow Receiving setting
-        // (`receive_shadows`); off → no attenuation (sun = 1.0). An `if` (not
-        // `select`) so the shadow-map sample is actually skipped when off —
-        // `select` evaluates both operands.
-        var sun = 1.0;
-        if (receive_shadows) {
-            sun = sun_shadow_factor(in.world_position, n, in.clip_position.xy);
-        }
         // Energy-conserving: albedo (texture * vertex color) lit ONCE by the
         // live scene sun/moon/ambient (+ point lights), with a soft wrap so
         // the unshadowed back side fades instead of clamping to hard black.
@@ -279,7 +253,7 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
         let EXPOSURE = 1.7;
         let AMBIENT_FLOOR = 0.10;
         let albedo = texel.rgb * in.color.rgb * rec.tint.rgb;
-        let irr = scene_irradiance(si, n, in.world_position, 0.3, sun);
+        let irr = scene_irradiance(si, n, in.world_position, 0.3, shadow_scale, receive_shadows, in.clip_position.xy);
         let rgb = albedo * (irr * EXPOSURE + vec3<f32>(AMBIENT_FLOOR));
         // Opaque output (AlphaMode::Mask already discarded cut-out texels). A
         // sub-1 alpha here would let the preview camera composite the character
@@ -292,15 +266,8 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     // 373,390,393,395 — fixed-function T&L sources DIFFUSE/AMBIENT from D3DMCS_COLOR1
     // and emits a D3DCOLOR, so the lit vertex term saturates before the stage.
     //
-    // Shadow-receive is gated by the Model Shadow Receiving setting (`receive_shadows`
-    // / flags.z). PCs still CAST shadows regardless (the depth prepass writes the
-    // shadow map independent of this branch).
-    var sun_scale = 1.0;
-    if (receive_shadows) {
-        let sun = sun_shadow_factor(in.world_position, n, in.clip_position.xy);
-        sun_scale = mix(FFXI_SHADOW_FLOOR, 1.0, sun);
-    }
-    let lit = saturate(scene_irradiance(si, n, in.world_position, 0.0, sun_scale) * in.color.rgb);
+    shadow_scale = mix(vec2<f32>(FFXI_SHADOW_FLOOR), vec2<f32>(1.0), shadow_scale);
+    let lit = saturate(scene_irradiance(si, n, in.world_position, 0.0, shadow_scale, receive_shadows, in.clip_position.xy) * in.color.rgb);
     let rgb = saturate(D3D_MODULATE_2X * lit * texel.rgb * rec.tint.rgb);
     // Opaque output (AlphaMode::Mask already discarded cut-out texels). A sub-1
     // alpha here would let the preview camera composite the character see-

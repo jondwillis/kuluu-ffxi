@@ -1,20 +1,11 @@
 # Worm burrow routines + animation dispatch (retail FFXI, observed on HorizonXI + static)
 
-Runtime: 2026-09-08, Carrion Worms in the retail client driven by `wormwatch.lua`
-v0.4 (`cow_tools/ffxi_disasm/ashita/wormwatch/`), logs
-`wormwatch_20260908_182632.log`, `wormwatch_20260908_182935.log` and
-`wormwatch_20260908_231759.log` (third session: routine record format, spawn flag,
-combat/death/despawn; F46-F49).
-Static: 2026-09-08, `p3_gates.py` (G1–G4) + full-function dumps against retail
-`FFXiMain.dll` via `cow_tools/ffxi_disasm` (POL1-packed `.text`; the tooling decodes
-it - see that README).
-
-Kuluu's worm implementation (`8fe705f`, `ffxi-actor/src/actor_state.rs`
-`BurrowPhase`/`burrow_clip`) implements this. This file is kept as the
-**observation record**; open work (generalizing beyond worms) is in the
-consolidated animation plan, to be recorded as a bead where `bd` is available. Findings F36–F45 below are **paste-ready for §9 of the out-of-repo
-disassembly doc** (`docs/ffxi_disassembly.md`, "your plan + my edits"). F36-F49 have now been
-pasted into that doc's §9 (2026-09-08, third session); this file stays the observation record.
+Runtime: 2026-09-08 and 2026-09-09, Carrion Worms and Forest Hares in the retail client,
+observed with an Ashita capture addon (packet + per-actor memory probe; the addon and its
+raw logs are not in this tree). Static: 2026-09-08, gate probes and full-function dumps
+against retail `FFXiMain.dll`. Finding ids (F36..F53) are this record's own numbering; the
+earlier ids they reference (F13..F35) come from the same capture series and are quoted where
+they matter. Kuluu code cites entries here by id.
 
 ## Retail runtime findings (Phase L, closed 2026-09-08)
 
@@ -162,14 +153,14 @@ non-burrow routines (damage / attack / hit families).
   0x29 (4 dw, unknown; appears mid-stream in the pop routine, so not a terminator). Decoded:
   **dig = {xref 'init', motion sp1?, sound 7025, kak0@0x36, mok0@0x37, mok1@0x12, dis0@0x19}** and
   **pop = {..., sound 7024, mok1@0x6C, motion sp0?, kak1@0x08, 0x29, VFX@0x5A, ...}**. Both match the
-  companion doc's DAT dump byte for byte (ini1 = sp1? + kak0/mok0/mok1/dis0 + 7025; init = sp0? +
+  earlier DAT dump byte for byte (ini1 = sp1? + kak0/mok0/mok1/dis0 + 7025; init = sp0? +
   dis0/mok1/kak1/kak0/mok0 + 7024). **Correction to F22:** the fourcc at +0x10 that F22 took for the
   record's own name ('ini1') is the payload of the 0x5F cross-reference stage, i.e. the sibling's
   name. F22's record {dis0, 0x307, 7024, mok1} was therefore `init` (pop), not `ini1`, and F22's
-  "the companion doc's routine contents are swapped" is withdrawn: dig = `ini1` = 7025, pop = `init`
-  = 7024. Closes the companion doc's sound-attribution item and the sound half of Q5 (the routine
+  "the earlier dump's routine contents are swapped" is withdrawn: dig = `ini1` = 7025, pop = `init`
+  = 7024. Closes the earlier sound-attribution item and the sound half of Q5 (the routine
   carries the SE id as ASCII digits; the path template `se%3.3u/se%6.6u.spw` from F25 is the resolver).
-  Raw dumps: Other_part3.md §G.1.
+  Raw dumps are not in tree.
 - **F47 [local] 2026-09-08 (spawn flag 0x04 is NOT masked by the client):** worm 100 was already
   underground when locked (SNAP f328: RF0 0x00C06000 = status 3, no actor) and carried RF1
   0x0200055A = **subA 5**, the raw wire value 1|0x04 stored unmasked in bits 1-3, RF4 bit 7 set
@@ -182,7 +173,7 @@ non-burrow routines (damage / attack / hit families).
   ran the full 94 frames (ActionTimer2 read a stale 17096 before the pop; reset to 1798 at lock
   start). RF0 before the pop was 0x00C06000 vs 0x00C16000 after a live destroy: bit 16 (0x10000) is
   set by the destroy-from-live path and absent when the entity was first seen already hidden. RF3
-  bit 23 ('spop') was 0 on all three worms; the zone-in case (Q4 lead in Other_part3.md) is still
+  bit 23 ('spop') was 0 on all three worms; the zone-in case  is still
   untested because no watched worm spawned into view.
 - **F48 [local] 2026-09-08 (lock statistics; F42 confirmed):** 6 dig locks all **56 wormwatch frames
   (1.94 s)**, 7 pop locks all **94 frames (3.24 s)**; one wormwatch frame is ~34.5 ms (client ~29 fps),
@@ -212,7 +203,7 @@ non-burrow routines (damage / attack / hit families).
     triggered from the action packet rather than from 0x0E. Which name is picked per action (attack
     id, hit vs miss, damage bracket) is the next thing to read; candidates are F37's weapon-state
     block ('wep0'..'wep8' via 0xD60F0) and the 0xD6B43 switch machine (F29). Raw excerpts:
-    Other_part3.md §G.2.
+    (raw dumps not in tree).
   - Death: 0x0E mask 0x06 anim=3 (f6232) -> StatusServer 1->3, HP->0, RF3 bit 28 set; Status 1->3 at
     f6240 with a 22-frame lock. Despawn: 0x0E status=2 mask 0x30 size 72 (f6762) -> UpdateMask
     0x0F->0x00, actor destroyed, RF0 0x00402200 -> 0x00406000 (no INVISIBLE bits 16/23), RF1 bit 12
@@ -272,27 +263,3 @@ packets, 6 hares locked. First direct evidence of how action packets drive mob r
   later. Identical to the pop-up create path: **leaving and re-entering view is a destroy/create and
   replays 'init'.** Also seen unwatched: idx 110 with sub=8 (does not fit RF1's 3 bits; the handler's
   `shl 1 / and 0xE` drops it to 0) and idx 966 status=3 sub=1 mask 0x3F.
-
-## Kuluu relevance
-
-- `8fe705f` (BurrowPhase FSM, sp1?/sp0? clips, ini1/init effect routines,
-  no early-cancel) matches the validated retail model: dig = sub set on a live
-  actor running `ini1`; pop-up = fresh actor running `init`; mid-routine sub=0 is
-  a no-op (F39/F42).
-- **No Kuluu action for F42** - the scheduler-pool contention quirk has no analog
-  in Kuluu's driver.
-- **F46 changes how the clip is chosen:** the motion clip is a stage *inside* the routine
-  record (0x05 stage), so Kuluu should play the routine named by the table and take the clip
-  from the routine's motion stage instead of a hard-coded `burrow_clip` mapping. Sound ids
-  (7025 dig / 7024 pop) and VFX start frames come from the same record. The DAT dump in the
-  companion doc §8 was right; F22 was misread.
-- **F47:** stop masking the spawn flag; index the 8-entry sub table with the raw 3-bit value.
-- **F49-F52:** combat is the same "run routine by name" mechanism, driven by 0x28 action
-  packets: melee round -> attacker plays 'atk0' (~0.85 s, client picks an at?? variant), target
-  plays a ~0.5 s damage reaction; TP move -> category 11 packet starts the special ('sp' clip)
-  routine (~1.4 s), the category 7 "readies" packet animates nothing; engage -> battle stance;
-  death -> per-model death routine. Locks are refcounted and overlap freely.
-- Remaining work: generalize mob animation beyond worms via the [esi+0x170] state
-  machine + sub->clip table (F37) + routine-record player (F46) + action-packet routine
-  selection (F49). Tracked as open work in beads; see the consolidated animation plan
-  produced alongside this record.

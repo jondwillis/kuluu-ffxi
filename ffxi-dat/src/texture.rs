@@ -120,7 +120,7 @@ mod imginfo {
     // type bytes: these two name themselves exactly where the 0x9x/0xAx/0xBx kinds do.
     // (research/xim TextureSection.kt read `warn`s on them, but that is an unhandled case, not
     // evidence of an absent name; XIClient is the stronger tier per research/AGENTS.md.)
-    // ImageData.h ImageData and :35 separate the pair: both are GetTextureFormat() 0, and it is
+    // ImageData.h ImageData separate the pair: both are GetTextureFormat() 0, and it is
     // IsCompressed() = Format >> 7 that tells 0x81 from 0x01.
     pub(super) const FLG_FMT0: u8 = 0x01;
 

@@ -11,7 +11,7 @@ Kuluu is a faithful, open-source FINAL FANTASY XI **client** rebuilt in Rust + B
 `scripts/checks.sh` is the **single source of truth** for check commands — both the `pre-push` hook and CI call it, so they can't drift. Prefer it over spelling out cargo flags:
 
 ```bash
-scripts/checks.sh harness comments fmt clippy   # what the pre-push hook runs
+scripts/checks.sh harness comments fmt contracts clippy # what the pre-push hook runs
 scripts/checks.sh fmt clippy test build         # the full CI gate
 COMMENTS_DIFF=staged scripts/checks.sh comments # what pre-commit runs on the staged hunks
 cargo fmt --all                         # autofix formatting
@@ -24,8 +24,9 @@ cargo test -p ffxi-proto framing::tests::roundtrip --features native-window
 ```
 
 - **Nightly is required.** `rust-toolchain.toml` pins a dated nightly; the dev profile uses the Cranelift codegen backend (gated by `[unstable] codegen-backend` in `.cargo/config.toml`), which makes a *stable* cargo error out. Cranelift is dev-only — `--release` and the Steam Deck cross-build use LLVM.
+- **State contracts cannot self-skip.** `scripts/checks.sh contracts` runs mandatory event and transport-render contracts without game assets or servers and fails if the test is missing. CI's test stage, pre-push (including fast mode), and pre-commit for event/protocol/session/DAT/viewer changes run them. Event VM numeric displays derive from its work slots. Production dialog steps require the transport module's private permit and return a sealed prepared packet; the outcome is exposed only after transmission succeeds. Extend the synthetic raw-packet contract when changing event state, acknowledgements, cancellation, or packet ordering; extend the transport render contract for vehicle motion and coordinate frames. Verify new assertions with a deliberate failing mutation before trusting them.
 - **Integration tests that need a live LSB server self-skip** when it's unreachable, so the test stage is safe on a network-isolated machine. Fixtures using `mysql_async` stamp out isolated accounts against a real MariaDB and only run when one is reachable.
-- **Enable the hooks once per clone:** `cargo xtask install-hooks` (sets `core.hooksPath=.githooks`). Bypass a push with `git push --no-verify`; `PREPUSH_FAST=1 git push` runs fmt only.
+- **Enable the hooks once per clone:** `cargo xtask install-hooks` (sets `core.hooksPath=.githooks`). Bypass a push with `git push --no-verify`; `PREPUSH_FAST=1 git push` runs fmt and state contracts.
 - `xtask` is excluded from `default-members`, so plain `cargo build`/`test` skip it; run it via the `cargo xtask` alias.
 
 ## Running

@@ -83,6 +83,39 @@ impl DialogRunner {
         })
     }
 
+    pub fn attach_scene(
+        &mut self,
+        dat: std::sync::Arc<ffxi_dat::event_dat::EventDat>,
+        actor: u32,
+        player: crate::vm::scene::EventPosition,
+    ) {
+        self.vm.attach_scene(dat, actor, player);
+    }
+
+    pub fn controls_player_position(&self) -> bool {
+        self.vm.controls_player_position()
+    }
+
+    pub fn controlled_position(&self) -> Option<crate::vm::scene::EventPosition> {
+        self.vm.controlled_position()
+    }
+
+    pub fn take_scene_actions(&mut self) -> Vec<crate::vm::scene::SceneAction> {
+        self.vm.take_scene_actions()
+    }
+
+    pub fn acknowledge_position(&mut self, position: crate::vm::scene::EventPosition) {
+        self.vm.acknowledge_position(position);
+    }
+
+    pub fn reject_position(&mut self) {
+        self.vm.reject_position();
+    }
+
+    pub fn acknowledge_event(&mut self) {
+        self.vm.acknowledge_event();
+    }
+
     /// Apply the player's response to the previous frame and run to the next one.
     /// `choice` is the selected option index for a menu frame (`None` cancels);
     /// it is ignored for a message frame and on the first call.
@@ -117,6 +150,10 @@ impl DialogRunner {
     /// cancel selection, a message invalidates the open dialog; either way the
     /// VM ends the event with [`EVENT_CANCELLED_END_PARA`].
     pub fn cancel(&mut self, strings: &StringDat) -> DialogStep {
+        if self.vm.controls_player_position() && self.vm.is_waiting() {
+            self.vm.cancel_message();
+            return self.run(strings);
+        }
         match self.pending {
             Pending::Message | Pending::Start => self.vm.cancel_message(),
             Pending::Choice => self.vm.select_choice(None),

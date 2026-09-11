@@ -4,7 +4,7 @@
 #
 # Bypass once:   git push --no-verify
 # Bypass via env: SKIP_PREPUSH=1 git push
-# Skip the slow clippy pass: PREPUSH_FAST=1 git push   (runs fmt only)
+# Skip the slow clippy pass: PREPUSH_FAST=1 git push   (runs fmt and state contracts)
 #
 # Install (per clone): scripts/install-hooks.sh   (sets core.hooksPath=.githooks)
 set -euo pipefail
@@ -24,8 +24,8 @@ fi
 
 # Delegate the actual fmt/clippy invocation to the shared script so this gate
 # and CI run byte-identical flags. A green hook therefore proves a green CI
-# fmt/clippy. (The hook stops at clippy for speed; clippy --all-targets still
-# compiles the tests, so broken constructors surface — it just doesn't run them.)
+# fmt/clippy. The state contract runs locally; the complete workspace test
+# suite runs in CI.
 if ! scripts/checks.sh harness; then
   echo "pre-push: ✗ harness config — see .agents/AGENTS.md (or 'git push --no-verify' to bypass)" >&2
   exit 1
@@ -41,8 +41,13 @@ if ! scripts/checks.sh fmt; then
   exit 1
 fi
 
+if ! scripts/checks.sh contracts; then
+  echo "pre-push: state contracts failed" >&2
+  exit 1
+fi
+
 if [[ "${PREPUSH_FAST:-}" == "1" ]]; then
-  echo "pre-push: ok (fmt only; PREPUSH_FAST=1)"
+  echo "pre-push: ok (fmt and state contracts; PREPUSH_FAST=1)"
   exit 0
 fi
 

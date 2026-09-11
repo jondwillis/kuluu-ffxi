@@ -1,7 +1,7 @@
 use bevy::prelude::*;
 
 use crate::graphics_settings::{
-    GraphicsField, GraphicsSettings, DLSS_CONFIG_FIELDS, GRAPHICS_FIELDS,
+    GraphicsField, GraphicsSettings, CONFIG_FIELDS, DLSS_CONFIG_FIELDS, GRAPHICS_FIELDS,
 };
 use crate::hud::style::{self, theme};
 use crate::input_mode::{InputMode, MenuKind, MenuStack};
@@ -253,7 +253,10 @@ const STATUS_LABELS: &[&str] = &[
     "Job Points",
 ];
 
-const CONFIG_ENTRIES: &[&str] = &[
+pub const CONFIG_CONTROLS: &str = "Controls";
+const CONFIG_ENTRIES: &[&str] = &["Minimap", "UI Scale", "Menu Scale", CONFIG_CONTROLS];
+
+const CONTROLS_ENTRIES: &[&str] = &[
     "Standard",
     "Compact 1",
     "Compact 2",
@@ -339,8 +342,6 @@ const GRAPHICS_ENTRIES: &[&str] = &[
     "Frame Rate Cap",
     "Render Scale",
     "FOV",
-    "UI Scale",
-    "Menu Scale",
     "Camera Spring",
     "Anti-Aliasing",
     "DLSS",
@@ -356,16 +357,14 @@ const GRAPHICS_ENTRIES: &[&str] = &[
     "Depth of Field",
     "DoF Aperture",
     "Zone Lines",
-    "Minimap",
     "Dynamic Lights",
-    "  Emitter Threshold",
-    "  Emitter Intensity",
-    "  Emitter Range",
+    "  Shadowed Lights",
     "  Flicker",
     "  Lights per Model",
     "Shading",
     "Model Shadow Receiving",
     "Model Shadow Casting",
+    "Zone Shadow Casting",
     "Reset to High",
 ];
 
@@ -604,6 +603,7 @@ fn static_entries(kind: MenuKind) -> &'static [&'static str] {
     match kind {
         MenuKind::Root => ROOT_ENTRIES,
         MenuKind::Config => CONFIG_ENTRIES,
+        MenuKind::Controls => CONTROLS_ENTRIES,
         MenuKind::Debug => DEBUG_ENTRIES,
         MenuKind::Graphics => GRAPHICS_ENTRIES,
 
@@ -632,6 +632,7 @@ pub fn menu_title(kind: MenuKind) -> &'static str {
     match kind {
         MenuKind::Root => "Commands",
         MenuKind::Config => "Config",
+        MenuKind::Controls => "Controls",
         MenuKind::Debug => "Debug",
         MenuKind::Graphics => "Graphics",
         MenuKind::Equipment => "Equipment",
@@ -715,7 +716,7 @@ pub const GRAPHICS_PANE_WIDTH: f32 = 320.0;
 
 fn pane_width_for(kind: MenuKind) -> f32 {
     match kind {
-        MenuKind::Graphics | MenuKind::GraphicsDlss => GRAPHICS_PANE_WIDTH,
+        MenuKind::Config | MenuKind::Graphics | MenuKind::GraphicsDlss => GRAPHICS_PANE_WIDTH,
         _ => MENU_PANE_WIDTH,
     }
 }
@@ -1465,6 +1466,14 @@ fn format_row_body(
     snapshot: &kuluu_snapshot::SceneSnapshot,
 ) -> String {
     match kind {
+        MenuKind::Config => match CONFIG_FIELDS.get(slot).copied() {
+            Some(field) => format!(
+                "{:<16}[{}]",
+                format!("{}:", field.label()),
+                settings.value_label(field)
+            ),
+            None => label.to_string(),
+        },
         MenuKind::Graphics => match graphics_field_at(slot, settings.dlss_supported) {
             Some(field) => format!(
                 "{:<16}[{}]",
@@ -2238,6 +2247,19 @@ mod tests {
         rows.swap(0, 1); // start Zeta-first so the sort has work to do
         order_dynamic_rows(MenuKind::Magic, true, &mut rows);
         assert_eq!(labels(&rows), ["Apple", "Zeta"]);
+    }
+
+    #[test]
+    fn config_entries_match_fields_and_keep_controls_reachable() {
+        assert_eq!(CONFIG_ENTRIES.len(), CONFIG_FIELDS.len() + 1);
+        for (entry, field) in CONFIG_ENTRIES.iter().zip(CONFIG_FIELDS) {
+            assert_eq!(*entry, field.label());
+            assert!(!GRAPHICS_ENTRIES.contains(entry));
+        }
+        assert_eq!(CONFIG_ENTRIES.last(), Some(&CONFIG_CONTROLS));
+        assert_eq!(root_child_kind("Config"), Some(MenuKind::Config));
+        assert!(static_entries(MenuKind::Controls).contains(&"Standard"));
+        assert_eq!(pane_width_for(MenuKind::Config), GRAPHICS_PANE_WIDTH);
     }
 
     #[test]

@@ -76,7 +76,7 @@ const FADE_IN_SECS: f32 = 0.35;
 const FADE_COLOR: Color = Color::srgb(0.04, 0.04, 0.05);
 
 // Flythrough tuning, matched to the retail character-select backdrop observed
-// on HorizonXI (artifacts/retail/20260719-1419*.png): a continuous slow dolly
+// on HorizonXI (screenshots taken 2026-07-19): a continuous slow dolly
 // covering roughly a run-speed's distance per second, with no cut inside a 37s
 // observation window.
 const FLIGHT_SPEED: f32 = 5.0;

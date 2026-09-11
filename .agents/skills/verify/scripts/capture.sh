@@ -1,24 +1,14 @@
 #!/usr/bin/env bash
-# Focus-free GUI capture (kuluu-wwwv). Sends `screenshot` over the agent socket,
-# so Bevy reads back the render target on the GPU: no window raise, no keystroke,
-# no Screen Recording permission, and the human keeps whatever they were doing.
-#
-#   capture.sh <out.png> [socket-path]
-#
-# The one condition the GPU path cannot escape: macOS stops producing drawables
-# for a FULLY occluded window, so the readback comes back solid black. That
-# failure is silent — a valid PNG of nothing — so this script asserts the frame
-# has content. Partially visible is enough; focus is not needed.
-#
-# If the frame IS blank, it raises the client once, re-captures, and hands focus
-# straight back. Correct evidence beats zero disruption, and a ~1s blip is far
-# cheaper than a black PNG being cited as proof — but it is logged loudly so you
-# know the human was interrupted, and it only happens when the window got buried.
+# Capture through the agent socket, retrying once with the socket owner's window raised.
+# Usage: capture.sh <out.png> [socket-path] [client-pid]
+# Black or stale captures are not visual evidence; see the native-video fallback
+# in references/drive-gui.md. Pass the known socket when several clients are open.
 
 set -euo pipefail
 
-out="${1:?usage: capture.sh <out.png> [socket-path]}"
+out="${1:?usage: capture.sh <out.png> [socket-path] [client-pid]}"
 sock="${2:-}"
+client_pid="${3:-}"
 
 if [ -z "$sock" ]; then
   # $TMPDIR/ffxi-agent.pid goes stale across the cargo-wrapper -> binary re-exec,
@@ -69,21 +59,40 @@ PY
 
 shoot || exit 1
 if ! lit_check; then
-  echo "capture.sh: blank frame — client window is fully occluded, so macOS stopped" >&2
-  echo "            rendering it. Raising it once to get a real frame; FOCUS WILL BLIP." >&2
-  pid=$(pgrep -f "^target/(release|debug)/kuluu" | head -1 || true)
-  prev=$(osascript -e 'tell application "System Events" to get name of first process whose frontmost is true' 2>/dev/null || true)
-  if [ -n "$pid" ]; then
-    osascript -e "tell application \"System Events\" to set frontmost of (first process whose unix id is $pid) to true" >/dev/null 2>&1 || true
+  echo "capture.sh: blank GPU readback; occlusion is one possible cause." >&2
+  if [ -z "$client_pid" ] && [[ "$(basename "$sock")" =~ ^ffxi-agent-([0-9]+)\.sock$ ]]; then
+    client_pid="${BASH_REMATCH[1]}"
+  fi
+  if ! [[ "$client_pid" =~ ^[0-9]+$ ]] || [ "$client_pid" -le 0 ]; then
+    echo "capture.sh: cannot identify this socket's client; pass its PID as argument 3." >&2
+    exit 2
+  fi
+  client_comm=$(ps -p "$client_pid" -o comm= 2>/dev/null || true)
+  if [ "$(basename "$client_comm")" != "kuluu" ]; then
+    echo "capture.sh: PID $client_pid is not a live kuluu client; refusing to raise it." >&2
+    exit 2
+  fi
+  echo "capture.sh: raising only PID $client_pid once; FOCUS WILL BLIP." >&2
+  prev=$(osascript -e 'tell application "System Events" to get unix id of first process whose frontmost is true' 2>/dev/null || true)
+  if [ -n "$client_pid" ]; then
+    osascript -e "tell application \"System Events\" to tell (first process whose unix id is $client_pid)" \
+      -e 'set frontmost to true' \
+      -e 'if exists window 1 then' \
+      -e 'set value of attribute "AXMinimized" of window 1 to false' \
+      -e 'perform action "AXRaise" of window 1' \
+      -e 'end if' -e 'end tell' >/dev/null 2>&1 || true
     sleep 1.2
-    shoot || exit 1
-    if [ -n "$prev" ] && [ "$prev" != "kuluu" ]; then
-      osascript -e "tell application \"System Events\" to set frontmost of (first process whose name is \"$prev\") to true" >/dev/null 2>&1 || true
+    capture_status=0
+    shoot || capture_status=$?
+    if [[ "$prev" =~ ^[0-9]+$ ]] && [ "$prev" != "$client_pid" ]; then
+      osascript -e "tell application \"System Events\" to set frontmost of (first process whose unix id is $prev) to true" >/dev/null 2>&1 || true
     fi
+    [ "$capture_status" -eq 0 ] || exit "$capture_status"
   fi
   lit_check || {
-    echo "capture.sh: still blank after raising — is the console locked, or the app hidden?" >&2
-    echo "            Do NOT cite this file as evidence." >&2
+    echo "capture.sh: still blank after raising; check console/window state, then use" >&2
+    echo "            the native window-video fallback in references/drive-gui.md." >&2
+    echo "            Do NOT cite this file as visual evidence." >&2
     exit 2
   }
 fi

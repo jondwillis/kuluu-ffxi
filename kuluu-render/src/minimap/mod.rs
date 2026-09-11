@@ -578,23 +578,20 @@ pub fn apply_minimap_radar_setting(
 
 pub fn update_minimap_visibility(
     visible: Res<MinimapVisible>,
-    mut q: Query<&mut Node, With<MinimapRoot>>,
+    mut q: Query<
+        (&mut Node, Has<MinimapRoot>),
+        Or<(With<MinimapRoot>, With<crate::hud::compass::CompassPanel>)>,
+    >,
 ) {
-    // Re-evaluated every frame, NOT gated on is_changed(): MinimapRoot spawns
-    // Display::Flex on OnEnter(InGame), long after apply_minimap_radar_setting
-    // consumed the startup change edge, so a gated system would leave the
-    // Vanilla widget open until the next manual toggle (the kuluu-9og /
-    // kuluu-j22 consumed-edge class). The `!=` assign keeps this churn-free.
-    let Ok(mut node) = q.single_mut() else {
-        return;
-    };
-    let want = if visible.0 {
-        Display::Flex
-    } else {
-        Display::None
-    };
-    if node.display != want {
-        node.display = want;
+    for (mut node, is_terrain_map) in &mut q {
+        let want = if is_terrain_map == visible.0 {
+            Display::Flex
+        } else {
+            Display::None
+        };
+        if node.display != want {
+            node.display = want;
+        }
     }
 }
 
@@ -814,9 +811,6 @@ mod tests {
         );
     }
 
-    /// Retail has no persistent radar, so the shipped default keeps the widget
-    /// closed and the entity categories off; flipping the setting opens both,
-    /// and an unrelated graphics edit must never undo a manual `/minimap`.
     #[test]
     fn radar_setting_owns_the_defaults_but_not_the_manual_toggle() {
         let mut world = World::new();
@@ -864,6 +858,51 @@ mod tests {
             overlay::MarkerFilters::for_radar(MinimapRadar::Vanilla),
             "switching back re-applies the mode"
         );
+    }
+
+    #[test]
+    fn radar_presentations_are_exclusive_after_settings_and_manual_toggles() {
+        use crate::hud::compass::CompassPanel;
+        let mut world = World::new();
+        world.init_resource::<GraphicsSettings>();
+        world.init_resource::<MinimapVisible>();
+        world.init_resource::<overlay::MarkerFilters>();
+        let apply = world.register_system(apply_minimap_radar_setting);
+        let show = world.register_system(update_minimap_visibility);
+        world.run_system(apply).unwrap();
+        world.run_system(show).unwrap();
+        world.clear_trackers();
+        let map = world.spawn((MinimapRoot, Node::default())).id();
+        let compass = world.spawn((CompassPanel, Node::default())).id();
+        for terrain in [false, true, false] {
+            world.resource_mut::<GraphicsSettings>().minimap_radar = if terrain {
+                MinimapRadar::Enhanced
+            } else {
+                MinimapRadar::Vanilla
+            };
+            world.run_system(apply).unwrap();
+            world.run_system(show).unwrap();
+            assert_eq!(
+                world.get::<Node>(map).unwrap().display == Display::Flex,
+                terrain
+            );
+            assert_eq!(
+                world.get::<Node>(compass).unwrap().display == Display::Flex,
+                !terrain
+            );
+        }
+        for terrain in [true, false] {
+            world.resource_mut::<MinimapVisible>().0 = terrain;
+            world.run_system(show).unwrap();
+            assert_eq!(
+                world.get::<Node>(map).unwrap().display == Display::Flex,
+                terrain
+            );
+            assert_eq!(
+                world.get::<Node>(compass).unwrap().display == Display::Flex,
+                !terrain
+            );
+        }
     }
 
     /// The widget node spawns Display::Flex on zone-in, after the startup

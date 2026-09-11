@@ -13,6 +13,7 @@ pub fn state_to_snapshot(s: &SessionState) -> wire::SceneSnapshot {
         char_name: s.character.clone(),
         zone_id: s.zone_id,
         sub_area: s.sub_area,
+        voyage: s.voyage,
         self_pos,
         entities: s.entities.iter().map(entity_to_wire).collect(),
         party: s.party.iter().map(party_to_wire).collect(),
@@ -423,10 +424,7 @@ pub fn event_to_viewer_event(ev: AgentEvent) -> Option<wire::ViewerEvent> {
             target_id,
             result,
             animation,
-            info,
-            hit_distortion,
-            knockback,
-            kind,
+            outcome,
         } => Some(wire::ViewerEvent::ActionStarted {
             actor_id,
             action_id,
@@ -434,10 +432,7 @@ pub fn event_to_viewer_event(ev: AgentEvent) -> Option<wire::ViewerEvent> {
             target_id,
             result: result.map(ffxi_proto::melee::MeleeResult::to_wire),
             animation,
-            info,
-            hit_distortion,
-            knockback,
-            kind,
+            outcome: outcome.map(ffxi_proto::melee::ResultOutcome::to_wire),
         }),
         AgentEvent::EntityEmoted {
             actor_id,
@@ -597,7 +592,15 @@ pub fn look_to_wire(l: ffxi_proto::decode::LookData) -> wire::EntityLook {
             size,
             door_id: door_id.map(DoorId::bytes),
         },
-        LookData::Transport { size } => wire::EntityLook::Transport { size },
+        LookData::Transport {
+            size,
+            model_id,
+            animation_start,
+        } => wire::EntityLook::Transport {
+            size,
+            model_id,
+            animation_start,
+        },
     }
 }
 
@@ -959,10 +962,7 @@ mod tests {
                 target_id,
                 result: None,
                 animation: None,
-                info: 0,
-                hit_distortion: 0,
-                knockback: 0,
-                kind: 0,
+                outcome: None,
             });
             assert!(matches!(
                 mapped,
@@ -976,11 +976,8 @@ mod tests {
         let hit_right = ffxi_proto::melee::MeleeResult {
             resolution: ffxi_proto::melee::ActionResolution::Hit,
             animation: ffxi_proto::melee::AttackAnimation::RightAttack,
-            info: 0,
-            hit_distortion: 0,
-            knockback: 0,
-            kind: 0,
         };
+        let crit = ffxi_proto::melee::ResultOutcome::from_wire(2, 3, 2);
         for result in [None, Some(hit_right)] {
             let mapped = event_to_viewer_event(AgentEvent::ActionStarted {
                 actor_id: 0xCAFE,
@@ -989,19 +986,13 @@ mod tests {
                 target_id: Some(0xBEEF),
                 result,
                 animation: None,
-                info: 2,
-                hit_distortion: 3,
-                knockback: 2,
-                kind: 1,
+                outcome: Some(crit),
             });
             assert!(matches!(
                 mapped,
                 Some(wire::ViewerEvent::ActionStarted {
                     result: r,
-                    info: 2,
-                    hit_distortion: 3,
-                    knockback: 2,
-                    kind: 1,
+                    outcome: Some((2, 3, 2)),
                     ..
                 }) if r == result.map(ffxi_proto::melee::MeleeResult::to_wire)
             ));

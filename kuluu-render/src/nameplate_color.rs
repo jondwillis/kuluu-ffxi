@@ -159,7 +159,7 @@ impl NameColorTable {
 /// research/XIClient/src/XIClient/source/UI/UIShapeQuad.cpp `ParseFromResource` nudges every
 /// non-saturated RGB channel up by one and rescales partial alpha by 1.5 on
 /// load; `InitializeNameColors` then reads those adjusted values.
-fn quad_color(raw: [u8; 4]) -> Color {
+pub(crate) fn quad_color(raw: [u8; 4]) -> Color {
     let channel = |v: u8| if v == u8::MAX { v } else { v + 1 };
     let alpha = match raw[3] {
         0 | u8::MAX => raw[3],

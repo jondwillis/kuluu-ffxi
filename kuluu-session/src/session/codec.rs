@@ -693,6 +693,36 @@ pub(crate) fn build_subpacket_event_end(
     buf
 }
 
+// vendor/server/src/map/packets/c2s/0x05c_eventendxzy.h GP_CLI_COMMAND_EVENTENDXZY.
+pub(crate) fn build_subpacket_event_position(
+    sync: u16,
+    identity: (u32, u16, u16),
+    event_zone: u16,
+    end_para: u32,
+    position: crate::state::Position,
+) -> Vec<u8> {
+    const PACKET_BYTES: usize = 32;
+    const PACKET_WORDS: u16 = (PACKET_BYTES / 4) as u16;
+    let (unique_no, act_index, event_id) = identity;
+    let mut buf = vec![0; PACKET_BYTES];
+    buf[..4].copy_from_slice(&build_subpacket_header(
+        ffxi_proto::map::event_position_wire::OPCODE,
+        PACKET_WORDS,
+        sync,
+    ));
+    buf[4..8].copy_from_slice(&position.pos.x.to_le_bytes());
+    buf[8..12].copy_from_slice(&position.pos.z.to_le_bytes());
+    buf[12..16].copy_from_slice(&position.pos.y.to_le_bytes());
+    buf[16..20].copy_from_slice(&unique_no.to_le_bytes());
+    buf[20..24].copy_from_slice(&end_para.to_le_bytes());
+    buf[24..26].copy_from_slice(&event_zone.to_le_bytes());
+    buf[26..28].copy_from_slice(&event_id.to_le_bytes());
+    buf[28..30].copy_from_slice(&act_index.to_le_bytes());
+    buf[30] = ffxi_proto::map::event_position_wire::UPDATE_PENDING as u8;
+    buf[31] = position.heading;
+    buf
+}
+
 // Inverse of the s2c 0x055 id decode — LSB reads the bits back as
 // keyItemId = TableIndex*512 + word*32 + bit (vendor/server/src/map/packets/
 // c2s/0x064_scenarioitem.cpp GP_CLI_COMMAND_SCENARIOITEM::process keyItemId). Ids outside `table_index`'s range are

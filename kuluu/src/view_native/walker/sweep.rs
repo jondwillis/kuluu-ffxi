@@ -3,7 +3,7 @@
 //! Ported from the legacy `dat_mzb::wall_clip_wire` core, minus its step lift,
 //! face_top validation, pending_floor and 45 degree wall test — vertical
 //! authority lives in `step.rs`, and a wall is anything with normal.y <
-//! FLOOR_COS (the 60 degree rule the geometry side already applies). Bevy xz
+//! FLOOR_COS (the 45 degree rule the geometry side already applies). Bevy xz
 //! throughout; y up.
 
 use bevy::math::{Vec2, Vec3};
@@ -15,7 +15,7 @@ use super::consts::*;
 /// zone geometry is one; closed door leaves add their triangles on top.
 pub trait WallSource {
     /// Nearest wall-class triangle within `r` of `center`: `(dist_sq, normal)`
-    /// for the slide re-projection (the 60 degree floor/wall rule lives in the
+    /// for the slide re-projection (the 45 degree floor/wall rule lives in the
     /// source — MZB's authored normals, door winding normals).
     fn nearest_wall(&self, center: Vec3, r: f32) -> Option<(f32, Vec3)>;
 }

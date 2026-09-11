@@ -168,6 +168,7 @@ pub(super) fn apply_slash_outcome(
                 door: None,
                 slot: kuluu_render::dat_mzb::ZONE_SLOT_MAIN,
                 sub_area_link: 0,
+                voyage_backdrop: false,
             });
             let label = match entity_id {
                 Some(id) => format!("/load_mmb_on {id} {file_id} {chunk_idx}: spawning…"),
@@ -393,20 +394,18 @@ pub(super) fn apply_slash_outcome(
         }
         SlashOutcome::SetLights(op) => {
             use crate::view_native::slash_commands::LightsOp;
-            use kuluu_render::graphics_settings::DynamicLights;
+            use kuluu_render::graphics_settings::{DynamicLights, SHADOWED_LIGHTS_SLOTS};
 
             let g = &mut *slash_writers.graphics;
             let chat = match op {
                 LightsOp::Status => format!(
-                    "/lights: {} · threshold {:.2} · intensity {:.0} · range {:.1} · flicker {}",
+                    "/lights: {} · shadowed {} · flicker {}",
                     g.dynamic_lights.label(),
-                    g.light_threshold,
-                    g.light_intensity,
-                    g.light_range,
+                    g.shadowed_lights,
                     if g.light_flicker { "on" } else { "off" },
                 ),
                 LightsOp::Enable(v) => {
-                    let on = v.unwrap_or(!g.dynamic_lights.emitters_enabled());
+                    let on = v.unwrap_or(!g.dynamic_lights.point_shadows_enabled());
                     g.dynamic_lights = if on {
                         DynamicLights::Enhanced
                     } else {
@@ -414,17 +413,10 @@ pub(super) fn apply_slash_outcome(
                     };
                     format!("/lights: {}", g.dynamic_lights.label())
                 }
-                LightsOp::Threshold(v) => {
-                    g.light_threshold = v;
-                    format!("/lights threshold: {v:.2} (re-enter zone to re-detect)")
-                }
-                LightsOp::Intensity(v) => {
-                    g.light_intensity = v;
-                    format!("/lights intensity: {v:.0}")
-                }
-                LightsOp::Range(v) => {
-                    g.light_range = v;
-                    format!("/lights range: {v:.1}")
+                LightsOp::Shadowed(v) => {
+                    let v = v.min(*SHADOWED_LIGHTS_SLOTS.last().unwrap_or(&0));
+                    g.shadowed_lights = v;
+                    format!("/lights shadowed: {v}")
                 }
                 LightsOp::Flicker(v) => {
                     let f = v.unwrap_or(!g.light_flicker);
@@ -833,6 +825,7 @@ pub(super) fn apply_slash_outcome(
                 kuluu_render::MenuKind::Equipment => "Equipment".into(),
                 kuluu_render::MenuKind::Root => "Root".into(),
                 kuluu_render::MenuKind::Config => "Config".into(),
+                kuluu_render::MenuKind::Controls => "Controls".into(),
                 kuluu_render::MenuKind::Debug => "Debug".into(),
                 kuluu_render::MenuKind::Graphics => "Graphics".into(),
                 kuluu_render::MenuKind::GraphicsDlss => "DLSS Config".into(),

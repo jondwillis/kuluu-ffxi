@@ -1056,22 +1056,24 @@ mod tests {
     /// same height is a single step (plan §4). The slope/step boundary is set
     /// by the FLOOR_COS angle cutoff: a jump pair counts as a riser only when
     /// its subdivided samples rise faster than that cutoff, so any continuous
-    /// ramp below ~60 degrees reads 0 risers regardless of LIP_MAX.
+    /// ramp below retail's 45 degrees reads 0 risers regardless of LIP_MAX.
     #[test]
-    fn slanted_riser_50_is_slope_65_is_step() {
+    fn slanted_riser_40_is_slope_65_is_step() {
         // Continuous floors below the normal cutoff do not count as risers.
-        let h50 = |xz: Vec2, _c: f32| -> Option<f32> {
+        let h40 = |xz: Vec2, _c: f32| -> Option<f32> {
             Some(if xz.x < 0.45 {
                 0.0
             } else {
-                ((xz.x - 0.45) * 50_f32.to_radians().tan()).min(0.3)
+                ((xz.x - 0.45) * 40_f32.to_radians().tan()).min(0.3)
             })
         };
-        let s = sampler(h50);
+        let s = sampler(h40);
         let f = sample_field(&s, Vec2::ZERO, 0.0, Vec2::X);
-        assert_eq!(f.riser_count, 0, "50 degree face must be a slope: {f:?}");
+        assert_eq!(f.riser_count, 0, "40 degree face must be a slope: {f:?}");
 
-        // The same rise above the floor-angle cutoff counts as a step.
+        // The same rise above the floor-angle cutoff counts as a step (65
+        // degrees keeps the whole rise inside one sample pair, so it is one
+        // riser rather than two).
         let h65 = |xz: Vec2, _c: f32| -> Option<f32> {
             Some(if xz.x < 0.45 {
                 0.0

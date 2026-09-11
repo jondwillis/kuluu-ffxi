@@ -640,3 +640,8 @@ mod tests {
         );
     }
 }
+
+// vendor/server/src/map/packets/c2s/0x05c_eventendxzy.h GP_CLI_COMMAND_EVENTENDXZY.
+pub mod event_position_wire {
+    include!(concat!(env!("OUT_DIR"), "/event_position_wire.rs"));
+}

@@ -81,6 +81,8 @@ pub(crate) enum LauncherState {
 
     Graphics,
 
+    Config,
+
     ChangePassword,
 
     ChangePasswordInFlight,
@@ -720,6 +722,17 @@ pub(crate) fn register(
                 graphics::update_scrollbar_visibility,
             )
                 .run_if(in_state(LauncherState::Graphics)),
+        );
+
+    app.add_systems(OnEnter(LauncherState::Config), graphics::spawn_config_ui)
+        .add_systems(OnExit(LauncherState::Config), graphics::despawn_ui)
+        .add_systems(
+            Update,
+            (
+                graphics::keyboard_input_system,
+                graphics::redraw_graphics_system,
+            )
+                .run_if(in_state(LauncherState::Config)),
         );
 
     app.add_systems(

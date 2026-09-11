@@ -146,6 +146,10 @@ impl SubAreaLatch {
         self.active
     }
 
+    pub fn shells(&self) -> &[SubAreaShell] {
+        &self.shells
+    }
+
     pub fn triggers(&self) -> &[ZoneInteraction] {
         &self.triggers
     }

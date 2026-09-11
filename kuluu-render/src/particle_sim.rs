@@ -1,3 +1,5 @@
+use std::sync::OnceLock;
+
 use bevy::asset::RenderAssetUsages;
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
@@ -67,7 +69,7 @@ impl ParticleSimulator {
         }
     }
 
-    // research/xim ParticleGeneratorAttachment / cexi-viewer particle/runtime.js:517-524 —
+    // research/xim ParticleGeneratorAttachment / cexi-viewer particle/runtime.js updateAssociatedPosition —
     // a Sun/Moon-attached generator's associated position is the celestial body's position
     // offset by the camera, refreshed every frame so the sky rides with the viewer.
     pub fn set_celestial_origins(&mut self, sun: Vec3, moon: Vec3) {
@@ -268,6 +270,10 @@ struct LiveGenerator {
     stopped: bool,
     // `origin` is rewritten from the camera each frame rather than fixed at spawn.
     camera_relative: bool,
+    // research/XIClient/src/XIClient/source/World/Generator/CYyGenerator.cpp CYyGenerator::Idle case 0x0A —
+    // outside the generator's authored camera-distance band the frame's emission is skipped.
+    // Decided by sync_particle_meshes (the system that sees the camera), read by the next tick.
+    emit_culled: bool,
     // research/XIClient/src/XIClient/source/World/Generator/CYyGenerator.cpp CYyGenerator::Idle —
     // `GetSomeGeneratorScalar() * 0.3` scales the per-emission count whenever field_DE bit 0 is
     // set, which Open() arms for every generator under the `taew` (weat) container (:418-434).
@@ -565,6 +571,7 @@ pub fn spawn_particle_generators(
             }),
             stopped: false,
             camera_relative: false,
+            emit_culled: false,
             emit_scale: UNSCALED_EMISSION,
             emit_rng: emit_seed(entity),
             built_key: MeshKey::Empty,
@@ -657,6 +664,7 @@ pub fn spawn_actor_auto_run_particles(
                 origin_routine: None,
                 stopped: false,
                 camera_relative: false,
+                emit_culled: false,
                 emit_scale: UNSCALED_EMISSION,
                 emit_rng: emit_seed(entity),
                 built_key: MeshKey::Empty,
@@ -732,6 +740,9 @@ pub fn spawn_zone_particle_generator(
         origin_routine: None,
         stopped: false,
         camera_relative: opts.camera_relative,
+        // Starts culled so a zone-in does not burst every out-of-band emitter once; the first
+        // sync settles the in-band ones a frame later.
+        emit_culled: def.emit_cull.is_some(),
         emit_scale: opts.emit_scale,
         emit_rng: emit_seed(entity),
         built_key: MeshKey::Empty,
@@ -797,7 +808,9 @@ fn advance_generator(g: &mut LiveGenerator, frames: f32) {
 
     // research/xim: a maxLifeSpan of 0 marks a singleton — emit one particle once.
     let singleton = g.def.is_singleton();
-    let emitting = !g.stopped && (g.auto_run || g.age_frames <= g.emit_window_frames.max(1.0));
+    let emitting = !g.stopped
+        && !g.emit_culled
+        && (g.auto_run || g.age_frames <= g.emit_window_frames.max(1.0));
     if singleton {
         // `age_frames <= frames` already pins this to the first tick, so the emit window must not
         // gate it: a long frame (the blocking action-DAT read precedes these) makes age_frames
@@ -860,7 +873,7 @@ fn advance_generator(g: &mut LiveGenerator, frames: f32) {
     // particle past its life within this same tick, after the pre-emit sweep
     // already ran — replace it now so the mesh is never empty at render and the
     // body does not blink out for a frame.
-    if g.def.continuous && g.particles.is_empty() && continuous_active(g) {
+    if g.def.continuous && g.particles.is_empty() && !g.emit_culled && continuous_active(g) {
         emit(g, g.def.max_life_frames);
     }
 }
@@ -904,17 +917,48 @@ fn emit(g: &mut LiveGenerator, life_frames: f32) {
     });
 }
 
+fn env_flag(cell: &'static OnceLock<bool>, name: &str) -> bool {
+    *cell.get_or_init(|| std::env::var_os(name).is_some())
+}
+
+fn trace_celestial() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    env_flag(&ON, "FFXI_TRACE_CELESTIAL")
+}
+
+/// `FFXI_TRACE_PARTICLE_REBUILDS`: once a second, which generators rebuilt
+/// their mesh and how many vertices each pushed — the per-frame `Assets<Mesh>`
+/// churn the perf log counts as `mesh+N`.
+fn trace_particle_rebuilds() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    env_flag(&ON, "FFXI_TRACE_PARTICLE_REBUILDS")
+}
+
+#[derive(Default)]
+pub struct RebuildTrace {
+    since_secs: f32,
+    per_generator: std::collections::HashMap<String, (u32, usize)>,
+}
+
 pub fn sync_particle_meshes(
     cam: Query<&GlobalTransform, With<OperatorCamera>>,
     q_mesh_xf: Query<&GlobalTransform, With<Mesh3d>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut sim: ResMut<ParticleSimulator>,
     mut commands: Commands,
+    time: Res<Time>,
+    draw: Option<Res<crate::dat_mzb::DrawDistance>>,
+    mut trace: Local<RebuildTrace>,
 ) {
     let cam_xf = cam.iter().next().copied().unwrap_or_default();
     let (cam_rot, cam_pos) = (cam_xf.rotation(), cam_xf.translation());
+    // XiZone::GetDrawDistance, the band a 0x0A block with no authored maximum falls back to.
+    let zone_draw = draw
+        .map(|d| d.world)
+        .unwrap_or(crate::dat_mzb::DEFAULT_WORLD_DRAW_DISTANCE);
     let clock = sim.clock;
-    let trace_celestial = std::env::var_os("FFXI_TRACE_CELESTIAL").is_some();
+    let trace_celestial = trace_celestial();
+    let trace_rebuilds = trace_particle_rebuilds();
 
     // (index, despawn-needed); indices ascending so the reverse sweep below can
     // swap_remove safely.
@@ -926,6 +970,15 @@ pub fn sync_particle_meshes(
             reap.push((i, false));
             continue;
         };
+        // A camera-pinned generator sits at the eye by construction, inside every band.
+        if let Some(cull) = g.def.emit_cull.filter(|_| !g.camera_relative) {
+            let emitter = if g.actor_local {
+                entity_xf.transform_point(g.origin)
+            } else {
+                g.origin
+            };
+            g.emit_culled = cull.out_of_range(cam_pos.distance(emitter), zone_draw);
+        }
         // In the actor-local frame a billboard must cancel the parent's
         // FFXI->Bevy basis: parent_rot * rot == cam_rot. Fixed-orientation
         // meshes use their DAT rotation directly in the local frame.
@@ -965,6 +1018,14 @@ pub fn sync_particle_meshes(
             if let Some(mut mesh) = meshes.get_mut(&g.mesh) {
                 rebuild_mesh(g, view, &clock, &mut mesh);
                 g.built_key = key;
+                if trace_rebuilds {
+                    let row = trace
+                        .per_generator
+                        .entry(String::from_utf8_lossy(&g.def.mesh_id).into_owned())
+                        .or_default();
+                    row.0 += 1;
+                    row.1 = g.particles.len() * g.template.positions.len();
+                }
             }
         }
         let window_over =
@@ -980,6 +1041,22 @@ pub fn sync_particle_meshes(
         if despawn {
             commands.entity(g.entity).try_despawn();
         }
+    }
+
+    if trace_rebuilds && time.elapsed_secs() - trace.since_secs >= 1.0 {
+        let mut rows: Vec<(String, (u32, usize))> = trace.per_generator.drain().collect();
+        rows.sort_by_key(|(_, (rebuilds, _))| std::cmp::Reverse(*rebuilds));
+        let summary: Vec<String> = rows
+            .iter()
+            .map(|(name, (rebuilds, verts))| format!("{name}x{rebuilds}({verts}v)"))
+            .collect();
+        info!(
+            target: "perf",
+            generators = sim.generators.len(),
+            "particle mesh rebuilds/s: {}",
+            summary.join(" ")
+        );
+        trace.since_secs = time.elapsed_secs();
     }
 }
 
@@ -1276,12 +1353,22 @@ fn rebuild_mesh(g: &LiveGenerator, cam: CameraView, clock: &CelestialClock, mesh
         // Fixed-orientation zone sheets carry raw FFXI-frame geometry; apply the
         // generator's FFXI->Bevy basis (the same flip on origin/velocity, matching
         // dat_mzb.rs to_bevy) so a falling water sheet hangs down into the basin
-        // instead of standing up above the emitter (kuluu-czc6). Screen billboards
-        // orient in Bevy already; actor-local generators integrate in the actor frame.
+        // instead of standing up above the emitter (kuluu-czc6). Actor-local generators
+        // integrate in the actor frame.
         let world_basis = (g.orientation.is_some() || axial) && !g.actor_local;
+        // A screen billboard's template is DAT-frame geometry too (Y down: the campfire flame
+        // `hi12` rises toward negative y). An actor-local generator inherits the FFXI->Bevy basis
+        // from its parent transform; a world-space one folds it into the template before the
+        // view rotation, or the flame hangs below its wick.
+        let screen_basis = g.orientation.is_none() && !axial && !g.actor_local;
         let base = positions.len() as u32;
         for ((tp, uv), vertex) in tpl.positions.iter().zip(&tpl.uvs).zip(&tpl.colors) {
             let local = Vec3::new(tp.x * draw.scale.x, tp.y * draw.scale.y, tp.z * sz);
+            let local = if screen_basis {
+                local * g.vel_basis
+            } else {
+                local
+            };
             let oriented = rot * local;
             let oriented = if world_basis {
                 oriented * g.vel_basis
@@ -1560,6 +1647,7 @@ mod tests {
             moon_phase_color: None,
             uv_scroll: [0.0, 0.0],
             accel: None,
+            emit_cull: None,
         }
     }
 
@@ -1594,6 +1682,7 @@ mod tests {
             origin_routine: None,
             stopped: false,
             camera_relative: false,
+            emit_culled: false,
             emit_scale: UNSCALED_EMISSION,
             emit_rng: emit_seed(Entity::PLACEHOLDER),
             built_key: MeshKey::Empty,
@@ -1603,6 +1692,109 @@ mod tests {
     // Drive the emission math directly (no Bevy world), one tick's worth of frames per call.
     fn advance(g: &mut LiveGenerator, frames: f32) {
         advance_generator(g, frames);
+    }
+
+    // The campfire flame `hi12` rises toward negative DAT y; a world-space screen billboard has
+    // to fold the FFXI->Bevy basis into that template itself, while an actor-local one leaves
+    // it to the parent transform.
+    #[test]
+    fn world_space_screen_billboard_folds_the_dat_basis_into_its_template() {
+        fn built_vertex(actor_local: bool) -> [f32; 3] {
+            let d = ParticleGeneratorDef {
+                auto_run: true,
+                max_life_frames: 60.0,
+                frames_per_emission: 1.0,
+                particles_per_emission: 1,
+                init_scale: [1.0; 3],
+                init_color: [1.0; 4],
+                ..Default::default()
+            };
+            let mut g = live(d, 0.0);
+            g.template.positions = vec![Vec3::new(0.5, -1.0, -2.0); 3];
+            g.orientation = None;
+            g.solid_mesh = false;
+            g.actor_local = actor_local;
+            g.vel_basis = if actor_local {
+                Vec3::ONE
+            } else {
+                Vec3::new(1.0, -1.0, -1.0)
+            };
+            emit(&mut g, 60.0);
+            let mut mesh = empty_mesh();
+            let view = CameraView {
+                rot: Quat::IDENTITY,
+                pos: Vec3::ZERO,
+            };
+            rebuild_mesh(&g, view, &ParticleSimulator::default().clock, &mut mesh);
+            mesh.attribute(Mesh::ATTRIBUTE_POSITION)
+                .and_then(|a| a.as_float3())
+                .expect("positions")[0]
+        }
+        assert_eq!(built_vertex(false), [0.5, 1.0, 2.0], "zone flame rises");
+        assert_eq!(
+            built_vertex(true),
+            [0.5, -1.0, -2.0],
+            "actor-local template stays in the actor's DAT frame"
+        );
+    }
+
+    #[test]
+    fn emit_culled_generator_ages_without_emitting() {
+        let mut g = live(def(600.0, 1.0, 1), 0.0);
+        g.auto_run = true;
+        g.emit_culled = true;
+        advance(&mut g, 30.0);
+        assert!(g.particles.is_empty(), "culled: nothing emitted");
+        assert_eq!(g.age_frames, 30.0, "but the clock still runs");
+        g.emit_culled = false;
+        advance(&mut g, 30.0);
+        assert_eq!(g.particles.len(), 30, "back in band: emits again");
+    }
+
+    #[test]
+    fn sync_culls_emitters_outside_their_authored_camera_band() {
+        use bevy::ecs::system::RunSystemOnce;
+
+        let mut world = World::new();
+        world.insert_resource(Time::<()>::default());
+        world.insert_resource(Assets::<Mesh>::default());
+        let cam = world
+            .spawn((
+                OperatorCamera,
+                GlobalTransform::from_translation(Vec3::ZERO),
+            ))
+            .id();
+        let mesh_entity = world
+            .spawn((Mesh3d(Handle::default()), GlobalTransform::IDENTITY))
+            .id();
+
+        let mut d = def(600.0, 1.0, 1);
+        d.emit_cull = Some(ffxi_dat::particle_gen::EmitCull {
+            max_distance: 40.0,
+            min_distance: 0.0,
+            unlink_out_of_range: false,
+        });
+        let mut g = live(d, 0.0);
+        g.auto_run = true;
+        g.entity = mesh_entity;
+        g.origin = Vec3::new(50.0, 0.0, 0.0);
+        let mut sim = ParticleSimulator::default();
+        sim.generators.push(g);
+        world.insert_resource(sim);
+
+        world.run_system_once(sync_particle_meshes).unwrap();
+        assert!(
+            world.resource::<ParticleSimulator>().generators[0].emit_culled,
+            "50 units out on a 40-unit band"
+        );
+
+        *world.get_mut::<GlobalTransform>(cam).unwrap() =
+            GlobalTransform::from_translation(Vec3::new(20.0, 0.0, 0.0));
+        world.run_system_once(sync_particle_meshes).unwrap();
+        assert!(
+            !world.resource::<ParticleSimulator>().generators[0].emit_culled,
+            "30 units: back in band"
+        );
     }
 
     // One colour on every template vertex, so a stage-chain expectation is a single number
@@ -2201,8 +2393,11 @@ mod tests {
         );
     }
 
+    // kuluu-czc6 assumed screen billboards needed no flip; the Selbina lantern showed
+    // otherwise (kuluu-3v98): the campfire ribbon hi12 rises toward DAT -y and hung below its
+    // wick, so a world-space screen billboard folds the same basis into its template.
     #[test]
-    fn camera_billboard_sheet_not_flipped() {
+    fn camera_billboard_sheet_flipped_into_the_bevy_frame() {
         let g = sheet_gen(None);
         let mut mesh = empty_mesh();
         rebuild_mesh(
@@ -2211,10 +2406,9 @@ mod tests {
             &CelestialClock::default(),
             &mut mesh,
         );
-        // Billboard: no basis flip, so the same +Y geometry rises above the emitter.
         assert!(
-            max_sheet_y(&mesh) > 10.0 + 1.0,
-            "camera billboards must keep their unflipped local frame"
+            max_sheet_y(&mesh) <= 10.0 + 1.0e-4,
+            "a screen billboard's DAT +Y (down) must not rise above the emitter"
         );
     }
 
@@ -3784,6 +3978,7 @@ mod tests {
                 random_group: None,
                 local_dir: HIT_SPARK_DIR,
                 model_transform: None,
+                follow_points: None,
                 screen_color: None,
                 actor_fade: None,
                 idle_transition_time: None,

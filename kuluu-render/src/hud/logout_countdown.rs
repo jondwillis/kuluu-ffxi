@@ -32,7 +32,7 @@ fn blocker_diagnostic(snap: &SceneSnapshot) -> String {
             snap.status_icons
         );
     }
-    "No dialog or status icons visible to the client — likely Crafting \
+    "No dialog or status icons visible to the client - likely Crafting \
      (synthesis in progress) or a PreventAction debuff."
         .into()
 }
@@ -90,12 +90,52 @@ pub struct LogoutCountdownAnchor {
     pub server_seconds: Option<u16>,
     pub shutdown: bool,
     pub anchor_secs: f64,
+    /// The snapshot value last folded in. The snapshot holds a tick until the
+    /// next 0x053 replaces or clears it, so only a changed value is a new
+    /// server observation; folding the held value again would re-anchor every
+    /// RESYNC_TOLERANCE_SECS as the implied remaining drifts past it.
+    pub consumed: Option<LogoutCountdown>,
+}
 
-    /// The last tick value captured at a local stand-up. Stand-up cancels
-    /// leavegame server-side WITHOUT any cancel packet, so that stale tick
-    /// keeps sitting in the snapshot — suppress exactly that value until a NEW
-    /// tick proves the countdown survived (or it is cleared on re-anchor).
-    pub suppress_stale: Option<LogoutCountdown>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TickFold {
+    /// No new server observation this frame.
+    Unchanged,
+    /// A new tick within RESYNC_TOLERANCE_SECS of the running anchor: same
+    /// countdown seen from a slightly different clock, so the anchor stays and
+    /// only the kind flag refreshes (/shutdown during a /logout re-powers the
+    /// existing effect without restarting it: 0x0e7_reqlogout.cpp SetPower).
+    Held,
+    /// A fresh countdown: para=30 only ever comes from leavegame.lua
+    /// onEffectGain, so anything outside the tolerance re-anchors.
+    Anchored,
+}
+
+pub fn fold_tick(
+    anchor: &mut LogoutCountdownAnchor,
+    tick: Option<LogoutCountdown>,
+    now: f64,
+) -> TickFold {
+    let Some(c) = tick else {
+        anchor.server_seconds = None;
+        anchor.consumed = None;
+        return TickFold::Unchanged;
+    };
+    if anchor.consumed == Some(c) {
+        return TickFold::Unchanged;
+    }
+    anchor.consumed = Some(c);
+    if let Some(prev) = anchor.server_seconds {
+        let implied = prev as f64 - (now - anchor.anchor_secs);
+        if (implied - c.seconds_remaining as f64).abs() <= RESYNC_TOLERANCE_SECS {
+            anchor.shutdown = c.shutdown;
+            return TickFold::Held;
+        }
+    }
+    anchor.server_seconds = Some(c.seconds_remaining);
+    anchor.shutdown = c.shutdown;
+    anchor.anchor_secs = now;
+    TickFold::Anchored
 }
 
 #[derive(Component)]
@@ -213,23 +253,18 @@ pub fn update_logout_countdown(
         pending.state = LogoutRequestState::None;
     }
 
-    // Stand-up is LOCAL knowledge (Sit key, heal toggle, movement exit, /sit):
-    // the server cancels leavegame on stand-up WITHOUT sending any cancel
-    // packet, so we just stop drawing — send-and-assume. If the countdown was
-    // actually still live, the next 0x053 tick carries a NEW value and
-    // re-anchors within a second; if it was cancelled, nothing does. Checked
-    // BEFORE request handling so a /shutdown on the same frame as stand-up
-    // still arms fresh.
+    // Stand-up is LOCAL knowledge (Sit key, heal toggle, movement exit, /sit).
+    // The server drops leavegame on stand-up with no cancel packet; the
+    // session reports the heal->walk transition as LogoutCountdownCancelled
+    // once CHAR_PC confirms it, and until then the held snapshot value is
+    // already marked consumed, so it cannot re-anchor. Checked BEFORE request
+    // handling so a /shutdown on the same frame as stand-up still arms fresh.
     let stood_up = rest.kind == RestKind::None && *prev_rest != RestKind::None;
     *prev_rest = rest.kind;
     if stood_up {
         pending.state = LogoutRequestState::None;
         anchor.server_seconds = None;
-        // The pre-stand-up tick is still sitting in the snapshot (no cancel
-        // packet exists to clear it); suppress exactly that value so it cannot
-        // re-anchor. A new /shutdown or a surviving countdown ticks a different
-        // value and anchors as usual.
-        anchor.suppress_stale = scene_state.snapshot.logout_countdown;
+        anchor.consumed = scene_state.snapshot.logout_countdown;
     }
 
     let mut latest_request: Option<LogoutRequested> = None;
@@ -248,50 +283,10 @@ pub fn update_logout_countdown(
         };
     }
 
-    // The stand-up-suppressed stale tick must not re-anchor; any other value is
-    // a live tick. A live tick within RESYNC_TOLERANCE_SECS of what the current
-    // anchor already implies is the same countdown seen from a slightly
-    // different clock: keep the running anchor so the display does not jump,
-    // but refresh the kind flag - /shutdown during a /logout (or vice versa)
-    // just re-powers the existing effect and keeps ticking (0x0e7_reqlogout.cpp
-    // SetPower branch). Anything further away is a fresh countdown: re-anchor.
-    let live = match scene_state.snapshot.logout_countdown {
-        Some(c) if anchor.suppress_stale == Some(c) => None,
-        other => other,
-    };
-    match live {
-        Some(c) => match anchor.server_seconds {
-            None => {
-                anchor.server_seconds = Some(c.seconds_remaining);
-                anchor.shutdown = c.shutdown;
-                anchor.anchor_secs = now;
-                anchor.suppress_stale = None;
-
-                if matches!(pending.state, LogoutRequestState::AwaitingTick { .. }) {
-                    pending.state = LogoutRequestState::None;
-                }
-            }
-            Some(prev) => {
-                let implied = prev as f64 - (now - anchor.anchor_secs);
-                if (implied - c.seconds_remaining as f64).abs() <= RESYNC_TOLERANCE_SECS {
-                    // Same countdown, different clock: no re-anchor. The kind
-                    // may have switched mid-countdown; refresh the label flag.
-                    anchor.shutdown = c.shutdown;
-                } else {
-                    anchor.server_seconds = Some(c.seconds_remaining);
-                    anchor.shutdown = c.shutdown;
-                    anchor.anchor_secs = now;
-                    anchor.suppress_stale = None;
-
-                    if matches!(pending.state, LogoutRequestState::AwaitingTick { .. }) {
-                        pending.state = LogoutRequestState::None;
-                    }
-                }
-            }
-        },
-        None => {
-            anchor.server_seconds = None;
-        }
+    if fold_tick(&mut anchor, scene_state.snapshot.logout_countdown, now) == TickFold::Anchored
+        && matches!(pending.state, LogoutRequestState::AwaitingTick { .. })
+    {
+        pending.state = LogoutRequestState::None;
     }
 
     if let LogoutRequestState::AwaitingTick {
@@ -377,25 +372,12 @@ mod tests {
         }
     }
 
-    /// The anchoring decision for one live tick against the current anchor.
-    /// Mirrors update_logout_countdown's match arm so the +-2s rule is testable
-    /// without a Bevy world. Returns (new_anchor_secs, new_shutdown).
-    fn apply_tick(
-        now: f64,
-        c: LogoutCountdown,
-        anchor_secs: Option<(u16, bool, f64)>,
-    ) -> (Option<u16>, bool, f64) {
-        match anchor_secs {
-            None => (Some(c.seconds_remaining), c.shutdown, now),
-            Some((prev, _shutdown, anchored_at)) => {
-                let implied = prev as f64 - (now - anchored_at);
-                if (implied - c.seconds_remaining as f64).abs() <= RESYNC_TOLERANCE_SECS {
-                    // Same countdown, different clock: keep the running anchor.
-                    (Some(prev), c.shutdown, anchored_at)
-                } else {
-                    (Some(c.seconds_remaining), c.shutdown, now)
-                }
-            }
+    fn anchored(secs: u16, shutdown: bool, at: f64) -> LogoutCountdownAnchor {
+        LogoutCountdownAnchor {
+            server_seconds: Some(secs),
+            shutdown,
+            anchor_secs: at,
+            consumed: Some(tick(secs, shutdown)),
         }
     }
 
@@ -486,16 +468,19 @@ mod tests {
     fn tick_within_tolerance_keeps_the_running_anchor() {
         // Anchor 30 @ t=0. The next server tick carries 25 but arrives late at
         // t=6: implied = 24, |24 - 25| = 1 <= 2 -> keep the anchor.
-        let (secs, _shutdown, anchored_at) =
-            apply_tick(6.0, tick(25, false), Some((30, false, 0.0)));
-        assert_eq!(secs, Some(30));
-        assert_eq!(anchored_at, 0.0);
+        let mut a = anchored(30, false, 0.0);
+        assert_eq!(
+            fold_tick(&mut a, Some(tick(25, false)), 6.0),
+            TickFold::Held
+        );
+        assert_eq!((a.server_seconds, a.anchor_secs), (Some(30), 0.0));
 
         // And the one after: carries 20 at t=11 (implied = 19, diff 1) -> keep.
-        let (secs, _shutdown, anchored_at) =
-            apply_tick(11.0, tick(20, false), Some((30, false, 0.0)));
-        assert_eq!(secs, Some(30));
-        assert_eq!(anchored_at, 0.0);
+        assert_eq!(
+            fold_tick(&mut a, Some(tick(20, false)), 11.0),
+            TickFold::Held
+        );
+        assert_eq!((a.server_seconds, a.anchor_secs), (Some(30), 0.0));
 
         // Display consequence: at t=6 the counter reads off the original anchor
         // (24) instead of jumping back up to 25 on the late tick.
@@ -509,33 +494,82 @@ mod tests {
         );
     }
 
+    /// The snapshot holds a tick until the next 0x053 replaces it. Folding that
+    /// held value frame after frame must never re-anchor, or the display would
+    /// read 30, 29, 28, 30, 29, 28 as the implied remaining drifts past the
+    /// tolerance.
+    #[test]
+    fn held_snapshot_value_never_reanchors() {
+        let mut a = LogoutCountdownAnchor::default();
+        assert_eq!(
+            fold_tick(&mut a, Some(tick(30, false)), 0.0),
+            TickFold::Anchored
+        );
+        for frame in 1..=300u32 {
+            let now = frame as f64 / 60.0;
+            assert_eq!(
+                fold_tick(&mut a, Some(tick(30, false)), now),
+                TickFold::Unchanged,
+                "frame {frame}"
+            );
+            assert_eq!((a.server_seconds, a.anchor_secs), (Some(30), 0.0));
+        }
+        assert_eq!(
+            compute_display(5.0, Some((30u16, false, 0.0)), LogoutRequestState::None),
+            DisplayMode::Counting {
+                seconds: 25,
+                shutdown: false
+            }
+        );
+    }
+
+    /// A cleared snapshot drops the anchor, and the same value arriving again
+    /// afterwards is a new observation.
+    #[test]
+    fn cleared_then_repeated_value_anchors_again() {
+        let mut a = anchored(30, false, 0.0);
+        assert_eq!(fold_tick(&mut a, None, 1.0), TickFold::Unchanged);
+        assert_eq!(a.server_seconds, None);
+        assert_eq!(
+            fold_tick(&mut a, Some(tick(30, false)), 2.0),
+            TickFold::Anchored
+        );
+        assert_eq!((a.server_seconds, a.anchor_secs), (Some(30), 2.0));
+    }
+
     /// A tick further than +-2s from the implied remaining is a fresh countdown
     /// (para=30 only ever comes from onEffectGain) and re-anchors.
     #[test]
     fn tick_beyond_tolerance_reanchors() {
         // Anchor 15 @ t=0; at t=2 a brand-new countdown's first tick arrives:
         // implied = 13, |13 - 30| = 17 > 2 -> re-anchor to 30 @ now.
-        let (secs, _shutdown, anchored_at) =
-            apply_tick(2.0, tick(30, false), Some((15, false, 0.0)));
-        assert_eq!(secs, Some(30));
-        assert_eq!(anchored_at, 2.0);
+        let mut a = anchored(15, false, 0.0);
+        assert_eq!(
+            fold_tick(&mut a, Some(tick(30, false)), 2.0),
+            TickFold::Anchored
+        );
+        assert_eq!((a.server_seconds, a.anchor_secs), (Some(30), 2.0));
     }
 
     /// The +-2s boundary itself: exactly 2 apart keeps the anchor (the rule is
     /// "within +-2 seconds").
     #[test]
     fn tick_exactly_at_tolerance_keeps_the_anchor() {
-        // Anchor 30 @ t=0; at t=4.5 implied = 25.5, incoming 23 -> diff 2.5 > 2:
-        // re-anchor. At t=4.0 implied = 26, incoming 24 -> diff exactly 2: keep.
-        let (secs, _shutdown, anchored_at) =
-            apply_tick(4.0, tick(24, false), Some((30, false, 0.0)));
-        assert_eq!(secs, Some(30));
-        assert_eq!(anchored_at, 0.0);
+        // Anchor 30 @ t=0; at t=4.0 implied = 26, incoming 24 -> diff exactly 2: keep.
+        let mut a = anchored(30, false, 0.0);
+        assert_eq!(
+            fold_tick(&mut a, Some(tick(24, false)), 4.0),
+            TickFold::Held
+        );
+        assert_eq!((a.server_seconds, a.anchor_secs), (Some(30), 0.0));
 
-        let (secs, _shutdown, anchored_at) =
-            apply_tick(4.5, tick(23, false), Some((30, false, 0.0)));
-        assert_eq!(secs, Some(23));
-        assert_eq!(anchored_at, 4.5);
+        // At t=4.5 implied = 25.5, incoming 23 -> diff 2.5 > 2: re-anchor.
+        let mut a = anchored(30, false, 0.0);
+        assert_eq!(
+            fold_tick(&mut a, Some(tick(23, false)), 4.5),
+            TickFold::Anchored
+        );
+        assert_eq!((a.server_seconds, a.anchor_secs), (Some(23), 4.5));
     }
 
     /// /shutdown during a /logout (or vice versa) re-powers the existing effect
@@ -545,10 +579,10 @@ mod tests {
     fn kind_switch_within_tolerance_refreshes_flag_without_reanchor() {
         // Anchor 30/logout @ t=0; at t=5 a shutdown-kind tick carries 25
         // (implied = 25, diff 0) -> same anchor, flag flips to shutdown.
-        let (_secs, shutdown, anchored_at) =
-            apply_tick(5.0, tick(25, true), Some((30, false, 0.0)));
-        assert!(shutdown);
-        assert_eq!(anchored_at, 0.0);
+        let mut a = anchored(30, false, 0.0);
+        assert_eq!(fold_tick(&mut a, Some(tick(25, true)), 5.0), TickFold::Held);
+        assert!(a.shutdown);
+        assert_eq!(a.anchor_secs, 0.0);
 
         // And the display carries the new label off the unchanged anchor.
         let mode = compute_display(5.0, Some((30u16, true, 0.0)), LogoutRequestState::None);
@@ -564,33 +598,14 @@ mod tests {
     /// The first tick after a request always anchors, whatever it carries.
     #[test]
     fn first_tick_always_anchors() {
-        let (secs, shutdown, anchored_at) = apply_tick(0.4, tick(30, true), None);
-        assert_eq!(secs, Some(30));
-        assert!(shutdown);
-        assert_eq!(anchored_at, 0.4);
-    }
-
-    /// Inside a Mog House the server disconnects immediately with no ticks at
-    /// all (leavegame.lua onEffectGain). The pending request is invalidated by
-    /// the Disconnected stage transition, so the ack timeout can never fire a
-    /// false "blocked" toast after we are already out.
-    #[test]
-    fn disconnected_stage_invalidates_pending_request() {
-        // This mirrors the system's stage guard: on Disconnected/Zoning the
-        // pending state is dropped before the ack-timeout check can run.
-        let mut state = LogoutRequestState::AwaitingTick {
-            requested_at: 0.0,
-            shutdown: false,
-        };
-        for stage in [Stage::Disconnected, Stage::Zoning] {
-            if matches!(stage, Stage::Disconnected | Stage::Zoning) {
-                state = LogoutRequestState::None;
-            }
-        }
-        assert_eq!(state, LogoutRequestState::None);
-
-        // And with nothing pending and no anchor, the banner stays hidden even
-        // long after a request was sent.
-        assert_eq!(compute_display(50.0, None, state), DisplayMode::Hidden);
+        let mut a = LogoutCountdownAnchor::default();
+        assert_eq!(
+            fold_tick(&mut a, Some(tick(30, true)), 0.4),
+            TickFold::Anchored
+        );
+        assert_eq!(
+            (a.server_seconds, a.shutdown, a.anchor_secs),
+            (Some(30), true, 0.4)
+        );
     }
 }

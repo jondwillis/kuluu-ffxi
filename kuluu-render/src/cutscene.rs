@@ -523,6 +523,7 @@ mod tests {
                     transition_in: 0,
                     transition_out: 0,
                     model_transform: None,
+                    follow_points: None,
                     screen_color: Some(ScreenColor { rgba }),
                     actor_fade: None,
                     idle_transition_time: None,

@@ -12,5 +12,10 @@ if ! COMMENTS_DIFF=staged scripts/checks.sh comments; then
   exit 1
 fi
 
+contract_paths=$(git diff --cached --name-only -- ffxi-event ffxi-proto ffxi-dat ffxi-vocab kuluu-session kuluu-render kuluu-snapshot kuluu scripts/checks.sh .githooks)
+if [[ -n "$contract_paths" ]]; then
+  scripts/checks.sh contracts
+fi
+
 command -v bd >/dev/null 2>&1 || exit 0
 exec bd hooks run pre-commit "$@"

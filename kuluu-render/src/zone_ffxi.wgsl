@@ -18,12 +18,14 @@
 
 #import bevy_pbr::{
     mesh_functions,
-    view_transformations::{position_world_to_clip, position_world_to_view},
+    view_transformations::position_world_to_clip,
     mesh_view_bindings as view_bindings,
     mesh_view_types,
     clustered_forward as clustering,
     shadows,
 }
+
+#import kuluu_render::directional_shadow::directional_shadow_factor
 
 // FFXI point-light falloff, applied to Bevy's clustered point lights (the
 // FaithfulZoneLight PointLights). Mirrors zone_point_lights.rs: peak factor
@@ -158,7 +160,13 @@ fn clustered_point_irradiance(n: vec3<f32>, p: vec3<f32>, frag_coord: vec2<f32>)
         let t = dist / range;
         let window = 1.0 - t * t;
         let nl = max(dot(n, to_light / max(dist, 1e-5)), 0.0);
-        rgb += nl * inv * window * window * color;
+        // Enhanced Dynamic Lights: the lit lights nearest the camera carry cube shadow maps
+        // (zone_point_lights.rs select_shadowed_zone_lights); the rest stay unshadowed.
+        var shadow = 1.0;
+        if ((lo.flags & mesh_view_types::POINT_LIGHT_FLAGS_SHADOWS_ENABLED_BIT) != 0u) {
+            shadow = shadows::fetch_point_shadow(light_id, vec4<f32>(p, 1.0), n, frag_coord);
+        }
+        rgb += shadow * nl * inv * window * window * color;
     }
     return rgb;
 }
@@ -166,33 +174,14 @@ fn clustered_point_irradiance(n: vec3<f32>, p: vec3<f32>, frag_coord: vec2<f32>)
 // Pure scene light (ambient sky fill + 2 directional + clustered point lights),
 // no vertex colour folded in — the caller multiplies by vertex colour, matching
 // skinned_ffxi.wgsl::scene_irradiance.
-fn scene_irradiance(n: vec3<f32>, p: vec3<f32>, sun_scale: f32, frag_coord: vec2<f32>) -> vec3<f32> {
+fn scene_irradiance(n: vec3<f32>, p: vec3<f32>, shadow_scale: vec2<f32>, frag_coord: vec2<f32>) -> vec3<f32> {
     var rgb = lighting.ambient.rgb;
     let nl0 = max(dot(n, -lighting.dir0_dir.xyz), 0.0);
-    rgb += sun_scale * nl0 * lighting.dir0_color.rgb * lighting.dir0_color.w;
+    rgb += shadow_scale.x * nl0 * lighting.dir0_color.rgb * lighting.dir0_color.w;
     let nl1 = max(dot(n, -lighting.dir1_dir.xyz), 0.0);
-    rgb += nl1 * lighting.dir1_color.rgb * lighting.dir1_color.w;
+    rgb += shadow_scale.y * nl1 * lighting.dir1_color.rgb * lighting.dir1_color.w;
     rgb += clustered_point_irradiance(n, p, frag_coord);
     return rgb;
-}
-
-// Directional cast-shadow factor for the sun term (dir0). Bevy owns the real
-// directional lights + cascade shadow maps at group(0); take the min shadow
-// factor over the shadow-enabled ones (1 = lit, 0 = occluded). Mirrors the
-// actor shader's sun_shadow_factor. No shadow-enabled light → returns 1.0.
-fn sun_shadow_factor(world_pos: vec3<f32>, world_normal: vec3<f32>, frag_coord_xy: vec2<f32>) -> f32 {
-    let view_z = position_world_to_view(world_pos).z;
-    let n = view_bindings::lights.n_directional_lights;
-    var factor = 1.0;
-    for (var i = 0u; i < n; i = i + 1u) {
-        let lflags = view_bindings::lights.directional_lights[i].flags;
-        if ((lflags & mesh_view_types::DIRECTIONAL_LIGHT_FLAGS_SHADOWS_ENABLED_BIT) == 0u) {
-            continue;
-        }
-        factor = min(factor, shadows::fetch_directional_shadow(
-            i, vec4<f32>(world_pos, 1.0), world_normal, view_z, frag_coord_xy));
-    }
-    return factor;
 }
 
 // Fade a lit fragment toward the fog colour by view distance. Scattering is
@@ -235,18 +224,15 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
         discard;
     }
     let n = normalize(in.world_normal);
-    // Retail runs no shadow map over zone geometry at all — ShadowRenderer is reached
-    // only per ModelInstance (research/XIClient World/Model/ModelInstance.h:139,
-    // Rendering/ModelRenderer.cpp:145) and paints an actor decal, while a building's
-    // own shading is already baked into these vertex colours. Taking Bevy's cascade
-    // over the full 0..1 range on top of that darkens the same shading twice, so keep
-    // the sun term from falling below the floor the actor shader uses.
-    let sun = mix(
-        FFXI_SHADOW_FLOOR,
-        1.0,
-        sun_shadow_factor(in.world_position, n, in.clip_position.xy),
+    let shadow_scale = mix(
+        vec2<f32>(FFXI_SHADOW_FLOOR),
+        vec2<f32>(1.0),
+        vec2<f32>(
+            directional_shadow_factor(in.world_position, n, -lighting.dir0_dir.xyz, in.clip_position.xy),
+            directional_shadow_factor(in.world_position, n, -lighting.dir1_dir.xyz, in.clip_position.xy),
+        ),
     );
-    let lit = scene_irradiance(n, in.world_position, sun, in.clip_position.xy) * in.color.rgb;
+    let lit = scene_irradiance(n, in.world_position, shadow_scale, in.clip_position.xy) * in.color.rgb;
     // research/xim ParticleGeneratorParser.kt:431-434: ToD color.rgb is a setter folded
     // over the lit texel; color multiplier (.w) scales the emitted alpha.
 #ifdef FFXI_GENERATOR_STAGE_CHAIN
