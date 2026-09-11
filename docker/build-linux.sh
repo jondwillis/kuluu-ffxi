@@ -85,6 +85,7 @@ docker run --rm -t --platform "$PLATFORM" \
     -v "$TARGET_VOL":/target \
     -e CARGO_TARGET_DIR=/target \
     -e CXXFLAGS= \
+    -e CXX=g++ \
     -e CARGO_NET_GIT_FETCH_WITH_CLI=true \
     -w /src \
     "$IMAGE" \

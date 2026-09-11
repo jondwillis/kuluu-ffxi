@@ -28,6 +28,9 @@ RUN rm -f /etc/apt/sources.list.d/debian.sources && printf '%s\n' \
 
 # Build-time system deps:
 #   clang / cmake / pkg-config / make  — recastnavigation-rs (cxx-build) + -sys crates
+#   g++                                — unrar_sys probes -stdlib=libc++ with clang and
+#                                        then fails on the missing libc++ headers; CI's
+#                                        runner has g++ too (.github/build-setup.yml)
 #   libasound2-dev                     — bevy_audio -> cpal -> alsa
 #   libudev-dev                        — bevy_gilrs -> gilrs (gamepad hotplug)
 #   libdbus-1-dev                      — keyring (Secret Service, remember-password)
@@ -39,7 +42,7 @@ RUN rm -f /etc/apt/sources.list.d/debian.sources && printf '%s\n' \
 #   file                               — ELF type sanity check
 RUN apt-get -o Acquire::AllowInsecureRepositories=true update \
     && apt-get install -y --no-install-recommends --allow-unauthenticated \
-        ca-certificates curl git pkg-config make cmake clang binutils file \
+        ca-certificates curl git pkg-config make cmake clang g++ binutils file \
         libasound2-dev libudev-dev libdbus-1-dev \
         libwayland-dev libxkbcommon-dev \
         libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
