@@ -560,8 +560,10 @@ impl Entity {
     /// A server-side door NPC. Doors classify to `EntityKind::Other` but are
     /// interactable: retail sends a Talk (0x01A, action 0x00) on the door's
     /// act_index and the door's onTrigger lua drives open/confirm/zone-change.
-    /// `look.size == 0x02` identifies a door; the only place LSB reads it is
-    /// the Monstrosity guard in `GP_CLI_COMMAND_ACTION::process`
+    /// `look.size == 0x02` identifies a door (LSB `MODEL_DOOR`, which picks the
+    /// 0x00E look encoding in vendor/server/src/map/packets/entity_update.cpp).
+    /// The only Talk gate LSB puts on it is the Monstrosity guard in
+    /// `GP_CLI_COMMAND_ACTION::process`
     /// (`GP_CLI_COMMAND_ACTION_ACTIONID::Talk`, vendor/server/src/map/packets/c2s/0x01a_action.cpp),
     /// which lets a MON use doors and nothing else. The general Talk path
     /// applies no size filter: any NPC within range that `IsSpawned()` with
@@ -573,13 +575,16 @@ impl Entity {
         matches!(self.look, Some(EntityLook::Door { .. }))
     }
 
-    /// The server-side precondition for a door Talk to do anything: LSB's
-    /// general trigger path (`GP_CLI_COMMAND_ACTION::process`,
+    /// The server-side precondition for a door Talk to fire its onTrigger:
+    /// LSB's general trigger path (`GP_CLI_COMMAND_ACTION::process`,
     /// vendor/server/src/map/packets/c2s/0x01a_action.cpp) requires
-    /// `status == STATUS_TYPE::NORMAL` (vendor/server/src/map/entities/baseentity.h)
-    /// and silently drops the Talk otherwise. Doors carry no other legitimate
-    /// status, so unlike the fail-open blacklist for PCs/mobs/NPCs this is an
-    /// exact match.
+    /// `status == STATUS_TYPE::NORMAL` (vendor/server/src/map/entities/baseentity.h).
+    /// Otherwise nothing triggers and the handler falls through to the
+    /// `GP_SERV_COMMAND_EVENTUCOFF` release it answers every unlocked Talk with.
+    /// Doors do ship with other statuses (DISAPPEAR, STATUS_4, CUTSCENE_ONLY in
+    /// vendor/server/sql/npc_list.sql), all already rejected by the blacklist;
+    /// the exact match here mirrors the server condition instead of relying on
+    /// that blacklist staying complete.
     pub fn is_door_triggerable(&self) -> bool {
         self.is_door() && self.status == status_type::NORMAL
     }
