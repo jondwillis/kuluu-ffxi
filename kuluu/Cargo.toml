@@ -139,9 +139,10 @@ tracing-chrome = { version = "0.7", optional = true }
 # launcher screen. v3 is the current stable line.
 #
 # keyring 3 ships every backend behind a feature — without one, `Entry`
-# constructs fine but every get/set returns `NoStorageAccess`, silently
-# breaking the Remember-password flow. We opt in to the native backend
-# for each platform we ship binaries on.
+# constructs fine but every get/set returns `NoStorageAccess`. We opt in to
+# the native backend for each platform we ship binaries on; when the backend
+# is present but no daemon answers (Steam Deck Game Mode), secret_store.rs
+# falls back to an owner-only file.
 keyring = { version = "3", features = [
     "apple-native",
     "windows-native",

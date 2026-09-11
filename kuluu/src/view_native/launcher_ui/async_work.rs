@@ -20,8 +20,22 @@ use crate::launcher_store::{self, keyring_account_key, SavedAccount, KEYRING_SER
 use crate::secret_store::SecretStore;
 
 fn save_on_success(server_name: &str, username: &str, password: &str, remember: bool) {
-    let mut store = launcher_store::load();
+    let key = keyring_account_key(server_name, username);
+    let remember_password = if remember {
+        SecretStore::set(KEYRING_SERVICE, &key, password)
+    } else {
+        SecretStore::delete(KEYRING_SERVICE, &key);
+        false
+    };
+    if remember && !remember_password {
+        tracing::warn!(
+            server_name,
+            username,
+            "password could not be saved; not remembering it"
+        );
+    }
 
+    let mut store = launcher_store::load();
     store
         .accounts
         .retain(|a| !(a.server_name == server_name && a.username == username));
@@ -30,18 +44,12 @@ fn save_on_success(server_name: &str, username: &str, password: &str, remember: 
         SavedAccount {
             server_name: server_name.to_string(),
             username: username.to_string(),
-            remember_password: remember,
+            remember_password,
         },
     );
     store.last_used = Some((server_name.to_string(), username.to_string()));
     if let Err(e) = launcher_store::save(&store) {
         tracing::warn!(error = %e, "launcher_store: save failed");
-    }
-    let key = keyring_account_key(server_name, username);
-    if remember {
-        SecretStore::set(KEYRING_SERVICE, &key, password);
-    } else {
-        SecretStore::delete(KEYRING_SERVICE, &key);
     }
 }
 
