@@ -579,17 +579,21 @@ pub fn apply_bgm_system(
         frames, sr, ch, file_loop_frame
     );
 
+    toasts.write(now_playing_toast(slot, track_id));
+    let _ = asset_server;
+}
+
+fn now_playing_toast(slot: u8, track_id: u16) -> crate::snapshot::ToastEvent {
     let (track_name, composer) = ffxi_audio::music_catalog::lookup(track_id)
         .map(|(_, n, c)| (n, c))
         .unwrap_or(("?", "?"));
-    toasts.write(crate::snapshot::ToastEvent::system(format!(
-        "♪ Now playing: \"{}\" by {} [track #{}, slot={}]",
+    crate::snapshot::ToastEvent::debug(format!(
+        "Now playing: \"{}\" by {} [track #{}, slot={}]",
         track_name,
         composer,
         track_id,
         slot_name(slot),
-    )));
-    let _ = asset_server;
+    ))
 }
 
 pub fn report_bgm_loops_system(
@@ -1269,6 +1273,23 @@ impl Plugin for AudioPlugin {
 mod tests {
     use super::*;
     use kuluu_snapshot::{SceneSnapshot, ViewerEvent};
+
+    #[test]
+    fn now_playing_toast_is_devhud_only_and_ascii() {
+        let track_id = ffxi_audio::music_catalog::MUSIC_CATALOG[0].0;
+        let (_, name, composer) = ffxi_audio::music_catalog::lookup(track_id).unwrap();
+        let toast = now_playing_toast(0, track_id);
+        assert_eq!(
+            toast.line.text,
+            format!("Now playing: \"{name}\" by {composer} [track #{track_id}, slot=ZoneDay]")
+        );
+        assert!(toast.line.text.is_ascii(), "{}", toast.line.text);
+        assert!(!crate::snapshot::chat_line_visible(
+            toast.line.channel,
+            false
+        ));
+        assert!(crate::snapshot::chat_line_visible(toast.line.channel, true));
+    }
 
     #[test]
     fn default_state_picks_zone_not_combat_when_both_filled() {
