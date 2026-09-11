@@ -17,6 +17,37 @@ is unclear — menu layout, HUD timing, animation, camera feel, spell effects �
 observe it in the real client, capture evidence, translate into the remake,
 then `/verify` the remake side against the same observation.
 
+## Recorded observations — read before driving the VM
+
+`references/` is the repository's durable record of how retail behaves. Check
+whether the question is already answered here before spending a login on it.
+
+- [Vanilla menu & target-interaction spec](references/vanilla-menu-spec.md) —
+  target-action menu, trade window, item detail, `/check`, Commands, Status,
+  Items + sort. The broadest single record.
+- [Auction House](references/auction-house.md) — category tree, screens, sell
+  flow, Sales Status, bid/browse, and how catalog paging is pull-based.
+- [Mog House menu](references/2026-07-17-moghouse-menu.md) — exact entry order
+  for the main menu, Storage, Delivery Box send/receive, Change Jobs.
+- [Compass radar](references/2026-09-09-compass-radar.md) — establishes the
+  standing compass as vanilla HUD; separates the terrain minimap question,
+  which it does *not* establish.
+- [Death / KO behavior](references/death-ko-behavior.md) — collapse motion,
+  corpse hold, homepoint timer wire facts, a lifecycle gotcha.
+- [Sub-target cursor](references/sub-target-cursor.md) — appearance, when it
+  opens, and how Esc unwinds one layer per press.
+- [Treasure pool chat lines](references/treasure-pool-chat.md) — wording and
+  colour selection, and which parts are still unpinned.
+- [Hatchling Shield](references/hatchling-shield.md) — Items menu flow, exact
+  tooltip text, use behavior, plus observation-method gotchas worth reading
+  before any item-use run.
+- [NPC animation routine selector](references/2026-09-08-npc-animation-selector.md)
+  — binary observation rather than a live drive; the computation and its
+  server cross-check.
+
+Record new durable findings here as dated observation records, per the routing
+rule in the root `AGENTS.md`. Captures and binary dumps stay local.
+
 Everything runs host-side through `.agents/skills/retail-observe/scripts/hxi.sh` (this machine has
 Parallels **Standard**: no `prlctl exec`/`prlctl capture`; the VM is reached
 via the macOS window server instead). Run `hxi.sh` (shorthand below for that path) with no args for the
@@ -276,8 +307,8 @@ Logout: main menu (`-` key) → Log Out → confirm dialog **defaults to No** �
 
 Observation loops are screenshot-heavy and burn main-agent context. Delegate them:
 
-- Use the Agent tool with `model: "haiku"` (haiku-4-5) for mechanical capture loops — press key / capture / read image / report what changed. Give it the exact `.agents/skills/retail-observe/scripts/hxi.sh` invocations and key codes it needs.
-- Use `model: "sonnet"` (sonnet-5) when the loop requires judgment (navigating unfamiliar menus, deciding next action from what's on screen, comparing against expected retail behavior).
+- Use a lower-cost available model for mechanical capture loops — press key / capture / read image / report what changed. Give it the exact `.agents/skills/retail-observe/scripts/hxi.sh` invocations and key codes it needs.
+- Use a capable available model when the loop requires judgment (navigating unfamiliar menus, deciding next action from what's on screen, comparing against expected retail behavior). If the harness offers no appropriate override, inherit the current model; do not request unavailable model names.
 - The main agent should only receive the subagent's *findings* (text + paths to the few decisive screenshots), never the full capture stream.
 - Subagent prompts must include: window/scale info (`capture` prints it), the "divide px coords by scale for click" rule, key codes (36=Enter, up/down arrows), and hard limits on what game actions are allowed (which items/menus may be touched).
 - In-game actions that consume items or charges must be explicitly listed in the subagent prompt as allowed; anything else is read-only observation.
