@@ -1,9 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["ffxi-proto", "kuluu", "kuluu-mcp", "kuluu-nav", "ffxi-nav-recast", "kuluu-snapshot", "kuluu-render", "kuluu-dlss-nr", "kuluu-ngx-fwd", "kuluu-viewer-wasm", "ffxi-dat", "ffxi-actor", "ffxi-audio", "ffxi-event", "kuluu-session", "ffxi-vocab", "lsb-scrape", "xtask"]
+members = ["ffxi-proto", "kuluu", "kuluu-mcp", "kuluu-nav", "ffxi-nav-recast", "kuluu-snapshot", "kuluu-render", "kuluu-dlss-nr", "kuluu-ngx-fwd", "kuluu-viewer-wasm", "ffxi-dat", "ffxi-actor", "ffxi-audio", "ffxi-event", "kuluu-session", "ffxi-vocab", "lsb-scrape", "ffxi-install", "xtask"]
 # `xtask` is project automation run on demand via `cargo xtask` — exclude it
 # from the default set so plain `cargo build`/`test` don't compile it.
-default-members = ["ffxi-proto", "kuluu", "kuluu-mcp", "kuluu-nav", "ffxi-nav-recast", "kuluu-snapshot", "kuluu-render", "kuluu-dlss-nr", "kuluu-ngx-fwd", "kuluu-viewer-wasm", "ffxi-dat", "ffxi-actor", "ffxi-audio", "ffxi-event", "kuluu-session", "ffxi-vocab", "lsb-scrape"]
+default-members = ["ffxi-proto", "kuluu", "kuluu-mcp", "kuluu-nav", "ffxi-nav-recast", "kuluu-snapshot", "kuluu-render", "kuluu-dlss-nr", "kuluu-ngx-fwd", "kuluu-viewer-wasm", "ffxi-dat", "ffxi-actor", "ffxi-audio", "ffxi-event", "kuluu-session", "ffxi-vocab", "lsb-scrape", "ffxi-install"]
 
 # Vendored fork of recastnavigation-rs 0.1.0 with a one-line `#include
 # <cstddef>` in Deterministic.h. Without it, `cargo test` fails with
@@ -12,6 +12,11 @@ default-members = ["ffxi-proto", "kuluu", "kuluu-mcp", "kuluu-nav", "ffxi-nav-re
 # Deterministic/Include/Deterministic.h for the patch comment.
 [patch.crates-io]
 recastnavigation-rs = { path = "vendor/recastnavigation-rs" }
+# Vendored cab 0.6.0 with `Cabinet::read_folder` and
+# `FileEntry::{uncompressed_offset, folder_index}` made public (grep "KULUU
+# PATCH"). Upstream only offers per-file readers that restart the folder's
+# decompressor, which is quadratic on SE's 5000-file LZX folders.
+cab = { path = "vendor/cab" }
 # Vendored copy of bevy_pbr 0.19.1 with one addition: an encoder-level GPU
 # diagnostic span around each shadow render pass (src/render/light.rs, grep
 # "KULUU PATCH"). Upstream records GPU timing for the main 3D passes but not

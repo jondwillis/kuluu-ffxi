@@ -13,16 +13,16 @@
 //! client selects it with `FFXI_CLIENT_TARGET=NAME`. `--list` shows the
 //! default and every named target.
 //!
-//! ## `cargo xtask game --download [--region us|eu] [--yes]`
+//! ## `cargo xtask game --download [--region us|eu] [--target NAME] [--yes]`
 //!
 //! Opt-in (and confirmation-gated): download Square Enix's official FFXI client
-//! installer from the public PlayOnline CDN and launch it. The installer is an
-//! interactive GUI (run via Wine on macOS/Linux) and installs SE's 2019 base
-//! image; `cargo xtask game --update` then launches PlayOnline Viewer, which
-//! patches it to the current client (native on Windows, via Wine elsewhere).
-//! Re-run `cargo xtask game` to wire the result into `vendor/game-files/`.
-//! Downloading the client is free; a registration code / subscription is
-//! needed to *play*.
+//! installer from the public PlayOnline CDN and unpack it natively (the
+//! `ffxi-install` crate reads the RAR volumes, MSIs and cabinets itself; no
+//! Wine, no installer GUI) into `vendor/game-files/targets/NAME/` (default
+//! `retail`). That is SE's 2019 base image; `cargo xtask game --update` then
+//! launches PlayOnline Viewer, which patches it to the current client (native
+//! on Windows, via Wine elsewhere). Downloading the client is free; a
+//! registration code / subscription is needed to *play*.
 //!
 //! ## `cargo xtask install-hooks [--check]`
 //!
@@ -34,8 +34,7 @@
 //! repo auto-enable its own hooks. `--check` only verifies (non-zero exit when
 //! inactive) so the README / CI / a setup doctor can assert the gate is live.
 //!
-//! Std-only by design — see Cargo.toml; HTTP and the installer run by shelling
-//! out to `curl` and `wine`.
+//! HTTP goes through `curl`; PlayOnline Viewer runs through `wine` off Windows.
 
 mod dlss;
 
@@ -50,6 +49,8 @@ const GAME_FILES: &str = "vendor/game-files";
 /// Named installs, mirrored by `ffxi_dat::archive::TARGETS_DIR`.
 const TARGETS: &str = "targets";
 const CLIENT_TARGET_ENV: &str = "FFXI_CLIENT_TARGET";
+/// Where `--download` lands unless `--target` says otherwise.
+const DEFAULT_DOWNLOAD_TARGET: &str = "retail";
 /// File that proves a directory is the FFXI client DAT root.
 const MARKER: &str = "VTABLE.DAT";
 /// How deep to descend under each detection root looking for the marker.
@@ -108,7 +109,8 @@ fn usage() {
          \x20           install to the current retail version\n\
          --copy      copy the install instead of symlinking it\n\
          --force     replace an existing vendor/game-files link\n\
-         --download  download SE's official client installer and launch it\n\
+         --download  download SE's official client installer and unpack it natively\n\
+         \x20           into vendor/game-files/targets/NAME (default: retail)\n\
          --region    us (default) or eu, for --download\n\
          --yes       skip the --download confirmation prompt\n\
          \n\
@@ -165,7 +167,12 @@ fn cmd_game(args: &[String]) -> Result<(), String> {
     let workspace = workspace_root();
 
     if download {
-        return download_official(&region, yes, &workspace);
+        return download_official(
+            &region,
+            yes,
+            &workspace,
+            target.as_deref().unwrap_or(DEFAULT_DOWNLOAD_TARGET),
+        );
     }
     if list {
         return list_installs(&workspace);
@@ -679,96 +686,73 @@ fn no_install_help() -> String {
 
 // --- official-client download (opt-in, confirmation-gated) ---
 
-/// SE's public PlayOnline CDN for the full client installer. part1 is a
-/// self-extracting exe; part2..5 are its rar volumes (must sit beside it).
-const SETUP_EXE: &str = "FFXISetup.exe";
-
-/// Matches the local file against the CDN's Content-Length so a re-run after
-/// the extractor or installer fails does not refetch ~7 GB.
-fn is_complete_download(url: &str, dest: &Path) -> bool {
-    let Ok(meta) = std::fs::metadata(dest) else {
-        return false;
-    };
-    let Ok(out) = Command::new("curl").args(["-sIL", url]).output() else {
-        return false;
-    };
-    let head = String::from_utf8_lossy(&out.stdout);
-    head.lines()
-        .filter_map(|l| l.split_once(':'))
-        .filter(|(k, _)| k.eq_ignore_ascii_case("content-length"))
-        .filter_map(|(_, v)| v.trim().parse::<u64>().ok())
-        .next_back()
-        .is_some_and(|len| len == meta.len())
-}
-
-fn download_official(region: &str, yes: bool, workspace: &Path) -> Result<(), String> {
-    let (tag, sub) = match region {
-        "us" => ("FFXIFullSetup_US", "us"),
-        "eu" => ("FFXIFullSetup_EU", "eu"),
-        other => return Err(format!("unknown --region `{other}` (use us or eu)")),
-    };
-    let base = format!("https://gdl.square-enix.com/ffxi/download/{sub}");
-    let parts = [
-        format!("{tag}.part1.exe"),
-        format!("{tag}.part2.rar"),
-        format!("{tag}.part3.rar"),
-        format!("{tag}.part4.rar"),
-        format!("{tag}.part5.rar"),
-    ];
-
+fn download_official(
+    region: &str,
+    yes: bool,
+    workspace: &Path,
+    target: &str,
+) -> Result<(), String> {
+    let region = ffxi_install::region(region)?;
+    let installer_dir = workspace.join("target/ffxi-installer");
+    let target_root = workspace.join(GAME_FILES).join(TARGETS).join(target);
     println!(
         "This downloads Square Enix's official FINAL FANTASY XI client installer\n\
-         (~several GB, 5 files) from {base}/ and launches it.\n\
-         The download is free; a registration code / subscription is required to\n\
-         actually play on the official service. On macOS/Linux the installer runs\n\
-         under Wine."
+         (5 volumes, ~7.2 GB) from {}/{}/ and unpacks it into\n  {}",
+        ffxi_install::CDN_BASE,
+        region.sub,
+        show(&target_root)
     );
     if !yes && !confirm("Proceed?")? {
         return Err("aborted".into());
     }
-
     require_tool("curl")?;
-    let dir = workspace.join("target/ffxi-installer");
-    std::fs::create_dir_all(&dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
-
-    for name in &parts {
-        let url = format!("{base}/{name}");
-        let dest = dir.join(name);
-        if is_complete_download(&url, &dest) {
-            println!("Already downloaded {name}");
-            continue;
-        }
-        println!("Downloading {name} ...");
-        curl(&url, &dest)?;
+    let plan = ffxi_install::Plan {
+        region,
+        installer_dir: &installer_dir,
+        target_root: &target_root,
+    };
+    ffxi_install::download_and_unpack(&plan, &print_progress)?;
+    let ffxi = target_root.join(SQUARE_ENIX).join(FFXI);
+    if !is_ffxi_root(&ffxi) {
+        return Err(format!(
+            "unpack finished but {} does not validate ({MARKER} missing)",
+            ffxi.display()
+        ));
     }
-
-    // part1.exe is a WinRAR self-extractor, not the installer: it unpacks
-    // `<tag>/FFXISetup.exe` plus the PlayOnline and FINAL_FANTASY_XI .msi trees.
-    let setup = dir.join(tag).join(SETUP_EXE);
-    if !setup.is_file() {
-        let entry = dir.join(&parts[0]);
-        println!("\nExtracting installer: {}", entry.display());
-        launch_installer(&entry)?;
-        if !setup.is_file() {
-            return Err(format!(
-                "extraction finished but {} is missing; extract {} by hand",
-                setup.display(),
-                entry.display()
-            ));
-        }
-    }
-    println!("\nLaunching installer: {}", setup.display());
-    launch_installer(&setup)?;
-
     println!(
-        "\nComplete the installer's GUI (DirectX -> PlayOnline Viewer -> FINAL FANTASY XI).\n\
-         This is SE's 2019 base image: launch PlayOnline Viewer and let it patch FINAL\n\
-         FANTASY XI to the current version (no account needed for the update step):\n  \
-         cargo xtask game --update \"<install dir>\"\n\
-         then wire the result up with:\n  cargo xtask game --target retail \"<install dir>\"\n\
-         (under Wine the install lands in the prefix, e.g. ~/.wine/drive_c/Program Files (x86)/PlayOnline/...)"
+        "\nThis is SE's 2019 base image; patch it to the current version with\n  \
+         cargo xtask game --update --target {target}\n\
+         and select it with\n  export {CLIENT_TARGET_ENV}={target}"
     );
     Ok(())
+}
+
+fn print_progress(p: ffxi_install::Progress) {
+    use ffxi_install::Progress::*;
+    match p {
+        VolumeCached { index } => println!("volume {index}: already downloaded"),
+        VolumeDownloading { index, url } => println!("volume {index}: downloading {url}"),
+        VolumeReady {
+            index,
+            complete_members,
+        } => println!("volume {index}: ready, {complete_members} member(s) complete"),
+        MemberExtracting { name } => println!("  extracting {name} ..."),
+        MemberExtracted { name, millis } => println!("  extracted {name} ({millis} ms)"),
+        CabDecoding { name, files } => println!("  decoding {name}: {files} file(s)"),
+        CabProgress { name, done, files } => println!("  decoding {name}: {done}/{files}"),
+        CabDecoded {
+            name,
+            new_files,
+            millis,
+        } => println!("  decoded {name}: {new_files} new file(s) ({millis} ms)"),
+        FilesOutsideInstallIgnored { msi, count } => {
+            println!("  {msi}: {count} file(s) outside SquareEnix/ ignored")
+        }
+        MsiPlaced { msi, files } => println!("placed {files} file(s) from {msi}"),
+        Finished { files, target_root } => {
+            println!("unpacked {files} file(s) into {}", target_root.display())
+        }
+    }
 }
 
 fn confirm(prompt: &str) -> Result<bool, String> {
@@ -789,49 +773,6 @@ fn require_tool(name: &str) -> Result<(), String> {
         .status()
         .map(|_| ())
         .map_err(|_| format!("`{name}` not found on PATH — install it and retry"))
-}
-
-fn curl(url: &str, dest: &Path) -> Result<(), String> {
-    // -L follow redirects, --fail on HTTP errors, -C - resume partial downloads.
-    let status = Command::new("curl")
-        .args(["-L", "--fail", "--retry", "3", "-C", "-", "-o"])
-        .arg(dest)
-        .arg(url)
-        .status()
-        .map_err(|e| format!("running curl: {e}"))?;
-    if !status.success() {
-        return Err(format!("curl failed for {url} ({status})"));
-    }
-    Ok(())
-}
-
-/// Run the self-extracting installer entry point: directly on Windows, under
-/// Wine elsewhere.
-fn launch_installer(exe: &Path) -> Result<(), String> {
-    let mut cmd = if cfg!(target_os = "windows") {
-        Command::new(exe)
-    } else {
-        require_tool("wine").map_err(|_| {
-            "wine not found — the FFXI installer is a Windows executable. Install Wine \
-             (macOS: `brew install --cask wine-stable`; Linux: your distro's winehq pkg) \
-             and re-run, or run the installer yourself from target/ffxi-installer/."
-                .to_string()
-        })?;
-        let mut c = Command::new("wine");
-        c.arg(exe);
-        c
-    };
-    // Run from the installer dir so part1.exe finds its .rar volumes.
-    if let Some(parent) = exe.parent() {
-        cmd.current_dir(parent);
-    }
-    let status = cmd
-        .status()
-        .map_err(|e| format!("launching installer: {e}"))?;
-    if !status.success() {
-        return Err(format!("installer exited with {status}"));
-    }
-    Ok(())
 }
 
 // --- small fs helpers (std-only) ---

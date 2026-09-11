@@ -5,10 +5,11 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
-# Intentionally dependency-free (std only). xtask is project automation that
-# may run *before* the build-time vendor data is present, so it must not depend
-# on workspace crates whose build scripts read vendor/ (e.g. ffxi-dat).
+# xtask may run *before* the build-time vendor data is present, so it must not
+# depend on workspace crates whose build scripts read vendor/ (e.g. ffxi-dat).
+# ffxi-install has no build script.
 [dependencies]
+ffxi-install = { path = "../ffxi-install" }
 
 # Project automation, never a shipped artifact — keep dist's release packaging
 # focused on kuluu.

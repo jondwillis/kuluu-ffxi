@@ -1,0 +1,11 @@
+[package]
+name = "ffxi-install"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Fetch and unpack Square Enix's official FFXI client installer natively (no Wine, no FFXISetup.exe)."
+
+[dependencies]
+cab = "0.6"
+msi = "0.10"
+unrar = "0.5"

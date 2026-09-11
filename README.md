@@ -191,23 +191,24 @@ cargo xtask game --copy          # copy instead of symlink
 ```
 
 Don't have an install yet? The helper can also download Square Enix's **official**
-client installer from the public PlayOnline CDN and launch it (opt-in and
-confirmation-gated; runs under Wine on macOS/Linux). The download is free; a
-registration code / subscription is needed to play on the official service:
+client installer from the public PlayOnline CDN and unpack it natively (opt-in
+and confirmation-gated). The `ffxi-install` crate reads the RAR volumes, MSIs
+and cabinets itself, decoding each cabinet while the next volume downloads, so
+no Wine and no installer GUI are involved on any platform. The download is
+free; a registration code / subscription is needed to play on the official
+service:
 
 ```bash
-cargo xtask game --download             # official US client; prompts first
-cargo xtask game --download --region eu
+cargo xtask game --download             # official US client -> targets/retail; prompts first
+cargo xtask game --download --region eu --target retail-eu
 ```
 
-Complete the installer GUI. That installs Square Enix's 2019 base image; the
-update step is PlayOnline Viewer patching FINAL FANTASY XI to the current
-version (no account needed), which `--update` launches for you, native on
-Windows and via Wine on Linux/macOS:
+That is Square Enix's 2019 base image. Patching it to the current version is
+still PlayOnline Viewer's job (no account needed for the update step), which
+`--update` launches for you, native on Windows and via Wine elsewhere:
 
 ```bash
-cargo xtask game --update "/path/to/PlayOnline/SquareEnix/FINAL FANTASY XI"
-cargo xtask game --target retail "/path/to/PlayOnline/SquareEnix/FINAL FANTASY XI"
+cargo xtask game --update --target retail
 ```
 
 (This is official-client only — HorizonXI and other flavors must be obtained

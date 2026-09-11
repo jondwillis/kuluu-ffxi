@@ -84,16 +84,29 @@ impl ItemBlockLayout {
 pub struct KnownClient {
     pub name: &'static str,
     pub ffximain_sha256: &'static str,
-    pub patch_version: &'static str,
+    /// `None` for an install PlayOnline Viewer has never patched: SE's base
+    /// image ships without `patch.cfg`.
+    pub patch_version: Option<&'static str>,
     pub item_layout: ItemBlockLayout,
 }
 
-pub const KNOWN_CLIENTS: &[KnownClient] = &[KnownClient {
-    name: "horizonxi-2023",
-    ffximain_sha256: "f4f90fbd080c05448aab3f866b127d7c1675b3cc15c8beaa57bfc584064b7e7c",
-    patch_version: "30230905_0",
-    item_layout: ItemBlockLayout::Legacy,
-}];
+pub const KNOWN_CLIENTS: &[KnownClient] = &[
+    KnownClient {
+        name: "horizonxi-2023",
+        ffximain_sha256: "f4f90fbd080c05448aab3f866b127d7c1675b3cc15c8beaa57bfc584064b7e7c",
+        patch_version: Some("30230905_0"),
+        item_layout: ItemBlockLayout::Legacy,
+    },
+    // FFXIFullSetup_US from gdl.square-enix.com (CDN Last-Modified 2019-05-10),
+    // unpacked by ffxi-install; the unpatched starting point of every retail
+    // install.
+    KnownClient {
+        name: "retail-2019-base",
+        ffximain_sha256: "3da0a1e0dc897294880c0a4bf9ea0e9c580786b2d05698290e588c761a802835",
+        patch_version: None,
+        item_layout: ItemBlockLayout::Legacy,
+    },
+];
 
 /// What an install actually is, measured from its files. `known` is `Some`
 /// only when the DLL hash matches a [`KNOWN_CLIENTS`] row; everything else is
@@ -261,7 +274,7 @@ mod tests {
         assert_eq!(profile.item_layout, Some(ItemBlockLayout::Legacy));
         assert_eq!(
             profile.patch_version.as_deref(),
-            profile.known.map(|k| k.patch_version),
+            profile.known.and_then(|k| k.patch_version),
             "{profile}"
         );
         assert!(

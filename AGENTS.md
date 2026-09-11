@@ -77,7 +77,7 @@ so its model sees the comment rule before it writes, not at commit time.
 **`ffxi-*` crates are domain truth** — facts about the game, its retail file
 formats, or the LSB protocol that would hold in any faithful client
 (`ffxi-proto`, `ffxi-vocab`, `ffxi-dat`, `ffxi-actor`, `ffxi-audio`,
-`ffxi-event`, `ffxi-nav-recast`). They must be provable against retail/LSB and
+`ffxi-event`, `ffxi-nav-recast`, `ffxi-install`). They must be provable against retail/LSB and
 carry upstream citations; `checks.sh style` fails on any `enhanced` reference
 inside them. **`kuluu-*` crates are product machinery** — this client's own
 design (`kuluu-session`, `kuluu-snapshot`, `kuluu-render`, `kuluu`,
