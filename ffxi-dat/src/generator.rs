@@ -1,8 +1,6 @@
 use crate::particle_gen::{LINKED_DATA_SOUND, OPCODE_END, OPCODE_STANDARD_SETUP, SIZE_WORDS_MASK};
 use crate::{DatError, Result};
 
-const SETUP_SIZE_NIBBLE_MASK: u8 = 0x0F;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Generator {
     pub name: [u8; 4],
@@ -39,11 +37,13 @@ impl Generator {
             body.len()
         };
 
+        // research/XIClient CYyGenerator.cpp CYyGenerator::FindFirst: the setup section shares
+        // the 5-bit size field of every other generator script section.
         let mut cursor = creation_start;
         while cursor + 4 <= creation_end {
             let data_type = body[cursor];
-            let data_size_nibble = (body[cursor + 1] & SETUP_SIZE_NIBBLE_MASK) as usize;
-            let advance = data_size_nibble.saturating_mul(4);
+            let size_words = (body[cursor + 1] & SIZE_WORDS_MASK) as usize;
+            let advance = size_words.saturating_mul(4);
             if data_type == OPCODE_END {
                 break;
             }
@@ -836,6 +836,26 @@ mod tests {
 
         let g = Generator::parse(*b"empt", &body).unwrap();
         assert!(g.is_none());
+    }
+
+    #[test]
+    fn setup_walk_advances_past_records_of_sixteen_or_more_dwords() {
+        const CREATION_OFFSET: u32 = 0x80 + 16;
+        const WIDE_RECORD_WORDS: u8 = 16;
+        const WIDE_OPCODE: u8 = 0x02;
+        let mut body = vec![0u8; 0x80];
+        body[0x74..0x78].copy_from_slice(&CREATION_OFFSET.to_le_bytes());
+
+        push_block(&mut body, WIDE_OPCODE, WIDE_RECORD_WORDS, &[]);
+        let mut setup = vec![0u8; 32];
+        setup[8..12].copy_from_slice(b"wide");
+        setup[29] = LINKED_DATA_SOUND;
+        push_block(&mut body, OPCODE_STANDARD_SETUP, WIDE_RECORD_WORDS, &setup);
+        push_block(&mut body, OPCODE_END, 0, &[]);
+
+        let g = Generator::parse(*b"gen2", &body).unwrap().unwrap();
+        assert_eq!(g.id, *b"wide");
+        assert!(g.is_sound());
     }
 
     #[test]
