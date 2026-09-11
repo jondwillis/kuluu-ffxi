@@ -4068,3 +4068,58 @@ async fn bootstrap_scenario(scenario: BootstrapReply) {
         );
     }
 }
+
+#[test]
+fn party_moghouse_flag_never_announces_a_mog_house_transition() {
+    const MOGHOUSE_FLG_ATTR: usize = 21;
+    const MOGHOUSE_FLG_LIST: usize = 23;
+    const ATTR_LEN: usize = 32;
+    const LIST_LEN: usize = 52;
+
+    for (opcode, len, flag_at) in [
+        (
+            ffxi_proto::map::s2c::GROUP_ATTR,
+            ATTR_LEN,
+            MOGHOUSE_FLG_ATTR,
+        ),
+        (
+            ffxi_proto::map::s2c::GROUP_LIST,
+            LIST_LEN,
+            MOGHOUSE_FLG_LIST,
+        ),
+    ] {
+        let mut body = vec![0u8; len];
+        body[flag_at] = 1;
+
+        let events = sub_packet_events(opcode, &body);
+        assert!(
+            events.iter().any(
+                |e| matches!(e, AgentEvent::PartyMemberUpdated { member } if member.in_mog_house)
+            ),
+            "{opcode:#05X}: the wire flag still reaches the party member"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ChatLine { .. })),
+            "{opcode:#05X}: only the 0x00A myroom cluster may announce a Mog House transition"
+        );
+    }
+}
+
+#[test]
+fn mog_transition_lines_are_devhud_only() {
+    let (tx, mut rx) = broadcast::channel(4);
+    let mut was = false;
+    note_mog_transition(true, &mut was, &tx);
+    note_mog_transition(true, &mut was, &tx);
+    note_mog_transition(false, &mut was, &tx);
+
+    let mut texts = Vec::new();
+    while let Ok(AgentEvent::ChatLine { line }) = rx.try_recv() {
+        assert_eq!(line.channel, ChatChannel::Debug);
+        assert!(line.text.is_ascii(), "{}", line.text);
+        texts.push(line.text);
+    }
+    assert_eq!(texts.len(), 2, "an unchanged state announces nothing");
+}

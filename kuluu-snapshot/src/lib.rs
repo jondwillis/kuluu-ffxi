@@ -1064,21 +1064,12 @@ impl SceneSnapshot {
         self.container(0).map(|c| c.items.as_slice()).unwrap_or(&[])
     }
 
-    /// Whether the self player is inside their Mog House: the s2c 0x00A myroom
-    /// cluster wins, otherwise the self party member's moghouse flag. Mirrors
+    /// Whether the self player is inside their Mog House. The s2c 0x00A myroom
+    /// cluster decides it alone; the party `in_mog_house` flag describes other
+    /// members' display state, not ours. Mirrors
     /// `SessionState::self_in_mog_house` on the producer side.
     pub fn self_in_mog_house(&self) -> bool {
-        if self.myroom.is_some() {
-            return true;
-        }
-        let Some(char_id) = self.self_char_id else {
-            return false;
-        };
-        self.party
-            .iter()
-            .find(|m| m.id == char_id)
-            .map(|m| m.in_mog_house)
-            .unwrap_or(false)
+        self.myroom.is_some()
     }
 }
 
@@ -2033,12 +2024,9 @@ mod tests {
             party_no: 0,
             in_mog_house: true,
         }];
-        assert!(snap.self_in_mog_house(), "self party member flag suffices");
-
-        snap.party[0].id = 0xDEAD_BEEF;
         assert!(
             !snap.self_in_mog_house(),
-            "another member's flag must not count"
+            "the self party member's moghouse flag must not decide where we are"
         );
     }
 

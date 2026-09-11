@@ -1358,18 +1358,11 @@ impl SessionState {
         }
     }
 
+    /// Not the party `MoghouseFlg` byte: that is a per-member display flag LSB
+    /// leaves unpopulated and forks fill in their own way
+    /// (vendor/server/src/map/packets/s2c/0x00a_login.cpp GP_SERV_COMMAND_LOGIN::GP_SERV_COMMAND_LOGIN).
     pub fn self_in_mog_house(&self) -> bool {
-        if self.myroom.is_some() {
-            return true;
-        }
-        let Some(char_id) = self.char_id else {
-            return false;
-        };
-        self.party
-            .iter()
-            .find(|m| m.id == char_id)
-            .map(|m| m.in_mog_house)
-            .unwrap_or(false)
+        self.myroom.is_some()
     }
 
     /// Riding is read off the broadcast animation byte, not `self_mount_id`:

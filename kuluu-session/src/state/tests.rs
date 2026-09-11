@@ -166,6 +166,16 @@ fn zone_change_sets_and_clears_myroom() {
     });
     assert_eq!(s.myroom, None);
     assert!(!s.self_in_mog_house());
+
+    let mut self_member = party_member(0xCAFE, "Vanari", 1500);
+    self_member.in_mog_house = true;
+    s.apply_event(&AgentEvent::PartyMemberUpdated {
+        member: self_member,
+    });
+    assert!(
+        !s.self_in_mog_house(),
+        "the party MoghouseFlg byte must not override the 0x00A myroom cluster"
+    );
 }
 
 #[test]

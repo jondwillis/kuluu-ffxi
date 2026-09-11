@@ -1824,9 +1824,6 @@ fn handle_sub_packet(
             if let Ok((attrs, extra)) = decode::PartyAttrs::decode_group_list(sub.data)
                 .inspect_err(|e| warn_decode_err(sub.opcode, e))
             {
-                if attrs.unique_no == self_char_id {
-                    note_mog_transition(attrs.moghouse_flg != 0, was_in_mog_house, event_tx);
-                }
                 let _ = event_tx.send(AgentEvent::PartyMemberUpdated {
                     member: party_member_from_attrs(&attrs, Some(&extra)),
                 });
@@ -1842,11 +1839,9 @@ fn handle_sub_packet(
                     hp = attrs.hp,
                     hpp = attrs.hpp,
                     zone_no = attrs.zone_no,
+                    moghouse_flg = attrs.moghouse_flg,
                     "0x0DF GROUP_ATTR",
                 );
-                if attrs.unique_no == self_char_id {
-                    note_mog_transition(attrs.moghouse_flg != 0, was_in_mog_house, event_tx);
-                }
                 let _ = event_tx.send(AgentEvent::PartyMemberUpdated {
                     member: party_member_from_attrs(&attrs, None),
                 });
@@ -6274,31 +6269,27 @@ fn item_stack_allowed(
     !too_soon
 }
 
+/// Retail prints nothing when you step in or out of a Mog House, so both lines
+/// go to the dev-HUD-only debug channel.
 fn note_mog_transition(now_in_mog: bool, was: &mut bool, event_tx: &broadcast::Sender<AgentEvent>) {
-    if now_in_mog && !*was {
-        let _ = event_tx.send(AgentEvent::ChatLine {
-            line: crate::state::ChatLine {
-                spans: Vec::new(),
-                channel: crate::state::ChatChannel::System,
-                sender: "<client>".into(),
-                text: "You're inside a Mog House (LSB keeps the zone id equal \
-                       to the surrounding city). Entity stream is filtered \
-                       server-side — use /mhexit to leave."
-                    .into(),
-                server_ts: 0,
-            },
-        });
+    let text = if now_in_mog && !*was {
+        "Entered a Mog House: the zone id stays the surrounding city's and the \
+         entity stream is filtered server-side. /mhexit leaves."
     } else if !now_in_mog && *was {
-        let _ = event_tx.send(AgentEvent::ChatLine {
-            line: crate::state::ChatLine {
-                spans: Vec::new(),
-                channel: crate::state::ChatChannel::System,
-                sender: "<client>".into(),
-                text: "Left the Mog House (server-side `m_moghouseID` cleared).".into(),
-                server_ts: 0,
-            },
-        });
-    }
+        "Left the Mog House."
+    } else {
+        *was = now_in_mog;
+        return;
+    };
+    let _ = event_tx.send(AgentEvent::ChatLine {
+        line: crate::state::ChatLine {
+            spans: Vec::new(),
+            channel: crate::state::ChatChannel::Debug,
+            sender: "<client>".into(),
+            text: text.into(),
+            server_ts: 0,
+        },
+    });
     *was = now_in_mog;
 }
 
