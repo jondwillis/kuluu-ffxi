@@ -86,6 +86,22 @@ pub fn build_subpacket_action(
     buf
 }
 
+pub const C2S_ACTION_LOG_TARGET: &str = "c2s_action";
+
+// Call only after the transport reports the datagram written, so the line is
+// evidence the packet left the client, not merely that it was built.
+pub fn log_action_sent(unique_no: u32, act_index: u16, kind: &crate::state::ActionKind) {
+    tracing::debug!(
+        target: C2S_ACTION_LOG_TARGET,
+        opcode = ffxi_proto::map::c2s::ACTION,
+        action_id = kind.action_id(),
+        kind = ?kind,
+        unique_no,
+        act_index,
+        "sent 0x01A ACTION"
+    );
+}
+
 // c2s 0x05D GP_CLI_COMMAND_MOTION: UniqueNo u32 @4, ActIndex u16 @8, Number u8
 // @10 (emote id), Mode u8 @11, Param u16 @12, pad u16 @14
 // (vendor/server/src/map/packets/c2s/0x05d_motion.h GP_CLI_COMMAND_MOTION). Note the c2s Mode

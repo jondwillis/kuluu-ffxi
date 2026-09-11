@@ -29,6 +29,7 @@ pub use codec::{
     build_subpacket_myroom_job, build_subpacket_pbx, build_subpacket_reqlogout,
     build_subpacket_shop_buy, build_subpacket_shop_sell_req, build_subpacket_shop_sell_set,
     build_subpacket_tracking_end, build_subpacket_tracking_list, build_subpacket_tracking_start,
+    log_action_sent,
 };
 
 struct NpcNameResolver {
@@ -2919,6 +2920,7 @@ async fn keepalive_loop(
                                 message: format!("action send: {e}"),
                             });
                         } else {
+                            log_action_sent(target_id, target_index, &kind);
                             if matches!(
                                 kind,
                                 crate::state::ActionKind::RaiseMenu { .. }
@@ -3084,12 +3086,10 @@ async fn keepalive_loop(
                     Some(AgentCommand::Fish) | Some(AgentCommand::FishingInput { .. }) => {}
                     Some(AgentCommand::ReturnToHomePoint) => {
 
-                        let payload = build_subpacket_action(
-                            sub_seq,
-                            self_char_id,
-                            self_act_index.unwrap_or(0),
-                            &crate::state::ActionKind::HomepointMenu { status_id: 0 },
-                        );
+                        let kind = crate::state::ActionKind::HomepointMenu { status_id: 0 };
+                        let act_index = self_act_index.unwrap_or(0);
+                        let payload =
+                            build_subpacket_action(sub_seq, self_char_id, act_index, &kind);
                         sub_seq = sub_seq.wrapping_add(1);
                         if let Err(e) = map
                             .send_encrypted(&payload, datagram_header_id(sub_seq), server_last_seq)
@@ -3099,6 +3099,8 @@ async fn keepalive_loop(
                             let _ = event_tx.send(AgentEvent::Error {
                                 message: format!("homepoint_return send: {e}"),
                             });
+                        } else {
+                            log_action_sent(self_char_id, act_index, &kind);
                         }
                     }
                     Some(AgentCommand::Follow { .. })
@@ -3937,6 +3939,7 @@ async fn keepalive_loop(
                     && should_release_on_walkaway(user_driven_events, walk_dist);
 
                 let mut payload = Vec::new();
+                let mut resrdy_in_payload = false;
 
                 if enterzone_seen && !zone_transition_sent {
                     payload.extend(build_subpacket_zone_transition(sub_seq));
@@ -3988,6 +3991,7 @@ async fn keepalive_loop(
                 // MH the same action pre-warms NPC/MOB/TRUST spawn lists.
                 if zone_transition_sent && self_pos_seeded && !resrdy_sent {
                     resrdy_sent = true;
+                    resrdy_in_payload = true;
                     payload.extend(build_subpacket_action(
                         sub_seq,
                         self_char_id,
@@ -3995,7 +3999,7 @@ async fn keepalive_loop(
                         &crate::state::ActionKind::SendResRdy,
                     ));
                     sub_seq = sub_seq.wrapping_add(1);
-                    tracing::info!("sent 0x01A SendResRdy (post zone-in spawn request)");
+                    tracing::info!("queued 0x01A SendResRdy (post zone-in spawn request)");
                 }
 
                 if let Some(flush) = flush_pending_event_end(
@@ -4114,6 +4118,13 @@ async fn keepalive_loop(
                 if !payload.is_empty() {
                     match map.send_encrypted(&payload, datagram_header_id(sub_seq), server_last_seq).await {
                         Ok(()) => {
+                            if resrdy_in_payload {
+                                log_action_sent(
+                                    self_char_id,
+                                    self_act_index.unwrap_or(0),
+                                    &crate::state::ActionKind::SendResRdy,
+                                );
+                            }
                             if keepalive_send_failing {
                                 keepalive_send_failing = false;
                                 tracing::info!("keepalive send recovered");
