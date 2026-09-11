@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+// v26: ViewerEvent::ActionStarted.outcome - the first result's (info, hitDistortion,
+// knockback) bits (GP_SERV_COMMAND_BATTLE2::pack) that drive the victim's reaction routine.
 // v25: ViewerEvent::TargetChanged - the server-pushed retarget (s2c 0x058 ASSIST).
 // Nothing in the snapshot carries the server's chosen target, so /assist and
 // auto-target-after-kill had no way to move the client's target cursor.
@@ -431,6 +433,69 @@ pub mod status_type {
     pub const CUTSCENE_ONLY: u8 = 6;
     pub const STATUS_18: u8 = 18;
     pub const SHUTDOWN: u8 = 20;
+}
+
+// Retail's decode of the wire movement/animation speed bytes (research/XiPackets
+// world/server/0x000E): MovementSpeed2 = Speed * 0.1 yps drives how fast a model walks toward
+// its target, and AnimationSpeed = SpeedBase * 0.1 scales walk/run clip playback. The two are
+// separate values; the run factor multiplies `speed` only (vendor/server/src/map/entities/
+// battleentity.cpp CBattleEntity::UpdateSpeed), never `animationSpeed`. These live in
+// kuluu-snapshot so both the session reactor and the render layer read one source of truth.
+pub mod speed {
+    /// Retail's own decode of the wire speed byte (research/XiPackets world/server/0x000E,
+    /// MovementSpeed2 = Speed * 0.1 yps).
+    pub const SPEED_TO_YPS: f32 = 0.1;
+
+    // The server does not send a faster speed to a mounted player; LSB caps its mount speed at
+    // map.MOUNT_SPEED/2 = 40, below the 50 it sends on foot (vendor/server/src/map/entities/
+    // battleentity.cpp CBattleEntity::UpdateSpeed). Retail makes up the difference in the client,
+    // doubling the decoded speed while mounted and then clamping (research/XIClient/src/XIClient/source/World/
+    // Actor/ControllableActor.cpp ControllableActor::StepControl). Taking the packet at face value
+    // therefore makes mounting slower.
+    pub const MOUNTED_SPEED_MULTIPLIER: f32 = 2.0;
+
+    /// The retail client's movement ceiling in yalms per second (ControllableActor::StepControl).
+    pub const MAX_MOVE_SPEED_YPS: f32 = 30.0;
+
+    /// The speed LSB sends an unmounted PC, which every "step per tick" budget in the reactor is
+    /// calibrated against (vendor/server/src/map/entities/battleentity.cpp CBattleEntity::UpdateSpeed).
+    pub const BASE_PACKET_SPEED: u8 = 50;
+
+    /// The movement rate a walk/run clip is authored at: the base packet speed decoded to yalms per
+    /// second. Retail's AnimationSpeed (SpeedBase * 0.1) scales clip playback relative to this, so a
+    /// slower mob walks in slow motion and a faster one in fast forward (research/XiPackets
+    /// world/server/0x000E).
+    pub const AUTHORED_ANIM_RATE: f32 = BASE_PACKET_SPEED as f32 * SPEED_TO_YPS;
+
+    /// Yalms per second for a decoded packet speed. `speed_base` is a separate value retail keeps but
+    /// never spends on the movement rate; StepControl reads only the doubled-and-clamped `speed`, so
+    /// scaling by `speed / speed_base` would under-drive a mounted PC rather than over-drive it.
+    pub const fn move_speed_yps(packet_speed: u8, mounted: bool) -> f32 {
+        let speed = packet_speed as f32 * SPEED_TO_YPS;
+        let speed = if mounted {
+            speed * MOUNTED_SPEED_MULTIPLIER
+        } else {
+            speed
+        };
+        speed.min(MAX_MOVE_SPEED_YPS)
+    }
+
+    /// Movement rate as a multiple of the unmounted run the callers' per-tick step budgets are sized for.
+    pub fn move_speed_ratio(packet_speed: u8, mounted: bool) -> f32 {
+        move_speed_yps(packet_speed, mounted) / move_speed_yps(BASE_PACKET_SPEED, false)
+    }
+
+    /// Walk/run clip playback scale for a decoded animationSpeed byte, relative to the authored
+    /// rate. Retail's AnimationSpeed = SpeedBase * 0.1 yps (research/XiPackets world/server/0x000E)
+    /// and the clips are authored at AUTHORED_ANIM_RATE, so the ratio is the playback multiplier:
+    /// a slower base walks in slow motion, a faster one in fast forward. A zero base (LSB ships
+    /// NPCs with speedsub 0) carries no authored rate, so it plays at 1.0 instead of freezing.
+    pub const fn anim_rate_scale(speed_base: u8) -> f32 {
+        if speed_base == 0 {
+            return 1.0;
+        }
+        (speed_base as f32 * SPEED_TO_YPS) / AUTHORED_ANIM_RATE
+    }
 }
 
 impl Entity {
@@ -1516,6 +1581,11 @@ pub enum ViewerEvent {
         /// First result's raw `animation` index, for every category — the file-table key of
         /// the caster's effect DAT. Absent on a result-less or truncated body.
         animation: Option<u16>,
+        /// First result's `(info, hit_distortion, knockback)` bits
+        /// (vendor/server/src/map/packets/s2c/0x028_battle2.cpp GP_SERV_COMMAND_BATTLE2::pack),
+        /// read for every category; absent when the body carries no result block. `info` is
+        /// only meaningful for a basic attack (vendor/server/src/map/enums/action/info.h).
+        outcome: Option<(u8, u8, u8)>,
     },
 
     /// One-shot emote broadcast (s2c 0x05A MOTIONMES): `emote_id` is the wire
@@ -2428,6 +2498,22 @@ mod tests {
         assert_eq!(
             hex, SNAPSHOT_DEFAULT_POSTCARD_HEX,
             "SceneSnapshot postcard encoding changed: update the pin deliberately and rebuild relay consumers together"
+        );
+    }
+
+    #[test]
+    fn anim_rate_scales_with_speed_base() {
+        // The authored base plays at unity; halves of it walk in half-speed slow motion, and a
+        // faster base scales up. No kind or threshold anywhere: the byte is the whole input.
+        assert!(
+            (speed::anim_rate_scale(50) - 1.0).abs() < 1e-6,
+            "authored base plays at unity"
+        );
+        assert!((speed::anim_rate_scale(25) - 0.5).abs() < 1e-6);
+        assert!(speed::anim_rate_scale(75) > speed::anim_rate_scale(50));
+        assert!(
+            speed::anim_rate_scale(1) > 0.0 && speed::anim_rate_scale(0) == 1.0,
+            "a nonzero base keeps a positive scale"
         );
     }
 }

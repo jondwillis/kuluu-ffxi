@@ -477,13 +477,14 @@ pub fn trigger_zone_doors(
         let Some(active) = ActiveScheduler::from_main(&dir.routines, &routine) else {
             continue;
         };
-        commands
-            .entity(entity)
-            .try_insert(active)
-            .try_insert(ActionAssets {
-                seps: dir.seps.clone(),
-                ..Default::default()
-            });
+        // Insert-or-push like the other dispatchers: a door swing alongside another running
+        // routine on the same entity runs concurrently; the push path leaves the first writer's
+        // ActionAssets alone.
+        crate::scheduler_runtime::enqueue_routine(&mut commands, entity, active);
+        commands.entity(entity).try_insert_if_new(ActionAssets {
+            seps: dir.seps.clone(),
+            ..Default::default()
+        });
         info!(
             "zone_doors: {label} runs {}",
             String::from_utf8_lossy(&routine)
@@ -640,6 +641,9 @@ mod tests {
                 }),
                 follow_points: None,
                 screen_color: None,
+                actor_fade: None,
+                idle_transition_time: None,
+                flinch_duration: None,
                 random_group: None,
                 local_dir: ffxi_dat::scheduler::NO_LOCAL_DIR,
             },

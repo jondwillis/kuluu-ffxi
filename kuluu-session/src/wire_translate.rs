@@ -424,6 +424,7 @@ pub fn event_to_viewer_event(ev: AgentEvent) -> Option<wire::ViewerEvent> {
             target_id,
             result,
             animation,
+            outcome,
         } => Some(wire::ViewerEvent::ActionStarted {
             actor_id,
             action_id,
@@ -431,6 +432,7 @@ pub fn event_to_viewer_event(ev: AgentEvent) -> Option<wire::ViewerEvent> {
             target_id,
             result: result.map(ffxi_proto::melee::MeleeResult::to_wire),
             animation,
+            outcome: outcome.map(ffxi_proto::melee::ResultOutcome::to_wire),
         }),
         AgentEvent::EntityEmoted {
             actor_id,
@@ -960,6 +962,7 @@ mod tests {
                 target_id,
                 result: None,
                 animation: None,
+                outcome: None,
             });
             assert!(matches!(
                 mapped,
@@ -974,6 +977,7 @@ mod tests {
             resolution: ffxi_proto::melee::ActionResolution::Hit,
             animation: ffxi_proto::melee::AttackAnimation::RightAttack,
         };
+        let crit = ffxi_proto::melee::ResultOutcome::from_wire(2, 3, 2);
         for result in [None, Some(hit_right)] {
             let mapped = event_to_viewer_event(AgentEvent::ActionStarted {
                 actor_id: 0xCAFE,
@@ -982,11 +986,15 @@ mod tests {
                 target_id: Some(0xBEEF),
                 result,
                 animation: None,
+                outcome: Some(crit),
             });
             assert!(matches!(
                 mapped,
-                Some(wire::ViewerEvent::ActionStarted { result: r, .. })
-                    if r == result.map(ffxi_proto::melee::MeleeResult::to_wire)
+                Some(wire::ViewerEvent::ActionStarted {
+                    result: r,
+                    outcome: Some((2, 3, 2)),
+                    ..
+                }) if r == result.map(ffxi_proto::melee::MeleeResult::to_wire)
             ));
         }
     }

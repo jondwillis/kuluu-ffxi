@@ -83,6 +83,21 @@ impl PosHead {
         ((self.flags0 >> Self::FACETARGET_SHIFT) & Self::FACETARGET_MASK) as u16
     }
 
+    // `Flags0.MovTime`: the low 13 bits of the POS block's moving u16. LSB writes
+    // `ref<uint16>(0x18) = PEntity->loc.p.moving` (vendor/server/src/map/packets/
+    // entity_update.cpp CEntityUpdatePacket::updateWith), and the pathfinder advances that
+    // counter by a fixed amount per step (a different one on a speed change), wrapping at
+    // the 13-bit width (vendor/server/src/map/ai/helpers/pathfind.cpp StepTo). So the delta
+    // between two POS updates counts server steps since the last one. XiPackets
+    // world/server/0x000E UpdateMoveTime reads the same 13 bits; retail
+    // phases walk/run cycles off it so foot timing matches, instead of re-deriving a phase
+    // from position deltas.
+    const MOV_TIME_MASK: u32 = 0x1FFF;
+
+    pub fn mov_time(&self) -> u16 {
+        (self.flags0 & Self::MOV_TIME_MASK) as u16
+    }
+
     // `Flags6.MountIndex` — the MOUNTTYPE this character last mounted. LSB's own
     // comment warns it stays set after dismounting
     // (vendor/server/src/map/packets/char_update.cpp,
@@ -643,6 +658,9 @@ impl NpcState {
     pub(crate) const ANIMATION_OFFSET: usize = 0x1B;
     pub(crate) const STATUS_OFFSET: usize = 0x1C;
     pub(crate) const ANIMATIONSUB_OFFSET: usize = 0x26;
+    /// LSB writes `4 | animationsub` on spawn (vendor/server/src/map/packets/entity_update.cpp
+    /// CEntityUpdatePacket::updateWith); consumers mask this off to read the selector.
+    pub const ANIMATIONSUB_SPAWN_FLAG: u8 = 0x04;
 
     /// Decode the appearance-state bytes from a `CHAR_NPC` (0x0E) body. Returns
     /// `None` if the body is too short to reach `animationsub` (the furthest of
@@ -1326,16 +1344,15 @@ mod npc_state_tests {
 
     #[test]
     fn npc_state_matches_fireworks_effect_npc() {
-        const SPAWN_FLAG: u8 = 0x04;
         let mut body = vec![0u8; 0x48];
         body[NpcState::ANIMATION_OFFSET] = 0;
         body[NpcState::STATUS_OFFSET] = 2;
-        body[NpcState::ANIMATIONSUB_OFFSET] = SPAWN_FLAG | 1;
+        body[NpcState::ANIMATIONSUB_OFFSET] = NpcState::ANIMATIONSUB_SPAWN_FLAG | 1;
         let st = NpcState::decode_char_npc(&body).expect("decode");
         assert_eq!(st.animation, 0);
         assert_eq!(st.status, 2);
         assert_ne!(st.animationsub, 0);
-        assert_eq!(st.animationsub & !SPAWN_FLAG, 1);
+        assert_eq!(st.animationsub & !NpcState::ANIMATIONSUB_SPAWN_FLAG, 1);
     }
 
     #[test]
@@ -1491,6 +1508,34 @@ mod pos_head_tests {
         let buf = vec![0u8; PosHead::SIZE];
         let h = PosHead::decode(&buf).unwrap();
         assert_eq!(h.facetarget(), 0);
+    }
+
+    #[test]
+    fn pos_head_mov_time_is_flags0_low_13_bits() {
+        // LSB's moving u16 (entity_update.cpp CEntityUpdatePacket::updateWith) carries MovTime
+        // in its low 13 bits;
+        // a value at the top of the counter's range must decode without bleeding into
+        // facetarget.
+        const FACETARGET_SAMPLE: u32 = 0x01A2;
+        // vendor/server/src/map/ai/helpers/pathfind.cpp StepTo: the per-step MovTime increment.
+        const PATHFIND_STEP_MOV_TIME: u32 = 0x35;
+        let mut buf = vec![0u8; PosHead::SIZE];
+        let flags0 = (FACETARGET_SAMPLE << PosHead::FACETARGET_SHIFT) | PosHead::MOV_TIME_MASK;
+        buf[20..24].copy_from_slice(&flags0.to_le_bytes());
+        let h = PosHead::decode(&buf).unwrap();
+        assert_eq!(u32::from(h.mov_time()), PosHead::MOV_TIME_MASK);
+        assert_eq!(
+            u32::from(h.facetarget()),
+            FACETARGET_SAMPLE,
+            "MovTime must not bleed into facetarget"
+        );
+
+        let mut buf = vec![0u8; PosHead::SIZE];
+        buf[20..24].copy_from_slice(&PATHFIND_STEP_MOV_TIME.to_le_bytes());
+        assert_eq!(
+            u32::from(PosHead::decode(&buf).unwrap().mov_time()),
+            PATHFIND_STEP_MOV_TIME
+        );
     }
 
     #[test]

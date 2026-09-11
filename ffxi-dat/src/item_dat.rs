@@ -1,10 +1,11 @@
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
+use crate::client_profile::ItemBlockLayout;
 use crate::map_image::{self, GraphicImage};
 
 // Retail packs item data into per-type DATs, each a gap-free ascending array of
-// 0xC00 blocks keyed by item id. Paths and split match XIM's InventoryItems
+// fixed-size blocks keyed by item id (`ItemBlockLayout::stride`). Paths and split match XIM's InventoryItems
 // (research/xim/src/jsMain/kotlin/xim/resource/InventoryItemParser.kt InventoryItems itemListDats), itself a port of Windower
 // POLUtils Item.cs. Block index within a file is `item_id - base_id`, where
 // base_id is the id stored in the file's first block.
@@ -18,11 +19,13 @@ pub const ITEM_DAT_ROM_PATHS: &[&str] = &[
     "ROM/301/115.DAT", // items (expansions)
 ];
 
-pub const ITEM_BLOCK_STRIDE: usize = 0xC00;
+/// Stride of the only layout this module decodes; `Retail2026` files are
+/// recognised but fail closed (kuluu-47cq).
+pub const ITEM_BLOCK_STRIDE: usize = ItemBlockLayout::Legacy.stride();
 
 pub const ITEM_ICON_OFFSET: usize = 0x280;
 
-const ITEM_BLOCK_SHIFT: u32 = 5;
+const ITEM_BLOCK_SHIFT: u32 = crate::client_profile::ITEM_BYTE_SHIFT;
 
 pub const ITEM_FLAG_RARE: u16 = 0x8000;
 
@@ -147,11 +150,12 @@ struct ItemDatFile {
     path: PathBuf,
     base: u16,
     blocks: usize,
+    layout: ItemBlockLayout,
 }
 
 /// The retail item database resolved across the per-type DATs. Each file is a
-/// gap-free ascending array of 0xC00 blocks, so a lookup is `O(1)`: pick the
-/// file whose `[base, base + blocks)` covers the id, then read block
+/// gap-free ascending array of fixed-size blocks, so a lookup is `O(1)`: pick
+/// the file whose `[base, base + blocks)` covers the id, then read block
 /// `id - base`. Blocks are read on demand (and decoded with the per-byte
 /// rotate-right-5 obfuscation), so the table itself stays tiny.
 pub struct ItemTable {
@@ -170,16 +174,20 @@ impl ItemTable {
                 continue;
             };
             let len = meta.len() as usize;
-            if len == 0 || !len.is_multiple_of(ITEM_BLOCK_STRIDE) {
+            let Some(layout) = ItemBlockLayout::probe_file(&path) else {
+                continue;
+            };
+            if len == 0 || !len.is_multiple_of(layout.stride()) {
                 continue;
             }
-            let Some(base) = read_block_id(&path, 0) else {
+            let Some(base) = first_block_id(&path) else {
                 continue;
             };
             files.push(ItemDatFile {
                 path,
                 base,
-                blocks: len / ITEM_BLOCK_STRIDE,
+                blocks: len / layout.stride(),
+                layout,
             });
         }
         ItemTable { files }
@@ -189,13 +197,36 @@ impl ItemTable {
         self.files.is_empty()
     }
 
+    /// Layouts present across the opened files, deduplicated in file order. A
+    /// healthy install has exactly one.
+    pub fn layouts(&self) -> Vec<ItemBlockLayout> {
+        let mut out: Vec<ItemBlockLayout> = Vec::new();
+        for f in &self.files {
+            if !out.contains(&f.layout) {
+                out.push(f.layout);
+            }
+        }
+        out
+    }
+
+    /// Whether every opened file is in a layout this module decodes.
+    pub fn is_decodable(&self) -> bool {
+        self.files
+            .iter()
+            .all(|f| f.layout == ItemBlockLayout::Legacy)
+    }
+
     fn block(&self, item_id: u16) -> Option<Vec<u8>> {
         let file = self
             .files
             .iter()
             .find(|f| item_id >= f.base && ((item_id - f.base) as usize) < f.blocks)?;
-        let offset = (item_id - file.base) as usize * ITEM_BLOCK_STRIDE;
-        let mut block = read_at(&file.path, offset, ITEM_BLOCK_STRIDE)?;
+        if file.layout != ItemBlockLayout::Legacy {
+            return None;
+        }
+        let stride = file.layout.stride();
+        let offset = (item_id - file.base) as usize * stride;
+        let mut block = read_at(&file.path, offset, stride)?;
         for b in block.iter_mut() {
             *b = rotate_byte_right(*b, ITEM_BLOCK_SHIFT);
         }
@@ -219,8 +250,8 @@ fn read_at(path: &Path, offset: usize, len: usize) -> Option<Vec<u8>> {
     Some(buf)
 }
 
-fn read_block_id(path: &Path, block_index: usize) -> Option<u16> {
-    let mut head = read_at(path, block_index * ITEM_BLOCK_STRIDE, 4)?;
+fn first_block_id(path: &Path) -> Option<u16> {
+    let mut head = read_at(path, 0, 4)?;
     for b in head.iter_mut() {
         *b = rotate_byte_right(*b, ITEM_BLOCK_SHIFT);
     }

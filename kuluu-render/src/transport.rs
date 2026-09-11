@@ -368,6 +368,9 @@ mod tests {
             stage: SchedulerStage {
                 kind: StageKind::FollowPoints,
                 raw_type: 0x27,
+                actor_fade: None,
+                idle_transition_time: None,
+                flinch_duration: None,
                 delay_frames: 0,
                 duration_frames: 60,
                 id,

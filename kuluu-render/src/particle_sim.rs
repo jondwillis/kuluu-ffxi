@@ -3980,6 +3980,9 @@ mod tests {
                 model_transform: None,
                 follow_points: None,
                 screen_color: None,
+                actor_fade: None,
+                idle_transition_time: None,
+                flinch_duration: None,
             },
         }
     }

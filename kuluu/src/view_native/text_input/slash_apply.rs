@@ -47,6 +47,7 @@ pub(super) fn apply_slash_outcome(
             if let Some(toast) = reqlogout_ack_text(&cmd) {
                 push_system_chat_line(scene_state, toast.into());
             }
+            #[cfg(feature = "enhanced-shutdown-counter")]
             if let Some(shutdown) = reqlogout_starts_countdown(&cmd) {
                 slash_writers
                     .logout_requested
@@ -70,6 +71,7 @@ pub(super) fn apply_slash_outcome(
                     push_system_chat_line(scene_state, toast.into());
                 }
                 mirror_heal_stance(&cmd, &mut slash_writers.rest_stance);
+                #[cfg(feature = "enhanced-shutdown-counter")]
                 if let Some(shutdown) = reqlogout_starts_countdown(&cmd) {
                     slash_writers
                         .logout_requested
@@ -96,6 +98,7 @@ pub(super) fn apply_slash_outcome(
             if let Some(toast) = reqlogout_ack_text(&req) {
                 push_system_chat_line(scene_state, toast.into());
             }
+            #[cfg(feature = "enhanced-shutdown-counter")]
             if let Some(shutdown) = reqlogout_starts_countdown(&req) {
                 slash_writers
                     .logout_requested
@@ -1176,6 +1179,7 @@ fn format_zoom_status(zoom: &kuluu_render::minimap::MinimapZoom) -> String {
     }
 }
 
+#[cfg(feature = "enhanced-shutdown-counter")]
 fn reqlogout_starts_countdown(cmd: &AgentCommand) -> Option<bool> {
     let AgentCommand::ReqLogout { kind } = cmd else {
         return None;

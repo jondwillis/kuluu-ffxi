@@ -22,6 +22,7 @@ pub mod item_grid;
 pub mod item_meta;
 pub mod item_screen;
 pub mod item_ui;
+#[cfg(feature = "enhanced-shutdown-counter")]
 pub mod logout_countdown;
 // Depends on `crate::minimap`, which is itself gated off wasm (lib.rs).
 pub mod graphics_debug;
@@ -271,9 +272,12 @@ impl Plugin for HudPlugin {
         app.add_message::<target_action_menu::TargetActionActivated>();
         app.add_message::<trade::TradeIntent>();
         app.init_resource::<target_panel::SwingPulse>();
+        #[cfg(feature = "enhanced-shutdown-counter")]
         app.init_resource::<logout_countdown::LogoutCountdownAnchor>();
-        app.init_resource::<logout_countdown::OptimisticLogoutCountdown>();
+        #[cfg(feature = "enhanced-shutdown-counter")]
+        app.init_resource::<logout_countdown::PendingLogoutRequest>();
         app.init_resource::<death_prompt::DeathPromptSelection>();
+        #[cfg(feature = "enhanced-shutdown-counter")]
         app.add_message::<logout_countdown::LogoutRequested>();
 
         app.add_message::<menu::MenuRowActivated>();
@@ -353,6 +357,7 @@ impl Plugin for HudPlugin {
             menu_help_bar::update_menu_help_bar.after(menu::refresh_dynamic_menu_rows),
         );
 
+        #[cfg(feature = "enhanced-shutdown-counter")]
         app.add_systems(Update, logout_countdown::update_logout_countdown);
         app.add_systems(Update, treasure_pool::update_treasure_pool);
 
@@ -490,6 +495,7 @@ pub fn add_hud_spawners<L: bevy::ecs::schedule::ScheduleLabel + Clone>(app: &mut
             party_frame::spawn_party_frames,
             status_ribbon::spawn_status_ribbon,
             death_prompt::spawn_death_prompt,
+            #[cfg(feature = "enhanced-shutdown-counter")]
             logout_countdown::spawn_logout_countdown,
             treasure_pool::spawn_treasure_pool,
             mesh_debug::spawn_mesh_debug_hud,

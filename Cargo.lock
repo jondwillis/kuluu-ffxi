@@ -3172,6 +3172,7 @@ dependencies = [
  "anyhow",
  "lsb-scrape",
  "rayon",
+ "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.20",
 ]
@@ -4363,6 +4364,7 @@ dependencies = [
  "ffxi-vocab",
  "js-sys",
  "kuluu-dlss-nr",
+ "kuluu-session",
  "kuluu-snapshot",
  "serde",
  "serde_json",

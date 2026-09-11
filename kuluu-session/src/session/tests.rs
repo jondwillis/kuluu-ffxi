@@ -2453,6 +2453,43 @@ fn battle2_basic_attack_reports_resolution_and_swing_animation() {
     assert_eq!(h.first_result, Some(BATTLE2_PARRIED_LEFT_ATTACK));
 }
 
+// the outcome bits after animation(12): info(5), hitDistortion(2), knockback(3) in LSB
+// write order. A hand-packed critical left-attack with level-2 knockback must come back split,
+// not lumped into one 5-bit "scale".
+#[test]
+fn battle2_result_outcome_bits_roundtrip() {
+    let mut w = BattleBitWriter::new(8);
+    w.write(0xCAFEu64, 32);
+    w.write(1, 6);
+    w.write(1, 4);
+    w.write(ffxi_proto::melee::CATEGORY_BASIC_ATTACK as u64, 4);
+    w.write(0, 32);
+    w.write(0, 32);
+    w.write(0xBEEFu64, 32);
+    w.write(1, 4);
+    w.write(0, 3); // resolution: Hit
+    w.write(1, 2); // kind
+    w.write(1, 12); // animation: LeftAttack
+    w.write(2, 5); // info: CriticalHit
+    w.write(3, 2); // hitDistortion: Heavy
+    w.write(2, 3); // knockback: level 2
+    w.write(0, 17); // param
+    w.write(67, 10); // messageID: AttackCrit
+    w.write(0, 31); // modifier
+    w.write(0, 1); // no proc block
+    w.write(0, 1); // no reaction block
+
+    let h = decode_battle2_header(&w.into_bytes()).unwrap();
+    let outcome = h
+        .first_outcome
+        .expect("a result block decodes its outcome bits");
+    assert_eq!(outcome.to_wire(), (2, 3, 2), "CriticalHit, Heavy, level 2");
+    assert!(outcome.is_critical());
+    let r = h.first_result.expect("a basic-attack result decodes");
+    assert_eq!(r.resolution, ffxi_proto::melee::ActionResolution::Hit);
+    assert_eq!(r.animation, ffxi_proto::melee::AttackAnimation::LeftAttack);
+}
+
 // A non-basic-attack category whose result block happens to carry low resolution/animation
 // bits (e.g. a spell's animation id 1) must not decode as a melee swing — the gate is the
 // category, not the bit ranges.

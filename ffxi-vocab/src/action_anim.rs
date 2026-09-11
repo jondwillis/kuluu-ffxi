@@ -38,6 +38,28 @@ pub fn ability_file_id(ability_id: u32, animation: Option<u16>) -> Option<u32> {
     Some(ABILITY_FILE_TABLE_OFFSET + index as u32)
 }
 
+// research/xim MobAbilityTable.kt getFileTableOffset - a mob skill's animation id (LSB
+// mob_skills.mob_anim_id, carried per result in s2c 0x028 category 11) is an FTABLE index with a
+// range-dependent base. The DAT at that index holds the skill's `main` routine, whose Motion stage
+// names the caster's own `sp??` clip. Pet skills (category 13) share the table.
+// (exclusive upper bound of the animation range, file-table base) per band.
+pub const MOB_SKILL_FILE_TABLE_BANDS: [(u32, u32); 4] = [
+    (0x200, 0x0F3C),
+    (0x600, 0xC1EF),
+    (0x800, 0xE739),
+    (u32::MAX, 0x14B07),
+];
+
+pub fn mob_skill_file_id(animation: u16) -> u32 {
+    let a = animation as u32;
+    let (_, base) = MOB_SKILL_FILE_TABLE_BANDS
+        .iter()
+        .copied()
+        .find(|(upper, _)| a < *upper)
+        .unwrap_or(MOB_SKILL_FILE_TABLE_BANDS[MOB_SKILL_FILE_TABLE_BANDS.len() - 1]);
+    a + base
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -85,5 +107,19 @@ mod tests {
     fn out_of_range_is_none() {
         assert_eq!(spell_file_id(0xF_FFFF, None), None);
         assert_eq!(ability_file_id(0xF_FFFF, None), None);
+    }
+
+    // Whirl Claws is mob skill 259 with mob_anim_id 3 (vendor/server/sql/mob_skills.sql): the
+    // first band's base plus the index. Each band boundary maps onto its own base.
+    #[test]
+    fn mob_skill_file_id_uses_the_range_dependent_base() {
+        let [(b0, base0), (b1, base1), (b2, base2), (_, base3)] = MOB_SKILL_FILE_TABLE_BANDS;
+        assert_eq!(mob_skill_file_id(3), base0 + 3);
+        assert_eq!(mob_skill_file_id((b0 - 1) as u16), base0 + b0 - 1);
+        assert_eq!(mob_skill_file_id(b0 as u16), base1 + b0);
+        assert_eq!(mob_skill_file_id((b1 - 1) as u16), base1 + b1 - 1);
+        assert_eq!(mob_skill_file_id(b1 as u16), base2 + b1);
+        assert_eq!(mob_skill_file_id((b2 - 1) as u16), base2 + b2 - 1);
+        assert_eq!(mob_skill_file_id(b2 as u16), base3 + b2);
     }
 }

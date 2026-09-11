@@ -70,6 +70,9 @@ enhanced-death-countdown = ["kuluu-render?/enhanced-death-countdown"]
 # Retail's party frame shows no jobs; without this feature a persisted
 # `job_display` can never light it, and the Debug -> Retail+ row does not exist.
 enhanced-job-display = ["kuluu-render?/enhanced-job-display"]
+# Enhanced (non-retail) on-screen shutdown/logout countdown banner; retail shows
+# only the 0x053 system chat lines. See kuluu-render for details.
+enhanced-shutdown-counter = ["kuluu-render?/enhanced-shutdown-counter"]
 # Enable the WebSocket relay listener (`--relay-listen <addr>` global flag).
 # Publishes the same `kuluu-snapshot` frames the in-process bridge produces,
 # so external tools (and the future wasm browser viewer) can consume the

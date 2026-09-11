@@ -134,45 +134,13 @@ pub fn model_radius(kind: EntityKind) -> f32 {
     }
 }
 
-/// Retail's own decode of the wire speed byte
-/// (research/XIClient/src/XIClient/source/Game/Net/Packets/s2c, RecvCharPc and RecvServerStatus).
-pub const SPEED_TO_YPS: f32 = 0.1;
-
-// The server does not send a faster speed to a mounted player — LSB caps its
-// mount speed at map.MOUNT_SPEED/2 = 40, *below* the 50 it sends on foot
-// (vendor/server/src/map/entities/battleentity.cpp, CBattleEntity::UpdateSpeed).
-// Retail makes up the difference in the client, doubling the decoded speed while
-// mounted and then clamping
-// (research/XIClient/src/XIClient/source/World/Actor/ControllableActor.cpp,
-// ControllableActor::StepControl). Taking the packet at face value therefore
-// makes mounting *slower*.
-pub const MOUNTED_SPEED_MULTIPLIER: f32 = 2.0;
-pub const MAX_MOVE_SPEED_YPS: f32 = 30.0;
-
-/// The speed LSB sends an unmounted PC, which every "step per tick" budget in
-/// the reactor is calibrated against
-/// (vendor/server/src/map/entities/battleentity.cpp, CBattleEntity::UpdateSpeed).
-pub const BASE_PACKET_SPEED: u8 = 50;
-
-/// Yalms per second for a decoded packet speed. `speed_base` is a separate value
-/// retail keeps but never spends on the movement rate — `StepControl` reads only
-/// the doubled-and-clamped `speed`, so scaling by `speed / speed_base` would
-/// under-drive a mounted PC rather than over-drive it.
-pub const fn move_speed_yps(packet_speed: u8, mounted: bool) -> f32 {
-    let speed = packet_speed as f32 * SPEED_TO_YPS;
-    let speed = if mounted {
-        speed * MOUNTED_SPEED_MULTIPLIER
-    } else {
-        speed
-    };
-    speed.min(MAX_MOVE_SPEED_YPS)
-}
-
-/// Movement rate as a multiple of the unmounted run the callers' per-tick step
-/// budgets are sized for.
-pub fn move_speed_ratio(packet_speed: u8, mounted: bool) -> f32 {
-    move_speed_yps(packet_speed, mounted) / move_speed_yps(BASE_PACKET_SPEED, false)
-}
+// The wire speed decode lives in kuluu-snapshot so the render layer (which cannot depend on
+// kuluu-session at runtime) and the session reactor share one source of truth; re-exported here
+// for the existing `kuluu_session::state::{...}` call sites.
+pub use kuluu_snapshot::speed::{
+    move_speed_ratio, move_speed_yps, AUTHORED_ANIM_RATE, BASE_PACKET_SPEED, MAX_MOVE_SPEED_YPS,
+    MOUNTED_SPEED_MULTIPLIER, SPEED_TO_YPS,
+};
 
 fn merge_kind(existing: EntityKind, incoming: EntityKind) -> EntityKind {
     use EntityKind::*;
@@ -2691,6 +2659,9 @@ pub enum AgentEvent {
         target_id: Option<u32>,
         result: Option<ffxi_proto::melee::MeleeResult>,
         animation: Option<u16>,
+        /// First result's outcome bits, read for every category; absent when the body carries
+        /// no result block.
+        outcome: Option<ffxi_proto::melee::ResultOutcome>,
     },
 
     /// The self player began casting a spell (optimistic, on send). Drives the

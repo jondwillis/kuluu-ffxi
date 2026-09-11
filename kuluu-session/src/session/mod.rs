@@ -788,14 +788,8 @@ fn first_decode_err(opcode: u16) -> bool {
         .unwrap_or(true)
 }
 
-/// Gated burrow wire diagnostics (`KULUU_BURROW_LOG=1`, same switch as the render-side FSM
-/// log): raw status/sub observations for every CHAR_NPC update that could drive a burrow FSM.
-/// Off by default; read once.
-fn burrow_wire_log_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        matches!(std::env::var("KULUU_BURROW_LOG").as_deref(), Ok(v) if !v.is_empty() && v != "0")
-    })
+fn special_wire_log_enabled() -> bool {
+    tracing::enabled!(target: "special", tracing::Level::DEBUG)
 }
 
 fn handle_sub_packet(
@@ -1219,18 +1213,21 @@ fn handle_sub_packet(
                 }
                 .unwrap_or(0);
 
-                // Burrow wire probe (KULUU_BURROW_LOG=1): raw status/sub for every update that
-                // could drive a burrow FSM — dig start (sub set while visible), buried ticks
-                // (status INVISIBLE), pop-up/settle. Answers "what does the server actually send?"
+                // Special-pose wire probe (RUST_LOG=special=debug): raw status/sub for every update
+                // that could drive a transition: sub set while visible, buried ticks (status
+                // INVISIBLE), resurface/settle. Answers "what does the server actually send?"
                 if op == s2c::CHAR_NPC
                     && matches!(kind, EntityKind::Mob | EntityKind::Pet)
-                    && burrow_wire_log_enabled()
+                    && special_wire_log_enabled()
                 {
                     if let Some(ns) = decode::NpcState::decode_char_npc(sub.data) {
-                        // 0x04 is the spawn flag LSB ORs into animationsub (see NpcState docs).
-                        if ns.status == 3 || (ns.animationsub & !0b100) != 0 {
+                        // Stripping LSB's spawn flag leaves a nonzero selector exactly when the
+                        // sub byte names a routine (sub 5 wraps to ini1, FFXiMain.dll).
+                        if ns.status == 3
+                            || (ns.animationsub & !decode::NpcState::ANIMATIONSUB_SPAWN_FLAG) != 0
+                        {
                             tracing::info!(
-                                target: "burrow",
+                                target: "special",
                                 id = head.unique_no,
                                 send_flag = format!("0x{:02x}", send_flag),
                                 status = ns.status,
@@ -1377,6 +1374,7 @@ fn handle_sub_packet(
         s2c::SHOP_OPEN => {}
         s2c::BATTLE2 => {
             if let Some(h) = decode_battle2_header(sub.data) {
+                tracing::debug!(target: "combat", header = ?h, "BATTLE2");
                 let _ = event_tx.send(AgentEvent::ActionStarted {
                     actor_id: h.actor_id,
                     action_id: h.action_id,
@@ -1384,6 +1382,7 @@ fn handle_sub_packet(
                     target_id: h.primary_target_id,
                     result: h.first_result,
                     animation: h.animation,
+                    outcome: h.first_outcome,
                 });
             }
             for line in decode_battle2_action(sub.data, name_cache, kind_cache) {
@@ -5001,6 +5000,7 @@ impl<'a> BattleBitReader<'a> {
 // resultCount(4). Only the first target is read: walking the rest requires re-walking the
 // variable-length result blocks, and XIM likewise attaches to `context.primaryTargetId`
 // (ParticleGeneratorAttachment.kt updateAssociatedPosition sourceActor).
+#[derive(Debug, Clone, Copy)]
 pub struct Battle2Header {
     pub actor_id: u32,
     pub action_id: u32,
@@ -5020,6 +5020,10 @@ pub struct Battle2Header {
     // weapon skill's own animation column (charentity.cpp CCharEntity::OnAbility, 1602; magic_state.cpp), which
     // is what the client resolves against its file table rather than the action id.
     pub animation: Option<u16>,
+
+    // The first result block's outcome bits, read for every category (unlike `first_result`,
+    // which is gated to basic attacks). Absent when no result block was read.
+    pub first_outcome: Option<ffxi_proto::melee::ResultOutcome>,
 }
 
 pub fn decode_battle2_header(data: &[u8]) -> Option<Battle2Header> {
@@ -5034,18 +5038,26 @@ pub fn decode_battle2_header(data: &[u8]) -> Option<Battle2Header> {
     // end the body before these trailing reads. Degrade to "no target" rather than dropping the
     // whole action — the sibling decode_battle2_action tolerates the same short payload.
     let primary_target_id = br.read(32).filter(|_| trg_sum > 0).map(|id| id as u32);
+    // vendor/server/src/map/packets/s2c/0x028_battle2.cpp GP_SERV_COMMAND_BATTLE2::pack -
+    // resolution(3), kind(2), animation(12), info(5), hitDistortion(2), knockback(3) in LSB write
+    // order.
     let first = primary_target_id
         .and_then(|_| br.read(4))
         .filter(|count| *count > 0)
         .and_then(|_| {
             let resolution = br.read(3)? as u8;
-            br.read(2)?;
+            let _kind = br.read(2)?;
             let animation = br.read(12)? as u16;
-            Some((resolution, animation))
+            let info = br.read(5)? as u8;
+            let hit_distortion = br.read(2)? as u8;
+            let knockback = br.read(3)? as u8;
+            let outcome =
+                ffxi_proto::melee::ResultOutcome::from_wire(info, hit_distortion, knockback);
+            Some((resolution, animation, outcome))
         });
     let first_result = first
         .filter(|_| action_kind == ffxi_proto::melee::CATEGORY_BASIC_ATTACK)
-        .and_then(|(resolution, animation)| {
+        .and_then(|(resolution, animation, _)| {
             ffxi_proto::melee::MeleeResult::from_wire(resolution, animation)
         });
     Some(Battle2Header {
@@ -5054,7 +5066,8 @@ pub fn decode_battle2_header(data: &[u8]) -> Option<Battle2Header> {
         action_kind,
         primary_target_id,
         first_result,
-        animation: first.map(|(_, animation)| animation),
+        animation: first.map(|(_, animation, _)| animation),
+        first_outcome: first.map(|(_, _, outcome)| outcome),
     })
 }
 

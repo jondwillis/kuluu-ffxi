@@ -50,6 +50,7 @@ pub struct SlashWriters<'w, 's> {
     pub set_sub_area: MessageWriter<'w, kuluu_render::sub_area_activation::SetSubArea>,
     pub debug_heights: MessageWriter<'w, DebugHeightsRequest>,
 
+    #[cfg(feature = "enhanced-shutdown-counter")]
     pub logout_requested: MessageWriter<'w, kuluu_render::hud::logout_countdown::LogoutRequested>,
 
     pub framepace: ResMut<'w, bevy_framepace::FramepaceSettings>,

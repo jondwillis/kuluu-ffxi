@@ -4,6 +4,7 @@ pub mod archive;
 pub mod bone;
 pub mod chunk;
 pub mod cib;
+pub mod client_profile;
 pub mod d3m;
 pub mod datid;
 pub mod dmsg;
@@ -41,6 +42,7 @@ pub mod zone_interaction;
 
 pub use archive::{discover_overlays, DatLocation, DatRoot};
 pub use chunk::{walk, walk_tree, Chunk, ChunkNode, ChunkWalker};
+pub use client_profile::{ClientProfile, ItemBlockLayout};
 pub use item_dat::ItemStatic;
 pub use kind::ChunkKind;
 pub use npc_names::{compose_id, split_id, NpcNameTable, NPC_LIST_FILE_ID_BASE};
@@ -58,6 +60,9 @@ pub enum DatError {
 
     #[error("FFXI_DAT_PATH environment variable not set")]
     EnvMissing,
+
+    #[error("FFXI_CLIENT_TARGET={name} names no install under vendor/game-files/targets/{name}")]
+    TargetMissing { name: String },
 
     #[error("invalid table file {path}: expected size multiple of {stride}, got {len}")]
     InvalidTableSize {

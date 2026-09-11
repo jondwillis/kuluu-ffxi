@@ -29,6 +29,17 @@ const CONTROL_FLOW_BRANCH_FALSE: u8 = 0x67;
 const CONTROL_FLOW_BLOCK_OPEN: u8 = 0x69;
 const CONTROL_FLOW_BLOCK_CLOSE: u8 = 0x6A;
 const CONTROL_FLOW_CONDITION: u8 = 0x6B;
+const ANIMATION_LOCK_OPCODE: u8 = 0x07;
+const ANIMATION_LOCK_MAGIC_OPCODE: u8 = 0x59;
+const FLINCH_CASTER_OPCODE: u8 = 0x21;
+const FLINCH_TARGET_OPCODE: u8 = 0x25;
+const TRANSITION_TO_IDLE_OPCODE: u8 = 0x28;
+const ACTOR_FADE_CASTER_OPCODE: u8 = 0x29;
+const ACTOR_FADE_TARGET_OPCODE: u8 = 0x2A;
+const KNOCKBACK_OPCODE: u8 = 0x5E;
+const KNOCKBACK_ALT_OPCODE: u8 = 0xBF;
+const STOP_ROUTINE_OPCODE: u8 = 0x5F;
+const DISPLAY_DEAD_OPCODE: u8 = 0x78;
 
 // research/xim EffectRoutineParser.kt — parseSection2 reads delay(+4) and duration(+6)
 // for EVERY opcode before dispatching, so the shortest stage the encoding admits is 8 bytes.
@@ -55,6 +66,14 @@ const MODEL_TRANSFORM_PAYLOAD_LEN: usize = 24;
 const MODEL_TRANSFORM_VECTOR_OFFSET: usize = 8;
 const MODEL_TRANSFORM_SUBCHUNK_OFFSET: usize = 20;
 
+// research/xim EffectRoutineParser.kt parseFlinchEffect: after delay/duration the
+// flinch payload is f32, f32, u32, f32, f32 animationDuration, u32, u32 - a 9-dword stage.
+// The duration drives retail's flinch transition times (animationDuration/2 each side,
+// EffectRoutineInterpolatedEffects.kt FlinchAnimationInstance). Verified against the shipped
+// DATs: Rarab's `damg` carries 10.0 here and its stage is exactly nine dwords.
+const FLINCH_ANIMATION_DURATION_OFFSET: usize = 24;
+const FLINCH_PAYLOAD_LEN: usize = FLINCH_ANIMATION_DURATION_OFFSET + 4;
+
 // A stage addresses a slot of the group `mzb::underscore_at_groups` builds, so the bound is
 // that builder's rather than a second reading of the same retail array.
 pub const MODEL_TRANSFORM_SUBCHUNK_SLOTS: u32 =
@@ -67,6 +86,10 @@ const NO_STAGE_ID: [u8; 4] = [0; 4];
 /// `D3DTOP_MODULATE2X`, whose identity is 0x80 — which is why the authored
 /// fade-in destination is 128,128,128 rather than 255,255,255.
 pub const SCREEN_COLOR_UNIT: u8 = 0x80;
+
+/// The untinted actor colour an ActorFade stage returns to: the modulate-2x
+/// identity in every channel (the worm's `init` fades back to it).
+pub const ACTOR_FADE_NEUTRAL: [u8; 4] = [SCREEN_COLOR_UNIT; 4];
 
 /// A [`StageKind::ScreenColorDrive`] destination, in the DAT's own byte scale.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -156,6 +179,20 @@ pub struct SchedulerStage {
     // so `id` is `NO_STAGE_ID` there for the same reason as a model transform.
     pub screen_color: Option<ScreenColor>,
 
+    // `Some` exactly for the two actor-fade kinds, whose +8 dword is an RGBA destination rather
+    // than a DatId (research/xim EffectRoutineParser.kt parseSection2); `id` is `NO_STAGE_ID` there.
+    pub actor_fade: Option<[u8; 4]>,
+
+    // `Some` exactly for `TransitionToIdle`, whose +8 dword is an f32 transition time (research/
+    // xim EffectRoutineParser.kt parseSection2); `id` is `NO_STAGE_ID` there.
+    pub idle_transition_time: Option<f32>,
+
+    // `Some` exactly for the two flinch kinds when the stage carries the full 9-dword payload:
+    // the animationDuration f32 at +24 (research/xim EffectRoutineParser.kt parseFlinchEffect).
+    // Retail plays the dfi?/dfm? flinch clip with transition in/out of
+    // animationDuration/2 frames each (EffectRoutineInterpolatedEffects.kt FlinchAnimationInstance).
+    pub flinch_duration: Option<f32>,
+
     // research/xim EffectRoutineParser.kt parseSection2,553-559 — stages between a 0x3D and its 0x3E
     // are children of one RandomChildRoutine, not siblings on the timeline: retail runs exactly
     // one of them per activation (`vatk`'s four atk1..atk4 grunts). Members of the same block
@@ -211,6 +248,37 @@ pub enum StageKind {
 
     DamageCallback,
 
+    /// AnimationLock for `duration_frames` ticks (SE: `BondageActor` /
+    /// `LockCasterMagic`; xim treats both as AnimationLockEffect). Retail's ActionTimer1
+    /// lock; refcounted across overlapping routines, and a routine without a lock stage does
+    /// not lock.
+    AnimationLock,
+
+    /// Stop the running routine named by `id` (xim EffectRoutineParser.kt
+    /// parseSection2). The worm's `ini1` stops `init` and `init` stops `ini1` this way.
+    StopRoutine,
+
+    /// Flinch on the caster / the target; SE `GetDamageDirId` picks the dfi/dbi/dfm/dbm
+    /// front/back clip by hit direction.
+    FlinchOnCaster,
+    FlinchOnTarget,
+
+    /// Knockback (xim EffectRoutineParser.kt parseSection2, SE tag table).
+    Knockback,
+
+    /// DisplayDeadRoutine (xim EffectRoutineParser.kt parseSection2): the actor is
+    /// dead from this stage on.
+    DisplayDead,
+
+    /// TransitionToIdle (xim EffectRoutineParser.kt parseSection2);
+    /// `idle_transition_time` holds the payload's f32 transition time when present.
+    TransitionToIdle,
+
+    /// ActorFade on the caster / the target to `actor_fade` over `duration_frames`
+    /// (SE `ActorColorDriveTask`; xim EffectRoutineParser.kt parseSection2).
+    ActorFadeOnCaster,
+    ActorFadeOnTarget,
+
     FollowPoints,
     Unknown,
 }
@@ -245,6 +313,32 @@ impl StageKind {
             // damage/battle-message callback is invoked on (EffectRoutineInstance.kt handleDamageCallbackRoutine).
             // Every spell routine tail-calls a `mdam` sub-routine that holds exactly this stage.
             0x2B => Self::DamageCallback,
+            // research/xim EffectRoutineParser.kt parseSection2 - AnimationLockEffect; SE
+            // `BondageActor` / `LockCasterMagic`, xim treats both as the same lock. Retail's
+            // ActionTimer1 animation lock, refcounted across overlapping routines. The first
+            // form carries a zero dword after delay/duration; the magic form is argument-less.
+            ANIMATION_LOCK_OPCODE | ANIMATION_LOCK_MAGIC_OPCODE => Self::AnimationLock,
+            // research/xim EffectRoutineParser.kt parseSection2 - FlinchRoutine (SE `GetDamageDirId`
+            // picks the dfi/dbi/dfm/dbm front/back clip by hit direction).
+            FLINCH_CASTER_OPCODE => Self::FlinchOnCaster,
+            FLINCH_TARGET_OPCODE => Self::FlinchOnTarget,
+            // research/xim EffectRoutineParser.kt parseSection2 - TransitionToIdleEffect; the f32 at
+            // +8 is the transition time.
+            TRANSITION_TO_IDLE_OPCODE => Self::TransitionToIdle,
+            // research/xim EffectRoutineParser.kt parseSection2 - ActorFadeRoutine to the RGBA at +8
+            // over `duration_frames` (SE `ActorColorDriveTask`).
+            ACTOR_FADE_CASTER_OPCODE => Self::ActorFadeOnCaster,
+            ACTOR_FADE_TARGET_OPCODE => Self::ActorFadeOnTarget,
+            // research/xim EffectRoutineParser.kt parseSection2 - KnockBackEffect (SE tag table);
+            // the alternate opcode dispatches the same payload.
+            KNOCKBACK_OPCODE | KNOCKBACK_ALT_OPCODE => Self::Knockback,
+            // research/xim EffectRoutineParser.kt parseSection2 - StopRoutineEffect: stop the running
+            // routine named by `id`. The worm's `ini1` stops `init` and `init` stops `ini1`
+            // this way.
+            STOP_ROUTINE_OPCODE => Self::StopRoutine,
+            // research/xim EffectRoutineParser.kt parseSection2 - DisplayDeadRoutine: the actor is
+            // dead from this stage on.
+            DISPLAY_DEAD_OPCODE => Self::DisplayDead,
             // research/xim EffectRoutineParser.kt parseSection2 — LinkedEffectRoutine with
             // `blocking = true`: the same sub-routine call as 0x03, except the parent stalls
             // until the child finishes (EffectRoutineInstance.kt createChild `blockers += newSequences`).
@@ -365,8 +459,44 @@ impl Scheduler {
                 let screen_color = payload
                     .filter(|_| kind == StageKind::ScreenColorDrive)
                     .map(|rgba| ScreenColor { rgba });
+                // research/xim EffectRoutineParser.kt parseSection2 - the +8 dword of these
+                // kinds is a colour or a transition time, not a DatId.
+                let actor_fade = payload.filter(|_| {
+                    matches!(
+                        kind,
+                        StageKind::ActorFadeOnCaster | StageKind::ActorFadeOnTarget
+                    )
+                });
+                let idle_transition_time = payload
+                    .filter(|_| kind == StageKind::TransitionToIdle)
+                    .map(f32::from_le_bytes);
+                // Flinch animationDuration sits at +24, past the id slot - read it straight off
+                // the stage bytes when the full 9-dword payload is present.
+                let flinch_duration =
+                    (matches!(kind, StageKind::FlinchOnCaster | StageKind::FlinchOnTarget)
+                        && stage_bytes >= FLINCH_PAYLOAD_LEN)
+                        .then(|| {
+                            f32::from_le_bytes([
+                                body[cursor + FLINCH_ANIMATION_DURATION_OFFSET],
+                                body[cursor + FLINCH_ANIMATION_DURATION_OFFSET + 1],
+                                body[cursor + FLINCH_ANIMATION_DURATION_OFFSET + 2],
+                                body[cursor + FLINCH_ANIMATION_DURATION_OFFSET + 3],
+                            ])
+                        });
+                // Flinch and knockback payloads are floats/ints from +8 on (research/xim
+                // EffectRoutineParser.kt parseSection2), so their id slot is not a DatId either.
+                let non_id_payload = model_transform.is_some()
+                    || screen_color.is_some()
+                    || actor_fade.is_some()
+                    || idle_transition_time.is_some()
+                    || matches!(
+                        kind,
+                        StageKind::FlinchOnCaster
+                            | StageKind::FlinchOnTarget
+                            | StageKind::Knockback
+                    );
                 let id = match payload {
-                    Some(bytes) if model_transform.is_none() && screen_color.is_none() => bytes,
+                    Some(bytes) if !non_id_payload => bytes,
                     _ => NO_STAGE_ID,
                 };
                 let (max_loops, transition_in, transition_out) =
@@ -402,6 +532,9 @@ impl Scheduler {
                         }),
                         model_transform,
                         screen_color,
+                        actor_fade,
+                        idle_transition_time,
+                        flinch_duration,
                         random_group: open_group,
                         local_dir,
                     },
@@ -511,6 +644,54 @@ mod tests {
         assert_eq!(st.max_loops, 0);
         assert_eq!(st.transition_in, 0);
         assert_eq!(st.transition_out, 0);
+    }
+
+    // research/xim EffectRoutineParser.kt parseFlinchEffect: the flinch payload is
+    // f32, f32, u32, f32, f32 animationDuration, u32, u32 after delay/duration - a 9-dword
+    // stage. The bytes mirror Rarab's `damg` flinch (ROM/4/109.DAT): delay 2, duration 10.0.
+    #[test]
+    fn flinch_stage_captures_animation_duration_at_offset_24() {
+        let mut body = vec![0u8; SCHEDULER_HEADER_LEN];
+        for op in [FLINCH_CASTER_OPCODE, FLINCH_TARGET_OPCODE] {
+            body.extend_from_slice(&[op, FLINCH_STAGE_WORDS, 0, 0]);
+            body.extend_from_slice(&2u16.to_le_bytes()); // +4 delay
+            body.extend_from_slice(&0u16.to_le_bytes()); // +6 duration
+            body.extend_from_slice(&1.0f32.to_le_bytes()); // +8
+            body.extend_from_slice(&1.0f32.to_le_bytes()); // +12
+            body.extend_from_slice(&2u32.to_le_bytes()); // +16
+            body.extend_from_slice(&1.0f32.to_le_bytes()); // +20
+            body.extend_from_slice(&10.0f32.to_le_bytes()); // +24 animationDuration
+            body.extend_from_slice(&0u32.to_le_bytes()); // +28
+            body.extend_from_slice(&0u32.to_le_bytes()); // +32
+        }
+
+        let s = Scheduler::parse(*b"damg", &body).unwrap();
+        assert_eq!(s.stages.len(), 2);
+        for (i, want_kind) in [StageKind::FlinchOnCaster, StageKind::FlinchOnTarget]
+            .into_iter()
+            .enumerate()
+        {
+            let st = s.stages[i].stage;
+            assert_eq!(st.kind, want_kind, "opcode of stage {i}");
+            assert_eq!(st.flinch_duration, Some(10.0), "animationDuration at +24");
+            // The flinch payload's id slot is not a DatId (XIM reads no ref there).
+            assert_eq!(&st.id, &[0; 4]);
+        }
+    }
+
+    // A flinch stage shorter than the full payload carries no animationDuration: the consumer
+    // must fall back to its default transitions rather than reading past the stage.
+    #[test]
+    fn short_flinch_stage_has_no_animation_duration() {
+        let mut body = vec![0u8; SCHEDULER_HEADER_LEN];
+        body.extend_from_slice(&[FLINCH_CASTER_OPCODE, ARGLESS_STAGE_WORDS + 1, 0, 0]);
+        body.extend_from_slice(&2u16.to_le_bytes());
+        body.extend_from_slice(&0u16.to_le_bytes());
+        body.extend_from_slice(&[0u8; 4]); // +8 id slot - not a DatId for flinch
+
+        let s = Scheduler::parse(*b"damg", &body).unwrap();
+        assert_eq!(s.stages[0].stage.kind, StageKind::FlinchOnCaster);
+        assert_eq!(s.stages[0].stage.flinch_duration, None);
     }
 
     #[test]
@@ -1256,14 +1437,139 @@ mod tests {
 
     // research/xim EffectRoutineParser.kt parseSection2 AnimationLockEffect — an argument-less opcode,
     // so the stage is 8 bytes and carries only delay/duration.
-    const ANIMATION_LOCK_OPCODE: u8 = 0x07;
     const ARGLESS_STAGE_WORDS: u8 = (STAGE_HEADER_LEN / 4) as u8;
+    const FLINCH_STAGE_WORDS: u8 = ((STAGE_HEADER_LEN + FLINCH_PAYLOAD_LEN) / 4) as u8;
+    const KNOCKBACK_PAYLOAD_LEN: usize = 16;
+    const KNOCKBACK_STAGE_WORDS: u8 = ((STAGE_HEADER_LEN + KNOCKBACK_PAYLOAD_LEN) / 4) as u8;
 
     fn timed_stage_bytes(opcode: u8, length_words: u8, delay: u16, duration: u16) -> Vec<u8> {
         let mut b = vec![opcode, length_words, 0, 0];
         b.extend_from_slice(&delay.to_le_bytes());
         b.extend_from_slice(&duration.to_le_bytes());
         b
+    }
+
+    // Opcodes cross-checked against research/xim EffectRoutineParser.kt parseSection2 on a
+    // synthetic body: a lock, a stop of the routine named `init`, and a fade to neutral.
+    #[test]
+    fn mob_routine_opcodes_decode_lock_stop_and_fade() {
+        const LOCK_TICKS: u16 = 112;
+        const FADE_TICKS: u16 = 60;
+        const LOCK_STAGE_WORDS: u8 = ARGLESS_STAGE_WORDS + 1;
+        const NAMED_STAGE_WORDS: u8 = ARGLESS_STAGE_WORDS + 2;
+        let mut body = vec![0u8; SCHEDULER_HEADER_LEN];
+        body.extend(timed_stage_bytes(
+            ANIMATION_LOCK_OPCODE,
+            LOCK_STAGE_WORDS,
+            0,
+            LOCK_TICKS,
+        ));
+        body.extend_from_slice(&0u32.to_le_bytes()); // xim expectZero32
+        body.extend(timed_stage_bytes(
+            STOP_ROUTINE_OPCODE,
+            NAMED_STAGE_WORDS,
+            0,
+            0,
+        ));
+        body.extend_from_slice(b"init");
+        body.extend_from_slice(&0u32.to_le_bytes()); // xim expectZero32
+        body.extend(timed_stage_bytes(
+            ACTOR_FADE_CASTER_OPCODE,
+            NAMED_STAGE_WORDS,
+            0,
+            FADE_TICKS,
+        ));
+        body.extend_from_slice(&ACTOR_FADE_NEUTRAL);
+        body.extend_from_slice(&0u32.to_le_bytes()); // xim expectZero32
+
+        let s = Scheduler::parse(*b"ini1", &body).unwrap();
+        assert_eq!(s.stages.len(), 3);
+        let lock = s.stages[0].stage;
+        assert_eq!(lock.kind, StageKind::AnimationLock);
+        assert_eq!(lock.duration_frames, LOCK_TICKS);
+        assert_eq!(lock.id, NO_STAGE_ID);
+        let stop = s.stages[1].stage;
+        assert_eq!(stop.kind, StageKind::StopRoutine);
+        assert_eq!(&stop.id, b"init");
+        let fade = s.stages[2].stage;
+        assert_eq!(fade.kind, StageKind::ActorFadeOnCaster);
+        assert_eq!(fade.duration_frames, FADE_TICKS);
+        assert_eq!(fade.actor_fade, Some(ACTOR_FADE_NEUTRAL));
+        assert_eq!(
+            fade.id, NO_STAGE_ID,
+            "the fade destination must not read as a DatId"
+        );
+    }
+
+    #[test]
+    fn mob_routine_opcodes_map_to_their_kinds() {
+        for (opcode, words, kind) in [
+            (ANIMATION_LOCK_MAGIC_OPCODE, 2, StageKind::AnimationLock),
+            (FLINCH_CASTER_OPCODE, 3, StageKind::FlinchOnCaster),
+            (FLINCH_TARGET_OPCODE, 3, StageKind::FlinchOnTarget),
+            (
+                KNOCKBACK_OPCODE,
+                KNOCKBACK_STAGE_WORDS as usize,
+                StageKind::Knockback,
+            ),
+            (
+                KNOCKBACK_ALT_OPCODE,
+                KNOCKBACK_STAGE_WORDS as usize,
+                StageKind::Knockback,
+            ),
+            (DISPLAY_DEAD_OPCODE, 5, StageKind::DisplayDead),
+            (TRANSITION_TO_IDLE_OPCODE, 3, StageKind::TransitionToIdle),
+            (ACTOR_FADE_TARGET_OPCODE, 4, StageKind::ActorFadeOnTarget),
+        ] {
+            assert_eq!(
+                StageKind::from_stage(opcode, words),
+                kind,
+                "opcode {opcode:#x}"
+            );
+        }
+    }
+
+    // The flinch and knockback payloads are floats/ints from +8 on (research/xim
+    // EffectRoutineParser.kt parseSection2), so their id slot must not surface as a DatId.
+    #[test]
+    fn flinch_and_knockback_payloads_are_not_datids() {
+        let mut body = vec![0u8; SCHEDULER_HEADER_LEN];
+        body.extend(timed_stage_bytes(
+            FLINCH_CASTER_OPCODE,
+            FLINCH_STAGE_WORDS,
+            0,
+            0,
+        ));
+        body.extend(std::iter::repeat_n(0u8, FLINCH_PAYLOAD_LEN));
+        // Knockback payload: u16 u16 f32 f32 u32.
+        body.extend(timed_stage_bytes(
+            KNOCKBACK_OPCODE,
+            KNOCKBACK_STAGE_WORDS,
+            0,
+            0,
+        ));
+        body.extend(std::iter::repeat_n(0u8, KNOCKBACK_PAYLOAD_LEN));
+
+        let s = Scheduler::parse(*b"damg", &body).unwrap();
+        assert_eq!(s.stages[0].stage.kind, StageKind::FlinchOnCaster);
+        assert_eq!(s.stages[0].stage.id, NO_STAGE_ID);
+        assert_eq!(s.stages[1].stage.kind, StageKind::Knockback);
+        assert_eq!(s.stages[1].stage.id, NO_STAGE_ID);
+    }
+
+    // The 0x28 payload is an f32 transition time in the id slot (research/xim
+    // EffectRoutineParser.kt parseSection2).
+    #[test]
+    fn transition_to_idle_reads_the_f32_payload() {
+        let mut body = vec![0u8; SCHEDULER_HEADER_LEN];
+        body.extend(timed_stage_bytes(0x28, 0x03, 0, 0));
+        body.extend_from_slice(&1.5f32.to_le_bytes());
+
+        let s = Scheduler::parse(*b"dead", &body).unwrap();
+        let st = s.stages[0].stage;
+        assert_eq!(st.kind, StageKind::TransitionToIdle);
+        assert_eq!(st.idle_transition_time, Some(1.5));
+        assert_eq!(st.id, NO_STAGE_ID);
     }
 
     // research/xim EffectRoutineParser.kt parseSection2 — delay is read for EVERY opcode, so an 8-byte

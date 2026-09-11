@@ -1,6 +1,48 @@
 // vendor/server/src/map/enums/action/category.h ActionCategory BasicAttack — `action.cmd_no`, 4 bits.
 pub const CATEGORY_BASIC_ATTACK: u8 = 1;
 
+// vendor/server/src/map/enums/action/info.h ActionInfo - the per-result `info` bits of a basic
+// attack. Other categories overload the same bits (Dancer step levels, Rune Fencer runes), so
+// only read them behind a CATEGORY_BASIC_ATTACK gate.
+pub const INFO_DEFEATED: u8 = 1;
+pub const INFO_CRITICAL_HIT: u8 = 2;
+
+// The outcome bits that follow `animation` in every result block of
+// vendor/server/src/map/packets/s2c/0x028_battle2.cpp GP_SERV_COMMAND_BATTLE2::pack:
+// info(5), hitDistortion(2), knockback(3). `hit_distortion` is the damage as a share of the
+// target's max HP (vendor/server/src/map/action/action.cpp action_result_t::recordDamage), not
+// the crit flag: a crit is `info & INFO_CRITICAL_HIT`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct ResultOutcome {
+    pub info: u8,
+    /// vendor/server/src/map/enums/action/hit_distortion.h HitDistortion, 0..=3.
+    pub hit_distortion: u8,
+    /// vendor/server/src/map/enums/action/knockback.h Knockback, 0..=7.
+    pub knockback: u8,
+}
+
+impl ResultOutcome {
+    pub const fn from_wire(info: u8, hit_distortion: u8, knockback: u8) -> Self {
+        Self {
+            info,
+            hit_distortion,
+            knockback,
+        }
+    }
+
+    pub const fn to_wire(self) -> (u8, u8, u8) {
+        (self.info, self.hit_distortion, self.knockback)
+    }
+
+    pub const fn is_critical(self) -> bool {
+        self.info & INFO_CRITICAL_HIT != 0
+    }
+
+    pub const fn defeated(self) -> bool {
+        self.info & INFO_DEFEATED != 0
+    }
+}
+
 // vendor/server/src/map/enums/action/resolution.h — `result.resolution`, 3 bits in
 // vendor/server/src/map/packets/s2c/0x028_battle2.cpp GP_SERV_COMMAND_BATTLE2::pack.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -70,9 +112,10 @@ impl AttackAnimation {
     }
 }
 
-// vendor/server/src/map/packets/s2c/0x028_battle2.cpp GP_SERV_COMMAND_BATTLE2::pack — one result block's
-// resolution(3)/animation(12) pair. A body that carries no result block, or that ends mid-block,
-// has no pair at all: `resolution == 0` is `Hit`, so absence must not be spelled as zero.
+// vendor/server/src/map/packets/s2c/0x028_battle2.cpp GP_SERV_COMMAND_BATTLE2::pack - one
+// result block's bits: resolution(3), kind(2), animation(12), info(5), hitDistortion(2),
+// knockback(3). A body that carries no result block, or that ends mid-block, has none of them
+// at all: `resolution == 0` is `Hit`, so absence must not be spelled as zero.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MeleeResult {
     pub resolution: ActionResolution,
@@ -106,6 +149,21 @@ mod tests {
         }
         assert_eq!(MeleeResult::from_wire(5, 0), None);
         assert_eq!(MeleeResult::from_wire(0, 5), None);
+    }
+
+    // The outcome bits ride through unvalidated: the bit reader already bounds them to their
+    // field widths (info 5, hitDistortion 2, knockback 3).
+    #[test]
+    fn outcome_bits_roundtrip_and_flags() {
+        let o = ResultOutcome::from_wire(INFO_CRITICAL_HIT, 3, 2);
+        assert_eq!(o.to_wire(), (INFO_CRITICAL_HIT, 3, 2));
+        assert!(o.is_critical());
+        assert!(!o.defeated());
+        // recordDamage sets hitDistortion from the damage share alone: Heavy without the flag
+        // is not a crit, and a crit can land Light.
+        assert!(!ResultOutcome::from_wire(0, 3, 0).is_critical());
+        assert!(ResultOutcome::from_wire(INFO_CRITICAL_HIT, 1, 0).is_critical());
+        assert!(ResultOutcome::from_wire(INFO_DEFEATED, 0, 0).defeated());
     }
 
     #[test]
