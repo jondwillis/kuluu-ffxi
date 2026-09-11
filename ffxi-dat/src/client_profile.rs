@@ -106,7 +106,7 @@ pub const KNOWN_CLIENTS: &[KnownClient] = &[
         patch_version: None,
         item_layout: ItemBlockLayout::Legacy,
     },
-    // retail-2019-base patched by `cargo xtask game --update` (ffxi-install's
+    // retail-2019-base patched by `cargo xtask ffxi-client update` (ffxi-install's
     // PlayOnline patch client) to the server's 2026-09-04 release.
     KnownClient {
         name: "retail-2026-09",

@@ -1,28 +1,34 @@
 //! Project automation, invoked via the `cargo xtask` alias (.cargo/config.toml).
 //!
-//! ## `cargo xtask game [PATH] [--target NAME] [--copy] [--force]`
+//! ## `cargo xtask ffxi-client <verb>`
 //!
-//! Wire a retail FFXI install into `vendor/game-files/` so the client finds it
-//! by default (it reads `vendor/game-files/SquareEnix/FINAL FANTASY XI`, or
-//! wherever `FFXI_DAT_PATH` points). Detects an existing install (HorizonXI /
-//! Lutris / Wine / CrossOver / PlayOnline / a Parallels shared drive),
-//! validates it, and symlinks it into place. Pass an explicit PATH to skip
-//! detection; `--copy` to copy instead of symlink; `--force` to replace an
-//! existing link. `--target NAME` wires it as a named install under
-//! `vendor/game-files/targets/NAME/` instead, leaving the default alone; the
-//! client selects it with `FFXI_CLIENT_TARGET=NAME`. `--list` shows the
-//! default and every named target.
+//! Wire, list, download or patch the FFXI client installs under
+//! `vendor/game-files/`, the workspace-side install roots (the default
+//! `vendor/game-files/SquareEnix/FINAL FANTASY XI` plus named targets under
+//! `vendor/game-files/targets/NAME/`). What the client actually loads is
+//! decided by `kuluu ffxi-client which`, which also knows the launcher's
+//! saved choice and the per-user client directory; this tool only manages
+//! the checkout.
 //!
-//! ## `cargo xtask game --download [--region us|eu] [--target NAME] [--yes]`
+//! - `link [PATH] [--target NAME] [--copy] [--force]`: detect an existing
+//!   install (HorizonXI / Lutris / Wine / CrossOver / PlayOnline / a Parallels
+//!   shared drive) or take PATH, validate it, and symlink it into place;
+//!   `--copy` copies instead, `--force` replaces an existing link.
+//! - `list`: the default install and every named target.
+//! - `download [--region us|eu] [--target NAME] [--yes] [--no-update]`:
+//!   opt-in, confirmation-gated download of Square Enix's official installer
+//!   from the public PlayOnline CDN, unpacked natively by `ffxi-install`
+//!   (RAR volumes, MSIs and cabinets; no Wine) into `targets/NAME` (default
+//!   `retail`), then patched to the current version unless `--no-update`.
+//! - `update (PATH | --target NAME) [--verify] [--yes]`: patch an install to
+//!   the current retail version over the PlayOnline patch protocol (no
+//!   viewer, no Wine). The unnamed default is never patched implicitly: it is
+//!   usually a private server's pinned client, which retail patches would
+//!   break. `--verify` re-checks every file even when the manifest stamp is
+//!   already current.
 //!
-//! Opt-in (and confirmation-gated): download Square Enix's official FFXI client
-//! installer from the public PlayOnline CDN and unpack it natively (the
-//! `ffxi-install` crate reads the RAR volumes, MSIs and cabinets itself; no
-//! Wine, no installer GUI) into `vendor/game-files/targets/NAME/` (default
-//! `retail`). That is SE's 2019 base image; `cargo xtask game --update` then
-//! patches it to the current client by speaking the PlayOnline patch protocol
-//! itself (no viewer, no Wine). Downloading the client is free; a
-//! registration code / subscription is needed to *play*.
+//! Downloading the client is free; a registration code / subscription is
+//! needed to *play* on the official service.
 //!
 //! ## `cargo xtask install-hooks [--check]`
 //!
@@ -66,13 +72,18 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        Some("game") => match cmd_game(&args[1..]) {
+        Some("ffxi-client") => match cmd_ffxi_client(&args[1..]) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("error: {e}");
                 ExitCode::FAILURE
             }
         },
+        Some("game") => {
+            eprintln!("`cargo xtask game` is now `cargo xtask ffxi-client <verb>`\n");
+            usage();
+            ExitCode::FAILURE
+        }
         Some("install-hooks") => match cmd_install_hooks(&args[1..]) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
@@ -94,25 +105,28 @@ fn main() -> ExitCode {
 
 fn usage() {
     eprintln!(
-        "usage: cargo xtask game [PATH] [--target NAME] [--copy] [--force]\n\
-         \x20      cargo xtask game --list\n\
-         \x20      cargo xtask game --update [PATH | --target NAME]\n\
-         \x20      cargo xtask game --download [--region us|eu] [--yes]\n\
+        "usage: cargo xtask ffxi-client link [PATH] [--target NAME] [--copy] [--force]\n\
+         \x20      cargo xtask ffxi-client list\n\
+         \x20      cargo xtask ffxi-client download [--region us|eu] [--target NAME] [--yes] [--no-update]\n\
+         \x20      cargo xtask ffxi-client update (PATH | --target NAME) [--verify] [--yes]\n\
          \x20      cargo xtask install-hooks [--check]\n\
          \n\
-         Wire a retail FFXI install into vendor/game-files/.\n\
-         PATH        an install dir to use (skips auto-detection)\n\
-         --target    wire under vendor/game-files/targets/NAME/ instead of the\n\
-         \x20           default; select it at runtime with FFXI_CLIENT_TARGET=NAME\n\
-         --list      show the default install and every named target\n\
-         --update    patch the install to the current retail version over the\n\
-         \x20           PlayOnline patch protocol (--force re-verifies every file)\n\
-         --copy      copy the install instead of symlinking it\n\
-         --force     replace an existing vendor/game-files link\n\
-         --download  download SE's official client installer and unpack it natively\n\
-         \x20           into vendor/game-files/targets/NAME (default: retail)\n\
-         --region    us (default) or eu, for --download\n\
-         --yes       skip the --download confirmation prompt\n\
+         Manage the FFXI client installs under vendor/game-files/ (the checkout side;\n\
+         `kuluu ffxi-client which` tells you what the client will actually load).\n\
+         link        wire an install: PATH, or auto-detect one\n\
+         list        show the default install and every named target\n\
+         download    fetch SE's official installer, unpack it natively into\n\
+         \x20           targets/NAME (default: retail), then update it\n\
+         update      patch an install to the current retail version over the\n\
+         \x20           PlayOnline patch protocol; never the unnamed default\n\
+         --target    a named install under vendor/game-files/targets/NAME/;\n\
+         \x20           select it at runtime with FFXI_CLIENT_TARGET=NAME\n\
+         --copy      copy instead of symlinking (link)\n\
+         --force     replace an existing link (link)\n\
+         --verify    re-check every file, not just the manifest stamp (update)\n\
+         --no-update leave the 2019 base image unpatched (download)\n\
+         --region    us (default) or eu (download)\n\
+         --yes       skip confirmation prompts\n\
          \n\
          DLSS: cargo xtask dlss <check|build>\n\
          \n\
@@ -121,113 +135,166 @@ fn usage() {
     );
 }
 
-fn cmd_game(args: &[String]) -> Result<(), String> {
-    let mut explicit: Option<PathBuf> = None;
-    let mut copy = false;
-    let mut force = false;
-    let mut download = false;
-    let mut list = false;
-    let mut update = false;
-    let mut yes = false;
-    let mut region = String::from("us");
-    let mut target: Option<String> = None;
-    let mut it = args.iter();
-    while let Some(a) = it.next() {
-        match a.as_str() {
-            "--copy" => copy = true,
-            "--force" => force = true,
-            "--download" => download = true,
-            "--list" => list = true,
-            "--update" => update = true,
-            "--yes" | "-y" => yes = true,
-            "--target" => {
-                let name = it.next().ok_or("--target needs a NAME")?;
-                if name.is_empty()
-                    || !name
-                        .bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-                {
-                    return Err(format!(
-                        "--target `{name}` must be [A-Za-z0-9_-]+ (it becomes a directory name)"
-                    ));
+#[derive(Default)]
+struct ClientArgs {
+    path: Option<PathBuf>,
+    target: Option<String>,
+    copy: bool,
+    force: bool,
+    verify: bool,
+    yes: bool,
+    no_update: bool,
+    region: Option<String>,
+    given: Vec<&'static str>,
+}
+
+const FLAGS_LINK: &[&str] = &["--target", "--copy", "--force"];
+const FLAGS_LIST: &[&str] = &[];
+const FLAGS_DOWNLOAD: &[&str] = &["--target", "--region", "--yes", "--no-update"];
+const FLAGS_UPDATE: &[&str] = &["--target", "--verify", "--yes"];
+
+impl ClientArgs {
+    fn parse(args: &[String]) -> Result<Self, String> {
+        let mut out = Self::default();
+        let mut it = args.iter();
+        while let Some(a) = it.next() {
+            match a.as_str() {
+                "--copy" => {
+                    out.copy = true;
+                    out.given.push("--copy");
                 }
-                target = Some(name.clone());
+                "--force" => {
+                    out.force = true;
+                    out.given.push("--force");
+                }
+                "--verify" => {
+                    out.verify = true;
+                    out.given.push("--verify");
+                }
+                "--no-update" => {
+                    out.no_update = true;
+                    out.given.push("--no-update");
+                }
+                "--yes" | "-y" => {
+                    out.yes = true;
+                    out.given.push("--yes");
+                }
+                "--target" => {
+                    let name = it.next().ok_or("--target needs a NAME")?;
+                    if name.is_empty()
+                        || !name
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                    {
+                        return Err(format!(
+                            "--target `{name}` must be [A-Za-z0-9_-]+ (it becomes a directory name)"
+                        ));
+                    }
+                    out.target = Some(name.clone());
+                    out.given.push("--target");
+                }
+                "--region" => {
+                    out.region = Some(
+                        it.next()
+                            .ok_or("--region needs a value (us|eu)")?
+                            .to_lowercase(),
+                    );
+                    out.given.push("--region");
+                }
+                s if s.starts_with('-') => return Err(format!("unknown flag `{s}`")),
+                s => out.path = Some(PathBuf::from(s)),
             }
-            "--region" => {
-                region = it
-                    .next()
-                    .ok_or("--region needs a value (us|eu)")?
-                    .to_lowercase();
-            }
-            s if s.starts_with("--") => return Err(format!("unknown flag `{s}`")),
-            s => explicit = Some(PathBuf::from(s)),
         }
+        Ok(out)
     }
 
+    fn only(&self, verb: &str, allowed: &[&str], takes_path: bool) -> Result<(), String> {
+        if let Some(flag) = self.given.iter().find(|f| !allowed.contains(f)) {
+            return Err(format!("`{verb}` does not take {flag}"));
+        }
+        if !takes_path {
+            if let Some(p) = &self.path {
+                return Err(format!("`{verb}` does not take a path ({})", p.display()));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn cmd_ffxi_client(args: &[String]) -> Result<(), String> {
+    let Some((verb, rest)) = args.split_first() else {
+        usage();
+        return Err("ffxi-client needs a verb (link|list|download|update)".into());
+    };
+    let opts = ClientArgs::parse(rest)?;
     let workspace = workspace_root();
+    match verb.as_str() {
+        "link" => {
+            opts.only("link", FLAGS_LINK, true)?;
+            link_install(&workspace, &opts)
+        }
+        "list" => {
+            opts.only("list", FLAGS_LIST, false)?;
+            list_installs(&workspace)
+        }
+        "download" => {
+            opts.only("download", FLAGS_DOWNLOAD, false)?;
+            download_official(&workspace, &opts)
+        }
+        "update" => {
+            opts.only("update", FLAGS_UPDATE, true)?;
+            update_verb(&workspace, &opts)
+        }
+        other => Err(format!(
+            "unknown verb `{other}` (link|list|download|update)"
+        )),
+    }
+}
 
-    if download {
-        return download_official(
-            &region,
-            yes,
-            &workspace,
-            target.as_deref().unwrap_or(DEFAULT_DOWNLOAD_TARGET),
-        );
-    }
-    if list {
-        return list_installs(&workspace);
-    }
+/// `SquareEnix/` parent and the DAT root for the default install or a named target.
+fn install_dirs(workspace: &Path, target: Option<&str>) -> (PathBuf, PathBuf) {
     let game_files = workspace.join(GAME_FILES);
-    let dest_se = match &target {
+    let dest_se = match target {
         Some(name) => game_files.join(TARGETS).join(name).join(SQUARE_ENIX),
         None => game_files.join(SQUARE_ENIX),
     };
     let dest = dest_se.join(FFXI);
+    (dest_se, dest)
+}
 
-    if update {
-        let root = match explicit {
-            Some(p) => find_ffxi_root(&p, SEARCH_DEPTH)
-                .ok_or_else(|| format!("no FFXI install found at or under {}", p.display()))?,
-            None if is_ffxi_root(&dest) => dest,
-            None => return Err(format!("{} holds no install to update", show(&dest))),
-        };
-        return update_install(&root, force);
-    }
+fn link_install(workspace: &Path, opts: &ClientArgs) -> Result<(), String> {
+    let (dest_se, dest) = install_dirs(workspace, opts.target.as_deref());
 
-    // Already wired up and valid? Nothing to do.
     if is_ffxi_root(&dest) {
         println!(
             "{} already has a valid install:\n  {}",
             show(&dest_se),
             show(&dest)
         );
-        print_env_hint(&dest, target.as_deref());
+        print_env_hint(&dest, opts.target.as_deref());
         return Ok(());
     }
 
-    // Resolve the source install: explicit path, else auto-detect.
-    let source = match explicit {
-        Some(p) => {
-            let found = find_ffxi_root(&p, SEARCH_DEPTH);
-            found.ok_or_else(|| {
-                format!(
-                    "no FFXI install (a dir containing {MARKER}) found at or under {}",
-                    p.display()
-                )
-            })?
-        }
+    let source = match &opts.path {
+        Some(p) => find_ffxi_root(p, SEARCH_DEPTH).ok_or_else(|| {
+            format!(
+                "no FFXI install (a dir containing {MARKER}) found at or under {}",
+                p.display()
+            )
+        })?,
         None => {
             let mut hits = detect();
             hits.dedup();
             match hits.len() {
-                0 => {
-                    return Err(no_install_help());
-                }
+                0 => return Err(no_install_help()),
                 1 => hits.into_iter().next().unwrap(),
                 _ => {
-                    let mut msg = String::from("multiple installs detected — re-run with one:\n");
+                    let mut msg = String::from("multiple installs detected; re-run with one:\n");
                     for h in &hits {
-                        msg.push_str(&format!("  cargo xtask game \"{}\"\n", h.display()));
+                        msg.push_str(&format!(
+                            "  cargo xtask ffxi-client link \"{}\"\n",
+                            h.display()
+                        ));
                     }
                     return Err(msg);
                 }
@@ -237,9 +304,8 @@ fn cmd_game(args: &[String]) -> Result<(), String> {
 
     println!("Using install: {}", source.display());
 
-    // Refuse to clobber a real directory (only ever replace our own symlink).
     if dest.exists() || is_symlink(&dest) {
-        if is_symlink(&dest) && force {
+        if is_symlink(&dest) && opts.force {
             std::fs::remove_file(&dest)
                 .map_err(|e| format!("removing old link {}: {e}", dest.display()))?;
         } else if is_symlink(&dest) {
@@ -252,7 +318,7 @@ fn cmd_game(args: &[String]) -> Result<(), String> {
             ));
         } else {
             return Err(format!(
-                "{} already exists and is not a symlink — move it aside first.",
+                "{} already exists and is not a symlink; move it aside first.",
                 dest.display()
             ));
         }
@@ -261,7 +327,7 @@ fn cmd_game(args: &[String]) -> Result<(), String> {
     std::fs::create_dir_all(&dest_se)
         .map_err(|e| format!("creating {}: {e}", dest_se.display()))?;
 
-    if copy {
+    if opts.copy {
         println!("Copying (this can be ~19 GB) ...");
         copy_dir(&source, &dest)?;
     } else {
@@ -271,22 +337,53 @@ fn cmd_game(args: &[String]) -> Result<(), String> {
 
     if !is_ffxi_root(&dest) {
         return Err(format!(
-            "wired {} but it does not validate ({MARKER} missing) — install may be incomplete",
+            "wired {} but it does not validate ({MARKER} missing); install may be incomplete",
             dest.display()
         ));
     }
     println!("OK: {} is ready.", show(&dest_se));
-    print_env_hint(&dest, target.as_deref());
+    print_env_hint(&dest, opts.target.as_deref());
     Ok(())
+}
+
+fn update_verb(workspace: &Path, opts: &ClientArgs) -> Result<(), String> {
+    let root = match (&opts.path, &opts.target) {
+        (Some(p), _) => find_ffxi_root(p, SEARCH_DEPTH)
+            .ok_or_else(|| format!("no FFXI install found at or under {}", p.display()))?,
+        (None, Some(name)) => {
+            let (_, dest) = install_dirs(workspace, Some(name));
+            if !is_ffxi_root(&dest) {
+                return Err(format!("{} holds no install to update", show(&dest)));
+            }
+            dest
+        }
+        (None, None) => {
+            return Err(
+                "update needs a PATH or --target NAME. The unnamed default install is \
+                 never patched implicitly: it is usually a private server's pinned client, \
+                 and retail patches would break it."
+                    .into(),
+            )
+        }
+    };
+    println!(
+        "Install: {}\nLocal patch version: {}",
+        root.display(),
+        ffxi_install::update::local_version(&root).unwrap_or_else(|| "none".into())
+    );
+    if !opts.yes && !confirm("Patch this install toward the current retail version?")? {
+        return Err("aborted".into());
+    }
+    update_install(&root, opts.verify)
 }
 
 /// Patch an install to the current retail version by speaking the
 /// PlayOnline patch protocol directly (`ffxi_install::update`); nothing of
 /// SE's viewer runs.
-fn update_install(root: &Path, force: bool) -> Result<(), String> {
-    let options = ffxi_install::update::Options { force };
-    match ffxi_install::update::run(root, options, &print_progress)? {
-        None => println!("already at the server's version; pass --force to re-verify every file"),
+fn update_install(root: &Path, verify: bool) -> Result<(), String> {
+    let options = ffxi_install::update::Options { force: verify };
+    match ffxi_install::update::run(root, options, &ffxi_install::report::print_progress)? {
+        None => println!("already at the server's version; pass --verify to re-check every file"),
         Some(outcome) => println!(
             "now at {} ({} file(s) fetched, {} MB)",
             outcome.version,
@@ -331,8 +428,9 @@ fn list_installs(workspace: &Path) -> Result<(), String> {
         println!("{name:<9} {}  {}", show(&dir), describe(&dir));
     }
     println!(
-        "\nSelect a named target with {CLIENT_TARGET_ENV}=NAME; identify a build with\n  \
-         cargo run -p ffxi-dat --example dat-client-profile -- <install dir>"
+        "\nSelect a named target with {CLIENT_TARGET_ENV}=NAME, or persist a choice with\n  \
+         cargo run -p kuluu -- ffxi-client use NAME\n\
+         `cargo run -p kuluu -- ffxi-client which` shows what the client will load."
     );
     Ok(())
 }
@@ -546,11 +644,12 @@ fn detect() -> Vec<PathBuf> {
 fn print_env_hint(dest: &Path, target: Option<&str>) {
     match target {
         Some(name) => println!(
-            "\nThe client uses vendor/game-files by default. To use this target instead, set:\n  \
-             export {CLIENT_TARGET_ENV}={name}"
+            "\nThe client uses vendor/game-files by default. To use this target instead:\n  \
+             export {CLIENT_TARGET_ENV}={name}        # this shell\n  \
+             cargo run -p kuluu -- ffxi-client use {name}   # persisted for the launcher"
         ),
         None => println!(
-            "\nThe client uses vendor/game-files by default. To point elsewhere, set:\n  \
+            "\nThe client uses vendor/game-files by default. To point elsewhere:\n  \
              export FFXI_DAT_PATH=\"{}\"",
             dest.display()
         ),
@@ -561,31 +660,33 @@ fn no_install_help() -> String {
     format!(
         "no FFXI install detected.\n\
          Get one (see README \"Getting the game files\"), then re-run:\n\
+         \x20 - cargo xtask ffxi-client download   (Square Enix's official client)\n\
          \x20 - HorizonXI launcher (Windows): https://horizonxi.com\n\
          \x20 - Lutris (Linux):               https://lutris.net/games/horizonxi/\n\
-         \x20 - or pass a path: cargo xtask game \"/path/to/.../{SQUARE_ENIX}/{FFXI}\""
+         \x20 - or pass a path: cargo xtask ffxi-client link \"/path/to/.../{SQUARE_ENIX}/{FFXI}\""
     )
 }
 
 // --- official-client download (opt-in, confirmation-gated) ---
 
-fn download_official(
-    region: &str,
-    yes: bool,
-    workspace: &Path,
-    target: &str,
-) -> Result<(), String> {
-    let region = ffxi_install::region(region)?;
+fn download_official(workspace: &Path, opts: &ClientArgs) -> Result<(), String> {
+    let region = ffxi_install::region(opts.region.as_deref().unwrap_or("us"))?;
+    let target = opts.target.as_deref().unwrap_or(DEFAULT_DOWNLOAD_TARGET);
     let installer_dir = workspace.join("target/ffxi-installer");
     let target_root = workspace.join(GAME_FILES).join(TARGETS).join(target);
     println!(
         "This downloads Square Enix's official FINAL FANTASY XI client installer\n\
-         (5 volumes, ~7.2 GB) from {}/{}/ and unpacks it into\n  {}",
+         (5 volumes, ~7.2 GB) from {}/{}/ and unpacks it into\n  {}{}",
         ffxi_install::CDN_BASE,
         region.sub,
-        show(&target_root)
+        show(&target_root),
+        if opts.no_update {
+            ""
+        } else {
+            "\nthen patches it to the current retail version (~0.5 GB more)."
+        }
     );
-    if !yes && !confirm("Proceed?")? {
+    if !opts.yes && !confirm("Proceed?")? {
         return Err("aborted".into());
     }
     require_tool("curl")?;
@@ -594,7 +695,7 @@ fn download_official(
         installer_dir: &installer_dir,
         target_root: &target_root,
     };
-    ffxi_install::download_and_unpack(&plan, &print_progress)?;
+    ffxi_install::download_and_unpack(&plan, &ffxi_install::report::print_progress)?;
     let ffxi = target_root.join(SQUARE_ENIX).join(FFXI);
     if !is_ffxi_root(&ffxi) {
         return Err(format!(
@@ -602,118 +703,16 @@ fn download_official(
             ffxi.display()
         ));
     }
-    println!(
-        "\nThis is SE's 2019 base image; patch it to the current version with\n  \
-         cargo xtask game --update --target {target}\n\
-         and select it with\n  export {CLIENT_TARGET_ENV}={target}"
-    );
+    if opts.no_update {
+        println!(
+            "\nThis is SE's 2019 base image; patch it later with\n  \
+             cargo xtask ffxi-client update --target {target}"
+        );
+    } else {
+        update_install(&ffxi, false)?;
+    }
+    print_env_hint(&ffxi, Some(target));
     Ok(())
-}
-
-fn print_progress(p: ffxi_install::Progress) {
-    use ffxi_install::Progress::*;
-    match p {
-        VolumeCached { index } => println!("volume {index}: already downloaded"),
-        VolumeDownloading { index, url } => println!("volume {index}: downloading {url}"),
-        VolumeReady {
-            index,
-            complete_members,
-        } => println!("volume {index}: ready, {complete_members} member(s) complete"),
-        MemberExtracting { name } => println!("  extracting {name} ..."),
-        MemberExtracted { name, millis } => println!("  extracted {name} ({millis} ms)"),
-        CabDecoding { name, files } => println!("  decoding {name}: {files} file(s)"),
-        CabProgress { name, done, files } => println!("  decoding {name}: {done}/{files}"),
-        CabDecoded {
-            name,
-            new_files,
-            millis,
-        } => println!("  decoded {name}: {new_files} new file(s) ({millis} ms)"),
-        FilesOutsideInstallIgnored { msi, count } => {
-            println!("  {msi}: {count} file(s) outside SquareEnix/ ignored")
-        }
-        MsiPlaced { msi, files } => println!("placed {files} file(s) from {msi}"),
-        Finished { files, target_root } => {
-            println!("unpacked {files} file(s) into {}", target_root.display())
-        }
-        UpdateVersion {
-            local,
-            server,
-            release_unix,
-        } => println!(
-            "server version {server} (released {}); local {}",
-            unix_date(release_unix),
-            local.as_deref().unwrap_or("unversioned")
-        ),
-        UpdateScanning { done, total } => println!("checking local files: {done}/{total}"),
-        UpdatePlanned {
-            files,
-            current,
-            to_fetch,
-            bytes,
-        } => println!(
-            "{files} file(s) in manifest: {current} current, {to_fetch} to fetch ({} MB)",
-            bytes / 1_000_000
-        ),
-        UpdateFile {
-            index,
-            count,
-            path,
-            bytes,
-        } => println!("[{}/{count}] {path} ({bytes} bytes)", index + 1),
-        UpdateBytes { done, total } => {
-            print!("\r  {} / {} MB", done / 1_000_000, total / 1_000_000);
-            std::io::stdout().flush().ok();
-        }
-        UpdateFinished {
-            version,
-            fetched,
-            bytes,
-            root,
-        } => println!(
-            "\nupdated {} to {version}: {fetched} file(s), {} MB",
-            root.display(),
-            bytes / 1_000_000
-        ),
-    }
-}
-
-fn unix_date(secs: u32) -> String {
-    const DAY: u64 = 86_400;
-    let days = secs as u64 / DAY;
-    let (mut y, mut rem) = (1970u64, days);
-    loop {
-        let len = if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 {
-            366
-        } else {
-            365
-        };
-        if rem < len {
-            break;
-        }
-        rem -= len;
-        y += 1;
-    }
-    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
-    let months = [
-        31,
-        if leap { 29 } else { 28 },
-        31,
-        30,
-        31,
-        30,
-        31,
-        31,
-        30,
-        31,
-        30,
-        31,
-    ];
-    let mut m = 0;
-    while rem >= months[m] {
-        rem -= months[m];
-        m += 1;
-    }
-    format!("{y}-{:02}-{:02}", m + 1, rem + 1)
 }
 
 fn confirm(prompt: &str) -> Result<bool, String> {

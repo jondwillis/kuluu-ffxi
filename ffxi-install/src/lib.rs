@@ -11,6 +11,7 @@ pub mod lz;
 pub mod manifest;
 pub mod patch_client;
 pub mod polp;
+pub mod report;
 pub mod update;
 
 use std::collections::{BTreeMap, HashMap};

@@ -12,7 +12,7 @@ const MAX_ROM_INDEX: u8 = 19;
 pub const DEFAULT_INSTALL_DIR: &str = "vendor/game-files/SquareEnix/FINAL FANTASY XI";
 
 /// Named installs live side by side here so one checkout can target several
-/// client generations; `cargo xtask game --target <name>` wires them.
+/// client generations; `cargo xtask ffxi-client link --target <name>` wires them.
 pub const TARGETS_DIR: &str = "vendor/game-files/targets";
 
 /// Selects a named install under [`TARGETS_DIR`]. `FFXI_DAT_PATH` wins when

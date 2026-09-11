@@ -35,13 +35,13 @@ Credentials and the DAT path come from env vars (never committed/logged). The la
 
 ```bash
 export FFXI_USER=... FFXI_PASS=... FFXI_CHAR="Exact Name" FFXI_SERVER=127.0.0.1
-export FFXI_DAT_PATH="/path/to/SquareEnix/FINAL FANTASY XI"   # or: cargo xtask game
+export FFXI_DAT_PATH="/path/to/SquareEnix/FINAL FANTASY XI"   # or: cargo xtask ffxi-client link
 
 cargo run -p kuluu -- play                          # native window (default)
 cargo run -p kuluu --no-default-features -- play --headless  # JSON event-stream agent session, no Bevy
 ```
 
-`cargo xtask game [path|--copy|--download]` detects/validates/symlinks a retail install into `vendor/game-files/`.
+`cargo xtask ffxi-client link|list|download|update` manages the installs under `vendor/game-files/` (detect/validate/symlink, official-client download, PlayOnline patching); `kuluu ffxi-client which|use|list|download|update` is the product-side view, which also knows the launcher's saved choice and the per-user client directory.
 
 ## Issue tracking (beads)
 
