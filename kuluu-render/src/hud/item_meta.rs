@@ -31,8 +31,6 @@ pub struct ItemDetail {
     /// reuse delay. Both in whole seconds (a 24h enchant is 86400 > u16).
     pub recast: Option<(u32, u32)>,
 
-    pub equipped: bool,
-
     pub quantity: u32,
 }
 
@@ -85,8 +83,6 @@ pub fn compose_item_detail(
         .map(|s| s.quantity)
         .sum();
 
-    let equipped = snapshot.equipped.contains(&Some(item_no));
-
     let slot = focused_slot
         .and_then(|(container, index)| find_slot(snapshot, container, index))
         .or_else(|| {
@@ -112,7 +108,6 @@ pub fn compose_item_detail(
 
         charges_remaining,
         recast,
-        equipped,
         quantity,
     }
 }

@@ -14,28 +14,6 @@ mod flag {
     pub const EX: u16 = 0x4000;
 }
 
-const SLOT_NAMES: &[&str] = &[
-    "Main", "Sub", "Ranged", "Ammo", "Head", "Body", "Hands", "Legs", "Feet", "Neck", "Waist",
-    "L.Ear", "R.Ear", "L.Ring", "R.Ring", "Back",
-];
-
-fn format_slots(slot_mask: u32) -> String {
-    if slot_mask == 0 {
-        return "—".to_string();
-    }
-    let parts: Vec<&str> = SLOT_NAMES
-        .iter()
-        .enumerate()
-        .filter(|(bit, _)| slot_mask & (1 << bit) != 0)
-        .map(|(_, name)| *name)
-        .collect();
-    if parts.is_empty() {
-        "—".to_string()
-    } else {
-        parts.join("/")
-    }
-}
-
 fn format_rare_ex(flags: u16) -> Option<String> {
     let rare = flags & flag::RARE != 0;
     let ex = flags & flag::EX != 0;
@@ -100,27 +78,31 @@ pub(crate) fn detail_rows(detail: &ItemDetail) -> Vec<String> {
     if let Some(tag) = format_rare_ex(s.flags) {
         rows.push(tag);
     }
-    rows.push(format!("Slot: {}", format_slots(s.slot_mask)));
-    rows.push(format!("Races: {}", format_races(s.races_mask)));
-    rows.push(format!("Jobs: {}", format_jobs(s.jobs_mask)));
-    if s.level > 0 {
-        rows.push(format!("Lv. {}", s.level));
+    // Retail frames an equipment description with the race line above and the
+    // level+jobs line below, and shows a bare description for everything else
+    // (.agents/skills/retail-observe/references/2026-09-11-items-window.md).
+    let equipment = s.slot_mask != 0;
+    if equipment {
+        rows.push(format_races(s.races_mask));
+    }
+    rows.extend(s.description.lines().map(str::to_string));
+    if equipment {
+        rows.push(format!("Lv.{} {}", s.level, format_jobs(s.jobs_mask)));
     }
     if let Some(line) = format_charge_line(detail) {
         rows.push(line);
-    }
-    if detail.equipped {
-        rows.push("(equipped)".to_string());
-    }
-    if !s.description.is_empty() {
-        rows.push(s.description.clone());
     }
     rows
 }
 
 fn format_jobs(jobs_mask: u32) -> String {
-    if jobs_mask == 0 {
-        return "All".to_string();
+    // A mask covering every job the scraped table knows reads "All Jobs"
+    // (retail prints it for bait and level-1 gear whose DAT lists all 22).
+    let every_job = (1..32u32)
+        .filter(|bit| ffxi_vocab::job_names::abbrev(*bit as u16).is_some())
+        .all(|bit| jobs_mask & (1 << bit) != 0);
+    if jobs_mask == 0 || every_job {
+        return ALL_JOBS.to_string();
     }
     // The *client item DAT* jobs field is 0-indexed (bit == job id), unlike LSB's
     // item_equipment.jobs which is 1-indexed (bit == job - 1). Verified: White
@@ -132,20 +114,24 @@ fn format_jobs(jobs_mask: u32) -> String {
         .filter_map(|bit| ffxi_vocab::job_names::abbrev(bit as u16))
         .collect();
     if parts.is_empty() {
-        "All".to_string()
+        ALL_JOBS.to_string()
     } else {
         parts.join("/")
     }
 }
+
+const ALL_JOBS: &str = "All Jobs";
+
+const ALL_RACES: &str = "All Races";
 
 fn format_races(races_mask: u16) -> String {
     // The item DAT races field is 1-indexed by race id (bit 0 = race None):
     // Hume M/F = bits 1/2, Elvaan M/F = 3/4, Taru M/F = 5/6, Mithra = 7, Galka = 8.
     // Verified vs retail DAT: Mithran Gaiters = 0x0080 (bit 7), Galkan Sandals =
     // 0x0100 (bit 8). "All races" is 0x01FE (bits 1..=8), not 0.
-    const ALL_RACES: u16 = 0x01FE;
-    if races_mask == 0 || races_mask & ALL_RACES == ALL_RACES {
-        return "All".to_string();
+    const ALL_RACE_BITS: u16 = 0x01FE;
+    if races_mask == 0 || races_mask & ALL_RACE_BITS == ALL_RACE_BITS {
+        return ALL_RACES.to_string();
     }
 
     const RACES: &[(u16, &str)] = &[
@@ -161,7 +147,7 @@ fn format_races(races_mask: u16) -> String {
         .map(|(_, name)| *name)
         .collect();
     if parts.is_empty() {
-        "All".to_string()
+        ALL_RACES.to_string()
     } else {
         parts.join("/")
     }
@@ -220,13 +206,21 @@ impl ItemMenuFocus {
     }
 }
 
+/// Rows of the Items window's Options box, in retail order (Auto, Manual,
+/// Recycle Bin). Recycle Bin is not a sort mode: confirming it browses the
+/// recycle-bin container.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortOptionId {
     Auto,
     Manual,
+    RecycleBin,
 }
 
-pub const SORT_OPTIONS: &[SortOptionId] = &[SortOptionId::Auto, SortOptionId::Manual];
+pub const SORT_OPTIONS: &[SortOptionId] = &[
+    SortOptionId::Auto,
+    SortOptionId::Manual,
+    SortOptionId::RecycleBin,
+];
 
 impl SortOptions {
     /// The `SortOptionId` currently in effect.
@@ -241,9 +235,20 @@ impl SortOptions {
 
 /// Apply a sort choice. Auto keeps the list ordered by item id and consolidates
 /// partial stacks (see the ITEM_STACK request); Manual shows raw inventory order
-/// (see `menu::refresh_dynamic_menu_rows`).
-pub fn apply_sort_option(sort: &mut SortOptions, id: SortOptionId) {
-    sort.auto = matches!(id, SortOptionId::Auto);
+/// (see `menu::inventory_rows`). Returns whether a sort mode changed hands;
+/// Recycle Bin leaves the mode alone.
+pub fn apply_sort_option(sort: &mut SortOptions, id: SortOptionId) -> bool {
+    match id {
+        SortOptionId::Auto => {
+            sort.auto = true;
+            true
+        }
+        SortOptionId::Manual => {
+            sort.auto = false;
+            true
+        }
+        SortOptionId::RecycleBin => false,
+    }
 }
 
 /// A keypress routed to the sort box while it has focus. `Other` is any key
@@ -261,8 +266,8 @@ pub enum SortPaneKey {
 /// Handle one keypress while the sort box has focus: Up/Down step the cursor
 /// through [`SORT_OPTIONS`] with wrap-around, Confirm applies the option under
 /// the cursor, and Exit returns focus to the item list. Returns the confirmed
-/// option, if any — the caller sends the server ITEM_STACK request for it.
-/// No-op when the list has focus.
+/// option, if any — the caller sends the server ITEM_STACK request for a sort
+/// mode or opens the recycle bin. No-op when the list has focus.
 pub fn sort_pane_key(
     focus: &mut ItemMenuFocus,
     sort: &mut SortOptions,
@@ -316,48 +321,9 @@ pub fn item_detail_open(mode: &InputMode) -> bool {
     }
 }
 
-pub(crate) fn selected_item_no(
-    mode: &InputMode,
-    dynamic: &crate::hud::menu::DynamicMenu,
-) -> Option<u16> {
-    let stack = match mode {
-        InputMode::Menu(stack) => stack,
-        _ => return None,
-    };
-    let level = stack.current()?;
-    if !matches!(level.kind, MenuKind::Items | MenuKind::UsableItems) {
-        return None;
-    }
-    dynamic.rows.get(level.cursor)?.action.item_no()
-}
-
-/// The focused row's source `(container, index)`, so the detail panel reads the
-/// exact instance's charges/recast rather than the first item of that id.
-pub(crate) fn selected_slot(
-    mode: &InputMode,
-    dynamic: &crate::hud::menu::DynamicMenu,
-) -> Option<(u8, u8)> {
-    let stack = match mode {
-        InputMode::Menu(stack) => stack,
-        _ => return None,
-    };
-    let level = stack.current()?;
-    if !matches!(level.kind, MenuKind::Items | MenuKind::UsableItems) {
-        return None;
-    }
-    dynamic.rows.get(level.cursor)?.action.item_slot()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn slots_render_slash_joined() {
-        assert_eq!(format_slots(0), "—");
-        assert_eq!(format_slots(1 << 4), "Head");
-        assert_eq!(format_slots((1 << 11) | (1 << 12)), "L.Ear/R.Ear");
-    }
 
     #[test]
     fn rare_ex_tag() {
@@ -430,7 +396,16 @@ mod tests {
 
     #[test]
     fn jobs_all_when_unrestricted() {
-        assert_eq!(format_jobs(0), "All");
+        assert_eq!(format_jobs(0), "All Jobs");
+        let every: u32 = (1..32u32)
+            .filter(|bit| ffxi_vocab::job_names::abbrev(*bit as u16).is_some())
+            .fold(0, |m, bit| m | (1 << bit));
+        assert_eq!(format_jobs(every), "All Jobs");
+        assert_eq!(
+            format_jobs(every | 1),
+            "All Jobs",
+            "the JOB_NONE bit is ignored"
+        );
 
         // The client item DAT jobs field is 0-indexed (bit == job id).
         // bit 1 = WAR (job 1), bit 2 = MNK (job 2) — White Belt's DAT jobs is
@@ -442,9 +417,9 @@ mod tests {
 
     #[test]
     fn races_collapse_per_gender_bits() {
-        assert_eq!(format_races(0), "All");
-        assert_eq!(format_races(0x01FE), "All"); // all 8 race bits set
-                                                 // 1-indexed race ids: Hume M = bit 1, Mithra = bit 7, Galka = bit 8.
+        assert_eq!(format_races(0), "All Races");
+        assert_eq!(format_races(0x01FE), "All Races"); // all 8 race bits set
+                                                       // 1-indexed race ids: Hume M = bit 1, Mithra = bit 7, Galka = bit 8.
         assert_eq!(format_races(0x0002), "Hume");
         assert_eq!(format_races(0x0080), "Mithra"); // Mithran Gaiters, not Galka
         assert_eq!(format_races(0x0100), "Galka");
@@ -462,17 +437,26 @@ mod tests {
     }
 
     #[test]
-    fn sort_options_are_auto_then_manual() {
-        assert_eq!(SORT_OPTIONS, &[SortOptionId::Auto, SortOptionId::Manual]);
+    fn options_are_auto_manual_recycle_bin() {
+        assert_eq!(
+            SORT_OPTIONS,
+            &[
+                SortOptionId::Auto,
+                SortOptionId::Manual,
+                SortOptionId::RecycleBin
+            ]
+        );
     }
 
     #[test]
     fn apply_sort_option_selects_mode() {
         let mut s = SortOptions { auto: true };
-        apply_sort_option(&mut s, SortOptionId::Manual);
+        assert!(apply_sort_option(&mut s, SortOptionId::Manual));
         assert!(!s.auto);
-        apply_sort_option(&mut s, SortOptionId::Auto);
+        assert!(apply_sort_option(&mut s, SortOptionId::Auto));
         assert!(s.auto);
+        assert!(!apply_sort_option(&mut s, SortOptionId::RecycleBin));
+        assert!(s.auto, "recycle bin leaves the sort mode alone");
     }
 
     #[test]
@@ -499,7 +483,7 @@ mod tests {
         let mut sort = SortOptions::default();
         // Up from the first row wraps to the last.
         assert_eq!(sort_pane_key(&mut focus, &mut sort, SortPaneKey::Up), None);
-        assert_eq!(focus.sort_selection(), Some(SortOptionId::Manual));
+        assert_eq!(focus.sort_selection(), Some(SortOptionId::RecycleBin));
         // Down from the last row wraps back to the first.
         assert_eq!(
             sort_pane_key(&mut focus, &mut sort, SortPaneKey::Down),

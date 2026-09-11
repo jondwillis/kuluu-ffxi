@@ -251,6 +251,44 @@ pub(super) fn confirm_menu_at_cursor(
                 });
                 return None;
             }
+            if let A::DropItem {
+                container,
+                index,
+                item_no,
+                quantity,
+            } = action
+            {
+                stack.push(MenuKind::ItemDropConfirm {
+                    container,
+                    index,
+                    item_no,
+                    quantity,
+                });
+                if let Some(level) = stack.current_mut() {
+                    level.cursor = kuluu_render::hud::menu::DROP_CONFIRM_DEFAULT;
+                }
+                return None;
+            }
+            // Retail lists Use for every item and refuses an unusable or
+            // cooling-down one silently: no sub-target cursor, no chat line,
+            // the submenu stays put (kuluu-5ndh capture).
+            if let A::UseItem {
+                container, index, ..
+            } = action
+            {
+                let snap = &scene_state.snapshot;
+                let usable = kuluu_render::hud::item_meta::find_slot(snap, container, index)
+                    .is_some_and(|slot| {
+                        kuluu_render::hud::menu::item_usable_now(snap, slot)
+                            && !kuluu_render::hud::item_meta::item_unusable(
+                                slot,
+                                kuluu_render::hud::item_meta::now_vana_ts(),
+                            )
+                    });
+                if !usable {
+                    return None;
+                }
+            }
             // Retail's key-item detail pane needs a description DAT not yet
             // identified (bead kuluu-h7x retail_unknowns); echo the name and
             // keep the list open.
@@ -302,6 +340,27 @@ pub(super) fn confirm_menu_at_cursor(
         return None;
     }
     let label = kuluu_render::hud::menu::entry_label(kind, cursor, dynamic);
+    if let MenuKind::ItemDropConfirm {
+        container,
+        index,
+        quantity,
+        ..
+    } = kind
+    {
+        if label == kuluu_render::hud::menu::DROP_CONFIRM_YES {
+            if let Err(e) = cmd_tx.try_send(AgentCommand::DropItem {
+                container,
+                index,
+                quantity,
+            }) {
+                push_system_chat_line(scene_state, format!("[menu] drop dropped: {e}"));
+            }
+        }
+        // Either answer unwinds the confirm and the Item submenu back to the list.
+        stack.pop();
+        stack.pop();
+        return None;
+    }
     match resolve_menu_entry(kind, label) {
         MenuDispatch::CommandWithToast { cmd, toast } => {
             if let Err(e) = cmd_tx.try_send(cmd) {
@@ -546,6 +605,7 @@ pub(super) fn handle_menu_key(
     sort_options: &mut kuluu_render::hud::item_detail::SortOptions,
     item_menu_focus: &mut kuluu_render::hud::item_detail::ItemMenuFocus,
     item_bag: &mut kuluu_render::hud::item_screen::ItemScreenContainer,
+    item_viewport: &mut kuluu_render::hud::item_screen::ItemListViewport,
     dynamic: &kuluu_render::hud::menu::DynamicMenu,
     target_id: Option<u32>,
     self_pos: kuluu_snapshot::Vec3,
@@ -631,54 +691,71 @@ pub(super) fn handle_menu_key(
     }
 
     // The Items window is a stack of panes: one per accessible bag plus the
-    // sort-options box. Retail's "Select active window" key (F in the compact
-    // presets, Numpad + on the full keyboard) steps focus through them in
-    // order, while NavLeft/NavRight page the item list a viewport at a time —
-    // matching the retail client, which never repurposes left/right for pane
-    // changes.
-    if matches!(kind, MenuKind::Items) {
-        use kuluu_render::hud::item_detail::{sort_pane_key, SortPaneKey};
-        if bindings.matches_logical(Action::SelectActiveWindow, key) {
-            if kuluu_render::hud::item_screen::select_active_window(
-                &scene_state.snapshot,
-                item_bag,
-                item_menu_focus,
-                sort_options,
-            )
-            .is_some()
-            {
-                if let Some(level) = stack.current_mut() {
-                    level.cursor = 0;
+    // Options box. Retail's "Select active window" key (Numpad + on the full
+    // keyboard) steps focus through them; Up/Down clamp at both ends and
+    // Left/Right shift cursor and page together by a full row count
+    // (.agents/skills/retail-observe/references/2026-09-11-items-window.md).
+    if matches!(kind, MenuKind::Items | MenuKind::UsableItems) {
+        use kuluu_render::hud::item_detail::{sort_pane_key, SortOptionId, SortPaneKey};
+        use kuluu_render::hud::item_screen::{page_cursor, step_cursor};
+        if kind == MenuKind::Items {
+            if bindings.matches_logical(Action::SelectActiveWindow, key) {
+                if kuluu_render::hud::item_screen::select_active_window(
+                    &scene_state.snapshot,
+                    item_bag,
+                    item_menu_focus,
+                    sort_options,
+                )
+                .is_some()
+                {
+                    if let Some(level) = stack.current_mut() {
+                        level.cursor = 0;
+                    }
                 }
+                return None;
             }
-            return None;
-        }
-        if item_menu_focus.sort_focused() {
-            let pane_key = if bindings.matches_logical(Action::NavUp, key) {
-                SortPaneKey::Up
-            } else if bindings.matches_logical(Action::NavDown, key) {
-                SortPaneKey::Down
-            } else if bindings.matches_logical(Action::NavConfirm, key) {
-                SortPaneKey::Confirm
-            } else if bindings.matches_logical(Action::NavLeft, key)
-                || bindings.matches_logical(Action::NavCancel, key)
-            {
-                SortPaneKey::Exit
-            } else {
-                // Swallow any other key so it can't leak into list navigation.
-                SortPaneKey::Other
-            };
-            if sort_pane_key(item_menu_focus, sort_options, pane_key).is_some() {
-                if let Err(e) = cmd_tx.try_send(AgentCommand::StackInventory {
-                    container: ffxi_proto::map::container::LOC_INVENTORY,
-                }) {
-                    push_system_chat_line(scene_state, format!("sort dropped (channel): {e}"));
+            if item_menu_focus.sort_focused() {
+                let pane_key = if bindings.matches_logical(Action::NavUp, key) {
+                    SortPaneKey::Up
+                } else if bindings.matches_logical(Action::NavDown, key) {
+                    SortPaneKey::Down
+                } else if bindings.matches_logical(Action::NavConfirm, key) {
+                    SortPaneKey::Confirm
+                } else if bindings.matches_logical(Action::NavLeft, key)
+                    || bindings.matches_logical(Action::NavCancel, key)
+                {
+                    SortPaneKey::Exit
+                } else {
+                    // Swallow any other key so it can't leak into list navigation.
+                    SortPaneKey::Other
+                };
+                match sort_pane_key(item_menu_focus, sort_options, pane_key) {
+                    Some(SortOptionId::RecycleBin) => {
+                        if kuluu_render::hud::item_screen::open_recycle_bin(
+                            &scene_state.snapshot,
+                            item_bag,
+                            item_menu_focus,
+                        ) {
+                            if let Some(level) = stack.current_mut() {
+                                level.cursor = 0;
+                            }
+                        }
+                    }
+                    Some(_) => {
+                        if let Err(e) = cmd_tx.try_send(AgentCommand::StackInventory {
+                            container: ffxi_proto::map::container::LOC_INVENTORY,
+                        }) {
+                            push_system_chat_line(
+                                scene_state,
+                                format!("sort dropped (channel): {e}"),
+                            );
+                        }
+                    }
+                    None => {}
                 }
+                return None;
             }
-            return None;
         }
-        // Retail pages the item list with left/right: one viewport per press,
-        // clamped at the ends (no wrap).
         let page = if bindings.matches_logical(Action::NavLeft, key) {
             Some(false)
         } else if bindings.matches_logical(Action::NavRight, key) {
@@ -687,10 +764,22 @@ pub(super) fn handle_menu_key(
             None
         };
         if let Some(forward) = page {
-            let rows = kuluu_render::hud::menu::list_page_rows(kind);
+            item_viewport.page(forward, entry_count);
             if let Some(level) = stack.current_mut() {
-                level.cursor =
-                    kuluu_render::hud::menu::page_cursor(level.cursor, entry_count, rows, forward);
+                level.cursor = page_cursor(level.cursor, entry_count, forward);
+            }
+            return None;
+        }
+        let step = if bindings.matches_logical(Action::NavUp, key) {
+            Some(false)
+        } else if bindings.matches_logical(Action::NavDown, key) {
+            Some(true)
+        } else {
+            None
+        };
+        if let Some(down) = step {
+            if let Some(level) = stack.current_mut() {
+                level.cursor = step_cursor(level.cursor, entry_count, down);
             }
             return None;
         }
@@ -809,7 +898,7 @@ pub(super) fn handle_menu_key(
         return None;
     }
     if bindings.matches_logical(Action::NavConfirm, key) {
-        return confirm_menu_at_cursor(
+        let next = confirm_menu_at_cursor(
             bindings,
             stack,
             scene_state,
@@ -826,6 +915,12 @@ pub(super) fn handle_menu_key(
             target_id,
             self_pos,
         );
+        // Commands > Items always opens on the inventory; only the Mog Menu
+        // storage rows open the window on another bag.
+        if kind == MenuKind::Root && stack.current().is_some_and(|l| l.kind == MenuKind::Items) {
+            item_bag.0 = ffxi_proto::map::container::LOC_INVENTORY;
+        }
+        return next;
     }
     if bindings.matches_logical(Action::NavCancel, key) {
         if matches!(kind, MenuKind::Status) {
@@ -866,6 +961,7 @@ mod menu_key_tests {
         sort_options: kuluu_render::hud::item_detail::SortOptions,
         item_menu_focus: kuluu_render::hud::item_detail::ItemMenuFocus,
         item_bag: kuluu_render::hud::item_screen::ItemScreenContainer,
+        item_viewport: kuluu_render::hud::item_screen::ItemListViewport,
         dynamic: kuluu_render::hud::menu::DynamicMenu,
         map_state: MapScreenState,
         map_view: MapView,
@@ -897,6 +993,7 @@ mod menu_key_tests {
                 sort_options: Default::default(),
                 item_menu_focus: Default::default(),
                 item_bag: Default::default(),
+                item_viewport: Default::default(),
                 dynamic: Default::default(),
                 map_state: MapScreenState::default(),
                 map_view: MapView::default(),
@@ -932,6 +1029,7 @@ mod menu_key_tests {
                 &mut self.sort_options,
                 &mut self.item_menu_focus,
                 &mut self.item_bag,
+                &mut self.item_viewport,
                 &self.dynamic,
                 None,
                 kuluu_snapshot::Vec3::default(),

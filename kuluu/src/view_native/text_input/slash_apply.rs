@@ -837,6 +837,9 @@ pub(super) fn apply_slash_outcome(
                 kuluu_render::MenuKind::ItemAction { item_no, .. } => {
                     format!("ItemAction({item_no})").into()
                 }
+                kuluu_render::MenuKind::ItemDropConfirm { item_no, .. } => {
+                    format!("ItemDropConfirm({item_no})").into()
+                }
                 kuluu_render::MenuKind::EquipSlot(slot) => format!("EquipSlot({slot})").into(),
                 kuluu_render::MenuKind::Map => "Map".into(),
             };

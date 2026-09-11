@@ -25,6 +25,9 @@ whether the question is already answered here before spending a login on it.
 - [Vanilla menu & target-interaction spec](references/vanilla-menu-spec.md) —
   target-action menu, trade window, item detail, `/check`, Commands, Status,
   Items + sort. The broadest single record.
+- [Items window](references/2026-09-11-items-window.md) — the main-menu Items
+  list: layout, 10-row paging and scroll rules, Options box, Item submenu
+  (Use/Drop), verbatim help-bar strings.
 - [Auction House](references/auction-house.md) — category tree, screens, sell
   flow, Sales Status, bid/browse, and how catalog paging is pull-based.
 - [Mog House menu](references/2026-07-17-moghouse-menu.md) — exact entry order

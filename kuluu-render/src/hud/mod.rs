@@ -117,8 +117,9 @@ pub struct BottomLeftStack;
 
 pub fn spawn_bottom_left_stack(
     mut commands: Commands,
-    #[cfg(not(target_arch = "wasm32"))] mut images: ResMut<Assets<bevy::image::Image>>,
+    mut images: ResMut<Assets<bevy::image::Image>>,
 ) {
+    let icon_placeholder = item_ui::transparent_placeholder(&mut images);
     commands
         .spawn((
             crate::components::InGameEntity,
@@ -159,17 +160,33 @@ pub fn spawn_bottom_left_stack(
                     #[cfg(not(target_arch = "wasm32"))]
                     crate::minimap::spawn_minimap_as_child(col, &mut images);
 
-                    compass::spawn_compass_as_child(col);
+                    item_screen::spawn_item_detail_card_as_child(col, icon_placeholder);
 
-                    col.spawn(Node {
-                        flex_direction: FlexDirection::Row,
-                        align_items: AlignItems::Center,
-                        column_gap: Val::Px(4.0),
-                        ..default()
-                    })
-                    .with_children(|under| {
-                        vana_clock::spawn_vana_clock_as_child(under);
-                        weather_icon::spawn_weather_icon_as_child(under);
+                    // Retail docks the item card where the compass and clock
+                    // sit, so the two swap visibility with the Items window.
+                    col.spawn((
+                        item_screen::CompassClockCluster,
+                        Node {
+                            flex_direction: FlexDirection::Column,
+                            align_items: AlignItems::FlexStart,
+                            row_gap: Val::Px(4.0),
+                            ..default()
+                        },
+                    ))
+                    .with_children(|cluster| {
+                        compass::spawn_compass_as_child(cluster);
+
+                        cluster
+                            .spawn(Node {
+                                flex_direction: FlexDirection::Row,
+                                align_items: AlignItems::Center,
+                                column_gap: Val::Px(4.0),
+                                ..default()
+                            })
+                            .with_children(|under| {
+                                vana_clock::spawn_vana_clock_as_child(under);
+                                weather_icon::spawn_weather_icon_as_child(under);
+                            });
                     });
                 });
 
@@ -243,6 +260,7 @@ impl Plugin for HudPlugin {
         app.init_resource::<item_detail::SortOptions>();
         app.init_resource::<item_detail::ItemMenuFocus>();
         app.init_resource::<item_screen::ItemScreenContainer>();
+        app.init_resource::<item_screen::ItemListViewport>();
         #[cfg(not(target_arch = "wasm32"))]
         {
             app.init_resource::<map_screen::MapScreenDots>();
@@ -367,7 +385,9 @@ impl Plugin for HudPlugin {
                 target_action_menu::update_target_action_menu,
                 target_action_menu::target_action_mouse_hover_system,
                 target_action_menu::target_action_mouse_click_system,
+                item_screen::update_item_screen_layout,
                 item_screen::update_item_screen.after(menu::refresh_dynamic_menu_rows),
+                item_screen::update_item_scrollbar.after(item_screen::update_item_screen),
                 item_screen::update_bag_tabs.after(item_screen::update_item_screen),
                 trade::update_trade_window,
                 check_view::update_check_view,

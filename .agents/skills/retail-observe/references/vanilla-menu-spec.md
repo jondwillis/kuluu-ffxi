@@ -122,9 +122,13 @@ Merit Points (disabled), Job Points`.
 
 ## Items menu (from main menu) + sort
 
+Superseded in detail by [2026-09-11-items-window.md](2026-09-11-items-window.md)
+(the Options panel sits top-right, not bottom-left; the bottom-left slot is the
+item card).
+
 - Top-left lists all items + equipment (icons, stacks); count `14 / 30`
   (held / capacity); helper "Select an item."
-- Bottom-left **Options** panel, label "Sort", three choices:
+- **Options** panel, label "Sort", three choices:
   - **Auto** → confirm yes/no → server/auto sort, refocuses the item list.
   - **Manual** → manual swap of item positions. Not implemented in the reference
     client either.

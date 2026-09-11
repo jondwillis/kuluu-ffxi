@@ -83,6 +83,16 @@ const COMMUNICATION_ENTRIES: &[&str] = &[COMM_EMOTE_LIST];
 
 const ITEMS_ENTRIES_STUB: &[&str] = &["(Items — Stage 3: pending inventory submenu)"];
 
+pub const DROP_CONFIRM_YES: &str = "Yes";
+
+pub const DROP_CONFIRM_NO: &str = "No";
+
+/// The drop confirm's rows; the cursor opens on No (`DROP_CONFIRM_DEFAULT`),
+/// like retail's Log Out prompt.
+pub const DROP_CONFIRM_ENTRIES: &[&str] = &[DROP_CONFIRM_YES, DROP_CONFIRM_NO];
+
+pub const DROP_CONFIRM_DEFAULT: usize = 1;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DynamicMenuRow {
     pub label: String,
@@ -144,6 +154,15 @@ pub enum DynamicMenuAction {
         item_no: u16,
     },
 
+    /// Item submenu "Drop": opens the Yes/No confirm for the whole stack
+    /// (c2s 0x028 ITEM_DUMP on Yes).
+    DropItem {
+        container: u8,
+        index: u8,
+        item_no: u16,
+        quantity: u32,
+    },
+
     EquipItem {
         container: u8,
         container_index: u8,
@@ -173,6 +192,7 @@ impl DynamicMenuAction {
             DynamicMenuAction::UseItem { item_no, .. }
             | DynamicMenuAction::MoveItem { item_no, .. }
             | DynamicMenuAction::OpenItemAction { item_no, .. }
+            | DynamicMenuAction::DropItem { item_no, .. }
             | DynamicMenuAction::EquipItem { item_no, .. } => Some(item_no),
             _ => None,
         }
@@ -187,6 +207,9 @@ impl DynamicMenuAction {
                 container, index, ..
             }
             | DynamicMenuAction::OpenItemAction {
+                container, index, ..
+            }
+            | DynamicMenuAction::DropItem {
                 container, index, ..
             } => Some((container, index)),
             DynamicMenuAction::EquipItem {
@@ -618,6 +641,7 @@ fn static_entries(kind: MenuKind) -> &'static [&'static str] {
         MenuKind::Status => STATUS_LABELS,
 
         MenuKind::ItemAction { .. } => &[],
+        MenuKind::ItemDropConfirm { .. } => DROP_CONFIRM_ENTRIES,
         MenuKind::EquipSlot(_) => &["(loading equippable items…)"],
 
         MenuKind::Communication => COMMUNICATION_ENTRIES,
@@ -642,6 +666,7 @@ pub fn menu_title(kind: MenuKind) -> &'static str {
         MenuKind::KeyItems => "Key Items",
         MenuKind::UsableItems => "Items",
         MenuKind::ItemAction { .. } => "Item",
+        MenuKind::ItemDropConfirm { .. } => "Drop",
         MenuKind::Status => "Status",
         MenuKind::EquipSlot(_) => "Equip",
         MenuKind::Communication => "Communication",
@@ -836,24 +861,7 @@ pub fn refresh_dynamic_menu_rows(
             }));
             out
         }
-        MenuKind::Items => snap
-            .container(active_bag.0)
-            .map(|c| c.items.as_slice())
-            .unwrap_or(&[])
-            .iter()
-            .filter_map(|slot| {
-                let name = ffxi_vocab::item_names::lookup(slot.item_no)?;
-                let label = item_qty_label(name, slot.quantity);
-                Some(DynamicMenuRow {
-                    label,
-                    action: DynamicMenuAction::OpenItemAction {
-                        container: slot.container,
-                        index: slot.index,
-                        item_no: slot.item_no,
-                    },
-                })
-            })
-            .collect(),
+        MenuKind::Items => inventory_rows(snap, active_bag.0, sort.auto),
         MenuKind::KeyItems => key_item_rows(snap),
         MenuKind::EmoteList => emote_rows(snap),
         MenuKind::UsableItems => usable_item_rows(snap),
@@ -907,6 +915,36 @@ pub fn refresh_dynamic_menu_rows(
     if rows != dynamic.rows {
         dynamic.rows = rows;
     }
+}
+
+/// One row per slot of `container`, labelled with the bare item name (the item
+/// window draws the stack count as an icon badge). Auto-sort orders by item id
+/// (usables, then weapons, then armor by their DAT id ranges); Manual keeps the
+/// raw slot order.
+pub fn inventory_rows(
+    snap: &kuluu_snapshot::SceneSnapshot,
+    container: u8,
+    auto_sort: bool,
+) -> Vec<DynamicMenuRow> {
+    let mut rows: Vec<DynamicMenuRow> = snap
+        .container(container)
+        .map(|c| c.items.as_slice())
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(|slot| {
+            let name = ffxi_vocab::item_names::lookup(slot.item_no)?;
+            Some(DynamicMenuRow {
+                label: name.to_string(),
+                action: DynamicMenuAction::OpenItemAction {
+                    container: slot.container,
+                    index: slot.index,
+                    item_no: slot.item_no,
+                },
+            })
+        })
+        .collect();
+    order_dynamic_rows(MenuKind::Items, auto_sort, &mut rows);
+    rows
 }
 
 /// Order the freshly built rows for one dynamic menu. Retail's Items window
@@ -1025,17 +1063,17 @@ pub fn item_usable_now(
 }
 
 /// Rows for the Command Menu "Items" submenu: every currently-usable item
-/// across all containers, firing Use directly (kuluu-268h).
+/// across all containers, firing Use directly (kuluu-268h), in item-id order.
 pub fn usable_item_rows(snap: &kuluu_snapshot::SceneSnapshot) -> Vec<DynamicMenuRow> {
-    snap.containers
+    let mut rows: Vec<DynamicMenuRow> = snap
+        .containers
         .iter()
         .flat_map(|cont| cont.items.iter())
         .filter(|slot| item_usable_now(snap, slot))
         .filter_map(|slot| {
             let name = ffxi_vocab::item_names::lookup(slot.item_no)?;
-            let label = item_qty_label(name, slot.quantity);
             Some(DynamicMenuRow {
-                label,
+                label: name.to_string(),
                 action: DynamicMenuAction::UseItem {
                     container: slot.container,
                     index: slot.index,
@@ -1043,7 +1081,9 @@ pub fn usable_item_rows(snap: &kuluu_snapshot::SceneSnapshot) -> Vec<DynamicMenu
                 },
             })
         })
-        .collect()
+        .collect();
+    order_dynamic_rows(MenuKind::UsableItems, true, &mut rows);
+    rows
 }
 
 /// Whether the quick-menu "Items" entry should be enabled at all.
@@ -1054,10 +1094,18 @@ pub fn any_usable_item(snap: &kuluu_snapshot::SceneSnapshot) -> bool {
         .any(|slot| item_usable_now(snap, slot))
 }
 
-/// Context rows for one slot, mirroring the LSB 0x029 move rules
+pub const ITEM_ACTION_USE: &str = "Use";
+
+pub const ITEM_ACTION_DROP: &str = "Drop";
+
+/// Context rows for one slot: retail's Use and Drop (Use is listed for every
+/// item and silently refused when the LSB 0x037 gate would reject it, see
+/// `item_usable_now`), then the moves LSB 0x029 allows
 /// (vendor/server/src/map/packets/c2s/0x029_item_move.cpp): Gil and Temporary
 /// items never move, wardrobes only take equipment, and "Take Out" leads when
-/// browsing a storage bag.
+/// browsing a storage bag. Drop follows 0x028's refusals
+/// (vendor/server/src/map/packets/c2s/0x028_item_dump.cpp process): never Gil
+/// or a locked slot.
 pub fn item_action_rows(
     snap: &kuluu_snapshot::SceneSnapshot,
     container: u8,
@@ -1074,28 +1122,45 @@ pub fn item_action_rows(
         return Vec::new();
     };
 
-    let mut rows = Vec::new();
-    // Same predicate as the Command Menu Items list: only offer Use when the
-    // LSB 0x037 gate would accept it (kuluu-268h).
-    if item_usable_now(snap, slot) {
+    let mut rows = vec![DynamicMenuRow {
+        label: ITEM_ACTION_USE.to_string(),
+        action: DynamicMenuAction::UseItem {
+            container,
+            index,
+            item_no,
+        },
+    }];
+
+    // Locked = equipped / linkshell / bazaar-reserved: the server rejects the
+    // move (and the drop) silently, so don't offer them. The recycle bin is
+    // the one container 0x028 never dumps from.
+    let droppable =
+        item_no != ffxi_proto::map::GIL_ITEM_NO && !slot.locked && container != c::LOC_RECYCLEBIN;
+    if droppable {
         rows.push(DynamicMenuRow {
-            label: "Use".to_string(),
-            action: DynamicMenuAction::UseItem {
+            label: ITEM_ACTION_DROP.to_string(),
+            action: DynamicMenuAction::DropItem {
                 container,
                 index,
                 item_no,
+                quantity: slot.quantity,
             },
         });
     }
-
-    // Locked = equipped / linkshell / bazaar-reserved: the server rejects the
-    // move silently, so don't offer it.
     let movable =
-        item_no != ffxi_proto::map::GIL_ITEM_NO && container != c::LOC_TEMPITEMS && !slot.locked;
+        item_no != ffxi_proto::map::GIL_ITEM_NO && !slot.locked && container != c::LOC_TEMPITEMS;
     if movable {
         let equipable = ffxi_vocab::equip_info::lookup(item_no).is_some();
         for dest in crate::hud::item_screen::accessible_containers(snap) {
             if dest == container || dest == c::LOC_TEMPITEMS || (c::is_wardrobe(dest) && !equipable)
+            {
+                continue;
+            }
+            // 0x029 isValidMovement: recycle-bin items only come back out to
+            // the inventory or the locker.
+            if container == c::LOC_RECYCLEBIN
+                && dest != c::LOC_INVENTORY
+                && dest != c::LOC_MOGLOCKER
             {
                 continue;
             }
@@ -1868,12 +1933,11 @@ mod tests {
         }
     }
 
-    /// Pins LSB 0x029 isValidMovement's ITEM_LOCKED rejection: locked slots
-    /// (equipped / linkshell / bazaar-reserved) get no move rows. Since the
-    /// 0x037 gate (kuluu-268h), a locked consumable also loses its Use row:
-    /// the server rejects using bazaar/linkshell-reserved items.
+    /// Pins LSB 0x029 isValidMovement's and 0x028's ITEM_LOCKED rejections:
+    /// locked slots (equipped / linkshell / bazaar-reserved) get no move rows
+    /// and no Drop. Use stays listed like retail; the confirm path refuses it.
     #[test]
-    fn locked_slot_offers_no_moves() {
+    fn locked_slot_offers_no_moves_or_drop() {
         use ffxi_proto::map::container as c;
         let mut snap = mh_snapshot();
         snap.containers[0].items[1].locked = true;
@@ -1884,7 +1948,13 @@ mod tests {
                 .any(|r| matches!(r.action, DynamicMenuAction::MoveItem { .. })),
             "{rows:?}"
         );
-        assert!(!rows.iter().any(|r| r.label == "Use"), "{rows:?}");
+        assert!(
+            !rows
+                .iter()
+                .any(|r| matches!(r.action, DynamicMenuAction::DropItem { .. })),
+            "{rows:?}"
+        );
+        assert_eq!(labels(&rows), [ITEM_ACTION_USE]);
     }
 
     /// Pins the LSB validContainers Safe-2F gate (mhflag & 0x20,
@@ -1919,8 +1989,12 @@ mod tests {
         // 13327 = an equipable ring in the retail id space; equip_info lookup
         // decides wardrobe eligibility, not this test.
         let rows = item_action_rows(&mh_snapshot(), c::LOC_MOGSAFE, 1, 13327);
-        assert_eq!(rows[0].label, "Take Out");
-        match rows[0].action {
+        assert_eq!(
+            &labels(&rows)[..3],
+            [ITEM_ACTION_USE, ITEM_ACTION_DROP, "Take Out"],
+            "retail order: Use, Drop, then the moves"
+        );
+        match rows[2].action {
             DynamicMenuAction::MoveItem {
                 from_container,
                 to_container,
@@ -1935,17 +2009,25 @@ mod tests {
             }
             _ => panic!("Take Out must be a MoveItem"),
         }
-        assert!(
-            !rows.iter().any(|r| r.label == "Use"),
-            "storage bags cannot use items: {rows:?}"
-        );
     }
 
     #[test]
     fn inventory_item_offers_use_and_put_in_bags() {
         use ffxi_proto::map::container as c;
         let rows = item_action_rows(&mh_snapshot(), c::LOC_INVENTORY, 1, 4509);
-        assert_eq!(rows[0].label, "Use");
+        assert_eq!(rows[0].label, ITEM_ACTION_USE);
+        assert!(
+            matches!(
+                rows[1].action,
+                DynamicMenuAction::DropItem {
+                    container: c::LOC_INVENTORY,
+                    index: 1,
+                    item_no: 4509,
+                    quantity: 12,
+                }
+            ),
+            "Drop carries the whole stack: {rows:?}"
+        );
         assert!(rows.iter().any(|r| r.label == "Put in Mog Safe"));
         assert!(rows.iter().any(|r| r.label == "Put in Storage"));
         assert!(
@@ -1957,25 +2039,20 @@ mod tests {
     }
 
     /// Gil and Temporary items never move (LSB 0x029 isValidMovement /
-    /// validContainers).
+    /// validContainers); Gil cannot be dropped either, Temporary items can
+    /// (0x028_item_dump.cpp validContainers).
     #[test]
     fn gil_and_temp_items_cannot_move() {
         use ffxi_proto::map::container as c;
         let snap = mh_snapshot();
         let gil = item_action_rows(&snap, c::LOC_INVENTORY, 0, ffxi_proto::map::GIL_ITEM_NO);
-        assert!(
-            !gil.iter()
-                .any(|r| matches!(r.action, DynamicMenuAction::MoveItem { .. })),
-            "{gil:?}"
-        );
+        assert_eq!(labels(&gil), [ITEM_ACTION_USE], "{gil:?}");
         let temp = item_action_rows(&snap, c::LOC_TEMPITEMS, 0, 4212);
-        assert!(
-            !temp
-                .iter()
-                .any(|r| matches!(r.action, DynamicMenuAction::MoveItem { .. })),
+        assert_eq!(
+            labels(&temp),
+            [ITEM_ACTION_USE, ITEM_ACTION_DROP],
             "{temp:?}"
         );
-        assert!(temp.iter().any(|r| r.label == "Use"), "{temp:?}");
     }
 
     #[test]

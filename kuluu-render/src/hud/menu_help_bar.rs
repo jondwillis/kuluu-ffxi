@@ -6,6 +6,7 @@
 
 use bevy::prelude::*;
 
+use crate::hud::item_detail::{ItemMenuFocus, SortOptionId};
 use crate::hud::menu::{self, DynamicMenu, DynamicMenuAction};
 use crate::hud::style::{self, theme};
 use crate::input_mode::{InputMode, MenuKind, PassiveCursorFocus};
@@ -189,19 +190,55 @@ fn entry_help(kind: MenuKind, cursor: usize, dynamic: &DynamicMenu) -> String {
         MenuKind::Abilities => "Select an ability.".to_string(),
         MenuKind::KeyItems => "Select a key item.".to_string(),
         MenuKind::Equipment | MenuKind::EquipSlot(_) => "Select equipment.".to_string(),
+        // Use / Drop wording per .agents/skills/retail-observe/references/2026-09-11-items-window.md;
+        // the move rows have no retail counterpart in that capture's bag layout.
         MenuKind::ItemAction { .. } => match menu::entry_action(kind, cursor, dynamic) {
-            Some(DynamicMenuAction::UseItem { .. }) => "Use this item.".to_string(),
+            Some(DynamicMenuAction::UseItem { .. }) => "Use an item.".to_string(),
+            Some(DynamicMenuAction::DropItem { .. }) => ITEM_DROP_HELP.to_string(),
             Some(DynamicMenuAction::MoveItem { .. }) => "Move this item.".to_string(),
             _ => "Select an action.".to_string(),
         },
+        MenuKind::ItemDropConfirm { .. } => ITEM_DROP_CONFIRM_HELP.to_string(),
         MenuKind::EmoteList => "Select an emote.".to_string(),
         MenuKind::Status => "Select a category.".to_string(),
         _ => "Select an option.".to_string(),
     }
 }
 
+pub const ITEM_DROP_HELP: &str = "Dispose of item. Most items will be placed in the recycle bin. \
+                                  If the recycle bin is full, the oldest item in the recycle bin \
+                                  will be deleted.";
+
+/// Provisional: retail's Drop flow past the submenu row is unobserved.
+pub const ITEM_DROP_CONFIRM_HELP: &str = "Drop this item?";
+
+/// Help-bar title and hint while the Items window's Options box has focus
+/// (.agents/skills/retail-observe/references/2026-09-11-items-window.md).
+pub fn option_help(id: SortOptionId) -> (&'static str, &'static str) {
+    match id {
+        SortOptionId::Auto => ("Auto-sort", "Automatically rearrange items."),
+        SortOptionId::Manual => ("Manual Sort", "Manually rearrange items."),
+        SortOptionId::RecycleBin => (
+            "Recycling Bin",
+            "Display thrown-away items. They will disappear for good when you change \
+             areas, log out, or disconnect.",
+        ),
+    }
+}
+
+/// The bar keeps the list's title while the per-item submenu is up (retail:
+/// `Items | Use an item.`), even though the submenu pane itself says "Item".
+fn help_bar_title(kind: MenuKind) -> &'static str {
+    if crate::hud::item_screen::is_item_submenu(kind) {
+        menu::menu_title(MenuKind::Items)
+    } else {
+        menu::menu_title(kind)
+    }
+}
+
 /// Retail shows bag fill (used/capacity, not cursor position) beside the title
-/// for item lists (kuluu-5ndh: "20/58" fixed while the cursor scrolled).
+/// for item lists (kuluu-5ndh: "20/58" fixed while the cursor scrolled), and
+/// drops it while the per-item submenu is up.
 fn bag_counter(
     kind: MenuKind,
     snap: &kuluu_snapshot::SceneSnapshot,
@@ -222,6 +259,7 @@ pub fn update_menu_help_bar(
     dynamic: Res<DynamicMenu>,
     scene: Res<crate::snapshot::SceneState>,
     active_bag: Res<crate::hud::item_screen::ItemScreenContainer>,
+    item_focus: Res<ItemMenuFocus>,
     check: Res<crate::hud::check_view::CheckTarget>,
     auction_screen: Res<crate::hud::auction::AuctionScreenState>,
     auction_inv: Res<crate::hud::auction::AuctionSellInventory>,
@@ -260,13 +298,28 @@ pub fn update_menu_help_bar(
     // after a drill the right column, and the parent again once focus toggles.
     let (content, is_menu) = match &*mode {
         InputMode::Menu(stack) => (
-            stack.active_level().map(|l| BarContent {
-                title: menu::menu_title(l.kind).to_string(),
-                counter: match bag_counter(l.kind, &scene.snapshot, active_bag.0) {
-                    Some((used, capacity)) => format!("{used}/{capacity}"),
-                    None => String::new(),
-                },
-                hint: entry_help(l.kind, l.cursor, &dynamic),
+            stack.active_level().map(|l| {
+                let option = (l.kind == MenuKind::Items)
+                    .then(|| item_focus.sort_selection())
+                    .flatten();
+                match option {
+                    Some(id) => {
+                        let (title, hint) = option_help(id);
+                        BarContent {
+                            title: title.to_string(),
+                            counter: String::new(),
+                            hint: hint.to_string(),
+                        }
+                    }
+                    None => BarContent {
+                        title: help_bar_title(l.kind).to_string(),
+                        counter: match bag_counter(l.kind, &scene.snapshot, active_bag.0) {
+                            Some((used, capacity)) => format!("{used}/{capacity}"),
+                            None => String::new(),
+                        },
+                        hint: entry_help(l.kind, l.cursor, &dynamic),
+                    },
+                }
             }),
             true,
         ),
@@ -448,6 +501,7 @@ mod tests {
         app.init_resource::<InputMode>()
             .init_resource::<DynamicMenu>()
             .init_resource::<ItemScreenContainer>()
+            .init_resource::<ItemMenuFocus>()
             .init_resource::<crate::hud::check_view::CheckTarget>()
             .init_resource::<crate::hud::auction::AuctionScreenState>()
             .init_resource::<crate::hud::auction::AuctionSellInventory>();

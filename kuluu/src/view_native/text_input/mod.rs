@@ -101,6 +101,8 @@ pub struct SlashWriters<'w, 's> {
 
     pub item_screen_container: ResMut<'w, kuluu_render::hud::item_screen::ItemScreenContainer>,
 
+    pub item_viewport: ResMut<'w, kuluu_render::hud::item_screen::ItemListViewport>,
+
     pub check_target: ResMut<'w, kuluu_render::hud::check_view::CheckTarget>,
 
     pub bazaar_state: ResMut<'w, kuluu_render::hud::bazaar_view::BazaarScreenState>,
@@ -338,6 +340,7 @@ pub(crate) fn text_input_system(
                     &mut slash_writers.sort_options,
                     &mut slash_writers.item_menu_focus,
                     &mut slash_writers.item_screen_container,
+                    &mut slash_writers.item_viewport,
                     &dynamic_menu,
                     current_target,
                     self_pos,
@@ -988,6 +991,7 @@ fn sub_target_action_for(
         }),
         A::MoveItem { .. } => None,
         A::OpenItemAction { .. } => None,
+        A::DropItem { .. } => None,
         A::EquipItem { .. } => None,
         A::KeyItem { .. } => None,
         A::Emote { .. } => None,
@@ -1377,8 +1381,8 @@ fn dispatch_dynamic_menu_action(
                 },
             )
         }
-        // Pushed as a submenu by confirm_menu_at_cursor, never dispatched.
-        A::OpenItemAction { .. } => return,
+        // Pushed as submenus by confirm_menu_at_cursor, never dispatched.
+        A::OpenItemAction { .. } | A::DropItem { .. } => return,
         // Handled in confirm_menu_at_cursor (chat echo, menu stays open).
         A::KeyItem { .. } => return,
         A::EquipItem {

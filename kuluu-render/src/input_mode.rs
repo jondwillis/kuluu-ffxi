@@ -235,6 +235,15 @@ pub enum MenuKind {
         item_no: u16,
     },
 
+    /// Yes/No step under the Item submenu's Drop row, cursor defaulting to No.
+    /// Confirming sends c2s 0x028 ITEM_DUMP for the whole stack.
+    ItemDropConfirm {
+        container: u8,
+        index: u8,
+        item_no: u16,
+        quantity: u32,
+    },
+
     Equipment,
 
     Status,
