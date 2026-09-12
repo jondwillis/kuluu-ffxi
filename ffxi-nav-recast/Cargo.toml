@@ -12,7 +12,7 @@ glam = "0.32"
 thiserror = { workspace = true }
 tracing = { workspace = true }
 ureq = { version = "2", default-features = false, features = ["tls"] }
-dirs = "6"
+dirs = "7"
 
 [dev-dependencies]
 tempfile = "3"

@@ -119,7 +119,7 @@ ffxi-install = { path = "../ffxi-install" }
 
 anyhow.workspace = true
 clap.workspace = true
-dirs = "6"
+dirs = "7"
 # Already linked transitively via ffxi-nav-recast with the identical
 # default-features = false, features = ["tls"] spec, so the lock and binary are
 # unchanged. The launcher's update check uses it for a CA-validated GitHub API
