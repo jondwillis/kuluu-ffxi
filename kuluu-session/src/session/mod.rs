@@ -2261,6 +2261,11 @@ const EVENT_WALKAWAY_YALMS: f32 = 2.0;
 
 const NAME_MISS_BODY_HEX_CAP: usize = 96;
 
+/// Marker the auto-release chat line carries. The live event tests assert its
+/// absence to prove the event played rather than being skipped, so a silent
+/// reword here would turn every one of them permanently green.
+pub const EVENT_AUTO_SKIPPED_MARKER: &str = "auto-skipped";
+
 fn record_name_miss(
     opcode: u16,
     unique_no: u32,
@@ -2484,10 +2489,10 @@ async fn begin_server_event(
                     sender: "client".into(),
                     text: match stopped_op {
                         Some(op) => format!(
-                            "[event] cutscene {event_id} auto-skipped (unimplemented opcode 0x{op:02X})"
+                            "[event] cutscene {event_id} {EVENT_AUTO_SKIPPED_MARKER} (unimplemented opcode 0x{op:02X})"
                         ),
                         None => format!(
-                            "[event] cutscene {event_id} auto-skipped ({})",
+                            "[event] cutscene {event_id} {EVENT_AUTO_SKIPPED_MARKER} ({})",
                             reason.as_str()
                         ),
                     },

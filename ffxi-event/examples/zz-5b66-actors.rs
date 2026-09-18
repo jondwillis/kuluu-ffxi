@@ -22,15 +22,21 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
 
 use ffxi_dat::{event_dat, event_locate, DatRoot};
+use ffxi_event::cue::ActorLookup;
 use ffxi_event::opcode_meta::{sub_size, OPCODE_META};
 
 fn categorize(v: u32) -> &'static str {
-    match v {
-        0x7FFF_FFC0 | 0x7FFF_FFF0 | 0x7FFF_FFF9 => "local-player",
-        0x7FFF_FFF8 => "event-entity",
-        0x7FFF_FFC1..=0x7FFF_FFF7 => "party/alliance",
-        v if v & 0xFF00_0000 != 0 => "literal-server-id",
-        _ => "small-fallback",
+    let lookup = ActorLookup(v);
+    if lookup.is_local_player() {
+        "local-player"
+    } else if v == ActorLookup::EVENT_ENTITY.0 {
+        "event-entity"
+    } else if lookup.server_id().is_some() {
+        "literal-server-id"
+    } else if lookup.is_event_entity() {
+        "small-fallback"
+    } else {
+        "party/alliance"
     }
 }
 

@@ -179,7 +179,9 @@ fn handle_event(tally: &mut Tally, ev: &AgentEvent, now: Instant) {
             }
         }
         AgentEvent::ChatLine { line, .. } => {
-            if line.text.contains("auto-skipped") && tally.auto_skipped_line.is_none() {
+            if line.text.contains(session::EVENT_AUTO_SKIPPED_MARKER)
+                && tally.auto_skipped_line.is_none()
+            {
                 tally.auto_skipped_line = Some(line.text.clone());
                 eprintln!("[live] AUTO-SKIP CHAT LINE: {}", line.text);
             }
@@ -272,7 +274,7 @@ async fn event_503_full_playback_against_live_lsb() {
     let auth_port = std::env::var("AUTH_PORT")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(54231);
+        .unwrap_or(ffxi_proto::login::LOGIN_AUTH_PORT);
 
     if !is_reachable(&server_host, auth_port).await {
         eprintln!(
@@ -321,8 +323,8 @@ async fn event_503_full_playback_against_live_lsb() {
         server: server_host.clone(),
         map_host_override: None,
         auth_port,
-        data_port: 54230,
-        view_port: 54001,
+        data_port: ffxi_proto::login::LOGIN_DATA_PORT,
+        view_port: ffxi_proto::login::LOGIN_VIEW_PORT,
         user: fixture.username.clone(),
         password: fixture.password.clone(),
         char_selection: CharSelection::Name(fixture.charname.clone()),
