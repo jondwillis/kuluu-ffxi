@@ -1,8 +1,8 @@
 # Ordinary PC model arrival: resource gate and opacity fade
 
 Date: 2026-09-14. Initial method: original-client binary inspection with XIClient
-as symbol/call-chain guidance. At that stage there was no live visual observation: `hxi.sh status` reports
-Windows 11 suspended; `hxi.sh capture` returned no window. The VM was left
+as symbol/call-chain guidance. At that stage there was no live visual observation: `observe.sh status` reports
+Windows 11 suspended; `observe.sh capture` returned no window. The VM was left
 suspended and no game inputs were sent.
 
 ## Finding

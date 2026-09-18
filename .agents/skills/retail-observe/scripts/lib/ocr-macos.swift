@@ -6,7 +6,7 @@ guard CommandLine.arguments.count > 1,
     let img = NSImage(contentsOfFile: CommandLine.arguments[1]),
     let cg = img.cgImage(forProposedRect: nil, context: nil, hints: nil)
 else {
-    FileHandle.standardError.write("usage: swift hxi-ocr.swift <png>\n".data(using: .utf8)!)
+    FileHandle.standardError.write("usage: swift ocr-macos.swift <png>  (prints TEXT\tx\ty in image pixels)\n".data(using: .utf8)!)
     exit(2)
 }
 

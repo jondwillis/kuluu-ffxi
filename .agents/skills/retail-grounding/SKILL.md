@@ -1,6 +1,6 @@
 ---
 name: retail-grounding
-description: Ground FFXI vanilla client behavior in available retail observation, binaries and DATs before implementing or reviewing parity changes. Use for rendering, animation, camera, UI, input, collision or client format semantics whose correct behavior depends on the original client. Skip product-only tooling and purely server-side protocol work.
+description: Ground FFXI vanilla client behavior in available retail observation, binaries and DATs before implementing or reviewing parity changes. Use this whenever the correct behavior depends on the original client -- rendering, animation, camera, UI, input, collision, or client file-format semantics -- including when the request sounds like ordinary implementation work and never mentions retail or parity. Works from whatever retail client is reachable on this machine (native, Wine or a VM) and from the installed binaries and DATs when none is running. Skip it for product-only tooling and for purely server-side protocol work.
 ---
 
 # Retail grounding
@@ -18,10 +18,14 @@ points: check that they cover this behavior and still apply to the relevant
 client build. Reuse sufficient evidence rather than repeating an investigation.
 
 - **Visible behavior or timing:** use [retail-observe](../retail-observe/SKILL.md)
-  for the original client. Capture a comparison that separates competing
-  explanations, with relevant model, pose, camera and client settings recorded.
-  Account for private-server differences, injected addons and graphics mods
-  before calling a measurement vanilla.
+  to drive the original client, on whatever host runs it here. Capture a
+  comparison that separates competing explanations, with relevant model, pose,
+  camera and client settings recorded. Account for private-server differences,
+  injected addons, graphics mods and the compatibility layer itself before
+  calling a measurement vanilla: a frame rate or a shadow observed under Wine or
+  in a VM is evidence about that stack too, so prefer measurements that a
+  translation layer cannot plausibly change, or confirm the same result on a
+  second host.
 - **Exact computation, predicates or format bits:** inspect the relevant retail
   binary/DAT and trace the caller, branch and data provenance. XIClient is the
   preferred community map into that code; its names and comments are not proof.
@@ -33,7 +37,10 @@ client build. Reuse sufficient evidence rather than repeating an investigation.
   sends; it does not establish how retail renders or interprets every field.
 
 Check availability before planning a live drive or assuming a reference clone
-is populated. A stopped VM does not make local binary/DAT inspection unavailable.
+is populated. A client you cannot launch right now -- a stopped VM, a Wine
+prefix that will not open a window, no install for the era in question -- does
+not make local binary/DAT inspection unavailable; those files are on disk
+regardless of whether anything can run them.
 If a source cannot be used, continue with the best available evidence and say
 which claim remains an inference. Do not make unrelated work wait for a client
 login, exhaustive reverse engineering, or optional tooling. Follow existing

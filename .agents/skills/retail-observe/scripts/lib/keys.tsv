@@ -1,0 +1,87 @@
+# Logical key name -> per-host key identifier. One source for every backend:
+# bash reads column 2/3, PowerShell reads column 4, so a key recipe written in
+# a skill or an observation record names the logical key and stays portable.
+#
+# macos  = CGEvent virtual keycode (US layout). macOS has no Scroll Lock or
+#          PrintScreen keycode; a PC keyboard's Scroll Lock/PrintScreen arrive
+#          as F14/F13, which is what the guest sees.
+# x11    = xdotool keysym
+# win32  = Win32 virtual-key code
+#
+# logical	macos	x11	win32	note
+enter	36	Return	0x0D	confirm
+esc	53	Escape	0x1B	cancel, unwinds one menu layer per press
+tab	48	Tab	0x09	cycle target
+space	49	space	0x20
+backspace	51	BackSpace	0x08
+up	126	Up	0x26
+down	125	Down	0x28
+left	123	Left	0x25
+right	124	Right	0x27
+menu	27	minus	0xBD	main menu; left/right switch its pages
+chat	44	slash	0xBF	opens chat entry for a slash command
+zoom-out	43	comma	0xBC	chase-camera zoom out; hold to run to the stop
+zoom-in	47	period	0xBE	chase-camera zoom in
+cam-up	91	KP_8	0x68	raises the eye's world Y, not an orbit
+cam-down	84	KP_2	0x62
+hud-toggle	107	Scroll_Lock	0x91	hides every HUD window; nameplates persist
+screenshot-key	105	Print	0x2C	the client's own screenshot, not the host's
+target-self	122	F1	0x70	F1; Enter alone targets the nearest NPC instead
+a	0	a	0x41
+b	11	b	0x42
+c	8	c	0x43
+d	2	d	0x44
+e	14	e	0x45
+f	3	f	0x46
+g	5	g	0x47
+h	4	h	0x48
+i	34	i	0x49
+j	38	j	0x4A
+k	40	k	0x4B
+l	37	l	0x4C
+m	46	m	0x4D
+n	45	n	0x4E
+o	31	o	0x4F
+p	35	p	0x50
+q	12	q	0x51
+r	15	r	0x52
+s	1	s	0x53
+t	17	t	0x54
+u	32	u	0x55
+v	9	v	0x56
+w	13	w	0x57
+x	7	x	0x58
+y	16	y	0x59
+z	6	z	0x5A
+0	29	0	0x30
+1	18	1	0x31
+2	19	2	0x32
+3	20	3	0x33
+4	21	4	0x34
+5	23	5	0x35
+6	22	6	0x36
+7	26	7	0x37
+8	28	8	0x38
+9	25	9	0x39
+kp0	82	KP_0	0x60
+kp1	83	KP_1	0x61
+kp2	84	KP_2	0x62
+kp3	85	KP_3	0x63
+kp4	86	KP_4	0x64
+kp5	87	KP_5	0x65
+kp6	88	KP_6	0x66
+kp7	89	KP_7	0x67
+kp8	91	KP_8	0x68
+kp9	92	KP_9	0x69
+f1	122	F1	0x70
+f2	120	F2	0x71
+f3	99	F3	0x72
+f4	118	F4	0x73
+f5	96	F5	0x74
+f6	97	F6	0x75
+f7	98	F7	0x76
+f8	100	F8	0x77
+f9	101	F9	0x78
+f10	109	F10	0x79
+f11	103	F11	0x7A
+f12	111	F12	0x7B

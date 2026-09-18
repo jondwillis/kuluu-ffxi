@@ -133,5 +133,5 @@ Parallels **Standard** — `prlctl start`/`resume` both refuse ("available only 
 Parallels Desktop for Mac Pro or Business Edition"). Opening the `.pvm` bundle
 resumed it, but the only window Parallels then exposed was an
 "You are running an older version of Parallels Desktop" upsell dialog, which
-took neither `hxi.sh click` nor System Events keystrokes, and the guest window
+took neither `observe.sh click` nor System Events keystrokes, and the guest window
 never appeared behind it. Dismissing that dialog by hand is the unblock.
