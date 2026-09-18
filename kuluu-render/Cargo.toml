@@ -123,7 +123,7 @@ ffxi-audio = { path = "../ffxi-audio" }
 # Same pinned copy as bevy's wgpu (29.x in the lockfile — zero new compile):
 # graphics/dlss_nr.rs names a few raw wgpu types that bevy does not re-export
 # (TextureTransition/TextureUses). Native-only; wasm never sees it.
-wgpu = { version = "29", default-features = false, features = ["std"] }
+wgpu = { version = "30", default-features = false, features = ["std"] }
 # Stable id for the synthetic picking pointer that bridges window-space mouse
 # input onto the off-screen render-scale target (graphics::render_scale, which
 # is itself native-only). from_u128 only — no getrandom needed.
