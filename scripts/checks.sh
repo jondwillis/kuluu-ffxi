@@ -448,13 +448,20 @@ run_comments() {
 }
 
 run_contracts() {
-  local contract="session::event_transport::contracts::event_state_contract" listing
+  # Two entry points because the ferry/bootstrap contracts block on their own
+  # current-thread runtime and must run outside an active tokio context; both
+  # are mandatory, so both are named here.
+  local contract listing
   listing=$(cargo test -p kuluu-session --lib --locked -- --list)
-  if ! grep -Fxq "$contract: test" <<< "$listing"; then
-    echo "checks: contracts — mandatory event state contract is missing" >&2
-    return 1
-  fi
-  cargo test -p kuluu-session --lib --locked "$contract" -- --exact --include-ignored
+  for contract in \
+    session::event_transport::contracts::event_state_contract \
+    session::event_transport::contracts::ferry_and_bootstrap_contracts_hold; do
+    if ! grep -Fxq "$contract: test" <<< "$listing"; then
+      echo "checks: contracts — mandatory event state contract is missing: $contract" >&2
+      return 1
+    fi
+    cargo test -p kuluu-session --lib --locked "$contract" -- --exact --include-ignored
+  done
   listing=$(cargo test -p kuluu-render -p kuluu --lib --locked "${FEATURES[@]}" -- --list)
   for contract in \
     transport::tests::transport_state_contract \
