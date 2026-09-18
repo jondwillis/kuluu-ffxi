@@ -1,0 +1,11 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Discord
+    url: https://discord.gg/5c8NK46SuD
+    about: Setup help, questions and bug reports from players. The fastest way to reach the project.
+  - name: Downloads
+    url: https://github.com/jondwillis/kuluu-ffxi/releases
+    about: Prebuilt Windows, macOS and Linux archives.
+  - name: Contributing guide
+    url: https://github.com/jondwillis/kuluu-ffxi/blob/main/CONTRIBUTING.md
+    about: How the backlog works and how to build, before opening a code issue.

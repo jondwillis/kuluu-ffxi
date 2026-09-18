@@ -405,7 +405,7 @@ const NGX_VERSION_API: c_int = 0x0000_0015;
 // ---------------------------------------------------------------------------
 
 /// Staged next to kuluu.exe as nvngx.dll_kuluu.dll (renamed from kuluu_ngx_fwd.dll;
-/// see README.md#optional-dlss-builds for the copy step).
+/// see CONTRIBUTING.md#optional-dlss-and-neural-uplift-builds for the copy step).
 /// The NR runtime gates its Init_Ext/CreateFeature/ReleaseFeature entry points on
 /// the calling module's file name containing "nvngx.dll" (case-insensitive substring);
 /// this name passes without shadowing the driver's real nvngx.dll that nvsdk_ngx_s.lib

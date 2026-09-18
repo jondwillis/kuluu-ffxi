@@ -168,7 +168,7 @@ impl NrState {
                     error!("dlss-nr: forwarder received a null Init_Ext pointer (kuluu-dlss-nr load-order bug)");
                 } else if r as u32 == NGX_FAIL_PLATFORM_ERROR {
                     // Still gated: the call did not land inside nvngx.dll_kuluu.dll.
-                    warn!("dlss-nr: still module-gated — confirm nvngx.dll_kuluu.dll sits next to this exe (staging in README.md#optional-dlss-builds)");
+                    warn!("dlss-nr: still module-gated — confirm nvngx.dll_kuluu.dll sits next to this exe (staging in CONTRIBUTING.md#optional-dlss-and-neural-uplift-builds)");
                 }
                 false
             }
@@ -437,7 +437,7 @@ pub fn prepare_nr(
                 if r == kuluu_dlss_nr::FWD_NULL_TARGET {
                     error!("dlss-nr: forwarder received a null CreateFeature pointer (kuluu-dlss-nr load-order bug)");
                 } else if r as u32 == NGX_FAIL_PLATFORM_ERROR {
-                    warn!("dlss-nr: still module-gated — confirm nvngx.dll_kuluu.dll sits next to this exe and is current (staging in README.md#optional-dlss-builds)");
+                    warn!("dlss-nr: still module-gated — confirm nvngx.dll_kuluu.dll sits next to this exe and is current (staging in CONTRIBUTING.md#optional-dlss-and-neural-uplift-builds)");
                 }
             }
         }

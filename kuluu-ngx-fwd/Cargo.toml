@@ -7,7 +7,7 @@ description = "Return-address forwarder so nvngx_dlssnr.dll's Init_Ext sees a ca
 
 [lib]
 # Cargo won't let a lib target contain '.', so the DLL is built as kuluu_ngx_fwd.dll
-# and renamed to nvngx.dll_kuluu.dll at staging time (see "Running / distributing" in README.md#optional-dlss-builds).
+# and renamed to nvngx.dll_kuluu.dll at staging time (see CONTRIBUTING.md#optional-dlss-and-neural-uplift-builds).
 name = "kuluu_ngx_fwd"
 crate-type = ["cdylib"]
 
