@@ -1028,9 +1028,8 @@ pub enum CutsceneActor {
 
 /// One staging effect the running event script asked for — the renderer-facing
 /// half of [`ffxi_event::EventCue`]. `MusicVolume` is absent because 0x5D rides
-/// [`AgentEvent::MusicVolumeChanged`] instead of the cue stream. Not `Eq`:
-/// [`CutsceneCue::ActorMove`] carries a float speed.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+/// [`AgentEvent::MusicVolumeChanged`] instead of the cue stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CutsceneCue {
     ActorMotion {
         actor: CutsceneActor,
@@ -1091,7 +1090,9 @@ pub enum CutsceneCue {
         y: i32,
         z: i32,
         heading: i32,
-        speed: f32,
+        /// Raw 0x32 MainSpeed operand; the renderer scales it with
+        /// `ffxi_event::vm::scene::EVENT_SPEED_SCALE`.
+        speed: i32,
     },
     /// Snap `actor` to `(x, y, z)` facing `heading`, in event-coordinate
     /// integers.

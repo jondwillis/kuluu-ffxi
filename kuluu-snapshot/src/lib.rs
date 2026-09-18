@@ -2,27 +2,43 @@
 
 use serde::{Deserialize, Serialize};
 
-// v35: InventoryItem.use_delay_end_vana_ts + ready (enchanted-item equip delay).
-// v34: CharFlags.graph_size - Flags1.GraphSize, the server's per-entity size class.
-// It indexes the model's four authored CIB scales, so without it every entity
-// renders at the model's index-0 size and mob size variation is lost.
-// v31: CutsceneCue::ExtScheduler.motion - the 0x66 Tpc package now carries its two
+// v39: CutsceneCue::ActorMove.speed is the raw 0x32 MainSpeed operand (i32,
+// scaled by ffxi_event EVENT_SPEED_SCALE at the consumer) instead of yalms/sec
+// as f32, which restores Eq on CutsceneCue for keyed hold tables.
+// v38: CutsceneCue::HudHide (0x67/0x68) + CutsceneCue::ClockHold (0x77/0x78) and
+// ViewerEvent::{MapOpen, MapMarkerPlaced, MapClosed} (event script 0xC8/0x8B/0x8A).
+// v37: SceneSnapshot.self_pet_targid - the owner-only 0x068 PetSync targid, which
+// PET-flagged ability targeting needs to offer the caster's own pet.
+// v36: DialogState.{cancel_armed, speaker_index, contains_item} - retail's
+// CliEventCancelFlag, the per-frame speaker's target index, and whether the line
+// carried an item / key-item marker before substitution.
+// v35: CutsceneCue::ZoneScheduler.zone_id - the 0x2D zone scene now carries the
+// current zone so the host resolves its key out of the zone's own model DAT (with
+// the entrance/instance partner and non-model carriers as fallbacks) instead of the
+// global title-screen scene DAT.
+// v34: CutsceneCue::EntityName (0xB5 case 0 display-name change, fed by the
+// s2c 0x005D PENDINGSTR table via 0xB4 case 1).
+// v33: CutsceneCue::ExtScheduler.motion - the 0x66 Tpc package now carries its two
 // container file ids (A + the CIB-waist-selected B) instead of one flat id; None is the
 // out-of-range package, which loads nothing.
-// v30: CutsceneCue::ZoneScheduler - the 0x2D/0x54 zone scene routine out of the global
+// v32: CutsceneCue::ZoneScheduler - the 0x2D/0x54 zone scene routine out of the global
 // scene DAT (ROM/0/23.DAT), whose camera routes drive the operator camera.
-// v29: CutsceneCue::ExtScheduler (the 0x5B/0x66 motion-resource cue) and the
+// v31: CutsceneCue::ExtScheduler (the 0x5B/0x66 motion-resource cue) and the
 // actor cues ActorMove / ActorPlace / ActorFace / ActorLookAt / ActorStopAction
 // that a REQSET-spawned NPC script emits.
-// v28: ViewerEvent::ActionStarted.outcome - the first result block as one typed
+// v30: ViewerEvent::ActionStarted.outcome - the first result block as one typed
 // Option<ResultOutcome> (resolution + info bits + hitDistortion + knockback, ffxi-proto enums
 // from the pinned vendor/server headers) instead of four parallel u8 fields that spelled "no
 // result block" as zero. None means no result block was read; resolution 0 is Hit, so absence
 // must not be a value.
-// v27: ViewerEvent::ActionStarted.{info, hit_distortion, knockback, kind} - the first
+// v29: ViewerEvent::ActionStarted.{info, hit_distortion, knockback, kind} - the first
 // result's per-result outcome bits packed by BATTLE2 (s2c 0x028): Defeated/CriticalHit
 // flags, the hit-distortion level and the knockback level that drive the victim's reaction
 // routine.
+// v28: InventoryItem.use_delay_end_vana_ts + ready (enchanted-item equip delay).
+// v27: CharFlags.graph_size - Flags1.GraphSize, the server's per-entity size class.
+// It indexes the model's four authored CIB scales, so without it every entity
+// renders at the model's index-0 size and mob size variation is lost.
 // v26: ViewerEvent::ActionStarted.outcome - the first result's (info, hitDistortion,
 // knockback) bits (GP_SERV_COMMAND_BATTLE2::pack) that drive the victim's reaction routine.
 // v25: ViewerEvent::TargetChanged - the server-pushed retarget (s2c 0x058 ASSIST).
@@ -75,13 +91,7 @@ use serde::{Deserialize, Serialize};
 // v5: InventoryItem.charges_remaining + next_use_vana_ts (item recast/charges).
 // v4: SceneSnapshot.delivery_box (dedicated delivery screen) + ViewerCommand::DeliveryBox
 // (postcard frames are not self-describing, so any shape change bumps this).
-// v33: CutsceneCue::ZoneScheduler.zone_id - the 0x2D zone scene now carries the
-// current zone so the host resolves its key out of the zone's own model DAT (with
-// the entrance/instance partner and non-model carriers as fallbacks) instead of the
-// global title-screen scene DAT.
-// v32: CutsceneCue::EntityName (0xB5 case 0 display-name change, fed by the
-// s2c 0x005D PENDINGSTR table via 0xB4 case 1).
-pub const PROTOCOL_VERSION: u32 = 35;
+pub const PROTOCOL_VERSION: u32 = 39;
 
 /// Longest countdown `SceneSnapshot::status_icon_expiries` can carry. The
 /// producer rejects anything beyond it as a corrupt 0x063 timestamp, and the HUD
@@ -1614,8 +1624,8 @@ pub enum ExtSchedulerMotion {
 /// One staging effect the running event script asked for, in execution order.
 /// Scoped to the event session: every one of these is undone at
 /// [`ViewerEvent::CutsceneEnded`], because the bytecode routinely never undoes
-/// it itself. Not `Eq`: [`CutsceneCue::ActorMove`] carries a float speed.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+/// it itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CutsceneCue {
     /// Play action `key` on `actor`, with `partner` as the action's partner.
     ActorMotion {
@@ -1683,7 +1693,9 @@ pub enum CutsceneCue {
         y: i32,
         z: i32,
         heading: i32,
-        speed: f32,
+        /// Raw 0x32 MainSpeed operand; the renderer scales it with
+        /// `ffxi_event::vm::scene::EVENT_SPEED_SCALE`.
+        speed: i32,
     },
     /// Snap `actor` to `(x, y, z)` facing `heading`, in event-coordinate
     /// integers.
@@ -2383,7 +2395,7 @@ mod tests {
 
     #[test]
     fn current_protocol_preserves_transport_and_voyage_fields() {
-        const VERSION: u32 = 35;
+        const VERSION: u32 = 39;
         const STAMP: u32 = 0x1200_3400;
         assert_eq!(PROTOCOL_VERSION, VERSION);
         let mut snapshot = sample_snapshot();

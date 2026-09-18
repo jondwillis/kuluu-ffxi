@@ -10,7 +10,7 @@ use super::{ActorLookup, EventVm, PendingTag, StepResult};
 // 0x0032.md MainSpeed; 0x0047.md FUNC_XiEvent_OpCode_0x0047.
 pub const EVENT_COORD_UNITS: f32 = 1000.0;
 pub const EVENT_HEADING_UNITS: f32 = 4096.0;
-const EVENT_SPEED_SCALE: f32 = 0.1;
+pub const EVENT_SPEED_SCALE: f32 = 0.1;
 /// Retail's ReqStack holds 16 requests per actor (research/XiEvents/Event VM
 /// Structures.md xievent_t::ReqStack); a push onto a full stack is the "no free
 /// slot" case that makes REQSET yield.
@@ -96,7 +96,9 @@ pub(super) struct Scene {
     dat: Arc<EventDat>,
     pub(super) actor: u32,
     player: EventPosition,
-    speed: f32,
+    /// Raw 0x32 MainSpeed work-slot operand; yalms/sec is
+    /// `speed as f32 * EVENT_SPEED_SCALE`.
+    speed: i32,
     motion: Option<EventPosition>,
     pending_position: bool,
     pending_event: bool,
@@ -117,7 +119,7 @@ impl EventVm {
             dat,
             actor,
             player,
-            speed: 0.0,
+            speed: 0,
             motion: None,
             pending_position: false,
             pending_event: false,
@@ -299,7 +301,7 @@ impl EventVm {
         let dx = (goal.x - scene.player.x) as f32;
         let dz = (goal.z - scene.player.z) as f32;
         let distance = dx.hypot(dz);
-        let travel = scene.speed * dt * EVENT_COORD_UNITS;
+        let travel = scene.speed as f32 * EVENT_SPEED_SCALE * dt * EVENT_COORD_UNITS;
         scene.player.heading =
             ((-dz).atan2(dx) / std::f32::consts::TAU * EVENT_HEADING_UNITS) as i32;
         if distance <= travel {
@@ -677,7 +679,7 @@ impl EventVm {
                 self.advance(op);
             }
             OP_SPEED => {
-                let speed = self.getworkofs(1, 0) as f32 * EVENT_SPEED_SCALE;
+                let speed = self.getworkofs(1, 0);
                 self.scene.as_mut().unwrap().speed = speed;
                 self.advance(op);
             }

@@ -2555,7 +2555,9 @@ mod tests {
         assert_eq!(
             cues_of_with_types(OP_LOADEXTSCHEDULER, &o, vec![FILE_OPERAND], &types),
             [EventCue::ExtScheduler {
-                motion: Some(ExtSchedulerMotion::Event(32104 + FILE_OPERAND)),
+                motion: Some(ExtSchedulerMotion::Event(event_motion_dat_id(
+                    FILE_OPERAND as i32
+                ))),
                 actor1: ActorLookup::EVENT_ENTITY,
                 actor2: ActorLookup::EVENT_ENTITY,
                 key: *b"abcd",
@@ -2639,7 +2641,9 @@ mod tests {
         assert_eq!(
             cues_of_with_types(OP_LOADEXTSCHEDULER, &o, vec![FILE_OPERAND], &types(2)),
             [EventCue::ExtScheduler {
-                motion: Some(ExtSchedulerMotion::Event(32104 + FILE_OPERAND)),
+                motion: Some(ExtSchedulerMotion::Event(event_motion_dat_id(
+                    FILE_OPERAND as i32
+                ))),
                 actor1: ActorLookup::EVENT_ENTITY,
                 actor2: ActorLookup::EVENT_ENTITY,
                 key: *b"abcd",
@@ -4179,14 +4183,14 @@ mod tests {
             data.extend_from_slice(&[i as u8, (REFERENCE_FLAG >> 8) as u8]);
         }
         data.extend_from_slice(&[OP_EVENTPOSSET, 0x01, OP_END]);
-        let mut e = vm(data, vec![0, 2048, (-512i32) as u32, 3072, 1024]);
+        let mut e = vm(data, vec![0, 2048, (-512i32) as u32, 4096, 1024]);
 
         assert_eq!(
             e.step(),
             StepResult::AwaitServerAck(PendingTag::SendXzy {
                 x: 2.048,
                 y: -0.512,
-                z: 3.072,
+                z: 4.096,
                 // A quarter turn lands at 63.998 on the wire's 0..=255 scale:
                 // retail's f32 literals fall just short of exactly a quarter
                 // and the conversion truncates rather than rounds.
@@ -4632,7 +4636,7 @@ mod tests {
             OP_END,
         ];
 
-        /// References[0]: the speed operand, * EVENT_SPEED_SCALE = 1.0.
+        /// References[0]: the raw speed operand; * EVENT_SPEED_SCALE it is 1.0 yalm/s.
         const MOVE_SPEED_REF: u32 = 10;
         /// References[1]: the y goal -5 (a bytecode literal cannot carry it).
         const NEG_FIVE_REF: u32 = (-5_i32) as u32;
@@ -4680,7 +4684,7 @@ mod tests {
                     z: 40,
                     heading: 0,
                 },
-                speed: 1.0,
+                speed: MOVE_SPEED_REF as i32,
             }]
         );
 
@@ -4870,7 +4874,7 @@ mod tests {
         npc.extend_from_slice(&NPC_SERVER_ID.to_le_bytes());
         npc.push(OP_END);
 
-        /// References[0]: the speed operand, * EVENT_SPEED_SCALE = 1.0.
+        /// References[0]: the raw speed operand; * EVENT_SPEED_SCALE it is 1.0 yalm/s.
         const SPEED_REF: u32 = 10;
         /// References[1]: the y goal -5 (a bytecode literal cannot carry it).
         const NEG_FIVE_REF: u32 = (-5_i32) as u32;
@@ -4919,7 +4923,7 @@ mod tests {
                         z: 40,
                         heading: 0,
                     },
-                    speed: 1.0,
+                    speed: SPEED_REF as i32,
                 },
                 EventCue::ActorHide {
                     target: ActorLookup(NPC_SERVER_ID),

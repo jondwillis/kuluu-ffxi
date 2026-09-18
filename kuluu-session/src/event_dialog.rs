@@ -706,9 +706,8 @@ pub fn agent_event_id(unique_no: u32, event_id: u16) -> u32 {
     ((unique_no as u64) << 16 | event_id as u64) as u32
 }
 
-/// A drained [`EventCue`] with its actors resolved. Not `Eq`: the scene arm
-/// carries a [`CutsceneCue`], whose [`CutsceneCue::ActorMove`] speed is a float.
-#[derive(Debug, Clone, PartialEq)]
+/// A drained [`EventCue`] with its actors resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResolvedCue {
     /// Crosses the wire boundary as a [`CutsceneCue`].
     Scene(CutsceneCue),
@@ -722,7 +721,7 @@ pub enum ResolvedCue {
 
 /// One event-script ask on the player's Map screen (research/XiEvents/OpCodes/
 /// 0x00C8.md, 0x008B.md, 0x008A.md).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MapOp {
     /// Open the Map on zone `map_id`; `tutorial` is retail's help-flag operand.
     Open { map_id: u16, tutorial: bool },
@@ -1515,7 +1514,7 @@ fn arm_move_holds(
             );
             continue;
         };
-        if speed <= 0.0 {
+        if speed <= 0 {
             tracing::debug!(
                 target: "kuluu_session::event_dialog",
                 server_id,
@@ -1524,13 +1523,14 @@ fn arm_move_holds(
             );
             continue;
         }
-        // The scene lerp travels `speed * EVENT_COORD_UNITS` event units per
-        // second in the x/z plane (ffxi-event vm/scene.rs tick_scene); hold
-        // units are 1/60 s on the VM's wait clock.
+        // The scene lerp travels `speed * EVENT_SPEED_SCALE * EVENT_COORD_UNITS`
+        // event units per second in the x/z plane (ffxi-event vm/scene.rs
+        // tick_scene); hold units are 1/60 s on the VM's wait clock.
         let dx = (goal.x - current.x) as f32;
         let dz = (goal.z - current.z) as f32;
-        let units =
-            dx.hypot(dz) / (speed * ffxi_event::vm::scene::EVENT_COORD_UNITS) * WAIT_UNITS_PER_SEC;
+        let yalms_per_sec = speed as f32 * ffxi_event::vm::scene::EVENT_SPEED_SCALE;
+        let units = dx.hypot(dz) / (yalms_per_sec * ffxi_event::vm::scene::EVENT_COORD_UNITS)
+            * WAIT_UNITS_PER_SEC;
         tracing::debug!(
             target: "kuluu_session::event_dialog",
             server_id,

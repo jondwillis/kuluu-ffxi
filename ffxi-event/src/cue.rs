@@ -250,8 +250,7 @@ pub enum ExtSchedulerMotion {
 pub const NO_ACTION_KEY: FourCc = *b"xxxx";
 
 /// One staging effect the running event asked for. Emitted in execution order.
-/// Not `Eq`: [`EventCue::ActorMove`] carries a float speed.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventCue {
     /// 0x2C SCHEDULOR: play action `key` on `actor1`, with `actor2` as the
     /// action's partner (research/XiEvents/OpCodes/0x002C.md).
@@ -321,7 +320,9 @@ pub enum EventCue {
     ActorMove {
         actor: ActorLookup,
         goal: EventPosition,
-        speed: f32,
+        /// Raw 0x32 MainSpeed operand; the host scales it with
+        /// [`crate::vm::scene::EVENT_SPEED_SCALE`].
+        speed: i32,
     },
     /// 0x37 on a non-player actor: set the event entity's position (teleport,
     /// no hold; research/XiEvents/OpCodes/0x0037.md).
@@ -467,6 +468,28 @@ impl EventCue {
 mod tests {
     use super::*;
 
+    // Band bases read back off FFXiMain.dll independently of the consts above:
+    // the band-edge tests are only worth running while their expected values
+    // come from a second source, so they are pinned here rather than imported.
+    const EVENT_MOTION_BASE_0_PINNED: u32 = 32104;
+    const EVENT_MOTION_BASE_1_PINNED: u32 = 49135;
+    const EVENT_MOTION_BASE_2_PINNED: u32 = 56345;
+    const EVENT_MOTION_BASE_3_PINNED: u32 = 59739;
+    const EVENT_MOTION_BASE_4_PINNED: u32 = 66339;
+    const EVENT_MOTION_BAND_4_PINNED: u32 = 3072;
+    const TPC_A_BASE_1_PINNED: u32 = 32712;
+    const TPC_B_SET_BASE_1_PINNED: u32 = 32782;
+    const TPC_B_CLEAR_BASE_1_PINNED: u32 = 32852;
+    const TPC_A_BASE_2_PINNED: u32 = 61241;
+    const TPC_B_SET_BASE_2_PINNED: u32 = 61311;
+    const TPC_B_CLEAR_BASE_2_PINNED: u32 = 61381;
+    const TPC_A_BASE_3_PINNED: u32 = 87825;
+    const TPC_B_SET_BASE_3_PINNED: u32 = 87895;
+    const TPC_B_CLEAR_BASE_3_PINNED: u32 = 87965;
+    const TPC_A_BASE_4_PINNED: u32 = 102239;
+    const TPC_B_SET_BASE_4_PINNED: u32 = 102309;
+    const TPC_B_CLEAR_BASE_4_PINNED: u32 = 102379;
+
     /// The fade pair's DAT id is the one the 0x45 base plus its authored work
     /// operand resolves to; both consts must keep agreeing.
     #[test]
@@ -500,15 +523,19 @@ mod tests {
     fn event_motion_dat_id_picks_its_base_at_each_band_edge() {
         // Each band edge lands on the next base exactly once; the value just
         // below an edge stays in the current band.
-        assert_eq!(event_motion_dat_id(0), 32104);
-        assert_eq!(event_motion_dat_id(511), 32104 + 511);
-        assert_eq!(event_motion_dat_id(512), 49135 + 512);
-        assert_eq!(event_motion_dat_id(1023), 49135 + 1023);
-        assert_eq!(event_motion_dat_id(1024), 56345 + 1024);
-        assert_eq!(event_motion_dat_id(2047), 56345 + 2047);
-        assert_eq!(event_motion_dat_id(2048), 59739 + 2048);
-        assert_eq!(event_motion_dat_id(3071), 59739 + 3071);
-        assert_eq!(event_motion_dat_id(3072), 66339 + 3072);
+        let band_4 = EVENT_MOTION_BAND_4_PINNED;
+        assert_eq!(event_motion_dat_id(0), EVENT_MOTION_BASE_0_PINNED);
+        assert_eq!(event_motion_dat_id(511), EVENT_MOTION_BASE_0_PINNED + 511);
+        assert_eq!(event_motion_dat_id(512), EVENT_MOTION_BASE_1_PINNED + 512);
+        assert_eq!(event_motion_dat_id(1023), EVENT_MOTION_BASE_1_PINNED + 1023);
+        assert_eq!(event_motion_dat_id(1024), EVENT_MOTION_BASE_2_PINNED + 1024);
+        assert_eq!(event_motion_dat_id(2047), EVENT_MOTION_BASE_2_PINNED + 2047);
+        assert_eq!(event_motion_dat_id(2048), EVENT_MOTION_BASE_3_PINNED + 2048);
+        assert_eq!(event_motion_dat_id(3071), EVENT_MOTION_BASE_3_PINNED + 3071);
+        assert_eq!(
+            event_motion_dat_id(band_4 as i32),
+            EVENT_MOTION_BASE_4_PINNED + band_4
+        );
     }
 
     #[test]
@@ -518,65 +545,65 @@ mod tests {
         assert_eq!(
             tpc_motion_packages(0),
             Some(TpcMotionPackages {
-                a: 32712,
-                b_set: 32782,
-                b_clear: 32852,
+                a: TPC_A_BASE_1_PINNED,
+                b_set: TPC_B_SET_BASE_1_PINNED,
+                b_clear: TPC_B_CLEAR_BASE_1_PINNED,
             })
         );
         assert_eq!(
             tpc_motion_packages(0x45),
             Some(TpcMotionPackages {
-                a: 32712 + 0x45,
-                b_set: 32782 + 0x45,
-                b_clear: 32852 + 0x45,
+                a: TPC_A_BASE_1_PINNED + 0x45,
+                b_set: TPC_B_SET_BASE_1_PINNED + 0x45,
+                b_clear: TPC_B_CLEAR_BASE_1_PINNED + 0x45,
             })
         );
         assert_eq!(
             tpc_motion_packages(0x46),
             Some(TpcMotionPackages {
-                a: 61241,
-                b_set: 61311,
-                b_clear: 61381,
+                a: TPC_A_BASE_2_PINNED,
+                b_set: TPC_B_SET_BASE_2_PINNED,
+                b_clear: TPC_B_CLEAR_BASE_2_PINNED,
             })
         );
         assert_eq!(
             tpc_motion_packages(0x8B),
             Some(TpcMotionPackages {
-                a: 61241 + 0x45,
-                b_set: 61311 + 0x45,
-                b_clear: 61381 + 0x45,
+                a: TPC_A_BASE_2_PINNED + 0x45,
+                b_set: TPC_B_SET_BASE_2_PINNED + 0x45,
+                b_clear: TPC_B_CLEAR_BASE_2_PINNED + 0x45,
             })
         );
         assert_eq!(
             tpc_motion_packages(0x8C),
             Some(TpcMotionPackages {
-                a: 87825,
-                b_set: 87895,
-                b_clear: 87965,
+                a: TPC_A_BASE_3_PINNED,
+                b_set: TPC_B_SET_BASE_3_PINNED,
+                b_clear: TPC_B_CLEAR_BASE_3_PINNED,
             })
         );
         assert_eq!(
             tpc_motion_packages(0xD1),
             Some(TpcMotionPackages {
-                a: 87825 + 0x45,
-                b_set: 87895 + 0x45,
-                b_clear: 87965 + 0x45,
+                a: TPC_A_BASE_3_PINNED + 0x45,
+                b_set: TPC_B_SET_BASE_3_PINNED + 0x45,
+                b_clear: TPC_B_CLEAR_BASE_3_PINNED + 0x45,
             })
         );
         assert_eq!(
             tpc_motion_packages(0xD2),
             Some(TpcMotionPackages {
-                a: 102239,
-                b_set: 102309,
-                b_clear: 102379,
+                a: TPC_A_BASE_4_PINNED,
+                b_set: TPC_B_SET_BASE_4_PINNED,
+                b_clear: TPC_B_CLEAR_BASE_4_PINNED,
             })
         );
         assert_eq!(
             tpc_motion_packages(0x117),
             Some(TpcMotionPackages {
-                a: 102239 + 0x45,
-                b_set: 102309 + 0x45,
-                b_clear: 102379 + 0x45,
+                a: TPC_A_BASE_4_PINNED + 0x45,
+                b_set: TPC_B_SET_BASE_4_PINNED + 0x45,
+                b_clear: TPC_B_CLEAR_BASE_4_PINNED + 0x45,
             })
         );
         assert_eq!(tpc_motion_packages(0x118), None);

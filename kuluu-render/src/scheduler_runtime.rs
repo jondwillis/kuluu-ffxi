@@ -14,7 +14,7 @@ use ffxi_dat::kind::ChunkKind;
 use ffxi_dat::scheduler::{Scheduler, StageKind, TimedStage};
 use ffxi_dat::sep::Sep;
 #[cfg(not(target_arch = "wasm32"))]
-use ffxi_event::vm::scene::{EVENT_COORD_UNITS, EVENT_HEADING_UNITS};
+use ffxi_event::vm::scene::{EVENT_COORD_UNITS, EVENT_HEADING_UNITS, EVENT_SPEED_SCALE};
 #[cfg(not(target_arch = "wasm32"))]
 use kuluu_snapshot::{CutsceneCue, ExtSchedulerMotion};
 
@@ -2499,6 +2499,7 @@ pub fn apply_cutscene_actor_cues(
                 let Some(id) = moved(actor) else {
                     continue;
                 };
+                let speed = speed as f32 * EVENT_SPEED_SCALE;
                 state.begin_walk(id, event_to_world(x, y, z), speed);
                 tracing::debug!(
                     target: "kuluu_render::scheduler_runtime",
