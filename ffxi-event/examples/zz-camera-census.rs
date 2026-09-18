@@ -1,4 +1,4 @@
-//! Camera chunk census (B5): chunk-kind counts per file and the AttachmentInfo
+//! Camera chunk census: chunk-kind counts per file and the AttachmentInfo
 //! distribution of kind 0x06 chunks, on the retail 19-bit chunk walk and on the
 //! xim-style 20-bit walk, plus an install-wide recount of attached routes.
 //! The two walks are run side by side so a file one walk reads as camera-free

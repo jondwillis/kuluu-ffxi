@@ -1,8 +1,8 @@
-//! Walk-error census (Cfix3): every .DAT under the install root walked with the
+//! Walk-error census: every .DAT under the install root walked with the
 //! retail 19-bit `ffxi_dat::walk`; the files that error are categorized by
 //! where the error lands, what the error chunk's header says, and what the
-//! clean prefix still carries — because the B5 census found 2,282 walk-error
-//! files (4.3% of the install) and this item asks whether any of them hide
+//! clean prefix still carries — because an earlier census found 2,282 walk-error
+//! files (4.3% of the install), and the open question was whether any of them hide
 //! 0x2D scene-key carriers (scheduler chunks) or attached camera routes
 //! (kind 0x06, AttachmentInfo nonzero).
 //!
@@ -20,11 +20,8 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use ffxi_dat::scheduler::NON_MODEL_SCENE_CARRIERS;
 use ffxi_dat::{walk, DatError};
-
-/// The five non-model 0x2D scene carriers (ffxi-dat scheduler
-/// NON_MODEL_SCENE_CARRIERS; fixToDo/Fix9.md corpus scan), by true file id.
-const NON_MODEL_SCENE_CARRIERS: [u32; 5] = [641, 30705, 57075, 57082, 57204];
 
 const KIND_CAMERA: u8 = 0x06;
 const KIND_SCHEDULER: u8 = 0x07;

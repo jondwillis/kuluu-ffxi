@@ -160,12 +160,6 @@ CR_RE_PRIVATE_PLAN='(^|[^A-Za-z0-9_])([Tt]he[[:space:]]+)?([Pp]lan|[Ww]riteup|[W
 # sentence (a zone's "step 42") still passes.
 CR_RE_STEP_LABEL='//[/!]?[[:space:]]*(-[[:space:]]+)?([Pp]iece|[Pp]hase|[Ss]tep|[Ss]tage|[Pp]art)[[:space:]]+[0-9]+[[:space:]]*[:.)]'
 
-# A path into the local-only Cow_doc research tree (Cow_doc/, Cow_docs/). It
-# never lands in the pushed tree, so a citation to it is unopenable for every
-# reader of the merged code: restate the fact against a public anchor or drop
-# the citation.
-CR_RE_COW_DOC='Cow_docs?/'
-
 # Narrative / session-history / temporal — describes how the code got
 # here or a passing moment, not what is true now.
 CR_RE_NARRATIVE='(why we |we (abandoned|switched|re-?wrote|removed|replaced|migrated)|no longer|used to |previously|originally|prior to |\bregression\b|stage [0-9]|phase [0-9]|\bfor now\b|for the moment|this replaces|the (old|previous) )'
@@ -221,9 +215,9 @@ scan_comment_rot() {
   fi
 
   local dangling
-  dangling=$(printf '%s\n' "$comments" | grep -E "$CR_RE_ELIDED_PATH|$CR_RE_FINDING_ID|$CR_RE_PRIVATE_PLAN|$CR_RE_STEP_LABEL|$CR_RE_COW_DOC" | head -4 || true)
+  dangling=$(printf '%s\n' "$comments" | grep -E "$CR_RE_ELIDED_PATH|$CR_RE_FINDING_ID|$CR_RE_PRIVATE_PLAN|$CR_RE_STEP_LABEL" | head -4 || true)
   if [ -n "$dangling" ]; then
-    printf '%s\n' "$dangling" | sed -E 's#^[[:space:]]*#  [citation nobody can open: elided path / finding id / private plan section / ordinal step label / local-only Cow_doc path] #'
+    printf '%s\n' "$dangling" | sed -E 's#^[[:space:]]*#  [citation nobody can open: elided path / finding id / private plan section / ordinal step label] #'
     found=0
   fi
 

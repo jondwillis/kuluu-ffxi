@@ -354,16 +354,13 @@ run_comments() {
     bad=1
   fi
 
-  hits=$(printf '%s\n' "$comments" | grep -E "//.*$CR_RE_COW_DOC" || true)
-  if [ -n "$hits" ]; then
-    echo "checks: comments - citation to a local-only Cow_doc path nobody else has. Restate the fact against a public anchor (research/, the code, a regression test) or delete the citation:" >&2
-    printf '%s\n' "$hits" | cut -c1-200 | sed 's/^/  /' >&2
-    bad=1
-  fi
-
   # Every cited in-tree path must exist. vendor/ and research/ roots are only
   # checked when that submodule (or local clone) is populated; docs/ never
-  # exists (the tree was retired), so any docs/ citation is dangling.
+  # exists (the tree was retired), so any docs/ citation is dangling. Any
+  # `<dir>/....md` is checked too, whatever the root: a citation into someone's
+  # local notes tree passes a filesystem test on one machine and nowhere else,
+  # and naming those trees one regex at a time only catches the ones already
+  # seen.
   local missing=''
   while IFS= read -r tok; do
     [ -z "$tok" ] && continue
@@ -386,7 +383,7 @@ run_comments() {
     esac
     missing+="  $path"$'\n'
   done < <(printf '%s\n' "$comments" \
-    | grep -oE '(^|[^A-Za-z0-9._/-])(vendor|research|docs|artifacts|\.agents)/[A-Za-z0-9._/-]+' \
+    | grep -oE '(^|[^A-Za-z0-9._/-])((vendor|research|docs|artifacts|\.agents)/[A-Za-z0-9._/-]+|[A-Za-z0-9._-]+/[A-Za-z0-9._/-]*\.md)' \
     | sed -E 's#^[^A-Za-z0-9._/-]##' | sort -u)
   if [ -n "$missing" ]; then
     echo "checks: comments - cited path does not exist in this tree (moved upstream, a private note, or the retired docs/ tree); fix or drop the citation:" >&2

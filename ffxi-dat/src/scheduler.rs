@@ -663,10 +663,10 @@ pub struct SoundEvent {
 }
 
 /// The entrance/instance zone pairs whose 0x2D MAPSCHEDULOR keys resolve in the
-/// partner zone's model DAT rather than their own (fixToDo/Fix9.md corpus scan:
-/// 27 "another zone's model DAT" pairs, the clean instance/entrance pairs below).
-/// Hand-built table from that single corpus scan: retail's loader rule for the
-/// partner fallback is unknown, and these five pairs are the observed clean cases.
+/// partner zone's model DAT rather than their own. Hand-built from one scan of
+/// the retail corpus, which turned up 27 "another zone's model DAT" pairs;
+/// retail's loader rule for the partner fallback is unknown, and these five are
+/// the observed clean instance/entrance cases.
 const ZONE_SCENE_PARTNERS: [(u16, u16); 5] = [
     (242, 170), // Heavens' Tower -> Full Moon Fountain
     (194, 192), // Outer Horutoto Ruins -> Inner Horutoto Ruins
@@ -675,11 +675,12 @@ const ZONE_SCENE_PARTNERS: [(u16, u16); 5] = [
     (32, 8),    // Sealion's Den -> Boneyard Gully
 ];
 
-/// The handful of non-model files that carry 0x2D scene keys no per-zone slot owns
-/// (fixToDo/Fix9.md: the Spire of Holla/Dem/Mea, Sealion's Den and Al'Taieu scene
-/// families, `sc11..sc41` / `kc51..kc54` / `kci1..kci4`). Hand-built list from the
-/// same corpus scan; retail's loader rule for these is unknown.
-const NON_MODEL_SCENE_CARRIERS: [u32; 5] = [
+/// The handful of non-model files that carry 0x2D scene keys no per-zone slot
+/// owns: the Spire of Holla/Dem/Mea, Sealion's Den and Al'Taieu scene families
+/// (`sc11..sc41` / `kc51..kc54` / `kci1..kci4`). Hand-built from the same corpus
+/// scan; retail's loader rule for these is unknown. `zz-walk-errors` re-checks
+/// that all five walk clean.
+pub const NON_MODEL_SCENE_CARRIERS: [u32; 5] = [
     641,   // ROM/3/48.DAT
     30705, // ROM/123/85.DAT
     57075, // ROM/213/92.DAT
@@ -2063,7 +2064,7 @@ mod vehicle_contract_tests {
 
     // Retail-byte guard (skips without an install). The 0x2D keys of the Chamber of
     // Oracles (168) live in zone 168's own model DAT (ROM/2/11.DAT): the corpus
-    // scan's dominant rule (fixToDo/Fix9.md).
+    // scan's dominant rule.
     #[test]
     fn zone_scene_resolves_in_the_zones_own_model_dat() {
         let Some(root) = DatRoot::from_env_or_default().ok() else {
@@ -2127,7 +2128,7 @@ mod vehicle_contract_tests {
 
     // Retail-byte guard (skips without an install). Heavens' Tower (242) carries no
     // `hshi` in its own model DAT; the key resolves in the partner zone Full Moon
-    // Fountain (170)'s model DAT (fixToDo/Fix9.md instance/entrance pair).
+    // Fountain (170)'s model DAT: a ZONE_SCENE_PARTNERS instance/entrance pair.
     #[test]
     fn zone_scene_falls_back_to_the_partner_zone_model_dat() {
         let Some(root) = DatRoot::from_env_or_default().ok() else {

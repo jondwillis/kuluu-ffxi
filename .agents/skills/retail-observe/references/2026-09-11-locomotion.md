@@ -1,8 +1,7 @@
 # Remote mob locomotion model, 2026-09-11
 
 Observation record for Kuluu's remote-entity chase model: how a roaming or chasing mob's position,
-gait and facing are driven off the 0x0E POS block. Written from the tree at `bionic/entity-table`
-after the hybrid cadence/tween rewrite; wire facts verified against pinned vendor/server
+gait and facing are driven off the 0x0E POS block. Wire facts verified against pinned vendor/server
 (SHA `c39004cef47fa1bde98c63ccc41874e86145e0af`) first, retail decode second. The MOTION_UPD probe
 (`KULUU_MOTION_LOG=1`, tracing target "motion") is the regression guard: it prints band, step,
 ratio and both timing halves (segment budget and ring max) on one line per POS update.

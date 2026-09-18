@@ -67,30 +67,14 @@ const SERVER_RESPONSE_GRACE: Duration = Duration::from_secs(30);
 // the trigger did not fire and waiting longer changes nothing.
 const NO_EVENT_GRACE: Duration = Duration::from_secs(60);
 
-// FFXI_DAT_PATH wins when set; otherwise fall back to the retail install on
-// this machine so a plain `cargo test` still mounts real DATs.
-const DEFAULT_RETAIL_INSTALL: &str = r"C:\PhoenixXI\SquareEnix\FINAL FANTASY XI";
-
 fn open_dat_root() -> Option<ffxi_dat::DatRoot> {
-    let mut candidates: Vec<PathBuf> = std::env::var_os("FFXI_DAT_PATH")
-        .into_iter()
-        .map(PathBuf::from)
-        .collect();
-    let default_install = PathBuf::from(DEFAULT_RETAIL_INSTALL);
-    if !candidates.contains(&default_install) {
-        candidates.push(default_install);
-    }
-    for candidate in candidates {
-        if !candidate.join("VTABLE.DAT").exists() {
-            eprintln!("dat root candidate {candidate:?} has no VTABLE.DAT; skipping it");
-            continue;
-        }
-        match ffxi_dat::DatRoot::open(&candidate) {
-            Ok(root) => return Some(root),
-            Err(e) => eprintln!("opening dat root at {candidate:?}: {e:#}; trying next"),
+    match ffxi_dat::DatRoot::from_env_or_default() {
+        Ok(root) => Some(root),
+        Err(e) => {
+            eprintln!("no dat root: {e:#}");
+            None
         }
     }
-    None
 }
 
 fn artifact_dir() -> PathBuf {
@@ -286,8 +270,8 @@ async fn event_503_full_playback_against_live_lsb() {
 
     let Some(dat_root) = open_dat_root() else {
         eprintln!(
-            "skipping: no FFXI install found (set FFXI_DAT_PATH or install at \
-             {DEFAULT_RETAIL_INSTALL}); without DATs the holds cannot arm and this \
+            "skipping: no FFXI install found (set FFXI_DAT_PATH, or install under \
+             vendor/game-files/); without DATs the holds cannot arm and this \
              test would only re-prove the skip-to-end failure mode"
         );
         return;

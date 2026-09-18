@@ -3944,9 +3944,7 @@ mod tests {
 // Stair-capture harness (FFXI_STAIR_DRIVE / FFXI_STAIR_CAPTURE) — rebuild #3.
 // An external driver holds {-1,0,1} axes over a TCP JSON line; dispatch folds
 // them into the real input pipeline, and `stair_capture_system` writes one JSON
-// position sample per FixedUpdate tick while capturing. See
-// archive/docs/stair_capture.md (archived) for the protocol, run recipe and
-// coordinate facts.
+// position sample per FixedUpdate tick while capturing, one object per line.
 // -----------------------------------------------------------------------------
 
 /// Remote drive state: axis holds from the external driver. Same {-1,0,1}

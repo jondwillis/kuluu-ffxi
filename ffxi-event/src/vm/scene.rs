@@ -542,7 +542,7 @@ impl EventVm {
     /// That skip is the tag-0 branch of [`Self::request_queued`] (an actor
     /// whose stack is not full always has a zeroed slot to match), not a
     /// property of this slot (research/XiEvents/Event VM Functions.md
-    /// XiEventInit, XiEvent::ReqSet; OpCodes/0x0000.md).
+    /// XiEventInit, XiEvent::ReqSet; research/XiEvents/OpCodes/0x0000.md).
     pub fn spawn_owner(&mut self, block: &EventBlock, entry: usize) {
         let Some(scene) = &self.scene else { return };
         let actor = block.actor;

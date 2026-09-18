@@ -232,7 +232,7 @@ const IF_KIND_MASK: u8 = 0x0F;
 const MESSAGE_OPEN_NONE: u8 = 0;
 const MESSAGE_OPEN_AWAITING: u8 = 1;
 // CliEventMessOpenFlag = 2 is the invalid-open state MESWAIT force-cancels on
-// (XiEvents OpCodes/0x0023.md).
+// (research/XiEvents/OpCodes/0x0023.md).
 const MESSAGE_OPEN_INVALID: u8 = 2;
 
 // Operand offsets from the opcode byte, per research/XiEvents/OpCodes/*.md.
@@ -391,7 +391,8 @@ pub struct EventVm {
     pending_ack: Option<PendingTag>,
     /// The request this VM queued via REQEW and is still tracking, as (actor,
     /// tag): retail keeps that wait in `ReqStack[RunPos].ReqFlag` across ticks
-    /// (research/XiEvents/Event VM Structures.md ReqFlag; OpCodes/0x0029.md).
+    /// (research/XiEvents/Event VM Structures.md ReqFlag;
+    /// research/XiEvents/OpCodes/0x0029.md).
     /// Set when the opcode queues its tag, cleared when that request leaves the
     /// target's stack so the re-run of the parked opcode advances instead of
     /// queueing a second child.
@@ -454,12 +455,12 @@ struct MoveHold {
 }
 
 /// `WaitTime` decrements by `GetFrameDelay()`, which counts 1/60ths of a
-/// second: research/XiEvents OpCodes/0x005A.md scales it by `0.016666668` and
+/// second: research/XiEvents/OpCodes/0x005A.md scales it by `0.016666668` and
 /// 0x0031.md divides it by 60.0 for per-second motion.
 const WAIT_UNITS_PER_SEC: f32 = 60.0;
 
 /// `0x6F` SLEEP authors no operand and loads this fixed duration
-/// (research/XiEvents OpCodes/0x006F.md).
+/// (research/XiEvents/OpCodes/0x006F.md).
 const SLEEP_WAIT_UNITS: f32 = 16.0;
 
 impl EventVm {
@@ -632,7 +633,7 @@ impl EventVm {
     }
 
     /// Mark the open message invalid so the next MESWAIT force-cancels the
-    /// event (XiEvents OpCodes/0x0023.md) — the Esc-on-message path.
+    /// event (research/XiEvents/OpCodes/0x0023.md) — the Esc-on-message path.
     pub fn cancel_message(&mut self) {
         if self.scene_waiting() {
             self.scene = None;
@@ -1043,8 +1044,8 @@ impl EventVm {
                     return self.finish_result();
                 }
                 // 0x21 sets EventExecEnd, which stops XiEvent::EventIdle from
-                // running the program again — the event is over (XiEvents
-                // OpCodes/0x0021.md).
+                // running the program again — the event is over
+                // (research/XiEvents/OpCodes/0x0021.md).
                 OP_EXECEND => {
                     self.finished = true;
                     return self.finish_result();
@@ -1114,7 +1115,7 @@ impl EventVm {
                 }
                 // Sets one bit in a work-slot bit array: operand 3 is the flat
                 // bit index, split into slot and bit the same way as BITTEST, and
-                // operand 5 bounds the array (XiEvents OpCodes/0x003C.md).
+                // operand 5 bounds the array (research/XiEvents/OpCodes/0x003C.md).
                 OP_BITARRAY_SET => {
                     let bit = self.getworkofs(3, 0);
                     let slot = bit >> BIT_TEST_WORD_SHIFT;
@@ -1406,8 +1407,8 @@ impl EventVm {
                     let key = self.fourcc_at(SCHEDULOR_KEY_OFS);
                     // The same-pass bridge the other loaders use: a 0x53 that
                     // follows the 0x2C in one pass must see the routine as
-                    // running, the way retail's IsMovingAction does (research/
-                    // XiEvents/OpCodes/0x0053.md). The host's pending hold from
+                    // running, the way retail's IsMovingAction does
+                    // (research/XiEvents/OpCodes/0x0053.md). The host's pending hold from
                     // the drained cue takes over from the bridge.
                     self.pending_action_starts
                         .push((self.resolve_hold_actor(actor1), key));
@@ -1590,8 +1591,8 @@ impl EventVm {
                     };
                     match (op, sub) {
                         // 0xB4 case 0: the inline 16-byte string at +4 becomes
-                        // the work string the +2 operand selects (research/
-                        // XiEvents/OpCodes/0x00B4.md).
+                        // the work string the +2 operand selects
+                        // (research/XiEvents/OpCodes/0x00B4.md).
                         (OP_WINDOW, 0x00) => {
                             let mut name = [0u8; 16];
                             let start = self.exec_pointer + 4;
@@ -1612,8 +1613,8 @@ impl EventVm {
                             self.setworkstr(2, self.pending_strings[idx]);
                         }
                         // 0xB5 case 0: the event entity's display name becomes
-                        // the work string the +2 operand selects (research/
-                        // XiEvents/OpCodes/0x00B5.md).
+                        // the work string the +2 operand selects
+                        // (research/XiEvents/OpCodes/0x00B5.md).
                         (OP_NAMESET, 0x00) => {
                             self.cues.push(EventCue::EntityName {
                                 actor: ActorLookup::EVENT_ENTITY,
@@ -1876,7 +1877,8 @@ impl EventVm {
     /// `XiEvent::CodeSETBITWORK` (0x40) / `CodeGETBITWORK` (0x41): build a
     /// contiguous bit mask spanning bit indices `[v1, v2]` and either store a
     /// masked, shifted value back (`set`) or extract one (`!set`). Used to pack
-    /// the available dialog-menu option flags. Per XiEvents OpCodes/0x0040.md,
+    /// the available dialog-menu option flags. Per
+    /// research/XiEvents/OpCodes/0x0040.md,
     /// 0x0041.md — the mask is built by the same signed arithmetic-shift idiom.
     fn op_bitwork(&mut self, set: bool) {
         let v1 = self.getworkofs(1, 0);
@@ -3535,7 +3537,7 @@ mod tests {
 
     #[test]
     fn setbitwork_matches_xievents_example() {
-        // XiEvents OpCodes/0x0040.md, "Call 1": v1=0, v2=0x0F, src(5)=0,
+        // research/XiEvents/OpCodes/0x0040.md, "Call 1": v1=0, v2=0x0F, src(5)=0,
         // v4(7)=0x0008 -> Set(5)=0x0008. idx5 is WorkLocal[10] (read 0, written
         // back), then MESSAGE reads it.
         let data = vec![
