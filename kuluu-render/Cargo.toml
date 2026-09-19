@@ -12,7 +12,7 @@ dist = false
 
 [features]
 default = []
-# SDK/toolchain setup: README.md#optional-dlss-builds.
+# SDK/toolchain setup: CONTRIBUTING.md#optional-dlss-and-neural-uplift-builds.
 dlss = ["bevy/dlss"]
 # Experimental Windows NR requires SR's NGX static library in the link graph.
 enhanced-neural-uplift = ["dlss", "dep:kuluu-dlss-nr"]

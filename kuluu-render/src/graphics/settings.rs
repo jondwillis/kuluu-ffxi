@@ -2168,7 +2168,7 @@ pub fn apply_anti_aliasing_system(
     // at the new internal resolution, where mutating a live component leans
     // on bevy's prepare-side re-creation that we can't compile-verify here.
     // One extra respawn per menu click is cheap; document as a possible
-    // in-place optimization once a dlss build is in hand (README.md#optional-dlss-builds).
+    // in-place optimization once a dlss build is in hand (CONTRIBUTING.md#optional-dlss-and-neural-uplift-builds).
     let want_dlss = settings.dlss_active();
     let dlss_quality = settings.dlss_quality;
     // volumetric_fog is part of the respawn key because bevy's

@@ -102,7 +102,7 @@ dynamic_linking = ["bevy/dynamic_linking"]
 # explicitly; SDK-less environments (CI runners, release legs, Steam Deck
 # docker) simply don't, so bevy/dlss stays out of their link graph.
 # Build-time requirements (DLSS SDK + Vulkan SDK + clang; dlss_wgpu's build.rs
-# panics without DLSS_SDK) and the runtime DLL story live in README.md#optional-dlss-builds.
+# panics without DLSS_SDK) and the runtime DLL story live in CONTRIBUTING.md#optional-dlss-and-neural-uplift-builds.
 dlss = ["native-window", "kuluu-render/dlss", "bevy/dlss"]
 enhanced-neural-uplift = ["dlss", "kuluu-render/enhanced-neural-uplift"]
 # DEV-ONLY: the in-game Debug menu (page 2 of Commands, incl. its Retail+

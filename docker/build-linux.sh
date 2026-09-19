@@ -6,7 +6,7 @@
 #   default: build --release --locked -p kuluu --no-default-features
 #            --features native-window
 #   (--no-default-features keeps dlss out: the container has no DLSS SDK, and
-#   streamline/llvm is a Windows toolchain — see README.md#optional-dlss-builds)
+#   streamline/llvm is a Windows toolchain — see CONTRIBUTING.md#optional-dlss-and-neural-uplift-builds)
 #
 # Why this shape:
 #  * Target is x86_64 (Steam Deck) but the host is aarch64, so every docker

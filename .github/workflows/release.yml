@@ -25,7 +25,7 @@ permissions:
 
 # Every build leg passes --no-default-features: dlss is opt-in and its runners
 # have no DLSS SDK (dlss_wgpu's build.rs panics without DLSS_SDK), so the
-# shipped binaries are built native-window-only. See README.md#optional-dlss-builds.
+# shipped binaries are built native-window-only. See CONTRIBUTING.md#optional-dlss-and-neural-uplift-builds.
 
 jobs:
   setup:
