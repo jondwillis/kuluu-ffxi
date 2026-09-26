@@ -23,6 +23,7 @@ const OP_REQUEST_WAIT: u8 = 0x29;
 const OP_REQWAIT: u8 = 0x2A;
 const OP_MOVE: u8 = 0x1F;
 const OP_CODE_MOVE2: u8 = 0x5A;
+const OP_SMOVE: u8 = 0x31;
 const OP_POSITION_UPDATE: u8 = 0x47;
 const OP_SET_EVENT_POS: u8 = 0x37;
 const OP_SET_FACING: u8 = 0x39;
@@ -148,6 +149,22 @@ impl EventVm {
             .as_ref()
             .filter(|_| self.controls_player_position())
             .map(|scene| scene.player)
+    }
+
+    /// The event entity's tracked position in the zone-interaction (RID) float
+    /// space 0x82 RANGE_RECT hit-tests against
+    /// (research/XiEvents/OpCodes/0x0082.md): the scene's tracked position
+    /// rescaled from event units back to float coords, still in the event VM's
+    /// own axes (x, y = height, z = ground) — note this is NOT the wire's
+    /// (x, y = ground, z = height). `None` when no scene is attached, so the
+    /// caller sees retail's null-entity early return.
+    pub(super) fn event_entity_rid_position(&self) -> Option<[f32; 3]> {
+        let p = self.scene.as_ref()?.player;
+        Some([
+            p.x as f32 / EVENT_COORD_UNITS,
+            p.y as f32 / EVENT_COORD_UNITS,
+            p.z as f32 / EVENT_COORD_UNITS,
+        ])
     }
 
     pub fn take_scene_actions(&mut self) -> Vec<SceneAction> {
@@ -509,6 +526,9 @@ impl EventVm {
             Arc::clone(&self.work_zone),
         );
         child.actor_types = self.actor_types.clone();
+        child.weather_forecast = self.weather_forecast.clone();
+        child.zone_rects = self.zone_rects.clone();
+        child.current_zone = self.current_zone;
         child.attach_scene(dat, actor, player);
         let stacks = &mut self.scene.as_mut().unwrap().stacks;
         match stacks.iter_mut().find(|s| s.actor == actor) {
@@ -565,6 +585,9 @@ impl EventVm {
             Arc::clone(&self.work_zone),
         );
         child.actor_types = self.actor_types.clone();
+        child.weather_forecast = self.weather_forecast.clone();
+        child.zone_rects = self.zone_rects.clone();
+        child.current_zone = self.current_zone;
         child.attach_scene(dat, actor, player);
         let stacks = &mut self.scene.as_mut().unwrap().stacks;
         match stacks.iter_mut().find(|s| s.actor == actor) {
@@ -684,6 +707,12 @@ impl EventVm {
             }
             OP_SPEED => {
                 let speed = self.getworkofs(1, 0);
+                // The default-arm 0x1F/0x31 move cues for non-player actors read
+                // the VM's own speed, which only this arm writes while a scene is
+                // attached; a cue that carries 0 drops its hold and the walk is
+                // skipped (research/XiEvents/OpCodes/0x0032.md: MainSpeed is the
+                // event entity's single speed).
+                self.move_speed = speed;
                 self.scene.as_mut().unwrap().speed = speed;
                 self.advance(op);
             }
@@ -692,8 +721,8 @@ impl EventVm {
                 if target.is_local_player() {
                     let p = self.scene.as_ref().unwrap().player;
                     self.setworkofs(5, p.x, 0);
-                    self.setworkofs(7, p.z, 0);
-                    self.setworkofs(9, p.y, 0);
+                    self.setworkofs(7, p.y, 0);
+                    self.setworkofs(9, p.z, 0);
                 }
                 self.advance(op);
             }
@@ -727,6 +756,7 @@ impl EventVm {
                         actor: ActorLookup::EVENT_ENTITY,
                         goal,
                         speed,
+                        max_time: None,
                     });
                     self.advance(op);
                 } else if self.byte_at(1) == 1 {
@@ -741,16 +771,56 @@ impl EventVm {
                     return Some(StepResult::Unimplemented(op));
                 }
             }
+            // 0x31 SMOVE on the player: the same scene-latched walk as 0x1F —
+            // case 0 latches the goal into the session's position lerp, case 1
+            // holds until the walk lands. The MoveTime operand is a budget the
+            // DAT sets to the walk's own duration (this CS: 90 frames against a
+            // 4.4-yalm walk at 2.7 yalms/s), so the arrival hold is the
+            // faithful wait; a budget-capped hold lets the next beat race ahead
+            // of the body (research/XiEvents/OpCodes/0x0031.md: SMOVE is 0x1F
+            // with the MoveTime control). The non-player path keeps the default
+            // arm's ActorMove cue.
+            OP_SMOVE if self.scene.as_ref().unwrap().actor == ZONE_PLAYER_ACTOR => {
+                if self.byte_at(1) == 0 {
+                    let goal = self.position_operands(2, false);
+                    self.scene.as_mut().unwrap().motion = Some(goal);
+                    self.scene.as_mut().unwrap().controls_position = true;
+                    self.exec_pointer += 10;
+                } else if self.byte_at(1) == 1 {
+                    if self.scene.as_ref().unwrap().motion.is_some() {
+                        self.scene.as_mut().unwrap().held = true;
+                        return Some(StepResult::Waiting);
+                    }
+                    self.scene.as_mut().unwrap().held = false;
+                    self.exec_pointer += 2;
+                } else {
+                    return Some(StepResult::Unimplemented(op));
+                }
+            }
             // `OP_SET_EVENT_POS` on a non-player actor: set the event entity's
-            // position (research/XiEvents/OpCodes/0x0037.md). The
-            // player-actor version keeps its width skip (the server round trip
-            // owns that path).
+            // position (research/XiEvents/OpCodes/0x0037.md).
             OP_SET_EVENT_POS if self.scene.as_ref().unwrap().actor != ZONE_PLAYER_ACTOR => {
                 let position = self.position_operands(SET_EVENT_POS_X_OFS, true);
                 self.cues.push(EventCue::ActorPlace {
                     actor: ActorLookup::EVENT_ENTITY,
                     position,
                 });
+                self.advance(op);
+            }
+            // `OP_SET_EVENT_POS` on the player: the authored position and
+            // facing become the tracked player position at once (retail's
+            // CopyAllPosEvent snaps the entity, no round-trip hold).
+            // Publishing it as a scene action snaps the rendered player and
+            // sends the c2s POS; the walks that follow start from here, and
+            // the camera routines the script loads after this opcode build
+            // their orbit around this position and facing.
+            OP_SET_EVENT_POS => {
+                let position = self.position_operands(SET_EVENT_POS_X_OFS, true);
+                let scene = self.scene.as_mut().unwrap();
+                scene.player = position;
+                scene.controls_position = true;
+                self.scene_actions
+                    .push(SceneAction::PlayerPosition(position));
                 self.advance(op);
             }
             // `OP_SET_FACING` on a non-player actor: set the event entity's
@@ -761,6 +831,18 @@ impl EventVm {
                     actor: ActorLookup::EVENT_ENTITY,
                     heading,
                 });
+                self.advance(op);
+            }
+            // `OP_SET_FACING` on the player: the authored facing becomes the
+            // tracked heading; republish the position so the rendered body
+            // turns onto it (the body's yaw follows the snapshot heading).
+            OP_SET_FACING => {
+                let heading = self.getworkofs(SET_FACING_OFS, 0);
+                let scene = self.scene.as_mut().unwrap();
+                scene.player.heading = heading;
+                scene.controls_position = true;
+                self.scene_actions
+                    .push(SceneAction::PlayerPosition(scene.player));
                 self.advance(op);
             }
             // `OP_DTURA`: turn the first named actor toward the second
@@ -841,7 +923,7 @@ impl EventVm {
         None
     }
 
-    fn position_operands(&self, start: usize, heading: bool) -> EventPosition {
+    pub(super) fn position_operands(&self, start: usize, heading: bool) -> EventPosition {
         EventPosition {
             x: self.getworkofs(start, 0),
             z: self.getworkofs(start + 2, 0),
@@ -866,6 +948,7 @@ impl EventVm {
                     | OP_GET_POSITION
                     | OP_MOVE
                     | OP_CODE_MOVE2
+                    | OP_SMOVE
                     | OP_SET_EVENT_POS
                     | OP_SET_FACING
                     | OP_DTURA

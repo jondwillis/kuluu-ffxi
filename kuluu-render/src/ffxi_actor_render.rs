@@ -1402,6 +1402,20 @@ impl FfxiRenderActor {
         self.action.as_ref().map(|a| &a.clip_id)
     }
 
+    /// Drop the completion motion a cutscene cast started so the pose falls back to idle on the
+    /// next frame. A cutscene's cast pose (the gate guard's Signet arm-raise) is owned by the
+    /// event, not by combat: when the event ends, the pose must not outlive it. The pose pass
+    /// re-selects idle from the cleared `action` on its next run.
+    pub fn clear_cutscene_action(&mut self) {
+        self.action = None;
+        self.action_clips.clear();
+    }
+
+    /// A scheduler Motion stage's action is in flight on this model.
+    pub fn has_action(&self) -> bool {
+        self.action.is_some()
+    }
+
     pub fn instance_slots(&self) -> &[u32] {
         &self.instance_slots
     }
@@ -1545,12 +1559,16 @@ impl FfxiRenderActor {
             .max(rest_clip_len_frames(&self.animations, clip_id));
         // research/xim EffectRoutineInterpolatedEffects.kt SkeletonAnimationInstance - maxLoops
         // passes through to the coordinator verbatim: 0 loops until the effect ends, N ≥ 1 plays
-        // N times and pins the end frame (SkeletonAnimator.kt applyLoopBounds).
+        // N times and pins the end frame (SkeletonAnimator.kt applyLoopBounds). Retail holds the
+        // pose for the whole authored loop count - the cast's mw2? hold, released when the
+        // sequence ends - so the countdown must cover every loop or the cleared action leaves
+        // the pinned end frame behind.
         let num_loops = (motion.max_loops != 0).then_some(motion.max_loops as u32);
+        let loop_total = len * num_loops.unwrap_or(1) as f32;
         self.action = Some(ActionPlayback {
             clip_id,
             looping: num_loops.is_some(),
-            remaining: len.max(motion.duration_frames * 0.5).max(1.0),
+            remaining: loop_total.max(motion.duration_frames * 0.5).max(1.0),
             num_loops,
             transition_in: motion.transition_in.whole_frames(),
             transition_out: motion.transition_out.whole_frames(),
@@ -2126,6 +2144,18 @@ pub fn render_actor_stub(world_id: u32) -> FfxiRenderActor {
     )
 }
 
+/// A stub actor carrying the skeleton's clip set, the way load_pc fills
+/// `animations` from the race skeleton DAT, for the cutscene cast tests.
+#[cfg(test)]
+pub(crate) fn render_actor_with_skeleton_clips(
+    world_id: u32,
+    clips: Vec<SkeletonAnimation>,
+) -> FfxiRenderActor {
+    let mut actor = render_actor_stub(world_id);
+    actor.animations = Arc::new(clips);
+    actor
+}
+
 /// A render actor with no model behind it, carrying an explicit Cib Info movement byte, for the
 /// remote-grounding test that gates on MovementType and needs nothing else.
 #[cfg(test)]
@@ -2232,6 +2262,18 @@ pub fn advance_actor_pose_standalone(
     mount: Option<MountAttach>,
 ) {
     advance_actor_pose(actor, elapsed_frames, None, mount, false, None);
+}
+
+/// The same standalone advance with the caller's routine-lock state instead of
+/// the fixed `false`: the flag the full pose system passes from
+/// scheduler_runtime's `is_locked_now`.
+#[cfg(test)]
+pub(crate) fn advance_actor_pose_standalone_locked(
+    actor: &mut FfxiRenderActor,
+    elapsed_frames: f32,
+    animation_locked: bool,
+) {
+    advance_actor_pose(actor, elapsed_frames, None, None, animation_locked, None);
 }
 
 pub fn tick_ffxi_render_actors(
@@ -2713,6 +2755,7 @@ fn advance_actor_pose(
     let animations: &[SkeletonAnimation] = animations;
     let battle_clips: &[SkeletonAnimation] = battle_clips;
 
+    let action_pre = action.is_some();
     let action_id = match action.as_mut() {
         Some(act) => {
             act.remaining -= elapsed_frames;
@@ -2742,6 +2785,10 @@ fn advance_actor_pose(
         }
         None => None,
     };
+    // The frame the action's clip loses the pose: its slot must hand over to
+    // the idle selection at once (below) instead of waiting for the clip to
+    // finish looping, which a hold loop never does on its own.
+    let action_just_ended = action_pre && action.is_none();
 
     let engage_overlay = match *engage {
         EngageMachine::Drawing { .. } | EngageMachine::Sheathing { .. } => {
@@ -2870,8 +2917,20 @@ fn advance_actor_pose(
         || !matches!(*engage, EngageMachine::NotEngaged)
         || inputs.engage_state.is_battle_idle();
     let overlay: &[SkeletonAnimation] = if use_battle { battle_clips } else { &[] };
+    // The strafe family (mvl?/mvr?/mvb?) is authored as one coherent set across the base
+    // motion DATs: the lower body in the race skeleton, the upper body in the upper-body
+    // motion DAT, the waist in the waist DAT (research/xim Model.kt getAnimationDirectories,
+    // the three disjoint joint ranges). The battle set ships its own upper-body strafe clip
+    // that poses the torso against the base lower/waist, so a battle-first dedup splits the
+    // family across two sets and the top half fights the legs; the family resolves from the
+    // base set alone, the set that carries the lower body.
+    let strafe_family = |id: &DatId| {
+        let s = id.as_str();
+        s.starts_with("mvl") || s.starts_with("mvr") || s.starts_with("mvb")
+    };
     // Skill-DAT (localDir) clips win over the actor's own pose set, per XIM resolution order.
     let resolve = |id: DatId| -> Vec<&SkeletonAnimation> {
+        let overlay: &[SkeletonAnimation] = if strafe_family(&id) { &[] } else { overlay };
         if !action_clips.is_empty() {
             pose_clip_matches(animations, action_clips.iter().chain(overlay.iter()), id)
         } else {
@@ -2984,6 +3043,7 @@ fn advance_actor_pose(
     // re-registration path for an unchanged locomotion clip: coordinator.update below advances
     // the cursor monotonically instead.
     if !matches.is_empty() && *current_clip != Some((selected_id, use_battle)) {
+        let prev_clip_id = current_clip.map(|(id, _)| id);
         if let Some(resolved) = matches.iter().find(|a| is_usable_clip(a)) {
             clip_ok(actor.world_id, &selected_id, resolved, actor.movement_type);
         }
@@ -3004,16 +3064,39 @@ fn advance_actor_pose(
 
         if is_idle {
             for &clip in &matches {
-                coordinator.register_idle_animation(clip.clone(), true);
+                if action_just_ended {
+                    coordinator.register_idle_animation_eager(clip.clone());
+                } else {
+                    coordinator.register_idle_animation(clip.clone(), true);
+                }
             }
         } else {
             // research/xim EffectRoutineInterpolatedEffects.kt SkeletonAnimationInstance loopParams — when the pose came from
             // a completion motion, honor its parsed transition + loop params; otherwise use the
             // locomotion crossfade defaults.
             let action = action.filter(|a| a.clip_id == selected_id);
+            // A switch into or out of a strafe family turns the body through the
+            // front: each joint takes whichever arc passes nearer the actor's
+            // idle pose (frame 0), which squares the body to where the root
+            // faces (the target, locked). Reference only; the idle pose is
+            // never played.
+            let strafe_switch =
+                strafe_family(&selected_id) || prev_clip_id.is_some_and(|p| strafe_family(&p));
+            let front_ref = strafe_switch.then(|| {
+                let mut front = HashMap::new();
+                for clip in resolve(DatId::from_str("idl?")) {
+                    for (&joint, frames) in &clip.key_frame_sets {
+                        if let Some(f0) = frames.first() {
+                            front.entry(joint as usize).or_insert(f0.rotation);
+                        }
+                    }
+                }
+                std::sync::Arc::new(front)
+            });
             let tp = TransitionParams {
                 transition_in_time: action.map_or(LOCOMOTION_XFADE_IN, |a| a.transition_in),
                 transition_out_time: action.map_or(LOCOMOTION_XFADE_OUT, |a| a.transition_out),
+                front_ref,
                 ..Default::default()
             };
             // Fishing resolution clips (fsh2..fsh6) have no ActionPlayback, so without an
@@ -3278,6 +3361,84 @@ mod actor_reveal_tests {
             opaque
         );
         assert!(app.world().get::<ActorFadeMaterial>(child).is_none());
+    }
+}
+
+#[cfg(test)]
+mod cutscene_transpar_tests {
+    use super::*;
+
+    fn transpar_app() -> App {
+        let mut app = App::new();
+        app.init_resource::<Time>()
+            .init_resource::<FfxiSkinRegistry>()
+            .add_systems(Update, tick_cutscene_transpar);
+        app
+    }
+
+    fn spawn_faded_actor(app: &mut App, opacity: f32, end: f32, total_secs: f32) -> (Entity, u32) {
+        let slot = app
+            .world_mut()
+            .resource_mut::<FfxiSkinRegistry>()
+            .alloc_instance(FfxiInstance {
+                opacity,
+                ..default()
+            });
+        let skeleton = Skeleton {
+            id: DatId::from_str("test"),
+            joints: Vec::new(),
+            references: Vec::new(),
+            bounding_boxes: Vec::new(),
+        };
+        let mut actor = render_actor_for_test(skeleton, Vec::new());
+        actor.instance_slots.push(slot);
+        let root = app.world_mut().spawn(actor).id();
+        let wire = app
+            .world_mut()
+            .spawn((FfxiRenderRoot(root), CutsceneTranspar::new(end, total_secs)))
+            .id();
+        (wire, slot)
+    }
+
+    /// The fade starts from the actor's first-tick opacity, interpolates to the
+    /// end value, and removes itself on completion.
+    #[test]
+    fn the_transpar_fade_drives_opacity_and_releases() {
+        let mut app = transpar_app();
+        let (wire, slot) = spawn_faded_actor(&mut app, 0.8, 0.4, 2.0);
+
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(std::time::Duration::from_secs_f32(0.5));
+        app.update();
+        assert!(
+            (app.world()
+                .resource::<FfxiSkinRegistry>()
+                .instance_opacity(slot)
+                - 0.7)
+                .abs()
+                < 1e-5
+        );
+        assert!(app.world().get::<CutsceneTranspar>(wire).is_some());
+
+        for _ in 0..4 {
+            app.world_mut()
+                .resource_mut::<Time>()
+                .advance_by(std::time::Duration::from_secs_f32(0.5));
+            app.update();
+        }
+        assert!(
+            (app.world()
+                .resource::<FfxiSkinRegistry>()
+                .instance_opacity(slot)
+                - 0.4)
+                .abs()
+                < 1e-5
+        );
+        assert!(
+            app.world().get::<CutsceneTranspar>(wire).is_none(),
+            "the fade must remove itself on completion"
+        );
     }
 }
 
@@ -3685,6 +3846,67 @@ pub fn poll_load_actor_tasks(
     }
 }
 
+/// A 0x6C TRANSPAR fade running on a wire entity (ffxi-event/src/cue.rs):
+/// drives every instance slot's opacity to `end` over `total_secs`, capturing
+/// the start value on the first tick the actor's slots exist, so a model that
+/// lands mid-fade fades from whatever it arrives at. Removed on completion.
+#[derive(Component)]
+pub struct CutsceneTranspar {
+    pub end: f32,
+    pub total_secs: f32,
+    pub elapsed: f32,
+    start: Option<f32>,
+}
+
+impl CutsceneTranspar {
+    pub fn new(end: f32, total_secs: f32) -> Self {
+        Self {
+            end,
+            total_secs,
+            elapsed: 0.0,
+            start: None,
+        }
+    }
+}
+
+/// Drives the 0x6C TRANSPAR fades queued by a running cutscene:
+/// ffxi-event/src/cue.rs Transpar. The query waits on the render root, so a
+/// model still loading starts its fade once it lands.
+pub fn tick_cutscene_transpar(
+    time: Res<Time>,
+    mut commands: Commands,
+    mut q_fade: Query<(Entity, &mut CutsceneTranspar, &FfxiRenderRoot)>,
+    q_actor: Query<&FfxiRenderActor>,
+    mut registry: ResMut<FfxiSkinRegistry>,
+) {
+    for (wire_entity, mut fade, root) in &mut q_fade {
+        fade.elapsed += time.delta_secs();
+        let Ok(actor) = q_actor.get(root.0) else {
+            continue;
+        };
+        let slots = actor.instance_slots();
+        if slots.is_empty() {
+            continue;
+        }
+        let start = match fade.start {
+            Some(start) => start,
+            None => {
+                let start = registry.instance_opacity(slots[0]);
+                fade.start = Some(start);
+                start
+            }
+        };
+        let progress = (fade.elapsed / fade.total_secs).clamp(0.0, 1.0);
+        let opacity = start + (fade.end - start) * progress;
+        for &slot in slots {
+            registry.set_instance_opacity(slot, opacity);
+        }
+        if progress >= 1.0 {
+            commands.entity(wire_entity).remove::<CutsceneTranspar>();
+        }
+    }
+}
+
 // .agents/skills/retail-observe/references/2026-09-14-pc-model-arrival.md
 const MORPH_DURATION: f32 = 32.0 / 60.0;
 
@@ -3734,7 +3956,10 @@ pub fn finish_actor_reveal(
         for child in children {
             if let Ok((opaque, mut material)) = materials.get_mut(*child) {
                 material.0 = opaque.0.clone();
-                commands.entity(*child).remove::<ActorFadeMaterial>();
+                // A zone change despawns these children in the same frame the
+                // fade finishes (scene.rs sync_entities_system); a removal on
+                // a gone entity is nothing to warn about.
+                commands.entity(*child).try_remove::<ActorFadeMaterial>();
             }
         }
     }
@@ -5443,6 +5668,111 @@ mod pose_resolution_tests {
         let root = ffxi_dat::archive::open_test_install()?;
 
         Some(load_pc(&root, 1, false, &[], None, None, None).expect("load Hume M"))
+    }
+
+    /// The engaged strafe keeps its clip family in one set: the upper body must
+    /// play the base set's mvl1 (the coherent partner of the base lower/waist),
+    /// not the battle set's mvl1, which poses the torso against the base legs
+    /// and reads as the top half flipping against them.
+    #[test]
+    fn engaged_strafe_resolves_the_family_from_one_set() {
+        let Some(loaded) = load_hume_m() else { return };
+        let mut actor = make_render_actor(&loaded, 0, Vec::new(), 1, 0.0, 1.0);
+        let inputs = inputs_for_pose(PoseState::StrafeLeft, true);
+
+        // The base set's mvl1 (upper-body motion DAT) and the battle set's mvl1
+        // are different clips; the strafe must keep the base one.
+        let base_mvl1_kfs = loaded
+            .animations
+            .iter()
+            .find(|a| a.id.as_str() == "mvl1")
+            .map(|a| a.key_frame_sets.len())
+            .expect("the base set ships an upper-body strafe clip");
+        let battle_mvl1_kfs = loaded
+            .battle_clips
+            .iter()
+            .find(|a| a.id.as_str() == "mvl1")
+            .map(|a| a.key_frame_sets.len())
+            .expect("the battle set ships an upper-body strafe clip");
+        assert_ne!(
+            base_mvl1_kfs, battle_mvl1_kfs,
+            "the test needs the two mvl1 variants to differ"
+        );
+
+        for _ in 0..90 {
+            actor.inputs = inputs;
+            advance_actor_pose_standalone(&mut actor, 1.0, None);
+        }
+
+        // The upper body (slot 1) must be playing the base set's mvl1.
+        let upper = actor
+            .coordinator
+            .animations
+            .get(1)
+            .and_then(|s| s.as_ref())
+            .and_then(|s| s.current_animation.as_ref())
+            .expect("the upper body slot is occupied");
+        assert_eq!(upper.animation.id.as_str(), "mvl1");
+        assert_eq!(
+            upper.animation.key_frame_sets.len(),
+            base_mvl1_kfs,
+            "the upper body must play the base set's strafe clip, not the battle set's"
+        );
+    }
+
+    /// With a main-hand weapon equipped, the weapon battle DAT's mvl1 must still
+    /// lose to the base set's: the strafe family resolves from one set per slot,
+    /// the base set that carries the lower body, regardless of the weapon.
+    #[test]
+    fn engaged_strafe_with_a_weapon_keeps_the_base_family() {
+        const HUME_M: u8 = 1;
+        const MAIN_HAND_SLOT: u8 = 6;
+        let Some(root) = ffxi_dat::archive::open_test_install() else {
+            return;
+        };
+        let dll =
+            crate::scheduler_runtime::main_dll_for_root(root.root()).expect("FFXiMain.dll loads");
+        let main_weapon = crate::look_resolver::equipment_dat_id(&dll, MAIN_HAND_SLOT, 0, HUME_M)
+            .expect("HumeM main-hand model 0");
+        let loaded = load_pc(&root, HUME_M, false, &[], None, Some(main_weapon), None)
+            .expect("load Hume M with a main-hand weapon");
+        let mut actor = make_render_actor(&loaded, 0, Vec::new(), 1, 0.0, 1.0);
+        let inputs = inputs_for_pose(PoseState::StrafeLeft, true);
+
+        let base_mvl1_kfs = loaded
+            .animations
+            .iter()
+            .find(|a| a.id.as_str() == "mvl1")
+            .map(|a| a.key_frame_sets.len())
+            .expect("the base set ships an upper-body strafe clip");
+        let weapon_mvl1_kfs = loaded
+            .battle_clips
+            .iter()
+            .find(|a| a.id.as_str() == "mvl1")
+            .map(|a| a.key_frame_sets.len())
+            .expect("the weapon battle set ships an upper-body strafe clip");
+        assert_ne!(
+            base_mvl1_kfs, weapon_mvl1_kfs,
+            "the test needs the base and weapon mvl1 to differ"
+        );
+
+        for _ in 0..90 {
+            actor.inputs = inputs;
+            advance_actor_pose_standalone(&mut actor, 1.0, None);
+        }
+
+        let upper = actor
+            .coordinator
+            .animations
+            .get(1)
+            .and_then(|s| s.as_ref())
+            .and_then(|s| s.current_animation.as_ref())
+            .expect("the upper body slot is occupied");
+        assert_eq!(
+            upper.animation.key_frame_sets.len(),
+            base_mvl1_kfs,
+            "the upper body must play the base set's strafe clip, not the weapon battle set's"
+        );
     }
 
     #[test]

@@ -37,24 +37,36 @@ fn main() {
             starts.push(entry);
         }
         for start in starts {
+            if start >= data.len() {
+                continue;
+            }
             println!("  -- from {start} --");
             let mut pc = start;
             let mut count = 0;
             while pc < data.len() && count < 400 {
                 let op = data[pc];
-                let meta = OPCODE_META[op as usize];
+                let meta = OPCODE_META.get(op as usize).copied();
                 let size = sub_size(op, *data.get(pc + 1).unwrap_or(&0))
                     .map(|s| s as usize)
-                    .unwrap_or(meta.size as usize)
+                    .unwrap_or(meta.map(|m| m.size as usize).unwrap_or(1))
                     .max(1);
                 let operands: Vec<String> = data[pc + 1..(pc + size).min(data.len())]
                     .iter()
                     .map(|b| format!("{b:02X}"))
                     .collect();
                 println!(
-                    "  {pc:5}: {op:02X} {}{}",
+                    "  {pc:5}: {op:02X} {}{}{}",
                     operands.join(" "),
-                    if meta.jumps { "  (jump)" } else { "" }
+                    if meta.is_some_and(|m| m.jumps) {
+                        "  (jump)"
+                    } else {
+                        ""
+                    },
+                    if meta.is_none() {
+                        "  (out of meta range)"
+                    } else {
+                        ""
+                    }
                 );
                 if op == OP_END || op == OP_EXECEND {
                     break;

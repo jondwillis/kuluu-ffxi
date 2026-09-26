@@ -1051,20 +1051,44 @@ pub enum CutsceneCue {
         target: CutsceneActor,
         hide: bool,
     },
+    /// 0x6C TRANSPAR: fade `target`'s alpha to `end_alpha` (0..=255) over
+    /// `duration_frames` frames (research/XiEvents/OpCodes/0x006C.md).
+    Transpar {
+        target: CutsceneActor,
+        end_alpha: i32,
+        duration_frames: i32,
+    },
     CameraLock {
         lock: bool,
+    },
+    /// 0x38: the lower word of retail's `CliEventModeLocal` (the operand's
+    /// high byte with 0x20 forced). While it holds, the local player model
+    /// and the HUD pieces stay hidden
+    /// (research/XiEvents/OpCodes/0x0038.md).
+    LocalMode {
+        mode: u16,
+    },
+    /// 0x20: write retail's `CliEventUcFlag`; while it holds, the player's
+    /// `CanIMove` is false (research/XiEvents/OpCodes/0x0020.md,
+    /// research/XIClient ActorTelemetry::CanIMove).
+    PlayerControl {
+        locked: bool,
     },
     /// 0x67/0x68 HIDE_HUD/SHOW_HUD: hide or show the entire HUD UI for the
     /// rest of the cutscene (research/XiEvents/OpCodes/0x0067.md, 0x0068.md).
     HudHide {
         hide: bool,
     },
-    /// 0x77/0x78 STOP_CLOCK/RESTORE_CLOCK: hold the game clock at Vana'diel
-    /// hour `hour`, or release it back to server time
-    /// (research/XiEvents/OpCodes/0x0077.md, 0x0078.md).
+    /// 0x77/0x78/0xA9/0xC9 game-clock holds: hold the clock at Vana'diel hour
+    /// `hour`, minute `minute`, on Vana day `day_from_epoch` from the calendar
+    /// epoch when set (else the current day), or release it back to server
+    /// time (research/XiEvents/OpCodes/0x0077.md, 0x0078.md, 0x00A9.md,
+    /// 0x00C9.md).
     ClockHold {
         stop: bool,
         hour: Option<u32>,
+        minute: u8,
+        day_from_epoch: Option<u32>,
     },
     Mount {
         target: CutsceneActor,

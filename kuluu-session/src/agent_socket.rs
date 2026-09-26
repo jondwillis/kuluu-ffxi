@@ -1,21 +1,34 @@
-use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::{Context, Result};
-use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{broadcast, mpsc, watch};
+use tokio::net::TcpListener;
+use tokio::sync::{broadcast, mpsc};
 
 use crate::agent_codec;
 use crate::state::{AgentCommand, AgentEvent};
 
+#[cfg(unix)]
+use std::path::{Path, PathBuf};
+
+#[cfg(unix)]
+use std::time::Duration;
+
+#[cfg(unix)]
+use tokio::net::{UnixListener, UnixStream};
+
+#[cfg(unix)]
+use tokio::sync::watch;
+
+#[cfg(unix)]
 pub const AGENT_PIDFILE_NAME: &str = "ffxi-agent.pid";
 
 // kuluu-smlg: macOS $TMPDIR purges have unlinked the live socket mid-run, so
 // poll our own path between accepts and re-bind when it vanishes.
+#[cfg(unix)]
 const SOCKET_LIVENESS_INTERVAL: Duration = Duration::from_secs(2);
 
+#[cfg(unix)]
 pub fn resolve_listen(arg: &str) -> ResolvedListen {
     if arg.eq_ignore_ascii_case("auto") {
         let tmp = std::env::temp_dir();
@@ -32,6 +45,7 @@ pub fn resolve_listen(arg: &str) -> ResolvedListen {
     }
 }
 
+#[cfg(unix)]
 #[derive(Debug, Clone)]
 pub struct ResolvedListen {
     pub sock: PathBuf,
@@ -39,9 +53,63 @@ pub struct ResolvedListen {
     pub pidfile: Option<PathBuf>,
 }
 
+/// Resolve the agent listen address on hosts without Unix domain sockets
+/// (Windows): the driver connects over loopback TCP. Accepts `:port`, a bare
+/// port, or `host:port`; anything unparseable falls back to loopback 48100,
+/// the port the local drivers use.
+pub fn resolve_tcp_listen(arg: &str) -> std::net::SocketAddr {
+    let addr = if arg.starts_with(':') {
+        format!("127.0.0.1{arg}")
+    } else if arg.parse::<u16>().is_ok() {
+        format!("127.0.0.1:{arg}")
+    } else {
+        arg.to_string()
+    };
+    addr.parse()
+        .unwrap_or_else(|_| "127.0.0.1:48100".parse().expect("literal fallback"))
+}
+
+/// The TCP half of the agent listener (Windows): bind loopback and serve each
+/// peer with the same line codec as the Unix socket. The headless session is
+/// fixed for the life of the process, so the channels are not swappable here.
+pub async fn serve_tcp(
+    listen: std::net::SocketAddr,
+    cmd_tx: mpsc::Sender<AgentCommand>,
+    event_tx: broadcast::Sender<AgentEvent>,
+    pause: Option<Arc<AtomicBool>>,
+    debug_ctrl: Option<crate::debug_control::SharedDebugControl>,
+) -> Result<()> {
+    let listener = TcpListener::bind(listen)
+        .await
+        .with_context(|| format!("binding agent TCP listener at {listen}"))?;
+    eprintln!("agent socket listening on tcp {listen}");
+    tracing::info!(addr = %listen, "ffxi agent TCP listener");
+    loop {
+        let (stream, peer) = listener.accept().await?;
+        tracing::info!(?peer, "agent TCP peer connected");
+        let (reader, writer) = stream.into_split();
+        let codec = agent_codec::run(
+            reader,
+            writer,
+            cmd_tx.clone(),
+            event_tx.subscribe(),
+            pause.clone(),
+            debug_ctrl.clone(),
+        );
+        tokio::spawn(async move {
+            if let Err(err) = codec.await {
+                tracing::debug!(error = %err, "agent TCP peer ended with error");
+            } else {
+                tracing::info!("agent TCP peer disconnected");
+            }
+        });
+    }
+}
+
 /// Channels of the session the socket currently serves. Swapping the value
 /// mid-listen drops connected peers, so an agent reconnecting after a relogin
 /// in the same window lands on the live session instead of the dead one.
+#[cfg(unix)]
 #[derive(Clone)]
 pub struct SessionChannels {
     pub cmd_tx: mpsc::Sender<AgentCommand>,
@@ -50,6 +118,7 @@ pub struct SessionChannels {
     pub debug_ctrl: Option<crate::debug_control::SharedDebugControl>,
 }
 
+#[cfg(unix)]
 pub async fn serve(
     listen: ResolvedListen,
     cmd_tx: mpsc::Sender<AgentCommand>,
@@ -73,6 +142,7 @@ pub async fn serve(
 /// Each peer reads the current channels with `borrow_and_update` so the shared
 /// marker is current; the per-peer receiver clone then fires only on the NEXT
 /// swap, not the one already in effect.
+#[cfg(unix)]
 pub async fn serve_dynamic(
     listen: ResolvedListen,
     mut sessions: watch::Receiver<Option<SessionChannels>>,
@@ -164,6 +234,7 @@ pub async fn serve_dynamic(
     }
 }
 
+#[cfg(unix)]
 async fn bind_listener(sock: &Path) -> Result<UnixListener> {
     if sock.exists() {
         match UnixStream::connect(sock).await {
@@ -183,6 +254,7 @@ async fn bind_listener(sock: &Path) -> Result<UnixListener> {
     UnixListener::bind(sock).with_context(|| format!("binding agent socket at {}", sock.display()))
 }
 
+#[cfg(unix)]
 fn write_pidfile(pidfile: Option<&Path>, sock: &Path) {
     let Some(path) = pidfile else {
         return;
@@ -197,6 +269,7 @@ fn write_pidfile(pidfile: Option<&Path>, sock: &Path) {
     }
 }
 
+#[cfg(unix)]
 fn pidfile_bears_our_pid(path: &Path) -> bool {
     let Ok(body) = std::fs::read_to_string(path) else {
         return false;
@@ -207,11 +280,13 @@ fn pidfile_bears_our_pid(path: &Path) -> bool {
     v.get("pid").and_then(serde_json::Value::as_u64) == Some(u64::from(std::process::id()))
 }
 
+#[cfg(unix)]
 struct SocketCleanup {
     sock: PathBuf,
     pidfile: Option<PathBuf>,
 }
 
+#[cfg(unix)]
 impl Drop for SocketCleanup {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.sock);
@@ -223,6 +298,7 @@ impl Drop for SocketCleanup {
     }
 }
 
+#[cfg(unix)]
 #[cfg(test)]
 mod tests {
     use super::*;

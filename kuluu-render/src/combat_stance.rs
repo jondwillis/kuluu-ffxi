@@ -17,6 +17,11 @@ use kuluu_snapshot::EntityKind;
 /// dll is unreadable.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn motion_dat_for_race(dll: Option<&ffxi_dat::main_dll::MainDll>, race: u8) -> Option<u32> {
+    // Only the playable races have a battle-animation block; a child config
+    // (look_resolver::equipment_table_row) reads past the table otherwise.
+    if !crate::look_resolver::PC_LOOK_RACES.contains(&race) {
+        return None;
+    }
     dll.and_then(|dll| dll.base_battle_animation_index(race))
         .map(u32::from)
         .or_else(|| motion_dat_fallback(crate::dat_vos2::skeleton_file_id_fallback(race)?))
@@ -293,6 +298,10 @@ pub struct SelfMoveIntent {
     pub forward: f32,
     pub strafe: f32,
     pub scripted_speed: Option<f32>,
+    /// The body heading the movement dispatch produced this tick, the one the
+    /// visual yaw and the camera follow read. `None` on a tick that produced
+    /// none (a snapshot-driven or muted tick), when the wire heading stands in.
+    pub heading: Option<u8>,
 }
 
 impl SelfMoveIntent {

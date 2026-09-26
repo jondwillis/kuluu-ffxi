@@ -44,6 +44,11 @@ fn main() {
 
     println!("=== joints {} ===", skel.joints.len());
     println!("AboveHead {abovehead:?}");
+    println!(
+        "BODY_CENTER ref21={:?} pos={:?}",
+        skel.references.get(21),
+        p(21)
+    );
     println!("RightFoot {rfoot:?}  LeftFoot {lfoot:?}");
     println!("LeftHand  {lhand:?}  RightHand {rhand:?}");
 

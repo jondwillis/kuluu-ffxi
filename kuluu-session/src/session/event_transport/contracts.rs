@@ -127,6 +127,15 @@ fn position_dat(child: bool) -> EventDat {
     }
 }
 
+/// research/XiEvents/OpCodes/0x0026.md: the event parks on a yield-forever
+/// with nothing that can move it, so the session's liveness check must cancel
+/// it.
+fn stall_dat() -> EventDat {
+    EventDat {
+        blocks: vec![block(vec![0x26], vec![])],
+    }
+}
+
 // vendor/server/src/map/packets/s2c/0x034_eventnum.h GP_SERV_COMMAND_EVENTNUM.
 fn trigger(gil: i32) -> crate::event_dialog::EventTrigger {
     let mut body = [0u8; 48];
@@ -584,6 +593,66 @@ fn pos_finite_contract() {
     }
 }
 
+/// A stalled event cancels itself in the tick that detects the stall: the
+/// 0x05B carries the cancel EndPara and the cutscene scope closes as a cancel
+/// in the same tick.
+/// vendor/server/src/map/packets/c2s/0x05b_eventend.cpp
+async fn stall_contract() {
+    let mut host = Host::new(stall_dat(), FARE).await;
+    host.waiting();
+    host.dialog
+        .age_liveness_for_test(std::time::Duration::from_secs(3));
+    let step = host.step(Drive::Tick(TICK));
+    let Advance::Ended {
+        end_para, error, ..
+    } = &step.advance
+    else {
+        panic!("the stalled event must end");
+    };
+    assert_eq!(*end_para, ffxi_event::EVENT_CANCELLED_END_PARA);
+    let Some(line) = error else {
+        panic!("the stall must carry the cancel line");
+    };
+    assert!(
+        line.starts_with("Cutscene error: event 221 in zone 248 stalled at 0x26"),
+        "{line}"
+    );
+    assert!(line.contains("no opcode can advance"), "{line}");
+    assert!(line.ends_with("; cancelled."), "{line}");
+
+    // The 0x05B that ends the event server-side rides the same tick, with the
+    // cancel EndPara in its choice word.
+    let end = packets(&step)
+        .into_iter()
+        .find(|p| p.opcode == map::c2s::EVENT_END)
+        .expect("the stall ends the event server-side");
+    assert_eq!(
+        u32::from_le_bytes(end.data[4..8].try_into().unwrap()),
+        ffxi_event::EVENT_CANCELLED_END_PARA,
+        "the 0x05B carries the cancel EndPara"
+    );
+    assert!(host.pending.is_empty());
+    assert!(host.dialog.active_end().is_none());
+
+    // The keepalive closes the scope as a cancel in the same tick.
+    let mut scope = crate::event_dialog::CutsceneScope::default();
+    scope.start(
+        crate::event_dialog::agent_event_id(NPC, EVENT),
+        &host.events,
+    );
+    scope.end(
+        crate::event_dialog::EventSessionExit::Cancelled,
+        &host.events,
+    );
+    let drained = std::iter::from_fn(|| host.receiver.try_recv().ok()).collect::<Vec<_>>();
+    assert!(
+        drained
+            .iter()
+            .any(|event| matches!(event, AgentEvent::CutsceneEnded)),
+        "CutsceneEnded follows the cancel: {drained:?}"
+    );
+}
+
 /// bootstrap_acceptance_contract blocks on its own current-thread runtime,
 /// so it must run outside an active tokio context.
 #[test]
@@ -601,4 +670,5 @@ async fn event_state_contract() {
     action_event_gate_contract().await;
     item_stack_gate_contract().await;
     pos_finite_contract();
+    stall_contract().await;
 }

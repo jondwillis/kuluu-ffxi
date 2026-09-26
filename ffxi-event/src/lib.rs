@@ -25,10 +25,13 @@ pub mod vm;
 
 pub use cue::{
     dat_id_helper, event_motion_dat_id, tpc_b_for_waist, tpc_motion_packages, ActorLookup,
-    EventCue, ExtSchedulerMotion, FourCc, TpcMotionPackages, MUSIC_VOLUME_MAX, NO_ACTION_KEY,
-    SCHEDULER_DAT_ID_BASE, SCHEDULER_DURATION_FROM_DAT, SCHEDULER_FADE_DAT_ID,
-    SCHEDULER_TAG_FADE_IN, SCHEDULER_TAG_FADE_OUT, STATUS_EVENT_CHOCOBO, STATUS_EVENT_IDLE,
-    STATUS_EVENT_MOUNT, TPC_PACKAGE_OUT_OF_RANGE,
+    EventCue, ExtSchedulerMotion, FourCc, TpcMotionPackages, EMOTE_ANIMATION_KEY, MUSIC_VOLUME_MAX,
+    NO_ACTION_KEY, SCHEDULER_DAT_ID_BASE, SCHEDULER_DURATION_FROM_DAT, SCHEDULER_FADE_DAT_ID,
+    SCHEDULER_TAG_FADE_IN, SCHEDULER_TAG_FADE_OUT, SOUND_TYPE_EFFECT, SOUND_TYPE_MASTER,
+    SOUND_TYPE_SPECIAL_CHAT, SOUND_TYPE_SYSTEM, SOUND_TYPE_ZONE, STATUS_EVENT_CHOCOBO,
+    STATUS_EVENT_IDLE, STATUS_EVENT_MOUNT, TPC_PACKAGE_OUT_OF_RANGE,
 };
 pub use runner::{clean_display, DialogFrame, DialogRunner, DialogStep, EVENT_CANCELLED_END_PARA};
-pub use vm::{EventChoice, EventMessage, EventVm, PendingTag, StepResult, OPCODE_BUDGET_PER_STEP};
+pub use vm::{
+    EventChoice, EventMessage, EventVm, Park, PendingTag, StepResult, OPCODE_BUDGET_PER_STEP,
+};

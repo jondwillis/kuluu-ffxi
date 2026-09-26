@@ -592,7 +592,11 @@ cmd_writer_plausible() {
     return $?
   fi
   if [[ "$cmd" =~ ${SESSION_EDITS_CMD_START_RE}rmcm([[:space:]]|$) ]]; then
-    local t abs prefix
+    local t abs prefix root_phys
+    # The payload's root may be in drive-letter form (C:/...) while `pwd -P`
+    # reports MSYS physical form (/...); normalize root into the same form as
+    # `abs` so the prefix match below cannot miss on the form alone.
+    root_phys=$(cd "$root" && pwd -P) || return 1
     set -f
     # shellcheck disable=SC2086
     for t in $cmd; do
@@ -610,12 +614,12 @@ cmd_writer_plausible() {
       else
         abs="$(cd "$(dirname "$abs")" && pwd -P)/$(basename "$abs")"
       fi
-      case "$abs" in "$root"|"$root"/*) ;; *) continue ;; esac
+      case "$abs" in "$root_phys"|"$root_phys"/*) ;; *) continue ;; esac
       if [ -d "$abs" ]; then
-        [ "$abs" = "$root" ] && return 0
-        prefix="${abs#"$root"/}"
+        [ "$abs" = "$root_phys" ] && return 0
+        prefix="${abs#"$root_phys"/}"
         case "$p" in "$prefix"/*) return 0 ;; esac
-      elif [ "$abs" = "$root/$p" ]; then
+      elif [ "$abs" = "$root_phys/$p" ]; then
         return 0
       fi
     done

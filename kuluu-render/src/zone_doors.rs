@@ -138,6 +138,12 @@ pub struct ZoneDoorNpc {
     /// Last animation byte acted on. The server repeats the byte on every 0x0E,
     /// so only a change is an event.
     pub animation: u8,
+
+    /// Last StatusEvent the running event wrote for this door (the 0x4C/0x4D/0x4F
+    /// cues, research/XiEvents/OpCodes/0x004C.md, 0x004D.md, 0x004F.md).
+    /// Kept off `animation` because the wire byte keeps reporting the
+    /// server's own state and would clobber the event's dedup.
+    pub event_animation: u8,
 }
 
 /// One zone-DAT door directory: every Scheduler it holds (so a routine's 0x03
@@ -482,6 +488,7 @@ pub fn trigger_zone_doors(
                 commands.entity(entity).try_insert(ZoneDoorNpc {
                     four_cc,
                     animation: wire.animation,
+                    event_animation: 0,
                 });
                 true
             }
@@ -523,17 +530,112 @@ pub fn trigger_zone_doors(
             );
             continue;
         }
-        let Some(active) = ActiveScheduler::from_main(&dir.routines, &routine) else {
-            continue;
-        };
-        crate::scheduler_runtime::enqueue_routine(&mut commands, entity, active);
-        commands.entity(entity).try_insert_if_new(ActionAssets {
-            seps: dir.seps.clone(),
-            ..Default::default()
-        });
+        swing_door(dir, &routine, entity, &mut commands);
         info!(
             "zone_doors: {label} runs {}",
             String::from_utf8_lossy(&routine)
+        );
+    }
+    flush_active_scheduler_inserts(&mut pending_inserts, &mut q_scheds, &mut commands);
+}
+
+/// Enqueue `routine` on `entity` with the Sep assets its sound stages resolve
+/// against; a routine the directory does not hold enqueues nothing.
+fn swing_door(dir: &DoorDir, routine: &[u8; 4], entity: Entity, commands: &mut Commands) {
+    let Some(active) = ActiveScheduler::from_main(&dir.routines, routine) else {
+        return;
+    };
+    crate::scheduler_runtime::enqueue_routine(commands, entity, active);
+    commands.entity(entity).try_insert_if_new(ActionAssets {
+        seps: dir.seps.clone(),
+        ..Default::default()
+    });
+}
+
+/// Swing the door the running event script asked for. The 0x4C/0x4D/0x4F
+/// StatusEvent writes ride the 0x7E Mount cue (ffxi-event/src/cue.rs), and
+/// this is their consumer: the target's look says which door geometry it is,
+/// and the swing is the same routine trigger_zone_doors runs on the server's
+/// byte. The two dedup on ZoneDoorNpc.animation, so a state the server already
+/// reported does not swing twice.
+pub fn trigger_event_doors(
+    events: Res<crate::snapshot::EventLog>,
+    scene_state: Res<SceneState>,
+    table: Res<crate::entity_table::EntityTable>,
+    tracked: Res<TrackedEntities>,
+    mut pending_inserts: Local<std::collections::HashMap<Entity, Vec<ActiveScheduler>>>,
+    doors: Res<ZoneDoors>,
+    mut q_npc: Query<&mut ZoneDoorNpc>,
+    mut q_scheds: Query<&mut ActiveSchedulers>,
+    mut commands: Commands,
+    mut last_seen: Local<u64>,
+) {
+    let new_count =
+        (events.pushed_total.saturating_sub(*last_seen)).min(events.recent.len() as u64) as usize;
+    *last_seen = events.pushed_total;
+    if new_count == 0 || doors.dirs.is_empty() {
+        return;
+    }
+    for ev in events.recent.iter().rev().take(new_count).rev() {
+        let kuluu_snapshot::ViewerEvent::Cutscene { cue } = *ev else {
+            continue;
+        };
+        let kuluu_snapshot::CutsceneCue::Mount {
+            target,
+            status_event,
+            mount_id,
+        } = cue
+        else {
+            continue;
+        };
+        // A mount id names a mount, not a door state
+        // (research/XiEvents/OpCodes/0x004C.md and its 0x4D/0x4F twins).
+        if mount_id.is_some() {
+            continue;
+        }
+        let Some(routine) = (match status_event {
+            animation::OPEN_DOOR => Some(ROUTINE_OPEN),
+            animation::CLOSE_DOOR => Some(ROUTINE_CLOSE),
+            _ => None,
+        }) else {
+            continue;
+        };
+        let Some(id) = crate::scheduler_runtime::cutscene_actor_server_id(table.self_id(), target)
+        else {
+            continue;
+        };
+        let Some(wire) = scene_state.snapshot.entities.iter().find(|e| e.id == id) else {
+            continue;
+        };
+        let Some(four_cc) = door_four_cc(wire.look.as_ref()) else {
+            continue;
+        };
+        let Some(&entity) = tracked.by_id.get(&id) else {
+            continue;
+        };
+        match q_npc.get_mut(entity) {
+            Ok(mut npc) => {
+                if npc.event_animation == status_event {
+                    continue;
+                }
+                npc.event_animation = status_event;
+            }
+            Err(_) => {
+                commands.entity(entity).try_insert(ZoneDoorNpc {
+                    four_cc,
+                    animation: wire.animation,
+                    event_animation: status_event,
+                });
+            }
+        }
+        let Some(dir) = doors.dirs.get(&four_cc) else {
+            continue;
+        };
+        swing_door(dir, &routine, entity, &mut commands);
+        info!(
+            door = door_label(four_cc),
+            animation = status_event,
+            "zone_doors: event door state"
         );
     }
     flush_active_scheduler_inserts(&mut pending_inserts, &mut q_scheds, &mut commands);
@@ -631,6 +733,7 @@ impl Plugin for ZoneDoorsPlugin {
             Update,
             (
                 sync_zone_door_dirs,
+                trigger_event_doors,
                 trigger_zone_doors.before(crate::scheduler_runtime::tick_active_schedulers),
                 apply_zone_door_stages.after(crate::scheduler_runtime::tick_active_schedulers),
                 animate_zone_door_leaves,
@@ -871,6 +974,123 @@ mod tests {
                 swept(&app, *leaf, shut[slot]) < 1e-4,
                 "closing returns leaf {slot} to the authored placement pose"
             );
+        }
+    }
+
+    /// The 0x4C/0x4D/0x4F StatusEvent writes on the Mount cue swing the door
+    /// the target's look names, with the server's byte still shut: the event is
+    /// the only trigger. A repeated cue and a non-door status swing nothing
+    /// (research/XiEvents/OpCodes/0x004C.md, 0x004D.md, 0x004F.md).
+    #[test]
+    fn an_event_cue_swings_the_door_and_dedups_on_the_same_state() {
+        let swing = SSANDY_STABLES_SWING_DEG.to_radians();
+        let mut app = App::new();
+        app.init_resource::<Time>()
+            .init_resource::<SceneState>()
+            .init_resource::<TrackedEntities>()
+            .init_resource::<ZoneDoors>()
+            .init_resource::<crate::entity_table::EntityTable>()
+            .init_resource::<crate::snapshot::EventLog>()
+            .add_message::<SchedulerStageEvent>()
+            .add_message::<crate::scheduler_runtime::CutsceneMotionDone>()
+            .add_systems(
+                Update,
+                (
+                    trigger_event_doors,
+                    trigger_zone_doors,
+                    crate::scheduler_runtime::tick_active_schedulers,
+                    apply_zone_door_stages,
+                    animate_zone_door_leaves,
+                )
+                    .chain(),
+            );
+        app.world_mut()
+            .resource_mut::<ZoneDoors>()
+            .dirs
+            .insert(u32::from_le_bytes(SSANDY_STABLES_DOOR), swing_dir(swing));
+
+        let npc = app.world_mut().spawn_empty().id();
+        app.world_mut()
+            .resource_mut::<TrackedEntities>()
+            .by_id
+            .insert(DOOR_ENTITY_ID, npc);
+        let shut: Vec<Mat4> = (0..2)
+            .map(|slot| {
+                ZoneDoorLeaf::new(slot, &placement(&SSANDY_STABLES_DOOR, 0.0, 1.0))
+                    .posed_transform(DoorPose::default())
+            })
+            .collect();
+        let leaves: Vec<Entity> = (0..2)
+            .map(|slot| {
+                let leaf = ZoneDoorLeaf::new(slot, &placement(&SSANDY_STABLES_DOOR, 0.0, 1.0));
+                app.world_mut()
+                    .spawn((leaf, Transform::from_matrix(shut[slot as usize])))
+                    .id()
+            })
+            .collect();
+        app.world_mut()
+            .resource_mut::<SceneState>()
+            .snapshot
+            .entities = vec![door_entity(DOOR_ENTITY_ID, animation::CLOSE_DOOR)];
+
+        let push_cue = |app: &mut App, cue: kuluu_snapshot::CutsceneCue| {
+            app.world_mut()
+                .resource_mut::<crate::snapshot::EventLog>()
+                .push(kuluu_snapshot::ViewerEvent::Cutscene { cue });
+        };
+        let open_cue = kuluu_snapshot::CutsceneCue::Mount {
+            target: kuluu_snapshot::CutsceneActor::Entity {
+                server_id: DOOR_ENTITY_ID,
+            },
+            status_event: animation::OPEN_DOOR,
+            mount_id: None,
+        };
+
+        push_cue(&mut app, open_cue);
+        step(&mut app, SWING_FRAMES as f32 / 2.0);
+        for (slot, leaf) in leaves.iter().enumerate() {
+            assert!(
+                swept(&app, *leaf, shut[slot]) > 0.0,
+                "leaf {slot} swings on the event cue, the server byte still shut"
+            );
+        }
+        step(&mut app, SWING_FRAMES as f32 / 2.0);
+
+        let at = (0..2)
+            .map(|slot| swept(&app, leaves[slot], shut[slot]))
+            .collect::<Vec<_>>();
+        push_cue(&mut app, open_cue);
+        step(&mut app, 1.0);
+        for (slot, leaf) in leaves.iter().enumerate() {
+            assert_eq!(
+                swept(&app, *leaf, shut[slot]),
+                at[slot],
+                "leaf {slot} does not re-swing on the same state"
+            );
+        }
+
+        for status in [animation::CHOCOBO, animation::OPEN_DOOR] {
+            let before = (0..2)
+                .map(|slot| swept(&app, leaves[slot], shut[slot]))
+                .collect::<Vec<_>>();
+            push_cue(
+                &mut app,
+                kuluu_snapshot::CutsceneCue::Mount {
+                    target: kuluu_snapshot::CutsceneActor::Entity {
+                        server_id: DOOR_ENTITY_ID,
+                    },
+                    status_event: status,
+                    mount_id: (status == animation::CHOCOBO).then_some(1),
+                },
+            );
+            step(&mut app, 1.0);
+            for (slot, leaf) in leaves.iter().enumerate() {
+                assert_eq!(
+                    swept(&app, *leaf, shut[slot]),
+                    before[slot],
+                    "status {status} swings nothing"
+                );
+            }
         }
     }
 

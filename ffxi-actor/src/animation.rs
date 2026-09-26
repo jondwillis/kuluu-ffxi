@@ -10,6 +10,59 @@ pub fn interpolate_kf(a: &KeyFrameTransform, b: &KeyFrameTransform, t: f32) -> K
     }
 }
 
+/// The midpoint of blending `a` to `b` the long way round: `b` taken on the
+/// far hemisphere from where `nlerp` would take it.
+fn long_arc_mid(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
+    let dot = a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3];
+    let far = if dot < 0.0 {
+        b
+    } else {
+        [-b[0], -b[1], -b[2], -b[3]]
+    };
+    let q = [a[0] + far[0], a[1] + far[1], a[2] + far[2], a[3] + far[3]];
+    let m = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]).sqrt();
+    if m < 1e-6 {
+        return nlerp(a, b, 0.5);
+    }
+    [q[0] / m, q[1] / m, q[2] / m, q[3] / m]
+}
+
+fn quat_abs_dot(a: [f32; 4], b: [f32; 4]) -> f32 {
+    (a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3]).abs()
+}
+
+/// Whether a joint blending from `a` to `b` should go the long way round:
+/// true when the long arc's midpoint is nearer the front reference than the
+/// short arc's.
+pub fn long_arc_is_nearer_front(a: [f32; 4], b: [f32; 4], front: [f32; 4]) -> bool {
+    quat_abs_dot(long_arc_mid(a, b), front) > quat_abs_dot(nlerp(a, b, 0.5), front) + 1e-4
+}
+
+/// `nlerp` along the arc chosen for this joint: the short one, or the long one.
+pub fn nlerp_arc(a: [f32; 4], b: [f32; 4], t: f32, long: bool) -> [f32; 4] {
+    if !long {
+        return nlerp(a, b, t);
+    }
+    let dot = a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3];
+    let far = if dot < 0.0 {
+        b
+    } else {
+        [-b[0], -b[1], -b[2], -b[3]]
+    };
+    let inv = 1.0 - t;
+    let q = [
+        a[0] * inv + far[0] * t,
+        a[1] * inv + far[1] * t,
+        a[2] * inv + far[2] * t,
+        a[3] * inv + far[3] * t,
+    ];
+    let m = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]).sqrt();
+    if m < 1e-6 {
+        return nlerp(a, b, t);
+    }
+    [q[0] / m, q[1] / m, q[2] / m, q[3] / m]
+}
+
 fn lerp3(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
     let inv = 1.0 - t;
     [
@@ -79,6 +132,10 @@ pub struct TransitionParams {
     pub transition_out_time: f32,
     pub resolved_in_between: HashMap<usize, SkeletonAnimation>,
     pub eager_transition_out: bool,
+    /// Per-joint front reference (the actor's idle pose, frame 0) for a switch
+    /// that must turn the body through the front; `None` blends every joint the
+    /// short way.
+    pub front_ref: Option<std::sync::Arc<HashMap<usize, [f32; 4]>>>,
 }
 
 impl Default for TransitionParams {
@@ -88,6 +145,7 @@ impl Default for TransitionParams {
             transition_out_time: 7.5,
             resolved_in_between: HashMap::new(),
             eager_transition_out: false,
+            front_ref: None,
         }
     }
 }
@@ -234,6 +292,7 @@ pub struct AnimationTransition {
     pub transition_duration: f32,
     pub in_between: Option<SkeletonAnimation>,
     progress: f32,
+    long_arc: std::collections::HashSet<usize>,
 }
 
 impl AnimationTransition {
@@ -242,13 +301,33 @@ impl AnimationTransition {
         next: SkeletonAnimationContext,
         transition_duration: f32,
         in_between: Option<SkeletonAnimation>,
+        front_ref: Option<&HashMap<usize, [f32; 4]>>,
     ) -> Self {
+        let mut long_arc = std::collections::HashSet::new();
+        if let Some(front_ref) = front_ref {
+            for &joint in next.animation.key_frame_sets.keys() {
+                let Some(prev) = previous.get_joint_transform(joint as usize) else {
+                    continue;
+                };
+                let Some(next_t) = next.get_joint_transform(joint as usize) else {
+                    continue;
+                };
+                let front = front_ref
+                    .get(&(joint as usize))
+                    .copied()
+                    .unwrap_or([0.0, 0.0, 0.0, 1.0]);
+                if long_arc_is_nearer_front(prev.rotation, next_t.rotation, front) {
+                    long_arc.insert(joint as usize);
+                }
+            }
+        }
         AnimationTransition {
             previous,
             next,
             transition_duration,
             in_between,
             progress: 0.0,
+            long_arc,
         }
     }
 
@@ -268,7 +347,16 @@ impl AnimationTransition {
             None => {
                 let prev = self.previous.get_joint_transform(joint);
                 let next = self.next.get_joint_transform(joint);
-                interpolate_nullable(prev.as_ref(), next.as_ref(), t)
+                match (prev.as_ref(), next.as_ref()) {
+                    (Some(a), Some(b)) if self.long_arc.contains(&joint) => {
+                        Some(KeyFrameTransform {
+                            rotation: nlerp_arc(a.rotation, b.rotation, t, true),
+                            translation: lerp3(a.translation, b.translation, t),
+                            scale: lerp3(a.scale, b.scale, t),
+                        })
+                    }
+                    _ => interpolate_nullable(prev.as_ref(), next.as_ref(), t),
+                }
             }
             Some(in_between) => {
                 if t < 0.5 {
@@ -359,11 +447,13 @@ impl SkeletonAnimator {
             let in_between = transition_params
                 .and_then(|t| t.resolved_in_between.get(&self.animation_slot).cloned());
 
+            let front_ref = transition_params.and_then(|t| t.front_ref.as_deref());
             self.transition = Some(AnimationTransition::new(
                 snapshot,
                 clone_context_at_frame0(&ctx),
                 transition_duration,
                 in_between,
+                front_ref,
             ));
         }
 
@@ -438,6 +528,15 @@ impl SkeletonAnimationCoordinator {
             None,
             |animator| ready_for_transition_out(animator, require_transition_out),
         );
+    }
+
+    /// The idle registration that hands the slot over at once even though the
+    /// current clip is still mid-loop: the action driving that clip just
+    /// ended, and retail's kill drops the sequence's animation instance, so
+    /// the pinned end frame must not outlive it. The crossfade runs the
+    /// current clip's own transition-out window.
+    pub fn register_idle_animation_eager(&mut self, animation: SkeletonAnimation) {
+        self.register_animation(animation, LoopParams::low_priority_loop(), None, |_| true);
     }
 
     pub fn get_joint_transform(&self, joint: usize) -> Option<KeyFrameTransform> {
@@ -853,5 +952,37 @@ mod tests {
             Some(&tp),
         );
         assert!(a7.transition.as_ref().unwrap().in_between.is_none());
+    }
+
+    fn yaw_quat(deg: f32) -> [f32; 4] {
+        let h = deg.to_radians() / 2.0;
+        [0.0, h.sin(), 0.0, h.cos()]
+    }
+
+    /// A twist from +100 to -100 degrees: the short arc (160) swings behind
+    /// through 180, the long arc (200) passes the front. With the front at
+    /// identity the long arc wins and its midpoint faces front.
+    #[test]
+    fn a_twist_that_would_swing_behind_takes_the_front() {
+        let (a, b, front) = (yaw_quat(100.0), yaw_quat(-100.0), [0.0, 0.0, 0.0, 1.0]);
+        assert!(long_arc_is_nearer_front(a, b, front));
+        let mid = nlerp_arc(a, b, 0.5, true);
+        assert!(mid[3].abs() > 0.99, "midpoint must face front, got {mid:?}");
+        let behind = nlerp(a, b, 0.5);
+        assert!(
+            behind[3].abs() < 0.2,
+            "the plain short arc swings behind, got {behind:?}"
+        );
+    }
+
+    /// A twist from +60 to -60: the short arc already passes the front, so it
+    /// stays.
+    #[test]
+    fn a_twist_through_the_front_keeps_its_short_arc() {
+        assert!(!long_arc_is_nearer_front(
+            yaw_quat(60.0),
+            yaw_quat(-60.0),
+            [0.0, 0.0, 0.0, 1.0]
+        ));
     }
 }

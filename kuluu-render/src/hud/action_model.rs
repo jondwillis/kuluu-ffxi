@@ -16,6 +16,8 @@ pub enum TargetActionId {
     Check,
     Open,
     Fish,
+    Dig,
+    Dismount,
 }
 
 impl TargetActionId {
@@ -27,6 +29,8 @@ impl TargetActionId {
             TargetActionId::Open
             | TargetActionId::Check
             | TargetActionId::Chat
+            | TargetActionId::Dig
+            | TargetActionId::Dismount
             | TargetActionId::SwitchTarget => true,
             TargetActionId::Attack
             | TargetActionId::Magic
@@ -90,6 +94,12 @@ pub struct TargetActionContext {
     /// "Fish" is offered at all — retail omits the entry rather than greying it
     /// (research/xim UiState.kt `getCurrentActions`).
     pub can_fish: bool,
+
+    /// The player is riding a mount: the self menu becomes Chat / Dig /
+    /// Dismount and Dismount is appended to every other menu
+    /// (.agents/skills/retail-observe/references/2026-09-24-chocobo-mounted-menu.md,
+    /// research/xim UiState.kt `getCurrentActions`).
+    pub mounted: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,7 +150,7 @@ impl AbilityGroup {
     }
 }
 
-fn applies_to(id: TargetActionId, kind: TargetKindLite, engaged: bool) -> bool {
+fn applies_to(id: TargetActionId, kind: TargetKindLite, engaged: bool, mounted: bool) -> bool {
     use TargetKindLite::*;
     match id {
         TargetActionId::Attack => matches!(kind, Mob) && !engaged,
@@ -166,6 +176,12 @@ fn applies_to(id: TargetActionId, kind: TargetKindLite, engaged: bool) -> bool {
         // happens to be selected (research/xim UiState.kt `getCurrentActions`
         // appends it independently of the target).
         TargetActionId::Fish => true,
+
+        // Chocobo commands: Dig only on the mounted self menu, Dismount
+        // appended to every menu while mounted (the same XIM `getCurrentActions`
+        // append, the self-menu replacement from the mounted-menu capture).
+        TargetActionId::Dig => kind == SelfPc && mounted,
+        TargetActionId::Dismount => mounted,
     }
 }
 
@@ -182,11 +198,30 @@ pub fn build_target_action_entries(
         TargetActionId::Abilities,
         TargetActionId::Trust,
         TargetActionId::Items,
+        TargetActionId::Dismount,
         TargetActionId::Trade,
         TargetActionId::Disengage,
         TargetActionId::Fish,
         TargetActionId::Check,
     ];
+
+    // While riding, retail replaces the self menu with Chat / Dig / Dismount
+    // (.agents/skills/retail-observe/references/2026-09-24-chocobo-mounted-menu.md;
+    // the item ids are retail's own, research/xim ActionMenu.kt Dig(38) /
+    // Dismount(39)). The command menu opens on the self target, which is the
+    // no-target menu (`has_target` false) as well as an explicit self target;
+    // a Pet/Other target still reads `None` kind with `has_target` true and
+    // keeps the appended-Dismount menu.
+    if ctx.mounted && (ctx.target_kind == TargetKindLite::SelfPc || !ctx.has_target) {
+        return [
+            TargetActionId::Chat,
+            TargetActionId::Dig,
+            TargetActionId::Dismount,
+        ]
+        .iter()
+        .map(|&id| entry_for(id, ctx))
+        .collect();
+    }
 
     let mut out = Vec::new();
     for &id in ORDER {
@@ -196,69 +231,74 @@ pub fn build_target_action_entries(
         if id == TargetActionId::Fish && !ctx.can_fish {
             continue;
         }
-        if !applies_to(id, ctx.target_kind, ctx.engaged) {
+        if !applies_to(id, ctx.target_kind, ctx.engaged, ctx.mounted) {
             continue;
         }
-
-        let needs_range = matches!(
-            id,
-            TargetActionId::Chat | TargetActionId::Trade | TargetActionId::Open
-        );
-        let out_of_range = needs_range && ctx.has_target && !ctx.in_range;
-        // Retail greys the Command Menu "Items" entry when nothing in the
-        // bags would pass the 0x037 use gate (kuluu-268h).
-        let no_usable_items = id == TargetActionId::Items && !ctx.usable_items_available;
-
-        let (kind, label) = match id {
-            TargetActionId::Attack => (ActionEntryKind::Plain, "Attack".to_string()),
-            TargetActionId::SwitchTarget => (ActionEntryKind::Plain, "Switch Target".to_string()),
-            TargetActionId::Disengage => (ActionEntryKind::Plain, "Disengage".to_string()),
-            TargetActionId::Chat => (
-                ActionEntryKind::Select {
-                    modes: vec!["Say", "Tell", "Party", "Linkshell", "Unity", "Shout"],
-                    mode_idx: 0,
-                },
-                "Chat".to_string(),
-            ),
-            TargetActionId::Magic => (
-                ActionEntryKind::Select {
-                    modes: vec!["Category", "Flat"],
-                    mode_idx: 0,
-                },
-                "Magic".to_string(),
-            ),
-            TargetActionId::Abilities => (
-                ActionEntryKind::Select {
-                    modes: AbilityGroup::ALL.iter().map(|g| g.label()).collect(),
-                    mode_idx: 0,
-                },
-                "Abilities".to_string(),
-            ),
-            TargetActionId::Trust => (ActionEntryKind::Plain, "Trust".to_string()),
-            TargetActionId::Items => (ActionEntryKind::Plain, "Items".to_string()),
-            TargetActionId::Trade => (ActionEntryKind::Plain, "Trade".to_string()),
-            TargetActionId::Check => (ActionEntryKind::Plain, "Check".to_string()),
-            TargetActionId::Open => (ActionEntryKind::Plain, "Open".to_string()),
-            TargetActionId::Fish => (ActionEntryKind::Plain, "Fish".to_string()),
-        };
-
-        let hint = if out_of_range {
-            Some("Target out of range.".to_string())
-        } else if no_usable_items {
-            Some("No usable items.".to_string())
-        } else {
-            None
-        };
-
-        out.push(ActionEntry {
-            id,
-            label,
-            kind,
-            enabled: !out_of_range && !no_usable_items,
-            hint,
-        });
+        out.push(entry_for(id, ctx));
     }
     out
+}
+
+fn entry_for(id: TargetActionId, ctx: &TargetActionContext) -> ActionEntry {
+    let needs_range = matches!(
+        id,
+        TargetActionId::Chat | TargetActionId::Trade | TargetActionId::Open
+    );
+    let out_of_range = needs_range && ctx.has_target && !ctx.in_range;
+    // Retail greys the Command Menu "Items" entry when nothing in the
+    // bags would pass the 0x037 use gate (kuluu-268h).
+    let no_usable_items = id == TargetActionId::Items && !ctx.usable_items_available;
+
+    let (kind, label) = match id {
+        TargetActionId::Attack => (ActionEntryKind::Plain, "Attack".to_string()),
+        TargetActionId::SwitchTarget => (ActionEntryKind::Plain, "Switch Target".to_string()),
+        TargetActionId::Disengage => (ActionEntryKind::Plain, "Disengage".to_string()),
+        TargetActionId::Chat => (
+            ActionEntryKind::Select {
+                modes: vec!["Say", "Tell", "Party", "Linkshell", "Unity", "Shout"],
+                mode_idx: 0,
+            },
+            "Chat".to_string(),
+        ),
+        TargetActionId::Magic => (
+            ActionEntryKind::Select {
+                modes: vec!["Category", "Flat"],
+                mode_idx: 0,
+            },
+            "Magic".to_string(),
+        ),
+        TargetActionId::Abilities => (
+            ActionEntryKind::Select {
+                modes: AbilityGroup::ALL.iter().map(|g| g.label()).collect(),
+                mode_idx: 0,
+            },
+            "Abilities".to_string(),
+        ),
+        TargetActionId::Trust => (ActionEntryKind::Plain, "Trust".to_string()),
+        TargetActionId::Items => (ActionEntryKind::Plain, "Items".to_string()),
+        TargetActionId::Trade => (ActionEntryKind::Plain, "Trade".to_string()),
+        TargetActionId::Check => (ActionEntryKind::Plain, "Check".to_string()),
+        TargetActionId::Open => (ActionEntryKind::Plain, "Open".to_string()),
+        TargetActionId::Fish => (ActionEntryKind::Plain, "Fish".to_string()),
+        TargetActionId::Dig => (ActionEntryKind::Plain, "Dig".to_string()),
+        TargetActionId::Dismount => (ActionEntryKind::Plain, "Dismount".to_string()),
+    };
+
+    let hint = if out_of_range {
+        Some("Target out of range.".to_string())
+    } else if no_usable_items {
+        Some("No usable items.".to_string())
+    } else {
+        None
+    };
+
+    ActionEntry {
+        id,
+        label,
+        kind,
+        enabled: !out_of_range && !no_usable_items,
+        hint,
+    }
 }
 
 pub fn context_for_target(
@@ -269,6 +309,7 @@ pub fn context_for_target(
     engaged: bool,
     usable_items_available: bool,
     can_fish: bool,
+    mounted: bool,
 ) -> TargetActionContext {
     use kuluu_snapshot::EntityKind;
 
@@ -303,6 +344,7 @@ pub fn context_for_target(
         engaged,
         usable_items_available,
         can_fish,
+        mounted,
     }
 }
 
@@ -342,6 +384,14 @@ mod tests {
             engaged: false,
             usable_items_available: true,
             can_fish: false,
+            mounted: false,
+        }
+    }
+
+    fn mounted_ctx(kind: TargetKindLite) -> TargetActionContext {
+        TargetActionContext {
+            mounted: true,
+            ..ctx(kind, true)
         }
     }
 
@@ -486,6 +536,81 @@ mod tests {
                 "{kind:?} is expected to offer more than one command"
             );
             assert!(sole_auto_confirm_entry(&entries).is_none());
+        }
+    }
+
+    /// The mounted no-target context: the command menu opens on the self
+    /// target, which is the no-target menu, not an explicit self target.
+    fn mounted_no_target() -> TargetActionContext {
+        TargetActionContext {
+            has_target: false,
+            target_kind: TargetKindLite::None,
+            mounted: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn mounted_self_menu_is_chat_dig_dismount() {
+        let entries = build_target_action_entries(&mounted_ctx(TargetKindLite::SelfPc), &RETAIL);
+        let ids: Vec<_> = entries.iter().map(|e| e.id).collect();
+        assert_eq!(
+            ids,
+            vec![
+                TargetActionId::Chat,
+                TargetActionId::Dig,
+                TargetActionId::Dismount
+            ]
+        );
+        assert!(entries.iter().all(|e| e.enabled));
+    }
+
+    #[test]
+    fn mounted_no_target_menu_is_chat_dig_dismount() {
+        let entries = build_target_action_entries(&mounted_no_target(), &RETAIL);
+        let ids: Vec<_> = entries.iter().map(|e| e.id).collect();
+        assert_eq!(
+            ids,
+            vec![
+                TargetActionId::Chat,
+                TargetActionId::Dig,
+                TargetActionId::Dismount
+            ]
+        );
+        assert!(entries.iter().all(|e| e.enabled));
+    }
+
+    #[test]
+    fn mounted_other_menus_gain_dismount_but_not_dig() {
+        for kind in [
+            TargetKindLite::Mob,
+            TargetKindLite::Pc,
+            TargetKindLite::None,
+        ] {
+            let entries = build_target_action_entries(&mounted_ctx(kind), &RETAIL);
+            let ids: Vec<_> = entries.iter().map(|e| e.id).collect();
+            assert!(
+                ids.contains(&TargetActionId::Dismount),
+                "{kind:?} loses Dismount"
+            );
+            assert!(!ids.contains(&TargetActionId::Dig), "{kind:?} gains Dig");
+        }
+    }
+
+    #[test]
+    fn dismounted_menus_have_no_chocobo_rows() {
+        for kind in [
+            TargetKindLite::SelfPc,
+            TargetKindLite::Pc,
+            TargetKindLite::None,
+        ] {
+            let entries = build_target_action_entries(&ctx(kind, true), &RETAIL);
+            let ids: Vec<_> = entries.iter().map(|e| e.id).collect();
+            assert!(!ids.contains(&TargetActionId::Dig), "{kind:?} gains Dig");
+            assert!(
+                !ids.contains(&TargetActionId::Dismount),
+                "{kind:?} gains Dismount"
+            );
         }
     }
 

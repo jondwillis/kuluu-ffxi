@@ -15,7 +15,7 @@ use bevy::picking::Pickable;
 use bevy::prelude::*;
 
 use ffxi_dat::scheduler::Scheduler;
-use ffxi_event::{FourCc, SCHEDULER_FADE_DAT_ID, SCHEDULER_TAG_FADE_IN, SCHEDULER_TAG_FADE_OUT};
+use ffxi_event::{FourCc, SCHEDULER_FADE_DAT_ID, SCHEDULER_TAG_FADE_IN};
 use kuluu_snapshot::{CutsceneActor, CutsceneCue, ViewerEvent};
 
 use crate::hud_hide::{HudHidden, HudHideExempt};
@@ -247,6 +247,14 @@ pub struct CutsceneMode {
     /// The last 0x67/0x68 the running event staged; `None` until one arrives.
     /// research/XiEvents/OpCodes/0x0067.md
     pub(crate) hud_event: Option<bool>,
+    /// True once the running event's 0x20 released the player's control
+    /// (retail's `CliEventUcFlag` written 0), lifting the event-wide pin
+    /// until a later 0x20 re-locks. research/XiEvents/OpCodes/0x0020.md
+    pub player_released: bool,
+    /// The lower word of retail's `CliEventModeLocal` the running event's 0x38
+    /// last wrote; `None` until one arrives. While set, the local player model
+    /// and the HUD pieces stay hidden. research/XiEvents/OpCodes/0x0038.md
+    pub local_mode: Option<u16>,
 }
 
 impl CutsceneMode {
@@ -262,6 +270,8 @@ impl CutsceneMode {
             active: true,
             camera_locked: true,
             hud_event: None,
+            player_released: false,
+            local_mode: None,
         }
     }
 }
@@ -354,10 +364,11 @@ pub fn apply_screen_fade(
 
 pub fn apply_cutscene_hud_hide(mode: Res<CutsceneMode>, mut hidden: ResMut<HudHidden>) {
     // 0x67/0x68 drive the whole-HUD flag independently of the camera (research/XiEvents/OpCodes/
-    // 0x0068.md), so an explicit show wins over the lock default.
+    // 0x0068.md), so an explicit show wins over the lock default; 0x38's local
+    // mode hides the HUD pieces for its whole run (research/XiEvents/OpCodes/0x0038.md).
     let cutscene = match mode.hud_event {
         Some(hide) => hide,
-        None => mode.camera_locked,
+        None => mode.camera_locked || mode.local_mode.is_some(),
     };
     if hidden.cutscene != cutscene {
         hidden.cutscene = cutscene;
@@ -456,7 +467,12 @@ fn apply_cue(
 ) {
     match *cue {
         CutsceneCue::CameraLock { lock } => mode.camera_locked = lock,
+        CutsceneCue::PlayerControl { locked } => mode.player_released = !locked,
         CutsceneCue::HudHide { hide } => mode.hud_event = Some(hide),
+        // 0x38's 0x20 is forced by the handler, so every authored word keeps
+        // the base cinematic mode set; the event end's `end()` clears it
+        // (research/XiEvents/OpCodes/0x0038.md).
+        CutsceneCue::LocalMode { mode: word } => mode.local_mode = Some(word),
         CutsceneCue::Scheduler {
             dat_id,
             tag,
@@ -493,9 +509,20 @@ pub fn drain_cutscene_clock(
     for g in (*cursor).max(first_global)..total {
         match &events.recent[(g - first_global) as usize] {
             ViewerEvent::Cutscene { cue } => match cue {
-                CutsceneCue::ClockHold { stop: true, hour } => match *hour {
-                    Some(hour) => clock.freeze_at_hour(hour),
-                    None => clock.freeze(),
+                CutsceneCue::ClockHold {
+                    stop: true,
+                    hour,
+                    minute,
+                    day_from_epoch,
+                } => match *day_from_epoch {
+                    Some(day) => {
+                        let hour = hour.unwrap_or(0);
+                        clock.freeze_at_day_hour_minute(day, hour, *minute as u32);
+                    }
+                    None => match *hour {
+                        Some(hour) => clock.freeze_at_hour_minute(hour, *minute as u32),
+                        None => clock.freeze(),
+                    },
                 },
                 CutsceneCue::ClockHold { stop: false, .. } => clock.thaw(),
                 _ => {}
@@ -531,11 +558,6 @@ fn scaled(program: &FadeProgram, ratio: f32) -> FadeProgram {
     }
 }
 
-/// The tags whose routines the renderer drives the screen with. Both live in
-/// [`SCHEDULER_FADE_DAT_ID`] — XIClient's own zone fade starts the same two out of the same
-/// file (`GameManager::CliLocalTask`, `StartSchedulerFromFile(0x78B8, '0odf'/'0idf', ...)`).
-const FADE_TAGS: [FourCc; 2] = [SCHEDULER_TAG_FADE_OUT, SCHEDULER_TAG_FADE_IN];
-
 #[cfg(not(target_arch = "wasm32"))]
 pub fn load_fade_programs(root: Res<CutsceneFadeDatRoot>, mut programs: ResMut<FadePrograms>) {
     *programs = FadePrograms::default();
@@ -555,14 +577,16 @@ pub fn load_fade_programs(root: Res<CutsceneFadeDatRoot>, mut programs: ResMut<F
     }
 }
 
-/// The fade routines of an already-read [`SCHEDULER_FADE_DAT_ID`] body.
+/// Every screen-color routine of an already-read [`SCHEDULER_FADE_DAT_ID`]
+/// body, keyed by its own tag. The DAT is the fade table: it ships fdo0/fdi0
+/// (30 frames), fdo1/fdi1 (60) and fdo2/fdi2 (120), and event scripts pick
+/// the tag — so every routine the DAT ships must register, or its cues are
+/// dropped. Routines without a screen-color stage parse to an empty program
+/// and stay out.
 pub fn fade_programs_in(dat: &[u8]) -> Vec<(FourCc, FadeProgram)> {
     ffxi_dat::walk(dat)
         .flatten()
-        .filter(|chunk| {
-            chunk.kind == ffxi_dat::kind::ChunkKind::Scheduler as u8
-                && FADE_TAGS.contains(&chunk.name)
-        })
+        .filter(|chunk| chunk.kind == ffxi_dat::kind::ChunkKind::Scheduler as u8)
         .filter_map(|chunk| {
             let routine = Scheduler::parse(chunk.name, chunk.data).ok()?;
             let program = FadeProgram::from_scheduler(&routine, 1.0);
@@ -611,6 +635,7 @@ mod tests {
     use ffxi_dat::scheduler::{
         SchedulerStage, ScreenColor, StageKind, TimedStage, SCREEN_COLOR_UNIT,
     };
+    use ffxi_event::SCHEDULER_TAG_FADE_OUT;
 
     // The DAT-authored destinations of ROM/62/110.DAT's fdo0/fdi0, asserted against the real
     // file by `real_dat_fade_tags_drive_to_black_and_back`.
@@ -780,6 +805,46 @@ mod tests {
         assert!(!app.world().resource::<CutsceneMode>().camera_locked);
     }
 
+    /// The 0x20 write of retail's CliEventUcFlag: 0 lifts the event-wide pin,
+    /// 1 re-locks, and the session end resets it with the mode.
+    /// research/XiEvents/OpCodes/0x0020.md
+    #[test]
+    fn the_player_control_cue_writes_the_pin_flag() {
+        let mut app = test_app();
+        push(&mut app, ViewerEvent::CutsceneStarted { event_id: 100 });
+        step(&mut app, 1.0);
+        assert!(
+            !app.world().resource::<CutsceneMode>().player_released,
+            "the event pins until the script says otherwise"
+        );
+
+        push(
+            &mut app,
+            ViewerEvent::Cutscene {
+                cue: CutsceneCue::PlayerControl { locked: false },
+            },
+        );
+        step(&mut app, 1.0);
+        assert!(app.world().resource::<CutsceneMode>().player_released);
+
+        push(
+            &mut app,
+            ViewerEvent::Cutscene {
+                cue: CutsceneCue::PlayerControl { locked: true },
+            },
+        );
+        step(&mut app, 1.0);
+        assert!(!app.world().resource::<CutsceneMode>().player_released);
+
+        push(&mut app, ViewerEvent::CutsceneEnded);
+        step(&mut app, 1.0);
+        let mode = app.world().resource::<CutsceneMode>();
+        assert!(
+            !mode.active && !mode.player_released,
+            "session end resets the mode"
+        );
+    }
+
     /// Event 503's D1 shows the HUD while the camera stays locked until H7: an explicit
     /// 0x68 must win over the lock default, and both clear at session end.
     /// research/XiEvents/OpCodes/0x0068.md
@@ -831,6 +896,42 @@ mod tests {
         );
     }
 
+    /// 0x38's local mode hides the HUD pieces for the event's whole run and
+    /// keeps the applied word on the mode; the session end clears both
+    /// (research/XiEvents/OpCodes/0x0038.md).
+    #[test]
+    fn local_mode_hides_the_hud_and_clears_at_session_end() {
+        let mut app = test_app();
+        push(&mut app, ViewerEvent::CutsceneStarted { event_id: 30035 });
+        push(
+            &mut app,
+            ViewerEvent::Cutscene {
+                cue: CutsceneCue::LocalMode { mode: 0x20 },
+            },
+        );
+        step(&mut app, 1.0);
+        assert_eq!(
+            app.world().resource::<CutsceneMode>().local_mode,
+            Some(0x20)
+        );
+        assert!(
+            app.world().resource::<HudHidden>().cutscene,
+            "local mode hides the HUD pieces"
+        );
+
+        push(&mut app, ViewerEvent::CutsceneEnded);
+        step(&mut app, 1.0);
+        assert_eq!(
+            app.world().resource::<CutsceneMode>().local_mode,
+            None,
+            "session end clears the mode"
+        );
+        assert!(
+            !app.world().resource::<HudHidden>().cutscene,
+            "cleared at session end"
+        );
+    }
+
     fn clock_app() -> App {
         let mut app = App::new();
         app.init_resource::<Time>()
@@ -842,7 +943,12 @@ mod tests {
 
     fn clock_hold(stop: bool, hour: Option<u32>) -> ViewerEvent {
         ViewerEvent::Cutscene {
-            cue: CutsceneCue::ClockHold { stop, hour },
+            cue: CutsceneCue::ClockHold {
+                stop,
+                hour,
+                minute: 0,
+                day_from_epoch: None,
+            },
         }
     }
 
@@ -903,12 +1009,62 @@ mod tests {
     }
 
     #[test]
-    fn freeze_at_hour_lands_on_the_zero_minute_of_that_day() {
+    fn freeze_at_hour_minute_lands_on_the_authored_hour_and_minute() {
         let mut clock = VanaClock::default();
-        clock.freeze_at_hour(8);
+        clock.freeze_at_hour_minute(8, 0);
         assert_eq!(
             crate::vana_time::format_vana_time(clock.earth_unix_secs_now()),
             "8:00"
+        );
+        clock.freeze_at_hour_minute(8, 30);
+        assert_eq!(
+            crate::vana_time::format_vana_time(clock.earth_unix_secs_now()),
+            "8:30"
+        );
+    }
+
+    /// 0xA9's date jump: Vana day 14 from the epoch at 00:30 is 886/1/15
+    /// (research/XiEvents/OpCodes/0x00A9.md).
+    #[test]
+    fn freeze_at_day_hour_minute_lands_on_the_authored_vana_day() {
+        let mut clock = VanaClock::default();
+        clock.freeze_at_day_hour_minute(14, 0, 30);
+        assert_eq!(
+            crate::vana_time::format_vana_time(clock.earth_unix_secs_now()),
+            "0:30"
+        );
+        let date = crate::vana_time::VanaDate::from_earth_unix(clock.earth_unix_secs_now());
+        assert_eq!(date.year, 886);
+        assert_eq!(date.month, 1);
+        assert_eq!(date.day, 15);
+    }
+
+    /// A 0xA9-style cue (a day_from_epoch) drives the date jump through the
+    /// drain, not just the VanaClock method
+    /// (research/XiEvents/OpCodes/0x00A9.md).
+    #[test]
+    fn a_set_clock_date_cue_jumps_the_vana_date() {
+        let mut app = clock_app();
+        step(&mut app, 1.0);
+        push(
+            &mut app,
+            ViewerEvent::Cutscene {
+                cue: CutsceneCue::ClockHold {
+                    stop: true,
+                    hour: Some(0),
+                    minute: 30,
+                    day_from_epoch: Some(14),
+                },
+            },
+        );
+        step(&mut app, 1.0);
+        let clock = app.world().resource::<VanaClock>();
+        assert!(clock.is_frozen());
+        let date = crate::vana_time::VanaDate::from_earth_unix(clock.earth_unix_secs_now());
+        assert_eq!(date.day, 15, "jumped to Vana day 14 (1-based 15)");
+        assert_eq!(
+            crate::vana_time::format_vana_time(clock.earth_unix_secs_now()),
+            "0:30"
         );
     }
 
@@ -1101,9 +1257,16 @@ mod tests {
         let bytes = std::fs::read(location.path_under(&root)).expect("fade scheduler DAT reads");
 
         let programs: HashMap<FourCc, FadeProgram> = fade_programs_in(&bytes).into_iter().collect();
-        for (tag, dest) in [
-            (SCHEDULER_TAG_FADE_OUT, FADE_OUT_DEST),
-            (SCHEDULER_TAG_FADE_IN, FADE_IN_DEST),
+        // The DAT's whole screen-color table: fdo0/fdi0 30 frames, fdo1/fdi1
+        // 60, fdo2/fdi2 120. Event scripts pick the tag (the Upper Jeuno
+        // rental rides fdo1/fdi1), so every one must register.
+        for (tag, dest, frames) in [
+            (SCHEDULER_TAG_FADE_OUT, FADE_OUT_DEST, FADE_FRAMES),
+            (SCHEDULER_TAG_FADE_IN, FADE_IN_DEST, FADE_FRAMES),
+            (*b"fdo1", FADE_OUT_DEST, FADE_FRAMES * 2),
+            (*b"fdi1", FADE_IN_DEST, FADE_FRAMES * 2),
+            (*b"fdo2", FADE_OUT_DEST, FADE_FRAMES * 4),
+            (*b"fdi2", FADE_IN_DEST, FADE_FRAMES * 4),
         ] {
             let program = programs
                 .get(&tag)
@@ -1112,8 +1275,8 @@ mod tests {
             assert_eq!(program.latched(), Some(ScreenColor { rgba: dest }.tint()));
             assert_eq!(
                 program.total_secs(),
-                FADE_FRAMES as f32 / ROUTINE_FPS,
-                "half a second per half at the 60Hz routine clock"
+                frames as f32 / ROUTINE_FPS,
+                "the authored {frames}-frame stage"
             );
         }
 

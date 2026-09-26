@@ -101,6 +101,7 @@ pub(super) fn receive(
     position: Position,
 ) {
     use ffxi_proto::{decode, map};
+    dialog.note_player_id(player);
     match sub.opcode {
         map::s2c::WPOS2 => {
             if let Ok(movement) = decode::ForcedMove::decode(sub.data) {
@@ -160,6 +161,17 @@ pub(super) fn receive(
 
 const WIRE_HEADING_UNITS: f32 = (u8::MAX as u16 + 1) as f32;
 
+// The wire and the event VM use DIFFERENT vertical axes, so this pair is a
+// y<->z swap, not an identity:
+//   * the wire (and the session Position it carries) is FFXI's native
+//     (x, y = ground, z = height) — y is the horizontal plane coordinate,
+//     z the vertical. Proven at login: a char at wire (x, 109.08, 8.0) in
+//     Upper Jeuno has y=109.08 on the ground plane and z=8.0 of height.
+//   * the retail event VM (XiEvent) is (x, y = height, z = ground): CodeMOVE
+//     (research/XiEvents/OpCodes/0x001F.md) walks EventPos[0]/EventPos[2]
+//     (x, z) and snaps EventPos[1] (y) to the floor, and SET_EVENT_POS
+//     (0x0037.md) VCalibrate-snaps EventPos[1] to the ground height.
+// So wire z (height) is event y, and wire y (ground) is event z.
 pub(super) fn event_position(position: Position) -> EventPosition {
     EventPosition {
         x: (position.pos.x * EVENT_COORD_UNITS) as i32,
@@ -236,16 +248,25 @@ mod tests {
 
     #[test]
     fn event_coordinates_and_heading_roundtrip_through_session_axes() {
+        // Event VM space (x, y = height, z = ground): the char sits at
+        // height -2.558, ground -31.432. The session (wire) space is
+        // (x, y = ground, z = height), so the conversion swaps y and z.
         let authored = EventPosition {
             x: 33_762,
-            y: -2_558,
-            z: -31_432,
+            y: -2_558,  // height
+            z: -31_432, // ground
             heading: HEADING_EVENT_UNITS_PINNED,
         };
         let converted = session_position(authored, Position::default());
         assert!((converted.pos.x - 33.762).abs() < 0.001);
-        assert!((converted.pos.y + 31.432).abs() < 0.001);
-        assert!((converted.pos.z + 2.558).abs() < 0.001);
+        assert!(
+            (converted.pos.y + 31.432).abs() < 0.001,
+            "wire y is the ground"
+        );
+        assert!(
+            (converted.pos.z + 2.558).abs() < 0.001,
+            "wire z is the height"
+        );
         assert_eq!(converted.heading, 192);
         assert_eq!(event_position(converted), authored);
     }

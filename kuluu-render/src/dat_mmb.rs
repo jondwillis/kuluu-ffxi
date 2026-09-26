@@ -281,6 +281,7 @@ impl Plugin for DatOverlayPlugin {
                     crate::ffxi_actor_render::kick_load_actor_tasks,
                     crate::ffxi_actor_render::poll_load_actor_tasks,
                     crate::ffxi_actor_render::tick_morph_in,
+                    crate::ffxi_actor_render::tick_cutscene_transpar,
                 )
                     .chain(),
             )

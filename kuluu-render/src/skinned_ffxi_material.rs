@@ -414,6 +414,10 @@ impl FfxiSkinRegistry {
         &mut self.instances[slot as usize]
     }
 
+    pub fn instance_opacity(&self, slot: u32) -> f32 {
+        self.instances[slot as usize].opacity
+    }
+
     pub fn set_instance_opacity(&mut self, slot: u32, opacity: f32) {
         if self.instances[slot as usize].opacity != opacity {
             self.instances[slot as usize].opacity = opacity;

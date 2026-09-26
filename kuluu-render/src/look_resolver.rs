@@ -28,6 +28,24 @@ const WEAPON_SLOTS: [u8; 3] = [EQUIP_SLOT_MAIN, EQUIP_SLOT_SUB, EQUIP_SLOT_RANGE
 /// `MainDll::equipment_model_index`).
 pub const PC_LOOK_RACES: std::ops::RangeInclusive<u8> = 1..=8;
 
+/// The non-playable PC-model configs a look packet carries for the child NPC
+/// models, paired with the equipment table row each one's parts come from. The
+/// race index and the row diverge past Galka, so the pairing is data, the same
+/// shape as `ffxi_actor_render::CHOCOBO_RACE_TABLE` (both listed in
+/// research/xim poc/Model.kt RaceGenderConfig).
+const CHILD_RACE_TABLE: [(u8, u8); 3] = [(29, 9), (30, 10), (31, 11)];
+
+/// The equipment table row a look race byte indexes: the byte itself for the
+/// playable races, the paired row for the child configs, `None` otherwise.
+pub fn equipment_table_row(race: u8) -> Option<u8> {
+    if PC_LOOK_RACES.contains(&race) {
+        return Some(race);
+    }
+    CHILD_RACE_TABLE
+        .iter()
+        .find_map(|&(r, row)| (r == race).then_some(row))
+}
+
 const EQUIP_SLOT_ID_SHIFT: u32 = 12;
 const EQUIP_SLOT_ID_SLOT_MASK: u16 = 0xF;
 const EQUIP_SLOT_ID_MODEL_MASK: u16 = 0x0FFF;
@@ -60,15 +78,13 @@ pub fn npc_dat_id(modelid: u16) -> u32 {
 /// (research/XIClient/src/XIClient/source/World/Actor/SkeletalMeshActor.cpp
 /// SkeletalMeshActor::SetEquipModel). A race outside [`PC_LOOK_RACES`] is `None`.
 pub fn equipment_dat_id(dll: &MainDll, slot_index: u8, model_id: u16, race: u8) -> Option<u32> {
-    if slot_index == EQUIP_SLOT_FACE
-        || slot_index > EQUIP_SLOT_RANGED
-        || !PC_LOOK_RACES.contains(&race)
-    {
+    if slot_index == EQUIP_SLOT_FACE || slot_index > EQUIP_SLOT_RANGED {
         return None;
     }
+    let row = equipment_table_row(race)?;
     let model_id = model_id & EQUIP_SLOT_ID_MODEL_MASK;
-    dll.equipment_model_index(race, slot_index, model_id)
-        .or_else(|| dll.equipment_model_index(race, slot_index, 0))
+    dll.equipment_model_index(row, slot_index, model_id)
+        .or_else(|| dll.equipment_model_index(row, slot_index, 0))
 }
 
 /// [`equipment_dat_id`] for a wire slot id: the slot number in the high nibble
@@ -87,11 +103,9 @@ pub fn equipment_slot_dat_id(dll: &MainDll, slot_id: u16, race: u8) -> Option<u3
 /// stylist spans the full row; xim EquipmentModelTable.getItemModelPath indexes
 /// the Face slot directly the same way.
 pub fn face_dat_id(dll: &MainDll, face: u8, race: u8) -> Option<u32> {
-    if !PC_LOOK_RACES.contains(&race) {
-        return None;
-    }
-    let face_zero = dll.equipment_model_index(race, EQUIP_SLOT_FACE, 0)?;
-    match dll.equipment_model_index(race, EQUIP_SLOT_FACE, u16::from(face)) {
+    let row = equipment_table_row(race)?;
+    let face_zero = dll.equipment_model_index(row, EQUIP_SLOT_FACE, 0)?;
+    match dll.equipment_model_index(row, EQUIP_SLOT_FACE, u16::from(face)) {
         Some(file_id) => Some(file_id),
         None => {
             // Retail clamp: an id past the slot's table renders model 0, never a
@@ -274,7 +288,7 @@ pub fn dispatch_look_driven_models(
                 equipment.push(file_id);
             } else {
                 warn!(
-                    "pc face unresolved (entity {}): race {} is not a PC race (face {}) -- head/hair will not render",
+                    "pc face unresolved (entity {}): race {} has no equipment table row (face {}) -- head/hair will not render",
                     we.id, race, face
                 );
             }
@@ -383,6 +397,17 @@ pub fn dispatch_look_driven_models(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn child_race_configs_map_to_their_equipment_rows() {
+        assert_eq!(equipment_table_row(1), Some(1));
+        assert_eq!(equipment_table_row(8), Some(8));
+        assert_eq!(equipment_table_row(29), Some(9));
+        assert_eq!(equipment_table_row(30), Some(10));
+        assert_eq!(equipment_table_row(31), Some(11));
+        assert_eq!(equipment_table_row(9), None);
+        assert_eq!(equipment_table_row(32), None, "mounts take the mount path");
+    }
 
     // A FFXiMain.dll carrying only the tables the resolver reads, laid out the
     // way ffxi-dat's reader locates them (ffxi-dat/src/main_dll.rs): each table

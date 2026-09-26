@@ -44,6 +44,13 @@ pub fn entries_for_mode(mode: &InputMode, overlay: &ActiveOverlay) -> Option<Vec
 }
 
 pub fn entry_count(mode: &InputMode, overlay: &ActiveOverlay) -> usize {
+    // The Dismount confirm replaces the rows with its two Yes/No slots, so the
+    // mouse hit-test limits to those while it holds.
+    if let InputMode::TargetAction(state) = mode {
+        if state.dismount_confirm {
+            return 2;
+        }
+    }
     entries_for_mode(mode, overlay)
         .map(|e| e.len())
         .unwrap_or(0)
@@ -184,6 +191,59 @@ pub fn update_target_action_menu(
         }
     }
     let cursor = state.cursor;
+
+    if state.dismount_confirm && sub_active.is_none() {
+        // The Dismount confirm: Yes/No replace the rows, the breadcrumb names
+        // the pending action. Slot 0 is Yes, slot 1 is No; the cursor is the
+        // confirm's own 0/1.
+        if let Ok((mut node, mut text, mut color)) = crumb_q.single_mut() {
+            if node.display != Display::Flex {
+                node.display = Display::Flex;
+            }
+            if **text != "» Dismount" {
+                **text = "» Dismount".into();
+            }
+            if color.0 != theme::TITLE {
+                color.0 = theme::TITLE;
+            }
+        }
+        for (row, mut node, mut text, mut color) in row_q.iter_mut() {
+            let (want, want_color) = match row.slot {
+                0 => (
+                    format!("{}Yes", style::cursor_prefix(cursor == 0)),
+                    if cursor == 0 {
+                        theme::CURSOR
+                    } else {
+                        theme::TEXT
+                    },
+                ),
+                1 => (
+                    format!("{}No", style::cursor_prefix(cursor == 1)),
+                    if cursor == 1 {
+                        theme::CURSOR
+                    } else {
+                        theme::TEXT
+                    },
+                ),
+                _ => {
+                    if node.display != Display::None {
+                        node.display = Display::None;
+                    }
+                    continue;
+                }
+            };
+            if node.display != Display::Flex {
+                node.display = Display::Flex;
+            }
+            if **text != want {
+                **text = want;
+            }
+            if color.0 != want_color {
+                color.0 = want_color;
+            }
+        }
+        return;
+    }
 
     if let Some(SubAction::AbilitiesGroup(group)) = sub_active {
         let rows = crate::hud::menu::ability_group_rows(&scene.snapshot, group);
@@ -346,6 +406,7 @@ mod tests {
             engaged: false,
             usable_items_available: true,
             can_fish: false,
+            mounted: false,
         }
     }
 

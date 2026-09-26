@@ -12,6 +12,7 @@ pub(super) fn handle_world_key(
     engaged: bool,
     usable_items_available: bool,
     can_fish: bool,
+    mounted: bool,
     cmd_tx: &Sender<AgentCommand>,
     scene_state: &mut SceneState,
     check_target: &mut kuluu_render::hud::check_view::CheckTarget,
@@ -52,6 +53,7 @@ pub(super) fn handle_world_key(
                         engaged,
                         usable_items_available,
                         can_fish,
+                        mounted,
                         cmd_tx,
                         scene_state,
                         check_target,
@@ -72,6 +74,7 @@ pub(super) fn handle_world_key(
                 engaged,
                 usable_items_available,
                 can_fish,
+                mounted,
                 cmd_tx,
                 scene_state,
                 check_target,
@@ -95,6 +98,7 @@ fn open_target_action_menu(
     engaged: bool,
     usable_items_available: bool,
     can_fish: bool,
+    mounted: bool,
     cmd_tx: &Sender<AgentCommand>,
     scene_state: &mut SceneState,
     check_target: &mut kuluu_render::hud::check_view::CheckTarget,
@@ -110,6 +114,7 @@ fn open_target_action_menu(
         engaged,
         usable_items_available,
         can_fish,
+        mounted,
     );
     let entries = kuluu_render::hud::overlay::RETAIL.resolve_target_actions(&ctx);
     if entries.is_empty() {
@@ -171,6 +176,32 @@ pub(super) fn handle_target_action_key(
     if count == 0 {
         return Some(InputMode::World);
     }
+
+    // A pending Dismount confirm owns the pane: Yes/No instead of the rows.
+    if state.dismount_confirm {
+        if bindings.matches_logical(Action::NavUp, key)
+            || bindings.matches_logical(Action::NavDown, key)
+        {
+            state.cursor = 1 - state.cursor % 2;
+            return None;
+        }
+        if bindings.matches_logical(Action::NavConfirm, key)
+            || bindings.matches_logical(Action::NavCancel, key)
+        {
+            // Confirm takes the row under the cursor (0 = Yes); Cancel is No.
+            return answer_dismount_confirm(
+                state,
+                &entries,
+                bindings.matches_logical(Action::NavConfirm, key) && state.cursor == 0,
+                scene_state,
+                entities,
+                cmd_tx,
+            );
+        }
+        // Any other key drops the confirm and falls through to the rows.
+        state.dismount_confirm = false;
+    }
+
     if state.cursor >= count {
         state.cursor = count - 1;
     }
@@ -396,7 +427,86 @@ pub(super) fn confirm_target_action_at_cursor(
             }
             Some(InputMode::World)
         }
+        TargetActionId::Dig => {
+            send_self_action(
+                ActionKind::ChocoboDig,
+                &entry.label,
+                scene_state,
+                entities,
+                cmd_tx,
+            );
+            Some(InputMode::World)
+        }
+        TargetActionId::Dismount => {
+            // Retail asks before the mount comes off: the pane flips to a
+            // Yes/No confirm; Yes sends the 0x01A, No returns to the rows.
+            state.dismount_confirm = true;
+            state.cursor = 0;
+            None
+        }
     }
+}
+
+/// The self-targeted 0x01A actions (Dig, Dismount): the vendor acts on the
+/// sender and ignores the target fields
+/// (vendor/server/src/map/packets/c2s/0x01a_action.cpp
+/// GP_CLI_COMMAND_ACTION::process).
+fn send_self_action(
+    kind: ActionKind,
+    label: &str,
+    scene_state: &mut SceneState,
+    entities: &[kuluu_snapshot::Entity],
+    cmd_tx: &Sender<AgentCommand>,
+) {
+    let self_id = scene_state.snapshot.self_char_id.unwrap_or(0);
+    let self_index = entities
+        .iter()
+        .find(|e| e.id == self_id)
+        .map(|e| e.act_index)
+        .unwrap_or(0);
+    if let Err(err) = cmd_tx.try_send(AgentCommand::Action {
+        target_id: self_id,
+        target_index: self_index,
+        kind,
+    }) {
+        push_system_chat_line(
+            scene_state,
+            format!("[menu] {label} dispatch dropped: {err}"),
+        );
+    }
+}
+
+/// The Dismount confirm's answer: Yes sends the self-targeted 0x01A and closes
+/// the menu; No (or a cancel) returns to the rows with the cursor back on
+/// Dismount.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn answer_dismount_confirm(
+    state: &mut kuluu_render::input_mode::TargetActionState,
+    entries: &[kuluu_render::hud::action_model::ActionEntry],
+    yes: bool,
+    scene_state: &mut SceneState,
+    entities: &[kuluu_snapshot::Entity],
+    cmd_tx: &Sender<AgentCommand>,
+) -> Option<InputMode> {
+    use kuluu_render::hud::action_model::TargetActionId;
+    state.dismount_confirm = false;
+    if !yes {
+        if let Some(row) = entries
+            .iter()
+            .position(|e| e.id == TargetActionId::Dismount)
+        {
+            state.cursor = row;
+        }
+        return None;
+    }
+    send_self_action(
+        ActionKind::Dismount,
+        "dismount",
+        scene_state,
+        entities,
+        cmd_tx,
+    );
+    Some(InputMode::World)
 }
 
 #[allow(clippy::too_many_arguments)]

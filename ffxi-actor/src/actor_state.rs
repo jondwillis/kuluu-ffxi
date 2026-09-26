@@ -331,7 +331,16 @@ pub fn movement_animation(inputs: &ActorAnimInputs) -> Vec<DatId> {
         return animation_mode_variant(DatId::from_str("wlk?"), inputs.walking_mode, "lk");
     }
 
-    match movement_direction(inputs.forward_vel, inputs.strafe_vel) {
+    // Mounted, the mount carries the movement and the rider stays in the
+    // saddle, so strafe/backward select the run clip (the mount DAT's
+    // seated-run variant) instead of the on-foot mvl?/mvr?/mvb?.
+    let direction = if inputs.mount_or_chocobo {
+        Direction::Forward
+    } else {
+        movement_direction(inputs.forward_vel, inputs.strafe_vel)
+    };
+
+    match direction {
         Direction::None | Direction::Forward => {
             animation_mode_variant(DatId::from_str("run?"), inputs.running_mode, "un")
         }
@@ -648,6 +657,30 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(idstr(movement_animation(&back)[0]), "mvb?");
+    }
+
+    #[test]
+    fn mounted_mover_never_plays_the_on_foot_strafe_clips() {
+        for (forward, strafe) in [(0.0, 1.0), (0.0, -1.0), (-1.0, 0.0), (-0.5, -1.0)] {
+            let mounted = ActorAnimInputs {
+                mount_or_chocobo: true,
+                forward_vel: forward,
+                strafe_vel: strafe,
+                ..Default::default()
+            };
+            assert_eq!(
+                idstr(movement_animation(&mounted)[0]),
+                "run?",
+                "mounted ({forward},{strafe}) must not play the on-foot strafe clip"
+            );
+        }
+        // Unmounted movers keep the on-foot strafe clips.
+        let on_foot = ActorAnimInputs {
+            forward_vel: 0.0,
+            strafe_vel: 1.0,
+            ..Default::default()
+        };
+        assert_eq!(idstr(movement_animation(&on_foot)[0]), "mvr?");
     }
 
     #[test]

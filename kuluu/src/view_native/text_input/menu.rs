@@ -477,10 +477,10 @@ fn toggle_debug_panel(
     #[cfg(feature = "enhanced-engage-move-lock-off")]
     use kuluu_render::hud::menu::DEBUG_ENGAGE_ANIM_LOCK;
     use kuluu_render::hud::menu::{
-        DEBUG_AUTO_ENTER_CS, DEBUG_ENTITY_LIST, DEBUG_FOG, DEBUG_GRAPHICS_DEBUG, DEBUG_MESH,
-        DEBUG_NAMEPLATES, DEBUG_NET_STATUS, DEBUG_NOCLIP, DEBUG_PERF, DEBUG_POSITION_LOG,
-        DEBUG_PRINT_POS, DEBUG_SOUND, DEBUG_STAIR_DRAW, DEBUG_STAIR_STATUS, DEBUG_TARGET_CYCLE,
-        DEBUG_UI_SETTINGS, DEBUG_WEATHER,
+        DEBUG_AUTO_ENTER_CS, DEBUG_BODY_SMOOTHER, DEBUG_ENTITY_LIST, DEBUG_FOG,
+        DEBUG_GRAPHICS_DEBUG, DEBUG_MESH, DEBUG_NAMEPLATES, DEBUG_NET_STATUS, DEBUG_NOCLIP,
+        DEBUG_PERF, DEBUG_POSITION_LOG, DEBUG_PRINT_POS, DEBUG_SOUND, DEBUG_STAIR_DRAW,
+        DEBUG_STAIR_STATUS, DEBUG_TARGET_CYCLE, DEBUG_UI_SETTINGS, DEBUG_WEATHER,
     };
 
     // Print Pos is a button, not a toggle: fire and return before the
@@ -529,6 +529,10 @@ fn toggle_debug_panel(
         DEBUG_FOG => {
             hud_panels.fog_off = !hud_panels.fog_off;
             !hud_panels.fog_off
+        }
+        DEBUG_BODY_SMOOTHER => {
+            hud_panels.body_smoother_off = !hud_panels.body_smoother_off;
+            !hud_panels.body_smoother_off
         }
         DEBUG_ENTITY_LIST => {
             hud_panels.entity_list = !hud_panels.entity_list;

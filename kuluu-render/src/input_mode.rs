@@ -447,6 +447,11 @@ pub struct TargetActionState {
     pub chat_mode_idx: usize,
 
     pub abilities_group_idx: usize,
+
+    /// A pending Dismount confirm: the pane shows Yes/No instead of the rows
+    /// until the player answers (retail asks before the mount comes off).
+    /// `cursor` is the confirm's own 0/1 while this holds.
+    pub dismount_confirm: bool,
 }
 
 impl TargetActionState {
@@ -457,6 +462,7 @@ impl TargetActionState {
             sub: None,
             chat_mode_idx: 0,
             abilities_group_idx: 0,
+            dismount_confirm: false,
         }
     }
 }

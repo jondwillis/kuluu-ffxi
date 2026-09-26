@@ -307,6 +307,9 @@ pub const DEBUG_WEATHER: &str = "Weather";
 /// Debug fog gate row: [on] = every fog layer (DAT distance fog, volumetric
 /// ground haze) renders; toggling it off strips all of them. Default on.
 pub const DEBUG_FOG: &str = "Fog";
+/// Debug body smoother row: [on] = the self model slerps toward the dispatch
+/// heading; off = it sits on it every frame. Default on.
+pub const DEBUG_BODY_SMOOTHER: &str = "Body_smoother";
 /// Debug Entity List overlay row: [on] = the scrollable live-entity dump
 /// (id/name/kind/pos/status/hp/invis flags from the EntityTable) is shown.
 /// Mouse wheel scrolls. Default off.
@@ -348,6 +351,7 @@ const DEBUG_ENTRIES: &[&str] = &[
     DEBUG_AUTO_ENTER_CS,
     DEBUG_WEATHER,
     DEBUG_FOG,
+    DEBUG_BODY_SMOOTHER,
     DEBUG_ENTITY_LIST,
     DEBUG_SOUND,
     DEBUG_VOLUME,
@@ -1549,6 +1553,7 @@ pub fn debug_panel_state(
         DEBUG_AUTO_ENTER_CS => panels.auto_enter_cs,
         DEBUG_WEATHER => !panels.weather_off,
         DEBUG_FOG => !panels.fog_off,
+        DEBUG_BODY_SMOOTHER => !panels.body_smoother_off,
         DEBUG_ENTITY_LIST => panels.entity_list,
         DEBUG_NET_STATUS => net_status_on,
         DEBUG_SOUND => sound_on,
@@ -2355,11 +2360,46 @@ mod tests {
             .filter(|s| s.header != ENHANCED_SECTION)
         {
             assert!(
-                !section.fields.contains(&GraphicsField::CameraSpring)
-                    && !section.fields.contains(&GraphicsField::DepthOfField)
+                !section.fields.contains(&GraphicsField::DepthOfField)
                     && !section.fields.contains(&GraphicsField::BloomIntensity),
                 "{} must not hold a row the original client never had",
                 section.header
+            );
+        }
+    }
+
+    /// The camera spring is the normal client's behaviour: tagged on, on in
+    /// every preset, and listed under Display, not the enhanced group.
+    #[test]
+    fn camera_spring_is_a_display_row_on_by_default() {
+        use crate::graphics_settings::{
+            BoolParity, QualityPreset, ENHANCED_SECTION, GRAPHICS_SECTIONS,
+        };
+        assert_eq!(
+            GraphicsField::CameraSpring.bool_parity(),
+            BoolParity::VanillaOn
+        );
+        let display = GRAPHICS_SECTIONS
+            .iter()
+            .find(|s| s.header == "Display")
+            .expect("a Display section");
+        assert!(display.fields.contains(&GraphicsField::CameraSpring));
+        let enhanced = GRAPHICS_SECTIONS
+            .iter()
+            .find(|s| s.header == ENHANCED_SECTION)
+            .expect("an enhanced section");
+        assert!(!enhanced.fields.contains(&GraphicsField::CameraSpring));
+        for preset in [
+            QualityPreset::Minimum,
+            QualityPreset::Low,
+            QualityPreset::Medium,
+            QualityPreset::High,
+            QualityPreset::Ultra,
+            QualityPreset::Maximum,
+        ] {
+            assert!(
+                GraphicsSettings::for_preset(preset).camera_spring,
+                "{preset:?} must ship the spring on"
             );
         }
     }

@@ -564,13 +564,12 @@ impl GraphicsField {
             // research/XIClient/src/XIClient/include/World/Model/ModelInstance.h
             // ModelInstance::shadowRenderer: the original client draws a
             // per-model shadow decal, so shadowed models are faithful here.
-            GraphicsField::CharacterShadowReceive | GraphicsField::CharacterShadowCast => {
-                BoolParity::VanillaOn
-            }
+            GraphicsField::CharacterShadowReceive
+            | GraphicsField::CharacterShadowCast
+            | GraphicsField::CameraSpring => BoolParity::VanillaOn,
             GraphicsField::VolumetricFog
             | GraphicsField::ZoneShadowCast
             | GraphicsField::DepthOfField
-            | GraphicsField::CameraSpring
             | GraphicsField::DebugChat
             | GraphicsField::LightFlicker => BoolParity::VanillaOff,
             _ => BoolParity::Neutral,
@@ -588,6 +587,10 @@ impl GraphicsField {
                 | GraphicsField::ModelLightCount
         )
     }
+}
+
+fn default_camera_spring() -> bool {
+    true
 }
 
 fn default_ui_scale() -> f32 {
@@ -695,11 +698,13 @@ pub struct GraphicsSettings {
     /// 1.0x). Applied via bevy's UiScale by apply_ui_scale_system.
     #[serde(default = "default_ui_scale")]
     pub ui_scale: f32,
-    /// Camera position-spring + boom easing. OFF by default while the
-    /// accel-driven UI jitter is under investigation (2026-08-27: disabling
-    /// this empirically killed the every-other-frame HUD jitter). Toggled in
-    /// the Debug menu; persisted here so the choice sticks.
-    #[serde(default)]
+    /// Camera spring (camera_collision.rs resolve_camera): how fast the camera
+    /// moves once its leash says it must. On, the eye glides there (a
+    /// gap-proportional pull) and the wall pull-in eases; off, both snap. The
+    /// leash itself (the focus dead zone and the eye's slack band) is always
+    /// on. On by default, the normal client behaviour. Persisted; a config
+    /// from before the default flipped reads on.
+    #[serde(default = "default_camera_spring")]
     pub camera_spring: bool,
     #[serde(default)]
     pub chat_layout: ChatLayout,
@@ -972,7 +977,7 @@ impl GraphicsSettings {
                 fps_cap: 0,
                 fov_deg: DEFAULT_FOV_DEG,
                 ui_scale: 1.0,
-                camera_spring: false,
+                camera_spring: true,
                 chat_layout: ChatLayout::default(),
                 debug_chat: false,
                 dynamic_lights: DynamicLights::Off,
@@ -1017,7 +1022,7 @@ impl GraphicsSettings {
                 fps_cap: 0,
                 fov_deg: DEFAULT_FOV_DEG,
                 ui_scale: 1.0,
-                camera_spring: false,
+                camera_spring: true,
                 chat_layout: ChatLayout::default(),
                 debug_chat: false,
                 dynamic_lights: DynamicLights::Vanilla,
@@ -1062,7 +1067,7 @@ impl GraphicsSettings {
                 fps_cap: 0,
                 fov_deg: DEFAULT_FOV_DEG,
                 ui_scale: 1.0,
-                camera_spring: false,
+                camera_spring: true,
                 chat_layout: ChatLayout::default(),
                 debug_chat: false,
                 dynamic_lights: DynamicLights::Vanilla,
@@ -1107,7 +1112,7 @@ impl GraphicsSettings {
                 fps_cap: 0,
                 fov_deg: DEFAULT_FOV_DEG,
                 ui_scale: 1.0,
-                camera_spring: false,
+                camera_spring: true,
                 chat_layout: ChatLayout::default(),
                 debug_chat: false,
                 dynamic_lights: DynamicLights::Vanilla,
@@ -1156,7 +1161,7 @@ impl GraphicsSettings {
                 fps_cap: 0,
                 fov_deg: DEFAULT_FOV_DEG,
                 ui_scale: 1.0,
-                camera_spring: false,
+                camera_spring: true,
                 chat_layout: ChatLayout::default(),
                 debug_chat: false,
                 dynamic_lights: DynamicLights::Enhanced,
@@ -1202,7 +1207,7 @@ impl GraphicsSettings {
                 fps_cap: 0,
                 fov_deg: DEFAULT_FOV_DEG,
                 ui_scale: 1.0,
-                camera_spring: false,
+                camera_spring: true,
                 chat_layout: ChatLayout::default(),
                 debug_chat: false,
                 dynamic_lights: DynamicLights::Enhanced,
@@ -1871,6 +1876,7 @@ pub const GRAPHICS_SECTIONS: &[GraphicsSection] = &[
             GraphicsField::FrameRateCap,
             GraphicsField::RenderScale,
             GraphicsField::Fov,
+            GraphicsField::CameraSpring,
         ],
     },
     GraphicsSection {
@@ -1911,7 +1917,6 @@ pub const GRAPHICS_SECTIONS: &[GraphicsSection] = &[
             GraphicsField::DepthOfField,
             GraphicsField::DofAperture,
             GraphicsField::ZoneShadowCast,
-            GraphicsField::CameraSpring,
             GraphicsField::ActorArrival,
         ],
     },
@@ -2938,7 +2943,7 @@ mod tests {
             volumetric_fog: true,
             fov_deg: 90.0,
             ui_scale: 1.0,
-            camera_spring: false,
+            camera_spring: true,
             chat_layout: ChatLayout::default(),
             debug_chat: false,
             ..Default::default()

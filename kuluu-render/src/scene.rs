@@ -823,12 +823,26 @@ const SELF_VISUAL_YAW_RATE: f32 = 14.0;
 pub fn self_visual_yaw_system(
     time: Res<Time>,
     state: Res<SceneState>,
+    intent: Option<Res<crate::combat_stance::SelfMoveIntent>>,
+    panels: Option<Res<crate::hud::HudPanels>>,
     mut q_self: Query<&mut Transform, With<IsSelf>>,
 ) {
     let Ok(mut t) = q_self.single_mut() else {
         return;
     };
-    let target = heading_to_quat(state.snapshot.self_pos.heading);
+    // The heading the movement dispatch produced this tick; the wire's echo of
+    // it only when no dispatch ran (the viewer, a snapshot-driven tick).
+    let heading = intent
+        .as_ref()
+        .and_then(|i| i.heading)
+        .unwrap_or(state.snapshot.self_pos.heading);
+    let target = heading_to_quat(heading);
+    // Debug Body_smoother off: the model sits on the dispatch heading every
+    // frame, no slerp.
+    if panels.as_ref().is_some_and(|p| p.body_smoother_off) {
+        t.rotation = target;
+        return;
+    }
     let alpha = 1.0 - (-SELF_VISUAL_YAW_RATE * time.delta_secs()).exp();
     t.rotation = t.rotation.slerp(target, alpha);
 }
@@ -937,6 +951,8 @@ pub fn process_entity_look_changes(q_changed: Query<(&WorldEntity, &LookComp), C
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bevy::time::TimeUpdateStrategy;
+    use std::time::Duration;
 
     #[test]
     fn entity_sync_preserves_first_person_self_visibility() {
@@ -988,6 +1004,135 @@ mod tests {
             assert_eq!(
                 app.world().get::<Visibility>(player),
                 Some(&Visibility::Hidden)
+            );
+        }
+    }
+
+    /// The fixed-step producer for the self-yaw schedule test: writes the
+    /// sweep heading onto the movement intent at the movement tick rate, the
+    /// way dispatch_movement_system writes it at the top of its tick.
+    const SWEEP_RAD_PER_SEC: f32 = 0.35;
+
+    fn orbit_sweep_producer(
+        mut intent: ResMut<crate::combat_stance::SelfMoveIntent>,
+        mut ticks: Local<u32>,
+    ) {
+        *ticks += 1;
+        let angle = SWEEP_RAD_PER_SEC * (*ticks as f32) / 60.0;
+        let normalized = angle.rem_euclid(std::f32::consts::TAU);
+        let heading = (normalized * 128.0 / std::f32::consts::PI).round() as u32 as u8;
+        *intent = crate::combat_stance::SelfMoveIntent {
+            moving: true,
+            forward: 0.0,
+            strafe: -1.0,
+            heading: Some(heading),
+            ..Default::default()
+        };
+    }
+
+    /// The self model's root rotation is owned by the visual yaw slerp alone:
+    /// with a fixed-step producer sweeping the intent heading like a locked
+    /// orbit, the IsSelf transform must sit on the last written heading
+    /// within the slerp's steady-state lag on every frame after the slerp
+    /// converges. A second writer of the self rotation (a mount pin, a look
+    /// arm, a cutscene cue) fights the slerp and misses the tolerance.
+    ///
+    /// The sweep is orbit-like but slower than the 5-yalm orbit's 0.75 rad/s
+    /// on purpose: at 0.75 rad/s the slerp's own steady-state lag (rate over
+    /// SELF_VISUAL_YAW_RATE) plus the heading's one-unit quantization wobble
+    /// already reaches 2.9 units, so a correct single writer would fail the
+    /// two-unit tolerance. At 0.35 rad/s a lone slerp holds to 1.5 units.
+    #[test]
+    fn self_visual_yaw_sits_on_the_dispatch_heading() {
+        const FRAMES: usize = 120;
+        const WARMUP: usize = 10;
+        const TOLERANCE_UNITS: i32 = 2;
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .init_resource::<SceneState>()
+            .init_resource::<EntityTable>()
+            .init_resource::<TrackedEntities>()
+            .init_resource::<crate::combat_stance::EntityPrediction>()
+            .init_resource::<crate::combat_stance::EntityMotion>()
+            .init_resource::<crate::combat_stance::AnimationBlends>()
+            .insert_resource(EntityMesh {
+                default: Handle::default(),
+                pc: Handle::default(),
+                mob: Handle::default(),
+                pet: Handle::default(),
+            })
+            .insert_resource(dummy_materials())
+            .init_resource::<crate::combat_stance::SelfMoveIntent>()
+            .insert_resource(Time::<Fixed>::from_hz(60.0))
+            // One app.update() is one 144 Hz render frame; the fixed loop
+            // consumes the 60 Hz producer out of the same accumulated time.
+            .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs_f32(
+                1.0 / 144.0,
+            )))
+            .add_systems(FixedUpdate, orbit_sweep_producer)
+            .add_systems(
+                Update,
+                (
+                    sync_entities_system,
+                    ensure_self_render_pos_system,
+                    self_visual_yaw_system.after(sync_entities_system),
+                    pin_mount_actors_system.after(self_visual_yaw_system),
+                ),
+            )
+            .add_systems(
+                bevy::prelude::RunFixedMainLoop,
+                interpolate_self_transform_system
+                    .in_set(bevy::prelude::RunFixedMainLoopSystems::AfterFixedMainLoop),
+            );
+        #[cfg(not(target_arch = "wasm32"))]
+        app.init_resource::<crate::dat_mzb::LastAutoLoadedZone>()
+            .init_resource::<crate::dat_mzb::LoadMzbInFlight>();
+        // The wire echo sits on the sweep start (the default): while the
+        // producer is silent the slerp targets it, and once the sweep moves
+        // off it a fallback to the echo (an intent tick with no heading) or a
+        // second writer planted on it misses the tolerance within a few
+        // frames.
+        let self_e = app
+            .world_mut()
+            .spawn((
+                WorldEntity {
+                    id: 1,
+                    act_index: 0,
+                    kind: EntityKind::Pc,
+                },
+                IsSelf,
+                // Five units off the sweep start: the slerp is inside the
+                // tolerance before the warmup ends.
+                Transform::from_rotation(Quat::from_rotation_y(
+                    -5.0 * std::f32::consts::TAU / 256.0,
+                )),
+                PrevRenderPos(Vec3::ZERO),
+                CurrRenderPos(Vec3::ZERO),
+            ))
+            .id();
+        for frame in 0..FRAMES {
+            app.update();
+            if frame < WARMUP {
+                continue;
+            }
+            let intent = *app
+                .world()
+                .resource::<crate::combat_stance::SelfMoveIntent>();
+            let Some(h) = intent.heading else {
+                panic!("frame {frame}: the producer left no heading on the intent");
+            };
+            let t = app
+                .world()
+                .entity(self_e)
+                .get::<Transform>()
+                .expect("the self entity");
+            let forward = t.rotation * Vec3::X;
+            let root_units = ((forward.z.atan2(forward.x) / std::f32::consts::TAU * 256.0)
+                .rem_euclid(256.0)) as i32;
+            let diff = (root_units - i32::from(h) + 128).rem_euclid(256) - 128;
+            assert!(
+                diff.abs() <= TOLERANCE_UNITS,
+                "frame {frame}: the self root sits {diff} heading units off the dispatch heading {h} (root {root_units}); a second writer owns the rotation"
             );
         }
     }

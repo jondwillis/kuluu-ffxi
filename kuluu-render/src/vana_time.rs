@@ -152,15 +152,33 @@ impl VanaClock {
         self.frozen_at_earth_unix = Some(self.earth_unix_now());
     }
 
-    /// Hold every reader at Vana'diel hour `hour`, minute zeroed, on the day they are in now (research/XiEvents/OpCodes/0x0077.md SetHour/SetMinute).
-    pub fn freeze_at_hour(&mut self, hour: u32) {
+    /// Hold every reader at Vana'diel hour `hour`, minute `minute`, on the day
+    /// they are in now (research/XiEvents/OpCodes/0x0077.md SetHour/SetMinute).
+    pub fn freeze_at_hour_minute(&mut self, hour: u32, minute: u32) {
         let since_epoch = (self.earth_unix_now() - EARTH_EPOCH_UNIX as f64).max(0.0);
         let day_index = (since_epoch / EARTH_SECS_PER_VANA_DAY as f64).floor();
-        self.frozen_at_earth_unix = Some(
+        self.freeze_at_earth_unix(
             EARTH_EPOCH_UNIX as f64
                 + day_index * EARTH_SECS_PER_VANA_DAY as f64
-                + hour.rem_euclid(24) as f64 * EARTH_SECS_PER_VANA_HOUR as f64,
+                + hour.rem_euclid(24) as f64 * EARTH_SECS_PER_VANA_HOUR as f64
+                + minute as f64 * EARTH_SECS_PER_VANA_HOUR as f64 / 60.0,
         );
+    }
+
+    /// Hold every reader at Vana'diel day `day_from_epoch` (0-based from the
+    /// calendar epoch) at hour `hour`, minute `minute`
+    /// (research/XiEvents/OpCodes/0x00A9.md).
+    pub fn freeze_at_day_hour_minute(&mut self, day_from_epoch: u32, hour: u32, minute: u32) {
+        self.freeze_at_earth_unix(
+            EARTH_EPOCH_UNIX as f64
+                + day_from_epoch as f64 * EARTH_SECS_PER_VANA_DAY as f64
+                + hour.rem_euclid(24) as f64 * EARTH_SECS_PER_VANA_HOUR as f64
+                + minute as f64 * EARTH_SECS_PER_VANA_HOUR as f64 / 60.0,
+        );
+    }
+
+    fn freeze_at_earth_unix(&mut self, earth_unix: f64) {
+        self.frozen_at_earth_unix = Some(earth_unix);
     }
 
     /// Release the hold so readers resume from the live clock (research/XiEvents/OpCodes/0x0078.md EnableGameTimer).

@@ -28,6 +28,12 @@ fn dat_native(p: kuluu_snapshot::Vec3) -> [f32; 3] {
     [p.x, p.z, p.y]
 }
 
+/// Margin (yalms) on the login-seed shell containment. A shell AABB's top can
+/// sit exactly at the interior's floor height (Upper Jeuno's stables do), so a
+/// character standing on that floor is on the boundary; the margin keeps the
+/// test true against the server's position rounding.
+const SEED_SHELL_MARGIN: f32 = 0.5;
+
 /// The sub-area the player just entered or left, for the c2s `0x0F2`
 /// SubMapChange report. `None` is `submap::NO_SUB_AREA`.
 #[derive(Message, Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,8 +59,9 @@ pub struct SubAreaActivation {
     /// task pool by [`crate::dat_mzb::build_zone_mmb_spawns`].
     loadable: Vec<u32>,
 
-    /// Set when a latch is installed and cleared once the driver has applied the
-    /// server's zone-in `SubMapNumber` to it.
+    /// Set when a latch is installed and cleared once the driver has seeded it:
+    /// the server's zone-in `SubMapNumber`, or, when the server sends none, the
+    /// interior the player's position is contained in.
     needs_seed: bool,
 }
 
@@ -140,7 +147,31 @@ pub fn drive_sub_area_activation(
     }
 
     let forced = overrides.read().last().copied();
-    let seed = std::mem::take(&mut activation.needs_seed).then(|| server_seed(&scene_state));
+    let seed = std::mem::take(&mut activation.needs_seed).then(|| {
+        server_seed(&scene_state).or_else(|| {
+            // The server did not say which interior the character logged into:
+            // ask the geometry. A character who logged in inside an interior
+            // never crosses its doorway trigger, so the rising-edge rule alone
+            // can only see them leave. The trigger is the finer signal (a
+            // doorway the character stands in); the shell is the building's
+            // footprint, which is what contains a character standing deep in
+            // the interior.
+            let p = dat_native(scene_state.snapshot.self_pos.pos);
+            let latch = activation.latch.as_ref()?;
+            latch
+                .triggers()
+                .iter()
+                .find(|t| t.contains(p))
+                .and_then(ZoneInteraction::sub_area_id)
+                .or_else(|| {
+                    latch
+                        .shells()
+                        .iter()
+                        .find(|s| s.contains_inflated(p, SEED_SHELL_MARGIN))
+                        .map(|s| s.id)
+                })
+        })
+    });
     let selected = {
         let Some(latch) = activation.latch.as_mut() else {
             return;
@@ -542,6 +573,26 @@ mod doorway_tests {
         assert_eq!(loads.len(), 1, "one request, for the interior: {loads:?}");
         assert_eq!(loads[0].slot, ZONE_SLOT_SUB_AREA);
         assert_eq!(loads[0].file_id, sub_area::sub_area_file_id(SUB_AREA));
+        assert_eq!(loads[0].active_sub_area, Some(SUB_AREA));
+    }
+
+    /// A character who logs in deep inside the interior — clear of its
+    /// doorway trigger, inside its shell — gets the interior seeded from the
+    /// position containment, not from a trigger crossing the rising-edge rule
+    /// can never see.
+    #[test]
+    fn logging_in_inside_the_shell_seeds_the_interior_without_a_trigger_crossing() {
+        let mut d = Doorway::new();
+        d.walk_to(DEEP_INSIDE);
+        assert_eq!(
+            d.changes(),
+            vec![SubAreaChanged {
+                sub_area: Some(SUB_AREA)
+            }]
+        );
+        let loads = d.loads();
+        assert_eq!(loads.len(), 1, "one request, for the interior: {loads:?}");
+        assert_eq!(loads[0].slot, ZONE_SLOT_SUB_AREA);
         assert_eq!(loads[0].active_sub_area, Some(SUB_AREA));
     }
 

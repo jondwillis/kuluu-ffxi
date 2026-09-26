@@ -5,9 +5,12 @@ use std::sync::{Arc, Mutex};
 use ffxi_dat::event_dat::EventBlock;
 
 use crate::cue::{
-    dat_id_helper, event_motion_dat_id, tpc_motion_packages, ActorLookup, EventCue,
-    ExtSchedulerMotion, FourCc, MUSIC_VOLUME_MAX, NO_ACTION_KEY, SCHEDULER_DAT_ID_BASE,
-    STATUS_EVENT_CHOCOBO, STATUS_EVENT_IDLE, STATUS_EVENT_MOUNT,
+    dat_id_helper, event_motion_dat_id, scheduler_twin_base, tpc_motion_packages, ActorLookup,
+    EventCue, ExtSchedulerMotion, FourCc, EMOTE_ANIMATION_KEY, LOCAL_PLAYER_SCHEDULER_DAT_ID_BASE,
+    MAGIC_DAT_ID_BASE, MAGIC_ROUTINE_TAG, MUSIC_VOLUME_MAX, NO_ACTION_KEY, SCHEDULER_DAT_ID_BASE,
+    SCHEDULER_DURATION_FROM_DAT, STATUS_EVENT_CHOCOBO, STATUS_EVENT_DOOR_CLOSE,
+    STATUS_EVENT_DOOR_CLOSE2, STATUS_EVENT_DOOR_OPEN, STATUS_EVENT_DOOR_OPEN2, STATUS_EVENT_IDLE,
+    STATUS_EVENT_MOTION_BASE, STATUS_EVENT_MOUNT,
 };
 use crate::opcode_meta::{
     OPCODE_META, OP_ENTITYSPEED, OP_EVENTPOSSET, OP_ITEMINFO, OP_LOADROOM, OP_LOOKSET, OP_MENU,
@@ -71,6 +74,39 @@ pub enum PendingTag {
         dir: u8,
         end_para: u32,
     },
+    /// `CTkDelivery_RequestEnterDeliveryMode`: the 0x04D PBX open request the
+    /// 0xB2 case 1 sends, acked by the 0x04B DELI_OPEN/POST_OPEN result
+    /// (research/XiEvents/OpCodes/0x00B2.md;
+    /// vendor/server/src/map/packets/c2s/0x04d_pbx.cpp).
+    DeliveryOpen,
+    /// `FUNC_gcZoneSendQueSearch(0xEB)`: the header-only 0x0EB REQSUBMAPNUM
+    /// request the 0xA6 case 0 sends; the 0x10E s2c's MapNum is its answer,
+    /// and the server answers nothing when the char is not npc-locked, so the
+    /// session's grace watchdog releases an unanswered hold
+    /// (research/XiEvents/OpCodes/0x00A6.md;
+    /// vendor/server/src/map/packets/c2s/0x0eb_reqsubmapnum.cpp).
+    SubMapNum,
+    /// `FUNC_gcZoneSendQueSearch(0x1B)`: the world-pass request the 0x87/0x88
+    /// send cases arm, carrying the `Para` the c2s 0x01B FRIENDPASS carries
+    /// (0x87: 0 begin / 2 begin-gold; 0x88: 1 confirm / 3 confirm-gold); the
+    /// 0x059 s2c is its answer (research/XiEvents/OpCodes/0x0087.md, 0x0088.md;
+    /// vendor/server/src/map/packets/c2s/0x01b_friendpass.cpp).
+    FriendPass { para: u16 },
+    /// `FUNC_gcZoneSendQueSearch(0x58)`: the crafting-support request the 0x8C
+    /// send cases arm, carrying the c2s 0x058 RECIPE's Mode/skill/level/
+    /// Param0..4 exactly as the case's retail pseudo code fills them; the
+    /// 0x031 s2c is its answer (research/XiEvents/OpCodes/0x008C.md;
+    /// vendor/server/src/map/packets/c2s/0x058_recipe.cpp).
+    Recipe {
+        mode: u16,
+        skill: u16,
+        level: u16,
+        param0: u16,
+        param1: u16,
+        param2: u16,
+        param3: u16,
+        param4: u16,
+    },
 }
 
 /// Outcome of running the VM until it next needs the host (one `XiEvent::EventIdle`
@@ -114,6 +150,23 @@ pub enum StepResult {
     AwaitServerAck(PendingTag),
 }
 
+/// Why the VM is not advancing right now, for the host's liveness check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Park {
+    /// Running, or ended.
+    None,
+    /// A frame is displayed and waits on the player; never stale.
+    Frame,
+    /// A timed wait with units left; stale only if the host stops ticking it.
+    TimedWait,
+    /// A scheduler/move hold the host must release when the action finishes.
+    Hold,
+    /// A pending tag awaiting the s2c ack.
+    ServerAck,
+    /// Parked with nothing that can move it (a yield-forever, an unmodelled poll).
+    Dead,
+}
+
 pub(crate) const OP_END: u8 = 0x00;
 const OP_GOTO: u8 = 0x01;
 const OP_IF: u8 = 0x02;
@@ -145,6 +198,11 @@ const OP_MESSAGE_UNNAMED_ACTOR: u8 = 0x49;
 const OP_MESSAGE_ACTOR_PAIR: u8 = 0xB0;
 const OP_EXECEND: u8 = 0x21;
 const OP_EVENT_HIDE_SELF: u8 = 0x22;
+const OP_LOCAL_MODE: u8 = 0x38;
+// 0x0038's operand high byte and the bit the handler forces into it
+// (research/XiEvents/OpCodes/0x0038.md).
+const LOCAL_MODE_BYTE_MASK: i32 = 0xFF;
+const LOCAL_MODE_FORCED_BIT: u16 = 0x20;
 pub(crate) const OP_MESWAIT: u8 = 0x23;
 // 0x42 clears CliEventCancelSetData/CliEventCancelFlag and 0x2E sets them:
 // whether ESC may cancel this event. Cutscenes that lock you in disarm it in
@@ -163,20 +221,158 @@ const OP_LOADEXTSCHEDULER2: u8 = 0x66;
 const OP_SCHEDULOR: u8 = 0x2C;
 const OP_MAPSCHEDULOR: u8 = 0x2D;
 const OP_LOADEVENTSCHEDULER2: u8 = 0x45;
+const OP_MAGICSCHEDULOR: u8 = 0x73;
+// The 0x45 scheduler twins: same layout and cue, each on its own DAT base
+// (research/XiEvents/OpCodes/0x0062.md and kin).
+const OP_SCHED_TWIN_62: u8 = 0x62;
+const OP_SCHED_TWIN_9F: u8 = 0x9F;
+const OP_SCHED_TWIN_BB: u8 = 0xBB;
+const OP_SCHED_TWIN_C5: u8 = 0xC5;
+const OP_SCHED_TWIN_CD: u8 = 0xCD;
+const OP_SCHED_TWIN_D0: u8 = 0xD0;
+const OP_SCHED_TWIN_D5: u8 = 0xD5;
+// The 0x73 twin: the spell cast with a case byte, wider than 0x73 by that
+// byte (research/XiEvents/OpCodes/0x00C4.md).
+const OP_MAGIC_TWIN: u8 = 0xC4;
+// The end-scheduler family: kill the tag-named action on actor1, actor2
+// riding along (research/XiEvents/OpCodes/0x0050.md, 0x0051.md, 0x0052.md).
+// 0x50/0x51 are 13 bytes; 0x52 and its seven twins are 15.
+const OP_ENDSCHEDULOR: u8 = 0x50;
+const OP_ENDMAPSCHEDULOR: u8 = 0x51;
+const OP_ENDLOADSCHEDULER_MAIN: u8 = 0x52;
+const OP_ENDLOADSCHED_TWIN_A1: u8 = 0xA1;
+const OP_ENDLOADSCHED_TWIN_A3: u8 = 0xA3;
+const OP_ENDLOADSCHED_TWIN_BD: u8 = 0xBD;
+const OP_ENDLOADSCHED_TWIN_C7: u8 = 0xC7;
+const OP_ENDLOADSCHED_TWIN_CF: u8 = 0xCF;
+const OP_ENDLOADSCHED_TWIN_D2: u8 = 0xD2;
+const OP_ENDLOADSCHED_TWIN_D7: u8 = 0xD7;
+// The local-player scheduler (rank-up animations): work at +1, both actors the
+// player, the `main` routine (research/XiEvents/OpCodes/0x007D.md).
+const OP_LOCAL_PLAYER_SCHEDULER: u8 = 0x7D;
+// Non-scene NPC choreography: the same cues the scene path (vm/scene.rs) emits
+// when the event carries scene data. 0x1F itself is the sub-byte `OP_MOVE`.
+const OP_MAIN_SPEED: u8 = 0x32;
+// 0x31 SMOVE: 0x1F with a heading update and a MoveTime budget, on the
+// non-scene path (research/XiEvents/OpCodes/0x0031.md).
+const OP_SMOVE: u8 = 0x31;
+// 0xDA: a batch motion loader beyond the 0x00..=0xD9 meta range. A 6-byte
+// header followed by 28-byte records, each naming (actor1, actor2, key);
+// the VM emits one ActorMotion cue per record and advances past them all.
+// Single-site in the retail corpus (zone 112 event 68), so the layout is
+// pinned by that block's bytes, not a doc.
+const OP_DA: u8 = 0xDA;
+// 0xDA record geometry: 6-byte header, then 28-byte records; within a record
+// actor1 is the u32 at +8, actor2 at +12, the key 4cc at +16.
+const OP_DA_HEADER: usize = 6;
+const OP_DA_RECORD: usize = 28;
+const OP_DA_ACTOR1: usize = 8;
+const OP_DA_ACTOR2: usize = 12;
+const OP_DA_KEY: usize = 16;
+const OP_DA_MAX_RECORDS: usize = 64;
+// 0x72 GETWEATHER: read the global forecast table into Work_Zone[2..5).
+// Sub-byte: mode 0 is 4 bytes, mode 1 is 6 (research/XiEvents/OpCodes/0x0072.md).
+const OP_GETWEATHER: u8 = 0x72;
+// 0x82 RANGE_RECT: hit-test the event entity against the zone range rect named
+// by the u32 at +1; a hit advances 7, a miss jumps to the u16 at +5
+// (research/XiEvents/OpCodes/0x0082.md).
+const OP_RANGE_RECT: u8 = 0x82;
+// 0x87/0x88 WORLD PASS: the send cases arm the 0x01B FRIENDPASS request
+// with the case's `Para` (0x87: 0 begin / 2 begin-gold; 0x88: 1 confirm /
+// 3 confirm-gold) and hold on the 0x059 answer; case 1 yields until it
+// lands. The pass number the 0x059 carries has no kuluu display, so the
+// receipt only clears the await
+// (research/XiEvents/OpCodes/0x0087.md, 0x0088.md).
+const OP_FRIENDPASS_87: u8 = 0x87;
+const OP_FRIENDPASS_88: u8 = 0x88;
+// 0x8C RECIPE: the crafting-support cases fill the 0x058 RECIPE with their
+// Mode and work-slot fields, hold on the 0x031 answer, and case 1 yields
+// until it lands; retail's case 5 sends mode 5 without setting the flag, and
+// case 5 has no LSB handler, so it advances without a send
+// (research/XiEvents/OpCodes/0x008C.md).
+const OP_RECIPE: u8 = 0x8C;
+// 0xD4 MAP_QUERY: case 0 runs the 0x24 query helper and opens the current
+// zone's map (type 6), parking on the answer; case 2 runs the helper without
+// the map; cases 1/3/4/5 copy into the client's query window, which has no
+// kuluu counterpart, so they advance by their width
+// (research/XiEvents/OpCodes/0x00D4.md).
+const OP_MAP_QUERY: u8 = 0xD4;
+// 0xA7 waits on the server's response to the client's request: case 0 sends
+// the pending tag (EndPara = Work_Zone[1]) and case 1 writes the result the
+// ack carried into its work slot (research/XiEvents/OpCodes/0x00A7.md).
+const OP_A7_WAIT: u8 = 0xA7;
+// 0xA6 requests the event's sub-map number: case 0 sends the header-only
+// 0x0EB REQSUBMAPNUM and holds on the 0x10E answer, case 1 yields until it
+// lands, and case 2 writes the answered MapNum into its work slot
+// (research/XiEvents/OpCodes/0x00A6.md).
+const OP_A6_SUBMAP: u8 = 0xA6;
+// 0xB2: mode 0 is a timed wait (WaitTime from work slot 1, +4 on expiry);
+// mode 1 requests delivery mode (the 0x04D PBX open, +2 on the 0x04B ack)
+// (research/XiEvents/OpCodes/0x00B2.md).
+const OP_B2_DELIVERY: u8 = 0xB2;
+// 0xB3 RANKING: the ranking-board cases. LSB has no ranking handler, so the
+// read cases write zeros into the board's work slots (the board draws empty)
+// and every case advances by its width; no packet is sent
+// (research/XiEvents/OpCodes/0x00B3.md).
+const OP_RANKING: u8 = 0xB3;
+const OP_SET_FACING: u8 = 0x39;
+const OP_YAW: u8 = 0x4B;
+const OP_SET_EVENT_POS: u8 = 0x36;
+const OP_SET_ACTOR_POS: u8 = 0xBA;
+// 0x0020: writes retail's CliEventUcFlag — the player-control lock
+// (research/XiEvents/OpCodes/0x0020.md).
+const OP_PLAYER_CONTROL: u8 = 0x20;
 const OP_DEFCAMERA: u8 = 0x46;
 const OP_EVENTHIDE: u8 = 0x4E;
 const OP_CLOSE_MAP: u8 = 0x8A;
+const OP_OPEN_MAP: u8 = 0x89;
+const OP_OPEN_MAP_PROPS: u8 = 0x8D;
 const OP_MAP_MARKER: u8 = 0x8B;
+const OP_MAP_ADD_MARK: u8 = 0xB8;
 const OP_MAP_TUTORIAL: u8 = 0xC8;
 const OP_HIDE_HUD: u8 = 0x67;
 const OP_SHOW_HUD: u8 = 0x68;
 const OP_STOP_CLOCK: u8 = 0x77;
 const OP_RESTORE_CLOCK: u8 = 0x78;
+const OP_MUSIC: u8 = 0x5C;
 const OP_MUSICVOLUME: u8 = 0x5D;
+const OP_SET_SOUND_VOLUME: u8 = 0x69;
+const OP_CHANGE_SOUND_VOLUME: u8 = 0x6A;
+const OP_SET_CLOCK_DATE: u8 = 0xA9;
+const OP_ENABLE_TIMER: u8 = 0xC9;
 const OP_WAITSCHEDULOR: u8 = 0x53;
 const OP_WAITMAPSCHEDULOR: u8 = 0x54;
 const OP_WAITLOADSCHEDULER: u8 = 0x55;
+// 0x55's WAITLOADSCHEDULER twins: the same hold, each on its own scheduler
+// DAT base (research/XiEvents/OpCodes/0x00A0.md, 0x00BC.md, 0x00C6.md,
+// 0x00CE.md, 0x00D1.md, 0x00D6.md).
+const OP_WAITLOADSCHED_TWIN_A0: u8 = 0xA0;
+const OP_WAITLOADSCHED_TWIN_BC: u8 = 0xBC;
+const OP_WAITLOADSCHED_TWIN_C6: u8 = 0xC6;
+const OP_WAITLOADSCHED_TWIN_CE: u8 = 0xCE;
+const OP_WAITLOADSCHED_TWIN_D1: u8 = 0xD1;
+const OP_WAITLOADSCHED_TWIN_D6: u8 = 0xD6;
+const OP_ACTOR_NOP: u8 = 0x56;
+const OP_ZONE_READ_YIELD: u8 = 0x98;
+const OP_ANIM_YIELD: u8 = 0x9B;
+const OP_YIELD_FOREVER: u8 = 0x26;
+const OP_ENTITY_VALID: u8 = 0x44;
+const OP_KILL_LAST_ACTION: u8 = 0xC1;
 const OP_CHOCOBO: u8 = 0x7E;
+// The door status writes: the event entity's StatusEvent, gated on a
+// Render.Flags0 bit no tier names (research/XiEvents/OpCodes/0x004C.md,
+// 0x004D.md, 0x004F.md).
+const OP_DOOR_OPEN: u8 = 0x4C;
+const OP_DOOR_CLOSE: u8 = 0x4D;
+const OP_STATUS_EVENT: u8 = 0x4F;
+// The D_OPEN2/D_CLOSE2 writes: 0x4C/0x4D's twins on the second door status
+// pair, the same gate and field (research/XiEvents/OpCodes/0x008E.md,
+// 0x008F.md).
+const OP_DOOR_OPEN2: u8 = 0x8E;
+const OP_DOOR_CLOSE2: u8 = 0x8F;
+// 0x90 writes the event-hide flag (the 0x4E bit, value 1) on the event
+// entity, plus a Flags1 bit no tier names (research/XiEvents/OpCodes/0x0090.md).
+const OP_EVENT_HIDE_ALWAYS: u8 = 0x90;
 const OP_SETBITWORK: u8 = 0x40;
 const OP_GETBITWORK: u8 = 0x41;
 const OP_SENDTAG: u8 = 0x43;
@@ -201,14 +397,14 @@ const OP_PLAYANIM: u8 = 0x63;
 const OP_BITTEST: u8 = 0x3E;
 const OP_QUERYWAIT2: u8 = 0x7F;
 
-// Advances the actor-driven wait opcodes take when their entity does not
-// resolve — retail's own `!GetActorIndex` / `!entity` early exit, which is the
-// only path this actor-less VM can be on (research/XiEvents/OpCodes/0x0080.md,
-// 0x0076.md, 0x0099.md, 0x006E.md, 0x006C.md, 0x0063.md).
+// Advances the load/turn opcodes take when their entity does not resolve —
+// retail's own `!GetActorIndex` / `!entity` early exit, which is the only
+// path this actor-less VM can be on (research/XiEvents/OpCodes/0x0080.md,
+// 0x0076.md).
 const LOADWAIT_SIZE: usize = 5;
-const EMOT_SIZE: usize = 7;
+// 0x6C TRANSPAR's width: the fade parks the script for its authored length,
+// then advances past itself (research/XiEvents/OpCodes/0x006C.md).
 const TRANSPAR_SIZE: usize = 9;
-const PLAYANIM_SIZE: usize = 3;
 /// 0x0034.md (and 0x0035.md, the same handler without the zone close) spreads
 /// its zone load over three `EventIdle` ticks driven by two file-scope counters,
 /// advancing only on the last; the net effect of the sequence is +3, and this VM
@@ -217,6 +413,9 @@ const MAPLOAD_SIZE: usize = 3;
 /// 0x0058.md is `ExecPointer++; RetFlag = 1`; 0x009A.md yields only while the
 /// music server is mid-read, which nothing here triggers.
 const YIELD_SIZE: usize = 1;
+/// 0x0025.md / 0x007F.md: one byte, `ExecPointer += 1` on every exit that
+/// advances (selection taken, or no talk window open).
+const QUERYWAIT_SIZE: usize = 1;
 
 // 0x003E BITTEST operand layout (research/XiEvents/OpCodes/0x003E.md): the bit
 // index at +3 selects a work slot `bit >> 5` past the one named at +1, and the
@@ -255,6 +454,57 @@ const LOADEVENTSCHEDULER2_ACTOR1_OFS: usize = 3;
 const LOADEVENTSCHEDULER2_ACTOR2_OFS: usize = 7;
 const LOADEVENTSCHEDULER2_TAG_OFS: usize = 11;
 const LOADEVENTSCHEDULER2_DURATION_OFS: usize = 15;
+// 0x0073: work operand at +1 (`getworkofs(param1 + 1)`, param1 = 0), the two
+// actor lookups at +3 and +7 (`eventgetcode2(3)`, `eventgetcode2(7 + param1)`),
+// research/XiEvents/OpCodes/0x0073.md.
+const MAGICSCHEDULOR_KEY_OFS: usize = 1;
+const MAGICSCHEDULOR_ACTOR1_OFS: usize = 3;
+const MAGICSCHEDULOR_ACTOR2_OFS: usize = 7;
+// 0x0050/0x0051: actor1 at +1, the tag at +9 (research/XiEvents/OpCodes/
+// 0x0050.md, 0x0051.md).
+const ENDSCHEDULOR_ACTOR1_OFS: usize = 1;
+const ENDSCHEDULOR_TAG_OFS: usize = 9;
+// 0x0052 and its twins: actor1 at +3, the tag at +11; the work operand at +1
+// selects the DAT, which the stop cue does not carry
+// (research/XiEvents/OpCodes/0x0052.md).
+const ENDLOADSCHED_ACTOR1_OFS: usize = 3;
+const ENDLOADSCHED_TAG_OFS: usize = 11;
+/// The stop family's tag operand values that name no routine slot: zero, and
+/// the four spaces retail writes over a cleared tag
+/// (research/XiEvents/OpCodes/0x005E.md `Unknown0001 = 0x20202020`).
+const STOP_TAG_ZERO: FourCc = [0, 0, 0, 0];
+const STOP_TAG_SPACES: FourCc = *b"    ";
+
+/// The stop family's tag operand as the cue's `key`.
+fn stop_action_key(tag: FourCc) -> Option<FourCc> {
+    (tag != STOP_TAG_ZERO && tag != STOP_TAG_SPACES).then_some(tag)
+}
+// 0x00C4: the 0x73 sub-handler with param1 = 1 — the case byte at +1, the key
+// work at +2 (`getworkofs(param1 + 1)`), actor1 at +3, actor2 at +8
+// (`eventgetcode2(7 + param1)`), and the advance is `11 + param1` = 12
+// (research/XiEvents/OpCodes/0x00C4.md, 0x0073.md).
+const MAGIC_TWIN_CASE_OFS: usize = 1;
+const MAGIC_TWIN_KEY_OFS: usize = 2;
+const MAGIC_TWIN_ACTOR1_OFS: usize = 3;
+const MAGIC_TWIN_ACTOR2_OFS: usize = 8;
+const MAGIC_TWIN_SIZE: usize = 12;
+// 0x007D: the work operand at +1 (research/XiEvents/OpCodes/0x007D.md).
+const LOCAL_PLAYER_SCHEDULER_FILE_OFS: usize = 1;
+// 0x0032 MainSpeed: the speed operand at +1 (research/XiEvents/OpCodes/0x0032.md).
+const MAIN_SPEED_OFS: usize = 1;
+// 0x0039 SetFacing: the heading operand at +1 (research/XiEvents/OpCodes/0x0039.md).
+const SET_FACING_OFS: usize = 1;
+// 0x004B yaw: the named actor at +1, the heading at +5
+// (research/XiEvents/OpCodes/0x004B.md).
+const YAW_ACTOR_OFS: usize = 1;
+const YAW_HEADING_OFS: usize = 5;
+// 0x0036 / 0x00BA position: x, z, y at +1/+3/+5 (0x36) and +5/+7/+9 with the
+// heading at +11 (0xBA); the goal of 0x1F case 0 sits at +2/+4/+6
+// (research/XiEvents/OpCodes/0x0036.md, 0x00BA.md, 0x001F.md).
+const SET_EVENT_POS_X_OFS: usize = 1;
+const SET_ACTOR_POS_ACTOR_OFS: usize = 1;
+const SET_ACTOR_POS_X_OFS: usize = 5;
+const MOVE_GOAL_X_OFS: usize = 2;
 const LOADEXTSCHEDULER_FILE_OFS: usize = 1; // 0x005B / 0x0066
 const LOADEXTSCHEDULER_ACTOR1_OFS: usize = 3;
 const LOADEXTSCHEDULER_ACTOR2_OFS: usize = 7;
@@ -266,27 +516,84 @@ const WAITSCHEDULOR_ACTOR1_OFS: usize = 1;
 const WAITSCHEDULOR_KEY_OFS: usize = 9;
 const WAITLOADSCHEDULER_ACTOR1_OFS: usize = 3;
 const WAITLOADSCHEDULER_KEY_OFS: usize = 11;
+// 0x0044: the work operand at +1 names the entity to test, the else-target
+// at +3 (research/XiEvents/OpCodes/0x0044.md).
+const ENTITY_VALID_ID_OFS: usize = 1;
+const ENTITY_VALID_TARGET_OFS: usize = 3;
+// 0x0056: the actor at +1, read and discarded (research/XiEvents/OpCodes/0x0056.md).
+const ACTOR_NOP_ACTOR_OFS: usize = 1;
+// 0x00C1: the actor at +1 (research/XiEvents/OpCodes/0x00C1.md).
+const KILL_LAST_ACTION_ACTOR_OFS: usize = 1;
 const MAPSCHEDULOR_KEY_OFS: usize = 9; // 0x002D, same layout as the WAIT family
 const MAPSCHEDULOR_ACTOR2_OFS: usize = 5; // 0x002D partner slot of that layout
+                                          // 0x006E EMOT: actor lookup at +1, the work value (emote id low byte, variant
+                                          // high byte) at +5 (research/XiEvents/OpCodes/0x006E.md).
+const EMOT_ACTOR_OFS: usize = 1;
+const EMOT_VALUE_OFS: usize = 5;
+// 0x006E's work value: emote id in the low byte, variant in the high byte
+// (research/XiEvents/OpCodes/0x006E.md).
+const EMOTE_VALUE_BYTE_MASK: i32 = 0xFF;
+const EMOTE_VALUE_PARAM_SHIFT: u32 = 8;
+// 0x0063 PLAYANIM: the event entity's emote from the work value at +1
+// (research/XiEvents/OpCodes/0x0063.md).
+const PLAYANIM_VALUE_OFS: usize = 1;
+// 0x0099 ANIMWAIT: the actor lookup at +1 (research/XiEvents/OpCodes/0x0099.md).
+const ANIMWAIT_ACTOR_OFS: usize = 1;
+// 0x0020: the flag byte at +1 (research/XiEvents/OpCodes/0x0020.md).
+const PLAYER_CONTROL_FLAG_OFS: usize = 1;
 const DEFCAMERA_CASE_OFS: usize = 1; // 0x0046
 const DEFCAMERA_CASE_UNLOCK: u8 = 0;
 const DEFCAMERA_CASE_LOCK: u8 = 1;
 const EVENTHIDE_FLAG_OFS: usize = 1; // 0x004E
 const EVENTHIDE_FLAG_MASK: u8 = 1;
 const EVENTHIDE_TARGET_OFS: usize = 2;
+// 0x006C TRANSPAR: the actor lookup at +1, the destination alpha byte at +5,
+// and the fade length in frames at +7 (research/XiEvents/OpCodes/0x006C.md).
+const TRANSPAR_ACTOR_OFS: usize = 1;
+const TRANSPAR_ALPHA_OFS: usize = 5;
+const TRANSPAR_TIME_OFS: usize = 7;
 const MUSICVOLUME_LEVEL_OFS: usize = 1; // 0x005D
 const MUSICVOLUME_FADE_OFS: usize = 3;
+// 0x005C: the low band (0x00-0x07) is 4 bytes, the 0x80-0x87 and 0xA0/0xA1
+// bands are 6; the song id is the +2 work selector in both song bands
+// (research/XiEvents/OpCodes/0x005C.md).
+const MUSIC_SONG_TRACK_OFS: usize = 2;
+const MUSIC_SONG_VOLUME_OFS: usize = 4;
+// 0x005C's 0x80-0x87 band: the slot is the sub-byte's low three bits
+// (research/XiEvents/OpCodes/0x005C.md).
+const MUSIC_SONG_SLOT_MASK: u8 = 0x07;
 /// 0x77's hour operand (research/XiEvents/OpCodes/0x0077.md); its weather
 /// half is server-driven here, so it has no cue.
 const STOP_CLOCK_HOUR_OFS: usize = 1;
 /// `OP_STOP_CLOCK`'s "no time change" sentinel for the hour operand.
 const STOP_CLOCK_NO_HOUR: i32 = 255;
+/// 0x69's on/off flag byte (0 -> full volume, non-zero -> mute) and its
+/// sound-type mask at +2 (research/XiEvents/OpCodes/0x0069.md).
+const SET_SOUND_FLAG_OFS: usize = 1;
+const SET_SOUND_MASK_OFS: usize = 2;
+/// 0x6A's volume (work[1] * 0.001), fade frames (work[3]) and sound-type mask
+/// (work[5]) (research/XiEvents/OpCodes/0x006A.md).
+const CHANGE_SOUND_LEVEL_OFS: usize = 1;
+const CHANGE_SOUND_FADE_OFS: usize = 3;
+const CHANGE_SOUND_MASK_OFS: usize = 5;
+/// 0xA9's day operand: the clock jumps to Vana day `7 * work[1]` at 00:30
+/// (research/XiEvents/OpCodes/0x00A9.md).
+const SET_CLOCK_DATE_DAY_OFS: usize = 1;
+/// 0xA9's authored minute and hour (the local time is zeroed before the day
+/// jump, so the clock lands at 00:30; research/XiEvents/OpCodes/0x00A9.md).
+const SET_CLOCK_DATE_MINUTE: u8 = 30;
+const SET_CLOCK_DATE_HOUR: u32 = 0;
 const MAP_OPEN_ID_OFS: usize = 1; // 0x00C8
 const MAP_OPEN_TUTORIAL_OFS: usize = 5; // 0x00C8, LOBYTE is the bool
 const MAP_MARKER_ID_OFS: usize = 1; // 0x008B
 const MAP_MARKER_X_OFS: usize = 5; // 0x008B
 const MAP_MARKER_Y_OFS: usize = 7; // 0x008B
 const MAP_MARKER_NAME_OFS: usize = 9; // 0x008B, 16 bytes
+const OPEN_MAP_ID_OFS: usize = 1; // 0x0089, 0x008D
+const MAP_ADD_MARK_ID_OFS: usize = 1; // 0x00B8
+const MAP_ADD_MARK_X_OFS: usize = 7; // 0x00B8
+const MAP_ADD_MARK_Y_OFS: usize = 9; // 0x00B8
+const MAP_ADD_MARK_NAME_OFS: usize = 11; // 0x00B8, 16 bytes
 const CHOCOBO_CASE_OFS: usize = 1; // 0x007E
 const CHOCOBO_TARGET_OFS: usize = 2;
 const CHOCOBO_MOUNT_ID_OFS: usize = 6;
@@ -300,6 +607,9 @@ const CHOCOBO_CASE_UNMOUNT: u8 = 8;
 /// `entity->MountId = getworkofs(6) + 1` — the id is stored biased by one.
 const CHOCOBO_MOUNT_ID_BIAS: u16 = 1;
 const CHOCOBO_UNMOUNT_ID: u16 = 0;
+/// 0x4F's work operand, the value added to `STATUS_EVENT_MOTION_BASE`
+/// (research/XiEvents/OpCodes/0x004F.md).
+const STATUS_EVENT_VALUE_OFS: usize = 1;
 
 const WORK_LOCAL_LEN: usize = 80;
 // `XiEvent::setworkstrofs` refuses string writes at slot 64 and up: a 16-byte
@@ -376,6 +686,14 @@ pub struct EventVm {
     /// [`Self::take_cues`].
     cues: Vec<EventCue>,
     finished: bool,
+    /// Set by the last [`step`](Self::step): whether it yielded
+    /// [`StepResult::Waiting`] with none of the state [`Self::park`] names,
+    /// the Park::Dead half of the host's liveness check.
+    last_waiting: bool,
+    /// The host force-cancelled the event (the liveness stall): the next
+    /// [`step`](Self::step) reports [`StepResult::Cancelled`] whatever the VM
+    /// was parked on.
+    force_cancelled: bool,
     /// Diagnostics: execution ran off the end of the bytecode without an
     /// END/EXECEND opcode. Retail treats this the same as END (the missing-
     /// byte read yields 0 == OP_END), so it only signals a decode or
@@ -393,6 +711,15 @@ pub struct EventVm {
     /// position-tag counterpart), held until [`Self::ack_server`]. While set,
     /// execution stays parked on the sending opcode's case-1 poll.
     pending_ack: Option<PendingTag>,
+    /// 0xA7's response result: the EndPara the case-0 tag carried, which case
+    /// 1 writes into its work slot once the server acks the tag
+    /// (research/XiEvents/OpCodes/0x00A7.md).
+    a7_result: u32,
+    /// 0xA6's response result: the MapNum the 0x10E s2c carried, which case 2
+    /// writes into its work slot; 0 when the server answered nothing and the
+    /// session's grace watchdog released the hold
+    /// (research/XiEvents/OpCodes/0x00A6.md).
+    a6_submap_num: u32,
     /// The request this VM queued via REQEW and is still tracking, as (actor,
     /// tag): retail keeps that wait in `ReqStack[RunPos].ReqFlag` across ticks
     /// (research/XiEvents/Event VM Structures.md ReqFlag;
@@ -406,6 +733,25 @@ pub struct EventVm {
     /// Host-armed move holds a non-player MOVE case 1 parks on; see
     /// [`MoveHold`].
     move_holds: Vec<MoveHold>,
+    /// The MainSpeed operand (0x32) the non-scene path arms its `OP_MOVE`
+    /// `ActorMove` cue with; the scene path tracks the same value on its own
+    /// `Scene` (research/XiEvents/OpCodes/0x0032.md).
+    move_speed: i32,
+    /// 0x31 SMOVE mode 0's goal, armed for the mode 1 that walks to it
+    /// (research/XiEvents/OpCodes/0x0031.md).
+    smove_goal: Option<crate::vm::scene::EventPosition>,
+    /// 0x31 SMOVE's MoveTime budget in seconds, from mode 0's work slot 8;
+    /// `0.0` arms no cap (research/XiEvents/OpCodes/0x0031.md).
+    smove_time: f32,
+    /// Set once 0x31 mode 1 has emitted its `ActorMove` cue, so a re-run of
+    /// the parked opcode parks instead of emitting a second cue
+    /// (research/XiEvents/OpCodes/0x0031.md).
+    smove_started: bool,
+    /// 0x31 mode 1's same-pass bridge: the actor its `ActorMove` cue named,
+    /// held until [`Self::take_cues`] arms the move hold from it, so the
+    /// parked opcode sees the move as running before the host arms it
+    /// (research/XiEvents/OpCodes/0x0031.md).
+    pending_move_starts: Vec<ActorLookup>,
     /// The retail entity Type byte of the actors this VM's
     /// `OP_LOADEXTSCHEDULER`/`OP_LOADEXTSCHEDULER2` opcodes name, keyed by the
     /// actor's server id and target index: the gate both motion resource
@@ -430,6 +776,22 @@ pub struct EventVm {
     parked_on_action_hold: bool,
     /// The same for a non-player MOVE case 1 parked on its move hold.
     parked_on_move_hold: bool,
+    /// The global weather forecast table 0x72 GETWEATHER reads
+    /// (research/XiEvents/OpCodes/0x0072.md). The host loads it once from the
+    /// forecast DATs and shares one copy across every VM it drives; `None` in a
+    /// host that never injects it, where 0x72 advances without writing.
+    weather_forecast: Option<Arc<ffxi_dat::weather::WeatherForecast>>,
+    /// The zone's range rects 0x82 RANGE_RECT hit-tests against
+    /// (research/XiEvents/OpCodes/0x0082.md): every RID chunk of the event
+    /// zone's resource DAT (ffxi-dat zone_interaction). The host loads it once
+    /// per zone and shares one copy across every VM; empty when the host has no
+    /// install, where 0x82 misses and jumps.
+    zone_rects: Arc<Vec<ffxi_dat::zone_interaction::ZoneInteraction>>,
+    /// The zone number 0xD4 case 0 opens the map on: retail's
+    /// `pGlobalNowZone->ZoneNo`, injected by the host via
+    /// [`Self::set_current_zone`] before driving
+    /// (research/XiEvents/OpCodes/0x00D4.md).
+    current_zone: i32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -596,17 +958,29 @@ impl EventVm {
             cancel_armed: true,
             cues: Vec::new(),
             finished: false,
+            last_waiting: false,
+            force_cancelled: false,
             ran_past_end: false,
             wait: None,
             pending_ack: None,
+            a7_result: 0,
+            a6_submap_num: 0,
             req_wait: None,
             action_holds: Vec::new(),
             move_holds: Vec::new(),
+            move_speed: 0,
+            smove_goal: None,
+            smove_time: 0.0,
+            smove_started: false,
+            pending_move_starts: Vec::new(),
             actor_types: std::collections::HashMap::new(),
             pending_action_starts: Vec::new(),
             pending_action_holds: Vec::new(),
             parked_on_action_hold: false,
             parked_on_move_hold: false,
+            weather_forecast: None,
+            zone_rects: Arc::new(Vec::new()),
+            current_zone: 0,
             oob_reads: std::cell::Cell::new(0),
         }
     }
@@ -636,6 +1010,13 @@ impl EventVm {
         }
         self.message_open = MESSAGE_OPEN_NONE;
         self.pending_message = None;
+    }
+
+    /// A message frame the host has not dismissed yet: retail's
+    /// `PTR_TalkWinFlag` for the message half of the talk window. The menu
+    /// half is `pending_choice`, checked by the QUERYWAIT arms themselves.
+    fn message_frame_open(&self) -> bool {
+        self.pending_message.is_some() || self.message_open == MESSAGE_OPEN_AWAITING
     }
 
     /// Mark the open message invalid so the next MESWAIT force-cancels the
@@ -668,6 +1049,66 @@ impl EventVm {
         self.exec_pointer
     }
 
+    /// The opcode byte the VM is parked on, for the host's stall diagnostics;
+    /// 0 when the pointer ran past the end of the bytecode.
+    pub fn current_opcode(&self) -> u8 {
+        self.event_data.get(self.exec_pointer).copied().unwrap_or(0)
+    }
+
+    /// The timed wait's remaining units (1/60 s, the [`Self::tick`] clock),
+    /// 0 when no wait is held: the host's liveness check watches it move.
+    pub fn wait_units_remaining(&self) -> f32 {
+        self.wait.as_ref().map_or(0.0, |w| w.remaining_units)
+    }
+
+    /// Why the VM is not advancing right now, for the host's liveness check:
+    /// a frame and a moving timed wait are never stale, a hold and a pending
+    /// tag are stale when their release does not arrive, and a yield with
+    /// nothing armed behind it is stale immediately.
+    pub fn park(&self) -> Park {
+        if self.force_cancelled {
+            return Park::None;
+        }
+        if self.frame_displayed() {
+            return Park::Frame;
+        }
+        if self.wait.is_some() {
+            return Park::TimedWait;
+        }
+        if self.parked_on_action_hold || self.parked_on_move_hold || self.scene_waiting() {
+            return Park::Hold;
+        }
+        if self.pending_tag().is_some() {
+            return Park::ServerAck;
+        }
+        if self.last_waiting {
+            return Park::Dead;
+        }
+        Park::None
+    }
+
+    /// End the event from the host side (the liveness stall): the next
+    /// [`step`](Self::step) reports [`StepResult::Cancelled`] whatever the VM
+    /// was parked on, and the pending tag, holds and children are dropped
+    /// with it (research/XiPackets/world/client/0x005B).
+    pub fn force_cancel(&mut self) {
+        self.force_cancelled = true;
+        self.finished = true;
+        self.pending_ack = None;
+        self.wait = None;
+        self.action_holds.clear();
+        self.move_holds.clear();
+        self.pending_action_holds.clear();
+        self.parked_on_action_hold = false;
+        self.parked_on_move_hold = false;
+        self.pending_message = None;
+        self.pending_choice = None;
+        self.selection_made = false;
+        self.message_open = MESSAGE_OPEN_NONE;
+        let mut cancel = |child: &mut EventVm| child.force_cancel();
+        self.for_each_child_vm(&mut cancel);
+    }
+
     /// Drain the [`EventCue`]s the staging opcodes emitted, in execution order.
     /// They accumulate across [`step`](Self::step) calls (one step can emit
     /// several), so the host drains after each step rather than reading a
@@ -675,6 +1116,7 @@ impl EventVm {
     pub fn take_cues(&mut self) -> Vec<EventCue> {
         let cues = std::mem::take(&mut self.cues);
         self.pending_action_starts.clear();
+        self.pending_move_starts.clear();
         if let Some(scene) = &self.scene {
             cues.into_iter()
                 .map(|cue| cue.resolve_event_actor(ActorLookup(scene.actor)))
@@ -760,6 +1202,70 @@ impl EventVm {
         self.actor_types = types.clone();
     }
 
+    /// Install the global weather forecast table 0x72 GETWEATHER reads
+    /// (research/XiEvents/OpCodes/0x0072.md). The host loads it once from the
+    /// install's forecast DATs and shares the same `Arc` across every VM, so the
+    /// table is read, not copied, per event. No-op on a second install.
+    pub fn set_weather_forecast(
+        &mut self,
+        forecast: std::sync::Arc<ffxi_dat::weather::WeatherForecast>,
+    ) {
+        self.weather_forecast = Some(forecast.clone());
+        let mut land = |child: &mut EventVm| child.set_weather_forecast(forecast.clone());
+        self.for_each_child_vm(&mut land);
+    }
+
+    /// Install the zone's range rects 0x82 RANGE_RECT hit-tests against
+    /// (research/XiEvents/OpCodes/0x0082.md). The host loads the event zone's
+    /// RID table once and shares the same `Arc` across every VM it drives, so
+    /// the table is read, not copied, per event. An empty install leaves the
+    /// default empty table, where 0x82 always misses.
+    pub fn set_zone_rects(
+        &mut self,
+        rects: std::sync::Arc<Vec<ffxi_dat::zone_interaction::ZoneInteraction>>,
+    ) {
+        self.zone_rects = rects.clone();
+        let mut land = |child: &mut EventVm| child.set_zone_rects(rects.clone());
+        self.for_each_child_vm(&mut land);
+    }
+
+    /// Install the zone number 0xD4 case 0 opens the map on
+    /// (research/XiEvents/OpCodes/0x00D4.md). The host injects the event zone
+    /// before driving; a host that never does leaves the default 0, where
+    /// case 0 opens the map on zone 0.
+    pub fn set_current_zone(&mut self, zone: i32) {
+        self.current_zone = zone;
+        let mut land = |child: &mut EventVm| child.set_current_zone(zone);
+        self.for_each_child_vm(&mut land);
+    }
+
+    /// 0x82's hit test: whether the event entity's tracked position falls inside
+    /// the zone range rect named by `rect_id`. `false` when no scene tracks a
+    /// position (retail's null-entity early return) or no rect matches
+    /// (research/XiEvents/OpCodes/0x0082.md).
+    fn range_rect_hit(&self, rect_id: u32) -> bool {
+        let Some(pos) = self.event_entity_rid_position() else {
+            return false;
+        };
+        self.zone_rects
+            .iter()
+            .any(|r| r.rect_id() == rect_id && r.contains(pos))
+    }
+
+    /// Arm the 0x24-style choice the 0xD4 cases 0/2 open. The embedded 0x24
+    /// helper is entered one byte past the opcode start, so its message and
+    /// default-cursor selectors sit at +2 and +4 here, not +1 and +3 as on a
+    /// standalone 0x24 (research/XiEvents/OpCodes/0x00D4.md, 0x0024.md).
+    fn arm_map_query_choice(&mut self) {
+        self.pending_choice = Some(EventChoice {
+            message_id: self.getworkofs(2, 0) as u32,
+            speaker_index: self.speaker_index,
+            default_index: self.getworkofs(4, 0) as u32,
+            params: self.params(),
+        });
+        self.selection_made = false;
+    }
+
     /// The retail entity Type byte the `OP_LOADEXTSCHEDULER`/
     /// `OP_LOADEXTSCHEDULER2` gate applies to `actor`: the former loads only
     /// for Type {1,2,7,8}, the latter only for {0,1,6}. Resolution stays in
@@ -801,12 +1307,15 @@ impl EventVm {
         });
     }
 
-    /// True while a host-armed move hold for `actor` still has frames left.
+    /// True while a host-armed move hold for `actor` still has frames left, or
+    /// this VM's own 0x31 cue named `actor` in the current batch, before the
+    /// host armed the hold from it (research/XiEvents/OpCodes/0x0031.md).
     fn move_running(&self, actor: ActorLookup) -> bool {
         let actor = self.resolve_hold_actor(actor);
         self.move_holds
             .iter()
             .any(|h| h.actor == actor && h.remaining_units > 0.0)
+            || self.pending_move_starts.contains(&actor)
     }
 
     /// True while a host-armed hold for `(actor, key)` still has frames left,
@@ -844,6 +1353,39 @@ impl EventVm {
             }
         }
         actor
+    }
+
+    /// `FUNC_SearchUniqueID` (research/XiEvents/OpCodes/0x0044.md): non-zero
+    /// when an actor with that server id is in the pool. The host publishes
+    /// event participants under their target index (kuluu-session's
+    /// note_entity_type), so a published target index is the modelled "in the
+    /// pool"; a reserved selector or an unpublished id is not.
+    fn entity_in_pool(&self, server_id: u32) -> bool {
+        ActorLookup(server_id)
+            .target_index()
+            .is_some_and(|t| self.actor_types.contains_key(&(t as u32)))
+    }
+
+    /// Whether retail's `GetActorIndex` would succeed for `actor` in this
+    /// model (research/XiEvents/Event VM Functions.md GetActorIndex): the
+    /// reserved selectors the host always stands in for, or a literal server
+    /// id the host has published.
+    fn actor_resolved(&self, actor: ActorLookup) -> bool {
+        actor.is_local_player()
+            || actor == ActorLookup::EVENT_ENTITY
+            || self.entity_in_pool(actor.0)
+    }
+
+    /// True while any host-armed or this-pass started action holds the event
+    /// entity: retail's `AnimationPlay` is a per-entity "any animation" flag
+    /// (research/XiEvents/OpCodes/0x009B.md), not a routine slot.
+    fn entity_animation_running(&self) -> bool {
+        let actor = self.resolve_hold_actor(ActorLookup::EVENT_ENTITY);
+        self.action_holds
+            .iter()
+            .any(|h| h.actor == actor && h.remaining_units > 0.0)
+            || self.pending_action_holds.iter().any(|(a, _)| *a == actor)
+            || self.pending_action_starts.iter().any(|(a, _)| *a == actor)
     }
 
     fn arm_wait(&mut self, units: f32, advance: usize) -> StepResult {
@@ -954,6 +1496,17 @@ impl EventVm {
         self.for_each_child_vm(&mut land);
     }
 
+    /// s2c 0x10E REQSUBMAPNUM's MapNum into the 0xA6 result slot case 2 reads;
+    /// lands before the next step even while the SubMapNum tag is held, like
+    /// [`Self::apply_pending_num`]. The tag is one global per event, so the
+    /// value lands in every VM's copy at once
+    /// (research/XiEvents/OpCodes/0x00A6.md).
+    pub fn set_submap_num(&mut self, num: u32) {
+        self.a6_submap_num = num;
+        let mut land = |child: &mut EventVm| child.set_submap_num(num);
+        self.for_each_child_vm(&mut land);
+    }
+
     /// The tag held on its case-1 poll, if any: this VM's own, else the first
     /// one held by a child (the tag is one global per event in retail, so an
     /// owner child can be the holder the host must gate on).
@@ -976,6 +1529,16 @@ impl EventVm {
 
     /// Run opcodes until the VM yields (one `EventIdle` tick).
     pub fn step(&mut self) -> StepResult {
+        let result = self.step_inner();
+        self.last_waiting = matches!(result, StepResult::Waiting);
+        result
+    }
+
+    /// The yield loop [`step`](Self::step) runs.
+    fn step_inner(&mut self) -> StepResult {
+        if self.force_cancelled {
+            return StepResult::Cancelled;
+        }
         if self.scene_cancelled {
             return StepResult::Cancelled;
         }
@@ -1068,6 +1631,17 @@ impl EventVm {
                     self.cues.push(EventCue::ActorHide {
                         target: ActorLookup::EVENT_ENTITY,
                         hide: self.byte_at(EVENTHIDE_FLAG_OFS) & EVENTHIDE_FLAG_MASK != 0,
+                    });
+                    self.advance(op);
+                }
+                // The handler writes the operand's high byte with 0x20 forced
+                // into CliEventModeLocal's lower word; retail's Ailevia tour
+                // stores 0x2003, which applies as 0x20
+                // (research/XiEvents/OpCodes/0x0038.md).
+                OP_LOCAL_MODE => {
+                    let val = self.getworkofs(1, 0);
+                    self.cues.push(EventCue::LocalMode {
+                        mode: ((val >> 8) & LOCAL_MODE_BYTE_MASK) as u16 | LOCAL_MODE_FORCED_BIT,
                     });
                     self.advance(op);
                 }
@@ -1207,6 +1781,160 @@ impl EventVm {
                     },
                     _ => self.exec_pointer += 2,
                 },
+                // 0xA7: waits on the server's response to the client's request.
+                // Case 0 arms the await bit and sends the pending tag
+                // (EndPara = Work_Zone[1]), holding until the server acks; case
+                // 1 writes the result the ack carried into the work slot its
+                // +2 operand selects. The result is the EndPara the tag carried
+                // — the value the session's ack path already knows — so it is
+                // captured when the tag is armed
+                // (research/XiEvents/OpCodes/0x00A7.md). Retail spins on any
+                // other case byte, so authored data cannot hold one.
+                OP_A7_WAIT => match self.byte_at(1) {
+                    0 => {
+                        if self.pending_ack.is_none() {
+                            self.a7_result = self.work_zone(1) as u32;
+                            self.pending_ack = Some(PendingTag::SendTag {
+                                end_para: self.a7_result,
+                            });
+                        }
+                        let tag = self.pending_ack.clone().expect("armed above");
+                        return StepResult::AwaitServerAck(tag);
+                    }
+                    1 => {
+                        self.setworkofs(2, self.a7_result as i32, 0);
+                        self.exec_pointer += 4;
+                    }
+                    _ => self.exec_pointer += 2,
+                },
+                // 0xA6: case 0 sends the header-only 0x0EB REQSUBMAPNUM and
+                // holds on the 0x10E answer; case 1 yields until it lands; case
+                // 2 writes the answered MapNum into the work slot its +2 operand
+                // selects. The server answers 0 when the char is npc-locked and
+                // nothing otherwise, so an unanswered request is released by the
+                // session's grace watchdog, which lands case 2 on 0
+                // (research/XiEvents/OpCodes/0x00A6.md). Retail spins on any
+                // other case byte, so authored data cannot hold one.
+                OP_A6_SUBMAP => match self.byte_at(1) {
+                    0 => {
+                        if self.pending_ack.is_none() {
+                            self.pending_ack = Some(PendingTag::SubMapNum);
+                        }
+                        let tag = self.pending_ack.clone().expect("armed above");
+                        return StepResult::AwaitServerAck(tag);
+                    }
+                    1 => {
+                        self.exec_pointer += 2;
+                    }
+                    2 => {
+                        self.setworkofs(2, self.a6_submap_num as i32, 0);
+                        self.exec_pointer += 4;
+                    }
+                    _ => self.exec_pointer += 2,
+                },
+                // 0xB2: mode 0 counts down WaitTime — the u16 at +1, which
+                // spans the mode byte and the first operand byte, so authors
+                // steer it to work_zone[0] with a 0x10 first byte — by frame
+                // delay and steps +4 on expiry. Mode 1 requests delivery mode:
+                // it arms the 0x04D PBX open request and holds until the 0x04B
+                // DELI_OPEN/POST_OPEN ack, then +2. Retail spins on any other
+                // mode byte, so authored data cannot hold one
+                // (research/XiEvents/OpCodes/0x00B2.md).
+                OP_B2_DELIVERY => match self.byte_at(1) {
+                    0 => return self.arm_wait(self.getworkofs(1, 0) as f32, 4),
+                    1 => {
+                        if self.pending_ack.is_none() {
+                            self.pending_ack = Some(PendingTag::DeliveryOpen);
+                        }
+                        let tag = self.pending_ack.clone().expect("armed above");
+                        return StepResult::AwaitServerAck(tag);
+                    }
+                    _ => self.exec_pointer += 2,
+                },
+                // 0x87/0x88: the world pass. The send cases (0 and 2) arm
+                // the 0x01B FRIENDPASS with the case's `Para` and hold on the
+                // 0x059 answer; case 1 yields until it lands. The server
+                // answers a random pass number for the confirm cases and 0
+                // for the begin cases; the number has no kuluu display, so
+                // the receipt only clears the await
+                // (vendor/server/src/map/packets/c2s/0x01b_friendpass.cpp).
+                // Retail spins on any other case byte, so authored data
+                // cannot hold one.
+                OP_FRIENDPASS_87 | OP_FRIENDPASS_88 => {
+                    let sub = self.byte_at(1);
+                    let para = match (op, sub) {
+                        (OP_FRIENDPASS_87, 0) => 0,
+                        (OP_FRIENDPASS_88, 0) => 1,
+                        (OP_FRIENDPASS_87, 2) => 2,
+                        (OP_FRIENDPASS_88, 2) => 3,
+                        _ => 0,
+                    };
+                    match sub {
+                        0 | 2 => {
+                            if self.pending_ack.is_none() {
+                                self.pending_ack = Some(PendingTag::FriendPass { para });
+                            }
+                            let tag = self.pending_ack.clone().expect("armed above");
+                            return StepResult::AwaitServerAck(tag);
+                        }
+                        _ => self.exec_pointer += 2,
+                    }
+                }
+                // 0x8C: the crafting support. The send cases (0/2/3/4) fill
+                // the 0x058 RECIPE with their Mode and the work-slot fields
+                // the retail pseudo code names, arm the await on the 0x031
+                // answer, and hold; case 1 yields until it lands. Mode 4 has
+                // no LSB handler, so its answer is the grace watchdog; retail
+                // case 5 sends mode 5 without setting RecRecipeFlag at all
+                // and LSB implements no mode 5, so it advances its width
+                // without a send (research/XiEvents/OpCodes/0x008C.md;
+                // vendor/server/src/map/packets/c2s/0x058_recipe.cpp). Retail
+                // spins on any other case byte, so authored data cannot hold
+                // one.
+                OP_RECIPE => match self.byte_at(1) {
+                    0 | 2 | 3 | 4 => {
+                        let recipe = match self.byte_at(1) {
+                            0 => PendingTag::Recipe {
+                                mode: 1,
+                                skill: self.getworkofs(2, 0) as u16,
+                                level: self.getworkofs(4, 0) as u16,
+                                param0: self.getworkofs(6, 0) as u16,
+                                param1: 0,
+                                param2: 0,
+                                param3: 0,
+                                param4: 0,
+                            },
+                            2 => PendingTag::Recipe {
+                                mode: 2,
+                                skill: self.getworkofs(2, 0) as u16,
+                                level: self.getworkofs(4, 0) as u16,
+                                param0: 0,
+                                param1: self.getworkofs(8, 0) as u16,
+                                param2: self.getworkofs(10, 0) as u16,
+                                param3: 0,
+                                param4: self.getworkofs(6, 0) as u16,
+                            },
+                            _ => PendingTag::Recipe {
+                                mode: u16::from(self.byte_at(1) == 4) + 3,
+                                skill: self.getworkofs(2, 0) as u16,
+                                level: self.getworkofs(4, 0) as u16,
+                                param0: 0,
+                                param1: 0,
+                                param2: 0,
+                                param3: self.getworkofs(8, 0) as u16,
+                                param4: self.getworkofs(6, 0) as u16,
+                            },
+                        };
+                        if self.pending_ack.is_none() {
+                            self.pending_ack = Some(recipe);
+                        }
+                        let tag = self.pending_ack.clone().expect("armed above");
+                        return StepResult::AwaitServerAck(tag);
+                    }
+                    1 => self.exec_pointer += 2,
+                    5 => self.exec_pointer += 14,
+                    _ => self.exec_pointer += 2,
+                },
                 OP_JUMP => {
                     if self.jump_index == JUMP_STACK_LEN {
                         self.finished = true;
@@ -1293,20 +2021,29 @@ impl EventVm {
                     self.selection_made = false;
                     self.exec_pointer += 7;
                 }
+                // With no menu armed and no message frame open, retail's
+                // `!PTR_TalkWinFlag` path steps past the opcode and yields;
+                // the script runs on with whatever Work_Zone[0] already holds
+                // (research/XiEvents/OpCodes/0x0025.md). A message frame that
+                // is still open keeps the ack yield so the host closes it first.
                 OP_QUERYWAIT => {
                     if !self.selection_made {
-                        return match self.pending_choice.clone() {
-                            Some(choice) => StepResult::AwaitChoice(choice),
-                            None => StepResult::AwaitMessageAck,
-                        };
+                        if let Some(choice) = self.pending_choice.clone() {
+                            return StepResult::AwaitChoice(choice);
+                        }
+                        if self.message_frame_open() {
+                            return StepResult::AwaitMessageAck;
+                        }
+                        self.exec_pointer += QUERYWAIT_SIZE;
+                    } else {
+                        self.selection_made = false;
+                        self.pending_choice = None;
+                        if self.work_zone.lock().unwrap()[0] == CHOICE_CANCELLED {
+                            self.finished = true;
+                            return StepResult::Cancelled;
+                        }
+                        self.exec_pointer += QUERYWAIT_SIZE;
                     }
-                    self.selection_made = false;
-                    self.pending_choice = None;
-                    if self.work_zone.lock().unwrap()[0] == CHOICE_CANCELLED {
-                        self.finished = true;
-                        return StepResult::Cancelled;
-                    }
-                    self.exec_pointer += 1;
                 }
                 // XiEvent ReqSet/GetReqStatus family (research/XiEvents/OpCodes/
                 // 0x0027.md, 0x0028.md, 0x0029.md, 0x002A.md): actor-choreography
@@ -1383,10 +2120,87 @@ impl EventVm {
                 }
                 // XiEvent WAITLOADSCHEDULER (research/XiEvents/OpCodes/0x0055.md):
                 // same hold, keyed on the actor1/key pair a 0x45 or 0x5B started.
-                OP_WAITLOADSCHEDULER => {
+                // The six twins run the identical hold on their own scheduler
+                // DAT base, which names no file in this model: the loader that
+                // armed the hold already chose the DAT and the routine
+                // (research/XiEvents/OpCodes/0x00A0.md and kin).
+                OP_WAITLOADSCHEDULER
+                | OP_WAITLOADSCHED_TWIN_A0
+                | OP_WAITLOADSCHED_TWIN_BC
+                | OP_WAITLOADSCHED_TWIN_C6
+                | OP_WAITLOADSCHED_TWIN_CE
+                | OP_WAITLOADSCHED_TWIN_D1
+                | OP_WAITLOADSCHED_TWIN_D6 => {
                     let actor = ActorLookup(self.eventgetcode2(WAITLOADSCHEDULER_ACTOR1_OFS));
                     let key = self.fourcc_at(WAITLOADSCHEDULER_KEY_OFS);
                     if self.action_running(actor, key) {
+                        self.parked_on_action_hold = true;
+                        return StepResult::Waiting;
+                    }
+                    self.parked_on_action_hold = false;
+                    self.exec_pointer += OPCODE_META[op as usize].size as usize;
+                }
+                // 0x56 reads an actor and does nothing with it: a deprecated
+                // yield (research/XiEvents/OpCodes/0x0056.md). The zero-length
+                // wait spends the frame retail's RetFlag spends.
+                OP_ACTOR_NOP => {
+                    self.eventgetcode2(ACTOR_NOP_ACTOR_OFS);
+                    return self.arm_wait(0.0, OPCODE_META[op as usize].size as usize);
+                }
+                // 0xC1 kills the named entity's last action and returns it to
+                // idle, then yields (research/XiEvents/OpCodes/0x00C1.md): the
+                // stop-all the ActorStopAction cue already carries, on the
+                // resolved actor, no key. An actor retail's GetActorIndex would
+                // drop emits nothing.
+                OP_KILL_LAST_ACTION => {
+                    let actor = ActorLookup(self.eventgetcode2(KILL_LAST_ACTION_ACTOR_OFS));
+                    if self.actor_resolved(actor) {
+                        self.cues
+                            .push(EventCue::ActorStopAction { actor, key: None });
+                    }
+                    self.exec_pointer += OPCODE_META[op as usize].size as usize;
+                    return StepResult::Waiting;
+                }
+                // 0x6E EMOT: the work value's low byte is the emote id, its high
+                // byte the variant selector (research/XiEvents/OpCodes/0x006E.md).
+                // Arms the same-pass start so a 0x99 in this pass sees the
+                // animation running; the host's timed hold from the drained cue
+                // takes over from the bridge.
+                OP_EMOT => {
+                    let actor = ActorLookup(self.eventgetcode2(EMOT_ACTOR_OFS));
+                    let value = self.getworkofs(EMOT_VALUE_OFS, 0);
+                    self.pending_action_starts
+                        .push((self.resolve_hold_actor(actor), EMOTE_ANIMATION_KEY));
+                    self.cues.push(EventCue::Emote {
+                        actor,
+                        emote_id: (value & EMOTE_VALUE_BYTE_MASK) as u16,
+                        param: ((value >> EMOTE_VALUE_PARAM_SHIFT) & EMOTE_VALUE_BYTE_MASK) as u16,
+                    });
+                    self.advance(op);
+                }
+                // 0x63 PLAYANIM: the event entity's emote from the same work slot
+                // (research/XiEvents/OpCodes/0x0063.md).
+                OP_PLAYANIM => {
+                    let value = self.getworkofs(PLAYANIM_VALUE_OFS, 0);
+                    self.pending_action_starts.push((
+                        self.resolve_hold_actor(ActorLookup::EVENT_ENTITY),
+                        EMOTE_ANIMATION_KEY,
+                    ));
+                    self.cues.push(EventCue::Emote {
+                        actor: ActorLookup::EVENT_ENTITY,
+                        emote_id: (value & EMOTE_VALUE_BYTE_MASK) as u16,
+                        param: ((value >> EMOTE_VALUE_PARAM_SHIFT) & EMOTE_VALUE_BYTE_MASK) as u16,
+                    });
+                    self.advance(op);
+                }
+                // 0x99 ANIMWAIT: hold while the named entity's animation is
+                // playing (research/XiEvents/OpCodes/0x0099.md). The host arms
+                // the timed hold from the emote DAT's authored routine length;
+                // with nothing armed the wait falls through, retail's path when
+                // the entity is unresolved.
+                OP_ANIMWAIT => {
+                    let actor = ActorLookup(self.eventgetcode2(ANIMWAIT_ACTOR_OFS));
+                    if self.action_running(actor, EMOTE_ANIMATION_KEY) {
                         self.parked_on_action_hold = true;
                         return StepResult::Waiting;
                     }
@@ -1429,6 +2243,31 @@ impl EventVm {
                     });
                     self.advance(op);
                 }
+                // 0xDA: a batch motion loader (see the constant). Scan the
+                // 28-byte records and emit one ActorMotion cue per record that
+                // carries a printable 4cc key; stop at the first record whose
+                // key field is not a 4cc, so the advance lands on the next real
+                // instruction. Single-site in the corpus, so the record count
+                // comes from the scan, not a header count.
+                OP_DA => {
+                    let mut n = 0;
+                    while n < OP_DA_MAX_RECORDS {
+                        let rec = OP_DA_HEADER + n * OP_DA_RECORD;
+                        let key = self.fourcc_at(rec + OP_DA_KEY);
+                        if !key.iter().all(|&b| b != 0 && (0x20..=0x7e).contains(&b)) {
+                            break;
+                        }
+                        let actor1 = ActorLookup(self.eventgetcode2(rec + OP_DA_ACTOR1));
+                        let actor2 = ActorLookup(self.eventgetcode2(rec + OP_DA_ACTOR2));
+                        self.cues.push(EventCue::ActorMotion {
+                            actor1,
+                            actor2,
+                            key,
+                        });
+                        n += 1;
+                    }
+                    self.exec_pointer += OP_DA_HEADER + n * OP_DA_RECORD;
+                }
                 OP_LOADEVENTSCHEDULER2 => {
                     let file = dat_id_helper(self.getworkofs(LOADEVENTSCHEDULER2_FILE_OFS, 0));
                     let actor1 = ActorLookup(self.eventgetcode2(LOADEVENTSCHEDULER2_ACTOR1_OFS));
@@ -1444,6 +2283,238 @@ impl EventVm {
                     });
                     self.advance(op);
                 }
+                // The 0x45 twins: the same helper and layout, but each on its
+                // own DAT base and with the work value used raw — the
+                // `dat_id_helper` remap is the 0x45-only branch of the helper
+                // (research/XiEvents/OpCodes/0x0045.md, 0x0062.md and kin).
+                OP_SCHED_TWIN_62 | OP_SCHED_TWIN_9F | OP_SCHED_TWIN_BB | OP_SCHED_TWIN_C5
+                | OP_SCHED_TWIN_CD | OP_SCHED_TWIN_D0 | OP_SCHED_TWIN_D5 => {
+                    let base = scheduler_twin_base(op).expect("matched a 0x45 twin");
+                    let file = self.getworkofs(LOADEVENTSCHEDULER2_FILE_OFS, 0) as u32;
+                    let actor1 = ActorLookup(self.eventgetcode2(LOADEVENTSCHEDULER2_ACTOR1_OFS));
+                    let tag = self.fourcc_at(LOADEVENTSCHEDULER2_TAG_OFS);
+                    self.pending_action_starts
+                        .push((self.resolve_hold_actor(actor1), tag));
+                    self.cues.push(EventCue::Scheduler {
+                        dat_id: base + file,
+                        actor1,
+                        actor2: ActorLookup(self.eventgetcode2(LOADEVENTSCHEDULER2_ACTOR2_OFS)),
+                        tag,
+                        duration: self.getworkofs(LOADEVENTSCHEDULER2_DURATION_OFS, 0) as u16,
+                    });
+                    self.advance(op);
+                }
+                // The end-scheduler family: kill the tag-named action on
+                // actor1 (research/XiEvents/OpCodes/0x0050.md, 0x0051.md,
+                // 0x0052.md). Retail skips the kill when either actor does not
+                // resolve; this VM resolves reserved lookups to the event
+                // entity, so the cue goes out unconditionally and the consumer
+                // drops an unknown id, the way the other actor cues do.
+                OP_ENDSCHEDULOR | OP_ENDMAPSCHEDULOR => {
+                    let actor = ActorLookup(self.eventgetcode2(ENDSCHEDULOR_ACTOR1_OFS));
+                    self.cues.push(EventCue::ActorStopAction {
+                        actor,
+                        key: stop_action_key(self.fourcc_at(ENDSCHEDULOR_TAG_OFS)),
+                    });
+                    self.advance(op);
+                }
+                OP_ENDLOADSCHEDULER_MAIN
+                | OP_ENDLOADSCHED_TWIN_A1
+                | OP_ENDLOADSCHED_TWIN_A3
+                | OP_ENDLOADSCHED_TWIN_BD
+                | OP_ENDLOADSCHED_TWIN_C7
+                | OP_ENDLOADSCHED_TWIN_CF
+                | OP_ENDLOADSCHED_TWIN_D2
+                | OP_ENDLOADSCHED_TWIN_D7 => {
+                    let actor = ActorLookup(self.eventgetcode2(ENDLOADSCHED_ACTOR1_OFS));
+                    self.cues.push(EventCue::ActorStopAction {
+                        actor,
+                        key: stop_action_key(self.fourcc_at(ENDLOADSCHED_TAG_OFS)),
+                    });
+                    self.advance(op);
+                }
+                // The cast is the spell effect DAT for the work operand's
+                // animation index, its `main` routine on actor1 with actor2 as
+                // the target: the same file and routine a 0x028 magic finish
+                // plays, so the 0x45 cue carries it unchanged. No hold entry:
+                // retail's 0x73 arms no wait of its own and the scripts that
+                // author it cover the cast with a 0x1C WAIT
+                // (research/XiEvents/OpCodes/0x0073.md). A work operand outside
+                // u16 names no file and plays nothing, like retail's
+                // unresolved-actor early return.
+                OP_MAGICSCHEDULOR => {
+                    let actor1 = ActorLookup(self.eventgetcode2(MAGICSCHEDULOR_ACTOR1_OFS));
+                    let actor2 = ActorLookup(self.eventgetcode2(MAGICSCHEDULOR_ACTOR2_OFS));
+                    if let Ok(animation) = u16::try_from(self.getworkofs(MAGICSCHEDULOR_KEY_OFS, 0))
+                    {
+                        self.cues.push(EventCue::Scheduler {
+                            dat_id: MAGIC_DAT_ID_BASE + u32::from(animation),
+                            actor1,
+                            actor2,
+                            tag: MAGIC_ROUTINE_TAG,
+                            duration: SCHEDULER_DURATION_FROM_DAT,
+                        });
+                    }
+                    self.advance(op);
+                }
+                // The 0x73 twin: the same spell cast, but the case byte at +1
+                // shifts the key to +2 and actor2 to +8 and widens the advance
+                // to 12. Cases 0/1/2 all run the `main` routine; a case past 2
+                // arms no cast (retail's empty switch fall-through) yet still
+                // advances the full width (research/XiEvents/OpCodes/0x00C4.md).
+                OP_MAGIC_TWIN => {
+                    let case = self.byte_at(MAGIC_TWIN_CASE_OFS);
+                    let actor1 = ActorLookup(self.eventgetcode2(MAGIC_TWIN_ACTOR1_OFS));
+                    let actor2 = ActorLookup(self.eventgetcode2(MAGIC_TWIN_ACTOR2_OFS));
+                    if case <= 2 {
+                        if let Ok(animation) = u16::try_from(self.getworkofs(MAGIC_TWIN_KEY_OFS, 0))
+                        {
+                            self.cues.push(EventCue::Scheduler {
+                                dat_id: MAGIC_DAT_ID_BASE + u32::from(animation),
+                                actor1,
+                                actor2,
+                                tag: MAGIC_ROUTINE_TAG,
+                                duration: SCHEDULER_DURATION_FROM_DAT,
+                            });
+                        }
+                    }
+                    self.exec_pointer += MAGIC_TWIN_SIZE;
+                }
+                // 0x7D runs the work-operand scheduler on the local player with
+                // the player as its own target — the rank-up animations
+                // (research/XiEvents/OpCodes/0x007D.md).
+                OP_LOCAL_PLAYER_SCHEDULER => {
+                    let file = self.getworkofs(LOCAL_PLAYER_SCHEDULER_FILE_OFS, 0) as u32;
+                    self.cues.push(EventCue::Scheduler {
+                        dat_id: LOCAL_PLAYER_SCHEDULER_DAT_ID_BASE + file,
+                        actor1: ActorLookup::LOCAL_PLAYER,
+                        actor2: ActorLookup::LOCAL_PLAYER,
+                        tag: MAGIC_ROUTINE_TAG,
+                        duration: SCHEDULER_DURATION_FROM_DAT,
+                    });
+                    self.advance(op);
+                }
+                // 0x32 MainSpeed: arm the speed the non-scene `OP_MOVE` case 0
+                // carries; the scene path keeps the same value on its `Scene`
+                // (research/XiEvents/OpCodes/0x0032.md).
+                OP_MAIN_SPEED => {
+                    self.move_speed = self.getworkofs(MAIN_SPEED_OFS, 0);
+                    self.advance(op);
+                }
+                // 0x31 SMOVE: mode 0 arms the goal (work slots 2/4/6, event
+                // units) and the MoveTime budget (slot 8, seconds); mode 1
+                // walks the event entity to that goal at the 0x32 speed and
+                // parks until the move hold releases it. The cue carries the
+                // budget so the host caps the distance-derived hold to it
+                // (research/XiEvents/OpCodes/0x0031.md).
+                OP_SMOVE => match self.byte_at(1) {
+                    0x00 => {
+                        self.smove_goal = Some(self.position_operands(2, false));
+                        self.smove_time = self.getworkofs(8, 0) as f32 * 0.001;
+                        self.smove_started = false;
+                        self.exec_pointer += 10;
+                    }
+                    0x01 => {
+                        if !self.smove_started {
+                            if let Some(goal) = self.smove_goal {
+                                let actor = ActorLookup::EVENT_ENTITY;
+                                self.pending_move_starts
+                                    .push(self.resolve_hold_actor(actor));
+                                self.cues.push(EventCue::ActorMove {
+                                    actor,
+                                    goal,
+                                    speed: self.move_speed,
+                                    max_time: (self.smove_time > 0.0).then_some(self.smove_time),
+                                });
+                                self.smove_started = true;
+                            }
+                        }
+                        if self.move_running(ActorLookup::EVENT_ENTITY) {
+                            self.parked_on_move_hold = true;
+                            return StepResult::Waiting;
+                        }
+                        self.parked_on_move_hold = false;
+                        self.exec_pointer += 2;
+                    }
+                    _ => return StepResult::Unimplemented(op),
+                },
+                // 0x72 GETWEATHER: mode 0 kicks off the forecast read and mode 1
+                // copies three values into Work_Zone[2..5)
+                // (research/XiEvents/OpCodes/0x0072.md). The table is resident
+                // in kuluu (the host loads it once), so the read is instant:
+                // mode 0 advances past itself and yields one frame the way
+                // retail's async read does, and mode 1 reads the values and
+                // advances. A region or index the shipped table does not cover
+                // writes nothing, like retail's unresolved early return.
+                OP_GETWEATHER => match self.byte_at(1) {
+                    0x00 => {
+                        self.exec_pointer += 4;
+                        return self.arm_wait(0.0, 0);
+                    }
+                    0x01 => {
+                        if let Some(forecast) = &self.weather_forecast {
+                            let region = self.getworkofs(2, 0) as u32;
+                            let day = self.getworkofs(4, 0) as u32;
+                            if let Some([v0, v1, v2]) = forecast.values(region, day) {
+                                let mut zone = self.work_zone.lock().unwrap();
+                                zone[2] = v0;
+                                zone[3] = v1;
+                                zone[4] = v2;
+                            }
+                        }
+                        self.exec_pointer += 6;
+                    }
+                    _ => return StepResult::Unimplemented(op),
+                },
+                // 0x82 RANGE_RECT: find the zone range rect named by the u32 at
+                // +1 and hit-test the event entity's tracked position against it;
+                // a hit advances 7, a miss (no rect, no position, or outside) jumps
+                // to the u16 at +5 (research/XiEvents/OpCodes/0x0082.md).
+                OP_RANGE_RECT => {
+                    let rect_id = self.eventgetcode2(1);
+                    if self.range_rect_hit(rect_id) {
+                        self.exec_pointer += 7;
+                    } else {
+                        self.exec_pointer = self.eventgetcode(5) as usize;
+                    }
+                }
+                // 0x39 SetFacing: set the event entity's facing, the raw work
+                // value on the 0..4095 heading scale (research/XiEvents/OpCodes/
+                // 0x0039.md).
+                OP_SET_FACING => {
+                    let heading = self.getworkofs(SET_FACING_OFS, 0);
+                    self.cues.push(EventCue::ActorFace {
+                        actor: ActorLookup::EVENT_ENTITY,
+                        heading,
+                    });
+                    self.advance(op);
+                }
+                // 0x4B: turn the named actor to the work-operand yaw
+                // (research/XiEvents/OpCodes/0x004B.md).
+                OP_YAW => {
+                    let actor = ActorLookup(self.eventgetcode2(YAW_ACTOR_OFS));
+                    let heading = self.getworkofs(YAW_HEADING_OFS, 0);
+                    self.cues.push(EventCue::ActorFace { actor, heading });
+                    self.advance(op);
+                }
+                // 0x36: place the event entity at the work-operand position, no
+                // heading (research/XiEvents/OpCodes/0x0036.md).
+                OP_SET_EVENT_POS => {
+                    let position = self.position_operands(SET_EVENT_POS_X_OFS, false);
+                    self.cues.push(EventCue::ActorPlace {
+                        actor: ActorLookup::EVENT_ENTITY,
+                        position,
+                    });
+                    self.advance(op);
+                }
+                // 0xBA: place the named actor at the work-operand position and
+                // heading (research/XiEvents/OpCodes/0x00BA.md).
+                OP_SET_ACTOR_POS => {
+                    let actor = ActorLookup(self.eventgetcode2(SET_ACTOR_POS_ACTOR_OFS));
+                    let position = self.position_operands(SET_ACTOR_POS_X_OFS, true);
+                    self.cues.push(EventCue::ActorPlace { actor, position });
+                    self.advance(op);
+                }
                 // Case 2 queries the camera state into a work slot rather than
                 // changing it, and every other case is retail's no-op
                 // fall-through (research/XiEvents/OpCodes/0x0046.md).
@@ -1457,12 +2528,34 @@ impl EventVm {
                     }
                     self.advance(op);
                 }
+                // 0x20 writes retail's CliEventUcFlag; while it holds, the
+                // player's CanIMove is false (research/XiEvents/OpCodes/0x0020.md).
+                OP_PLAYER_CONTROL => {
+                    self.cues.push(EventCue::PlayerControl {
+                        locked: self.byte_at(PLAYER_CONTROL_FLAG_OFS) != 0,
+                    });
+                    self.advance(op);
+                }
                 OP_EVENTHIDE => {
                     self.cues.push(EventCue::ActorHide {
                         target: ActorLookup(self.eventgetcode2(EVENTHIDE_TARGET_OFS)),
                         hide: self.byte_at(EVENTHIDE_FLAG_OFS) & EVENTHIDE_FLAG_MASK != 0,
                     });
                     self.advance(op);
+                }
+                // 0x6C fades the target's alpha to the work(5) byte over the
+                // work(7) frames and parks the script for that fade
+                // (research/XiEvents/OpCodes/0x006C.md).
+                OP_TRANSPAR => {
+                    let actor = ActorLookup(self.eventgetcode2(TRANSPAR_ACTOR_OFS));
+                    let end_alpha = self.getworkofs(TRANSPAR_ALPHA_OFS, 0);
+                    let frames = self.getworkofs(TRANSPAR_TIME_OFS, 0).max(1);
+                    self.cues.push(EventCue::Transpar {
+                        actor,
+                        end_alpha,
+                        duration_frames: frames,
+                    });
+                    return self.arm_wait(frames as f32, TRANSPAR_SIZE);
                 }
                 // 0xC8 opens the map window on the work-slot zone id —
                 // research/XiEvents/OpCodes/0x00C8.md.
@@ -1495,9 +2588,127 @@ impl EventVm {
                     });
                     self.advance(op);
                 }
+                // 0x89 opens the map on the work-slot zone id, sub-menus
+                // hidden (research/XiEvents/OpCodes/0x0089.md).
+                OP_OPEN_MAP => {
+                    self.cues.push(EventCue::MapOpen {
+                        map_id: self.getworkofs(OPEN_MAP_ID_OFS, 0),
+                        tutorial: false,
+                    });
+                    self.advance(op);
+                }
+                // 0x8D opens the map with its authored sub-menu property, which
+                // the MapOpen carrier does not carry
+                // (research/XiEvents/OpCodes/0x008D.md).
+                OP_OPEN_MAP_PROPS => {
+                    self.cues.push(EventCue::MapOpen {
+                        map_id: self.getworkofs(OPEN_MAP_ID_OFS, 0),
+                        tutorial: false,
+                    });
+                    self.advance(op);
+                }
+                // 0xB8 adds a named marker to the map; with the map closed
+                // retail opens it data-level and closes it again, so the
+                // visible result is the marker itself
+                // (research/XiEvents/OpCodes/0x00B8.md).
+                OP_MAP_ADD_MARK => {
+                    let mut name = [0u8; 16];
+                    for (slot, byte) in name.iter_mut().enumerate() {
+                        *byte = self.byte_at(MAP_ADD_MARK_NAME_OFS + slot);
+                    }
+                    // Retail rewrites underscores to spaces before the rename
+                    // (research/XiEvents/OpCodes/0x00B8.md).
+                    for b in &mut name {
+                        if *b == b'_' {
+                            *b = b' ';
+                        }
+                    }
+                    self.cues.push(EventCue::MapMarker {
+                        map_id: self.getworkofs(MAP_ADD_MARK_ID_OFS, 0),
+                        x_milli: self.getworkofs(MAP_ADD_MARK_X_OFS, 0),
+                        y_milli: self.getworkofs(MAP_ADD_MARK_Y_OFS, 0),
+                        name,
+                    });
+                    self.advance(op);
+                }
                 OP_CLOSE_MAP => {
                     self.cues.push(EventCue::MapClose);
                     self.advance(op);
+                }
+                // 0xD4 MAP_QUERY: cases 0 and 2 run the 0x24 query helper —
+                // case 0 also opens the current zone's map (type 6) — and park
+                // on the answer; cases 1/3/4/5 copy into the client's query
+                // window, which has no kuluu counterpart, so they advance by
+                // their width; an unknown case parks
+                // (research/XiEvents/OpCodes/0x00D4.md).
+                OP_MAP_QUERY => {
+                    let sub = self.byte_at(1);
+                    match sub {
+                        0 | 2 => {
+                            if self.selection_made {
+                                self.selection_made = false;
+                                self.pending_choice = None;
+                                if self.work_zone.lock().unwrap()[0] == CHOICE_CANCELLED {
+                                    self.finished = true;
+                                    return StepResult::Cancelled;
+                                }
+                                self.exec_pointer += 8;
+                            } else {
+                                self.arm_map_query_choice();
+                                if sub == 0 {
+                                    self.cues.push(EventCue::MapOpen {
+                                        map_id: self.current_zone,
+                                        tutorial: false,
+                                    });
+                                }
+                                return match self.pending_choice.clone() {
+                                    Some(choice) => StepResult::AwaitChoice(choice),
+                                    None => StepResult::AwaitMessageAck,
+                                };
+                            }
+                        }
+                        1 => {
+                            self.exec_pointer += 8;
+                        }
+                        3 => {
+                            self.exec_pointer += 6;
+                        }
+                        4 | 5 => {
+                            self.exec_pointer += 12;
+                        }
+                        _ => return StepResult::Unimplemented(op),
+                    }
+                }
+                // 0xB3 RANKING: the ranking-board cases. LSB has no ranking
+                // handler, so the read cases write zeros into the board's work
+                // slots (the board draws empty) and every case advances by its
+                // width; no packet is sent (research/XiEvents/OpCodes/0x00B3.md).
+                OP_RANKING => {
+                    let sub = self.byte_at(1);
+                    match sub {
+                        1 => {
+                            for ofs in [2usize, 4, 6, 8, 10, 12] {
+                                self.setworkofs(ofs, 0, 0);
+                            }
+                            self.exec_pointer += 14;
+                        }
+                        5 => {
+                            for ofs in [2usize, 4, 6, 8, 10, 12, 14, 16] {
+                                self.setworkofs(ofs, 0, 0);
+                            }
+                            self.exec_pointer += 18;
+                        }
+                        9 => {
+                            self.setworkofs(2, 0, 0);
+                            self.exec_pointer += 4;
+                        }
+                        0 | 3 | 4 | 6 | 7 => {
+                            self.exec_pointer += 4;
+                        }
+                        _ => {
+                            self.exec_pointer += 2;
+                        }
+                    }
                 }
                 // 0x67's operands are retail's event-message presets, which carry no cue
                 // payload (research/XiEvents/OpCodes/0x0067.md).
@@ -1518,6 +2729,8 @@ impl EventVm {
                         self.cues.push(EventCue::ClockHold {
                             stop: true,
                             hour: Some(hour.rem_euclid(24) as u32),
+                            minute: 0,
+                            day_from_epoch: None,
                         });
                     }
                     self.advance(op);
@@ -1526,8 +2739,73 @@ impl EventVm {
                     self.cues.push(EventCue::ClockHold {
                         stop: false,
                         hour: None,
+                        minute: 0,
+                        day_from_epoch: None,
                     });
                     self.advance(op);
+                }
+                // 0xA9 zeros the local time, then jumps the date to Vana day
+                // 7 * work[1] at 00:30 (research/XiEvents/OpCodes/0x00A9.md
+                // Helper2, SetMinute).
+                OP_SET_CLOCK_DATE => {
+                    let day = self.getworkofs(SET_CLOCK_DATE_DAY_OFS, 0);
+                    self.cues.push(EventCue::ClockHold {
+                        stop: true,
+                        hour: Some(SET_CLOCK_DATE_HOUR),
+                        minute: SET_CLOCK_DATE_MINUTE,
+                        day_from_epoch: Some(day.saturating_mul(7).max(0) as u32),
+                    });
+                    self.advance(op);
+                }
+                // 0xC9 releases the hold 0x77/0xA9 set
+                // (research/XiEvents/OpCodes/0x00C9.md).
+                OP_ENABLE_TIMER => {
+                    self.cues.push(EventCue::ClockHold {
+                        stop: false,
+                        hour: None,
+                        minute: 0,
+                        day_from_epoch: None,
+                    });
+                    self.advance(op);
+                }
+                // 0x5C MUSIC: the low band (0x00-0x07) sets BGM slot `sub`'s
+                // song to the +2 work selector and starts it at full volume;
+                // the 0x80-0x87 band does the same for slot `sub & 7` at the
+                // +4 start volume; 0xA0/0xA1 ease the playing track to the +2
+                // volume over the +4 frames, the 0x5D shape
+                // (research/XiEvents/OpCodes/0x005C.md).
+                OP_MUSIC => {
+                    let sub = self.byte_at(1);
+                    match sub {
+                        0x00..=0x07 => {
+                            self.cues.push(EventCue::MusicSong {
+                                slot: sub,
+                                track: self.getworkofs(MUSIC_SONG_TRACK_OFS, 0) as u16,
+                                volume: MUSIC_VOLUME_MAX,
+                            });
+                            self.exec_pointer += 4;
+                        }
+                        0x80..=0x87 => {
+                            self.cues.push(EventCue::MusicSong {
+                                slot: sub & MUSIC_SONG_SLOT_MASK,
+                                track: self.getworkofs(MUSIC_SONG_TRACK_OFS, 0) as u16,
+                                volume: self.getworkofs(MUSIC_SONG_VOLUME_OFS, 0).clamp(0, 255)
+                                    as u8,
+                            });
+                            self.exec_pointer += 6;
+                        }
+                        0xA0 | 0xA1 => {
+                            self.cues.push(EventCue::MusicVolume {
+                                volume: self
+                                    .getworkofs(MUSIC_SONG_TRACK_OFS, 0)
+                                    .clamp(0, MUSIC_VOLUME_MAX as i32)
+                                    as u8,
+                                fade_frames: self.getworkofs(MUSIC_SONG_VOLUME_OFS, 0) as u16,
+                            });
+                            self.exec_pointer += 6;
+                        }
+                        _ => return StepResult::Unimplemented(op),
+                    }
                 }
                 OP_MUSICVOLUME => {
                     self.cues.push(EventCue::MusicVolume {
@@ -1536,6 +2814,76 @@ impl EventVm {
                             .clamp(0, MUSIC_VOLUME_MAX as i32)
                             as u8,
                         fade_frames: self.getworkofs(MUSICVOLUME_FADE_OFS, 0) as u16,
+                    });
+                    self.advance(op);
+                }
+                // 0x69 sets the named sound types to full volume or mutes them
+                // (the flag byte); 0x6A eases them to work[1] * 0.001 over
+                // work[3] frames (research/XiEvents/OpCodes/0x0069.md, 0x006A.md).
+                OP_SET_SOUND_VOLUME => {
+                    let mask = self.getworkofs(SET_SOUND_MASK_OFS, 0) as u8;
+                    let volume = if self.byte_at(SET_SOUND_FLAG_OFS) == 0 {
+                        MUSIC_VOLUME_MAX
+                    } else {
+                        0
+                    };
+                    self.cues.push(EventCue::SoundVolume {
+                        mask,
+                        volume,
+                        fade_frames: 0,
+                    });
+                    self.advance(op);
+                }
+                OP_CHANGE_SOUND_VOLUME => {
+                    let mask = self.getworkofs(CHANGE_SOUND_MASK_OFS, 0) as u8;
+                    let volume = (self.getworkofs(CHANGE_SOUND_LEVEL_OFS, 0).clamp(0, 1000)
+                        * MUSIC_VOLUME_MAX as i32
+                        / 1000) as u8;
+                    self.cues.push(EventCue::SoundVolume {
+                        mask,
+                        volume,
+                        fade_frames: self.getworkofs(CHANGE_SOUND_FADE_OFS, 0) as u16,
+                    });
+                    self.advance(op);
+                }
+                // 0x4C/0x4D/0x4F write the event entity's StatusEvent: the door's
+                // open/close byte and the M1..M8 event-motion range
+                // (research/XiEvents/OpCodes/0x004C.md, 0x004D.md, 0x004F.md;
+                // research/XIClient/src/XIClient/include/World/Actor/GameStatus.h).
+                // Each is gated on a Render.Flags0 bit no tier names; the door
+                // consumer's change-dedup is the modelled equivalent, and the
+                // cue rides 0x7E's Mount shape — the same field, so the whole
+                // path is already there.
+                OP_DOOR_OPEN => {
+                    self.emit_status_event_cue(STATUS_EVENT_DOOR_OPEN);
+                    self.advance(op);
+                }
+                OP_DOOR_CLOSE => {
+                    self.emit_status_event_cue(STATUS_EVENT_DOOR_CLOSE);
+                    self.advance(op);
+                }
+                OP_STATUS_EVENT => {
+                    let status = self
+                        .getworkofs(STATUS_EVENT_VALUE_OFS, 0)
+                        .wrapping_add(STATUS_EVENT_MOTION_BASE as i32)
+                        as u8;
+                    self.emit_status_event_cue(status);
+                    self.advance(op);
+                }
+                OP_DOOR_OPEN2 => {
+                    self.emit_status_event_cue(STATUS_EVENT_DOOR_OPEN2);
+                    self.advance(op);
+                }
+                OP_DOOR_CLOSE2 => {
+                    self.emit_status_event_cue(STATUS_EVENT_DOOR_CLOSE2);
+                    self.advance(op);
+                }
+                // The Flags1 half of 0x90 has no tier-named meaning, so the cue
+                // carries only the hide write (research/XiEvents/OpCodes/0x0090.md).
+                OP_EVENT_HIDE_ALWAYS => {
+                    self.cues.push(EventCue::ActorHide {
+                        target: ActorLookup::EVENT_ENTITY,
+                        hide: true,
                     });
                     self.advance(op);
                 }
@@ -1554,34 +2902,67 @@ impl EventVm {
                     self.emit_mount_cue();
                     self.exec_pointer += width as usize;
                 }
-                // The actor-driven waits: retail yields only once the named
-                // entity resolves and reports mid-load/mid-turn/mid-animation,
-                // and this VM resolves no actors, so each takes its own
-                // "no such entity" advance (research/XiEvents/OpCodes/0x0080.md,
-                // 0x0076.md, 0x0099.md — 0x99 advances on every path).
-                OP_LOADWAIT | OP_TURNCHECK | OP_ANIMWAIT => self.exec_pointer += LOADWAIT_SIZE,
-                OP_EMOT => self.exec_pointer += EMOT_SIZE,
-                OP_TRANSPAR => self.exec_pointer += TRANSPAR_SIZE,
-                OP_PLAYANIM => self.exec_pointer += PLAYANIM_SIZE,
+                // The load/turn waits: retail yields only once the named entity
+                // resolves and reports mid-load/mid-turn, and this VM resolves no
+                // actors, so each takes its own "no such entity" advance
+                // (research/XiEvents/OpCodes/0x0080.md, 0x0076.md).
+                OP_LOADWAIT | OP_TURNCHECK => self.exec_pointer += LOADWAIT_SIZE,
                 OP_MAPLOAD | OP_MAPLOAD_KEEP => self.exec_pointer += MAPLOAD_SIZE,
                 OP_MUSICREADWAIT | OP_YIELD => self.exec_pointer += YIELD_SIZE,
+                // 0x98 yields while the zone is reading ext data; an event
+                // never starts before the zone is resident, so only the
+                // advance path is reachable (research/XiEvents/OpCodes/0x0098.md).
+                OP_ZONE_READ_YIELD => self.exec_pointer += OPCODE_META[op as usize].size as usize,
+                // 0x9B yields while the event entity is playing any animation
+                // (research/XiEvents/OpCodes/0x009B.md): the same hold the
+                // loader waits arm, read for the event entity against every
+                // key, retail's AnimationPlay being a per-entity flag, not a
+                // routine slot.
+                OP_ANIM_YIELD => {
+                    if self.entity_animation_running() {
+                        self.parked_on_action_hold = true;
+                        return StepResult::Waiting;
+                    }
+                    self.parked_on_action_hold = false;
+                    self.exec_pointer += OPCODE_META[op as usize].size as usize;
+                }
+                // 0x26 sets RetFlag and never advances: a deprecated yield that
+                // spins in place until the event ends by another route
+                // (research/XiEvents/OpCodes/0x0026.md).
+                OP_YIELD_FOREVER => return StepResult::Waiting,
                 OP_BITTEST => self.op_bit_test(op),
+                // 0x44 tests whether the entity the work operand names is in
+                // the pool and branches on it: an if without an else body, the
+                // else-target skipping the true side
+                // (research/XiEvents/OpCodes/0x0044.md).
+                OP_ENTITY_VALID => {
+                    let id = self.getworkofs(ENTITY_VALID_ID_OFS, 0) as u32;
+                    if self.entity_in_pool(id) {
+                        self.exec_pointer += OPCODE_META[op as usize].size as usize;
+                    } else {
+                        self.exec_pointer = self.eventgetcode(ENTITY_VALID_TARGET_OFS) as usize;
+                    }
+                }
                 // 0x007F is 0x25 QUERYWAIT with one difference: a cancelled
                 // menu stores 255 and runs on rather than ending the event
                 // (research/XiEvents/OpCodes/0x007F.md).
                 OP_QUERYWAIT2 => {
                     if !self.selection_made {
-                        return match self.pending_choice.clone() {
-                            Some(choice) => StepResult::AwaitChoice(choice),
-                            None => StepResult::AwaitMessageAck,
-                        };
+                        if let Some(choice) = self.pending_choice.clone() {
+                            return StepResult::AwaitChoice(choice);
+                        }
+                        if self.message_frame_open() {
+                            return StepResult::AwaitMessageAck;
+                        }
+                        self.exec_pointer += QUERYWAIT_SIZE;
+                    } else {
+                        self.selection_made = false;
+                        self.pending_choice = None;
+                        if self.work_zone.lock().unwrap()[0] == CHOICE_CANCELLED {
+                            self.work_zone.lock().unwrap()[0] = CHOICE_CANCELLED_QUERYWAIT2;
+                        }
+                        self.exec_pointer += QUERYWAIT_SIZE;
                     }
-                    self.selection_made = false;
-                    self.pending_choice = None;
-                    if self.work_zone.lock().unwrap()[0] == CHOICE_CANCELLED {
-                        self.work_zone.lock().unwrap()[0] = CHOICE_CANCELLED_QUERYWAIT2;
-                    }
-                    self.exec_pointer += 1;
                 }
                 // The sub-byte-dispatched families. Their width is the case's,
                 // not the table's widest, so an undocumented sub stops the VM
@@ -1632,6 +3013,25 @@ impl EventVm {
                                 actor: ActorLookup::EVENT_ENTITY,
                                 name: self.getworkstr(2),
                             });
+                        }
+                        // 0x1F case 0: walk the event entity to its goal at the
+                        // 0x32 speed; case 1 holds while that move still has
+                        // frames left (research/XiEvents/OpCodes/0x001F.md).
+                        (OP_MOVE, 0x00) => {
+                            let goal = self.position_operands(MOVE_GOAL_X_OFS, false);
+                            self.cues.push(EventCue::ActorMove {
+                                actor: ActorLookup::EVENT_ENTITY,
+                                goal,
+                                speed: self.move_speed,
+                                max_time: None,
+                            });
+                        }
+                        (OP_MOVE, 0x01) => {
+                            if self.move_running(ActorLookup::EVENT_ENTITY) {
+                                self.parked_on_move_hold = true;
+                                return StepResult::Waiting;
+                            }
+                            self.parked_on_move_hold = false;
                         }
                         _ => {}
                     }
@@ -1715,6 +3115,17 @@ impl EventVm {
     /// the scheduler/action keys are tags, not numbers.
     fn fourcc_at(&self, index: usize) -> FourCc {
         self.eventgetcode2(index).to_le_bytes()
+    }
+
+    /// The door opcodes' `StatusEvent` write, on 0x7E's Mount cue: same field,
+    /// so the session and wire paths 0x7E already owns carry it
+    /// (research/XiEvents/OpCodes/0x004C.md).
+    fn emit_status_event_cue(&mut self, status_event: u8) {
+        self.cues.push(EventCue::Mount {
+            target: ActorLookup::EVENT_ENTITY,
+            status_event,
+            mount_id: None,
+        });
     }
 
     /// The `StatusEvent` write 0x7E's case performs, as a cue
@@ -2742,6 +4153,330 @@ mod tests {
         }
     }
 
+    #[test]
+    fn waitloadsched_twin_falls_through_without_a_hold() {
+        for op in [
+            OP_WAITLOADSCHED_TWIN_A0,
+            OP_WAITLOADSCHED_TWIN_BC,
+            OP_WAITLOADSCHED_TWIN_C6,
+            OP_WAITLOADSCHED_TWIN_CE,
+            OP_WAITLOADSCHED_TWIN_D1,
+            OP_WAITLOADSCHED_TWIN_D6,
+        ] {
+            assert_eq!(
+                OPCODE_META[op as usize].size as usize, 15,
+                "op 0x{op:02X} size drifted from research/XiEvents/OpCodes"
+            );
+            let mut data = vec![op];
+            data.extend(std::iter::repeat_n(0u8, 14));
+            data.push(OP_END);
+            let mut e = vm(data, vec![]);
+            assert_eq!(
+                e.step(),
+                StepResult::Done,
+                "op 0x{op:02X} should run to END"
+            );
+            assert_eq!(e.exec_pointer(), 15, "op 0x{op:02X} advanced wrong size");
+        }
+    }
+
+    #[test]
+    fn waitloadsched_twin_parks_on_the_actors_hold() {
+        /// A literal server id with no References entry: it resolves to itself.
+        const ACTOR: u32 = 0x010E_6032;
+        let key: [u8; 4] = *b"abcd";
+        for op in [OP_WAITLOADSCHED_TWIN_A0, OP_WAITLOADSCHED_TWIN_D1] {
+            let mut data = vec![op];
+            data.extend(std::iter::repeat_n(0u8, 2));
+            data.extend_from_slice(&ACTOR.to_le_bytes());
+            data.extend_from_slice(&0u32.to_le_bytes());
+            data.extend_from_slice(&key);
+            data.push(OP_END);
+            let mut e = vm(data, vec![]);
+            e.hold_action(ActorLookup(ACTOR), key, WAIT_UNITS_PER_SEC);
+            assert_eq!(
+                e.step(),
+                StepResult::Waiting,
+                "op 0x{op:02X} parks on its hold"
+            );
+            e.tick(1.1);
+            assert_eq!(
+                e.step(),
+                StepResult::Done,
+                "op 0x{op:02X} falls through after expiry"
+            );
+            assert_eq!(e.exec_pointer(), 15);
+        }
+    }
+
+    #[test]
+    fn actor_nop_yields_a_frame_then_advances() {
+        let mut data = vec![OP_ACTOR_NOP];
+        data.extend_from_slice(&NPC_SERVER_ID.to_le_bytes());
+        data.push(OP_END);
+        let mut e = vm(data, vec![]);
+        assert_eq!(
+            e.step(),
+            StepResult::Waiting,
+            "the deprecated yield holds the frame"
+        );
+        e.tick(1.0 / 60.0);
+        assert_eq!(e.step(), StepResult::Done, "the next frame runs past it");
+        assert_eq!(e.exec_pointer(), 5);
+        assert!(e.take_cues().is_empty());
+    }
+
+    /// 0x98 yields while the zone is reading data; this VM starts no zone
+    /// read, so it takes the one-byte advance
+    /// (research/XiEvents/OpCodes/0x0098.md).
+    #[test]
+    fn zone_read_yield_advances_past_itself() {
+        let mut e = vm(vec![OP_ZONE_READ_YIELD, OP_END], vec![]);
+        assert_eq!(e.step(), StepResult::Done);
+        assert_eq!(e.exec_pointer(), 1);
+    }
+
+    #[test]
+    fn anim_yield_parks_while_the_event_entity_animates() {
+        let key: [u8; 4] = *b"abcd";
+        let program = || vm(vec![OP_ANIM_YIELD, OP_END], vec![]);
+        let mut e = program();
+        assert_eq!(
+            e.step(),
+            StepResult::Done,
+            "no animation: the yield falls through"
+        );
+        assert_eq!(e.exec_pointer(), 1);
+        let mut e = program();
+        e.hold_action(ActorLookup::EVENT_ENTITY, key, WAIT_UNITS_PER_SEC);
+        assert_eq!(
+            e.step(),
+            StepResult::Waiting,
+            "a running animation parks the yield"
+        );
+        e.tick(1.1);
+        assert_eq!(e.step(), StepResult::Done, "an expired hold falls through");
+    }
+
+    /// A 0x9B after a 0x6E on the event entity in one pass parks on the
+    /// same-batch start, the way retail's AnimationPlay goes up at the emote
+    /// (research/XiEvents/OpCodes/0x009B.md).
+    #[test]
+    fn anim_yield_parks_on_the_same_pass_emote() {
+        let mut data = vec![OP_EMOT];
+        data.extend_from_slice(&ActorLookup::EVENT_ENTITY.0.to_le_bytes());
+        data.extend_from_slice(&REF0);
+        data.push(OP_ANIM_YIELD);
+        data.push(OP_END);
+        let mut e = vm(data, vec![7]);
+        assert_eq!(e.step(), StepResult::Waiting);
+    }
+
+    #[test]
+    fn yield_forever_parks_without_advancing() {
+        let mut e = vm(vec![OP_YIELD_FOREVER, OP_END], vec![]);
+        for frame in 0..3 {
+            assert_eq!(
+                e.step(),
+                StepResult::Waiting,
+                "frame {frame}: the deprecated yield never advances"
+            );
+            assert_eq!(e.exec_pointer(), 0, "frame {frame}: the pointer holds");
+            e.tick(1.0 / 60.0);
+        }
+    }
+
+    /// The liveness classification: one program per Park variant, the input
+    /// the host's stall check reads between steps.
+    #[test]
+    fn park_classifies_each_yield_state() {
+        let mut e = vm(vec![OP_END], vec![]);
+        assert_eq!(e.step(), StepResult::Done);
+        assert_eq!(e.park(), Park::None, "an ended VM is not parked");
+
+        let mut e = vm(vec![OP_MESSAGE, 0x00, 0x80, OP_MESWAIT, OP_END], vec![100]);
+        assert!(matches!(e.step(), StepResult::AwaitMessage(_)));
+        assert_eq!(
+            e.park(),
+            Park::Frame,
+            "a displayed frame waits on the player"
+        );
+
+        let mut e = vm(vec![OP_WAIT, 0x28, 0x01, OP_END], vec![]);
+        assert_eq!(e.step(), StepResult::Waiting);
+        assert_eq!(e.park(), Park::TimedWait, "a timed wait has units left");
+
+        let mut e = vm(
+            vec![
+                OP_WAITSCHEDULOR,
+                0xF8,
+                0xFF,
+                0xFF,
+                0x7F,
+                0,
+                0,
+                0,
+                0,
+                b'm',
+                b'a',
+                b'i',
+                b'n',
+                OP_END,
+            ],
+            vec![],
+        );
+        e.hold_action_pending(ActorLookup::EVENT_ENTITY, *b"main");
+        assert_eq!(e.step(), StepResult::Waiting);
+        assert_eq!(
+            e.park(),
+            Park::Hold,
+            "a pending hold is the host's to release"
+        );
+
+        // Case 0 sends the tag and runs into its case-1 poll, which yields
+        // until the s2c ack (research/XiEvents/OpCodes/0x0043.md).
+        let mut e = vm(vec![OP_SENDTAG, 0x00, OP_SENDTAG, 0x01, OP_END], vec![]);
+        assert!(matches!(e.step(), StepResult::AwaitServerAck(_)));
+        assert_eq!(
+            e.park(),
+            Park::ServerAck,
+            "a pending tag waits on the s2c ack"
+        );
+
+        let mut e = vm(vec![OP_YIELD_FOREVER, OP_END], vec![]);
+        assert_eq!(e.step(), StepResult::Waiting);
+        assert_eq!(
+            e.park(),
+            Park::Dead,
+            "a yield with nothing armed moves on no clock"
+        );
+    }
+
+    /// force_cancel ends the event from the host side: a VM parked on each
+    /// Park variant reports Cancelled from the next step, and reads as
+    /// un-parked after.
+    #[test]
+    fn force_cancel_reports_cancelled_from_every_park() {
+        let programs = [
+            (vec![OP_END], vec![]),
+            (vec![OP_MESSAGE, 0x00, 0x80, OP_MESWAIT, OP_END], vec![100]),
+            (vec![OP_WAIT, 0x28, 0x01, OP_END], vec![]),
+            (vec![OP_YIELD_FOREVER, OP_END], vec![]),
+            (vec![OP_SENDTAG, 0x00, OP_SENDTAG, 0x01, OP_END], vec![]),
+        ];
+        for (data, references) in programs {
+            let mut e = vm(data, references);
+            e.step();
+            e.force_cancel();
+            assert_eq!(
+                e.step(),
+                StepResult::Cancelled,
+                "the force-cancelled VM ends cancelled"
+            );
+            assert_eq!(e.park(), Park::None, "a cancelled VM is not parked");
+        }
+        // The Hold variant needs its hold armed before the step.
+        let mut e = vm(
+            vec![
+                OP_WAITSCHEDULOR,
+                0xF8,
+                0xFF,
+                0xFF,
+                0x7F,
+                0,
+                0,
+                0,
+                0,
+                b'm',
+                b'a',
+                b'i',
+                b'n',
+                OP_END,
+            ],
+            vec![],
+        );
+        e.hold_action_pending(ActorLookup::EVENT_ENTITY, *b"main");
+        e.step();
+        e.force_cancel();
+        assert_eq!(e.step(), StepResult::Cancelled);
+    }
+
+    #[test]
+    fn entity_valid_branches_on_the_pool() {
+        const NPC: u32 = 0x0100_02C5;
+        let program = |references: Vec<u32>| {
+            let mut data = vec![OP_ENTITY_VALID];
+            data.extend_from_slice(&REF0);
+            data.extend_from_slice(&8u16.to_le_bytes());
+            data.extend_from_slice(&[OP_WAIT, 0x01, 0x80]);
+            data.push(OP_END);
+            (data, references)
+        };
+        let (data, references) = program(vec![NPC]);
+        let mut e = vm(data, references);
+        e.set_actor_types(&bridge_types(NPC));
+        assert_eq!(
+            e.step(),
+            StepResult::Waiting,
+            "a published entity runs on past the opcode into the wait"
+        );
+        let (data, references) = program(vec![0x0100_9999]);
+        let mut e = vm(data, references);
+        assert_eq!(
+            e.step(),
+            StepResult::Done,
+            "an unpublished entity takes the else-target"
+        );
+        assert_eq!(e.exec_pointer(), 8);
+        let (data, references) = program(vec![ActorLookup::EVENT_ENTITY.0]);
+        let mut e = vm(data, references);
+        e.set_actor_types(&bridge_types(NPC));
+        assert_eq!(
+            e.step(),
+            StepResult::Done,
+            "a reserved selector names no pool entry"
+        );
+    }
+
+    /// 0xC1 emits the stop-all for a resolved actor and parks one frame; an
+    /// actor retail's GetActorIndex would drop emits nothing but still parks
+    /// (research/XiEvents/OpCodes/0x00C1.md).
+    #[test]
+    fn kill_last_action_stops_the_resolved_actor_and_yields() {
+        const NPC: u32 = 0x0100_02C5;
+        let program = |actor: u32| {
+            let mut data = vec![OP_KILL_LAST_ACTION];
+            data.extend_from_slice(&actor.to_le_bytes());
+            data.push(OP_END);
+            data
+        };
+        let mut e = vm(program(NPC), vec![]);
+        e.set_actor_types(&bridge_types(NPC));
+        assert_eq!(e.step(), StepResult::Waiting, "the kill yields its frame");
+        assert_eq!(
+            e.take_cues(),
+            vec![EventCue::ActorStopAction {
+                actor: ActorLookup(NPC),
+                key: None,
+            }]
+        );
+        e.tick(1.0 / 60.0);
+        assert_eq!(e.step(), StepResult::Done);
+        assert_eq!(e.exec_pointer(), 5);
+        let mut e = vm(program(0x0100_9999), vec![]);
+        assert_eq!(
+            e.step(),
+            StepResult::Waiting,
+            "an unresolved actor still yields"
+        );
+        assert!(
+            e.take_cues().is_empty(),
+            "an actor retail would drop emits nothing"
+        );
+        e.tick(1.0 / 60.0);
+        assert_eq!(e.step(), StepResult::Done);
+    }
+
     /// `OP_MAPSCHEDULOR` starts the zone-level routine (kuluu resolves the key
     /// out of the current zone's own model DAT); the key sits at @9 like the
     /// WAIT family's, and both actors ride along for the host
@@ -3177,15 +4912,87 @@ mod tests {
         assert_eq!(e.exec_pointer(), 3);
     }
 
+    /// 0x82 RANGE_RECT hit-tests the event entity's tracked position against the
+    /// zone range rect named by the u32 at +1: a hit advances 7, a miss (outside
+    /// the box, or no rect) jumps to the u16 at +5
+    /// (research/XiEvents/OpCodes/0x0082.md).
     #[test]
-    fn unimplemented_jump_opcode_stops() {
-        // 0x44 is a jumping opcode we don't implement; it must not be skipped by
-        // size (that would desync ExecPointer), so the VM stops.
-        const OP_UNIMPLEMENTED_JUMP: u8 = 0x44;
-        assert!(OPCODE_META[OP_UNIMPLEMENTED_JUMP as usize].jumps);
-        let mut e = vm(vec![OP_UNIMPLEMENTED_JUMP, 0, 0, 0, 0, 0, 0], vec![]);
-        assert_eq!(e.step(), StepResult::Unimplemented(OP_UNIMPLEMENTED_JUMP));
-        assert_eq!(e.exec_pointer(), 0);
+    fn range_rect_hit_tests_the_event_entity() {
+        use ffxi_dat::datid::DatId;
+        use ffxi_dat::zone_interaction::ZoneInteraction;
+        fn box_rect(source: [u8; 4]) -> ZoneInteraction {
+            ZoneInteraction {
+                position: [0.0, 0.0, 0.0],
+                rect_class: 0,
+                orientation: [0.0, 0.0, 0.0],
+                size: [10.0, 10.0, 10.0],
+                source_id: DatId(source),
+                dest_id: None,
+                param: 0,
+                terrain_flags: 0,
+                map_id: 0,
+                elevator_bottom_y: 0.0,
+                elevator_top_y: 0.0,
+            }
+        }
+        let source: [u8; 4] = *b"test";
+        let rect_id = u32::from_le_bytes(source);
+        let rects = std::sync::Arc::new(vec![box_rect(source)]);
+
+        let mut data = vec![OP_RANGE_RECT];
+        data.extend_from_slice(&rect_id.to_le_bytes());
+        data.extend_from_slice(&10u16.to_le_bytes());
+        data.push(OP_END);
+        data.push(0xFF);
+        data.push(0xFF);
+        data.push(OP_END);
+        let dat = std::sync::Arc::new(ffxi_dat::event_dat::EventDat {
+            blocks: vec![block(vec![OP_END], vec![])],
+        });
+
+        let mut e = vm(data.clone(), vec![]);
+        e.set_zone_rects(rects.clone());
+        e.attach_scene(
+            dat.clone(),
+            ffxi_dat::event_dat::ZONE_PLAYER_ACTOR,
+            crate::vm::scene::EventPosition {
+                x: 0,
+                y: 0,
+                z: 0,
+                heading: 0,
+            },
+        );
+        assert_eq!(e.step(), StepResult::Done);
+        assert_eq!(e.exec_pointer(), 7, "a hit advances 7");
+
+        let mut e = vm(data.clone(), vec![]);
+        e.set_zone_rects(rects.clone());
+        e.attach_scene(
+            dat.clone(),
+            ffxi_dat::event_dat::ZONE_PLAYER_ACTOR,
+            crate::vm::scene::EventPosition {
+                x: 6000,
+                y: 0,
+                z: 0,
+                heading: 0,
+            },
+        );
+        assert_eq!(e.step(), StepResult::Done);
+        assert_eq!(e.exec_pointer(), 10, "a miss jumps to the u16 at +5");
+
+        let mut e = vm(data.clone(), vec![]);
+        e.attach_scene(
+            dat.clone(),
+            ffxi_dat::event_dat::ZONE_PLAYER_ACTOR,
+            crate::vm::scene::EventPosition {
+                x: 0,
+                y: 0,
+                z: 0,
+                heading: 0,
+            },
+        );
+        assert_eq!(e.step(), StepResult::Done);
+        assert_eq!(e.exec_pointer(), 10, "no rect table misses");
     }
 
     /// The actor-driven waits all reduce to retail's own "no such entity"
@@ -3196,14 +5003,10 @@ mod tests {
         for (op, size) in [
             (OP_LOADWAIT, LOADWAIT_SIZE),
             (OP_TURNCHECK, LOADWAIT_SIZE),
-            (OP_ANIMWAIT, LOADWAIT_SIZE),
-            (OP_EMOT, EMOT_SIZE),
-            (OP_TRANSPAR, TRANSPAR_SIZE),
             (OP_MAPLOAD, MAPLOAD_SIZE),
             (OP_MAPLOAD_KEEP, MAPLOAD_SIZE),
             (OP_MUSICREADWAIT, YIELD_SIZE),
             (OP_YIELD, YIELD_SIZE),
-            (OP_PLAYANIM, PLAYANIM_SIZE),
         ] {
             assert_eq!(
                 OPCODE_META[op as usize].size as usize, size,
@@ -3220,6 +5023,47 @@ mod tests {
             );
             assert_eq!(e.exec_pointer(), size, "op 0x{op:02X} advanced wrong size");
         }
+    }
+
+    /// 0x6C emits the fade cue and parks the script for the authored frame
+    /// count; a zero-length fade still costs one frame, retail's `AlphaTime`
+    /// 0 → 1 (research/XiEvents/OpCodes/0x006C.md).
+    #[test]
+    fn transpar_opcode_parks_for_its_fade_length() {
+        let program = || {
+            let mut data = vec![OP_TRANSPAR];
+            data.extend_from_slice(&NPC_SERVER_ID.to_le_bytes());
+            data.extend_from_slice(&REF0);
+            data.extend_from_slice(&REF1);
+            data.push(OP_END);
+            data
+        };
+        let mut e = vm(program(), vec![128, 60]);
+        assert_eq!(e.step(), StepResult::Waiting, "the fade is running");
+        assert_eq!(
+            e.take_cues(),
+            [EventCue::Transpar {
+                actor: ActorLookup(NPC_SERVER_ID),
+                end_alpha: 128,
+                duration_frames: 60,
+            }]
+        );
+        e.tick(0.5);
+        assert_eq!(e.step(), StepResult::Waiting, "half way is still waiting");
+        e.tick(0.6);
+        assert_eq!(e.step(), StepResult::Done);
+
+        let mut e = vm(program(), vec![0, 0]);
+        assert_eq!(e.step(), StepResult::Waiting);
+        assert_eq!(
+            e.take_cues(),
+            [EventCue::Transpar {
+                actor: ActorLookup(NPC_SERVER_ID),
+                end_alpha: 0,
+                duration_frames: 1,
+            }],
+            "a zero-length fade reads as one frame"
+        );
     }
 
     /// 0x3E BITTEST program: bit index from References[1], work word named by
@@ -3297,6 +5141,61 @@ mod tests {
         e.select_choice(Some(1));
         assert_eq!(e.step(), StepResult::Done);
         assert_eq!(e.exec_pointer(), 8);
+    }
+
+    /// 8700's favorites branch: a bare 0x25 after the menu that answered the
+    /// previous 0x25. Retail steps past it (`!PTR_TalkWinFlag`) and the IF
+    /// behind it reads the slot the player already picked
+    /// (research/XiEvents/OpCodes/0x0025.md). Layout: [0..7] QUERY,
+    /// [7] QUERYWAIT, [8] QUERYWAIT (bare), [9] END.
+    #[test]
+    fn op_25_querywait_with_no_menu_open_skips_and_keeps_the_last_selection() {
+        let data = vec![
+            OP_QUERY,
+            0x00,
+            0x80,
+            0x01,
+            0x80,
+            0x00,
+            0x00,
+            OP_QUERYWAIT,
+            OP_QUERYWAIT,
+            OP_END,
+        ];
+        let mut e = vm(data, vec![500, 0]);
+        assert!(matches!(e.step(), StepResult::AwaitChoice(_)));
+        e.select_choice(Some(2));
+        assert_eq!(e.step(), StepResult::Done);
+        assert_eq!(e.exec_pointer(), 9, "the bare QUERYWAIT is one byte");
+        assert_eq!(e.work_zone(0), 2, "the earlier selection survives the skip");
+    }
+
+    /// A 0x25 with nothing armed at all: the event starts on it and runs on.
+    #[test]
+    fn op_25_querywait_as_the_first_opcode_runs_on() {
+        let mut e = vm(vec![OP_QUERYWAIT, OP_END], vec![]);
+        assert_eq!(e.step(), StepResult::Done);
+        assert_eq!(e.exec_pointer(), 1);
+    }
+
+    /// A message frame with no MESWAIT behind it, then a bare 0x25: the frame
+    /// shows, the host dismisses it, and the 0x25 skips instead of parking.
+    #[test]
+    fn op_25_querywait_after_a_dismissed_message_skips() {
+        let data = vec![OP_MESSAGE, 0x00, 0x80, OP_QUERYWAIT, OP_END];
+        let mut e = vm(data, vec![900]);
+        assert!(matches!(e.step(), StepResult::AwaitMessage(_)));
+        e.dismiss_message();
+        assert_eq!(e.step(), StepResult::Done);
+        assert_eq!(e.exec_pointer(), 4);
+    }
+
+    /// 0x7F takes the same no-window exit as 0x25.
+    #[test]
+    fn op_7f_querywait2_with_no_menu_open_skips() {
+        let mut e = vm(vec![OP_QUERYWAIT2, OP_END], vec![]);
+        assert_eq!(e.step(), StepResult::Done);
+        assert_eq!(e.exec_pointer(), 1);
     }
 
     /// Unlike 0x25, a cancelled menu stores 255 and the event runs on.
@@ -3727,9 +5626,9 @@ mod tests {
     }
 
     use crate::cue::{
-        ExtSchedulerMotion, FourCc, TpcMotionPackages, LOOKUP_TARGET_INDEX_MASK,
-        SCHEDULER_DURATION_FROM_DAT, SCHEDULER_FADE_DAT_ID, SCHEDULER_TAG_FADE_IN,
-        SCHEDULER_TAG_FADE_OUT, TPC_PACKAGE_OUT_OF_RANGE,
+        ExtSchedulerMotion, FourCc, TpcMotionPackages, EVENT_MOTION_BAND_4,
+        LOOKUP_TARGET_INDEX_MASK, SCHEDULER_DURATION_FROM_DAT, SCHEDULER_FADE_DAT_ID,
+        SCHEDULER_TAG_FADE_IN, SCHEDULER_TAG_FADE_OUT, TPC_PACKAGE_OUT_OF_RANGE,
     };
 
     /// Run one choreography opcode (padded to its documented width) to END and
@@ -3823,7 +5722,531 @@ mod tests {
         }
     }
 
-    /// 0x2C's third operand is an ASCII action key, not a numeric id.
+    /// 0x73's work operand is a spell animation index; the cue is the spell
+    /// effect DAT's `main` on actor1 with actor2 as the target, the gate guard's
+    /// Signet (497) and home point (504) casts being the authored cases
+    /// (research/XiEvents/OpCodes/0x0073.md).
+    #[test]
+    fn magic_schedulor_opcode_emits_the_spell_dat_main_routine() {
+        const SIGNET_ANIMATION: u32 = 497;
+        const HOME_POINT_ANIMATION: u32 = 504;
+        for animation in [SIGNET_ANIMATION, HOME_POINT_ANIMATION] {
+            let mut operands = REF0.to_vec();
+            operands.extend_from_slice(&LOOKUP_EVENT_ENTITY.to_le_bytes());
+            operands.extend_from_slice(&ActorLookup::LOCAL_PLAYER.0.to_le_bytes());
+            assert_eq!(
+                cues_of(OP_MAGICSCHEDULOR, &operands, vec![animation]),
+                [EventCue::Scheduler {
+                    dat_id: MAGIC_DAT_ID_BASE + animation,
+                    actor1: ActorLookup::EVENT_ENTITY,
+                    actor2: ActorLookup::LOCAL_PLAYER,
+                    tag: MAGIC_ROUTINE_TAG,
+                    duration: SCHEDULER_DURATION_FROM_DAT,
+                }]
+            );
+        }
+    }
+
+    /// A work operand that is not a u16 names no spell DAT: the opcode is
+    /// stepped over with no cue, and the program continues.
+    #[test]
+    fn magic_schedulor_opcode_with_no_animation_emits_nothing() {
+        let mut operands = REF0.to_vec();
+        operands.extend_from_slice(&LOOKUP_EVENT_ENTITY.to_le_bytes());
+        operands.extend_from_slice(&ActorLookup::LOCAL_PLAYER.0.to_le_bytes());
+        assert!(cues_of(OP_MAGICSCHEDULOR, &operands, vec![u32::MAX]).is_empty());
+    }
+
+    /// 0x50 ENDSCHEDULOR: kill the tag-named action on actor1, actor2 riding
+    /// along; a zero word or four spaces names no routine slot
+    /// (research/XiEvents/OpCodes/0x0050.md).
+    #[test]
+    fn end_schedulor_emits_the_stop_action_cue() {
+        const NPC: u32 = 0x0100_02C5;
+        let operands = |tag: FourCc| {
+            let mut o = NPC.to_le_bytes().to_vec();
+            o.extend_from_slice(&NPC.to_le_bytes());
+            o.extend_from_slice(&tag);
+            o
+        };
+        assert_eq!(
+            cues_of(OP_ENDSCHEDULOR, &operands(*b"sswh"), vec![]),
+            [EventCue::ActorStopAction {
+                actor: ActorLookup(NPC),
+                key: Some(*b"sswh"),
+            }]
+        );
+        for tag in [STOP_TAG_ZERO, STOP_TAG_SPACES] {
+            assert_eq!(
+                cues_of(OP_ENDSCHEDULOR, &operands(tag), vec![]),
+                [EventCue::ActorStopAction {
+                    actor: ActorLookup(NPC),
+                    key: None,
+                }]
+            );
+        }
+    }
+
+    /// 0x52 ENDLOADSCHEDULER_Main: the same kill with the DAT-selector work
+    /// operand at +1, which the stop cue does not carry (the arm does not read
+    /// it), actor1 at +3, the tag at +11
+    /// (research/XiEvents/OpCodes/0x0052.md).
+    #[test]
+    fn end_loads_scheduler_main_emits_the_stop_action_cue() {
+        const NPC: u32 = 0x0100_02C5;
+        let mut operands = REF0.to_vec();
+        operands.extend_from_slice(&NPC.to_le_bytes());
+        operands.extend_from_slice(&NPC.to_le_bytes());
+        operands.extend_from_slice(b"sswh");
+        assert_eq!(
+            cues_of(OP_ENDLOADSCHEDULER_MAIN, &operands, vec![0]),
+            [EventCue::ActorStopAction {
+                actor: ActorLookup(NPC),
+                key: Some(*b"sswh"),
+            }]
+        );
+    }
+
+    /// The 0x52 twins share the layout and the cue, each on its own DAT base
+    /// (research/XiEvents/OpCodes/0x00A3.md).
+    #[test]
+    fn end_loads_scheduler_twin_emits_the_stop_action_cue() {
+        const NPC: u32 = 0x0100_02C5;
+        let mut operands = REF0.to_vec();
+        operands.extend_from_slice(&NPC.to_le_bytes());
+        operands.extend_from_slice(&NPC.to_le_bytes());
+        operands.extend_from_slice(b"sswh");
+        assert_eq!(
+            cues_of(OP_ENDLOADSCHED_TWIN_A3, &operands, vec![0]),
+            [EventCue::ActorStopAction {
+                actor: ActorLookup(NPC),
+                key: Some(*b"sswh"),
+            }]
+        );
+    }
+
+    /// The 0x45 twins load their scheduler DAT from their own base plus the raw
+    /// work value — the `dat_id_helper` remap is the 0x45-only branch, so a
+    /// mid-band reference (400) must land at `base + 400`, not `base + 25937 + 400`
+    /// (research/XiEvents/OpCodes/0x0045.md).
+    #[test]
+    fn scheduler_twin_uses_its_base_without_the_dat_id_helper() {
+        const WORK: u32 = 400;
+        for (op, base) in [
+            (OP_SCHED_TWIN_62, 5012u32),
+            (OP_SCHED_TWIN_9F, 51183),
+            (OP_SCHED_TWIN_BB, 56685),
+            (OP_SCHED_TWIN_C5, 67355),
+            (OP_SCHED_TWIN_CD, 70435),
+            (OP_SCHED_TWIN_D0, 70691),
+            (OP_SCHED_TWIN_D5, 102449),
+        ] {
+            let mut operands = REF0.to_vec();
+            operands.extend_from_slice(&LOOKUP_EVENT_ENTITY.to_le_bytes());
+            operands.extend_from_slice(&ActorLookup::LOCAL_PLAYER.0.to_le_bytes());
+            operands.extend_from_slice(&MAGIC_ROUTINE_TAG);
+            operands.extend_from_slice(&REF1);
+            assert_eq!(
+                cues_of(
+                    op,
+                    &operands,
+                    vec![WORK, SCHEDULER_DURATION_FROM_DAT as u32]
+                ),
+                [EventCue::Scheduler {
+                    dat_id: base + WORK,
+                    actor1: ActorLookup::EVENT_ENTITY,
+                    actor2: ActorLookup::LOCAL_PLAYER,
+                    tag: MAGIC_ROUTINE_TAG,
+                    duration: SCHEDULER_DURATION_FROM_DAT,
+                }],
+                "op 0x{op:02X}"
+            );
+        }
+    }
+
+    /// 0xC4 is the 0x73 cast with a case byte: the key shifts to +2, actor2 to
+    /// +8, and the advance is 12 (11 + param1), not the 11 the table records.
+    /// The key's reference high byte doubles as actor1's low byte, so actor1 is
+    /// a server id whose low byte is 0x80
+    /// (research/XiEvents/OpCodes/0x00C4.md, research/XiEvents/OpCodes/0x0073.md).
+    #[test]
+    fn magic_twin_0xc4_casts_and_advances_twelve() {
+        const ANIMATION: u32 = 497;
+        const ACTOR1: u32 = 0x0100_0080;
+        let mut data = vec![OP_MAGIC_TWIN, 0x00];
+        data.extend_from_slice(&REF0);
+        data.extend_from_slice(&[0x00, 0x00, 0x01]);
+        data.push(0x00);
+        data.extend_from_slice(&ActorLookup::LOCAL_PLAYER.0.to_le_bytes());
+        data.push(OP_END);
+        let mut e = vm(data, vec![ANIMATION]);
+        assert_eq!(e.step(), StepResult::Done);
+        assert_eq!(e.exec_pointer(), MAGIC_TWIN_SIZE, "0xC4 must advance 12");
+        assert_eq!(
+            e.take_cues(),
+            [EventCue::Scheduler {
+                dat_id: MAGIC_DAT_ID_BASE + ANIMATION,
+                actor1: ActorLookup(ACTOR1),
+                actor2: ActorLookup::LOCAL_PLAYER,
+                tag: MAGIC_ROUTINE_TAG,
+                duration: SCHEDULER_DURATION_FROM_DAT,
+            }]
+        );
+    }
+
+    /// Without scene data, 0x32 arms the speed and 0x1F case 0 walks the event
+    /// entity to its goal; the goal reads x@2, z@4, y@6
+    /// (research/XiEvents/OpCodes/0x001F.md, research/XiEvents/OpCodes/0x0032.md).
+    #[test]
+    fn main_speed_arms_the_non_scene_move() {
+        const MOVE_CASE_WALK: u8 = 0x00;
+        let mut data = vec![OP_MAIN_SPEED];
+        data.extend_from_slice(&REF0);
+        data.push(crate::opcode_meta::OP_MOVE);
+        data.push(MOVE_CASE_WALK);
+        data.extend_from_slice(&REF1);
+        data.extend_from_slice(&REF2);
+        data.extend_from_slice(&REF3);
+        data.push(OP_END);
+        let mut e = vm(data, vec![10, 20, 40, (-5_i32) as u32]);
+        assert_eq!(e.step(), StepResult::Done);
+        assert_eq!(
+            e.take_cues(),
+            [EventCue::ActorMove {
+                actor: ActorLookup::EVENT_ENTITY,
+                goal: crate::vm::scene::EventPosition {
+                    x: 20,
+                    z: 40,
+                    y: -5,
+                    heading: 0,
+                },
+                speed: 10,
+                max_time: None,
+            }]
+        );
+    }
+
+    /// 0x1F case 1 parks on the host-armed move hold and advances once it is
+    /// released (research/XiEvents/OpCodes/0x001F.md).
+    #[test]
+    fn non_scene_move_case1_holds_on_the_move_hold() {
+        let program = || vec![crate::opcode_meta::OP_MOVE, 0x01, OP_END];
+        let mut e = vm(program(), vec![]);
+        e.hold_move(ActorLookup::EVENT_ENTITY, 5.0);
+        assert_eq!(e.step(), StepResult::Waiting, "the move is running");
+        e.tick(5.0 / WAIT_UNITS_PER_SEC);
+        assert_eq!(e.step(), StepResult::Done, "the move is over");
+    }
+
+    /// 0x31 mode 0 arms the goal (refs 1/2/3) and the MoveTime budget (ref 0),
+    /// advancing ten bytes with no cue (research/XiEvents/OpCodes/0x0031.md).
+    #[test]
+    fn smove_mode0_arms_the_goal_and_time() {
+        let mut data = vec![OP_SMOVE, 0x00];
+        data.extend_from_slice(&REF1);
+        data.extend_from_slice(&REF2);
+        data.extend_from_slice(&REF3);
+        data.extend_from_slice(&REF0);
+        data.push(OP_END);
+        let mut e = vm(data, vec![4000, 20, 40, (-5_i32) as u32]);
+        assert_eq!(e.step(), StepResult::Done);
+        assert!(e.take_cues().is_empty(), "mode 0 emits no cue");
+    }
+
+    /// 0x31 mode 1 walks the event entity to the mode-0 goal at the 0x32
+    /// speed, carries the MoveTime budget as the cue's cap, and parks until the
+    /// move hold releases it (research/XiEvents/OpCodes/0x0031.md).
+    #[test]
+    fn smove_mode1_walks_and_parks_on_the_move_hold() {
+        let mut data = vec![OP_SMOVE, 0x00];
+        data.extend_from_slice(&REF1);
+        data.extend_from_slice(&REF2);
+        data.extend_from_slice(&REF3);
+        data.extend_from_slice(&REF0);
+        data.push(OP_SMOVE);
+        data.push(0x01);
+        data.push(OP_END);
+        let mut e = vm(data, vec![4000, 20, 40, (-5_i32) as u32]);
+        assert_eq!(
+            e.step(),
+            StepResult::Waiting,
+            "mode 0 arms, mode 1 emits the cue and parks"
+        );
+        assert_eq!(
+            e.take_cues(),
+            [EventCue::ActorMove {
+                actor: ActorLookup::EVENT_ENTITY,
+                goal: crate::vm::scene::EventPosition {
+                    x: 20,
+                    z: 40,
+                    y: -5,
+                    heading: 0,
+                },
+                speed: 0,
+                max_time: Some(4.0),
+            }]
+        );
+        e.hold_move(ActorLookup::EVENT_ENTITY, 5.0);
+        assert_eq!(e.step(), StepResult::Waiting, "the move is running");
+        e.tick(5.0 / WAIT_UNITS_PER_SEC);
+        assert_eq!(e.step(), StepResult::Done, "the move is over");
+    }
+
+    /// 0x31 mode 1 with no mode-0 goal emits no cue and falls through, the way
+    /// retail's zero MovePosition snaps immediately (research/XiEvents/OpCodes/
+    /// 0x0031.md).
+    #[test]
+    fn smove_mode1_without_a_goal_falls_through() {
+        let data = vec![OP_SMOVE, 0x01, OP_END];
+        let mut e = vm(data, vec![]);
+        assert_eq!(e.step(), StepResult::Done);
+        assert!(e.take_cues().is_empty(), "no goal, no cue");
+    }
+
+    /// 0x31's undocumented cases stop the VM rather than guessing a width
+    /// (research/XiEvents/OpCodes/0x0031.md).
+    #[test]
+    fn smove_unknown_case_stops() {
+        let data = vec![OP_SMOVE, 0x02, OP_END];
+        let mut e = vm(data, vec![]);
+        assert_eq!(e.step(), StepResult::Unimplemented(OP_SMOVE));
+    }
+
+    /// 0x72 mode 0 kicks off the forecast read: it advances past itself and
+    /// yields one frame the way retail's async read does, then mode 1 copies
+    /// the region's three forecast values into Work_Zone[2..5)
+    /// (research/XiEvents/OpCodes/0x0072.md).
+    #[test]
+    fn getweather_reads_the_forecast_into_work_zone() {
+        let mut data = vec![OP_GETWEATHER, 0x00];
+        data.extend_from_slice(&REF0);
+        data.push(OP_GETWEATHER);
+        data.push(0x01);
+        data.extend_from_slice(&REF0);
+        data.extend_from_slice(&REF1);
+        data.push(OP_END);
+        let mut head_low = [0u8; ffxi_dat::weather::FORECAST_HEADS_LOW];
+        head_low[17] = 5;
+        let mut data_low = vec![0u32; 14000];
+        data_low[6785] = 111;
+        data_low[6786] = 222;
+        data_low[6787] = 333;
+        let forecast = ffxi_dat::weather::WeatherForecast::from_parts(
+            head_low,
+            data_low,
+            [0u8; ffxi_dat::weather::FORECAST_HEADS_HIGH],
+            vec![0u32; 14000],
+        );
+        let mut e = vm(data, vec![17, 100]);
+        e.set_weather_forecast(std::sync::Arc::new(forecast));
+        assert_eq!(e.step(), StepResult::Waiting, "mode 0 yields on the read");
+        e.tick(1.0 / WAIT_UNITS_PER_SEC);
+        assert_eq!(e.step(), StepResult::Done, "mode 1 reads and advances");
+        assert_eq!(e.work_zone(2), 111);
+        assert_eq!(e.work_zone(3), 222);
+        assert_eq!(e.work_zone(4), 333);
+        assert!(e.take_cues().is_empty(), "0x72 writes work, not cues");
+    }
+
+    /// A VM the host never gave the forecast table advances past 0x72 without
+    /// writing, like retail's unresolved early return
+    /// (research/XiEvents/OpCodes/0x0072.md).
+    #[test]
+    fn getweather_without_the_forecast_advances_without_writing() {
+        let mut data = vec![OP_GETWEATHER, 0x00];
+        data.extend_from_slice(&REF0);
+        data.push(OP_GETWEATHER);
+        data.push(0x01);
+        data.extend_from_slice(&REF0);
+        data.extend_from_slice(&REF1);
+        data.push(OP_END);
+        let mut e = vm(data, vec![17, 100]);
+        assert_eq!(e.step(), StepResult::Waiting);
+        e.tick(1.0 / WAIT_UNITS_PER_SEC);
+        assert_eq!(e.step(), StepResult::Done);
+        assert_eq!(e.work_zone(2), 0);
+        assert_eq!(e.work_zone(3), 0);
+        assert_eq!(e.work_zone(4), 0);
+    }
+
+    /// 0x72's undocumented sub-byte stops the VM rather than guessing a width
+    /// (research/XiEvents/OpCodes/0x0072.md).
+    #[test]
+    fn getweather_unknown_sub_byte_stops() {
+        let data = vec![OP_GETWEATHER, 0x02, OP_END];
+        let mut e = vm(data, vec![]);
+        assert_eq!(e.step(), StepResult::Unimplemented(OP_GETWEATHER));
+    }
+
+    /// 0x39 sets the event entity's facing from the raw work value
+    /// (research/XiEvents/OpCodes/0x0039.md).
+    #[test]
+    fn set_facing_faces_the_event_entity() {
+        assert_eq!(
+            cues_of(OP_SET_FACING, &REF0, vec![2048]),
+            [EventCue::ActorFace {
+                actor: ActorLookup::EVENT_ENTITY,
+                heading: 2048,
+            }]
+        );
+    }
+
+    /// 0x4B turns the named actor to the work-operand yaw
+    /// (research/XiEvents/OpCodes/0x004B.md).
+    #[test]
+    fn yaw_turns_the_named_actor() {
+        let mut operands = NPC_SERVER_ID.to_le_bytes().to_vec();
+        operands.extend_from_slice(&REF0);
+        assert_eq!(
+            cues_of(OP_YAW, &operands, vec![100]),
+            [EventCue::ActorFace {
+                actor: ActorLookup(NPC_SERVER_ID),
+                heading: 100,
+            }]
+        );
+    }
+
+    /// 0x36 places the event entity at the work-operand position, no heading
+    /// (research/XiEvents/OpCodes/0x0036.md).
+    #[test]
+    fn set_event_pos_places_the_event_entity() {
+        let mut operands = Vec::new();
+        operands.extend_from_slice(&REF0);
+        operands.extend_from_slice(&REF1);
+        operands.extend_from_slice(&REF2);
+        assert_eq!(
+            cues_of(OP_SET_EVENT_POS, &operands, vec![20, 40, 3]),
+            [EventCue::ActorPlace {
+                actor: ActorLookup::EVENT_ENTITY,
+                position: crate::vm::scene::EventPosition {
+                    x: 20,
+                    z: 40,
+                    y: 3,
+                    heading: 0,
+                },
+            }]
+        );
+    }
+
+    /// 0xBA places the named actor at the work-operand position and heading
+    /// (research/XiEvents/OpCodes/0x00BA.md).
+    #[test]
+    fn set_actor_pos_places_the_named_actor() {
+        let mut operands = NPC_SERVER_ID.to_le_bytes().to_vec();
+        operands.extend_from_slice(&REF0);
+        operands.extend_from_slice(&REF1);
+        operands.extend_from_slice(&REF2);
+        operands.extend_from_slice(&REF3);
+        assert_eq!(
+            cues_of(OP_SET_ACTOR_POS, &operands, vec![20, 40, 3, 512]),
+            [EventCue::ActorPlace {
+                actor: ActorLookup(NPC_SERVER_ID),
+                position: crate::vm::scene::EventPosition {
+                    x: 20,
+                    z: 40,
+                    y: 3,
+                    heading: 512,
+                },
+            }]
+        );
+    }
+
+    /// 0x7D runs the work-operand scheduler on the local player with the player
+    /// as its own target — the rank-up animations, tag `main`, no helper remap
+    /// (research/XiEvents/OpCodes/0x007D.md).
+    #[test]
+    fn local_player_scheduler_runs_on_the_player() {
+        const WORK: u32 = 100;
+        assert_eq!(
+            cues_of(OP_LOCAL_PLAYER_SCHEDULER, &REF0, vec![WORK]),
+            [EventCue::Scheduler {
+                dat_id: LOCAL_PLAYER_SCHEDULER_DAT_ID_BASE + WORK,
+                actor1: ActorLookup::LOCAL_PLAYER,
+                actor2: ActorLookup::LOCAL_PLAYER,
+                tag: MAGIC_ROUTINE_TAG,
+                duration: SCHEDULER_DURATION_FROM_DAT,
+            }]
+        );
+    }
+
+    /// A 0xC4 case past 2 arms no cast (retail's empty switch fall-through) yet
+    /// still advances the full 12-byte width
+    /// (research/XiEvents/OpCodes/0x00C4.md).
+    #[test]
+    fn magic_twin_0xc4_case_past_two_casts_nothing() {
+        let mut data = vec![OP_MAGIC_TWIN, 0x03];
+        data.extend_from_slice(&REF0);
+        data.extend_from_slice(&[0x00, 0x00, 0x01]);
+        data.push(0x00);
+        data.extend_from_slice(&ActorLookup::LOCAL_PLAYER.0.to_le_bytes());
+        data.push(OP_END);
+        let mut e = vm(data, vec![497]);
+        assert_eq!(e.step(), StepResult::Done);
+        assert_eq!(e.exec_pointer(), MAGIC_TWIN_SIZE);
+        assert!(e.take_cues().is_empty());
+    }
+
+    /// 0x6E's work value splits into the emote id (low byte) and the variant
+    /// selector (high byte); the cue names the actor the lookup operand picks
+    /// (research/XiEvents/OpCodes/0x006E.md).
+    #[test]
+    fn emot_opcode_emits_the_split_emote_cue() {
+        let mut operands = ActorLookup::LOCAL_PLAYER.0.to_le_bytes().to_vec();
+        operands.extend_from_slice(&REF0);
+        assert_eq!(
+            cues_of(OP_EMOT, &operands, vec![0x0201]),
+            [EventCue::Emote {
+                actor: ActorLookup::LOCAL_PLAYER,
+                emote_id: 1,
+                param: 2,
+            }]
+        );
+    }
+
+    /// 0x63 emotes the event entity, reading the same work slot as 0x6E
+    /// (research/XiEvents/OpCodes/0x0063.md).
+    #[test]
+    fn playanim_opcode_emotes_the_event_entity() {
+        let operands = REF0.to_vec();
+        assert_eq!(
+            cues_of(OP_PLAYANIM, &operands, vec![0x0004]),
+            [EventCue::Emote {
+                actor: ActorLookup::EVENT_ENTITY,
+                emote_id: 4,
+                param: 0,
+            }]
+        );
+    }
+
+    /// A 0x99 in the same pass as its 0x6E parks on the same-pass start, the
+    /// way retail's IsMovingAction sees the just-set animation
+    /// (research/XiEvents/OpCodes/0x0099.md).
+    #[test]
+    fn animwait_parks_on_the_same_pass_emote() {
+        let mut data = vec![OP_EMOT];
+        data.extend_from_slice(&ActorLookup::LOCAL_PLAYER.0.to_le_bytes());
+        data.extend_from_slice(&REF0);
+        data.push(OP_ANIMWAIT);
+        data.extend_from_slice(&ActorLookup::LOCAL_PLAYER.0.to_le_bytes());
+        data.push(OP_END);
+        let mut e = vm(data, vec![7]);
+        assert_eq!(e.step(), StepResult::Waiting);
+    }
+
+    /// With no emote armed, a 0x99 falls through to the next opcode, retail's
+    /// unresolved-entity path (research/XiEvents/OpCodes/0x0099.md).
+    #[test]
+    fn animwait_falls_through_with_no_armed_emote() {
+        let mut data = vec![OP_ANIMWAIT];
+        data.extend_from_slice(&ActorLookup::LOCAL_PLAYER.0.to_le_bytes());
+        data.push(OP_END);
+        let mut e = vm(data, vec![]);
+        assert_eq!(e.step(), StepResult::Done);
+        assert_eq!(e.exec_pointer(), 5);
+    }
+
+    /// 0x2C's third operand is an ASCII action key, not a numeric id
+    /// (research/XiEvents/OpCodes/0x002C.md).
     #[test]
     fn actor_motion_opcode_emits_its_ascii_action_key() {
         const KNEEL: FourCc = *b"kue0";
@@ -3841,7 +6264,8 @@ mod tests {
     }
 
     /// 0x4E's hide flag is bit 0 of the byte after the opcode; the target is the
-    /// lookup at +2 and the cue is event-scoped either way.
+    /// lookup at +2 and the cue is event-scoped either way
+    /// (research/XiEvents/OpCodes/0x004E.md).
     #[test]
     fn event_hide_opcode_emits_both_directions() {
         for (flag, hide) in [(1u8, true), (0, false)] {
@@ -3926,6 +6350,218 @@ mod tests {
                 OP_MAP_MARKER,
                 &ops2[1..],
                 vec![0, 230, 0, (-10264i32) as u32, (-363i32) as u32]
+            ),
+            [EventCue::MapMarker {
+                map_id: 230,
+                x_milli: -10264,
+                y_milli: -363,
+                name: *b"some name\0\0\0\0\0\0\0",
+            }]
+        );
+    }
+
+    /// `OP_OPEN_MAP` opens the map on the work-slot zone id, sub-menus
+    /// hidden (research/XiEvents/OpCodes/0x0089.md).
+    #[test]
+    fn open_map_opcode_emits_the_open_cue() {
+        assert_eq!(
+            cues_of(OP_OPEN_MAP, &REF1, vec![0, 230]),
+            [EventCue::MapOpen {
+                map_id: 230,
+                tutorial: false
+            }]
+        );
+    }
+
+    /// `OP_OPEN_MAP_PROPS`'s sub-menu property has no carrier field; the cue
+    /// carries the zone id only (research/XiEvents/OpCodes/0x008D.md).
+    #[test]
+    fn open_map_props_opcode_drops_its_property_operand() {
+        assert_eq!(
+            cues_of(OP_OPEN_MAP_PROPS, &[REF1, REF2].concat(), vec![0, 230, 5]),
+            [EventCue::MapOpen {
+                map_id: 230,
+                tutorial: false
+            }]
+        );
+    }
+
+    /// 0xD4 case 0 runs the 0x24 query helper and opens the current zone's map
+    /// (type 6), parking on the answer; the message and default-cursor selectors
+    /// sit at +2 and +4, where the embedded helper reads them
+    /// (research/XiEvents/OpCodes/0x00D4.md).
+    #[test]
+    fn map_query_case0_opens_the_map_and_parks_on_the_answer() {
+        let mut data = vec![OP_MAP_QUERY, 0x00];
+        data.extend_from_slice(&REF0);
+        data.extend_from_slice(&REF1);
+        data.extend_from_slice(&[0x00, 0x00]);
+        data.push(OP_END);
+        let mut e = vm(data, vec![500, 0]);
+        e.set_current_zone(283);
+        assert_eq!(
+            e.step(),
+            StepResult::AwaitChoice(EventChoice {
+                message_id: 500,
+                speaker_index: 5,
+                default_index: 0,
+                params: vec![],
+            })
+        );
+        let cues = e.take_cues();
+        assert!(
+            cues.contains(&EventCue::MapOpen {
+                map_id: 283,
+                tutorial: false
+            }),
+            "case 0 opens the current zone's map: {cues:?}"
+        );
+        e.select_choice(Some(1));
+        assert_eq!(e.step(), StepResult::Done);
+        assert_eq!(e.exec_pointer(), 8, "case 0 advances its 8-byte width");
+    }
+
+    /// 0xD4 case 2 runs the 0x24 query helper without the map, parking on the
+    /// answer (research/XiEvents/OpCodes/0x00D4.md).
+    #[test]
+    fn map_query_case2_parks_on_the_answer_without_the_map() {
+        let mut data = vec![OP_MAP_QUERY, 0x02];
+        data.extend_from_slice(&REF0);
+        data.extend_from_slice(&REF1);
+        data.extend_from_slice(&[0x00, 0x00]);
+        data.push(OP_END);
+        let mut e = vm(data, vec![500, 0]);
+        e.set_current_zone(283);
+        assert_eq!(
+            e.step(),
+            StepResult::AwaitChoice(EventChoice {
+                message_id: 500,
+                speaker_index: 5,
+                default_index: 0,
+                params: vec![],
+            })
+        );
+        assert!(e.take_cues().is_empty(), "case 2 opens no map");
+        e.select_choice(Some(1));
+        assert_eq!(e.step(), StepResult::Done);
+        assert_eq!(e.exec_pointer(), 8);
+    }
+
+    /// 0xD4 cases 1/3/4/5 copy into the client's query window, which has no
+    /// kuluu counterpart, so they advance by their width and emit no cue
+    /// (research/XiEvents/OpCodes/0x00D4.md).
+    #[test]
+    fn map_query_data_cases_advance_by_their_width() {
+        for (sub, width) in [(1u8, 8usize), (3, 6), (5, 12)] {
+            let mut data = vec![OP_MAP_QUERY, sub];
+            data.extend(std::iter::repeat_n(0, width - 2));
+            data.push(OP_END);
+            let mut e = vm(data, vec![]);
+            assert_eq!(e.step(), StepResult::Done, "case {sub}");
+            assert_eq!(e.exec_pointer(), width, "case {sub} advances {width}");
+            assert!(e.take_cues().is_empty(), "case {sub} emits no cue");
+        }
+    }
+
+    /// 0xD4's unknown cases stop the VM: it is a jumping opcode, so the
+    /// default arm's rule applies — no size-skip that would desync ExecPointer
+    /// (research/XiEvents/OpCodes/0x00D4.md).
+    #[test]
+    fn map_query_unknown_case_stops() {
+        let mut data = vec![OP_MAP_QUERY, 0x06, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        data.push(OP_END);
+        let mut e = vm(data, vec![]);
+        assert_eq!(e.step(), StepResult::Unimplemented(OP_MAP_QUERY));
+        assert_eq!(e.exec_pointer(), 0, "an unknown case does not advance");
+    }
+
+    /// 0xB3 RANKING: LSB has no ranking handler, so every case advances by
+    /// its width and emits no cue (research/XiEvents/OpCodes/0x00B3.md).
+    #[test]
+    fn ranking_cases_advance_by_their_widths() {
+        for (sub, width) in [
+            (0u8, 4usize),
+            (1, 14),
+            (2, 2),
+            (3, 4),
+            (4, 4),
+            (5, 18),
+            (6, 4),
+            (7, 4),
+            (8, 2),
+            (9, 4),
+            (0x0A, 2),
+        ] {
+            let mut data = vec![OP_RANKING, sub];
+            data.extend(std::iter::repeat_n(0, width - 2));
+            data.push(OP_END);
+            let mut e = vm(data, vec![]);
+            assert_eq!(e.step(), StepResult::Done, "case {sub}");
+            assert_eq!(e.exec_pointer(), width, "case {sub} advances {width}");
+            assert!(e.take_cues().is_empty(), "case {sub} emits no cue");
+        }
+    }
+
+    /// 0xB3's read cases fill the board's work slots from the server answer;
+    /// with no ranking server to answer, they write zeros so the board draws
+    /// empty instead of the event dying
+    /// (research/XiEvents/OpCodes/0x00B3.md).
+    #[test]
+    fn ranking_read_cases_zero_their_board_slots() {
+        let sel = |slot: u32| -> [u8; 2] { ((WORK_ZONE_BASE + slot) as u16).to_le_bytes() };
+        for (sub, width, slots, untouched) in [
+            (1u8, 14usize, &[2u32, 4, 6, 8, 2, 4][..], Some(3u32)),
+            (5, 18, &[2, 3, 4, 5, 6, 7, 8, 9][..], Some(10)),
+            (9, 4, &[2][..], Some(3)),
+        ] {
+            let mut data = vec![OP_RANKING, sub];
+            for &slot in slots {
+                data.extend_from_slice(&sel(slot));
+            }
+            data.extend(std::iter::repeat_n(0, width - 2 - 2 * slots.len()));
+            data.push(OP_END);
+            let mut e = EventVm::start(&block(data, vec![]), 7, 5, vec![1; 8]).unwrap();
+            if let Some(slot) = untouched {
+                if slot < 10 {
+                    assert_eq!(e.work_zone(slot as usize), 1, "params pre-set slot {slot}");
+                }
+            }
+            assert_eq!(e.step(), StepResult::Done, "case {sub}");
+            assert_eq!(e.exec_pointer(), width, "case {sub} advances {width}");
+            for &slot in slots {
+                assert_eq!(
+                    e.work_zone(slot as usize),
+                    0,
+                    "case {sub} zeroes slot {slot}"
+                );
+            }
+            if let Some(slot) = untouched {
+                assert_eq!(
+                    e.work_zone(slot as usize),
+                    if slot < 10 { 1 } else { 0 },
+                    "case {sub} leaves untouched slot {slot} alone"
+                );
+            }
+        }
+    }
+
+    /// `OP_MAP_ADD_MARK` carries the marker's zone id and milli-unit position
+    /// in work slots, its sub-menu and index operands uncarried, and its
+    /// 16-byte name inline with the underscore rewrite
+    /// (research/XiEvents/OpCodes/0x00B8.md).
+    #[test]
+    fn map_add_mark_opcode_carries_position_and_rewritten_name() {
+        let mut ops = [REF1, REF2, REF3].concat();
+        ops.extend_from_slice(&[4, 0x80]);
+        ops.extend_from_slice(&[5, 0x80]);
+        let mut name = [0u8; 16];
+        name[..9].copy_from_slice(b"some_name");
+        ops.extend_from_slice(&name);
+        assert_eq!(
+            cues_of(
+                OP_MAP_ADD_MARK,
+                &ops,
+                vec![0, 230, 0, 3, (-10264i32) as u32, (-363i32) as u32]
             ),
             [EventCue::MapMarker {
                 map_id: 230,
@@ -4021,14 +6657,18 @@ mod tests {
             cues_of(OP_STOP_CLOCK, &ops, vec![0, 8, 0, 1]),
             [EventCue::ClockHold {
                 stop: true,
-                hour: Some(8)
+                hour: Some(8),
+                minute: 0,
+                day_from_epoch: None
             }]
         );
         assert_eq!(
             cues_of(OP_STOP_CLOCK, &ops, vec![0, 30, 0, 1]),
             [EventCue::ClockHold {
                 stop: true,
-                hour: Some(6)
+                hour: Some(6),
+                minute: 0,
+                day_from_epoch: None
             }]
         );
         assert!(cues_of(OP_STOP_CLOCK, &ops, vec![0, 255, 0, 1]).is_empty());
@@ -4040,7 +6680,96 @@ mod tests {
             cues_of(OP_RESTORE_CLOCK, &[], vec![]),
             [EventCue::ClockHold {
                 stop: false,
-                hour: None
+                hour: None,
+                minute: 0,
+                day_from_epoch: None
+            }]
+        );
+    }
+
+    /// 0xA9's day operand is multiplied by seven: work slot 1 of 2 lands on
+    /// Vana day 14 at 00:30 (research/XiEvents/OpCodes/0x00A9.md).
+    #[test]
+    fn set_clock_date_opcode_jumps_seven_days_per_work_unit() {
+        let ops = [0x01u8, 0x80];
+        assert_eq!(
+            cues_of(OP_SET_CLOCK_DATE, &ops, vec![0, 2]),
+            [EventCue::ClockHold {
+                stop: true,
+                hour: Some(0),
+                minute: 30,
+                day_from_epoch: Some(14)
+            }]
+        );
+        assert_eq!(
+            cues_of(OP_SET_CLOCK_DATE, &ops, vec![0, 0]),
+            [EventCue::ClockHold {
+                stop: true,
+                hour: Some(0),
+                minute: 30,
+                day_from_epoch: Some(0)
+            }]
+        );
+    }
+
+    /// 0xC9 releases the game-timer hold, the same cue 0x78 emits
+    /// (research/XiEvents/OpCodes/0x00C9.md, 0x0078.md).
+    #[test]
+    fn enable_timer_opcode_releases_the_hold() {
+        assert_eq!(
+            cues_of(OP_ENABLE_TIMER, &[], vec![]),
+            [EventCue::ClockHold {
+                stop: false,
+                hour: None,
+                minute: 0,
+                day_from_epoch: None
+            }]
+        );
+    }
+
+    /// 0x69's flag byte selects full volume (0) or mute (nonzero); the mask
+    /// rides work slot 2 (research/XiEvents/OpCodes/0x0069.md).
+    #[test]
+    fn set_sound_volume_opcode_toggles_the_named_channels() {
+        let ops = [0x00, 0x02, 0x80];
+        assert_eq!(
+            cues_of(OP_SET_SOUND_VOLUME, &ops, vec![0, 0, 0x04]),
+            [EventCue::SoundVolume {
+                mask: 0x04,
+                volume: MUSIC_VOLUME_MAX,
+                fade_frames: 0
+            }]
+        );
+        let mute = [0x01, 0x02, 0x80];
+        assert_eq!(
+            cues_of(OP_SET_SOUND_VOLUME, &mute, vec![0, 0, 0x08]),
+            [EventCue::SoundVolume {
+                mask: 0x08,
+                volume: 0,
+                fade_frames: 0
+            }]
+        );
+    }
+
+    /// 0x6A scales work[1] by 0.001 onto the 0..=127 table, carries work[3]
+    /// as the fade and work[5] as the mask (research/XiEvents/OpCodes/0x006A.md).
+    #[test]
+    fn change_sound_volume_opcode_scales_the_level_and_carries_the_fade() {
+        let ops = [0x01u8, 0x80, 0x03, 0x80, 0x05, 0x80];
+        assert_eq!(
+            cues_of(OP_CHANGE_SOUND_VOLUME, &ops, vec![0, 500, 0, 60, 0, 0x04]),
+            [EventCue::SoundVolume {
+                mask: 0x04,
+                volume: 63,
+                fade_frames: 60
+            }]
+        );
+        assert_eq!(
+            cues_of(OP_CHANGE_SOUND_VOLUME, &ops, vec![0, 9999, 0, 0, 0, 0x01]),
+            [EventCue::SoundVolume {
+                mask: 0x01,
+                volume: MUSIC_VOLUME_MAX,
+                fade_frames: 0
             }]
         );
     }
@@ -4058,6 +6787,39 @@ mod tests {
             [EventCue::CameraLock { lock: false }]
         );
         assert!(cues_of(OP_DEFCAMERA, &[2, 0x0A, 0x00], vec![]).is_empty());
+    }
+
+    /// 0x38 writes the operand's high byte with 0x20 forced: retail's Ailevia
+    /// tour stores 0x2003, which applies as 0x20, as does the 0x0013 default
+    /// that covers most of the retail corpus
+    /// (research/XiEvents/OpCodes/0x0038.md).
+    #[test]
+    fn local_mode_opcode_carries_the_high_byte_with_the_cinematic_bit() {
+        for (stored, applied) in [
+            (0x2003u32, 0x20u16),
+            (0x0013, 0x20),
+            (0x0413, 0x24),
+            (0, 0x20),
+        ] {
+            assert_eq!(
+                cues_of(OP_LOCAL_MODE, &[0x01, 0x80], vec![0, stored]),
+                [EventCue::LocalMode { mode: applied }]
+            );
+        }
+    }
+
+    /// 0x20 writes retail's CliEventUcFlag: any nonzero byte locks the
+    /// player, zero releases it (research/XiEvents/OpCodes/0x0020.md).
+    #[test]
+    fn player_control_opcode_writes_the_flag() {
+        assert_eq!(
+            cues_of(OP_PLAYER_CONTROL, &[1], vec![]),
+            [EventCue::PlayerControl { locked: true }]
+        );
+        assert_eq!(
+            cues_of(OP_PLAYER_CONTROL, &[0], vec![]),
+            [EventCue::PlayerControl { locked: false }]
+        );
     }
 
     /// `OP_MUSICVOLUME`'s first operand is a volume *table index*, its second
@@ -4081,6 +6843,40 @@ mod tests {
             [EventCue::MusicVolume {
                 volume: MUSIC_VOLUME_MAX,
                 fade_frames: 0,
+            }]
+        );
+    }
+
+    /// 0x5C's low band sets the BGM slot's song from the +2 work selector and
+    /// starts it at full volume; the 0x80 band names the slot in its high
+    /// nibble and carries the start volume at +4; 0xA0/0xA1 ride 0x5D's shape
+    /// (research/XiEvents/OpCodes/0x005C.md).
+    #[test]
+    fn music_opcode_sets_the_slot_song_and_start_volume() {
+        let low = [0x00u8, 0x01, 0x80];
+        assert_eq!(
+            cues_of(OP_MUSIC, &low, vec![0, 101]),
+            [EventCue::MusicSong {
+                slot: 0,
+                track: 101,
+                volume: MUSIC_VOLUME_MAX
+            }]
+        );
+        let vol = [0x83u8, 0x01, 0x80, 0x02, 0x80];
+        assert_eq!(
+            cues_of(OP_MUSIC, &vol, vec![0, 99, 40]),
+            [EventCue::MusicSong {
+                slot: 3,
+                track: 99,
+                volume: 40
+            }]
+        );
+        let fade = [0xA0u8, 0x01, 0x80, 0x02, 0x80];
+        assert_eq!(
+            cues_of(OP_MUSIC, &fade, vec![0, 32, 60]),
+            [EventCue::MusicVolume {
+                volume: 32,
+                fade_frames: 60
             }]
         );
     }
@@ -4127,6 +6923,55 @@ mod tests {
         assert_eq!(
             cues_of(OP_CHOCOBO, &case(CHOCOBO_CASE_UNMOUNT), vec![]),
             mount(STATUS_EVENT_IDLE, Some(CHOCOBO_UNMOUNT_ID))
+        );
+    }
+
+    /// 0x4C/0x4D/0x4F/0x8E/0x8F write the event entity's StatusEvent on the
+    /// Mount cue: the door's open/close byte, its D_OPEN2/D_CLOSE2 pair, and
+    /// work(1) + 18 into the M1..M8 range
+    /// (research/XiEvents/OpCodes/0x004C.md, 0x004D.md, 0x004F.md,
+    /// 0x008E.md, 0x008F.md).
+    #[test]
+    fn door_status_opcodes_write_the_event_entity_status() {
+        let door = |status_event| {
+            [EventCue::Mount {
+                target: ActorLookup::EVENT_ENTITY,
+                status_event,
+                mount_id: None,
+            }]
+        };
+        assert_eq!(
+            cues_of(OP_DOOR_OPEN, &[], vec![]),
+            door(STATUS_EVENT_DOOR_OPEN)
+        );
+        assert_eq!(
+            cues_of(OP_DOOR_CLOSE, &[], vec![]),
+            door(STATUS_EVENT_DOOR_CLOSE)
+        );
+        assert_eq!(
+            cues_of(OP_DOOR_OPEN2, &[], vec![]),
+            door(STATUS_EVENT_DOOR_OPEN2)
+        );
+        assert_eq!(
+            cues_of(OP_DOOR_CLOSE2, &[], vec![]),
+            door(STATUS_EVENT_DOOR_CLOSE2)
+        );
+        assert_eq!(
+            cues_of(OP_STATUS_EVENT, &REF1, vec![0, 3]),
+            door(STATUS_EVENT_MOTION_BASE as u8 + 3)
+        );
+    }
+
+    /// 0x90 hides the event entity: the 0x4E bit with the value fixed at 1
+    /// (research/XiEvents/OpCodes/0x0090.md, 0x004E.md).
+    #[test]
+    fn event_hide_always_opcode_hides_the_event_entity() {
+        assert_eq!(
+            cues_of(OP_EVENT_HIDE_ALWAYS, &[], vec![]),
+            [EventCue::ActorHide {
+                target: ActorLookup::EVENT_ENTITY,
+                hide: true,
+            }]
         );
     }
 
@@ -4182,6 +7027,276 @@ mod tests {
         let data = vec![OP_SENDTAG, 0x01, OP_END];
         let mut e = vm(data, vec![]);
         assert_eq!(e.step(), StepResult::Done);
+    }
+
+    /// 0xA7 pair: case 0 arms the await and sends the tag (EndPara =
+    /// Work_Zone[1], which the program seeds from refs[1]), holding until the
+    /// server acks; case 1 then writes the result the ack carried into the
+    /// work slot its +2 operand selects (research/XiEvents/OpCodes/0x00A7.md).
+    #[test]
+    fn a7_pair_sends_the_tag_and_writes_the_result() {
+        let mut data = vec![OP_GET_STORE, 0x01, 0x10, SRC[0], SRC[1]];
+        data.extend_from_slice(&[OP_A7_WAIT, 0x00]);
+        data.extend_from_slice(&[OP_A7_WAIT, 0x01, 0x03, 0x10]);
+        data.push(OP_END);
+        let mut e = vm(data, vec![0, 42]);
+
+        assert_eq!(
+            e.step(),
+            StepResult::AwaitServerAck(PendingTag::SendTag { end_para: 42 })
+        );
+        assert_eq!(
+            e.step(),
+            StepResult::AwaitServerAck(PendingTag::SendTag { end_para: 42 }),
+            "a second step must not resend"
+        );
+
+        e.ack_server();
+        assert_eq!(e.step(), StepResult::Done);
+        assert_eq!(
+            e.work_zone(3),
+            42,
+            "case 1 writes the result the ack carried"
+        );
+    }
+
+    /// A bare 0xA7 case-1 poll with no outstanding tag writes the zero result
+    /// and advances its width, matching retail's acknowledged path
+    /// (research/XiEvents/OpCodes/0x00A7.md).
+    #[test]
+    fn a7_case1_without_a_tag_writes_the_zero_result() {
+        let data = vec![OP_A7_WAIT, 0x01, 0x03, 0x10, OP_END];
+        let mut e = vm(data, vec![]);
+        assert_eq!(e.step(), StepResult::Done);
+        assert_eq!(e.exec_pointer(), 4, "case 1 advances its 4-byte width");
+        assert_eq!(e.work_zone(3), 0, "no tag means the zero result");
+    }
+
+    /// 0xA6 pair: case 0 sends the 0x0EB request and holds on the 0x10E
+    /// answer, case 1 yields until it lands, and case 2 writes the answered
+    /// MapNum into the work slot its +2 operand selects
+    /// (research/XiEvents/OpCodes/0x00A6.md).
+    #[test]
+    fn a6_pair_requests_and_writes_the_submap_num() {
+        let mut data = vec![OP_A6_SUBMAP, 0x00, OP_A6_SUBMAP, 0x01, OP_A6_SUBMAP, 0x02];
+        data.extend_from_slice(&DST);
+        data.push(OP_END);
+        let mut e = vm(data, vec![]);
+
+        assert_eq!(e.step(), StepResult::AwaitServerAck(PendingTag::SubMapNum));
+        assert_eq!(
+            e.step(),
+            StepResult::AwaitServerAck(PendingTag::SubMapNum),
+            "a second step must not resend"
+        );
+
+        e.set_submap_num(77);
+        e.ack_server();
+        assert_eq!(e.step(), StepResult::Done);
+        assert_eq!(e.work_zone(0), 77, "case 2 writes the answered MapNum");
+    }
+
+    /// A bare 0xA6 case-2 read with no outstanding request writes the zero
+    /// MapNum and advances its width, like retail's unanswered path
+    /// (research/XiEvents/OpCodes/0x00A6.md).
+    #[test]
+    fn a6_case2_without_a_request_writes_the_zero_result() {
+        let mut data = vec![OP_A6_SUBMAP, 0x02];
+        data.extend_from_slice(&DST);
+        data.push(OP_END);
+        let mut e = vm(data, vec![]);
+        assert_eq!(e.step(), StepResult::Done);
+        assert_eq!(e.exec_pointer(), 4, "case 2 advances its 4-byte width");
+        assert_eq!(e.work_zone(0), 0, "no answer means the zero MapNum");
+    }
+
+    /// 0x87/0x88 pair: each send case arms the 0x01B FRIENDPASS with its
+    /// case's `Para` (0x87: 0 begin / 2 begin-gold; 0x88: 1 confirm /
+    /// 3 confirm-gold), holds on the 0x059 answer, and case 1 yields until it
+    /// lands (research/XiEvents/OpCodes/0x0087.md, 0x0088.md).
+    #[test]
+    fn friendpass_pairs_arm_their_para_and_hold() {
+        for (op, paras) in [(OP_FRIENDPASS_87, [0u16, 2]), (OP_FRIENDPASS_88, [1, 3])] {
+            for (sub, para) in [(0u8, paras[0]), (2, paras[1])] {
+                let data = vec![op, sub, op, 0x01, OP_END];
+                let mut e = vm(data, vec![]);
+                assert_eq!(
+                    e.step(),
+                    StepResult::AwaitServerAck(PendingTag::FriendPass { para }),
+                    "0x{op:02X} sub {sub} arms para {para}"
+                );
+                assert_eq!(
+                    e.step(),
+                    StepResult::AwaitServerAck(PendingTag::FriendPass { para }),
+                    "a second step must not resend"
+                );
+                e.ack_server();
+                assert_eq!(e.step(), StepResult::Done);
+            }
+        }
+    }
+
+    /// Seed `slot` of Work_Zone from `refs[i]` with one GET_STORE each.
+    fn seed_work_slots(slots: &[(u16, u16)]) -> (Vec<u8>, Vec<u32>) {
+        let mut data = Vec::new();
+        let mut refs = vec![0u32];
+        for (slot, value) in slots {
+            refs.push(u32::from(*value));
+            data.push(OP_GET_STORE);
+            data.extend_from_slice(&(*slot + WORK_ZONE_BASE as u16).to_le_bytes());
+            data.extend_from_slice(
+                &((refs.len() - 1) as u16 | REFERENCE_FLAG as u16).to_le_bytes(),
+            );
+        }
+        (data, refs)
+    }
+
+    /// 0x8C case 0 arms the 0x058 RECIPE with Mode 1 and the work-slot fields
+    /// its retail pseudo code names (skill work[2], level work[4], Param0
+    /// work[6]), holds on the 0x031 answer, and case 1 yields until it lands
+    /// (research/XiEvents/OpCodes/0x008C.md).
+    #[test]
+    fn recipe_case0_arms_mode1_from_the_work_slots() {
+        let (seed, refs) = seed_work_slots(&[(2, 3), (4, 40), (6, 7)]);
+        let mut data = seed;
+        data.extend_from_slice(&[OP_RECIPE, 0x00, 0x02, 0x10, 0x04, 0x10, 0x06, 0x10]);
+        data.extend_from_slice(&[OP_RECIPE, 0x01, OP_END]);
+        let mut e = vm(data, refs);
+        assert_eq!(
+            e.step(),
+            StepResult::AwaitServerAck(PendingTag::Recipe {
+                mode: 1,
+                skill: 3,
+                level: 40,
+                param0: 7,
+                param1: 0,
+                param2: 0,
+                param3: 0,
+                param4: 0,
+            })
+        );
+        e.ack_server();
+        assert_eq!(e.step(), StepResult::Done);
+    }
+
+    /// 0x8C cases 2/3/4 arm Mode 2/3/4 with their own work-slot field maps
+    /// (research/XiEvents/OpCodes/0x008C.md).
+    #[test]
+    fn recipe_cases_fill_their_mode_and_params() {
+        let (seed, refs) = seed_work_slots(&[(2, 3), (4, 40), (6, 7), (8, 11), (10, 13)]);
+        let cases: [(u8, &[u8], PendingTag); 3] = [
+            (
+                2u8,
+                &[0x02, 0x10, 0x04, 0x10, 0x06, 0x10, 0x08, 0x10, 0x0A, 0x10],
+                PendingTag::Recipe {
+                    mode: 2,
+                    skill: 3,
+                    level: 40,
+                    param0: 0,
+                    param1: 11,
+                    param2: 13,
+                    param3: 0,
+                    param4: 7,
+                },
+            ),
+            (
+                3,
+                &[0x02, 0x10, 0x04, 0x10, 0x06, 0x10, 0x08, 0x10],
+                PendingTag::Recipe {
+                    mode: 3,
+                    skill: 3,
+                    level: 40,
+                    param0: 0,
+                    param1: 0,
+                    param2: 0,
+                    param3: 11,
+                    param4: 7,
+                },
+            ),
+            (
+                4,
+                &[0x02, 0x10, 0x04, 0x10, 0x06, 0x10, 0x08, 0x10],
+                PendingTag::Recipe {
+                    mode: 4,
+                    skill: 3,
+                    level: 40,
+                    param0: 0,
+                    param1: 0,
+                    param2: 0,
+                    param3: 11,
+                    param4: 7,
+                },
+            ),
+        ];
+        for (sub, selectors, tag) in cases {
+            let mut data = seed.clone();
+            data.push(OP_RECIPE);
+            data.push(sub);
+            data.extend_from_slice(selectors);
+            data.extend_from_slice(&[OP_RECIPE, 0x01, OP_END]);
+            let mut e = vm(data, refs.clone());
+            assert_eq!(
+                e.step(),
+                StepResult::AwaitServerAck(tag.clone()),
+                "case {sub}"
+            );
+            e.ack_server();
+            assert_eq!(e.step(), StepResult::Done);
+        }
+    }
+
+    /// 0x8C case 5 advances its 14-byte width without arming a tag: retail
+    /// sends mode 5 without setting RecRecipeFlag, and LSB implements no
+    /// mode 5 (research/XiEvents/OpCodes/0x008C.md).
+    #[test]
+    fn recipe_case5_advances_without_a_tag() {
+        let mut data = vec![OP_RECIPE, 0x05];
+        data.extend_from_slice(&[0u8; 12]);
+        data.push(OP_END);
+        let mut e = vm(data, vec![]);
+        assert_eq!(e.step(), StepResult::Done);
+        assert_eq!(e.exec_pointer(), 14, "case 5 advances its 14-byte width");
+        assert_eq!(e.pending_tag(), None);
+    }
+
+    /// 0xB2 mode 0 counts down WaitTime by frame delay and steps its 4-byte
+    /// width on expiry. Retail reads WaitTime as the u16 at +1, which spans
+    /// the mode byte and the first operand byte, so the authored events steer
+    /// that read to work_zone[0] with a 0x10 first byte; the program seeds
+    /// work_zone[0] from refs[1] (60 units = one second)
+    /// (research/XiEvents/OpCodes/0x00B2.md).
+    #[test]
+    fn b2_mode0_waits_then_advances() {
+        let mut data = vec![OP_GET_STORE, DST[0], DST[1], SRC[0], SRC[1]];
+        data.extend_from_slice(&[OP_B2_DELIVERY, 0x00, 0x10, 0x00, OP_END]);
+        let mut e = vm(data, vec![0, 60]);
+        assert_eq!(e.step(), StepResult::Waiting);
+        e.tick(0.5);
+        assert_eq!(e.step(), StepResult::Waiting, "halfway through the wait");
+        e.tick(0.51);
+        assert_eq!(e.step(), StepResult::Done);
+        assert_eq!(e.exec_pointer(), 9, "mode 0 advances its 4-byte width");
+    }
+
+    /// 0xB2 mode 1 arms the 0x04D PBX open request and holds until the server
+    /// acks it, then steps its 2-byte width
+    /// (research/XiEvents/OpCodes/0x00B2.md).
+    #[test]
+    fn b2_mode1_holds_until_the_delivery_ack() {
+        let data = vec![OP_B2_DELIVERY, 0x01, OP_END];
+        let mut e = vm(data, vec![]);
+        assert_eq!(
+            e.step(),
+            StepResult::AwaitServerAck(PendingTag::DeliveryOpen)
+        );
+        assert_eq!(
+            e.step(),
+            StepResult::AwaitServerAck(PendingTag::DeliveryOpen),
+            "a second step must not resend"
+        );
+        e.ack_server();
+        assert_eq!(e.step(), StepResult::Done);
+        assert_eq!(e.exec_pointer(), 2, "mode 1 advances its 2-byte width");
     }
 
     /// The position-tag pair: case 0 scales its work-slot raw values into the
@@ -4688,6 +7803,7 @@ mod tests {
                     heading: 0,
                 },
                 speed: MOVE_SPEED_REF as i32,
+                max_time: None,
             }]
         );
 
@@ -4922,6 +8038,7 @@ mod tests {
                         heading: 0,
                     },
                     speed: SPEED_REF as i32,
+                    max_time: None,
                 },
                 EventCue::ActorHide {
                     target: ActorLookup(NPC_SERVER_ID),
@@ -5065,6 +8182,46 @@ mod tests {
         );
     }
 
+    /// 0xDA: the single retail site (zone 112 event 68) is a 6-byte header and
+    /// six 28-byte records, each naming (event entity, event entity, "senN").
+    /// The VM emits one ActorMotion cue per record and advances past all of
+    /// them, landing on the next real instruction.
+    #[test]
+    fn da_batch_motion_loader_emits_one_cue_per_record_and_advances_past_them() {
+        let actor = 0x7FFFFFF8u32.to_le_bytes();
+        let mut data = vec![0xDA, 0x0C, 0x00, 0x02, 0x0C, 0x00];
+        for i in 0..6u8 {
+            let mut rec = [0u8; 28];
+            rec[8..12].copy_from_slice(&actor);
+            rec[12..16].copy_from_slice(&actor);
+            rec[16..20].copy_from_slice(&[b's', b'e', b'n', b'0' + i]);
+            data.extend_from_slice(&rec);
+        }
+        // The scan must stop at the first record whose key is not a printable
+        // 4cc: this one's key field is 0x80 0x27 0x10 0xF0.
+        let mut term = [0u8; 28];
+        term[16..20].copy_from_slice(&[0x80, 0x27, 0x10, 0xF0]);
+        data.extend_from_slice(&term);
+        let mut e = vm(data, vec![]);
+        assert_eq!(e.step(), StepResult::Done);
+        let cues = e.take_cues();
+        assert_eq!(cues.len(), 6, "six records, six cues");
+        for (i, cue) in cues.iter().enumerate() {
+            match cue {
+                EventCue::ActorMotion {
+                    actor1,
+                    actor2,
+                    key,
+                } => {
+                    assert_eq!(*actor1, ActorLookup::EVENT_ENTITY);
+                    assert_eq!(*actor2, ActorLookup::EVENT_ENTITY);
+                    assert_eq!(*key, [b's', b'e', b'n', b'0' + i as u8]);
+                }
+                other => panic!("expected ActorMotion, got {other:?}"),
+            }
+        }
+    }
+
     /// setworkstrofs refuses both stores: a References-flagged operand is
     /// read-only, and the write bound is slot 64 even though the int view runs
     /// to 80 (research/XiEvents/Event VM Functions.md).
@@ -5083,5 +8240,99 @@ mod tests {
                 "dest 0x{dest:04X} must not store"
             );
         }
+    }
+
+    /// Copy event params 0..4 into work_local 0..4 (0x03 GET_STORE, 5-byte
+    /// width): the 0x37/0x39 tests read their operands from work slots the
+    /// way the authored programs do.
+    fn store_params_to_work_local(data: &mut Vec<u8>) {
+        for i in 0..4u16 {
+            data.push(OP_GET_STORE);
+            data.extend_from_slice(&i.to_le_bytes());
+            data.extend_from_slice(&(4098u16 + i).to_le_bytes());
+        }
+    }
+
+    fn scene_player_vm(
+        data: Vec<u8>,
+        params: Vec<i32>,
+        start: crate::vm::scene::EventPosition,
+    ) -> EventVm {
+        let block = block(data, vec![]);
+        let mut e = EventVm::start(&block, 7, 5, params).unwrap();
+        e.attach_scene(
+            std::sync::Arc::new(ffxi_dat::event_dat::EventDat {
+                blocks: vec![block],
+            }),
+            ffxi_dat::event_dat::ZONE_PLAYER_ACTOR,
+            start,
+        );
+        e
+    }
+
+    /// 0x37 on the player: the authored position and facing become the
+    /// tracked player position at once, published as one PlayerPosition scene
+    /// action (the renderer's snap and the c2s POS ride on it); the walks
+    /// that follow start from here.
+    #[test]
+    fn set_event_pos_on_the_player_snaps_the_tracked_position() {
+        let authored = crate::vm::scene::EventPosition {
+            x: -56_030,
+            y: 8_000,
+            z: 109_070,
+            heading: 1590,
+        };
+        let mut data = Vec::new();
+        store_params_to_work_local(&mut data);
+        data.push(0x37);
+        for i in 0..4u16 {
+            data.extend_from_slice(&i.to_le_bytes());
+        }
+        data.push(OP_END);
+        let mut e = scene_player_vm(
+            data,
+            vec![authored.x, authored.z, authored.y, authored.heading],
+            crate::vm::scene::EventPosition::default(),
+        );
+        assert_eq!(e.step(), StepResult::Done);
+        assert_eq!(
+            e.take_scene_actions(),
+            [crate::vm::scene::SceneAction::PlayerPosition(authored)]
+        );
+        assert_eq!(e.controlled_position(), Some(authored));
+    }
+
+    /// 0x39 on the player: the authored facing becomes the tracked heading and
+    /// the position is republished so the rendered body turns onto it.
+    #[test]
+    fn set_facing_on_the_player_republishes_the_heading() {
+        let mut data = Vec::new();
+        store_params_to_work_local(&mut data);
+        data.push(0x39);
+        data.extend_from_slice(&3u16.to_le_bytes());
+        data.push(OP_END);
+        let start = crate::vm::scene::EventPosition {
+            x: -56_030,
+            y: 8_000,
+            z: 109_070,
+            heading: 0,
+        };
+        let mut e = scene_player_vm(
+            data,
+            vec![start.x, start.z, start.y, EVENT_MOTION_BAND_4],
+            start,
+        );
+        assert_eq!(e.step(), StepResult::Done);
+        let expected = crate::vm::scene::EventPosition {
+            x: -56_030,
+            y: 8_000,
+            z: 109_070,
+            heading: EVENT_MOTION_BAND_4,
+        };
+        assert_eq!(
+            e.take_scene_actions(),
+            [crate::vm::scene::SceneAction::PlayerPosition(expected)]
+        );
+        assert_eq!(e.controlled_position(), Some(expected));
     }
 }

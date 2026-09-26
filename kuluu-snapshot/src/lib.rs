@@ -2,6 +2,18 @@
 
 use serde::{Deserialize, Serialize};
 
+// v45: CutsceneCue::ClockHold gains `minute` and `day_from_epoch` (0xA9
+// SET_CLOCK_DATE jumps the whole date to Vana day 7*work[1] at 00:30; 0xC9
+// ENABLE_TIMER releases the hold), so the 0x77/0x78 hour-only shape now carries
+// minute 0 and no day (research/XiEvents/OpCodes/0x00A9.md, 0x00C9.md,
+// 0x0077.md, 0x0078.md).
+// v44: CutsceneCue::Transpar (0x6C) - the target's alpha fade to the authored
+// byte over the authored frame count, the first actor-colour drive on the cue
+// channel (research/XiEvents/OpCodes/0x006C.md).
+// v43: CutsceneCue::PlayerControl (0x20) - the script's write of retail's
+// CliEventUcFlag, so an event that releases the player mid-script (the flag's 0) stops the
+// event-wide pin instead of holding it to EVENT_END
+// (research/XiEvents/OpCodes/0x0020.md).
 // v42: ViewerEvent::Knockbacks - every target result of one 0x028 that landed with a
 // knockback level (GP_SERV_COMMAND_BATTLE2::pack), so the client can shove the victims when
 // the skill routine's knockback stage fires; ActionStarted.outcome carries the first
@@ -99,7 +111,7 @@ use serde::{Deserialize, Serialize};
 // v5: InventoryItem.charges_remaining + next_use_vana_ts (item recast/charges).
 // v4: SceneSnapshot.delivery_box (dedicated delivery screen) + ViewerCommand::DeliveryBox
 // (postcard frames are not self-describing, so any shape change bumps this).
-pub const PROTOCOL_VERSION: u32 = 42;
+pub const PROTOCOL_VERSION: u32 = 46;
 
 /// Longest countdown `SceneSnapshot::status_icon_expiries` can carry. The
 /// producer rejects anything beyond it as a corrupt 0x063 timestamp, and the HUD
@@ -1678,15 +1690,38 @@ pub enum CutsceneCue {
     /// the event session ends — retail stops consulting it rather than
     /// clearing it.
     ActorHide { target: CutsceneActor, hide: bool },
+    /// 0x6C TRANSPAR: fade `target`'s alpha to `end_alpha` (0..=255) over
+    /// `duration_frames` frames (research/XiEvents/OpCodes/0x006C.md).
+    Transpar {
+        target: CutsceneActor,
+        end_alpha: i32,
+        duration_frames: i32,
+    },
     /// Take camera control away from the player, or give it back.
     CameraLock { lock: bool },
+    /// 0x38: the lower word of retail's `CliEventModeLocal` (the operand's
+    /// high byte with 0x20 forced). While it holds, hide the local player
+    /// model and the HUD pieces; the event end clears the flag
+    /// (research/XiEvents/OpCodes/0x0038.md).
+    LocalMode { mode: u16 },
+    /// 0x20: write retail's `CliEventUcFlag`; while it holds, the player's
+    /// `CanIMove` is false (research/XiEvents/OpCodes/0x0020.md,
+    /// research/XIClient ActorTelemetry::CanIMove).
+    PlayerControl { locked: bool },
     /// 0x67/0x68 HIDE_HUD/SHOW_HUD: hide or show the entire HUD UI for the
     /// rest of the cutscene (research/XiEvents/OpCodes/0x0067.md, 0x0068.md).
     HudHide { hide: bool },
-    /// 0x77/0x78 STOP_CLOCK/RESTORE_CLOCK: hold the game clock at Vana'diel
-    /// hour `hour`, or release it back to server time
-    /// (research/XiEvents/OpCodes/0x0077.md, 0x0078.md).
-    ClockHold { stop: bool, hour: Option<u32> },
+    /// 0x77/0x78/0xA9/0xC9 game-clock holds: hold the clock at Vana'diel hour
+    /// `hour`, minute `minute`, on Vana day `day_from_epoch` from the calendar
+    /// epoch when set (else the current day), or release it back to server
+    /// time (research/XiEvents/OpCodes/0x0077.md, 0x0078.md, 0x00A9.md,
+    /// 0x00C9.md).
+    ClockHold {
+        stop: bool,
+        hour: Option<u32>,
+        minute: u8,
+        day_from_epoch: Option<u32>,
+    },
     /// Put the target on or off a mount. `status_event` is the `GameStatus`
     /// value the script writes; `mount_id` is carried only by the non-chocobo
     /// mount cases.
@@ -2446,7 +2481,7 @@ mod tests {
 
     #[test]
     fn current_protocol_preserves_transport_and_voyage_fields() {
-        const VERSION: u32 = 42;
+        const VERSION: u32 = 46;
         const STAMP: u32 = 0x1200_3400;
         assert_eq!(PROTOCOL_VERSION, VERSION);
         let mut snapshot = sample_snapshot();
@@ -2695,11 +2730,19 @@ mod tests {
                 duration: 0,
             },
             CutsceneCue::CameraLock { lock: true },
+            CutsceneCue::PlayerControl { locked: true },
             CutsceneCue::ActorHide {
                 target: CutsceneActor::Entity {
                     server_id: 0x010E_6032,
                 },
                 hide: true,
+            },
+            CutsceneCue::Transpar {
+                target: CutsceneActor::Entity {
+                    server_id: 0x010E_6032,
+                },
+                end_alpha: 0,
+                duration_frames: 60,
             },
             CutsceneCue::Mount {
                 target: CutsceneActor::LocalPlayer,

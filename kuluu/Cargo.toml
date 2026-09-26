@@ -79,6 +79,10 @@ enhanced-job-display = ["kuluu-render?/enhanced-job-display"]
 enhanced-shutdown-counter = ["kuluu-render?/enhanced-shutdown-counter"]
 # Enhanced (non-retail) free movement during the weapon draw/sheathe. See kuluu-render.
 enhanced-engage-move-lock-off = ["kuluu-render?/enhanced-engage-move-lock-off"]
+# Enhanced (non-retail) `//targetname` slash command: target the nearest
+# NPC/mob/pet by exact name. Kuluu-local (no render side), so no sub-features;
+# the local build (build_cowland.bat) enables it. Vanilla builds omit it.
+enhanced-targetname = []
 # Enable the WebSocket relay listener (`--relay-listen <addr>` global flag).
 # Publishes the same `kuluu-snapshot` frames the in-process bridge produces,
 # so external tools (and the future wasm browser viewer) can consume the

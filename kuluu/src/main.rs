@@ -39,7 +39,6 @@ struct Args {
     #[arg(long, value_parser = kuluu_session::relay::parse_relay_listen)]
     relay_listen: Option<std::net::SocketAddr>,
 
-    #[cfg(unix)]
     #[arg(long)]
     agent_listen: Option<String>,
 
@@ -426,28 +425,47 @@ async fn run_command_async(args: Args, auth: auth_client::AuthClient) -> Result<
             ));
             let agent_task = tokio::spawn(agent_io::run(cmd_tx.clone(), event_rx));
 
-            #[cfg(unix)]
             if let Some(arg) = args
                 .agent_listen
                 .clone()
                 .or_else(|| std::env::var("FFXI_AGENT_LISTEN").ok())
             {
-                let listen = kuluu_session::agent_socket::resolve_listen(&arg);
                 let sock_cmd_tx = cmd_tx.clone();
                 let sock_event_tx = event_tx.clone();
-                tokio::spawn(async move {
-                    if let Err(err) = kuluu_session::agent_socket::serve(
-                        listen,
-                        sock_cmd_tx,
-                        sock_event_tx,
-                        None,
-                        None,
-                    )
-                    .await
-                    {
-                        tracing::warn!(error = %err, "agent socket listener exited");
-                    }
-                });
+                #[cfg(unix)]
+                {
+                    let listen = kuluu_session::agent_socket::resolve_listen(&arg);
+                    tokio::spawn(async move {
+                        if let Err(err) = kuluu_session::agent_socket::serve(
+                            listen,
+                            sock_cmd_tx,
+                            sock_event_tx,
+                            None,
+                            None,
+                        )
+                        .await
+                        {
+                            tracing::warn!(error = %err, "agent socket listener exited");
+                        }
+                    });
+                }
+                #[cfg(windows)]
+                {
+                    let listen = kuluu_session::agent_socket::resolve_tcp_listen(&arg);
+                    tokio::spawn(async move {
+                        if let Err(err) = kuluu_session::agent_socket::serve_tcp(
+                            listen,
+                            sock_cmd_tx,
+                            sock_event_tx,
+                            None,
+                            None,
+                        )
+                        .await
+                        {
+                            tracing::warn!(error = %err, "agent TCP listener exited");
+                        }
+                    });
+                }
             }
 
             #[cfg(feature = "relay")]

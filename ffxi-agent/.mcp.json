@@ -4,10 +4,10 @@
       "command": "cargo",
       "args": ["run", "--release", "--manifest-path", "../Cargo.toml", "-p", "kuluu-mcp"],
       "env": {
-        "FFXI_SERVER": "127.0.0.1",
-        "FFXI_AUTH_PORT": "54231",
-        "FFXI_DATA_PORT": "54230",
-        "FFXI_VIEW_PORT": "54001",
+        "FFXI_SERVER": "${FFXI_SERVER}",
+        "FFXI_AUTH_PORT": "${FFXI_AUTH_PORT}",
+        "FFXI_DATA_PORT": "${FFXI_DATA_PORT}",
+        "FFXI_VIEW_PORT": "${FFXI_VIEW_PORT}",
         "FFXI_USER": "${FFXI_USER}",
         "FFXI_PASS": "${FFXI_PASS}",
         "FFXI_CHAR": "${FFXI_CHAR}",
@@ -19,10 +19,10 @@
       "args": ["run", "--release", "--manifest-path", "../Cargo.toml", "-p", "kuluu-mcp"],
       "env": {
         "FFXI_ATTACH": "auto",
-        "FFXI_SERVER": "127.0.0.1",
-        "FFXI_AUTH_PORT": "54231",
-        "FFXI_DATA_PORT": "54230",
-        "FFXI_VIEW_PORT": "54001",
+        "FFXI_SERVER": "${FFXI_SERVER}",
+        "FFXI_AUTH_PORT": "${FFXI_AUTH_PORT}",
+        "FFXI_DATA_PORT": "${FFXI_DATA_PORT}",
+        "FFXI_VIEW_PORT": "${FFXI_VIEW_PORT}",
         "RUST_LOG": "info"
       }
     }

@@ -565,9 +565,30 @@ fn cutscene_cue_to_wire(cue: crate::state::CutsceneCue) -> wire::CutsceneCue {
             target: cutscene_actor_to_wire(target),
             hide,
         },
+        Cue::Transpar {
+            target,
+            end_alpha,
+            duration_frames,
+        } => wire::CutsceneCue::Transpar {
+            target: cutscene_actor_to_wire(target),
+            end_alpha,
+            duration_frames,
+        },
         Cue::CameraLock { lock } => wire::CutsceneCue::CameraLock { lock },
+        Cue::LocalMode { mode } => wire::CutsceneCue::LocalMode { mode },
+        Cue::PlayerControl { locked } => wire::CutsceneCue::PlayerControl { locked },
         Cue::HudHide { hide } => wire::CutsceneCue::HudHide { hide },
-        Cue::ClockHold { stop, hour } => wire::CutsceneCue::ClockHold { stop, hour },
+        Cue::ClockHold {
+            stop,
+            hour,
+            minute,
+            day_from_epoch,
+        } => wire::CutsceneCue::ClockHold {
+            stop,
+            hour,
+            minute,
+            day_from_epoch,
+        },
         Cue::Mount {
             target,
             status_event,
@@ -1677,7 +1698,7 @@ mod tests {
         let mut scope = CutsceneScope::default();
         scope.start(crate::event_dialog::agent_event_id(NPC_ID, EVENT_ID), &tx);
         for cue in runner.take_cues() {
-            scope.push(resolve_cue(cue, NPC_ID, 0), &tx);
+            scope.push(resolve_cue(cue, NPC_ID, 0, 0), &tx);
         }
         scope.end(EventSessionExit::ScriptEnded, &tx);
 

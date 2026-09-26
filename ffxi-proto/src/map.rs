@@ -101,6 +101,26 @@ pub mod c2s {
 
     pub const REQ_LOGOUT: u16 = 0x0E7;
 
+    // GP_CLI_COMMAND_FRIENDPASS, vendor/server/src/map/packets/c2s/
+    // 0x01b_friendpass.h: uint16 Para, uint16 padding. The world-pass request
+    // the event VM's 0x87/0x88 send cases send (Para 0/2 begin, 1/3 confirm);
+    // the server answers s2c 0x059 with a random pass number for the confirm
+    // cases and 0 for the begin cases (0x01b_friendpass.cpp process).
+    pub const FRIENDPASS: u16 = 0x01B;
+
+    // GP_CLI_COMMAND_RECIPE, vendor/server/src/map/packets/c2s/0x058_recipe.h:
+    // uint16 skill/level/Param0/Mode/Param1..4. The crafting-support request
+    // the event VM's 0x8C send cases send; the server answers s2c 0x031 for
+    // Mode 1/2/3 and nothing for 4/5 (0x058_recipe.cpp process).
+    pub const RECIPE: u16 = 0x058;
+
+    // GP_CLI_COMMAND_REQSUBMAPNUM, vendor/server/src/map/packets/c2s/
+    // 0x0eb_reqsubmapnum.h. Header-only request the event VM sends from 0xA6
+    // case 0 to fetch the event's sub-map number; the server answers with s2c
+    // 0x10E when the char is npc-locked and with nothing otherwise
+    // (0x0eb_reqsubmapnum.cpp process).
+    pub const REQSUBMAPNUM: u16 = 0x0EB;
+
     // GP_CLI_COMMAND_SUBMAPCHANGE, vendor/server/src/map/packets/c2s/
     // 0x0f2_submapchange.h. Sent whenever the client crosses into a different
     // sub-area within the current zone (State/SubMapNumber below); the server
@@ -631,6 +651,28 @@ pub mod s2c {
     // GP_SERV_COMMAND_BAZAAR_SELL, vendor/server/src/map/packets/s2c/0x109_bazaar_sell.h.
     // Another customer bought a row of the bazaar we are browsing.
     pub const BAZAAR_SELL: u16 = 0x109;
+
+    // GP_SERV_COMMAND_FRIENDPASS, vendor/server/src/map/packets/s2c/
+    // 0x059_friendpass.h: int32 leftNum/leftDays/passPop, char String[16]
+    // (the pass number zero-padded to 10 digits when non-zero), char Type,
+    // char unknown21, uint16 padding. The answer to our c2s 0x01B request
+    // (the event VM's 0x87/0x88 send cases); the server fills the pass for
+    // the confirm Paras and 0 for the begin ones (0x059_friendpass.cpp).
+    pub const FRIENDPASS: u16 = 0x059;
+
+    // GP_SERV_COMMAND_RECIPE, vendor/server/src/map/packets/s2c/0x031_recipe.h:
+    // a 48-byte union — the recipe details (productitem/need_skill_1..3/
+    // need_item/need_key_item/itemnum[8]/itemcount[8]) or the 16-entry recipe
+    // list, with the GP_SERV_COMMAND_RECIPE_TYPE word at byte 44. The answer
+    // to our c2s 0x058 RECIPE request (the event VM's 0x8C send cases)
+    // (0x031_recipe.cpp).
+    pub const RECIPE: u16 = 0x031;
+
+    // GP_SERV_COMMAND_REQSUBMAPNUM, vendor/server/src/map/packets/s2c/
+    // 0x10e_reqsubmapnum.h: uint32 MapNum. The answer to our c2s 0x0EB request
+    // (the event VM's 0xA6 case 0); the server pushes 0 when the char is
+    // npc-locked and nothing otherwise (0x0eb_reqsubmapnum.cpp process).
+    pub const REQSUBMAPNUM: u16 = 0x10E;
 
     // GP_SERV_COMMAND_TRACKING_LIST, vendor/server/src/map/packets/s2c/0x0f4_tracking_list.h.
     // One wide-scan entry (ActIndex/Level/Type + relative x/z + sName[16]).

@@ -164,6 +164,35 @@ impl DialogRunner {
         self.vm.set_actor_types(types);
     }
 
+    /// Install the global weather forecast table 0x72 GETWEATHER reads
+    /// (research/XiEvents/OpCodes/0x0072.md); see
+    /// [`EventVm::set_weather_forecast`]. The session loads it once and shares
+    /// the same `Arc` across every runner it drives.
+    pub fn set_weather_forecast(
+        &mut self,
+        forecast: std::sync::Arc<ffxi_dat::weather::WeatherForecast>,
+    ) {
+        self.vm.set_weather_forecast(forecast);
+    }
+
+    /// Install the zone's range rects 0x82 RANGE_RECT hit-tests against
+    /// (research/XiEvents/OpCodes/0x0082.md); see [`EventVm::set_zone_rects`].
+    /// The session loads the event zone's RID table once and shares the same
+    /// `Arc` across every runner it drives.
+    pub fn set_zone_rects(
+        &mut self,
+        rects: std::sync::Arc<Vec<ffxi_dat::zone_interaction::ZoneInteraction>>,
+    ) {
+        self.vm.set_zone_rects(rects);
+    }
+
+    /// Install the zone number 0xD4 case 0 opens the map on
+    /// (research/XiEvents/OpCodes/0x00D4.md); see [`EventVm::set_current_zone`].
+    /// The session injects the event zone before driving.
+    pub fn set_current_zone(&mut self, zone: i32) {
+        self.vm.set_current_zone(zone);
+    }
+
     /// Arm the SCHEDULOR hold the WAIT* family parks on until the renderer
     /// reports the routine finished; see [`EventVm::hold_action_pending`]. The
     /// session calls this when it publishes a SCHEDULOR motion cue, whose
@@ -216,9 +245,46 @@ impl DialogRunner {
         self.vm.apply_pending_str(strings);
     }
 
+    /// s2c 0x10E REQSUBMAPNUM's MapNum into the VM's 0xA6 result slot
+    /// (research/XiEvents/OpCodes/0x00A6.md); lands before the next step even
+    /// while the SubMapNum tag is held, like [`Self::apply_pending_num`].
+    pub fn set_submap_num(&mut self, num: u32) {
+        self.vm.set_submap_num(num);
+    }
+
     /// The pending tag the VM holds on its case-1 poll, if any.
     pub fn pending_tag(&self) -> Option<&PendingTag> {
         self.vm.pending_tag()
+    }
+
+    /// Why the VM is not advancing right now, for the host's liveness check;
+    /// see [`EventVm::park`].
+    pub fn park(&self) -> crate::vm::Park {
+        self.vm.park()
+    }
+
+    /// The opcode byte the VM is parked on (0 past the end of the bytecode),
+    /// for the host's stall diagnostics.
+    pub fn current_opcode(&self) -> u8 {
+        self.vm.current_opcode()
+    }
+
+    /// The VM's exec pointer, for the host's stall diagnostics.
+    pub fn exec_pointer(&self) -> usize {
+        self.vm.exec_pointer()
+    }
+
+    /// The timed wait's remaining units, 0 when no wait is held: the host's
+    /// liveness check watches it move on every tick.
+    pub fn wait_units_remaining(&self) -> f32 {
+        self.vm.wait_units_remaining()
+    }
+
+    /// Force-cancel the event from the host side (the liveness stall): the
+    /// next step reports Cancelled, which [`Self::run`] maps to
+    /// [`DialogStep::Ended`] with [`EVENT_CANCELLED_END_PARA`].
+    pub fn force_cancel(&mut self) {
+        self.vm.force_cancel();
     }
 
     /// Whether ESC may cancel this event right now (retail's `CliEventCancelFlag`;
@@ -595,6 +661,22 @@ mod tests {
         );
     }
 
+    /// Regression: a bare QUERYWAIT used to yield AwaitMessageAck without moving
+    /// EP, and this loop answered it with dismiss_message and stepped onto the
+    /// same opcode forever (8700's favorites branch). It now ends.
+    #[test]
+    fn bare_querywait_does_not_spin_the_runner() {
+        let strings = empty_strings();
+        let mut r = DialogRunner::start(
+            &one_event_block(vec![OP_QUERYWAIT, OP_END], vec![]),
+            1,
+            0,
+            vec![],
+        )
+        .unwrap();
+        assert_eq!(r.advance(None, &strings), DialogStep::Ended { end_para: 0 });
+    }
+
     #[test]
     fn cancel_on_choice_frame_ends_cancelled() {
         let data = vec![
@@ -919,6 +1001,152 @@ mod tests {
                 fade_frames: 120,
             }),
             "the rental ducks the music: {cues:#?}"
+        );
+    }
+
+    /// The Upper Jeuno rental (Mairee, event 10002) with a live scene: the
+    /// player walks the authored approach to the chocobo and the mount cue
+    /// fires. A y/z slip between the session and the scene turns that
+    /// four-yalm walk into a hundred-yalm jog, so the final position is
+    /// pinned to the authored goal.
+    #[test]
+    fn upper_jeuno_rental_walks_the_authored_approach() {
+        let Some(root) = install() else {
+            eprintln!("skipping: no FFXI install");
+            return;
+        };
+        const ZONE: u16 = 244;
+        const EVENT: u16 = 10002;
+        const MAIREE: u32 = 0x010F_4048;
+
+        let eloc = root
+            .resolve(ffxi_dat::event_locate::event_dat_file_id(ZONE))
+            .expect("resolve event DAT");
+        let edat = EventDat::parse(&std::fs::read(eloc.path_under(&root)).expect("read"))
+            .expect("parse event dat");
+        let sfid = ffxi_dat::zone_dat::string_dat_file_id(ZONE);
+        let sloc = root.resolve(sfid).expect("resolve string dat");
+        let strings =
+            StringDat::parse(&std::fs::read(sloc.path_under(&root)).expect("read string dat"))
+                .expect("parse string dat");
+
+        let block = edat.block_for_actor(MAIREE).expect("mairee block");
+        let mut runner =
+            DialogRunner::start(block, EVENT, 0, vec![160, 10000, 0]).expect("rental event 10002");
+        // Mairee stands at wire (-56.308, 109.080 ground, 7.999 height);
+        // the event VM is (x, y = height, z = ground), so the start position
+        // carries height in y and ground in z (event units = coords * 1000).
+        use crate::cue::STATUS_EVENT_CHOCOBO;
+        use crate::vm::scene::EventPosition;
+        let start = EventPosition {
+            x: -56308,
+            y: 7999,
+            z: 109080,
+            heading: 0,
+        };
+        runner.attach_scene(std::sync::Arc::new(edat.clone()), MAIREE, start);
+
+        const DT: f32 = 1.0 / 30.0;
+        let mut response = None;
+        let mut cues = Vec::new();
+        let mut last_player = start;
+        let mut furthest = 0.0_f32;
+        let mut ended: Option<u32> = None;
+        let mut ticks = 0u32;
+        let mut track = |p: EventPosition| {
+            let dx = (p.x - start.x) as f32;
+            let dz = (p.z - start.z) as f32;
+            furthest = furthest.max(dx.hypot(dz) / 1000.0);
+            p
+        };
+        while ended.is_none() && ticks < 6000 {
+            let step = runner.advance(response.take(), &strings);
+            cues.extend(runner.take_cues());
+            for action in runner.take_scene_actions() {
+                if let crate::vm::scene::SceneAction::PlayerPosition(p) = action {
+                    last_player = track(p);
+                }
+            }
+            match step {
+                DialogStep::Frame(f) => {
+                    response = if f.choices.is_empty() { None } else { Some(0) };
+                    ticks += 1;
+                }
+                DialogStep::Ended { end_para } => {
+                    ended = Some(end_para);
+                }
+                DialogStep::Stopped(op) => {
+                    panic!("event 10002 stopped on opcode 0x{op:02X}");
+                }
+                DialogStep::Waiting => {
+                    ticks += 1;
+                    let step = runner.tick(DT, &strings);
+                    cues.extend(runner.take_cues());
+                    for action in runner.take_scene_actions() {
+                        if let crate::vm::scene::SceneAction::PlayerPosition(p) = action {
+                            last_player = track(p);
+                        }
+                    }
+                    match step {
+                        DialogStep::Frame(f) => {
+                            response = if f.choices.is_empty() { None } else { Some(0) };
+                        }
+                        DialogStep::Ended { end_para } => {
+                            ended = Some(end_para);
+                        }
+                        DialogStep::Stopped(op) => {
+                            panic!("event 10002 stopped on opcode 0x{op:02X}");
+                        }
+                        DialogStep::Waiting => {}
+                        DialogStep::AwaitServerAck(_) => {
+                            let _ = runner.ack_server(&strings);
+                        }
+                    }
+                }
+                DialogStep::AwaitServerAck(_) => {
+                    let _ = runner.ack_server(&strings);
+                }
+            }
+        }
+        assert!(
+            ended.is_some(),
+            "event 10002 did not end within {ticks} ticks"
+        );
+        assert_eq!(
+            ended,
+            Some(0),
+            "the rental's \"yes\" choice must end with EndPara 0"
+        );
+        assert!(
+            cues.iter().any(|c| matches!(
+                c,
+                EventCue::Mount {
+                    target: ActorLookup(ZONE_PLAYER_ACTOR),
+                    status_event: STATUS_EVENT_CHOCOBO,
+                    mount_id: None
+                }
+            )),
+            "the rental must mount the player: {cues:#?}"
+        );
+        // The authored end of the rental: the mount position the tag-24
+        // program writes after the SMOVE approach to the chocobo (the player
+        // block's refs 415..417, right after the SMOVE goal's 412..414).
+        let goal = EventPosition {
+            x: -72299,
+            y: 7999,
+            z: 120506,
+            heading: 0,
+        };
+        let dx = (last_player.x - goal.x) as f32;
+        let dz = (last_player.z - goal.z) as f32;
+        assert!(
+            dx.hypot(dz) < 100.0,
+            "the player must finish at the authored mount position, got {:?}",
+            last_player
+        );
+        assert!(
+            furthest < 25.0,
+            "the rental is a short approach to the stable, the player wandered {furthest} yalms"
         );
     }
 }

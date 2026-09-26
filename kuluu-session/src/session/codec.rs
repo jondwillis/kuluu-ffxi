@@ -263,6 +263,62 @@ pub fn build_subpacket_bazaar_exit(sync: u16) -> Vec<u8> {
     buf
 }
 
+// GP_CLI_COMMAND_REQSUBMAPNUM, vendor/server/src/map/packets/c2s/
+// 0x0eb_reqsubmapnum.h: header only. The event VM's 0xA6 case 0 sends it to
+// fetch the event's sub-map number; the server answers with s2c 0x10E when
+// the char is npc-locked and with nothing otherwise
+// (0x0eb_reqsubmapnum.cpp process).
+pub fn build_subpacket_reqsubmapnum(sync: u16) -> Vec<u8> {
+    build_subpacket_header(ffxi_proto::map::c2s::REQSUBMAPNUM, 1, sync).to_vec()
+}
+
+// GP_CLI_COMMAND_FRIENDPASS, vendor/server/src/map/packets/c2s/
+// 0x01b_friendpass.h: uint16 Para, uint16 padding. The event VM's 0x87/0x88
+// send cases send it (Para 0/2 begin, 1/3 confirm); the server answers with
+// s2c 0x059 (0x01b_friendpass.cpp process).
+pub fn build_subpacket_friendpass(sync: u16, para: u16) -> Vec<u8> {
+    let mut buf = vec![0u8; 8];
+    buf[0..4].copy_from_slice(&build_subpacket_header(
+        ffxi_proto::map::c2s::FRIENDPASS,
+        2,
+        sync,
+    ));
+    buf[4..6].copy_from_slice(&para.to_le_bytes());
+    buf
+}
+
+// GP_CLI_COMMAND_RECIPE, vendor/server/src/map/packets/c2s/0x058_recipe.h:
+// uint16 skill/level/Param0/Mode/Param1..4. The event VM's 0x8C send cases
+// send it; the server answers s2c 0x031 for Mode 1/2/3 and nothing for 4/5
+// (0x058_recipe.cpp process).
+pub fn build_subpacket_recipe(
+    sync: u16,
+    mode: u16,
+    skill: u16,
+    level: u16,
+    param0: u16,
+    param1: u16,
+    param2: u16,
+    param3: u16,
+    param4: u16,
+) -> Vec<u8> {
+    let mut buf = vec![0u8; 20];
+    buf[0..4].copy_from_slice(&build_subpacket_header(
+        ffxi_proto::map::c2s::RECIPE,
+        5,
+        sync,
+    ));
+    buf[4..6].copy_from_slice(&skill.to_le_bytes());
+    buf[6..8].copy_from_slice(&level.to_le_bytes());
+    buf[8..10].copy_from_slice(&param0.to_le_bytes());
+    buf[10..12].copy_from_slice(&mode.to_le_bytes());
+    buf[12..14].copy_from_slice(&param1.to_le_bytes());
+    buf[14..16].copy_from_slice(&param2.to_le_bytes());
+    buf[16..18].copy_from_slice(&param3.to_le_bytes());
+    buf[18..20].copy_from_slice(&param4.to_le_bytes());
+    buf
+}
+
 pub fn build_subpacket_reqlogout(sync: u16, mode: u16, kind: u16) -> Vec<u8> {
     let mut buf = vec![0u8; 8];
     buf[0..4].copy_from_slice(&build_subpacket_header(
@@ -1087,6 +1143,44 @@ mod tests {
             ffxi_proto::map::submap::NO_SUB_AREA,
         );
         assert_eq!(u16::from_le_bytes([buf[6], buf[7]]), 0);
+    }
+
+    #[test]
+    fn recipe_layout_matches_server_struct() {
+        let buf = build_subpacket_recipe(0x0102, 2, 43, 60, 1, 2, 3, 4, 5);
+        assert_eq!(buf.len(), 20, "sizeof(GP_CLI_COMMAND_RECIPE) + header");
+        let hdr = u16::from_le_bytes([buf[0], buf[1]]);
+        assert_eq!(
+            hdr & ffxi_proto::framing::SUBPACKET_OPCODE_MASK,
+            ffxi_proto::map::c2s::RECIPE,
+            "opcode 0x058"
+        );
+        assert_eq!((hdr >> 9) as usize, 5, "size_words");
+        assert_eq!(u16::from_le_bytes([buf[2], buf[3]]), 0x0102, "sync");
+        assert_eq!(u16::from_le_bytes([buf[4], buf[5]]), 43, "skill");
+        assert_eq!(u16::from_le_bytes([buf[6], buf[7]]), 60, "level");
+        assert_eq!(u16::from_le_bytes([buf[8], buf[9]]), 1, "Param0");
+        assert_eq!(u16::from_le_bytes([buf[10], buf[11]]), 2, "Mode");
+        assert_eq!(u16::from_le_bytes([buf[12], buf[13]]), 2, "Param1");
+        assert_eq!(u16::from_le_bytes([buf[14], buf[15]]), 3, "Param2");
+        assert_eq!(u16::from_le_bytes([buf[16], buf[17]]), 4, "Param3");
+        assert_eq!(u16::from_le_bytes([buf[18], buf[19]]), 5, "Param4");
+    }
+
+    #[test]
+    fn friendpass_layout_matches_server_struct() {
+        let buf = build_subpacket_friendpass(0x0102, 3);
+        assert_eq!(buf.len(), 8, "sizeof(GP_CLI_COMMAND_FRIENDPASS) + header");
+        let hdr = u16::from_le_bytes([buf[0], buf[1]]);
+        assert_eq!(
+            hdr & ffxi_proto::framing::SUBPACKET_OPCODE_MASK,
+            ffxi_proto::map::c2s::FRIENDPASS,
+            "opcode 0x01B"
+        );
+        assert_eq!((hdr >> 9) as usize, 2, "size_words");
+        assert_eq!(u16::from_le_bytes([buf[2], buf[3]]), 0x0102, "sync");
+        assert_eq!(u16::from_le_bytes([buf[4], buf[5]]), 3, "Para");
+        assert_eq!(u16::from_le_bytes([buf[6], buf[7]]), 0, "padding00");
     }
 
     #[test]

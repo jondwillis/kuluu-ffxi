@@ -19,13 +19,13 @@
         "kuluu-mcp"
       ],
       "environment": {
-        "FFXI_SERVER": "127.0.0.1",
-        "FFXI_AUTH_PORT": "54231",
-        "FFXI_DATA_PORT": "54230",
-        "FFXI_VIEW_PORT": "54001",
-        "FFXI_USER": "claude",
-        "FFXI_PASS": "testpass123",
-        "FFXI_CHAR": "Cleric",
+        "FFXI_SERVER": "{env:FFXI_SERVER}",
+        "FFXI_AUTH_PORT": "{env:FFXI_AUTH_PORT}",
+        "FFXI_DATA_PORT": "{env:FFXI_DATA_PORT}",
+        "FFXI_VIEW_PORT": "{env:FFXI_VIEW_PORT}",
+        "FFXI_USER": "{env:FFXI_USER}",
+        "FFXI_PASS": "{env:FFXI_PASS}",
+        "FFXI_CHAR": "{env:FFXI_CHAR}",
         "FFXI-RELAY_LISTEN": "auto",
         "RUST_LOG": "info"
       }
@@ -43,10 +43,10 @@
       ],
       "environment": {
         "FFXI_ATTACH": "auto",
-        "FFXI_SERVER": "127.0.0.1",
-        "FFXI_AUTH_PORT": "54231",
-        "FFXI_DATA_PORT": "54230",
-        "FFXI_VIEW_PORT": "54001",
+        "FFXI_SERVER": "{env:FFXI_SERVER}",
+        "FFXI_AUTH_PORT": "{env:FFXI_AUTH_PORT}",
+        "FFXI_DATA_PORT": "{env:FFXI_DATA_PORT}",
+        "FFXI_VIEW_PORT": "{env:FFXI_VIEW_PORT}",
         "RUST_LOG": "info"
       }
     }

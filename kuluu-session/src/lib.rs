@@ -2,7 +2,6 @@
 
 pub mod agent_codec;
 pub mod agent_io;
-#[cfg(unix)]
 pub mod agent_socket;
 pub mod auction;
 pub mod auth_binary;

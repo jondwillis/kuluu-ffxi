@@ -428,9 +428,11 @@ mod tests {
     const UTSUSEMI_ICHI: u16 = 338;
     const GEO_REFRESH: u16 = 800;
     const SHANTOTTO: u16 = 896;
-    // retail-2026-09 Fire is 2 units (500 ms), matching LSB castTime; horizonxi-2023
-    // ships the era-accurate 8 units (2000 ms).
-    const FIRE_CAST_MS_RETAIL: u32 = 500;
+    // Fire's cast time on the installed SE retail (FFXI_DAT_PATH's
+    // ROM/118/114.DAT) is 9 units (2250 ms); the 2 units (500 ms) in
+    // vendor/server/sql/spell_list.sql is the LSB value, not the retail
+    // DAT's. horizonxi-2023 ships the era-accurate 8 units (2000 ms).
+    const FIRE_CAST_MS_RETAIL: u32 = 2250;
     const FIRE_CAST_MS_HORIZON: u32 = 2000;
 
     #[test]

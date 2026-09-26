@@ -23,6 +23,15 @@ fn install() -> Option<DatRoot> {
     root
 }
 
+/// The same install with the content-substitution overlay cleared, so the
+/// pin sees the install's own dialog tables, not a Pivot era pack's
+/// (ffxi-dat/src/archive.rs discover_overlays).
+fn vanilla_install() -> Option<DatRoot> {
+    let root = open_test_install()?;
+    root.set_overlays(Vec::new());
+    Some(root)
+}
+
 fn parse(root: &DatRoot, zone: u16) -> Result<StringDat, String> {
     let file_id = string_dat_file_id(zone);
     let loc = root
@@ -46,7 +55,9 @@ fn pinned_zones_address_the_measured_file_ids() {
 
 #[test]
 fn the_zone_set_resolves_to_files_that_parse_as_dialog_tables() {
-    let Some(root) = install() else { return };
+    let Some(root) = vanilla_install() else {
+        return;
+    };
     let mut parsed = 0usize;
     let mut failures = Vec::new();
     for &(zone, _) in ZONE_DAT_TABLE {

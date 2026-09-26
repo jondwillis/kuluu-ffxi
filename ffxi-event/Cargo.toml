@@ -7,6 +7,7 @@ description = "FFXI client event/cutscene bytecode VM (atom0s/XiEvents), drives 
 
 [dependencies]
 ffxi-dat = { path = "../ffxi-dat" }
+ffxi-vocab = { path = "../ffxi-vocab" }
 tracing.workspace = true
 
 [dev-dependencies]

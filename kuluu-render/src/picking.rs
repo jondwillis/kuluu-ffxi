@@ -503,6 +503,7 @@ pub fn click_to_target_system(
                 engaged,
                 crate::hud::menu::any_usable_item(&scene.snapshot),
                 fishing_spot.0.is_ready(),
+                scene.snapshot.self_mount.is_some(),
             );
             if !action_model::build_target_action_entries(&ctx, &crate::hud::overlay::RETAIL)
                 .is_empty()

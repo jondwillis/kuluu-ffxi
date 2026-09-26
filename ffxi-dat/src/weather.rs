@@ -5,7 +5,7 @@ use crate::{
     kind::ChunkKind,
     mmb::D3DCOLOR_CHANNEL_MASK,
     mzb::AreaResourceId,
-    DatError, Result,
+    DatError, DatRoot, Result,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -650,6 +650,134 @@ fn lerp_records(a: &WeatherRecord, b: &WeatherRecord, t: f32, time_minutes: u32)
         skybox_colors: sk_c,
         skybox_altitudes: sk_a,
     }
+}
+
+// ---------------------------------------------------------------------------
+// 0x72 GETWEATHER: the global weather forecast table
+// ---------------------------------------------------------------------------
+
+/// The 2160-day cycle 0x72 indexes the forecast by
+/// (research/XiEvents/OpCodes/0x0072.md: `work[4] % 2160`).
+pub const FORECAST_DAYS: u32 = 2160;
+
+/// The u32 offset past which the per-head forecast values begin in the data
+/// DATs; 0x72 reads `WeatherData[6480 + head + 3*day]`
+/// (research/XiEvents/OpCodes/0x0072.md).
+pub const FORECAST_DATA_BASE: usize = 6480;
+
+/// The three values 0x72 copies into `Work_Zone[2..5)` per day
+/// (research/XiEvents/OpCodes/0x0072.md `PTR_Work_Zone[2..5)` loop).
+pub const FORECAST_VALUES_PER_DAY: usize = 3;
+
+/// The head-table entry counts: 7032 serves regions < 100 (100 entries), 7036
+/// serves regions >= 100 (200 entries).
+pub const FORECAST_HEADS_LOW: usize = 100;
+pub const FORECAST_HEADS_HIGH: usize = 200;
+
+/// The DAT file ids the forecast table ships in: 7032/7033 for regions < 100,
+/// 7036/7037 for regions >= 100. The pairing is settled by value range: 7032's
+/// head values top out at 37, which indexes 7033's 38 heads (61560 u32 =
+/// 38 x 6480); 7036's top out at 51, indexing 7037's 52 heads (84240 u32 =
+/// 52 x 6480). The PS2 pseudo-code's `WeatherHead`/`WeatherHead2` names are
+/// swapped relative to the XIClient port (research/XIClient StringManager.cpp
+/// loads 7032 into `WeatherHead`), so the pairing is taken from the measured
+/// ranges, not the names.
+pub const FORECAST_HEAD_LOW_FILE: u32 = 7032;
+pub const FORECAST_DATA_LOW_FILE: u32 = 7033;
+pub const FORECAST_HEAD_HIGH_FILE: u32 = 7036;
+pub const FORECAST_DATA_HIGH_FILE: u32 = 7037;
+
+/// The global weather forecast table 0x72 GETWEATHER reads: a per-region head
+/// (which of the region group's heads the region uses) plus the per-head,
+/// per-day forecast values. research/XiEvents/OpCodes/0x0072.md shows the index
+/// arithmetic; the layout (head tables 7032/7036, data 7033/7037) is measured
+/// from the shipped DATs. The three values are the raw u32s the opcode copies
+/// into `Work_Zone[2..5)`; the script that authors 0x72 decides what they mean.
+#[derive(Debug, Clone)]
+pub struct WeatherForecast {
+    head_low: [u8; FORECAST_HEADS_LOW],
+    data_low: Vec<u32>,
+    head_high: [u8; FORECAST_HEADS_HIGH],
+    data_high: Vec<u32>,
+}
+
+impl WeatherForecast {
+    /// Assemble a table from its four parts. The host builds this from
+    /// [`load_weather_forecast`]; tests build it directly with synthetic cells.
+    pub fn from_parts(
+        head_low: [u8; FORECAST_HEADS_LOW],
+        data_low: Vec<u32>,
+        head_high: [u8; FORECAST_HEADS_HIGH],
+        data_high: Vec<u32>,
+    ) -> Self {
+        Self {
+            head_low,
+            data_low,
+            head_high,
+            data_high,
+        }
+    }
+
+    /// The three forecast values 0x72 writes into `Work_Zone[2..5)` for
+    /// `region` on `day` of the 2160-day cycle
+    /// (research/XiEvents/OpCodes/0x0072.md). `None` if the region or the
+    /// derived index falls outside the shipped table.
+    pub fn values(&self, region: u32, day: u32) -> Option<[u32; 3]> {
+        let day = (day % FORECAST_DAYS) as usize;
+        let (head_table, data) = if region < 100 {
+            (&self.head_low[..], &self.data_low)
+        } else {
+            (&self.head_high[..], &self.data_high)
+        };
+        let head_idx = (if region < 100 { region } else { region - 100 }) as usize;
+        let head = *head_table.get(head_idx)? as usize;
+        let base = FORECAST_DATA_BASE + head + FORECAST_VALUES_PER_DAY * day;
+        if base + FORECAST_VALUES_PER_DAY > data.len() {
+            return None;
+        }
+        Some([data[base], data[base + 1], data[base + 2]])
+    }
+}
+
+/// Load the forecast table from the install's four forecast DATs (7032/7033/
+/// 7036/7037). The table is global — one copy serves every zone — so a host
+/// loads it once and shares it across the event VMs it drives.
+pub fn load_weather_forecast(root: &DatRoot) -> Result<WeatherForecast> {
+    fn read_file(root: &DatRoot, file_id: u32) -> Result<Vec<u8>> {
+        let loc = root.resolve(file_id)?;
+        let path = loc.path_under(root);
+        std::fs::read(&path).map_err(|e| DatError::Io {
+            path: path.clone(),
+            source: e,
+        })
+    }
+    fn to_u32s(bytes: &[u8]) -> Vec<u32> {
+        bytes
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    }
+
+    let head_low = read_file(root, FORECAST_HEAD_LOW_FILE)?;
+    let head_high = read_file(root, FORECAST_HEAD_HIGH_FILE)?;
+    if head_low.len() < FORECAST_HEADS_LOW || head_high.len() < FORECAST_HEADS_HIGH {
+        return Err(DatError::Weather(format!(
+            "forecast head tables too small: {FORECAST_HEAD_LOW_FILE}={} bytes (need {}), {FORECAST_HEAD_HIGH_FILE}={} bytes (need {})",
+            head_low.len(),
+            FORECAST_HEADS_LOW,
+            head_high.len(),
+            FORECAST_HEADS_HIGH
+        )));
+    }
+    let data_low = to_u32s(&read_file(root, FORECAST_DATA_LOW_FILE)?);
+    let data_high = to_u32s(&read_file(root, FORECAST_DATA_HIGH_FILE)?);
+
+    Ok(WeatherForecast {
+        head_low: head_low[..FORECAST_HEADS_LOW].try_into().unwrap(),
+        data_low,
+        head_high: head_high[..FORECAST_HEADS_HIGH].try_into().unwrap(),
+        data_high,
+    })
 }
 
 #[cfg(test)]
@@ -1300,5 +1428,52 @@ mod tests {
         let sets = collect_zone_weather_sets(&buf);
         assert!(sets.by_type.is_empty());
         assert_eq!(sets.flat.len(), 1);
+    }
+
+    fn synth_forecast() -> WeatherForecast {
+        let head_low = std::array::from_fn(|i| i as u8);
+        let head_high = std::array::from_fn(|i| i as u8);
+        let mut data_low = vec![0u32; 14000];
+        let mut data_high = vec![0u32; 14000];
+        data_low[6515] = 1;
+        data_low[6516] = 2;
+        data_low[6517] = 3;
+        data_high[6485] = 4;
+        data_high[6486] = 5;
+        data_high[6487] = 6;
+        WeatherForecast {
+            head_low,
+            data_low,
+            head_high,
+            data_high,
+        }
+    }
+
+    #[test]
+    fn forecast_values_index_the_head_and_day() {
+        let fc = synth_forecast();
+        assert_eq!(fc.values(5, 10), Some([1, 2, 3]));
+        assert_eq!(fc.values(105, 0), Some([4, 5, 6]));
+        assert_eq!(fc.values(5, FORECAST_DAYS), fc.values(5, 0));
+        assert_eq!(fc.values(0, 0), Some([0, 0, 0]));
+    }
+
+    #[test]
+    fn forecast_values_out_of_range_region_is_none() {
+        let fc = synth_forecast();
+        assert_eq!(fc.values(300, 0), None);
+    }
+
+    #[test]
+    fn real_forecast_reads_the_shipped_base_cell() {
+        let Some(root) = crate::archive::open_test_install() else {
+            eprintln!("skipping: no FFXI install");
+            return;
+        };
+        let fc = load_weather_forecast(&root).expect("forecast loads");
+        assert_eq!(
+            fc.values(0, 0),
+            Some([0x01FF_FF01, 0xFF01_FFFF, 0xFFFF_01FF])
+        );
     }
 }

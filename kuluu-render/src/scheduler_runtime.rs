@@ -1344,6 +1344,7 @@ fn start_cutscene_camera_tasks(
     mode: &crate::camera::CameraMode,
     tasks: &mut ResMut<CutsceneCameraTasks>,
     actor_entity: Entity,
+    self_pos: &kuluu_snapshot::Position,
     q_attach: &Query<
         (&Transform, Option<&BakedActor>),
         (
@@ -1435,6 +1436,21 @@ fn start_cutscene_camera_tasks(
                         children.iter().find_map(|child| q_render.get(child).ok())
                     });
                     let locator = cam.attach_locator_index();
+                    // For the local player the event script's position/heading (the
+                    // snapshot's self_pos, updated in the same ingest before this cue is
+                    // processed) is authoritative at this instant; the rendered Transform
+                    // lags it (the walker walks to it, the heading slerps at
+                    // SELF_VISUAL_YAW_RATE), and a zero-interp attach freezes the matrix at
+                    // start, so build it from the snapshot instead of the stale Transform.
+                    let attach_xform = if q_self.get(actor).is_ok() {
+                        Transform {
+                            translation: crate::scene::ffxi_to_bevy(self_pos.pos),
+                            rotation: crate::scene::heading_to_quat(self_pos.heading),
+                            ..Default::default()
+                        }
+                    } else {
+                        *xform
+                    };
                     match crate::cutscene_camera::eid_model_point(locator, baked, render) {
                         Some(point) => {
                             attach = Some(crate::cutscene_camera::AttachStart {
@@ -1442,7 +1458,10 @@ fn start_cutscene_camera_tasks(
                                 locator,
                                 interp: cam.interp_factor as f32
                                     / ffxi_dat::camera::INTERP_FACTOR_SCALE,
-                                initial_matrix: crate::cutscene_camera::attach_matrix(xform, point),
+                                initial_matrix: crate::cutscene_camera::attach_matrix(
+                                    &attach_xform,
+                                    point,
+                                ),
                             });
                         }
                         None => {
@@ -1512,6 +1531,7 @@ pub fn poll_action_dat_tasks(
         ),
     >,
     mode: Res<crate::camera::CameraMode>,
+    state: Res<crate::snapshot::SceneState>,
     mut q_scheds: Query<&mut ActiveSchedulers>,
     mut pending_inserts: Local<HashMap<Entity, Vec<ActiveScheduler>>>,
     mut commands: Commands,
@@ -1593,8 +1613,19 @@ pub fn poll_action_dat_tasks(
                     continue;
                 };
                 let target_entity = tracked.by_id.get(&target_id).copied();
-                let Some(mut active) = ActiveScheduler::from_main(&parsed.schedulers, &routine)
-                else {
+                // A spell DAT's `main` links the caster's own invoke routine (0x3C `shwh`,
+                // research/xim DatResource.kt invokeWhiteMagic) out of the caster's skeleton
+                // DAT, which in turn links global-dir routines — so the flatten spans the
+                // same three tiers apply_action_dispatch uses: the file's schedulers, then
+                // the actor's, then the global effect dir.
+                let mut lookup = RoutineLookup::new().with_dat(&parsed.schedulers);
+                if let Some(r) = actor_routines_via_mut(actor_entity, &q_children, &q_actors) {
+                    lookup = lookup.with_actor(r);
+                }
+                if let Some(g) = global.as_ref() {
+                    lookup = lookup.with_dat(&g.schedulers);
+                }
+                let Some(mut active) = ActiveScheduler::from_routine(&lookup, &routine) else {
                     // A cutscene motion's key is not an emote name: report the miss so the
                     // session's hold releases (kuluu-session/src/state.rs
                     // AgentCommand::CutsceneMotionDone), instead of playing a local clip.
@@ -1622,6 +1653,7 @@ pub fn poll_action_dat_tasks(
                         &mode,
                         &mut tasks,
                         actor_entity,
+                        &state.snapshot.self_pos,
                         &q_attach,
                         &q_children,
                         &q_actors,
@@ -1665,8 +1697,14 @@ pub fn poll_action_dat_tasks(
                     continue;
                 };
                 let target_entity = tracked.by_id.get(&target_id).copied();
-                let Some(mut active) = ActiveScheduler::from_main(&parsed.schedulers, &routine)
-                else {
+                let mut lookup = RoutineLookup::new().with_dat(&parsed.schedulers);
+                if let Some(r) = actor_routines_via_mut(actor_entity, &q_children, &q_actors) {
+                    lookup = lookup.with_actor(r);
+                }
+                if let Some(g) = global.as_ref() {
+                    lookup = lookup.with_dat(&g.schedulers);
+                }
+                let Some(mut active) = ActiveScheduler::from_routine(&lookup, &routine) else {
                     // A cutscene motion's key is not an emote name: report the miss so the
                     // session's hold releases (kuluu-session/src/state.rs
                     // AgentCommand::CutsceneMotionDone), instead of playing a local clip.
@@ -1710,6 +1748,7 @@ pub fn poll_action_dat_tasks(
                         &mode,
                         &mut tasks,
                         actor_entity,
+                        &state.snapshot.self_pos,
                         &q_attach,
                         &q_children,
                         &q_actors,
@@ -2303,7 +2342,7 @@ fn actor_render_routines<'a>(
 /// against the entity table's self id (None until it is known), everything else
 /// is already a literal.
 #[cfg(not(target_arch = "wasm32"))]
-fn cutscene_actor_server_id(
+pub(crate) fn cutscene_actor_server_id(
     self_id: Option<u32>,
     actor: kuluu_snapshot::CutsceneActor,
 ) -> Option<u32> {
@@ -2576,6 +2615,10 @@ pub struct CutsceneActorState {
     touched: std::collections::HashSet<u32>,
     /// Server ids hidden by a running cutscene's EVENT_HIDE cue; cleared at CutsceneEnded.
     hidden: std::collections::HashSet<u32>,
+    /// Server ids with a running 0x6C TRANSPAR fade (the
+    /// crate::ffxi_actor_render::CutsceneTranspar component,
+    /// research/XiEvents/OpCodes/0x006C.md); cleared at CutsceneEnded.
+    faded: std::collections::HashSet<u32>,
 }
 
 /// A model root hidden by a running cutscene's ActorHide cue (ffxi-event/src/cue.rs).
@@ -2607,8 +2650,19 @@ impl CutsceneActorState {
         self.hidden.remove(&id);
     }
 
+    pub fn fade(&mut self, id: u32) {
+        self.faded.insert(id);
+    }
+
+    pub fn unfade(&mut self, id: u32) {
+        self.faded.remove(&id);
+    }
+
     pub fn is_empty(&self) -> bool {
-        self.touched.is_empty() && self.walks.is_empty() && self.hidden.is_empty()
+        self.touched.is_empty()
+            && self.walks.is_empty()
+            && self.hidden.is_empty()
+            && self.faded.is_empty()
     }
 }
 
@@ -2631,6 +2685,15 @@ fn event_heading_to_quat(heading: i32) -> Quat {
     Quat::from_rotation_y(-std::f32::consts::TAU * heading as f32 / EVENT_HEADING_UNITS)
 }
 
+/// The rotation that points an actor's +X forward along the Bevy-space
+/// horizontal offset `(dx, dz)` to its target. Same basis as
+/// `crate::scene::heading_to_quat` and `event_heading_to_quat`: a rotation of
+/// `-theta` about Y sends +X to `(cos theta, 0, sin theta)`
+/// (combat_stance::heading_forward), so the yaw is the negated atan2.
+fn look_at_rotation(dx: f32, dz: f32) -> Quat {
+    Quat::from_rotation_y(-dz.atan2(dx))
+}
+
 // The five client-side actor cues (research/XiEvents/OpCodes/0x001F.md, 0x0037.md, 0x0039.md,
 // 0x004A.md, 0x005E.md): the event script's NPC choreography. Every write is client-side
 // transform state scoped to the running cutscene; release_cutscene_actors puts each touched
@@ -2644,6 +2707,8 @@ pub fn apply_cutscene_actor_cues(
     mut q_xform: Query<&mut Transform, With<WorldEntity>>,
     mut q_vis: Query<&mut Visibility, With<WorldEntity>>,
     mut q_scheds: Query<&mut ActiveSchedulers>,
+    q_children: Query<&Children>,
+    mut q_actors: Query<&mut crate::ffxi_actor_render::FfxiRenderActor>,
     mut commands: Commands,
     mut last_seen: Local<u64>,
 ) {
@@ -2756,7 +2821,7 @@ pub fn apply_cutscene_actor_cues(
                     continue;
                 }
                 if let Ok(mut t) = q_xform.get_mut(entity) {
-                    t.rotation = Quat::from_rotation_y(dz.atan2(dx));
+                    t.rotation = look_at_rotation(dx, dz);
                     state.touch(id);
                     tracing::debug!(
                         target: "kuluu_render::scheduler_runtime",
@@ -2773,18 +2838,39 @@ pub fn apply_cutscene_actor_cues(
                 let Some(&entity) = tracked.by_id.get(&id) else {
                     continue;
                 };
-                if let Ok(mut scheds) = q_scheds.get_mut(entity) {
+                let queue_now_empty = if let Ok(mut scheds) = q_scheds.get_mut(entity) {
                     match key {
                         Some(name) => scheds.remove_routine_named(&name),
                         None => scheds.stop_all(),
                     }
-                    tracing::debug!(
-                        target: "kuluu_render::scheduler_runtime",
-                        id,
-                        key = %key.map(fourcc).unwrap_or_default(),
-                        "cutscene actor stop action"
-                    );
+                    scheds.is_empty()
+                } else {
+                    false
+                };
+                // The killed routine's Motion stage owns the caster's pose
+                // (the gate guard's Signet arm-raise, research/XiEvents/OpCodes/0x0073.md):
+                // dropping the queue entry leaves the held action, so clear it on the
+                // render actor and let the pose path fall back to idle.
+                if let Ok(children) = q_children.get(entity) {
+                    for &child in children {
+                        if let Ok(mut render) = q_actors.get_mut(child) {
+                            render.clear_cutscene_action();
+                        }
+                    }
                 }
+                // The same strip tick_active_schedulers does when the last entry
+                // retires: an entity with no running routines keeps no action components.
+                if queue_now_empty {
+                    commands
+                        .entity(entity)
+                        .remove::<(ActiveSchedulers, ActionAssets, ActionTarget)>();
+                }
+                tracing::debug!(
+                    target: "kuluu_render::scheduler_runtime",
+                    id,
+                    key = %key.map(fourcc).unwrap_or_default(),
+                    "cutscene actor stop action"
+                );
             }
             CutsceneCue::ActorHide { target, hide } => {
                 // Hiding the local player model is a valid ask (the EVENT_HIDE_SELF opcode
@@ -2819,6 +2905,60 @@ pub fn apply_cutscene_actor_cues(
                         "cutscene actor show"
                     );
                 }
+            }
+            // 0x38: while CliEventModeLocal holds, the event hides the local
+            // player model so it can drive the camera apart from it
+            // (research/XiEvents/OpCodes/0x0038.md); the HUD half rides
+            // CutsceneMode.local_mode in crate::cutscene, and
+            // release_cutscene_actors owns the unhide at CutsceneEnded.
+            CutsceneCue::LocalMode { .. } => {
+                let Some(id) = self_id else {
+                    continue;
+                };
+                let Some(&entity) = tracked.by_id.get(&id) else {
+                    continue;
+                };
+                commands.entity(entity).insert(CutsceneHidden);
+                state.hide(id);
+                if let Ok(mut v) = q_vis.get_mut(entity) {
+                    *v = Visibility::Hidden;
+                }
+                tracing::debug!(
+                    target: "kuluu_render::scheduler_runtime",
+                    id,
+                    "cutscene local mode hides the self actor"
+                );
+            }
+            // 0x6C: drive the target's opacity to the authored byte over the
+            // authored frames; the fade stops at CutsceneEnded at whatever
+            // value it has reached (ffxi-event/src/cue.rs Transpar).
+            CutsceneCue::Transpar {
+                target,
+                end_alpha,
+                duration_frames,
+            } => {
+                // Fading the local player model is a valid ask, so resolve
+                // without excluding self (research/XiEvents/OpCodes/0x006C.md).
+                let Some(id) = cutscene_actor_server_id(self_id, target) else {
+                    continue;
+                };
+                let Some(&entity) = tracked.by_id.get(&id) else {
+                    continue;
+                };
+                commands
+                    .entity(entity)
+                    .insert(crate::ffxi_actor_render::CutsceneTranspar::new(
+                        (end_alpha as f32 / 255.0).clamp(0.0, 1.0),
+                        (duration_frames as f32).max(1.0) / 60.0,
+                    ));
+                state.fade(id);
+                tracing::debug!(
+                    target: "kuluu_render::scheduler_runtime",
+                    id,
+                    end_alpha,
+                    duration_frames,
+                    "cutscene actor transpar"
+                );
             }
             _ => {}
         }
@@ -2881,6 +3021,10 @@ pub fn release_cutscene_actors(
     mut cursor: Local<u64>,
     mut q_xform: Query<&mut Transform, With<WorldEntity>>,
     q_hidden: Query<Entity, With<CutsceneHidden>>,
+    q_faded: Query<Entity, With<crate::ffxi_actor_render::CutsceneTranspar>>,
+    q_scheds: Query<(Entity, &ActiveSchedulers), With<WorldEntity>>,
+    q_children: Query<&Children>,
+    mut q_actors: Query<&mut crate::ffxi_actor_render::FfxiRenderActor>,
     mut commands: Commands,
 ) {
     let total = events.pushed_total;
@@ -2895,7 +3039,36 @@ pub fn release_cutscene_actors(
         }
     }
     *cursor = total;
-    if !ended || state.is_empty() {
+    if !ended {
+        return;
+    }
+    // A cutscene cast's Motion stage owns the caster's pose (the gate guard's
+    // Signet arm-raise, research/XiEvents/OpCodes/0x0073.md). The event
+    // ending must release it: stop the routine so its Motion stage cannot
+    // re-arm the pose, and drop the held action so the pose pass falls back
+    // to idle on its next run. This runs even when no entity was touched
+    // (the cast does not move the guard), so it precedes the touched-only
+    // position reset below.
+    for (entity, scheds) in q_scheds.iter() {
+        if !scheds
+            .routines
+            .iter()
+            .any(|r| r.cutscene_motion_actor.is_some())
+        {
+            continue;
+        }
+        if let Ok(children) = q_children.get(entity) {
+            for &child in children {
+                if let Ok(mut actor) = q_actors.get_mut(child) {
+                    actor.clear_cutscene_action();
+                }
+            }
+        }
+        commands
+            .entity(entity)
+            .remove::<(ActiveSchedulers, ActionAssets, ActionTarget)>();
+    }
+    if state.is_empty() {
         return;
     }
     for wire in &scene_state.snapshot.entities {
@@ -2916,9 +3089,18 @@ pub fn release_cutscene_actors(
     for e in q_hidden.iter() {
         commands.entity(e).remove::<CutsceneHidden>();
     }
+    // Stop every running 0x6C fade at its current value: retail drops the
+    // fade's driver with the event's own ExtData
+    // (research/XiEvents/OpCodes/0x006C.md).
+    for e in q_faded.iter() {
+        commands
+            .entity(e)
+            .remove::<crate::ffxi_actor_render::CutsceneTranspar>();
+    }
     state.walks.clear();
     state.touched.clear();
     state.hidden.clear();
+    state.faded.clear();
 }
 
 // The routine the caster's cast-start effects were flattened from, so an interrupt can stop the
@@ -3633,62 +3815,6 @@ pub fn dispatch_spell_effect_stages(
     }
 }
 
-pub const EMOTE_ROUTINES_PER_FILE: u16 = 8;
-
-const SALUTE_NATION_MAX: u16 = 2;
-
-fn em_routine(sub: u16) -> [u8; 4] {
-    [
-        b'e',
-        b'm',
-        b'0',
-        b'0' + (sub % EMOTE_ROUTINES_PER_FILE) as u8,
-    ]
-}
-
-/// Emote id → (emote-file offset from the FFXiMain.dll race base, `em0N`
-/// routine). Derived empirically from the retail HumeM emote DATs (dump:
-/// examples/zz-emote-probe.rs; each routine's Motion clip mnemonic names the
-/// emote — bow/poi/sl1-3/kne/lau/wee, den/nod/wav/wel/gla/che/clp, …) and
-/// pinned to XIM's only known points (Actor.kt onGatheringAttempt HELM: Logging=(5,0),
-/// Mining=(6,0), Harvesting=(7,0) — confirmed by the files' Japanese tool
-/// particles: ono0=axe, turu=pickaxe, kama=sickle). Notable non-uniformities
-/// the old id/8 hypothesis missed: Point/Bow are swapped in file 0, Salute
-/// occupies em02..em04 (one per nation, 0x05A Param = nation), and ids ≥ 6
-/// sit at (id+2)/8 only through id 37. Returns None when no body routine
-/// exists in the era DATs (face-only emotes, id gaps, unmapped job emotes).
-pub fn emote_routine(emote_id: u16, param: u16) -> Option<(u32, [u8; 4])> {
-    match emote_id {
-        0 => Some((0, *b"em01")),
-        1 => Some((0, *b"em00")),
-        2 => Some((0, em_routine(2 + param.min(SALUTE_NATION_MAX)))),
-        3 => Some((0, *b"em05")),
-        4 => Some((0, *b"em06")),
-        5 => Some((0, *b"em07")),
-        6..=37 => {
-            let shifted = emote_id + 2;
-            Some((
-                (shifted / EMOTE_ROUTINES_PER_FILE) as u32,
-                em_routine(shifted % EMOTE_ROUTINES_PER_FILE),
-            ))
-        }
-        // HELM (server-initiated): axe / pickaxe / sickle files.
-        40 => Some((5, *b"em00")),
-        41 => Some((6, *b"em00")),
-        42 => Some((7, *b"em00")),
-        // Hurray variants (xe0..xe6) are weapon-keyed; selection unmapped — em00 default.
-        43 => Some((8, *b"em00")),
-        44 => Some((11, *b"em00")),
-        // Dance1-4 (dc0..dc3).
-        65..=68 => Some((12, em_routine(emote_id - 65))),
-        // Bell-ring motion variants (rx/rs); note→variant selection unmapped.
-        73 => Some((10, *b"em00")),
-        // Aim variants (ye0..ye6) are ranged-weapon-keyed; selection unmapped — em00 default.
-        96 => Some((9, *b"em00")),
-        _ => None,
-    }
-}
-
 #[cfg(not(target_arch = "wasm32"))]
 pub fn dispatch_entity_emoted(
     events: Res<crate::snapshot::EventLog>,
@@ -3733,7 +3859,8 @@ pub fn dispatch_entity_emoted(
         let Some(&actor_entity) = tracked.by_id.get(&actor_id) else {
             continue;
         };
-        let Some((file_offset, routine)) = emote_routine(emote_id, param) else {
+        let Some((file_offset, routine)) = ffxi_vocab::emote_anim::emote_routine(emote_id, param)
+        else {
             continue;
         };
         let race = q_look.get(actor_entity).ok().and_then(|l| look_race(&l.0));
@@ -3928,6 +4055,31 @@ impl Plugin for SchedulerRuntimePlugin {
 mod tests {
     use super::*;
     use ffxi_dat::scheduler::{SchedulerStage, StageKind};
+    use ffxi_vocab::emote_anim::emote_routine;
+
+    /// A look-at must send the actor's +X forward along the offset to its
+    /// target, on the same basis every other heading in the renderer uses.
+    #[test]
+    fn look_at_rotation_faces_the_offset() {
+        for (dx, dz) in [
+            (1.0, 0.0),
+            (0.0, 1.0),
+            (-1.0, 0.0),
+            (0.0, -1.0),
+            (0.6, -0.8),
+        ] {
+            let forward = look_at_rotation(dx, dz) * Vec3::X;
+            let want = Vec3::new(dx, 0.0, dz).normalize();
+            assert!(
+                (forward - want).length() < 1e-5,
+                "offset ({dx}, {dz}): forward {forward:?}, want {want:?}"
+            );
+        }
+        let quarter = (EVENT_HEADING_UNITS / 4.0) as i32;
+        let a = event_heading_to_quat(quarter) * Vec3::X;
+        let b = look_at_rotation(0.0, 1.0) * Vec3::X;
+        assert!((a - b).length() < 1e-4, "{a:?} vs {b:?}");
+    }
 
     #[test]
     #[cfg(not(target_arch = "wasm32"))]
@@ -5437,6 +5589,328 @@ mod tests {
         );
     }
 
+    // Retail-DAT guard (skips without an install): the gate guard's Signet cast (zone 231,
+    // event 32762) is spell DAT 3297's `main` over 0x73. Its 0x3C `shwh` invoke routine lives
+    // in the caster's skeleton DAT, and `shwh`'s `sswh` holds the cast's Motion stages — so a
+    // flatten over the spell DAT alone drops the arm raise (research/xim DatResource.kt
+    // invokeWhiteMagic).
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn spell_main_flattens_the_caster_invoke_routine_from_the_actor_tier() {
+        const SIGNET_SPELL_FILE: u32 = 3297;
+        const HUME_M_SKELETON_FILE: u32 = 7072;
+
+        let (Some(spell_bytes), Some(actor_bytes), Some(global_bytes)) = (
+            read_dat(SIGNET_SPELL_FILE),
+            read_dat(HUME_M_SKELETON_FILE),
+            read_dat(GLOBAL_EFFECT_DIR_FILE_ID),
+        ) else {
+            return;
+        };
+        let (spell_scheds, _, _) = parse_action_bytes(&spell_bytes);
+        let (actor_scheds, _, _) = parse_action_bytes(&actor_bytes);
+        let (global_scheds, _, _) = parse_action_bytes(&global_bytes);
+
+        let spell_only = ActiveScheduler::from_main(&spell_scheds, b"main").expect("main exists");
+        assert!(
+            spell_only
+                .stages
+                .iter()
+                .all(|t| t.stage.kind != StageKind::Motion),
+            "the spell DAT alone carries no cast motion — shwh is on the caster"
+        );
+
+        let lookup = RoutineLookup::new()
+            .with_dat(&spell_scheds)
+            .with_dat(&actor_scheds)
+            .with_dat(&global_scheds);
+        let full = ActiveScheduler::from_routine(&lookup, b"main").expect("main exists");
+        let motions: Vec<[u8; 4]> = full
+            .stages
+            .iter()
+            .filter(|t| t.stage.kind == StageKind::Motion)
+            .map(|t| t.stage.id)
+            .collect();
+        assert!(
+            motions.contains(b"mw1?") && motions.contains(b"mw2?"),
+            "the skeleton tier's sswh cast motion must flatten into main, got {motions:?}"
+        );
+    }
+
+    // The same flatten driven through the runtime the 0x73 cue lands in: the
+    // routine ticks, its Motion stages start the caster's action, and the pose
+    // path runs with the routine's own lock state. The cast's pose must be
+    // released by the routine's authored end, and CutsceneEnded must release
+    // whatever the routine still holds (research/XiEvents/OpCodes/0x0073.md).
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn signet_cast_releases_the_caster_pose_at_event_end() {
+        const SIGNET_SPELL_FILE: u32 = 3297;
+        const HUME_M_SKELETON_FILE: u32 = 7072;
+        const GUARD_ID: u32 = 0x010E_704F;
+
+        let (Some(spell_bytes), Some(actor_bytes), Some(global_bytes)) = (
+            read_dat(SIGNET_SPELL_FILE),
+            read_dat(HUME_M_SKELETON_FILE),
+            read_dat(GLOBAL_EFFECT_DIR_FILE_ID),
+        ) else {
+            return;
+        };
+        let (spell_scheds, _, _) = parse_action_bytes(&spell_bytes);
+        let (actor_scheds, actor_assets, _) = parse_action_bytes(&actor_bytes);
+        let (global_scheds, _, _) = parse_action_bytes(&global_bytes);
+
+        // The tiers poll_action_dat_tasks assembles for the 0x73 cue.
+        let lookup = RoutineLookup::new()
+            .with_dat(&spell_scheds)
+            .with_dat(&actor_scheds)
+            .with_dat(&global_scheds);
+        let mut active = ActiveScheduler::from_routine(&lookup, b"main").expect("main exists");
+        active.cutscene_motion_actor = Some(kuluu_snapshot::CutsceneActor::Entity {
+            server_id: GUARD_ID,
+        });
+        let end_frame = active.end_frame();
+
+        // The guard as load_pc builds it: a WorldEntity parent running the
+        // routine, the render-actor child carrying the skeleton's clips.
+        let actor = crate::ffxi_actor_render::render_actor_with_skeleton_clips(
+            GUARD_ID,
+            actor_assets.animations.clone(),
+        );
+
+        let mut app = App::new();
+        app.add_message::<SchedulerStageEvent>()
+            .add_message::<CutsceneMotionDone>()
+            .init_resource::<Time>()
+            .add_systems(
+                Update,
+                (
+                    tick_active_schedulers,
+                    dispatch_motion_stages,
+                    signet_pose_pass,
+                )
+                    .chain(),
+            );
+
+        let child = app.world_mut().spawn(actor).id();
+        let parent = app
+            .world_mut()
+            .spawn((
+                crate::components::WorldEntity {
+                    id: GUARD_ID,
+                    act_index: 0,
+                    kind: kuluu_snapshot::EntityKind::Pc,
+                },
+                Transform::default(),
+                ActiveSchedulers::one(active),
+                ActionAssets::default(),
+                ActionTarget(None),
+            ))
+            .id();
+        app.world_mut().entity_mut(child).insert(ChildOf(parent));
+
+        // One pose tick per frame to the routine's authored end plus the
+        // post-finish TTL: the point tick_active_schedulers retires the entry,
+        // where a self-releasing pose is already idle.
+        let step = std::time::Duration::from_secs_f32(1.0 / crate::ffxi_actor_render::FRAME_RATE);
+        let ticks = ((end_frame as f32 / ROUTINE_FPS + POST_FINISH_TTL_SECS)
+            * crate::ffxi_actor_render::FRAME_RATE)
+            .ceil() as u32;
+        for _ in 0..ticks {
+            app.world_mut().resource_mut::<Time>().advance_by(step);
+            app.update();
+        }
+
+        let actor = app
+            .world()
+            .entity(child)
+            .get::<crate::ffxi_actor_render::FfxiRenderActor>()
+            .unwrap();
+        assert!(
+            !actor.has_action(),
+            "the cast's pose must clear by the routine's authored end (lock {} frames, routine end frame {end_frame})",
+            active_lock_frames(&lookup)
+        );
+        assert!(
+            actor.is_pose_idle(),
+            "the caster is idle by the routine's authored end"
+        );
+
+        // CutsceneEnded: release whatever the routine still holds.
+        app.init_resource::<crate::snapshot::EventLog>();
+        app.init_resource::<crate::snapshot::SceneState>();
+        app.init_resource::<crate::scene::TrackedEntities>();
+        app.init_resource::<CutsceneActorState>();
+        app.add_systems(Update, release_cutscene_actors);
+        app.world_mut()
+            .resource_mut::<crate::snapshot::EventLog>()
+            .push(kuluu_snapshot::ViewerEvent::CutsceneEnded);
+        app.world_mut()
+            .resource_mut::<crate::scene::TrackedEntities>()
+            .by_id
+            .insert(GUARD_ID, parent);
+        app.world_mut().resource_mut::<Time>().advance_by(step);
+        app.update();
+
+        let entity = app.world().entity(parent);
+        assert!(!entity.contains::<ActiveSchedulers>());
+        let actor = app
+            .world()
+            .entity(child)
+            .get::<crate::ffxi_actor_render::FfxiRenderActor>()
+            .unwrap();
+        assert!(!actor.has_action(), "the event end releases the cast pose");
+    }
+
+    /// A stop-action cue kills the routine and releases the pose it started:
+    /// the queue entry drops, the held action clears, and the emptied entity is
+    /// stripped in the same cue (research/XiEvents/OpCodes/0x0050.md).
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn stop_action_cue_clears_the_cast_pose_and_strips_the_entity() {
+        const NPC_ID: u32 = 0x010E_704F;
+        const CAST_CLIP: [u8; 4] = *b"mw2?";
+        const HUME_M_SKELETON_FILE: u32 = 7072;
+
+        let Some(actor_bytes) = read_dat(HUME_M_SKELETON_FILE) else {
+            return;
+        };
+        let (_, actor_assets, _) = parse_action_bytes(&actor_bytes);
+        let clips = actor_assets.animations.clone();
+        let clip = ffxi_dat::datid::DatId::from_name(&CAST_CLIP);
+        assert!(
+            clips.iter().any(|a| a.id.parameterized_match(&clip)),
+            "the stub must own the cast clip"
+        );
+
+        let mut lock = stage(0, StageKind::AnimationLock, 0x07, *b"lock");
+        lock.stage.duration_frames = 600;
+        let motion = stage(1, StageKind::Motion, 0x05, CAST_CLIP);
+        let active = ActiveScheduler::from_scheduler(&make_scheduler(*b"cast", vec![lock, motion]));
+
+        let mut app = actor_cue_app();
+        app.add_message::<SchedulerStageEvent>()
+            .add_message::<CutsceneMotionDone>()
+            .init_resource::<Time>()
+            .add_systems(
+                Update,
+                (tick_active_schedulers, dispatch_motion_stages).chain(),
+            );
+
+        let child = app
+            .world_mut()
+            .spawn(crate::ffxi_actor_render::render_actor_with_skeleton_clips(
+                NPC_ID, clips,
+            ))
+            .id();
+        let parent = app
+            .world_mut()
+            .spawn((
+                crate::components::WorldEntity {
+                    id: NPC_ID,
+                    act_index: 0,
+                    kind: kuluu_snapshot::EntityKind::Pc,
+                },
+                Transform::default(),
+                ActiveSchedulers::one(active),
+                ActionAssets::default(),
+                ActionTarget(None),
+            ))
+            .id();
+        app.world_mut().entity_mut(child).insert(ChildOf(parent));
+
+        // One tick: the Motion stage fires and starts the cast's pose.
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(std::time::Duration::from_secs_f32(
+                1.0 / crate::ffxi_actor_render::FRAME_RATE,
+            ));
+        app.update();
+        let actor = app
+            .world()
+            .entity(child)
+            .get::<crate::ffxi_actor_render::FfxiRenderActor>()
+            .unwrap();
+        assert!(actor.has_action(), "the Motion stage must start the pose");
+        assert!(
+            app.world().entity(parent).contains::<ActiveSchedulers>(),
+            "the routine is still queued before the stop"
+        );
+
+        // The stop cue: kill the routine, clear the pose, strip the entity.
+        app.world_mut()
+            .resource_mut::<crate::snapshot::EventLog>()
+            .push(kuluu_snapshot::ViewerEvent::Cutscene {
+                cue: CutsceneCue::ActorStopAction {
+                    actor: kuluu_snapshot::CutsceneActor::Entity { server_id: NPC_ID },
+                    key: None,
+                },
+            });
+        app.world_mut()
+            .resource_mut::<crate::scene::TrackedEntities>()
+            .by_id
+            .insert(NPC_ID, parent);
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(std::time::Duration::from_secs_f32(
+                1.0 / crate::ffxi_actor_render::FRAME_RATE,
+            ));
+        app.update();
+
+        let entity = app.world().entity(parent);
+        assert!(
+            !entity.contains::<ActiveSchedulers>(),
+            "an emptied queue is stripped with the stop cue"
+        );
+        assert!(!entity.contains::<ActionAssets>());
+        assert!(!entity.contains::<ActionTarget>());
+        let mut actor = app
+            .world_mut()
+            .get_mut::<crate::ffxi_actor_render::FfxiRenderActor>(child)
+            .unwrap();
+        assert!(!actor.has_action(), "the stop cue clears the held pose");
+        crate::ffxi_actor_render::advance_actor_pose_standalone_locked(&mut actor, 1.0, false);
+        assert!(actor.is_pose_idle(), "one pose pass after the stop is idle");
+    }
+
+    /// The flattened routine's AnimationLock span, for the failure message.
+    fn active_lock_frames(lookup: &RoutineLookup) -> u32 {
+        ActiveScheduler::from_routine(lookup, b"main")
+            .expect("main exists")
+            .stages
+            .iter()
+            .filter(|t| t.stage.kind == StageKind::AnimationLock)
+            .map(|t| t.stage.duration_frames as u32)
+            .sum()
+    }
+
+    /// The pose pass the full app runs, with the routine's own lock state: the
+    /// test double for ffxi_actor_render's pose system in the signet test.
+    fn signet_pose_pass(
+        time: Res<Time>,
+        q_parent: Query<(Entity, Option<&ActiveSchedulers>), With<crate::components::WorldEntity>>,
+        q_children: Query<&Children>,
+        mut q_actors: Query<&mut crate::ffxi_actor_render::FfxiRenderActor>,
+    ) {
+        let dt = time.delta_secs();
+        for (parent, scheds) in &q_parent {
+            let locked = scheds.is_some_and(|s| s.is_locked_now());
+            let Ok(children) = q_children.get(parent) else {
+                continue;
+            };
+            for &child in children {
+                let Ok(mut actor) = q_actors.get_mut(child) else {
+                    continue;
+                };
+                crate::ffxi_actor_render::advance_actor_pose_standalone_locked(
+                    &mut actor,
+                    dt * crate::ffxi_actor_render::FRAME_RATE,
+                    locked,
+                );
+            }
+        }
+    }
+
     fn tagged_stage(
         frame: u32,
         kind: StageKind,
@@ -6422,6 +6896,23 @@ mod tests {
             });
     }
 
+    fn push_transpar(
+        app: &mut App,
+        target: kuluu_snapshot::CutsceneActor,
+        end_alpha: i32,
+        duration_frames: i32,
+    ) {
+        app.world_mut()
+            .resource_mut::<crate::snapshot::EventLog>()
+            .push(kuluu_snapshot::ViewerEvent::Cutscene {
+                cue: CutsceneCue::Transpar {
+                    target,
+                    end_alpha,
+                    duration_frames,
+                },
+            });
+    }
+
     /// Hides event 503's party lead (Curilla) and releases her on unhide.
     #[test]
     #[cfg(not(target_arch = "wasm32"))]
@@ -6485,6 +6976,40 @@ mod tests {
         );
     }
 
+    /// 0x38's local mode hides the local player model for the event's whole
+    /// run; release_cutscene_actors owns the unhide at CutsceneEnded
+    /// (research/XiEvents/OpCodes/0x0038.md).
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn local_mode_cue_hides_the_self_actor() {
+        const SELF: u32 = 7;
+        let mut app = actor_cue_app();
+        let player = spawn_tracked_actor(&mut app, SELF);
+        app.world_mut()
+            .resource_mut::<crate::entity_table::EntityTable>()
+            .set_self_id(Some(SELF));
+
+        app.world_mut()
+            .resource_mut::<crate::snapshot::EventLog>()
+            .push(kuluu_snapshot::ViewerEvent::Cutscene {
+                cue: CutsceneCue::LocalMode { mode: 0x20 },
+            });
+        app.update();
+        assert!(
+            app.world().get::<CutsceneHidden>(player).is_some(),
+            "local mode hides the self model for the event's whole run"
+        );
+        assert_eq!(
+            *app.world().get::<Visibility>(player).unwrap(),
+            Visibility::Hidden
+        );
+        let state = app.world().resource::<CutsceneActorState>();
+        assert!(
+            state.hidden.contains(&SELF),
+            "the event-end release must know this id"
+        );
+    }
+
     #[test]
     #[cfg(not(target_arch = "wasm32"))]
     fn cutscene_ended_releases_cutscene_hidden_models() {
@@ -6512,5 +7037,273 @@ mod tests {
         );
         let state = app.world().resource::<CutsceneActorState>();
         assert!(state.is_empty());
+    }
+
+    /// 0x6C inserts the fade component on the target and stops it, at whatever
+    /// value it reached, on CutsceneEnded
+    /// (research/XiEvents/OpCodes/0x006C.md).
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn transpar_cue_inserts_the_fade_and_end_stops_it() {
+        const NPC: u32 = 0x010E_60D5;
+        let mut app = actor_cue_app();
+        app.init_resource::<crate::snapshot::SceneState>()
+            .add_systems(Update, release_cutscene_actors);
+        let npc = spawn_tracked_actor(&mut app, NPC);
+
+        push_transpar(
+            &mut app,
+            kuluu_snapshot::CutsceneActor::Entity { server_id: NPC },
+            0,
+            60,
+        );
+        app.update();
+        let fade = app
+            .world()
+            .get::<crate::ffxi_actor_render::CutsceneTranspar>(npc)
+            .expect("the cue must insert the fade");
+        assert!(
+            (fade.end - 0.0).abs() < f32::EPSILON,
+            "alpha byte 0 is fully transparent"
+        );
+        assert!(
+            (fade.total_secs - 1.0).abs() < 1e-6,
+            "60 frames is one second"
+        );
+        let state = app.world().resource::<CutsceneActorState>();
+        assert!(
+            state.faded.contains(&NPC),
+            "the fade must be recorded so release finds it"
+        );
+
+        app.world_mut()
+            .resource_mut::<crate::snapshot::EventLog>()
+            .push(kuluu_snapshot::ViewerEvent::CutsceneEnded);
+        app.update();
+        assert!(
+            app.world()
+                .get::<crate::ffxi_actor_render::CutsceneTranspar>(npc)
+                .is_none(),
+            "ended must stop the fade at its current value"
+        );
+        assert!(app.world().resource::<CutsceneActorState>().is_empty());
+    }
+
+    /// The 0x45 camera route drives the operator camera to where the DAT
+    /// authored it: the captured chocobo-rental CS cues (camera lock, then the
+    /// 30906 c05i/c01i/c00i routines on the local player) are fed through the
+    /// real dispatch -> load -> advance pipeline, and the camera must land on
+    /// each route's authored eye/target/focal, not hold its chase position.
+    /// Self-skips without a real install (ROM/62/112.DAT).
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn the_cutscene_camera_route_drives_the_camera_to_the_authored_points() {
+        let Some(root) = ffxi_dat::archive::open_test_install() else {
+            return;
+        };
+        bevy::tasks::AsyncComputeTaskPool::get_or_init(Default::default);
+        let root = Arc::new(root);
+
+        // The file the 0x45 cue names, through the same resolution the runtime uses.
+        let loc = root
+            .resolve(30906)
+            .expect("30906 resolves through the vtables");
+        let bytes = std::fs::read(loc.path_under(&root)).expect("the camera route DAT reads");
+        let (schedulers, _assets, _report, cameras) = parse_action_bytes_reporting(&bytes);
+        let lookup = RoutineLookup::new().with_dat(&schedulers);
+
+        const SELF_ID: u32 = 1;
+        let player_pos = Vec3::new(10.0, 0.0, -5.0);
+
+        // The route's authored eye/target (bevy space) for a player at `player`
+        // with identity yaw: the point's model-frame coords out through the same
+        // attach the runtime builds (EID_BODY_CENTER at the fallback height).
+        let authored = |routine: &[u8; 4], player: Vec3| -> (Vec3, Vec3, f32) {
+            let name = String::from_utf8_lossy(routine);
+            let active = ActiveScheduler::from_routine(&lookup, routine)
+                .unwrap_or_else(|| panic!("routine {name} missing from the file"));
+            let cam_id = active
+                .stages
+                .iter()
+                .find(|t| t.stage.kind == StageKind::CameraRoute)
+                .map(|t| t.stage.id)
+                .unwrap_or_else(|| panic!("routine {name} carries no CameraRoute stage"));
+            let cam = cameras
+                .get(&cam_id)
+                .unwrap_or_else(|| panic!("routine {name} names no camera chunk"));
+            let pt = &cam.points[0];
+            let model_point = crate::cutscene_camera::eid_model_point(21, None, None)
+                .expect("the body-center locator resolves without a model");
+            let to_bevy = |p: [f32; 3]| {
+                crate::scene::mzb_to_bevy(kuluu_snapshot::Vec3 {
+                    x: p[0],
+                    y: p[1],
+                    z: p[2],
+                })
+            };
+            let offset = to_bevy([model_point.x, model_point.y, model_point.z]);
+            (
+                player + offset + to_bevy(pt.position),
+                player + offset + to_bevy(pt.target),
+                pt.focal_length,
+            )
+        };
+
+        let mut app = App::new();
+        app.add_message::<CutsceneMotionDone>();
+        app.init_resource::<Time>()
+            .init_resource::<crate::snapshot::EventLog>()
+            .init_resource::<crate::snapshot::SceneState>()
+            .init_resource::<crate::cutscene::CutsceneMode>()
+            .init_resource::<crate::cutscene::FadePrograms>()
+            .init_resource::<crate::cutscene::ScreenFade>()
+            .init_resource::<crate::cutscene::EventNameOverrides>()
+            .init_resource::<crate::entity_table::EntityTable>()
+            .init_resource::<crate::scene::TrackedEntities>()
+            .init_resource::<ActionDatCache>()
+            .init_resource::<CutsceneCameraTasks>()
+            .init_resource::<crate::camera::CameraMode>()
+            .init_resource::<crate::graphics_settings::GraphicsSettings>()
+            .insert_resource(ActionDatRoot(Some(root.clone())));
+
+        let player = app
+            .world_mut()
+            .spawn((
+                Transform::from_translation(player_pos),
+                crate::components::WorldEntity {
+                    id: SELF_ID,
+                    act_index: 72,
+                    kind: kuluu_snapshot::EntityKind::Pc,
+                },
+                crate::components::IsSelf,
+            ))
+            .id();
+        app.world_mut().spawn((
+            Transform::from_translation(Vec3::new(0.0, 0.0, 4.0)).looking_at(Vec3::ZERO, Vec3::Y),
+            Camera::default(),
+            Projection::Perspective(PerspectiveProjection::default()),
+            crate::camera::OperatorCamera,
+        ));
+        app.world_mut()
+            .resource_mut::<crate::entity_table::EntityTable>()
+            .set_self_id(Some(SELF_ID));
+        app.world_mut()
+            .resource_mut::<crate::scene::TrackedEntities>()
+            .by_id
+            .insert(SELF_ID, player);
+        // The local-player attach reads the snapshot's self_pos, not the
+        // rendered Transform: seed it so ffxi_to_bevy(self_pos.pos) is the
+        // player's position at identity heading (ffxi_to_bevy is
+        // (x, -z, -y), so bevy (10, 0, -5) is wire (10, 5, 0)).
+        app.world_mut()
+            .resource_mut::<crate::snapshot::SceneState>()
+            .snapshot
+            .self_pos = kuluu_snapshot::Position {
+            pos: kuluu_snapshot::Vec3 {
+                x: 10.0,
+                y: 5.0,
+                z: 0.0,
+            },
+            heading: 0,
+            speed: 0,
+            speed_base: 0,
+        };
+
+        app.add_systems(
+            Update,
+            (
+                adopt_action_dat_root.run_if(resource_exists_and_changed::<ActionDatRoot>),
+                crate::cutscene::drain_cutscene_events,
+                (dispatch_cutscene_motion, poll_action_dat_tasks).chain(),
+                crate::cutscene_camera::advance_cutscene_camera_task,
+            )
+                .chain(),
+        );
+
+        let step =
+            |app: &mut App, frames: u32| {
+                app.world_mut().resource_mut::<Time>().advance_by(
+                    std::time::Duration::from_secs_f32(frames as f32 / ROUTINE_FPS),
+                );
+                app.update();
+            };
+        let scheduler_cue = |tag: [u8; 4]| kuluu_snapshot::ViewerEvent::Cutscene {
+            cue: kuluu_snapshot::CutsceneCue::Scheduler {
+                dat_id: 30906,
+                actor: kuluu_snapshot::CutsceneActor::LocalPlayer,
+                partner: kuluu_snapshot::CutsceneActor::LocalPlayer,
+                tag,
+                duration: 0,
+            },
+        };
+        let camera = |app: &mut App| {
+            let mut q = app
+                .world_mut()
+                .query_filtered::<&Transform, With<crate::camera::OperatorCamera>>();
+            q.single(app.world())
+                .expect("one operator camera")
+                .translation
+        };
+        let focal = |app: &mut App| {
+            let mut q = app
+                .world_mut()
+                .query_filtered::<&Projection, With<crate::camera::OperatorCamera>>();
+            let proj = q.single(app.world()).expect("one operator camera");
+            match proj {
+                Projection::Perspective(p) => p.fov,
+                _ => panic!("the operator camera is a perspective projection"),
+            }
+        };
+
+        // Enter CS mode with the captured cues, then feed each camera routine.
+        app.world_mut()
+            .resource_mut::<crate::snapshot::EventLog>()
+            .push(kuluu_snapshot::ViewerEvent::CutsceneStarted { event_id: 10002 });
+        app.world_mut()
+            .resource_mut::<crate::snapshot::EventLog>()
+            .push(kuluu_snapshot::ViewerEvent::Cutscene {
+                cue: kuluu_snapshot::CutsceneCue::CameraLock { lock: true },
+            });
+        step(&mut app, 1);
+        assert!(
+            app.world()
+                .resource::<crate::cutscene::CutsceneMode>()
+                .camera_locked,
+            "the camera lock must hold the scene"
+        );
+
+        for routine in [b"c05i", b"c01i", b"c00i"] {
+            let name = String::from_utf8_lossy(routine);
+            app.world_mut()
+                .resource_mut::<crate::snapshot::EventLog>()
+                .push(scheduler_cue(*routine));
+            // The load is async; the route starts once the parse lands.
+            for _ in 0..120 {
+                step(&mut app, 1);
+                if app.world().resource::<CutsceneCameraTasks>().is_active() {
+                    break;
+                }
+            }
+            assert!(
+                app.world().resource::<CutsceneCameraTasks>().is_active(),
+                "routine {name} never started its camera route"
+            );
+            // The route is a single authored point: it holds it for its whole
+            // duration, so sample after the full 60 frames have run out.
+            step(&mut app, 60);
+            let (eye, _target, focal_length) = authored(routine, player_pos);
+            let got = camera(&mut app);
+            assert!(
+                (got - eye).length() < 1e-3,
+                "routine {name}: camera at {got:?}, authored eye {eye:?}"
+            );
+            let want_fov = 2.0
+                * (crate::graphics_settings::RETAIL_PROJECTION_HALF_HEIGHT / focal_length).atan();
+            assert!(
+                (focal(&mut app) - want_fov).abs() < 1e-4,
+                "routine {name}: fov {} rad, authored focal {focal_length}",
+                focal(&mut app)
+            );
+        }
     }
 }

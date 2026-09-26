@@ -81,6 +81,42 @@ pub type FourCc = [u8; 4];
 /// 30704 to `CodeLOADEVENTSCHEDULER2`).
 pub const SCHEDULER_DAT_ID_BASE: u32 = 30704;
 
+/// The DAT file id base each 0x45 twin adds its work operand to. Each twin
+/// calls `FUNC_XiEvent_CodeLOADEVENTSCHEDULER2` with a fixed second argument
+/// and skips the 0x45-only `dat_id_helper` remap, so its DAT id is this base
+/// plus the raw work value (research/XiEvents/OpCodes/0x0062.md, 0x009F.md,
+/// 0x00BB.md, 0x00C5.md, 0x00CD.md, 0x00D0.md, 0x00D5.md).
+pub const fn scheduler_twin_base(op: u8) -> Option<u32> {
+    Some(match op {
+        0x62 => 5012,
+        0x9F => 51183,
+        0xBB => 56685,
+        0xC5 => 67355,
+        0xCD => 70435,
+        0xD0 => 70691,
+        0xD5 => 102449,
+        _ => return None,
+    })
+}
+
+/// Base DAT file id opcode 0x7D adds its work operand to: the scheduler that
+/// runs on the local player (the rank-up animations), its `main` routine on
+/// the player with the player as its own target, no `dat_id_helper` remap
+/// (research/XiEvents/OpCodes/0x007D.md, `FUNC_LoadStartScheduler(val + 5112, …)`).
+pub const LOCAL_PLAYER_SCHEDULER_DAT_ID_BASE: u32 = 5112;
+
+/// Base DAT file id opcode 0x73 MAGICSCHEDULOR adds its work operand to. The
+/// operand is a spell animation index: the same column vendor/server
+/// sql/spell_list.sql `animation` fills for a cast (Invisible 498, Sneak 499,
+/// Deodorize 500 sit beside the gate guard's Signet 497 and home point 504),
+/// and the same base a 0x028 magic finish resolves through
+/// (ffxi_vocab::action_anim::spell_file_id).
+pub const MAGIC_DAT_ID_BASE: u32 = ffxi_vocab::action_anim::SPELL_FILE_TABLE_OFFSET;
+
+/// The routine 0x73 plays out of that DAT: research/XiEvents/OpCodes/0x0073.md
+/// passes `0x6E69616D` ("main") to `FUNC_XiActor_Unknown` for every case.
+pub const MAGIC_ROUTINE_TAG: FourCc = *b"main";
+
 /// Scheduler DAT holding the screen-fade pair (ROM/62/110.DAT).
 pub const SCHEDULER_FADE_DAT_ID: u32 = 30904;
 
@@ -93,16 +129,42 @@ pub const SCHEDULER_TAG_FADE_IN: FourCc = *b"fdi0";
 /// timing verbatim" — the overwhelming majority of authored call sites.
 pub const SCHEDULER_DURATION_FROM_DAT: u16 = 0;
 
+/// The hold key 0x6E/0x63 arm and 0x99 polls: retail's `AnimationPlay` is one
+/// per-entity slot, so the wait carries no key operand of its own and keys on
+/// this constant (research/XiEvents/OpCodes/0x006E.md, 0x0099.md).
+pub const EMOTE_ANIMATION_KEY: FourCc = *b"emot";
+
 /// `GameStatus` values opcode 0x7E writes to the target's `StatusEvent`
 /// (research/XIClient/src/XIClient/include/World/Actor/GameStatus.h; the case-to-value mapping is
 /// research/XiEvents/OpCodes/0x007E.md).
 pub const STATUS_EVENT_IDLE: u8 = 0;
 pub const STATUS_EVENT_CHOCOBO: u8 = 5;
 pub const STATUS_EVENT_MOUNT: u8 = 85;
+/// The door bytes opcodes 0x4C/0x4D write: `GameStatus` `D_OPEN`/`D_CLOSE`
+/// (research/XiEvents/OpCodes/0x004C.md, 0x004D.md; research/XIClient/src/XIClient/include/World/Actor/GameStatus.h).
+pub const STATUS_EVENT_DOOR_OPEN: u8 = 8;
+pub const STATUS_EVENT_DOOR_CLOSE: u8 = 9;
+/// 0x4F adds this to its work operand: the `M1`..`M8` event-motion statuses
+/// (research/XiEvents/OpCodes/0x004F.md; research/XIClient/src/XIClient/include/World/Actor/GameStatus.h).
+pub const STATUS_EVENT_MOTION_BASE: u32 = 18;
+/// The second door status pair opcodes 0x8E/0x8F write: `GameStatus`
+/// `D_OPEN2`/`D_CLOSE2` (research/XiEvents/OpCodes/0x008E.md, 0x008F.md;
+/// research/XIClient/src/XIClient/include/World/Actor/GameStatus.h).
+pub const STATUS_EVENT_DOOR_OPEN2: u8 = 45;
+pub const STATUS_EVENT_DOOR_CLOSE2: u8 = 46;
 
 /// Highest music-volume table index (`FUNC_YmMusicServer_Volume`'s first
 /// argument indexes a volume table; it is not a percentage).
 pub const MUSIC_VOLUME_MAX: u8 = 127;
+
+/// The retail sound-type bits the 0x69/0x6A volume opcodes write
+/// (research/XiEvents/OpCodes/0x0069.md): which of the client's volume
+/// channels the opcode sets.
+pub const SOUND_TYPE_EFFECT: u8 = 0x01;
+pub const SOUND_TYPE_SYSTEM: u8 = 0x02;
+pub const SOUND_TYPE_ZONE: u8 = 0x04;
+pub const SOUND_TYPE_MASTER: u8 = 0x08;
+pub const SOUND_TYPE_SPECIAL_CHAT: u8 = 0x10;
 
 /// `FUNC_DatIdHelper` (research/XiEvents/OpCodes/0x0045.md): the two folded
 /// bands of the scheduler DAT id space.
@@ -126,7 +188,7 @@ pub fn dat_id_helper(param: i32) -> i32 {
 const EVENT_MOTION_BAND_1: i32 = 512;
 const EVENT_MOTION_BAND_2: i32 = 1024;
 const EVENT_MOTION_BAND_3: i32 = 2048;
-const EVENT_MOTION_BAND_4: i32 = 3072;
+pub(crate) const EVENT_MOTION_BAND_4: i32 = 3072;
 const EVENT_MOTION_BASE_0: i32 = 32104;
 const EVENT_MOTION_BASE_1: i32 = 49135;
 const EVENT_MOTION_BASE_2: i32 = 56345;
@@ -253,7 +315,8 @@ pub enum ExtSchedulerMotion {
 pub const NO_ACTION_KEY: FourCc = *b"xxxx";
 
 /// One staging effect the running event asked for. Emitted in execution order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Not `Eq`: [`EventCue::ActorMove`] carries a float MoveTime budget.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum EventCue {
     /// 0x2C SCHEDULOR: play action `key` on `actor1`, with `actor2` as the
     /// action's partner (research/XiEvents/OpCodes/0x002C.md).
@@ -261,6 +324,15 @@ pub enum EventCue {
         actor1: ActorLookup,
         actor2: ActorLookup,
         key: FourCc,
+    },
+    /// 0x6E EMOT / 0x63 PLAYANIM: play the emote animation `emote_id` on
+    /// `actor`, `param` the emote's variant selector (salute nation, …).
+    /// `emote_id` is the low byte and `param` the high byte of the operand's
+    /// work value (research/XiEvents/OpCodes/0x006E.md, 0x0063.md).
+    Emote {
+        actor: ActorLookup,
+        emote_id: u16,
+        param: u16,
     },
     /// 0x45 LOADEVENTSCHEDULER2: run scheduler `tag` out of DAT file `dat_id`
     /// over the two actors (research/XiEvents/OpCodes/0x0045.md). `duration` is
@@ -295,20 +367,63 @@ pub enum EventCue {
     /// 0x4E EVENTHIDE: set/clear the target's event-hide render flag
     /// (research/XiEvents/OpCodes/0x004E.md).
     ActorHide { target: ActorLookup, hide: bool },
+    /// 0x6C TRANSPAR: fade the target's alpha to `end_alpha` (a 0..=255 byte,
+    /// the work(5) operand) over `duration_frames` frames (the work(7)
+    /// operand, 0 read as 1), parking the script for that fade
+    /// (research/XiEvents/OpCodes/0x006C.md).
+    Transpar {
+        actor: ActorLookup,
+        end_alpha: i32,
+        duration_frames: i32,
+    },
     /// 0x46 DEFCAMERA: take the camera (and the cutscene HUD) away from the
     /// player, or give it back (research/XiEvents/OpCodes/0x0046.md). Retail's
     /// restore reads saved global camera state, so the cue carries none.
     CameraLock { lock: bool },
+    /// 0x38: write the lower word of retail's `CliEventModeLocal` — the work
+    /// operand's high byte with 0x20 forced (the base cinematic bit the
+    /// handler always sets, so every authored value keeps it). While it holds,
+    /// the client hides the local player model and the HUD pieces and lets the
+    /// event drive the camera; the event end clears the flag
+    /// (research/XiEvents/OpCodes/0x0038.md).
+    LocalMode { mode: u16 },
+    /// 0x20: write retail's `CliEventUcFlag`; while it holds, the player's
+    /// `CanIMove` is false (research/XiEvents/OpCodes/0x0020.md,
+    /// research/XIClient ActorTelemetry::CanIMove).
+    PlayerControl { locked: bool },
     /// 0x67/0x68 HIDE_HUD/SHOW_HUD: hide or show the entire HUD UI for the
     /// rest of the cutscene (research/XiEvents/OpCodes/0x0067.md, 0x0068.md).
     HudHide { hide: bool },
-    /// 0x77/0x78 STOP_CLOCK/RESTORE_CLOCK: hold the game clock at Vana'diel
-    /// hour `hour`, or release it back to server time
-    /// (research/XiEvents/OpCodes/0x0077.md, 0x0078.md).
-    ClockHold { stop: bool, hour: Option<u32> },
+    /// 0x77/0x78/0xA9/0xC9 game-clock holds: hold the clock at Vana'diel hour
+    /// `hour`, minute `minute`, on Vana day `day_from_epoch` from the calendar
+    /// epoch when set (else the current day), or release it back to server
+    /// time (research/XiEvents/OpCodes/0x0077.md, 0x0078.md, 0x00A9.md,
+    /// 0x00C9.md). 0x77 sets the hour on the current day at minute zero; 0xA9
+    /// zeros the local time first, so it jumps the whole date to Vana day
+    /// `7 * work[1]` at 00:30.
+    ClockHold {
+        stop: bool,
+        hour: Option<u32>,
+        minute: u8,
+        day_from_epoch: Option<u32>,
+    },
     /// 0x5D MUSICVOLUME: ease the playing track to volume table index `volume`
     /// over `fade_frames` (research/XiEvents/OpCodes/0x005D.md).
     MusicVolume { volume: u8, fade_frames: u16 },
+    /// 0x5C MUSIC: set BGM slot `slot`'s song to `track` and its start volume
+    /// to `volume` (the 0x00-0x07 band starts at full, 127; the 0x80-0x87 band
+    /// starts at the authored value). The slot indexes retail's `PTR_MusicSongIds`
+    /// table, the same table the BGM slot layout reads
+    /// (research/XiEvents/OpCodes/0x005C.md).
+    MusicSong { slot: u8, track: u16, volume: u8 },
+    /// 0x69/0x6A SET/CHANGE sound volume: set the named retail sound types
+    /// (the `mask` bits) to `volume` over `fade_frames`
+    /// (research/XiEvents/OpCodes/0x0069.md, 0x006A.md).
+    SoundVolume {
+        mask: u8,
+        volume: u8,
+        fade_frames: u16,
+    },
     /// 0x7E CHOCOBO/MOUNT: put the target on or off a mount by writing its
     /// `StatusEvent` (research/XiEvents/OpCodes/0x007E.md). `mount_id` is
     /// carried only by the non-chocobo mount cases.
@@ -320,12 +435,17 @@ pub enum EventCue {
     /// 0x1F MOVE case 0 on a non-player actor: walk the event entity to `goal`
     /// at `speed` (research/XiEvents/OpCodes/0x001F.md). The host arms the
     /// arrival hold from its own distance and speed; the VM never measures it.
+    /// `max_time` is 0x31 SMOVE's MoveTime budget in seconds: when set and
+    /// shorter than the distance-derived length, the host caps the hold to it
+    /// (research/XiEvents/OpCodes/0x0031.md).
     ActorMove {
         actor: ActorLookup,
         goal: EventPosition,
         /// Raw MainSpeed operand of the trigger packet; the host scales it
         /// with [`crate::vm::scene::EVENT_SPEED_SCALE`].
         speed: i32,
+        /// 0x31 SMOVE's MoveTime budget in seconds; `None` for 0x1F.
+        max_time: Option<f32>,
     },
     /// 0x37 on a non-player actor: set the event entity's position (teleport,
     /// no hold; research/XiEvents/OpCodes/0x0037.md).
@@ -391,6 +511,15 @@ impl EventCue {
                 actor2: resolve(actor2),
                 key,
             },
+            Self::Emote {
+                actor,
+                emote_id,
+                param,
+            } => Self::Emote {
+                actor: resolve(actor),
+                emote_id,
+                param,
+            },
             Self::Scheduler {
                 dat_id,
                 actor1,
@@ -428,6 +557,15 @@ impl EventCue {
                 target: resolve(target),
                 hide,
             },
+            Self::Transpar {
+                actor,
+                end_alpha,
+                duration_frames,
+            } => Self::Transpar {
+                actor: resolve(actor),
+                end_alpha,
+                duration_frames,
+            },
             Self::Mount {
                 target,
                 status_event,
@@ -437,10 +575,16 @@ impl EventCue {
                 status_event,
                 mount_id,
             },
-            Self::ActorMove { actor, goal, speed } => Self::ActorMove {
+            Self::ActorMove {
+                actor,
+                goal,
+                speed,
+                max_time,
+            } => Self::ActorMove {
                 actor: resolve(actor),
                 goal,
                 speed,
+                max_time,
             },
             Self::ActorPlace { actor, position } => Self::ActorPlace {
                 actor: resolve(actor),
