@@ -513,6 +513,7 @@ impl DialogSession {
             Drive::Cancel => self.cancel(),
             Drive::Choice(choice) => self.advance(Some(choice)),
             Drive::Tick(seconds) => self.tick(seconds),
+            Drive::ServerAck => self.ack_server(),
         }
     }
 

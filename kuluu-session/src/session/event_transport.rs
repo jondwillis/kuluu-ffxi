@@ -10,6 +10,7 @@ pub(crate) enum Drive {
     Cancel,
     Choice(u32),
     Tick(f32),
+    ServerAck,
 }
 
 pub(crate) struct DrivePermit(());
@@ -33,6 +34,41 @@ impl PreparedStep {
                 .await?;
         }
         Ok((self.advance, self.cues))
+    }
+}
+
+pub(super) fn server_ack_matches(
+    dialog: &mut DialogSession,
+    sub: &ffxi_proto::framing::SubPacket<'_>,
+) -> bool {
+    use ffxi_event::PendingTag;
+    use ffxi_proto::{decode, map};
+    match sub.opcode {
+        map::s2c::PBX_RESULT => decode::PbxResult::decode(sub.data).is_ok_and(|result| {
+            matches!(
+                result.command,
+                map::pbx::command::DELI_OPEN | map::pbx::command::POST_OPEN
+            ) && result.result == map::pbx::result::OK
+                && dialog.pending_tag() == Some(PendingTag::DeliveryOpen)
+        }),
+        map::s2c::REQSUBMAPNUM => decode::ReqSubMapNum::decode(sub.data).is_ok_and(|result| {
+            dialog.set_submap_num(result.map_num);
+            dialog.pending_tag() == Some(PendingTag::SubMapNum)
+        }),
+        map::s2c::FRIENDPASS => {
+            decode::FriendPass::decode(sub.data).is_ok()
+                && matches!(dialog.pending_tag(), Some(PendingTag::FriendPass { .. }))
+        }
+        map::s2c::RECIPE => {
+            decode::Recipe::decode(sub.data).is_ok()
+                && matches!(dialog.pending_tag(), Some(PendingTag::Recipe { .. }))
+        }
+        map::s2c::EVENTUCOFF => {
+            super::eventucoff_mode_of(sub.data)
+                == Some(map::event_position_wire::EVENT_RECV_PENDING)
+                && dialog.has_pending_tag()
+        }
+        _ => false,
     }
 }
 

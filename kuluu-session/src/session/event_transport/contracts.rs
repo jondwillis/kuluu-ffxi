@@ -406,6 +406,68 @@ async fn acknowledgement_contract() {
         }
     }
 }
+async fn server_reply_contract() {
+    // research/XiEvents/OpCodes/0x00B2.md CodeREQPBX.
+    const OP_DELIVERY: u8 = 0xB2;
+    for show_message in [false, true] {
+        let mut host = if show_message {
+            let mut program = vec![OP_DELIVERY, 1];
+            message(&mut program, 0);
+            program.push(OP_END);
+            Host::new(
+                EventDat {
+                    blocks: vec![block(program, vec![0])],
+                },
+                FARE,
+            )
+            .await
+        } else {
+            let mut dat = position_dat(false);
+            let program = &mut dat.blocks[0].event_data;
+            assert_eq!(program.pop(), Some(OP_END));
+            program.extend([OP_DELIVERY, 1, OP_END]);
+            let mut host = Host::new(dat, FARE).await;
+            host.request();
+            host.position_ack(PLAYER, PosMode::Event);
+            host.event_ack();
+            assert!(matches!(
+                host.step(Drive::Tick(TICK)).advance,
+                Advance::AwaitServerAck(_)
+            ));
+            host
+        };
+        assert_eq!(
+            host.dialog.pending_tag(),
+            Some(ffxi_event::PendingTag::DeliveryOpen)
+        );
+        // vendor/server/src/map/packets/s2c/0x04b_pbx_result.h GP_SERV_COMMAND_PBX_RESULT.
+        let mut body = [0u8; 16];
+        body[0] = map::pbx::command::DELI_OPEN;
+        body[8] = map::pbx::result::OK;
+        let packet = framing::SubPacket {
+            opcode: map::s2c::PBX_RESULT,
+            sequence: 0,
+            data: &body,
+        };
+        assert!(server_ack_matches(&mut host.dialog, &packet));
+        let step = host.step(Drive::ServerAck);
+        let emitted = packets(&step);
+        if show_message {
+            assert!(matches!(step.advance, Advance::Frame(_)));
+            assert!(emitted.is_empty());
+        } else {
+            assert!(matches!(step.advance, Advance::Ended { .. }));
+            assert_eq!(
+                emitted.iter().map(|p| p.opcode).collect::<Vec<_>>(),
+                [map::c2s::POS, map::c2s::EVENT_END]
+            );
+            assert_eq!(step.datagram_id, emitted[1].sequence);
+            assert!(host.pending.is_empty());
+        }
+        assert!(!server_ack_matches(&mut host.dialog, &packet));
+    }
+}
+
 async fn abort_contract() {
     let mut replaced = Host::new(position_dat(false), FARE).await;
     replaced.begin(FARE).await;
@@ -666,6 +728,7 @@ fn ferry_and_bootstrap_contracts_hold() {
 async fn event_state_contract() {
     numeric_contract().await;
     acknowledgement_contract().await;
+    server_reply_contract().await;
     abort_contract().await;
     action_event_gate_contract().await;
     item_stack_gate_contract().await;
