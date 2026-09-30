@@ -328,6 +328,7 @@ pub const MAX_CONCURRENT_SE: usize = 12;
 #[derive(Resource, Default)]
 pub struct SeRequestBuffer {
     queued: Vec<u32>,
+    reserved_voices: usize,
     pub refused_total: u64,
 }
 
@@ -338,19 +339,22 @@ impl SeRequestBuffer {
             self.refused_total += 1;
             return false;
         }
-        if !self.queued.contains(&se_id) && active_voices >= MAX_CONCURRENT_SE {
+        let projected_voices = active_voices.max(self.reserved_voices);
+        if projected_voices >= MAX_CONCURRENT_SE {
             self.refused_total += 1;
             return false;
         }
         if !self.queued.contains(&se_id) {
             self.queued.push(se_id);
         }
+        self.reserved_voices = projected_voices + 1;
         true
     }
 
     /// `CYySoundElem::SysMove` — the queue drains FIFO every tick and resets to zero.
     pub fn begin_frame(&mut self) {
         self.queued.clear();
+        self.reserved_voices = 0;
     }
 
     pub fn queued_count(&self) -> usize {
@@ -2577,6 +2581,18 @@ mod tests {
 
     // AudioManager::RequestSoundEffectPlay: ActiveInstanceCount >= MaxConcurrentSoundEffects
     // refuses; a loop that leaves `far` despawns and frees its slot for the next frame.
+    #[test]
+    fn concurrent_cap_reserves_deferred_spawns_and_counts_duplicate_voices() {
+        let mut buffer = SeRequestBuffer::default();
+        let active = MAX_CONCURRENT_SE - 1;
+        assert!(buffer.request(1, active));
+        assert!(!buffer.request(2, active));
+        assert!(!buffer.request(1, active));
+        buffer.begin_frame();
+        assert!(!buffer.request(1, MAX_CONCURRENT_SE));
+        assert!(buffer.request(1, active));
+    }
+
     #[test]
     fn concurrent_cap_refuses_until_a_voice_frees() {
         let mut buf = SeRequestBuffer::default();
