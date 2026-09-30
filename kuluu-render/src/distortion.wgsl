@@ -28,14 +28,14 @@ fn vs(@builtin(vertex_index) vi: u32) -> VsOut {
     );
     var out: VsOut;
     out.pos = vec4<f32>(p[vi], 0.0, 1.0);
-    out.uv = p[vi] * 0.5 + 0.5;
+    out.uv = p[vi] * vec2(0.5, -0.5) + 0.5;
     return out;
 }
 
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
     let uv = in.uv + u.offset;
-    let c = textureSample(src_tex, src_sampler, clamp(uv, 0.0, 1.0));
+    let c = textureSample(src_tex, src_sampler, clamp(uv, vec2(0.0), vec2(1.0)));
     if (u.copy_mode > 0.5) {
         return vec4<f32>(c.rgb, 1.0);
     }
