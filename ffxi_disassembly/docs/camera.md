@@ -15,7 +15,7 @@ Target binary: `FFXiMain.dll`, build TDS 0x6A7297F5 (same build as the E pass).
 |---|----------|--------|
 | Q1 | What does 0x46 DEFCAMERA do, case by case, in this build? | Resolved (C1, C4) |
 | Q2 | Where do 0xAF's camera reads come from, and what object is it? | Resolved (C2, C3) |
-| Q3 | What scale converts between event work slots and camera space? | Resolved (C4): x32 |
+| Q3 | What scale converts between event work slots and camera space? | C4 restore multiplier approximately 1/1000; C2 round-trip conversion unresolved |
 | Q4 | How do 0x1E / 0x4A / 0x79 pose an actor, and what does lookatone write? | Resolved (C5, C6, C7, C8) |
 | Q5 | How does 0x47 move the player and report it? | Resolved (C9) |
 | Q6 | What does 0x38 write? | Resolved (C10) |
@@ -73,9 +73,10 @@ event entity via 0x485FBA, requires RF0 bit 9, then tail-jumps 0xA8CD0 (a valida
 **C4 [local].** Case 3's one-time block: `if (!byte@rva 0x48982A) { byte |= 1; f32@0x489960 =
 (workofs(2)) * f32@0x32A22C; f32@0x489964 = (workofs(4)) * f32@0x32A22C; f32@0x489968 =
 (workofs(6)) * f32@0x32A22C; f32@0x48996C = 1.0f; }` where **f32@rva 0x32A22C = 0x3A83126F =
-0.03125 = 1/32**. Since 0xAF stored `round(cam_float)` (C2), the restore divides by 32: the camera
-manager's internal coordinate space is **32x the event work-slot space**. The four f32s then feed the
-two manager calls. (0x47's xz restore uses the same 1/32, C9; its yaw uses 6.28 * 0.001, C9.)
+approximately 0.001 (1/1000)**. The four f32s then feed the two manager calls.
+The exact coordinate conversion in C2 still needs to be reconciled with this scale;
+these bits do not support a 32x coordinate-space claim. 0x47 uses the same positional
+scale and a yaw multiplier of approximately 6.283/4096 (C9).
 
 ## 4. Look-at opcodes (C5, C6, C7, C8)
 
@@ -117,13 +118,13 @@ entity (the NPC) is the looker, the code@1 entity the target. Matches the PS2 ps
 
 **C9 [local].** @0xB62C0 (width 2 / 10). `sub = EventData[EP+1]`. sub 1: if
 `!byte@rva 0x4855E8 && !byte@rva 0x47FAEF` (the two RecPending flags) then EP += 2; RetFlag = 1
-(yield while pending). sub 0: `v1 = workofs(2) * 0.03125`, `v2 = workofs(4) * 0.03125`,
-`v3 = workofs(6) * 0.03125` (f32@0x32A22C again), `v4 = workofs(8) * f32@0x329D2C * f32@0x330250`
-where 0x329D2C = 0x40C90E56 = 6.28f and 0x330250 = 0x39800000 = 0.001f; then `call 0xA05F0(v1..v4)`
+(yield while pending). sub 0: `v1 = workofs(2) * 0.001`, `v2 = workofs(4) * 0.001`,
+`v3 = workofs(6) * 0.001` (f32@0x32A22C again), `v4 = workofs(8) * f32@0x329D2C * f32@0x330250`
+where 0x329D2C = 0x40C90E56 = 6.283f and 0x330250 = 0x39800000 = 0.000244140625f (1/4096); then `call 0xA05F0(v1..v4)`
 (`FUNC_SendPendingXzyTag`, the 0x005C-packet sender of the XiEvents page). On success:
 `byte@0x4855E8 = 1; byte@0x47FAEF = 1; EP += 10`. On failure: RetFlag = 1 (retry next tick). The PS2
-pseudocode says `val3 = workofs(6) * 0.001`; this build scales the x/y/z slots by 1/32 like the
-camera restore (C4) and only the yaw slot by 6.28 * 0.001 (research/XiEvents/OpCodes/0x0047.md).
+pseudocode also scales x/y/z by 0.001; the recorded bits agree with that positional scale.
+The yaw multiplier is approximately 6.283/4096 (research/XiEvents/OpCodes/0x0047.md).
 0x43 sub 1 polls the same 0x4855E8 flag (the event-report half of the pair; 0x43 sub 0 sends via
 `0xA0520`, its sibling of 0xA05F0).
 
@@ -160,8 +161,8 @@ open item, still open).
 | 0x48093C | CliEventModeLocal u16 (0x38) |
 | 0x48982A | one-time flag for 0x46 case 3's work-slot restore |
 | 0x489960 / 0x489964 / 0x489968 / 0x48996C | restored camera x / z / y / (1.0f) f32s |
-| 0x32A22C | 0.03125f (1/32) work-slot -> camera-space scale |
-| 0x329D2C / 0x330250 | 6.28f / 0.001f (0x47 yaw scale) |
+| 0x32A22C | approximately 0.001f (1/1000) work-slot -> camera-space scale |
+| 0x329D2C / 0x330250 | 6.283f / 0.000244140625f (0x47 yaw scale) |
 | 0x4855E8 / 0x47FAEF | RecPendingFlag / RecPendingXZYFlag (0x47, 0x43) |
 | 0x6346D8 | menu object for 0x46 sub 1's disable call (0x221C40) |
 | ent+0x14 / +0x18 / +0x1C | pitch / yaw / roll f32s (0x4A storage) |
@@ -178,12 +179,12 @@ open item, still open).
 | C1 [local] | 0x46 case-by-case decode; widths 2/2/2/6; callee map | out4/d_46_defcamera.md |
 | C2 [local] | 0xAF reads CachedEye/LookAt (+0x44/+0x50), conv 0x311C6C, workofs 2/4/6 = x/z/y | out4/d_af_campos.md |
 | C3 [local] | 0x15250 = [0x45693C+0x50] camera manager getter; layout matches XiClient CameraManager | out4/d_cammng_getter.md, XiClient header |
-| C4 [local] | work-slot -> camera scale = 1/32 (0x32A22C); one-time restore into 0x489960..0x48996C | out4/d_46_defcamera.md |
+| C4 [local] | work-slot -> camera scale approximately 1/1000 (0x32A22C); one-time restore into 0x489960..0x48996C | out4/d_46_defcamera.md |
 | C5 [local] | 0x4A: GA(1)/GA(5), bit-7 EventPos override, negated-atan2 yaw to ent+0x18 (or VM +0x154) | out4/d_4a_lookat.md |
 | C6 [local] | lookatone @0xB8820: both RF0 bit 9; ent1+0x12D bit 0, +0x146/+0x148 self/target u16 | out4/d_lookatone.md |
 | C7 [local] | 0x79: sub0 lookatone EP+10, sub1 +workofs(0xA) EP+12, sub2 Flags3 bit 1 + LookAxis 0x14A/0x14C | out4/d_79_lookat2.md |
 | C8 [local] | 0x1E: angle event-pos -> entity into ExtData+0x154; lookatone(event entity, code@1); EP+5 | out4/d_1e_looktalk.md |
-| C9 [local] | 0x47: xz/y x 1/32, yaw x 6.28 x 0.001 -> 0xA05F0; pending flags 0x4855E8/0x47FAEF; 0x43 polls the same | out4/d_47_posupdate.md, out4/d_43_eventreport.md |
+| C9 [local] | 0x47: xz/y x 0.001, yaw x 6.283/4096 -> 0xA05F0; pending flags 0x4855E8/0x47FAEF; 0x43 polls the same | out4/d_47_posupdate.md, out4/d_43_eventreport.md |
 | C10 [local] | 0x38: u16@0x48093C = workofs(1) with high byte \| 0x20 (low byte kept, unlike PS2) | out4/d_38_localmode.md |
 | C11 [local+web] | 280/350 @0x5940A via 0x487FC0 (E19); CameraTask END_AT_CURRENT_POS and 6.0f/tick easing web-confirmed | out4/, XiClient CameraTask.cpp / CameraManager.cpp |
 
@@ -195,8 +196,8 @@ open item, still open).
   mirror.
 - 0x46 sub 1 is the "camera off + menu off" pair; kuluu's cutscene HUD-hide (0x67, see
   [ui.md](ui.md) U1) is the wider variant. The two are independent opcodes.
-- The 1/32 scale (C4) matters for any kuluu consumer that round-trips camera positions through event
-  work slots (0xAF -> 0x46 case 3 / 0x47): work slots hold `round(32x_world_coord)`-shaped integers in
-  camera space, not world floats.
+- The recorded C4 multiplier is approximately 1/1000. Reconcile the C2 read conversion before
+  deriving a camera-position round trip through event work slots (0xAF -> 0x46 case 3 / 0x47);
+  the recorded bits do not establish a 32x coordinate convention.
 - Camera-route playback (0x2D -> 0x06 route -> CameraTask) remains the open item from E14/E19; this
   pass located the manager and the focal path but not the tag-0x04 dispatch.

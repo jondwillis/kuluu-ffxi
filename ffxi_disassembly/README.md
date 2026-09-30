@@ -67,7 +67,7 @@ python p8_jumptable.py "<install>" > out_p8.md                # ExecProg opcode 
 | `mob_animation.md` | Mob animation driver: synthesis, reference tables (RVAs, entity/actor layout, RenderFlags bits, stage ops), findings F1-F58, open items, kuluu conclusions |
 | `event_vm.md` | Event VM and cutscenes: struct layouts, motion resource readers, request stack, wait predicates, GetActorIndex, zone scene DAT, camera, Type byte; findings E1-E20 |
 | `event_opcode_table.md` | ExecProg jump table: opcode -> thunk -> handler RVA, with XiEvents names and width notes |
-| `camera.md` | Event camera control: 0x46 DEFCAMERA case decode, camera manager object, work-slot -> camera 1/32 scale, look-at opcodes, 0x47 position update, 0x38 local mode, focal; findings C1-C11 |
+| `camera.md` | Event camera control: 0x46 DEFCAMERA case decode, camera manager object, work-slot -> camera scaling, look-at opcodes, 0x47 position update, 0x38 local mode, focal; findings C1-C11 |
 | `ui.md` | Event UI/HUD and dialog control: HUD hide/unhide, 0x6A sound volume, cancel/ESC flag triad, 0x20 input lock, dialog create/wait-select, menu option masks, chat opcodes, string input, hide flags, 0x43 report, 0xB5 name; findings U1-U16 |
 | `tpc_package_table.md` | Opcode 0x66 Tpc motion package -> A/B DAT file id rule (four bands) with worked examples |
 | `mob_evidence_1_modmap_anchors.md` | §A module map, POL1 entry stub; §B vtable slots, ctor sites, fourcc literals (F24-F27) |
