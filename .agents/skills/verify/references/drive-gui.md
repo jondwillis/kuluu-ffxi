@@ -283,6 +283,11 @@ and `screencapture -l` stills were frozen while socket snapshots reported moving
 actors. Native window-only video captured the actual motion. Do not repeatedly
 retry stills or treat non-black pixels as proof of a current frame.
 
+Keep the test window visible for the entire recording. Raising it for a
+baseline and then covering it again can produce an all-black video even
+while server events continue. Restore the previous foreground app after
+recording, then inspect frames from the actual effect or movement interval.
+
 Resolve the window for the **known test PID**, not the first process named kuluu:
 
 ```bash

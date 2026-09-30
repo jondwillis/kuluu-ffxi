@@ -76,6 +76,16 @@ docker exec server-database-1 mariadb -uxiadmin -ppassword xidb -e "..."
   see SKILL.md §Character strategy. Not an env problem; don't restart the
   stack over it.
 
+## Map-server watchdog restarts
+
+If chat/actions stop responding while the GUI still renders, inspect the map
+log for `INACTIVITY WATCHDOG HAS TRIGGERED` and a fresh server start. A local
+run has hit the 2000ms watchdog in `CStatusEffectContainer::TickEffects` /
+`CZoneEntities::mobTick`; its clients kept rendering after losing the server.
+Discard affected command-response claims, wait for server readiness, and
+reconnect only the test session. Record the tombstone and investigate load
+rather than disabling the watchdog or restarting another person's client.
+
 ## Server-side introspection
 
 - `docker logs server-map-1 --since 5m` — LoadChar / IncreaseZoneCounter /

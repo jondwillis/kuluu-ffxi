@@ -1,16 +1,15 @@
 # Headless drive — canonical recipes (single source of truth)
 
-The single tracked source of truth for running kuluu without a visible window. Windows-first
-(this machine), with the other-OS equivalents kept inline — do not drop them, and do not
-improvise: on this host use the Windows entries, on other hosts use the Unix ones.
+Recipes for running Kuluu without a visible window where the host supports
+reliable readback. Choose the Windows or Unix entries for the actual host;
+macOS visual verification uses the companion native-window workflow.
 Companion: `.agents/skills/verify/SKILL.md` (canonical verify recipes + evidence recording).
 
 ## Credentials
 
-Never stored in any tracked file, doc, log, or command history. **Ask the user** for the
-account/password/character before a run that needs them; use them only inside the single
-launch command of that session. If you cannot ask (user asleep), do not guess and do not
-mine old sessions for credentials — pick work that does not need login, or stop and say so.
+Use the local throwaway accounts or fixture provisioning in `../SKILL.md`
+("Character strategy"). Never ask for or log the user's real credentials.
+The documented local test credentials are safe for local-stack verification.
 
 ## Options menu — pick by what you're verifying
 
@@ -35,11 +34,16 @@ mine old sessions for credentials — pick work that does not need login, or sto
 
 ### Unix / other-OS options list
 
-1. **Build**: same cargo invocation as the .bat's feature list (see its header),
-   `./target/release/kuluu` is the binary to run.
-2. **Render box**: Surface A with `KULUU_WINDOW_HIDDEN=1`, no `WGPU_ADAPTER_NAME` pinning (§A).
-3. **Pixels from the hidden window**: in-app GPU readback (same as Windows);
-   `cap-window.ps1` is Windows-only — on other OSes use the readback paths only.
+1. **Build**: `cargo build -p kuluu --features native-window --release`; run
+   `./target/release/kuluu`. Add only the opt-in features the check exercises.
+2. **Render box**: on macOS, use the visible, muted, unfocused native-window
+   workflow in `drive-gui.md`; warn before launch. Hidden Metal readbacks can
+   stay entirely black while the simulation advances. Other Unix hosts may use
+   Surface A with `KULUU_WINDOW_HIDDEN=1`; inspect the capture before trusting it.
+3. **Pixels**: on macOS, use `scripts/capture.sh` with the exact test socket/PID.
+   Its one-time raise can recover a black readback; if it cannot, use the
+   window-only video fallback in `drive-gui.md`. Check changing poses or scene
+   content against the command trace. `cap-window.ps1` is Windows-only.
 4. **Session, no pixels**: raw stdio with `mktemp -d` + pipe holder (§B2), MCP standalone
    (§B1), TCP injection via `nc` (§B2).
 5. **No server**: `cargo run -p kuluu_noserver_tester --features native-window` (§C).
@@ -49,11 +53,11 @@ mine old sessions for credentials — pick work that does not need login, or sto
 
 1. **Build with the repo-root release `.bat`** (Windows; untracked by design) — release +
    full local feature batch, exe synced to repo root. Never an ad-hoc `cargo build -p kuluu --features <subset>`: a
-   half-feature binary is not what gets verified and behavior can differ. On other OSes the
-   equivalent is the same cargo invocation with that feature list (see the bat file header).
-2. **Never open a visible window for agent runs.** Surface A/D: `KULUU_WINDOW_HIDDEN=1`.
-   Surface B: raw stdio / MCP have no window at all; GUI attach (`FFXI_ATTACH=auto`) is only
-   when pixels are required, and then warn first.
+   half-feature binary is not what gets verified and behavior can differ. On other OSes,
+   use the native release build above and record the features actually tested.
+2. **Use the host-appropriate capture path.** Windows Surface A/D uses
+   `KULUU_WINDOW_HIDDEN=1`; macOS visual checks follow `drive-gui.md` and warn
+   before opening or raising the test window. Surface B needs no window.
 3. **Always mute** launches (`--mute`): a hidden run still decodes and plays BGM/SFX.
 4. **Kill the process when done.** Windows: `taskkill //F //IM kuluu.exe`. Other OSes:
    `pkill -f kuluu`. Check first — never fire a test if one is already running
@@ -143,11 +147,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/cap-window.ps1 kuluu
   fire for mid-burst shots; zone/weather shots can wait until placement settles (the log's
   `queued ... placements` / weather lines).
 - Output is the window client area at its configured resolution (default 1280x800,
-  `KULUU_RESOLUTION=WxH` to change). A black frame means the capture beat the first
-  rendered frame — wait and re-shoot.
-- These are the only sanctioned pixel paths for surface A. Do not launch a visible window
-  "to check", do not use screen-grab of the desktop, do not point an example binary at the
-  zone: those put pixels on the user's screen.
+  `FFXI_WINDOW_SIZE=WxH` to change). A black frame does not establish why
+  capture failed. On macOS, follow `drive-gui.md` rather than repeatedly
+  retrying hidden readbacks.
+- These hidden-window recipes apply where readback works. For macOS, use the
+  native test window and capture fallback above; capture only that window,
+  restore focus after raising it, and stop only task-owned clients.
 
 ### Kill
 
