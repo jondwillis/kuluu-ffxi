@@ -624,6 +624,8 @@ fn handle_button_presses(
             Some("player level up") => Case::LevelUp,
             Some("hi26 routine (g261 child)") => Case::Hi26,
             Some("sb00 routine (gs02 child)") => Case::Sb00,
+            Some("load zone (West Ronfaure)") => Case::LoadZone,
+            Some("load weather (clouds)") => Case::LoadWeather,
             _ => continue,
         };
         pending.0 = Some(case);
