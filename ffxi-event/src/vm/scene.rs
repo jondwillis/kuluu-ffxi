@@ -147,10 +147,7 @@ impl Scene {
 
 impl EventVm {
     pub fn attach_scene(&mut self, dat: Arc<EventDat>, actor: u32, player: EventPosition) {
-        // The zone block owns the local player's position: seed the shared
-        // cell every sibling VM reads so a walk child starts from the snapped
-        // position, not its own zeroed scene.
-        if actor == ZONE_PLAYER_ACTOR {
+        if self.shared_player.is_none() {
             self.shared_player = Some(Arc::new(std::sync::Mutex::new(player)));
         }
         self.scene = Some(Scene {
@@ -215,6 +212,7 @@ impl EventVm {
     }
 
     pub fn acknowledge_position(&mut self, position: EventPosition) {
+        self.set_shared_player_position(position);
         if let Some(scene) = &mut self.scene {
             scene.player = position;
             if scene.pending_position {
@@ -380,6 +378,8 @@ impl EventVm {
         scene.player.y = goal.y;
         self.scene_actions
             .push(SceneAction::PlayerPosition(scene.player));
+        let position = scene.player;
+        self.set_shared_player_position(position);
     }
 
     /// The remaining units (1/60 s, the [`EventVm::tick`] clock) of the moves

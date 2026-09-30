@@ -8603,6 +8603,16 @@ mod tests {
             dx < 1_000 && dz < 1_000,
             "the walk starts at the snap ({first:?}), not the origin"
         );
+        for _ in 0..400 {
+            e.tick(0.1);
+            e.step();
+        }
+        let final_position = e.controlled_position().expect("the child moved the player");
+        assert_eq!(
+            [final_position.x, final_position.y, final_position.z],
+            [G.x, G.y, G.z]
+        );
+        assert_eq!(e.shared_player_position(), Some(final_position));
     }
 
     /// 0x39 on the player: the authored facing becomes the tracked heading and
