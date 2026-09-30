@@ -336,8 +336,8 @@ pub const LAMP_ALPHAMAP_LIFT_DEFAULT: f32 = 0.12;
 // gain ceiling mirrors `LAMP_GAIN_CEILING` in ffxi_particle.wgsl.
 pub const LAMP_HALOS_GAIN_DEFAULT: f32 = 1.0;
 pub const LAMP_HALOS_GAIN_MAX: f32 = 2.0;
-// Wall-wash slider seed (1.0 = authored alpha) and ceiling.
-pub const WASH_ALPHA_LIFT_DEFAULT: f32 = 0.18;
+// Preserve DAT alpha unless the diagnostic slider explicitly changes it.
+pub const WASH_ALPHA_LIFT_DEFAULT: f32 = 1.0;
 pub const WASH_ALPHA_LIFT_MAX: f32 = 2.0;
 pub const LAMP_HALOS_RADIUS_DEFAULT: f32 = 1.0;
 pub const LAMP_HALOS_RADIUS_MAX: f32 = 4.0;
@@ -7342,12 +7342,7 @@ mod tests {
         assert!(def.is_singleton());
         assert_eq!(def.init_color[3], SHAFT_ALPHA);
         let expected = expected_factor_alpha(SHAFT_ALPHA);
-        // Neutral wash lift: the assertion is on the authored byte holding for the whole life,
-        // not on the slider seed that multiplies it.
-        let clock = CelestialClock {
-            wash_alpha_lift: 1.0,
-            ..CelestialClock::default()
-        };
+        let clock = CelestialClock::default();
         let mut g = celestial(def);
         g.particles[0].life_frames = f32::INFINITY;
         for age in [0.0, 300.0, 30_000.0] {
