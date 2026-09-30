@@ -2274,10 +2274,7 @@ fn load_sg_lamp_room(
                 hit.push(field.label());
             }
         }
-        log_line(
-            &mut *log,
-            format!("sky fx seeded off: {}", hit.join(", ")).into(),
-        );
+        log_line(&mut *log, format!("sky fx seeded off: {}", hit.join(", ")));
     }
     // ANIMTEST_LAMP_HALOS_OFF=1 pre-checks the lamps kill switch for headless A/B captures.
     if std::env::var_os("ANIMTEST_LAMP_HALOS_OFF").is_some() {
