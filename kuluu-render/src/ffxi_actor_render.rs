@@ -3122,7 +3122,7 @@ fn advance_actor_pose(
             .filter(|a| a.id.final_digit() == Some(0) && is_usable_clip(a))
             .collect();
         if lower.is_empty() {
-            matches.iter().copied().collect()
+            matches.to_vec()
         } else {
             let mut clips: Vec<&SkeletonAnimation> = matches
                 .iter()
@@ -3133,7 +3133,7 @@ fn advance_actor_pose(
             clips
         }
     } else {
-        matches.iter().copied().collect()
+        matches.to_vec()
     };
 
     if !matches.is_empty() && *current_clip != Some((selected_id, use_battle)) {

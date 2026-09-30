@@ -37,7 +37,7 @@ fn main() -> ExitCode {
                     continue;
                 }
                 if ChunkKind::from_u8(child.chunk.kind) == Some(ChunkKind::Generator) {
-                    if let Ok(Some(d)) = ParticleGeneratorDef::parse(&child.chunk.data) {
+                    if let Ok(Some(d)) = ParticleGeneratorDef::parse(child.chunk.data) {
                         println!(
                             "gen dir={:?} {:?} kind={:?} mesh={:?} init_color=({:.3},{:.3},{:.3},{:.3}) blend={:?} billboard={} cam_rel={} tod_a_driven={}",
                             dir, name, d.mesh_kind, d.mesh_id,
@@ -127,7 +127,7 @@ fn list_sheets(file_id: u32) {
             if child.chunk.kind == 0x01 {
                 walk(child);
             } else if ChunkKind::from_u8(child.chunk.kind) == Some(ChunkKind::SpriteSheet) {
-                if let Some(ss) = ParticleSpriteSheet::parse(&child.chunk.data) {
+                if let Some(ss) = ParticleSpriteSheet::parse(child.chunk.data) {
                     println!(
                         "sheet {:?} ({}:{}) frames={}",
                         child.chunk.name,
