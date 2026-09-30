@@ -126,7 +126,7 @@ pub(crate) fn apply_light_occlusion_system(
             active
                 .lights
                 .get(i as usize)
-                .is_some_and(|l| l.color != Vec3::ZERO && !bvh_blocks(&bvh, l.world_pos, eval_pos))
+                .is_some_and(|l| !bvh_blocks(&bvh, l.world_pos, eval_pos))
         });
     }
 }
@@ -152,5 +152,66 @@ pub(crate) fn restore_light_bindings_on_rays_off(
             // the restored bindings on its next pass.
             mat.light_bindings = bindings;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kuluu_render::{
+        dat_mzb::MzbCollisionGeometry,
+        ffxi_actor_render::{render_actor_stub, update_ffxi_actor_point_lights},
+        graphics_settings::GraphicsSettings,
+        skinned_ffxi_material::FfxiSkinRegistry,
+        zone_point_lights::{ZonePointLight, UNAUTHORED_LIGHT_ID},
+    };
+
+    #[test]
+    fn stationary_actor_relights_after_a_daytime_lamp_pause() {
+        let mut app = App::new();
+        app.init_resource::<Assets<FfxiZoneMaterial>>()
+            .init_resource::<AuthoredZoneBindings>()
+            .init_resource::<MzbCollisionGeometry>()
+            .init_resource::<GraphicsSettings>()
+            .init_resource::<kuluu_render::ffxi_zone_material::ZoneGlobalLighting>()
+            .init_resource::<FfxiSkinRegistry>()
+            .insert_resource(ZoneCollisionBvh(Some(
+                super::super::collision_bvh::CollisionBvh::from_world_triangles(Vec::new()),
+            )))
+            .insert_resource(ActiveSceneLights {
+                lights: vec![ZonePointLight {
+                    light_id: UNAUTHORED_LIGHT_ID,
+                    world_pos: Vec3::new(2.0, 2.0, 0.0),
+                    color: Vec3::ONE,
+                    range: 10.0,
+                    attenuation: 1.0,
+                    theta_track: None,
+                    theta_multiplier: 1.0,
+                }],
+            })
+            .add_systems(
+                Update,
+                (apply_light_occlusion_system, update_ffxi_actor_point_lights).chain(),
+            );
+        let actor = render_actor_stub(1);
+        let slot = actor.skin_slot();
+        app.world_mut().spawn((actor, GlobalTransform::IDENTITY));
+        app.update();
+        let lighting = |app: &App| {
+            app.world()
+                .resource::<FfxiSkinRegistry>()
+                .skin(slot)
+                .lighting
+                .point_color
+        };
+        let night = lighting(&app);
+        assert!(night.iter().any(|c| c.truncate() != Vec3::ZERO));
+
+        app.world_mut().resource_mut::<ActiveSceneLights>().lights[0].color = Vec3::ZERO;
+        app.update();
+        assert!(lighting(&app).iter().all(|c| c.truncate() == Vec3::ZERO));
+        app.world_mut().resource_mut::<ActiveSceneLights>().lights[0].color = Vec3::ONE;
+        app.update();
+        assert_eq!(lighting(&app), night);
     }
 }
