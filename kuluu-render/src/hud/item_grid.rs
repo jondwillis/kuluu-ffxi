@@ -14,26 +14,19 @@ pub(crate) const CELL_GAP_PX: f32 = 4.0;
 /// Type size for a cell's slot name.
 const NAME_FONT_PX: f32 = 11.0;
 
-/// Type size for a stack count drawn over item art.
-pub(crate) const BADGE_FONT_PX: f32 = 11.0;
+const COUNT_FONT_PX: f32 = 11.0;
+const COUNT_SHADOW_PX: f32 = 1.0;
+const COUNT_SHADOW_COLOR: Color = Color::srgba(0.0, 0.0, 0.0, 0.95);
 
-const BADGE_PAD_PX: f32 = 2.0;
-const BADGE_BORDER_PX: f32 = 1.0;
-const BADGE_BG: Color = Color::srgba(0.02, 0.03, 0.06, 0.9);
-const BADGE_EDGE: Color = Color::srgb(0.0, 0.0, 0.0);
-
-/// The chip a stack count sits on, merged into the caller's placement. The art
-/// under the count is whatever colour the item happens to be, so the digits
-/// carry their own dark plate rather than relying on the icon being dark.
-pub(crate) fn stack_badge_chip(placement: Node) -> (Node, BackgroundColor, BorderColor) {
+pub(crate) fn stack_count_style(placement: Node) -> (Node, TextFont, TextColor, TextShadow) {
     (
-        Node {
-            padding: UiRect::axes(Val::Px(BADGE_PAD_PX), Val::Px(0.0)),
-            border: UiRect::all(Val::Px(BADGE_BORDER_PX)),
-            ..placement
+        placement,
+        text_font(COUNT_FONT_PX),
+        TextColor(theme::TEXT),
+        TextShadow {
+            offset: Vec2::splat(COUNT_SHADOW_PX),
+            color: COUNT_SHADOW_COLOR,
         },
-        BackgroundColor(BADGE_BG),
-        BorderColor::all(BADGE_EDGE),
     )
 }
 
@@ -96,16 +89,7 @@ pub(crate) fn spawn_item_cell(
             }
             CellOverlay::StackCount => {
                 spawn_cell_icon(c, icon_marker, placeholder);
-                let (node, bg, edge) = stack_badge_chip(placement);
-                c.spawn((
-                    label_marker,
-                    Text::new(""),
-                    text_font(BADGE_FONT_PX),
-                    TextColor(theme::TEXT),
-                    node,
-                    bg,
-                    edge,
-                ));
+                c.spawn((label_marker, Text::new(""), stack_count_style(placement)));
             }
         }
     });
@@ -190,16 +174,25 @@ mod tests {
         assert!(app.world().get::<Overlay>(kids[1]).is_some());
     }
 
-    /// The count carries its own plate, so it stays legible on art of any
-    /// colour rather than depending on the icon under it being dark.
     #[test]
-    fn a_stack_count_rides_a_bordered_chip() {
+    fn a_stack_count_has_a_shadow_without_a_box() {
         let (kids, app) = cell(false);
-        let badge = kids[1];
-        let node = app.world().get::<Node>(badge).expect("badge node");
-        assert_ne!(node.border, UiRect::ZERO);
-        assert_ne!(node.padding, UiRect::ZERO);
-        let bg = app.world().get::<BackgroundColor>(badge).expect("chip");
-        assert_ne!(bg.0, Color::NONE);
+        let count = kids[1];
+        let node = app.world().get::<Node>(count).expect("count node");
+        assert_eq!(node.border, UiRect::ZERO);
+        assert_eq!(node.padding, UiRect::ZERO);
+        let bg = app
+            .world()
+            .get::<BackgroundColor>(count)
+            .expect("default background");
+        assert_eq!(bg.0, Color::NONE);
+        let border = app
+            .world()
+            .get::<BorderColor>(count)
+            .expect("default border");
+        assert_eq!(*border, BorderColor::DEFAULT);
+        let shadow = app.world().get::<TextShadow>(count).expect("text shadow");
+        assert_eq!(shadow.offset, Vec2::splat(COUNT_SHADOW_PX));
+        assert_eq!(shadow.color, COUNT_SHADOW_COLOR);
     }
 }

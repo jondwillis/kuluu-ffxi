@@ -237,8 +237,7 @@ pub fn update_dialog_panel_system(
 /// Drive the delivery-box style item grid from `DialogState::grid`: show the
 /// container when a grid is present, size it to `cols`, and fill each cell's
 /// frame/icon/label (cursor highlight follows the choice cursor; sent cells
-/// are dimmed). The stack count rides a chip, so a cell with nothing to count
-/// hides its label node rather than leaving an empty plate on the art.
+/// are dimmed). A cell with nothing to count hides its count node.
 #[allow(clippy::too_many_arguments)]
 pub fn update_dialog_grid_system(
     state: Res<SceneState>,
