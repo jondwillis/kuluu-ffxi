@@ -2798,6 +2798,14 @@ fn tear_down(
     // Restore what the open unloaded: launcher render camera + backdrop entities. Zone state
     // was left standing, so the standing zone block is already in place for the mirror.
     if was_open {
+        commands.queue(|world: &mut World| {
+            world.insert_resource(kuluu_render::particle_sim::TestAlphaOverride::default());
+            world.insert_resource(VfxTrace(false));
+            if let Some(mut clock) = world.get_resource_mut::<kuluu_render::vana_time::VanaClock>()
+            {
+                clock.thaw();
+            }
+        });
         super::launcher_ui::spawn_launcher_camera_core(&mut *commands);
         super::launcher_backdrop::restore_for_test(commands, &mut *meshes, &mut *materials);
     }
@@ -2849,4 +2857,39 @@ fn tear_down_test_scene(
         &mut meshes,
         &mut materials,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy::ecs::system::RunSystemOnce;
+    use kuluu_render::particle_sim::TestAlphaOverride;
+    use kuluu_render::vana_time::VanaClock;
+
+    #[test]
+    fn launcher_exit_clears_test_scene_overrides_without_another_update() {
+        let mut world = World::new();
+        world.init_resource::<TrackedEntities>();
+        world.init_resource::<SceneState>();
+        world.init_resource::<kuluu_render::graphics_settings::GraphicsSettings>();
+        world.init_resource::<ShadowOverrides>();
+        world.init_resource::<EnhanceRestore>();
+        world.init_resource::<crate::graphics_store::GraphicsPersistSuspended>();
+        world.init_resource::<Assets<Mesh>>();
+        world.init_resource::<Assets<StandardMaterial>>();
+        let mut clock = VanaClock::default();
+        clock.freeze_at_hour_minute(SG_LAMP_HOUR, 0);
+        world.insert_resource(clock);
+        world.insert_resource(TestAlphaOverride(std::collections::HashSet::from([
+            *b"g141",
+        ])));
+        world.insert_resource(VfxTrace(true));
+        world.spawn(TestSceneScoped);
+
+        world.run_system_once(tear_down_test_scene).unwrap();
+
+        assert!(world.resource::<TestAlphaOverride>().0.is_empty());
+        assert!(!world.resource::<VfxTrace>().0);
+        assert!(!world.resource::<VanaClock>().is_frozen());
+    }
 }
