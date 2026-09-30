@@ -966,7 +966,7 @@ mod tests {
 
     // Real-install guard: every ROM's tables fit the base id space (no ROM
     // skipped), and wherever more than one ROM claims an id the highest wins.
-    // The horizonxi-2023 target (vendor/game-files/targets/hxi) ships a ROM10
+    // The horizonxi-2023 target ships a ROM10
     // that re-claims base-ROM ids; retail-2026-09 has no multi-claims, where
     // this passes vacuously.
     #[test]
@@ -1096,7 +1096,7 @@ mod tests {
     }
 
     // The XI-Pivot overlays of the horizonxi-2023 target
-    // (vendor/game-files/targets/hxi) mix both spellings, which only matters
+    // mix both spellings, which only matters
     // where the filesystem is case-sensitive.
     #[test]
     fn overlay_matches_a_lowercase_extension() {
