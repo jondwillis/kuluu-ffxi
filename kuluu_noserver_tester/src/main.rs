@@ -21,7 +21,6 @@ use kuluu_render::scene::{apply_invis_flag_system, EntityMesh, Target, TrackedEn
 use kuluu_render::scheduler_runtime::{
     enqueue_routine, evaluate_switch, stage_summary, ActionDatRoot, ActionTarget, ActiveScheduler,
     GlobalEffectDir, HitContext, RoutineLookup, SchedulerRuntimePlugin, UnknownFieldPolicy,
-    LEVEL_UP_EFFECT_DAT_ID,
 };
 use kuluu_render::skinned_ffxi_material::{FfxiSkinRegistry, FfxiSkinnedMaterialCache};
 use kuluu_render::snapshot::{EventLog, SceneState};
@@ -641,7 +640,7 @@ fn run_pending_case(
     q_children: Query<&Children>,
     q_render: Query<&kuluu_render::ffxi_actor_render::FfxiRenderActor>,
     global: Option<Res<GlobalEffectDir>>,
-    root: Res<ActionDatRoot>,
+    mut events: ResMut<EventLog>,
     mut worm_state: ResMut<WormState>,
     mut state: ResMut<SceneState>,
     q_root: Query<&FfxiRenderRoot>,
@@ -660,15 +659,9 @@ fn run_pending_case(
             &q_root,
             &mut q_vis,
         ),
-        Case::LevelUp => fire_level_up(
-            &root,
-            &tracked,
-            &q_children,
-            &q_render,
-            global.as_deref(),
-            &mut log,
-            &mut commands,
-        ),
+        Case::LevelUp => {
+            events.push(kuluu_snapshot::ViewerEvent::LevelUp { player_id: HUME_ID });
+        }
         Case::Hi26 => fire_named_routine(
             &tracked,
             global.as_deref(),
@@ -871,63 +864,6 @@ fn respawn_worm(
         e.hp_pct = Some(100);
     }
     log_line(log, "worm respawned (visible again, hp 100)".into());
-}
-
-fn fire_level_up(
-    root: &ActionDatRoot,
-    tracked: &TrackedEntities,
-    q_children: &Query<&Children>,
-    q_render: &Query<&kuluu_render::ffxi_actor_render::FfxiRenderActor>,
-    global: Option<&GlobalEffectDir>,
-    log: &mut TestLog,
-    commands: &mut Commands,
-) {
-    let Some(hume) = tracked.by_id.get(&HUME_ID).copied() else {
-        log_line(log, "hume not loaded yet".into());
-        return;
-    };
-    let Some(dat_root) = root.0.as_ref() else {
-        log_line(log, "no install wired".into());
-        return;
-    };
-    let Ok(loc) = dat_root.resolve(LEVEL_UP_EFFECT_DAT_ID) else {
-        log_line(
-            log,
-            format!("level-up effect DAT {LEVEL_UP_EFFECT_DAT_ID} not found in the install"),
-        );
-        return;
-    };
-    let Ok(bytes) = std::fs::read(loc.path_under(dat_root)) else {
-        log_line(log, "failed to read the level-up effect DAT".into());
-        return;
-    };
-    let (schedulers, _assets, _cameras) =
-        kuluu_render::scheduler_runtime::parse_action_bytes(&bytes);
-    log_line(
-        log,
-        format!(
-            "level-up effect DAT file {LEVEL_UP_EFFECT_DAT_ID}: {} routines",
-            schedulers.len()
-        ),
-    );
-    let hume_routines = actor_routines(hume, q_children, q_render);
-    let mut lookup = RoutineLookup::new().with_dat(&schedulers);
-    if let Some(r) = &hume_routines {
-        lookup = lookup.with_actor(r);
-    }
-    if let Some(g) = global {
-        lookup = lookup.with_dat(&g.schedulers);
-    }
-    match ActiveScheduler::from_routine(&lookup, b"main") {
-        Some(active) => {
-            log_line(
-                log,
-                format!("lvup main on hume: {}", stage_summary(&active)),
-            );
-            enqueue_routine(commands, hume, active);
-        }
-        None => log_line(log, "lvup `main` UNRESOLVED".into()),
-    }
 }
 
 // Play a named ROM/0/0.DAT routine on the worm (as target), no alpha override — the
