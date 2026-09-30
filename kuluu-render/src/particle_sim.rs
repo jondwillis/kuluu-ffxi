@@ -7090,13 +7090,9 @@ mod tests {
             .collect()
     }
 
-    // Read off the shipped f_ro DAT: the lunar halo sheet `kasa` is a DXT3 whose alpha is
-    // entirely the nibble 7/8 dithered-opaque pair (ffxi-dat/examples/dat-sky-alpha-histogram.rs
-    // on zone files 210/331), so the plain particle converter hands the GPU the stored 119/136
-    // per-texel stipple as-is and only the celestial converter undithers and expands it to the
-    // authored half-step. Skips without a retail install.
+    // ffxi-dat/examples/dat-sky-alpha-histogram.rs: zone 210 kasa alpha varies by sheet.
     #[test]
-    fn zone_210_halo_sheet_is_dithered_and_only_the_celestial_converter_resolves_it() {
+    fn zone_210_halo_preserves_source_alpha_outside_the_celestial_converter() {
         const F_RO: u32 = 210;
         const HALO_TEX: [u8; 4] = *b"kasa";
         const DITHER_LO: u8 = 0x77;
@@ -7129,10 +7125,8 @@ mod tests {
         let sky = images.add(decoded_sky_texture_to_image(&tex));
 
         let plain_alpha = image_alpha(&images, &plain);
-        assert!(
-            plain_alpha.contains(&DITHER_LO) && plain_alpha.contains(&DITHER_HI),
-            "the shared particle converter passes the stored stipple through as-is"
-        );
+        let source_alpha: Vec<_> = tex.rgba.chunks_exact(4).map(|p| p[3]).collect();
+        assert_eq!(plain_alpha, source_alpha);
 
         let sky_alpha = image_alpha(&images, &sky);
         let spread =
