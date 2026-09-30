@@ -1751,7 +1751,7 @@ fn remove_dead_generators(
     let old_len = sim.generators.len();
     for (i, g) in sim.generators.iter().enumerate() {
         if set.contains(&i) {
-            commands.entity(g.entity).despawn();
+            commands.entity(g.entity).try_despawn();
         }
     }
     let mut remap: Vec<Option<usize>> = vec![None; old_len];
@@ -2840,14 +2840,12 @@ pub fn sync_particle_meshes(
     let trace_celestial = trace_celestial();
     let trace_rebuilds = trace_particle_rebuilds();
 
-    // (index, despawn-needed); indices ascending so the reverse sweep below can
-    // swap_remove safely.
-    let mut reap: Vec<(usize, bool)> = Vec::new();
+    let mut reap = std::collections::BTreeSet::new();
     for (i, g) in sim.generators.iter_mut().enumerate() {
         // The mesh entity despawns with its actor (auto-run generators are
         // children of the actor root); reap the simulator entry when it's gone.
         let Ok(entity_xf) = q_mesh_xf.get(g.entity) else {
-            reap.push((i, false));
+            reap.insert(i);
             continue;
         };
         // The 0x1F camera-oriented ring resolves against the camera and the actor's world
@@ -2952,16 +2950,11 @@ pub fn sync_particle_meshes(
             g.stopped || (!g.auto_run && g.age_frames > g.emit_window_frames.max(1.0));
         let done = window_over && g.particles.is_empty();
         if done {
-            reap.push((i, true));
+            reap.insert(i);
         }
     }
 
-    for &(i, despawn) in reap.iter().rev() {
-        let g = sim.generators.swap_remove(i);
-        if despawn {
-            commands.entity(g.entity).try_despawn();
-        }
-    }
+    remove_dead_generators(&mut sim, &mut commands, reap);
 
     if trace_rebuilds && time.elapsed_secs() - trace.since_secs >= 1.0 {
         let mut rows: Vec<(String, (u32, usize))> = trace.per_generator.drain().collect();
@@ -4027,6 +4020,46 @@ mod tests {
             60,
             "back in band: emits again (two per period)"
         );
+    }
+
+    #[test]
+    fn mesh_reaping_preserves_child_generator_links() {
+        use bevy::ecs::system::RunSystemOnce;
+
+        let mut world = World::new();
+        world.insert_resource(Time::<()>::default());
+        world.insert_resource(Assets::<Mesh>::default());
+        let mut generators = Vec::new();
+        for _ in 0..3 {
+            let mut g = live(def(60.0, 1.0, 1), 60.0);
+            g.entity = world
+                .spawn((Mesh3d(Handle::default()), GlobalTransform::IDENTITY))
+                .id();
+            generators.push(g);
+        }
+        generators[0].stopped = true;
+        emit(&mut generators[1], 60.0);
+        generators[1].particles[0].child_gens.push(2);
+        generators[2].parent = Some((1, generators[1].particles[0].id));
+        let parent_entity = generators[1].entity;
+        let child_entity = generators[2].entity;
+        world.insert_resource(ParticleSimulator {
+            generators,
+            clock: CelestialClock::default(),
+        });
+
+        world.run_system_once(sync_particle_meshes).unwrap();
+        let mut sim = world.resource_mut::<ParticleSimulator>();
+        let child = sim
+            .generators
+            .iter()
+            .find(|g| g.entity == child_entity)
+            .unwrap();
+        let parent_index = child.parent.unwrap().0;
+        assert_eq!(sim.generators[parent_index].entity, parent_entity);
+        let child_index = sim.generators[parent_index].particles[0].child_gens[0];
+        assert_eq!(sim.generators[child_index].entity, child_entity);
+        assert!(anchor_children(&mut sim).is_empty());
     }
 
     #[test]
