@@ -201,6 +201,7 @@ fn build_app() -> App {
     app.insert_resource(ActionDatRoot(root.clone()));
     app.insert_resource(kuluu_render::ffxi_actor_render::ActorDatRoot(root));
     app.init_resource::<Time>();
+    app.init_resource::<kuluu_render::graphics_settings::GraphicsSettings>();
     app.init_resource::<bevy::asset::Assets<bevy::prelude::Mesh>>();
     app.init_resource::<bevy::asset::Assets<kuluu_render::ffxi_particle_material::FfxiParticleMaterial>>();
     app.init_resource::<bevy::asset::Assets<bevy::image::Image>>();
