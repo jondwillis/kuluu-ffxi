@@ -1795,8 +1795,6 @@ pub fn dispatch_sound_stages(
             continue;
         };
 
-        // A 0x4A/0x60 stage has no world emitter: it mixes dry, like a UI or
-        // weather cue, so it must not be sited on an actor and attenuated.
         if kind == StageKind::SoundNonPositional {
             sfx_writer.write(crate::audio::SfxEvent::new(se_id));
             continue;
