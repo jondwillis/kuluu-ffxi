@@ -105,7 +105,9 @@ pub struct SlashWriters<'w, 's> {
 
     pub net_status_visible: ResMut<'w, kuluu_render::hud::network_status::NetStatusVisible>,
 
-    pub vana_clock: Res<'w, kuluu_render::vana_time::VanaClock>,
+    /// `ResMut` (not `Res`): the Debug menu "Force_18:00" row freezes/thaws
+    /// the clock at confirm time.
+    pub vana_clock: ResMut<'w, kuluu_render::vana_time::VanaClock>,
 
     pub vana_clock_visible: ResMut<'w, kuluu_render::hud::vana_clock::VanaClockVisible>,
 
@@ -220,7 +222,9 @@ pub struct MenuConfirmWriters<'w> {
     pub hud_panels: ResMut<'w, kuluu_render::hud::HudPanels>,
     pub net_status: ResMut<'w, kuluu_render::hud::network_status::NetStatusVisible>,
     pub audio_mute: ResMut<'w, kuluu_render::audio::AudioMuteState>,
-    pub vana_clock: Res<'w, kuluu_render::vana_time::VanaClock>,
+    /// `ResMut` (not `Res`): the Debug menu "Force_18:00" row freezes/thaws
+    /// the clock at confirm time.
+    pub vana_clock: ResMut<'w, kuluu_render::vana_time::VanaClock>,
     pub vana_clock_visible: ResMut<'w, kuluu_render::hud::vana_clock::VanaClockVisible>,
     pub item_screen_container: ResMut<'w, kuluu_render::hud::item_screen::ItemScreenContainer>,
 }
@@ -459,7 +463,7 @@ pub(crate) fn text_input_system(
                     &mut slash_writers.hud_panels,
                     &mut slash_writers.net_status_visible,
                     &mut slash_writers.audio_mute,
-                    &slash_writers.vana_clock,
+                    &mut slash_writers.vana_clock,
                     &mut slash_writers.vana_clock_visible,
                     &mut slash_writers.sort_options,
                     &mut slash_writers.item_menu_focus,
@@ -1823,7 +1827,7 @@ pub fn mouse_nav_dispatch_system(
                 &mut menu_writers.hud_panels,
                 &mut menu_writers.net_status,
                 &mut menu_writers.audio_mute,
-                &menu_writers.vana_clock,
+                &mut menu_writers.vana_clock,
                 &mut menu_writers.vana_clock_visible,
                 &dynamic_menu,
                 current_target,
