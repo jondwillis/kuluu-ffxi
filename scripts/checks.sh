@@ -615,7 +615,7 @@ run_enhanced() {
   # enhanced-neural-uplift is the one exclusion, because it implies dlss and so
   # needs the SDK that KULUU_CHECK_DLSS gates.
   local enhanced
-  enhanced=$(grep -oE '^enhanced-[a-z-]+' kuluu/Cargo.toml \
+  enhanced=$(grep -oE '^enhanced-[a-z0-9-]+' kuluu/Cargo.toml \
     | grep -v '^enhanced-neural-uplift$' | paste -sd, - || true)
   if [[ -z "$enhanced" ]]; then
     echo "checks: enhanced — no enhanced-* features found in kuluu/Cargo.toml" >&2
