@@ -706,6 +706,25 @@ impl MzbCollisionGeometry {
     }
 }
 
+fn build_collision_geometry_at(
+    submeshes: &[MzbSubMesh],
+    instances: &[MzbInstance],
+    file_id: Option<u32>,
+    world_pos: Vec3,
+) -> MzbCollisionBlock {
+    let placed: Vec<MzbInstance> = instances
+        .iter()
+        .map(|instance| MzbInstance {
+            bevy_transform: Transform {
+                translation: instance.bevy_transform.translation + world_pos,
+                ..instance.bevy_transform
+            },
+            ..*instance
+        })
+        .collect();
+    build_collision_geometry(submeshes, &placed, file_id)
+}
+
 /// Bakes placed submeshes into the geometry the player grounds on. The client
 /// and the `zz-*` collision probes both go through here, so a probe can't
 /// disagree with what the game actually walks on.
@@ -2896,7 +2915,7 @@ fn spawn_mzb_overlay(
 
     collision_geometry.set_block(
         req.slot,
-        build_collision_geometry(submeshes, instances, Some(req.file_id)),
+        build_collision_geometry_at(submeshes, instances, Some(req.file_id), req.world_pos),
     );
 
     spawn_merged(
@@ -3555,6 +3574,40 @@ pub(crate) mod ground_tests {
         geom.set_block(ZONE_SLOT_MAIN, block);
 
         assert_eq!(geom.ground_nearest(Vec2::ZERO, 6.0), Some(2.0));
+    }
+
+    #[test]
+    fn collision_block_uses_the_render_parent_translation() {
+        const OFFSET: Vec3 = Vec3::new(40.0, 7.0, -30.0);
+        let (positions, indices) = floor_at(0.0);
+        let submeshes = [MzbSubMesh {
+            positions: positions.iter().map(|v| v.to_array()).collect(),
+            indices: indices.to_vec(),
+            tri_terrain: vec![0; 2],
+            tri_normal: vec![Vec3::Y.to_array(); 2],
+            tri_camera_transparent: vec![false; 2],
+            flags: 0,
+        }];
+        let instances = [MzbInstance {
+            submesh_idx: 0,
+            bevy_transform: Transform::IDENTITY,
+            water_height_bevy: None,
+            lighting: None,
+            sub_area_link: 0,
+        }];
+        for offset in [Vec3::ZERO, OFFSET] {
+            let block = build_collision_geometry_at(&submeshes, &instances, None, offset);
+            let expected: Vec<_> = positions.iter().map(|p| *p + offset).collect();
+            assert_eq!(block.positions, expected);
+            let geometry = MzbCollisionGeometry::from_block(block);
+            assert_eq!(
+                geometry.ground_nearest(offset.xz(), offset.y),
+                Some(offset.y)
+            );
+            if offset != Vec3::ZERO {
+                assert_eq!(geometry.ground_nearest(Vec2::ZERO, offset.y), None);
+            }
+        }
     }
 
     /// `tri_sub_area` fans out per *placed* triangle like `camera_skip`: one
