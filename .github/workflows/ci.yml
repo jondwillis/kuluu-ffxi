@@ -48,9 +48,9 @@ jobs:
       - run: scripts/checks.sh harness
       - run: scripts/checks.sh comments
       - run: scripts/checks.sh literals
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
+      # No toolchain step on purpose: the workspace manifest needs the pinned nightly
+      # (unstable codegen-backend), so stable cargo cannot parse Cargo.toml. Like every other
+      # job here, rustup installs the channel from rust-toolchain.toml.
       - run: scripts/checks.sh fmt
 
   # clippy (check-mode) and test (codegen) share almost no compiled first-party
