@@ -94,6 +94,28 @@ pub struct LastAtmosphereZone {
     pub file_id: Option<u32>,
 }
 
+/// The AnimationTest box's fog checkbox (`sun_moon::SkyFxOverride.fog`): yanks `DistanceFog`
+/// off the operator camera while checked, re-inserts what it stashed on uncheck. Re-reads every
+/// pass so a zone/weather writer re-adding fog cannot slip past the checkbox; without the
+/// override resource (a real session) it does nothing.
+pub fn suppress_distance_fog_when_overridden(
+    sky_fx: Option<Res<crate::sun_moon::SkyFxOverride>>,
+    mut commands: Commands,
+    q_cam: Query<(Entity, Option<&DistanceFog>), With<OperatorCamera>>,
+    mut stashed: Local<Option<DistanceFog>>,
+) {
+    if sky_fx.as_ref().is_some_and(|ov| ov.fog) {
+        if let Ok((cam, Some(fog))) = q_cam.single() {
+            *stashed = Some(fog.clone());
+            commands.entity(cam).remove::<DistanceFog>();
+        }
+    } else if let Some(fog) = stashed.take() {
+        if let Ok((cam, None)) = q_cam.single() {
+            commands.entity(cam).insert(fog);
+        }
+    }
+}
+
 pub fn apply_zone_atmosphere_system(
     state: Res<SceneState>,
     provider: Res<ZoneAtmosphereProvider>,

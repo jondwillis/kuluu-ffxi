@@ -70,14 +70,22 @@ pub struct ActiveSceneLights {
     pub lights: Vec<ZonePointLight>,
 }
 
+/// The AnimationTest box's wall-glow kill switch (panel checkbox): while set,
+/// [`build_active_scene_lights`] publishes an empty feed, so the FFXI zone/actor materials lose
+/// their authored lamp point-terms — retail's own `ligh` palette is what paints the stone.
+/// Only the box inserts it; without it (a real session) lighting stays authored.
+#[derive(Resource, Default)]
+pub struct ZoneLampLightsOff(pub bool);
+
 pub fn build_active_scene_lights(
     faithful: Res<ZonePointLights>,
     vana_clock: Res<crate::vana_time::VanaClock>,
     settings: Res<crate::graphics_settings::GraphicsSettings>,
+    lamp_off: Option<Res<ZoneLampLightsOff>>,
     mut active: ResMut<ActiveSceneLights>,
 ) {
     let day = crate::vana_time::full_day_fraction(vana_clock.earth_unix_secs_now());
-    let enabled = settings.dynamic_lights.faithful_enabled();
+    let enabled = settings.dynamic_lights.faithful_enabled() && !lamp_off.is_some_and(|off| off.0);
     let source = if enabled {
         faithful.lights.as_slice()
     } else {

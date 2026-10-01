@@ -334,6 +334,7 @@ impl<S: SceneSource + Resource + Component<Mutability = bevy::ecs::component::Mu
                         weather_fx::sync_current_weather_from_snapshot,
                         weather_fx::update_weather_modifier_system,
                         weather_fx::apply_weather_to_ambient_and_fog_system,
+                        atmosphere::suppress_distance_fog_when_overridden,
                         sun_moon::sun_moon_system,
                         weather_fx::apply_weather_to_sun_system,
                     ),

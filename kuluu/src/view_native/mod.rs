@@ -1,3 +1,4 @@
+pub mod animation_test_scene;
 mod app_icon;
 pub mod auto_target;
 pub mod bridge;
@@ -720,6 +721,9 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
     app.insert_resource(crate::graphics_store::GraphicsStateRes {
         store: graphics_store_obj,
     });
+    // The AnimationTest box's shadow suppression reads/writes this gate every Launcher frame;
+    // it must exist before the first Update, not only while the box is open.
+    app.init_resource::<crate::graphics_store::GraphicsPersistSuspended>();
 
     app.insert_resource(crate::marker_store::load_or_default());
 
@@ -729,6 +733,7 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
         MousePlugin,
         navmesh_overlay::NavmeshOverlayPlugin,
         launcher_backdrop::LauncherBackdropPlugin,
+        animation_test_scene::AnimationTestScenePlugin,
         zone_transition::ZoneTransitionOverlayPlugin,
     ))
     .insert_resource(ZoneNameResolver::new(kuluu_nav::zone_name))

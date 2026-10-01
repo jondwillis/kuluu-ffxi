@@ -565,6 +565,23 @@ pub struct SunMoonRenderCfg<'w> {
     pub dat_celestials: Res<'w, DatCelestials>,
 }
 
+/// The AnimationTest box's night-fx kill switches (panel checkboxes in
+/// `kuluu::view_native::animation_test_scene`). Forcing an altitude below the horizon drives every
+/// consumer down its existing "below the horizon" path — light, disc, lens flare and the published
+/// zone dir-lighting scalars alike — instead of each one learning a new override. Only the box
+/// inserts it; without the resource (a real session) everything stays authored.
+#[derive(Resource, Default, Debug, Clone, Copy)]
+pub struct SkyFxOverride {
+    /// Sun pinned below the horizon: sun light, disc and landscape dir0 term off.
+    pub sun: bool,
+    /// Moon pinned below the horizon: moon light, disc and landscape dir1 term off.
+    pub moon: bool,
+    /// Star dome hidden whatever the sky says (the dome's own fade reads raw altitudes).
+    pub stars: bool,
+    /// Camera distance fog suppressed (`atmosphere::suppress_distance_fog_when_overridden`).
+    pub fog: bool,
+}
+
 /// The sun's depth map self-shadows, so it tracks the illuminating light;
 /// retail's ground-projected shadow direction is not an occlusion ray.
 pub fn sun_moon_system(
@@ -619,6 +636,7 @@ pub fn sun_moon_system(
     mut moon_materials: ResMut<Assets<crate::moon_material::MoonMaterial>>,
     mut toasts: MessageWriter<crate::snapshot::ToastEvent>,
     vana_clock: Res<crate::vana_time::VanaClock>,
+    sky_fx: Option<Res<SkyFxOverride>>,
     mut render_cfg: SunMoonRenderCfg,
     mut transition_state: Local<MoonTransitionState>,
 ) {
@@ -633,6 +651,11 @@ pub fn sun_moon_system(
         moon_disc_written,
     } = &mut *transition_state;
     *sky = vana_sky_from_clock(&vana_clock);
+    // Box override: pin the sun under the horizon before any consumer reads it (the moon gets its
+    // own clamp where its altitude is recomputed below).
+    if sky_fx.as_ref().is_some_and(|ov| ov.sun) {
+        sky.sun_altitude = sky.sun_altitude.min(-0.25);
+    }
 
     let sun_up_now = sky.sun_altitude > 0.0;
     if let Some(prev) = *prev_sun_up {
@@ -745,6 +768,9 @@ pub fn sun_moon_system(
 
     let moon_altitude = moon_dir.y.asin();
     sky.moon_altitude = moon_altitude;
+    if sky_fx.as_ref().is_some_and(|ov| ov.moon) {
+        sky.moon_altitude = sky.moon_altitude.min(-0.25);
+    }
     let moon_pos = moon_dir * LIGHT_DISTANCE;
     let (moon_color, moon_lux) = match dat {
         Some(_) if indoors => (Color::BLACK, 0.0),
