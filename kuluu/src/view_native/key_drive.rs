@@ -81,6 +81,19 @@ impl KeyMsg {
             "down" => (KeyCode::ArrowDown, Key::ArrowDown),
             "left" => (KeyCode::ArrowLeft, Key::ArrowLeft),
             "right" => (KeyCode::ArrowRight, Key::ArrowRight),
+            "f1" => (KeyCode::F1, Key::F1),
+            "f2" => (KeyCode::F2, Key::F2),
+            "f3" => (KeyCode::F3, Key::F3),
+            "f4" => (KeyCode::F4, Key::F4),
+            "f5" => (KeyCode::F5, Key::F5),
+            "f6" => (KeyCode::F6, Key::F6),
+            "f7" => (KeyCode::F7, Key::F7),
+            "f8" => (KeyCode::F8, Key::F8),
+            "f9" => (KeyCode::F9, Key::F9),
+            "f10" => (KeyCode::F10, Key::F10),
+            "f11" => (KeyCode::F11, Key::F11),
+            "f12" => (KeyCode::F12, Key::F12),
+            "printscreen" | "prtsc" | "prtscn" => (KeyCode::PrintScreen, Key::PrintScreen),
             _ => return None,
         };
         Some((kc, lk))
@@ -305,6 +318,33 @@ mod tests {
     fn unknown_lines_rejected() {
         assert!(KeyMsg::from_json_line("not json").is_none());
         assert!(KeyMsg::from_json_line(r#"{"foo":1}"#).is_none());
+    }
+
+    #[test]
+    fn resolve_function_and_screenshot_keys() {
+        let function_keys = [
+            ("F1", KeyCode::F1, Key::F1),
+            ("F2", KeyCode::F2, Key::F2),
+            ("F3", KeyCode::F3, Key::F3),
+            ("F4", KeyCode::F4, Key::F4),
+            ("F5", KeyCode::F5, Key::F5),
+            ("F6", KeyCode::F6, Key::F6),
+            ("F7", KeyCode::F7, Key::F7),
+            ("F8", KeyCode::F8, Key::F8),
+            ("F9", KeyCode::F9, Key::F9),
+            ("F10", KeyCode::F10, Key::F10),
+            ("F11", KeyCode::F11, Key::F11),
+            ("F12", KeyCode::F12, Key::F12),
+        ];
+        for (name, physical, logical) in function_keys {
+            assert_eq!(KeyMsg::resolve(name), Some((physical, logical)));
+        }
+        for name in ["PrintScreen", "prtsc", "prtscn"] {
+            assert_eq!(
+                KeyMsg::resolve(name),
+                Some((KeyCode::PrintScreen, Key::PrintScreen))
+            );
+        }
     }
 
     #[test]
