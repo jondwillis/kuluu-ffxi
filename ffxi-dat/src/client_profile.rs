@@ -426,11 +426,17 @@ mod tests {
             profile.known.map(|k| k.item_layout),
             "{profile}"
         );
-        assert_eq!(
-            profile.patch_version.as_deref(),
-            profile.known.and_then(|k| k.patch_version),
-            "{profile}"
-        );
+        // The stamp is checkable only when the install carries one: the
+        // patch.cfg stamp is the PlayOnline patch session's manifest
+        // (ffxi-install/src/manifest.rs MANIFEST_FILE); SE's own patcher
+        // stamps patch.txt, so a stamped-row install can lack it.
+        if profile.patch_version.is_some() {
+            assert_eq!(
+                profile.patch_version.as_deref(),
+                profile.known.and_then(|k| k.patch_version),
+                "{profile}"
+            );
+        }
     }
 
     #[test]
