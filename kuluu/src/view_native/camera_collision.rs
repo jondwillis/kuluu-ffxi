@@ -10,13 +10,13 @@ use kuluu_render::{
 
 use super::collision_bvh::{CollisionBvh, ZoneCollisionBvh};
 
-/// The focus dead zone, yalms: the camera's focus holds still while the pivot
-/// moves inside it, and is dragged to exactly this distance once the pivot
-/// leaves it. Longer than an average step so a single step never moves the
-/// camera (0.25 was not), short enough that the player never reads
-/// off-centre. The idea is the orbit camera's focus radius
-/// (catlikecoding.com, Orbit Camera, "focus radius").
-const FOCUS_DEADZONE: f32 = 0.5;
+// FFXiMain.dll retail-2026-09 RVA 0x1F5B2: focus += (actor_anchor - focus) * 0.25 per tick.
+const FOCUS_FOLLOW_PER_TICK: f32 = 0.25;
+
+fn follow_focus(from: Vec2, target: Vec2, dt: f32) -> Vec2 {
+    let ticks = dt.max(0.0) * kuluu_render::scheduler_runtime::ROUTINE_FPS;
+    from.lerp(target, 1.0 - (1.0 - FOCUS_FOLLOW_PER_TICK).powf(ticks))
+}
 
 /// The camera spring: once the leash says the eye must move, it closes the
 /// gap at this fraction of the gap per second, capped at CAM_MAX_SPEED, and
@@ -139,55 +139,6 @@ const OUTWARD_LERP: f32 = 0.18;
 
 const INWARD_LERP: f32 = 0.45;
 
-/// The single chase-camera authority: a leash with slack at both ends, the
-/// camera spring that decides how fast the eye reaches the leash's goal, the
-/// lock look-at behind the player, and the wall pull-in against the zone MZB
-/// BVH, with one transform write at the end.
-///
-/// While a running event holds the camera (CutsceneMode::camera_locked) this
-/// system writes nothing: the cutscene camera route (kuluu-render's
-/// advance_cutscene_camera_task, registered after this one) owns the operator
-/// camera, and a chase write would pull the scripted view back behind the
-/// player every frame. The leash resets while held, so on release the chase
-/// re-seats behind the player from a clean state (retail's DEFCAMERA release
-/// re-seats the chase the same way).
-///
-/// The camera is a world point (the eye) on a leash from a focus point. The
-/// focus is what the camera looks at: the player's anchor. It holds still
-/// while the pivot moves inside FOCUS_DEADZONE and is dragged to exactly
-/// that distance once the pivot leaves it, so the per-frame wobble of the
-/// player transform (a server correction, an interpolation seam, a stair
-/// step) never reaches the camera. The eye holds still while its horizontal
-/// distance from the focus is between half and all of the zoom
-/// (LEASH_SLACK_MIN_RATIO); outside the band the leash says where it must be
-/// and the camera spring (CAM_PULL_RATE, capped at CAM_MAX_SPEED) says how
-/// fast it gets there — with the spring off the eye snaps to the goal. The
-/// yaw is the direction from the focus to the eye; the one exception is a
-/// frame where something else wrote chase.yaw since last frame (the mouse,
-/// the yaw keys, Q/E, a stair warp) — then the eye swings around the focus
-/// to that yaw at once, no spring. Locked on, the camera instead sits behind
-/// the player aimed at the target and turns onto that bearing at
-/// LOCK_TURN_RATE, and the yaw does not come back from the eye.
-///
-/// Init sync aligns yaw behind the player on the first frame.
-/// snap_to_anchor (zone/warp) resets the leash to the exact position.
-///
-/// Pass 3 is the collision pull-in: a ray from the pivot along the boom,
-/// where walls block and mobs do not — the same solid world the walker
-/// sweeps (the door triangles join this ray when the obstacle set lands).
-/// The nearest hit shortens the boom so the camera does not clip through
-/// geometry; cast from the pivot (the player), not the glide origin, so wall
-/// pull-in is measured from where the camera is actually looking. The BVH
-/// rebuilds ~1 s after zone geometry goes quiet; until then there is no ray
-/// and the boom runs unclipped.
-///
-/// Boom-length easing (not position) snaps in fast when a wall appears and
-/// eases out slow when it clears, so the camera does not jitter at wall
-/// edges; the camera spring moves the eye, this only smooths the pull-in
-/// distance. The single write places the eye along the boom from the focus
-/// while the camera looks at the focus, so however the rig moves the player
-/// stays centered and rotation orbits the focus; with the spring off the eye
-/// sits on the leash's goal and this reduces to the plain centered behavior.
 pub fn resolve_camera(
     mode: Res<CameraMode>,
     settings: Res<kuluu_render::GraphicsSettings>,
@@ -242,7 +193,7 @@ pub fn resolve_camera(
     let dt = time.delta_secs().max(1e-4);
 
     // Debug menu Camera_leash row (enhanced-camera-leash builds): off bypasses the
-    // focus dead zone, eye slack band and spring — the eye sits on its plain polar goal.
+    // focus follow, eye slack band and spring — the eye sits on its plain polar goal.
     let leash_on = !hud_panels.camera_leash_off;
 
     let cos_p = chase.pitch.cos().max(1e-3);
@@ -255,12 +206,8 @@ pub fn resolve_camera(
     };
     let yaw_dir = |yaw: f32| Vec2::new(yaw.sin(), yaw.cos());
 
-    // Focus: held inside the dead zone, dragged to its edge outside it. The
-    // dead zone is always on; it decides when the camera moves at all.
     let focus = match leash_state.focus {
-        Some(f) if !chase.snap_to_anchor && leash_on => {
-            leash(f, pivot_xz, 0.0, FOCUS_DEADZONE, Vec2::ZERO)
-        }
+        Some(f) if !chase.snap_to_anchor && leash_on => follow_focus(f, pivot_xz, dt),
         _ => pivot_xz,
     };
 
@@ -282,7 +229,7 @@ pub fn resolve_camera(
     // A yaw this system did not write (arrows, mouse drag, Q/E, the lock
     // turn) is a manual turn: the whole rig, eye and focus together, turns
     // about the player by the yaw's change. Nothing jumps and the player
-    // keeps its spot on screen; the focus's dead-zone offset turns with the
+    // keeps its spot on screen; the focus's follow offset turns with the
     // rig instead of making the camera orbit a point beside the player.
     let (focus, eye_prev) = match (leash_state.eye, leash_state.yaw) {
         (Some(e), Some(last_yaw)) if !chase.snap_to_anchor => {
@@ -602,20 +549,78 @@ mod tests {
         );
     }
 
-    /// Inside the dead zone the focus does not move: a pivot wobbling 5 cm
-    /// every frame never reaches the camera. This is the jitter the old
-    /// follow passed straight through.
     #[test]
-    fn focus_deadzone_swallows_pivot_wobble() {
-        let mut focus = Vec2::new(10.0, -4.0);
-        let start = focus;
-        for i in 0..600 {
-            let wobble = Vec2::new(
-                if i % 2 == 0 { 0.05 } else { -0.05 },
-                if i % 3 == 0 { 0.04 } else { -0.03 },
-            );
-            focus = leash(focus, start + wobble, 0.0, FOCUS_DEADZONE, Vec2::ZERO);
-            assert_eq!(focus, start, "frame {i}: the focus moved");
+    fn focus_follows_small_lateral_motion_on_the_first_tick() {
+        const STEP: f32 = 0.05;
+        let dt = 1.0 / kuluu_render::scheduler_runtime::ROUTINE_FPS;
+        for sign in [-1.0, 1.0] {
+            let target = Vec2::X * STEP * sign;
+            let focus = follow_focus(Vec2::ZERO, target, dt);
+            assert!((focus.x - target.x / 4.0).abs() < f32::EPSILON);
+            assert!(focus.x * sign > 0.0);
+        }
+    }
+
+    #[test]
+    fn focus_response_preserves_retail_ticks_across_render_rates() {
+        let target = Vec2::new(0.2, -0.1);
+        let tick = 1.0 / kuluu_render::scheduler_runtime::ROUTINE_FPS;
+        let first = follow_focus(Vec2::ZERO, target, tick);
+        let second = follow_focus(first, target, tick);
+        assert!((second - follow_focus(Vec2::ZERO, target, tick * 2.0)).length() < f32::EPSILON);
+        let half = follow_focus(Vec2::ZERO, target, tick * 0.5);
+        assert!((first - follow_focus(half, target, tick * 0.5)).length() < f32::EPSILON);
+        assert_eq!(follow_focus(first, target, 0.0), first);
+    }
+
+    #[test]
+    fn chase_view_responds_to_sub_half_yalm_lateral_steps() {
+        const STEP: f32 = 0.05;
+        let mut app = App::new();
+        app.init_resource::<Time>()
+            .insert_resource(CameraMode::Chase)
+            .init_resource::<kuluu_render::GraphicsSettings>()
+            .init_resource::<kuluu_render::hud::HudPanels>()
+            .init_resource::<SceneState>()
+            .init_resource::<ZoneCollisionBvh>()
+            .init_resource::<kuluu_render::camera::CameraStepSmoothing>()
+            .init_resource::<kuluu_render::cutscene::CutsceneMode>()
+            .init_resource::<kuluu_render::lock_on::LockOn>()
+            .insert_resource(ChaseCamera {
+                synced_initial: true,
+                snap_to_anchor: true,
+                yaw: 0.0,
+                ..Default::default()
+            })
+            .add_systems(Update, resolve_camera);
+        let player = app.world_mut().spawn((IsSelf, Transform::default())).id();
+        let camera = app
+            .world_mut()
+            .spawn((OperatorCamera, Transform::default()))
+            .id();
+        for sign in [-1.0, 1.0] {
+            app.world_mut()
+                .get_mut::<Transform>(player)
+                .unwrap()
+                .translation = Vec3::ZERO;
+            app.world_mut().resource_mut::<ChaseCamera>().snap_to_anchor = true;
+            app.update();
+            app.world_mut()
+                .get_mut::<Transform>(player)
+                .unwrap()
+                .translation
+                .x = STEP * sign;
+            app.world_mut()
+                .resource_mut::<Time>()
+                .advance_by(std::time::Duration::from_secs_f32(
+                    1.0 / kuluu_render::scheduler_runtime::ROUTINE_FPS,
+                ));
+            app.update();
+            let view = app.world().get::<Transform>(camera).unwrap();
+            let forward = *view.forward();
+            let distance = (third_person_anchor_y(None) - view.translation.y) / forward.y;
+            let focus = view.translation + forward * distance;
+            assert!((focus.x - STEP * sign / 4.0).abs() < 1e-5, "{focus:?}");
         }
     }
 
@@ -651,7 +656,11 @@ mod tests {
             // Camera forward is -(sin yaw, cos yaw) in bevy xz; right of a
             // forward (fx, fz) with Y up is (-fz, fx), here (cos yaw, -sin yaw).
             pivot += Vec2::new(yaw.cos(), -yaw.sin()) * STEP;
-            focus = leash(focus, pivot, 0.0, FOCUS_DEADZONE, Vec2::ZERO);
+            focus = follow_focus(
+                focus,
+                pivot,
+                1.0 / kuluu_render::scheduler_runtime::ROUTINE_FPS,
+            );
             eye = leash(eye, focus, MIN, MAX, fb);
             let v = eye - focus;
             let next = continuous_yaw(yaw, v.x.atan2(v.y));
@@ -683,7 +692,11 @@ mod tests {
         let mut pivot = focus;
         for _ in 0..300 {
             pivot += away * 0.1;
-            focus = leash(focus, pivot, 0.0, FOCUS_DEADZONE, Vec2::ZERO);
+            focus = follow_focus(
+                focus,
+                pivot,
+                1.0 / kuluu_render::scheduler_runtime::ROUTINE_FPS,
+            );
             eye = leash(eye, focus, 3.0, 6.0, fb);
         }
         let v = eye - focus;
