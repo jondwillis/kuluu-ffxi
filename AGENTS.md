@@ -31,6 +31,10 @@ cargo test -p ffxi-proto framing::tests::roundtrip --features native-window
 - **Enable the hooks once per clone:** `cargo xtask install-hooks` (sets `core.hooksPath=.githooks`). Bypass a push with `git push --no-verify`; `PREPUSH_FAST=1 git push` runs fmt and state contracts.
 - `xtask` is excluded from `default-members`, so plain `cargo build`/`test` skip it; run it via the `cargo xtask` alias.
 
+## PR review and evidence
+
+PRs must justify why the change belongs in Kuluu beyond linking an issue. Prefer verified GitHub issue links in contributor-facing material; Beads remains the tracking source. Vanilla/Retail is the default; modest FPS or UX improvements need a clear benefit without material gameplay or convenience drift; Enhanced behavior requires explicit opt-in. Use the [Kuluu review skill](.agents/skills/kuluu-review/SKILL.md) for project-fit assessment, focused correction stacks and evidence requirements. Graphical or visible interaction changes need reviewer-accessible screenshots/video; use [verify](.agents/skills/verify/SKILL.md) to capture them.
+
 ## Running
 
 Credentials and the DAT path come from env vars (never committed/logged). The launcher prompts for any unset credential and lists characters by name.
