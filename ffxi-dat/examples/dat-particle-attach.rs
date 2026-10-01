@@ -4,7 +4,7 @@ use ffxi_dat::{
     chunk::walk,
     kind::ChunkKind,
     particle_gen::{
-        ParticleGeneratorDef, ATTACH_JOINT0_MASK, ATTACH_JOINT0_SHIFT, ATTACH_JOINT1_MASK,
+        ParticleGeneratorDef, ATTACH_EID_LOW_MASK, ATTACH_EID_LOW_SHIFT, ATTACH_JOINT1_MASK,
         ATTACH_JOINT1_SHIFT,
     },
     DatRoot,
@@ -70,7 +70,7 @@ fn main() -> ExitCode {
                 "  {name:<6} attach=0x{:04X} -> {:<24} j0={} j1={} extra=0x{extra:04X}",
                 attach_flags,
                 attach_name(attach_flags),
-                (attach_flags & ATTACH_JOINT0_MASK) >> ATTACH_JOINT0_SHIFT,
+                (attach_flags & ATTACH_EID_LOW_MASK) >> ATTACH_EID_LOW_SHIFT,
                 (attach_flags & ATTACH_JOINT1_MASK) >> ATTACH_JOINT1_SHIFT,
             );
             if let Some(d) = parsed {

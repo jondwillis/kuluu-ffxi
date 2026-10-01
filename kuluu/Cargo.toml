@@ -67,6 +67,8 @@ enhanced-cast-bar = ["kuluu-render?/enhanced-cast-bar"]
 # shows no mob HP; without this feature a persisted `mob_hp_under` can never
 # light either, and the Debug -> Retail+ row does not exist.
 enhanced-mob-hp-under = ["kuluu-render?/enhanced-mob-hp-under"]
+# Enhanced (non-retail): +20% particle alpha for hit flashes. See kuluu-render.
+enhanced-particle-alpha-20 = ["kuluu-render?/enhanced-particle-alpha-20"]
 # Enhanced (non-retail) numeric KO countdown on the death prompt. Retail shows
 # the home-point menu and no visible clock, so vanilla builds omit the line.
 enhanced-death-countdown = ["kuluu-render?/enhanced-death-countdown"]

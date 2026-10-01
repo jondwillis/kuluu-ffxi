@@ -1,4 +1,5 @@
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use bevy::asset::RenderAssetUsages;
 use bevy::mesh::{Indices, PrimitiveTopology};
@@ -20,54 +21,21 @@ use crate::scheduler_runtime::{
 };
 use ffxi_dat::scheduler::{StageKind, NO_LOCAL_DIR};
 
+// The per-particle TEXTUREFACTOR (F) rides the TANGENT slot: Bevy's material pipeline only
+// exposes standard attributes at fixed shader locations (bevy_pbr render/mesh.rs
+// MeshPipeline::specialize — position 0, normal 1, uv 2, uv_b 3, tangent 4, color 5), and a
+// custom attribute id never reaches the vertex buffer layout. TANGENT is the one standard
+// vec4 slot these meshes do not otherwise use; ffxi_particle.wgsl reads it at location 4.
+
 // CPU particle simulation. research/xim ParticleGenerator + Particle: a Particle stage (0x02)
 // spawns a `LiveGenerator` that streams billboard particles over its window, each integrating
 // velocity and following per-particle keyframe tracks (scale/alpha) by life progress. One retained
 // mesh entity per generator is rebuilt each frame from its live particles — not an entity per
 // particle.
-// The AnimationTest box's kill switches (panel checkboxes in
-// `kuluu::view_native::animation_test_scene`): while set, the lamp halos / wall washes stand down.
-// Only the box inserts them; without them (a real session) everything stays authored. The tick-side
-// consumption lands with the zone-lamp generator work.
 #[derive(Resource, Default)]
-pub struct LampHalosOff(pub bool);
-
-#[derive(Resource, Default)]
-pub struct WallWashOff(pub bool);
-
-/// Tester-only: generator names whose authored alpha is forced to 1.0 at spawn, so an a=0
-/// additive flash (g141/g144) can be inspected in isolation. Absent/empty in production.
-#[derive(Resource, Default)]
-pub struct TestAlphaOverride(pub std::collections::HashSet<[u8; 4]>);
-
-// Retail reference peak (user-verified against the real client at 18:00): at 0.12 the halo
-// reads as lantern light on stone without washing out the wall texture; past roughly 0.6 it
-// covers the stone instead of lighting it.
-// pub: the AnimationTest box seeds its lantern-alpha slider from this default.
-pub const LAMP_ALPHAMAP_LIFT_DEFAULT: f32 = 0.12;
-// Wall-wash slider seed (1.0 = authored alpha) and ceiling.
-pub const WASH_ALPHA_LIFT_DEFAULT: f32 = 0.18;
-pub const WASH_ALPHA_LIFT_MAX: f32 = 2.0;
-
-#[derive(Resource)]
 pub struct ParticleSimulator {
     generators: Vec<LiveGenerator>,
     clock: CelestialClock,
-    // AnimationTest box slider values; the tick-side application lands with the zone-lamp
-    // generator work, so until then these only carry what a capture script set.
-    lamp_halos_lift: f32,
-    wash_alpha_lift: f32,
-}
-
-impl Default for ParticleSimulator {
-    fn default() -> Self {
-        Self {
-            generators: Vec::new(),
-            clock: CelestialClock::default(),
-            lamp_halos_lift: LAMP_ALPHAMAP_LIFT_DEFAULT,
-            wash_alpha_lift: WASH_ALPHA_LIFT_DEFAULT,
-        }
-    }
 }
 
 // The Vana'diel clock inputs the celestial particle opcodes read. research/xim
@@ -75,11 +43,38 @@ impl Default for ParticleSimulator {
 // EnvironmentManager.getFullDayInterpolation() (the fraction of the Vana'diel day, NOT the
 // particle's life progress); DayOfWeekColorUpdater / MoonPhaseColorUpdater /
 // MoonPhaseSpriteSheetUpdater index their tables by the elemental weekday and moon phase.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub struct CelestialClock {
     pub day_fraction: f32,
     pub day_of_week: usize,
     pub moon_phase: usize,
+    // The animation-test slider values for lamp halos (PATH_LAMP_ALPHAMAP): lift is the peak
+    // wall-brighten, gain multiplies the added light's colour past white under additive blending,
+    // radius scales each halo quad. wash_alpha_lift multiplies the authored alpha of the ghu*/li*
+    // wall-wash volumes (1.0 = exactly as authored). All live on the clock so every draw site
+    // reads them without new plumbing.
+    pub lamp_halos_lift: f32,
+    pub lamp_halos_gain: f32,
+    pub lamp_halos_radius: f32,
+    pub wash_alpha_lift: f32,
+    // Seconds accumulator for the halo flicker wave (the DAT ships no flicker keyframes; retail
+    // wavers at runtime, so both modes ride the hand-tuned `lamp_flicker` model on this clock).
+    pub lamp_flicker_phase: f32,
+}
+
+impl Default for CelestialClock {
+    fn default() -> Self {
+        Self {
+            day_fraction: 0.0,
+            day_of_week: 0,
+            moon_phase: 0,
+            lamp_halos_lift: LAMP_ALPHAMAP_LIFT_DEFAULT,
+            lamp_halos_gain: LAMP_HALOS_GAIN_DEFAULT,
+            lamp_halos_radius: LAMP_HALOS_RADIUS_DEFAULT,
+            wash_alpha_lift: WASH_ALPHA_LIFT_DEFAULT,
+            lamp_flicker_phase: 0.0,
+        }
+    }
 }
 
 impl ParticleSimulator {
@@ -87,18 +82,70 @@ impl ParticleSimulator {
         self.generators.drain(..).map(|g| g.entity).collect()
     }
 
-    pub fn set_celestial_clock(&mut self, clock: CelestialClock) {
+    // World-space emit origins of the live generators (the mesh entity itself stays at identity;
+    // world-space generators bake their position into the vertices).
+    pub fn generator_origins(&self) -> impl Iterator<Item = Vec3> + '_ {
+        self.generators.iter().map(|g| g.origin)
+    }
+
+    pub fn set_celestial_clock(&mut self, mut clock: CelestialClock) {
+        clock.lamp_halos_lift = self.clock.lamp_halos_lift;
+        clock.lamp_halos_gain = self.clock.lamp_halos_gain;
+        clock.lamp_halos_radius = self.clock.lamp_halos_radius;
+        clock.wash_alpha_lift = self.clock.wash_alpha_lift;
+        clock.lamp_flicker_phase = self.clock.lamp_flicker_phase;
         self.clock = clock;
     }
 
-    /// AnimationTest box lantern-alpha slider (0..1 over the track).
-    pub fn set_lamp_halos_lift(&mut self, lift: f32) {
-        self.lamp_halos_lift = lift.clamp(0.0, 1.0);
+    /// World positions of the live halo generators — one per lamp, for enhance mode's point lights.
+    pub fn lamp_halo_origins(&self) -> impl Iterator<Item = Vec3> + '_ {
+        self.generators
+            .iter()
+            .filter(|g| is_lamp_halo_def(&g.def))
+            .map(|g| g.origin)
     }
 
-    /// AnimationTest box wall-wash slider (0..WASH_ALPHA_LIFT_MAX over the track).
+    /// One entry per lamp: world position and its time-of-day gate (0 by day, ~1 at night).
+    /// Follow-camera halos are excluded: their origin re-anchors to the eye every frame, so a
+    /// real light there would pan with the view — retail authors no world light for them.
+    pub fn lamp_halo_lights(&self) -> impl Iterator<Item = (Vec3, f32)> + '_ {
+        self.generators
+            .iter()
+            .filter(|g| is_lamp_halo_def(&g.def) && !g.camera_relative)
+            .map(|g| {
+                let gate = g.tod_color[TOD_ALPHA_CHANNEL]
+                    .as_ref()
+                    .filter(|_| g.def.tod_color_driven[TOD_ALPHA_CHANNEL])
+                    .map_or(1.0, |t| t.sample(self.clock.day_fraction));
+                (g.origin, gate)
+            })
+    }
+
+    pub fn set_lamp_halos_lift(&mut self, lift: f32) {
+        self.clock.lamp_halos_lift = lift.clamp(0.0, 1.0);
+    }
+
+    /// Brightness knob: how far past white the lamp's added light may reach under additive
+    /// blending. The ceiling mirrors `LAMP_GAIN_CEILING` in ffxi_particle.wgsl.
+    pub fn set_lamp_halos_gain(&mut self, gain: f32) {
+        self.clock.lamp_halos_gain = gain.clamp(0.0, LAMP_HALOS_GAIN_MAX);
+    }
+
+    /// Range knob: multiplier on each lamp halo quad's authored size (1.0 = as-authored ±2 units).
+    pub fn set_lamp_halos_radius(&mut self, radius: f32) {
+        self.clock.lamp_halos_radius = radius.clamp(0.0, LAMP_HALOS_RADIUS_MAX);
+    }
+
+    /// Wall-wash brightness knob: multiplier on the ghu*/li* volumes' authored alpha
+    /// (1.0 = exactly as authored; 2.0 ceiling matches the lamp gain ceiling).
     pub fn set_wash_alpha_lift(&mut self, lift: f32) {
-        self.wash_alpha_lift = lift.clamp(0.0, WASH_ALPHA_LIFT_MAX);
+        self.clock.wash_alpha_lift = lift.clamp(0.0, WASH_ALPHA_LIFT_MAX);
+    }
+
+    /// The Vana'diel day fraction the time-of-day tracks sample at (the zone lighting's clock —
+    /// the ambient mixer multiplies its ToD volume track by this, as retail's ClockValueUpdater does).
+    pub fn clock(&self) -> CelestialClock {
+        self.clock
     }
 
     // research/xi-model-viewer/ui/js/particle/runtime.js updateAssociatedPosition:
@@ -195,45 +242,22 @@ struct SpriteTemplate {
     colors: Vec<Vec4>,
 }
 
-// research/XIClient/src/XIClient/source/Resource/Derived/CMoD3m.cpp ZeroOneTSS — the D3m texture-stage
-// tables, with D = diffuse/vertex, T = texture, F = TEXTUREFACTOR (the generator's particle
-// colour). NonZeroTwoTSS is the textured default: stage 0 is MODULATE2X(D,T) for both channels,
-// stage 1 MODULATE2X(CURRENT,F) for rgb and MODULATE4X(CURRENT,F) for alpha — totals 4 and 8.
-// NonZeroOneTSS (renderStateFlags 0x1000) replaces stage 0's alpha with SELECTARG1(D.a), halving
-// the alpha total to 4. The MMB-mesh branch
-// (research/XIClient/src/XIClient/source/Rendering/ZoneRenderer.cpp ZoneRenderer::DoD3mDraw DoD3mDraw) reaches
-// the same per-stage ops, so every template kind goes through `d3m_stage_chain`.
-const D3M_STAGE1_RGB_GAIN: f32 = 2.0;
-const D3M_STAGE1_ALPHA_GAIN: f32 = 4.0;
-// Stage 0's MODULATE2X is already folded into `SpriteTemplate::colors` by the /128 vertex-colour
-// normalise (ffxi_dat::d3m::VERTEX_COLOR_DIVISOR). NonZeroOneTSS's SELECTARG1 does not double, so
-// the ignore-texture-alpha table divides it back out.
-const D3M_VERTEX_BAKED_GAIN: f32 = 2.0;
-// ZoneRenderer.cpp ZoneRenderer::DoD3mDraw, the `Texture == nullptr` branch: stage 0 is
-// MODULATE2X(CURRENT, TFACTOR) for rgb and MODULATE4X(CURRENT, TFACTOR) for alpha with stage 1
-// disabled — totals 2 and 4, half the textured table's. The /128 normalise already supplies
-// one doubling of each, so the CPU gains are the textured ones halved.
-const D3M_UNTEXTURED_RGB_GAIN: f32 = D3M_STAGE1_RGB_GAIN / 2.0;
-const D3M_UNTEXTURED_ALPHA_GAIN: f32 = D3M_STAGE1_ALPHA_GAIN / 2.0;
-// D3D saturates every texture-stage result. Stage 0's texture argument is only available in the
-// sampler, so the CPU keeps only the clamp it can evaluate exactly — stage 0's, which is exact
-// wherever the vertex colour is at or below the /128 midpoint (D * T <= 1 then, so the clamp is
-// a no-op either way). Stage 1's clamp lands in ffxi_particle.wgsl, after the texel multiply:
-// applying it here instead threw away the 4x/8x MODULATE gains before the texel could use them,
-// which is why the home point crystal (D3m alpha 4 * 1.0 * 1.0, saturated in retail at every
-// `kori` texel) drew at bare texture alpha and let the ground show through.
-const D3M_STAGE_CLAMP: f32 = 1.0;
-
-// research/XIClient/src/XIClient/source/World/Generator/Effects/CMoD3mElem.cpp CMoD3mElem::OnDraw — `OnDraw`
-// sends the element through `DoMMBDraw` when its link is an MMB and `CMoD3m::Draw` otherwise. The
-// two paths share the stage tables but not the blend bytes they honour.
+// The fixed-function colour tables live in ffxi_particle.wgsl (per stage, with D3D8 saturation
+// after every op): CMoD3m.cpp's TSS blocks for the D3m path (NonZeroTwoTSS textured default,
+// NonZeroOneTSS when renderStateFlags 0x1000 drops the texture alpha, ZeroOneTSS untextured) and
+// ZoneRenderer.cpp DoD3mDraw's tables for MMB meshes. The path selects which table; nothing is
+// pre-scaled on the CPU — D3m/sheet template colours carry stage 0's MODULATE2X via the /128
+// normalise (ffxi_dat::d3m::VERTEX_COLOR_DIVISOR), MMB colours are raw byte/255, and the factor
+// attribute carries the particle's TEXTUREFACTOR.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum D3mDrawPath {
+pub enum D3mDrawPath {
+    // CMoD3m.cpp NonZeroTwoTSS / NonZeroOneTSS (the ignore flag picks between them).
     D3m,
+    // ZoneRenderer.cpp DoD3mDraw textured tables.
     Mmb,
-    // ZoneRenderer.cpp ZoneRenderer::DoD3mDraw — a submesh whose texture pointer is null
-    // takes the one-stage table instead of the textured two-stage one.
-    MmbUntextured,
+    // Untextured: CMoD3m.cpp ZeroOneTSS for a textureless D3m submesh, DoD3mDraw's one-stage
+    // table for an MMB without its texture — both are MODULATE2X/MODULATE4X against TFACTOR.
+    Untextured,
 }
 
 // CMoD3mElem.cpp CMoD3mElem::DoMMBDraw — DoMMBDraw forces the ignore-texture-alpha table at this blend byte,
@@ -245,7 +269,67 @@ const D3M_TFACTOR_PROMOTE_BLEND_BYTE: u8 = 0x44;
 const D3M_TFACTOR_PROMOTE_MIN: f32 = 0x7F as f32 / u8::MAX as f32;
 const D3M_TFACTOR_PROMOTED: f32 = 1.0;
 
-fn ignores_texture_alpha(def: &ParticleGeneratorDef, path: D3mDrawPath) -> bool {
+// Lamp halo billboards — the soft glow sheets retail authors under ligh/ (SG's lig* quad,
+// Bastok's lt__/gl*/lp* families, the lglt wall wash): additive sprite sheets whose whole
+// brightness is their ToD gate. The class is content-based so every zone's lanterns ride one
+// code path: lift/flicker/range knobs and Enhanced-mode replacement all apply identically.
+const LAMP_HALO_INIT_ALPHA_MAX: f32 = 0.2;
+
+pub(crate) fn is_lamp_halo_def(def: &ParticleGeneratorDef) -> bool {
+    def.mesh_kind == ParticleMeshKind::SpriteSheet
+        && def.blend == ffxi_dat::particle_gen::ParticleBlend::Additive
+        && def.tod_color_driven[TOD_ALPHA_CHANNEL]
+        // Halos author a near-zero alpha (SG lig2 0.071, Bastok lt__ 0.0) and let the ToD gate
+        // do all the work; flame sheets carry their own authored alpha (fi* 0.5) and stay out.
+        && def.init_color[TOD_ALPHA_CHANNEL] <= LAMP_HALO_INIT_ALPHA_MAX
+}
+
+/// Wall-wash volumes — the soft light shafts retail draws around tunnel mouths and lantern
+/// clusters (verified against the real client): additive StaticMesh `ligh` generators. In South
+/// Gustaberg that is the ghu* sheet pair plus the li*/li0x families sharing one "ligh" volume
+// mesh — the generator name isn't on the def, only its drawn mesh, so kind is the discriminator.
+pub(crate) fn is_wall_wash_def(def: &ParticleGeneratorDef) -> bool {
+    matches!(
+        def.mesh_kind,
+        ParticleMeshKind::StaticMesh | ParticleMeshKind::WeightedMesh
+    )
+}
+
+/// The AnimationTest box's lamps kill switch (panel checkbox): while set, the tick hides every
+/// lig* halo billboard (and restores it on uncheck), so the lantern glow sprites draw nothing.
+/// Only the box inserts it; without it (a real session) halos render as authored.
+#[derive(Resource, Default)]
+pub struct LampHalosOff(pub bool);
+
+/// The AnimationTest box's wall-glow kill switch (panel checkbox): while set, the tick hides
+/// every additive ligh wash volume (`is_wall_wash_def`) and restores it on uncheck. Only the box
+/// inserts it; without it (a real session) the washes render as authored.
+#[derive(Resource, Default)]
+pub struct WallWashOff(pub bool);
+
+/// Halo suppression marker (AnimationTest lamps/enhance/wall-glow rows): while present,
+/// `sync_particle_meshes` keeps the mesh hidden whatever the frustum says — tick runs before the
+/// culler, so a direct Visibility write from there would be overwritten every frame. The tick
+/// inserts/removes it per checkbox state, live both ways.
+#[derive(Component)]
+pub struct HaloSuppressed;
+
+// Retail reference peak (user-verified against the real client at 18:00): at 0.12 the halo
+// reads as lantern light on stone without washing out the wall texture; past roughly 0.6 it
+// covers the stone instead of lighting it.
+// pub: the AnimationTest box seeds its lantern-alpha slider from this default.
+pub const LAMP_ALPHAMAP_LIFT_DEFAULT: f32 = 0.12;
+// Brightness and range sliders' neutral defaults (1.0 = exactly as authored) and ceilings; the
+// gain ceiling mirrors `LAMP_GAIN_CEILING` in ffxi_particle.wgsl.
+pub const LAMP_HALOS_GAIN_DEFAULT: f32 = 1.0;
+pub const LAMP_HALOS_GAIN_MAX: f32 = 2.0;
+// Wall-wash slider seed (1.0 = authored alpha) and ceiling.
+pub const WASH_ALPHA_LIFT_DEFAULT: f32 = 0.18;
+pub const WASH_ALPHA_LIFT_MAX: f32 = 2.0;
+pub const LAMP_HALOS_RADIUS_DEFAULT: f32 = 1.0;
+pub const LAMP_HALOS_RADIUS_MAX: f32 = 4.0;
+
+pub(crate) fn ignores_texture_alpha(def: &ParticleGeneratorDef, path: D3mDrawPath) -> bool {
     def.ignore_texture_alpha
         || (path == D3mDrawPath::Mmb
             && def.blend_byte == D3M_MMB_FORCE_IGNORE_TEXTURE_ALPHA_BLEND_BYTE)
@@ -278,31 +362,94 @@ const CELESTIAL_MODULATE: f32 = 2.0;
 // Index of the alpha channel in the 0x60..0x63 time-of-day track array (0x63 -> 0x3F).
 const TOD_ALPHA_CHANNEL: usize = 3;
 
-fn d3m_stage_chain(
-    vertex_rgb: Vec3,
-    vertex_alpha: f32,
-    f_rgb: Vec3,
-    f_alpha: f32,
-    ignore_texture_alpha: bool,
-    path: D3mDrawPath,
-) -> (Vec3, f32) {
-    let clamp = Vec3::splat(D3M_STAGE_CLAMP);
-    let stage0_rgb = vertex_rgb.min(clamp);
-    if path == D3mDrawPath::MmbUntextured {
-        return (
-            stage0_rgb * f_rgb * D3M_UNTEXTURED_RGB_GAIN,
-            vertex_alpha.min(D3M_STAGE_CLAMP) * f_alpha * D3M_UNTEXTURED_ALPHA_GAIN,
-        );
+// The parent particle's state a child generator copies when its own def carries the sec2
+// 0x45..0x49 parent-copy blocks (research/xim ParticleInitializers.kt Parent*Config). World
+// space: `pos` is the anchor particle's, `vel` its total velocity.
+#[derive(Clone, Copy)]
+struct AnchorState {
+    pos: Vec3,
+    vel: Vec3,
+    rotation: Vec3,
+    rgb: Vec3,
+    scale: Vec2,
+}
+
+impl AnchorState {
+    // research/xim Particle.kt getTotalVelocity — the velocityRotation rotates the total
+    // velocity; the anchor captures what this engine integrates.
+    fn from_particle(origin: Vec3, p: &Particle) -> Self {
+        let total = p.vel + p.rel_vel;
+        let vel = if p.vel_rot == Vec3::ZERO {
+            total
+        } else {
+            velocity_rotation(p.vel_rot, p.negate_rotation_y) * total
+        };
+        AnchorState {
+            pos: origin + p.pos,
+            vel,
+            rotation: p.rotation,
+            rgb: p.rgb,
+            scale: p.scale,
+        }
     }
-    let stage0_alpha = if ignore_texture_alpha {
-        vertex_alpha / D3M_VERTEX_BAKED_GAIN
-    } else {
-        vertex_alpha.min(D3M_STAGE_CLAMP)
-    };
-    (
-        stage0_rgb * f_rgb * D3M_STAGE1_RGB_GAIN,
-        stage0_alpha * f_alpha * D3M_STAGE1_ALPHA_GAIN,
-    )
+}
+
+// A child generator resolved at parent spawn time (research/xim ParticleInitializers.kt
+// ChildGeneratorSetup / OnceChildGeneratorSetup): the def plus everything its mesh path needs,
+// so per-particle instantiation never touches the DAT again. `once` marks a sec2 0x3C binding —
+// one burst at init; `on_expiry` marks a sec4 0x01 binding — one burst when the parent particle
+// dies (research/xim ParticleExpirationHandlers.kt EmitChildHandler). `children` are this def's
+// own bindings, resolved recursively.
+// The payload a child binding resolves to at parent spawn time. Draw carries everything the
+// mesh path needs; the non-draw kinds carry their resolved cues so instantiation calls the
+// same arm_* dispatch the routine scheduler uses — a sec2 0x44 binding and a 0x02 stage that
+// name the same def behave identically.
+#[derive(Clone)]
+struct ChildDraw {
+    def: ParticleGeneratorDef,
+    template: SpriteTemplate,
+    sprite_frames: Vec<SpriteTemplate>,
+    mat: Handle<FfxiParticleMaterial>,
+    scale_x: Option<KeyFrameTrack>,
+    scale_y: Option<KeyFrameTrack>,
+    position_x: Option<KeyFrameTrack>,
+    position_y: Option<KeyFrameTrack>,
+    position_z: Option<KeyFrameTrack>,
+    dampening_factor: Option<KeyFrameTrack>,
+    alpha: Option<KeyFrameTrack>,
+    tod_color: [Option<KeyFrameTrack>; ffxi_dat::particle_gen::TOD_COLOR_CHANNELS],
+}
+
+#[derive(Clone)]
+enum ChildPayload {
+    Draw(Box<ChildDraw>),
+    Sound {
+        se_id: u32,
+        near: f32,
+        far: f32,
+        vertical_weight: f32,
+    },
+    Distortion {
+        haze_offset_x: f32,
+        life_frames: f32,
+        envelope: Option<ffxi_dat::particle_gen::KeyFrameTrack>,
+    },
+    Rumble {
+        envelope: ffxi_dat::particle_gen::KeyFrameTrack,
+        near: f32,
+        far: f32,
+        life_frames: f32,
+    },
+}
+
+#[derive(Clone)]
+struct ChildFactory {
+    // The bound generator's name — the trace and diagnostics need it.
+    name: [u8; 4],
+    once: bool,
+    on_expiry: bool,
+    payload: ChildPayload,
+    children: Vec<ChildFactory>,
 }
 
 struct LiveGenerator {
@@ -315,6 +462,16 @@ struct LiveGenerator {
     sprite_frames: Vec<SpriteTemplate>,
     scale_x: Option<KeyFrameTrack>,
     scale_y: Option<KeyFrameTrack>,
+    // sec2 0x21..0x23 position tracks — each frame the bound track replaces the particle's
+    // channel, key 0 seeded from its spawn-time value (research/xim ParticleUpdaters.kt
+    // ProgressValueUpdater initialValueOverride; CYyGenerator.cpp ElemIdle cases 0x0F..0x11).
+    position_x: Option<KeyFrameTrack>,
+    position_y: Option<KeyFrameTrack>,
+    position_z: Option<KeyFrameTrack>,
+    // The sec2 0x69 velocity-dampener track, resolved only while the sec3 0x44 applier is
+    // present — without it nothing samples the track (research/xim ParticleUpdaters.kt
+    // VelocityDampener getDampeningFactor: transform.dampeningFactor ?: dampen).
+    dampening_factor: Option<KeyFrameTrack>,
     alpha: Option<KeyFrameTrack>,
     // The 0x60..0x63 time-of-day RGBA curves, resolved against the DAT's keyframe chunks.
     // Sampled at the Vana'diel day fraction, so unlike `alpha` above they do not advance
@@ -343,8 +500,8 @@ struct LiveGenerator {
     // template UV so a scrolling water sheet/cascade slides its texture.
     tex_translate: Vec2,
     // Per-axis sign applied to init_velocity/accel. Actor-local generators integrate
-    // in the DAT frame (ONE); world-space zone generators build positions directly in
-    // Bevy space, so velocity gets the same mzb->bevy basis (x,-y,-z) as the origin.
+    // in the DAT frame (ONE); world-space generators build positions directly in Bevy
+    // space, so velocity gets the same mzb->bevy basis (x,-y,-z) as the origin.
     vel_basis: Vec3,
     origin_routine: Option<RoutineOrigin>,
     stopped: bool,
@@ -373,6 +530,30 @@ struct LiveGenerator {
     /// The mesh entity's world rotation — the actor root's for actor-local generators, whose
     /// local frame is the actor's FFXI frame; identity otherwise.
     actor_rot: Quat,
+    // The mesh entity's GlobalTransform at the last sync — identity for a world-space generator,
+    // the actor root's for an actor-local one. Draw-distance falloff (sec3 0x2E) measures
+    // camera-to-particle in true world space, so the particle's local-frame position passes
+    // through it before the distance is taken.
+    entity_world: GlobalTransform,
+    // The owning parent of a child generator: index into ParticleSimulator::generators plus the
+    // id of the parent particle. None for top-level generators (research/xim Particle.kt —
+    // children live on their parent particle and die with it).
+    parent: Option<(usize, u64)>,
+    // The anchor particle's state at the last sync; refreshed every frame while `parent` is
+    // Some. None for top-level generators.
+    anchor: Option<AnchorState>,
+    // This def's child bindings, resolved at spawn (research/xim ParticleInitializers.kt
+    // ChildGeneratorSetup / OnceChildGeneratorSetup + sec4 EmitChildHandler).
+    child_factories: Vec<ChildFactory>,
+    // Next unique id for a particle of this generator (child generators reference their parent
+    // particle by it; ids only need to be unique within one generator).
+    next_particle_id: u64,
+    // Child-generator indices whose parent particle was reaped this tick, drained by the tick
+    // system after advance.
+    dead_child_gens: Vec<usize>,
+    // (world position, factory index) pairs queued by reap for sec4 0x01 emit-on-expiry, drained
+    // by the tick system after advance.
+    pending_expiry_spawns: Vec<(Vec3, usize)>,
     // Key of the last BUILT mesh (spawn writes `empty_mesh`, hence `MeshKey::Empty`), so
     // quantization error is bounded by one quantum and never accumulates across skipped frames.
     built_key: MeshKey,
@@ -422,6 +603,10 @@ pub struct ActorAutoRunEffects {
 
 struct Particle {
     pos: Vec3,
+    // The spawn-time offset from the generator origin: the sec2 0x21..0x23 position tracks
+    // seed their opening segment from it (research/xim ParticleUpdaters.kt ProgressValueUpdater
+    // — initialValueOverride is captured once, while null).
+    spawn_pos: Vec3,
     // research/xim Particle.kt updateAssociatedPosition — cameraAttachedBasePosition resolves the offset from the
     // camera only while `age == 0`, so the particle is placed in front of the viewer once and
     // then lives in world space. Carrying the live generator origin instead glues the whole
@@ -456,10 +641,28 @@ struct Particle {
     // getOscillationDirection reads ParticleTransform.relativeVelocity, not the total
     // velocity; Particle.kt getTotalVelocity keeps the two transforms separate).
     rel_vel: Vec3,
+    // Euler radians of the particle transform's velocityRotation: accumulated by the sec3
+    // 0x26 VelocityRotator and replaced wholesale by the sec3 0x2F VelocityRotationUpdater.
+    // Zero while neither block is present, so the integration path stays a plain add.
+    vel_rot: Vec3,
+    // The sec2 0x19 color transform for this element (base plus one 0x1A variance draw per
+    // channel), drifted by the sec3 0x0C modifier and applied to rgb by the sec3 0x0B
+    // applier. None while the generator carries no setup — xim allocates the slot only from
+    // ColorTransformSetup. The a channel is parsed and drifted but not applied: every shipped
+    // transform's alpha is 0, and per-particle alpha has no draw path of its own.
+    color_transform: Option<[i32; 4]>,
+
     // Some while the generator carries the sec2 0x3D marker (research/xim
     // ParticleGeneratorSettings.kt OscillationParams): the per-axis acceleration (0x3E/0x3F/
     // 0x40 base plus one variance draw) and the applier's last-amplitude memory.
     osc: Option<Oscillation>,
+    // Unique within its generator; child generators reference their parent particle by it
+    // (research/xim Particle.kt — children live on the parent particle).
+    id: u64,
+    // Indices into ParticleSimulator::generators of this particle's child generators.
+    child_gens: Vec<usize>,
+    // Child-factory indices awaiting entity spawn, drained by the tick system after emit.
+    pending_child_factories: Vec<usize>,
 }
 
 // research/xim ParticleGeneratorSettings.kt OscillationParams — the per-particle oscillation
@@ -475,6 +678,37 @@ struct Oscillation {
 const MOUNT_FOOTSTEP_JOINTS: std::ops::RangeInclusive<u8> = 52..=53;
 const MOUNT_FOOTSTEP_REFERENCE: usize = 0;
 
+// The mzb->bevy axis mapping (dat_mzb.rs to_bevy) for world-space particle math: FFXI's -Y up
+// becomes Bevy +Y up and Z mirrors, so a DAT velocity/spread authored in the FFXI frame lands
+// where retail puts it.
+const WORLD_PARTICLE_VEL_BASIS: Vec3 = Vec3::new(1.0, -1.0, -1.0);
+
+// research/xim ParticleUpdaters.kt VelocityRotator — "TODO - 0.5 is needed for Ice Spikes to
+// work": the rotateAmount accumulates into the velocity rotation at half the authored rate per
+// frame. No XIClient symbol found; flagged for retail verification.
+const VELOCITY_ROTATOR_RATE_HALF: f32 = 0.5;
+
+// research/xim ParticleUpdaters.kt ColorTransformApplier — the transform's shr-7 value is
+// added to the colour at half rate per frame.
+const COLOR_TRANSFORM_STEP_HALF: f32 = 0.5;
+
+// research/xim ParticleUpdaters.kt ColorTransformModifier — the drift divisor: the modifier
+// accumulates floor(modifier × frames/30) into the transform each frame.
+const COLOR_TRANSFORM_MODIFIER_RATE_FRAMES: f32 = 30.0;
+
+// The particle colour is a D3DCOLOR (byte/255), so xim's raw-byte-space transform delta
+// normalises against the full byte range to land on p.rgb.
+const COLOR_TRANSFORM_BYTE_SCALE: f32 = u8::MAX as f32;
+
+// research/xim Particle.kt getTotalVelocity — the velocityRotation rotates the total velocity
+// before integration, negate_rotation_y flipping the y angle sign (yRotationMultiplier). xim's
+// Matrix4f.rotateZYXInPlace builds the transpose of the standard ZYX Euler product,
+// Rx(−x)·Ry(−y)·Rz(−z), which is glam's intrinsic XYZ euler order at negated angles.
+fn velocity_rotation(vel_rot: Vec3, negate_y: bool) -> Quat {
+    let y = if negate_y { -vel_rot.y } else { vel_rot.y };
+    Quat::from_euler(EulerRot::XYZ, -vel_rot.x, -y, -vel_rot.z)
+}
+
 // research/xim ParticleGeneratorAttachment.kt updateAssociatedPosition jointRefIdx,103,111,125 updateAssociatedPosition — an
 // actor-attached generator emits from the attach actor's position PLUS the position of the joint
 // reference the def names: attachedJoint0 for the source-side attach types, attachedJoint1 for the
@@ -487,12 +721,18 @@ const MOUNT_FOOTSTEP_REFERENCE: usize = 0;
 // model -- and FfxiRenderActor carries no PC-model flag to branch on. Resolving the raw field would
 // place a PC weapon trail on whatever else that reference happens to be filed as, so weapon
 // attachments keep the plain root origin until that flag exists.
+// research/XIClient Attachment.cpp MakeAttachMatrix — every attach type resolves the def's
+// single EID index (AttachmentInfo bits 4-9 + bit 18); the mount footstep indices are remapped
+// to reference 0 before resolution. A target-side attach carrying a plain index resolves it
+// through the nearest-ring selector instead: retail places those effects at the contact point,
+// the victim's ring locator nearest the attacker
+// (.agents/skills/retail-observe/references/2026-09-27-hit-effect-contact-point.md).
 fn attach_joint_reference(def: &ParticleGeneratorDef) -> Option<usize> {
     use ffxi_dat::particle_gen::AttachType;
-    let source = if MOUNT_FOOTSTEP_JOINTS.contains(&def.attach_joint_source) {
+    let reference = if MOUNT_FOOTSTEP_JOINTS.contains(&def.attach_eid) {
         MOUNT_FOOTSTEP_REFERENCE
     } else {
-        def.attach_joint_source as usize
+        def.attach_eid as usize
     };
     match def.attach_type {
         AttachType::SourceActor
@@ -500,10 +740,16 @@ fn attach_joint_reference(def: &ParticleGeneratorDef) -> Option<usize> {
         | AttachType::SourceToTargetBasis
         | AttachType::ZoneActorA
         | AttachType::ZoneActorB
-        | AttachType::ZoneActorC => Some(source),
+        | AttachType::ZoneActorC => Some(reference),
         AttachType::TargetActor
         | AttachType::TargetActorSourceFacing
-        | AttachType::TargetToSourceBasis => Some(def.attach_joint_target as usize),
+        | AttachType::TargetToSourceBasis => {
+            if ffxi_actor::skeleton_instance::NEAREST_JOINT_REFERENCES.contains(&reference) {
+                Some(reference)
+            } else {
+                Some(*ffxi_actor::skeleton_instance::NEAREST_JOINT_REFERENCES.start())
+            }
+        }
         AttachType::SourceActorWeapon | AttachType::None | AttachType::Sun | AttachType::Moon => {
             None
         }
@@ -626,6 +872,78 @@ fn attached_origin(
 /// frame, but Bevy computes the frustum-culling Aabb once from the initially-empty mesh and
 /// does not recompute it, so the entity would be culled permanently. `sync_particle_meshes`
 /// owns the draw gate instead.
+/// Tester-only: generator names whose authored alpha is forced to 1.0 at spawn, so an a=0
+/// additive flash (g141/g144) can be inspected in isolation. Absent/empty in production.
+#[derive(Resource, Default)]
+pub struct TestAlphaOverride(pub std::collections::HashSet<[u8; 4]>);
+
+// The non-drawable generator kinds share one implementation between the routine scheduler and
+// child bindings: a 0x02 stage and a sec2 0x44/0x53/0x6A/0x3C binding that name the same def
+// must behave identically, so neither path carries its own copy of these branches.
+fn rescale_track(
+    t: &ffxi_dat::particle_gen::KeyFrameTrack,
+) -> ffxi_dat::particle_gen::KeyFrameTrack {
+    ffxi_dat::particle_gen::KeyFrameTrack {
+        points: t
+            .points
+            .iter()
+            .map(|&(time, v)| (time, ffxi_dat::particle_gen::ps2_float_rescale(v)))
+            .collect(),
+    }
+}
+
+fn arm_distortion_effect(
+    haze_offset_x: f32,
+    life_frames: f32,
+    envelope: Option<ffxi_dat::particle_gen::KeyFrameTrack>,
+    commands: &mut Commands,
+) {
+    let life_secs = life_frames / 60.0;
+    commands.insert_resource(crate::distortion_pass::ActiveDistortion {
+        haze_offset_x,
+        expires_at: Some(Instant::now() + Duration::from_secs_f32(life_secs)),
+        envelope,
+        started_at: Instant::now(),
+        duration_secs: life_secs,
+        strength: 1.0,
+    });
+}
+
+fn play_generator_sound(
+    se_id: u32,
+    near: f32,
+    far: f32,
+    vertical_weight: f32,
+    origin_pos: Vec3,
+    sfx_writer: &mut MessageWriter<crate::audio::SfxEvent>,
+) {
+    // sec2 0x4C AudioRangeSetup: full inside near, linear to silence at far.
+    sfx_writer.write(crate::audio::SfxEvent::at_ranged(
+        se_id,
+        origin_pos,
+        near,
+        far,
+        vertical_weight,
+    ));
+}
+
+fn arm_rumble_effect(
+    envelope: ffxi_dat::particle_gen::KeyFrameTrack,
+    near: f32,
+    far: f32,
+    life_frames: f32,
+    origin: Vec3,
+    commands: &mut Commands,
+) {
+    // sec2 0x82 + sec3 0x5F: a rumble generator never draws — it drives gamepad vibration
+    // (kuluu-render/src/rumble.rs).
+    commands.spawn((
+        InGameEntity,
+        Transform::from_translation(origin),
+        crate::rumble::RumbleSource::new(envelope, near, far, life_frames),
+    ));
+}
+
 pub fn spawn_particle_generators(
     mut events: MessageReader<SchedulerStageEvent>,
     q_actors: Query<(&Transform, Option<&ActionAssets>)>,
@@ -634,12 +952,17 @@ pub fn spawn_particle_generators(
     q_children: Query<&Children>,
     q_render: Query<&FfxiRenderActor>,
     global: Option<Res<GlobalEffectDir>>,
+    alpha_override: Option<Res<TestAlphaOverride>>,
+    trace: Option<Res<crate::scheduler_runtime::VfxTrace>>,
+    mut trace_writer: MessageWriter<crate::scheduler_runtime::ParticleSpawnTrace>,
+    mut sfx_writer: MessageWriter<crate::audio::SfxEvent>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut mats: ResMut<Assets<FfxiParticleMaterial>>,
     mut images: ResMut<Assets<Image>>,
     mut sim: ResMut<ParticleSimulator>,
     mut commands: Commands,
 ) {
+    let tracing = trace.is_some_and(|t| t.0);
     for ev in events.read() {
         if ev.stage.stage.kind != StageKind::Particle {
             continue;
@@ -659,23 +982,183 @@ pub fn spawn_particle_generators(
             global.as_ref().map(|g| &g.assets),
             |a| a.particle_def(local_dir, &ev.stage.stage.id).is_some(),
         ) else {
+            // A SpawnGenerator whose target links a Sep (not a mesh) is a sound cue, not a
+            // particle: play its sep at the impact point. g14s in hit1/hi14 is the crit SFX —
+            // without this it was silently dropped and only the generic damg SE heard.
+            let sound_pair = [
+                local_assets,
+                actor_assets,
+                global.as_ref().map(|g| &g.assets),
+            ]
+            .into_iter()
+            .flatten()
+            .find_map(|a| a.sound_defs.get(&ev.stage.stage.id).map(|s| (a, s)));
+            let mut played_sound = false;
+            if let Some((sound_assets, sound)) = sound_pair {
+                if let Some(se_id) = sound_assets.seps.get(&sound.sep_id).map(|sep| sep.se_id) {
+                    // sec2 0x4C AudioRangeSetup: full inside near, linear to silence at far. The
+                    // vertical weight follows the generator's attachment (retail sets the
+                    // unattached flag exactly when the attach code is 0).
+                    let vertical_weight =
+                        if sound.attach_type == ffxi_dat::particle_gen::AttachType::None {
+                            crate::audio::UNATTACHED_VERTICAL_WEIGHT
+                        } else {
+                            crate::audio::ATTACHED_VERTICAL_WEIGHT
+                        };
+                    let origin = q_action_target
+                        .get(ev.actor)
+                        .ok()
+                        .and_then(|t| t.0)
+                        .unwrap_or(ev.actor);
+                    match q_xf.get(origin) {
+                        Ok(xf) => {
+                            play_generator_sound(
+                                se_id,
+                                sound.near,
+                                sound.far,
+                                vertical_weight,
+                                xf.translation,
+                                &mut sfx_writer,
+                            );
+                        }
+                        Err(_) => {
+                            sfx_writer.write(crate::audio::SfxEvent::new(se_id));
+                        }
+                    };
+                    played_sound = true;
+                }
+            }
+            if !played_sound {
+                // A SpawnGenerator whose target links a 0x22 Distortion def is a screen-space
+                // haze cue, not a particle: arm the distortion pass for the generator's life.
+                // g142 in hi14 (the crit chain) is retail's motion smear — without this it was
+                // silently dropped with the mesh particles.
+                let dist_pair = [
+                    local_assets,
+                    actor_assets,
+                    global.as_ref().map(|g| &g.assets),
+                ]
+                .into_iter()
+                .flatten()
+                .find_map(|a| a.distortion_defs.get(&ev.stage.stage.id).map(|d| (a, d)));
+                if let Some((dist_assets, dist)) = dist_pair {
+                    // sec2 0x2D strength/alpha envelope: resolve the track against the owning
+                    // tier + global and PS2-rescale its points (authored at half scale).
+                    let envelope = keyframe(
+                        dist_assets,
+                        global.as_ref().map(|g| &g.assets),
+                        dist.envelope_track,
+                    )
+                    .map(|t| rescale_track(&t));
+                    let life_secs = dist.max_life_frames / 60.0;
+                    let envelope_pts = envelope.as_ref().map(|t| t.points.len()).unwrap_or(0);
+                    arm_distortion_effect(
+                        dist.haze_offset_x,
+                        dist.max_life_frames,
+                        envelope.clone(),
+                        &mut commands,
+                    );
+                    if tracing {
+                        info!(
+                            "animationtest trace: particle stage {} [{}] — DISTORTION armed haze_x={:.3} life {:.1}s envelope={} pts",
+                            String::from_utf8_lossy(&ev.stage.stage.id),
+                            String::from_utf8_lossy(&local_dir),
+                            dist.haze_offset_x,
+                            life_secs,
+                            envelope_pts,
+                        );
+                    }
+                } else if tracing {
+                    info!(
+                        "animationtest trace: particle stage {} [{}] unresolved — no tier holds the def",
+                        String::from_utf8_lossy(&ev.stage.stage.id),
+                        String::from_utf8_lossy(&local_dir),
+                    );
+                }
+            }
             continue;
         };
-        let Some((def_dir, def)) = assets
+        let Some((def_dir, mut def)) = assets
             .particle_def_scoped(local_dir, &ev.stage.stage.id)
             .map(|(dir, def)| (dir, *def))
         else {
+            if tracing {
+                info!(
+                    "animationtest trace: particle stage {} [{}] — scoped lookup missed",
+                    String::from_utf8_lossy(&ev.stage.stage.id),
+                    String::from_utf8_lossy(&local_dir),
+                );
+            }
             continue;
         };
-        let Some((template, sprite_frames, tex)) =
-            resolve_mesh(assets, def_dir, &def, &mut images, false)
-        else {
+        // Tester-only alpha override: force an a=0 additive flash to opaque for inspection.
+        if alpha_override
+            .as_ref()
+            .is_some_and(|o| o.0.contains(&ev.stage.stage.id))
+        {
+            def.init_color[3] = 1.0;
+        }
+        // sec2 0x82 + sec3 0x5F: a rumble generator never draws — it drives gamepad
+        // vibration (kuluu-render/src/rumble.rs). Skip the mesh path entirely.
+        if let (Some(track_id), Some([near, far, _])) = (def.rumble_track, def.rumble_falloff) {
+            // A missing track falls back to a full-to-zero ramp over life.
+            let envelope = keyframe(assets, global.as_ref().map(|g| &g.assets), Some(track_id))
+                .map(|t| rescale_track(&t))
+                .unwrap_or_else(|| ffxi_dat::particle_gen::KeyFrameTrack {
+                    points: vec![(0.0, 1.0), (1.0, 0.0)],
+                });
+            let target = q_action_target.get(ev.actor).ok().and_then(|t| t.0);
+            let origin = attached_origin(&def, ev.actor, target, &q_xf, &q_children, &q_render)
+                .unwrap_or(actor_xf.translation + Vec3::Y * def.base_position[1]);
+            arm_rumble_effect(
+                envelope.clone(),
+                near,
+                far,
+                def.max_life_frames,
+                origin,
+                &mut commands,
+            );
+            if tracing {
+                info!(
+                    "animationtest trace: particle stage {} [{}] — RUMBLE armed envelope={} pts near={:.1} far={:.1} life {:.1}s",
+                    String::from_utf8_lossy(&ev.stage.stage.id),
+                    String::from_utf8_lossy(&local_dir),
+                    envelope.points.len(),
+                    near,
+                    far,
+                    def.max_life_frames / 60.0,
+                );
+            }
+            continue;
+        }
+        let Some((template, sprite_frames, tex)) = resolve_mesh(
+            assets,
+            global.as_deref().map(|g| &g.assets),
+            def_dir,
+            &def,
+            &mut images,
+            false,
+        ) else {
+            if tracing {
+                info!(
+                    "animationtest trace: particle stage {} [{}] — def found but mesh {} [{}] missing",
+                    String::from_utf8_lossy(&ev.stage.stage.id),
+                    String::from_utf8_lossy(&local_dir),
+                    String::from_utf8_lossy(&def.mesh_id),
+                    String::from_utf8_lossy(&def_dir),
+                );
+            }
             continue;
         };
         let target = q_action_target.get(ev.actor).ok().and_then(|t| t.0);
         let origin = attached_origin(&def, ev.actor, target, &q_xf, &q_children, &q_render)
             .unwrap_or(actor_xf.translation + Vec3::Y * def.base_position[1]);
-        let mat = mats.add(FfxiParticleMaterial::for_def(&def, tex, NO_DAT_ORDER));
+        let mat = mats.add(FfxiParticleMaterial::for_def(
+            &def,
+            tex,
+            NO_DAT_ORDER,
+            D3mDrawPath::D3m,
+        ));
         let mesh = meshes.add(empty_mesh());
 
         let entity = commands
@@ -691,21 +1174,59 @@ pub fn spawn_particle_generators(
             ))
             .id();
 
-        debug!(
-            "spawned particle generator {} mesh {} life {}",
-            String::from_utf8_lossy(&ev.stage.stage.id),
-            String::from_utf8_lossy(&def.mesh_id),
-            def.max_life_frames
-        );
+        if tracing {
+            let line = format!(
+                "route {} spawned particle generator {} mesh {} frame={} delay={} win={} life {} origin=({:.2},{:.2},{:.2})",
+                String::from_utf8_lossy(&ev.scheduler),
+                String::from_utf8_lossy(&ev.stage.stage.id),
+                String::from_utf8_lossy(&def.mesh_id),
+                ev.stage.frame,
+                ev.stage.stage.delay_frames,
+                ev.stage.stage.duration_frames,
+                def.max_life_frames,
+                origin.x,
+                origin.y,
+                origin.z
+            );
+            info!("animationtest trace: {line}");
+            trace_writer.write(crate::scheduler_runtime::ParticleSpawnTrace(line));
+        } else {
+            debug!(
+                "spawned particle generator {} mesh {} life {}",
+                String::from_utf8_lossy(&ev.stage.stage.id),
+                String::from_utf8_lossy(&def.mesh_id),
+                def.max_life_frames
+            );
+        }
 
         let resolve = |id: Option<[u8; 4]>| -> Option<KeyFrameTrack> {
             id.and_then(|i| assets.keyframes.get(&i).cloned())
         };
+        let child_factories = resolve_child_factories(
+            &def,
+            assets,
+            global.as_ref().map(|g| &g.assets),
+            def_dir,
+            &mut images,
+            &mut mats,
+        );
 
+        // The accumulator is primed to one full period below: research/xim ParticleGenerator.kt
+        // emit starts framesUntilNextParticle at 0, so a generator's first burst lands on its
+        // first tick. A zero-duration stage (hit1's g01x) then emits exactly that one burst —
+        // the flash — and stops; its particles live out their own max_life.
         let emit_window_frames = ev.stage.stage.duration_frames as f32;
         sim.generators.push(LiveGenerator {
             scale_x: resolve(def.scale_x_track),
             scale_y: resolve(def.scale_y_track),
+            position_x: resolve(def.position_x_track),
+            position_y: resolve(def.position_y_track),
+            position_z: resolve(def.position_z_track),
+            dampening_factor: if def.dampening_factor_applier {
+                resolve(def.velocity_dampener_track)
+            } else {
+                None
+            },
             alpha: resolve(def.alpha_track),
             tod_color: resolve_tod_tracks(&def, assets),
             solid_mesh: is_solid_mesh(&template),
@@ -716,7 +1237,7 @@ pub fn spawn_particle_generators(
             def,
             origin,
             particles: Vec::new(),
-            emit_accum: 0.0,
+            emit_accum: def.frames_per_emission,
             age_frames: 0.0,
             emit_window_frames,
             mesh,
@@ -725,7 +1246,10 @@ pub fn spawn_particle_generators(
             orientation: None,
             actor_local: false,
             tex_translate: Vec2::ZERO,
-            vel_basis: Vec3::ONE,
+            // World-space origin, so DAT velocities integrate through the mzb->bevy basis:
+            // retail steps elements in FFXI space (CYyGenerator.cpp ElemIdle case 0x02) and
+            // the attach matrix carries them to world at draw time.
+            vel_basis: WORLD_PARTICLE_VEL_BASIS,
             origin_routine: Some(RoutineOrigin {
                 owner: ev.actor,
                 gen_id: ev.stage.stage.id,
@@ -739,6 +1263,13 @@ pub fn spawn_particle_generators(
             elements_emitted: 0,
             cam_view: Quat::IDENTITY,
             actor_rot: Quat::IDENTITY,
+            entity_world: GlobalTransform::IDENTITY,
+            parent: None,
+            anchor: None,
+            child_factories,
+            next_particle_id: 0,
+            dead_child_gens: Vec::new(),
+            pending_expiry_spawns: Vec::new(),
             built_key: MeshKey::Empty,
         });
     }
@@ -751,6 +1282,7 @@ pub fn spawn_particle_generators(
 // and despawns with the actor.
 pub fn spawn_actor_auto_run_particles(
     q_added: Query<(Entity, &ActorAutoRunEffects), Added<ActorAutoRunEffects>>,
+    global: Option<Res<GlobalEffectDir>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut mats: ResMut<Assets<FfxiParticleMaterial>>,
     mut images: ResMut<Assets<Image>>,
@@ -769,12 +1301,22 @@ pub fn spawn_actor_auto_run_particles(
                 .get(name)
                 .copied()
                 .unwrap_or(NO_LOCAL_DIR);
-            let Some((template, sprite_frames, tex)) =
-                resolve_mesh(&fx.assets, def_dir, &def, &mut images, false)
-            else {
+            let Some((template, sprite_frames, tex)) = resolve_mesh(
+                &fx.assets,
+                global.as_deref().map(|g| &g.assets),
+                def_dir,
+                &def,
+                &mut images,
+                false,
+            ) else {
                 continue;
             };
-            let mat = mats.add(FfxiParticleMaterial::for_def(&def, tex, NO_DAT_ORDER));
+            let mat = mats.add(FfxiParticleMaterial::for_def(
+                &def,
+                tex,
+                NO_DAT_ORDER,
+                D3mDrawPath::D3m,
+            ));
             let mesh = meshes.add(empty_mesh());
 
             let entity = commands
@@ -800,9 +1342,25 @@ pub fn spawn_actor_auto_run_particles(
             let resolve = |id: Option<[u8; 4]>| -> Option<KeyFrameTrack> {
                 id.and_then(|i| fx.assets.keyframes.get(&i).cloned())
             };
+            let child_factories = resolve_child_factories(
+                &def,
+                &fx.assets,
+                global.as_ref().map(|g| &g.assets),
+                def_dir,
+                &mut images,
+                &mut mats,
+            );
             sim.generators.push(LiveGenerator {
                 scale_x: resolve(def.scale_x_track),
                 scale_y: resolve(def.scale_y_track),
+                position_x: resolve(def.position_x_track),
+                position_y: resolve(def.position_y_track),
+                position_z: resolve(def.position_z_track),
+                dampening_factor: if def.dampening_factor_applier {
+                    resolve(def.velocity_dampener_track)
+                } else {
+                    None
+                },
                 alpha: resolve(def.alpha_track),
                 tod_color: resolve_tod_tracks(&def, &fx.assets),
                 solid_mesh: is_solid_mesh(&template),
@@ -812,7 +1370,7 @@ pub fn spawn_actor_auto_run_particles(
                 sprite_frames,
                 origin: Vec3::from_array(def.base_position),
                 particles: Vec::new(),
-                emit_accum: 0.0,
+                emit_accum: def.frames_per_emission,
                 age_frames: 0.0,
                 emit_window_frames: 0.0,
                 mesh,
@@ -831,6 +1389,13 @@ pub fn spawn_actor_auto_run_particles(
                 elements_emitted: 0,
                 cam_view: Quat::IDENTITY,
                 actor_rot: Quat::IDENTITY,
+                entity_world: GlobalTransform::IDENTITY,
+                parent: None,
+                anchor: None,
+                child_factories,
+                next_particle_id: 0,
+                dead_child_gens: Vec::new(),
+                pending_expiry_spawns: Vec::new(),
                 built_key: MeshKey::Empty,
                 def,
             });
@@ -863,7 +1428,12 @@ pub fn spawn_zone_particle_generator(
     let (template, sprite_frames, tex, draw_path) =
         resolve_zone_mesh(assets, &def, images, undither)
             .or_else(|| global.and_then(|g| resolve_zone_mesh(g, &def, images, undither)))?;
-    let mat = mats.add(FfxiParticleMaterial::for_def(&def, tex, opts.dat_offset));
+    let mat = mats.add(FfxiParticleMaterial::for_def(
+        &def,
+        tex,
+        opts.dat_offset,
+        draw_path,
+    ));
     let mesh = meshes.add(empty_mesh());
 
     let entity = commands
@@ -880,9 +1450,18 @@ pub fn spawn_zone_particle_generator(
         .id();
 
     let resolve = |id: Option<[u8; 4]>| keyframe(assets, global, id);
+    let child_factories = resolve_child_factories(&def, assets, global, NO_LOCAL_DIR, images, mats);
     sim.generators.push(LiveGenerator {
         scale_x: resolve(def.scale_x_track),
         scale_y: resolve(def.scale_y_track),
+        position_x: resolve(def.position_x_track),
+        position_y: resolve(def.position_y_track),
+        position_z: resolve(def.position_z_track),
+        dampening_factor: if def.dampening_factor_applier {
+            resolve(def.velocity_dampener_track)
+        } else {
+            None
+        },
         alpha: resolve(def.alpha_track),
         tod_color: def.tod_color_tracks.map(|id| keyframe(assets, global, id)),
         solid_mesh: is_solid_mesh(&template),
@@ -892,7 +1471,7 @@ pub fn spawn_zone_particle_generator(
         sprite_frames,
         origin,
         particles: Vec::new(),
-        emit_accum: 0.0,
+        emit_accum: def.frames_per_emission,
         age_frames: 0.0,
         emit_window_frames: 0.0,
         mesh,
@@ -901,7 +1480,7 @@ pub fn spawn_zone_particle_generator(
         orientation: particle_orientation(&def),
         actor_local: false,
         tex_translate: Vec2::ZERO,
-        vel_basis: Vec3::new(1.0, -1.0, -1.0),
+        vel_basis: WORLD_PARTICLE_VEL_BASIS,
         origin_routine: None,
         stopped: false,
         camera_relative: opts.camera_relative,
@@ -911,6 +1490,13 @@ pub fn spawn_zone_particle_generator(
         elements_emitted: 0,
         cam_view: Quat::IDENTITY,
         actor_rot: Quat::IDENTITY,
+        entity_world: GlobalTransform::IDENTITY,
+        parent: None,
+        anchor: None,
+        child_factories,
+        next_particle_id: 0,
+        dead_child_gens: Vec::new(),
+        pending_expiry_spawns: Vec::new(),
         built_key: MeshKey::Empty,
         def,
     });
@@ -1014,11 +1600,611 @@ pub fn track_attached_origins(
     }
 }
 
-pub fn tick_particle_simulator(time: Res<Time>, mut sim: ResMut<ParticleSimulator>) {
+pub fn tick_particle_simulator(
+    time: Res<Time>,
+    mut sim: ResMut<ParticleSimulator>,
+    mut suppressed: Local<std::collections::BTreeSet<Entity>>,
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    trace: Option<Res<crate::scheduler_runtime::VfxTrace>>,
+    lamp_halos: Option<Res<LampHalosOff>>,
+    wall_washes: Option<Res<WallWashOff>>,
+    mut trace_writer: MessageWriter<crate::scheduler_runtime::ParticleSpawnTrace>,
+    mut sfx_writer: MessageWriter<crate::audio::SfxEvent>,
+) {
+    // Box kill switches, applied as a per-entity marker diff (live both ways): glow billboards
+    // hide while the box's lamps row is set; wash volumes hide when their box row is unchecked.
+    // Zone-static generators only re-dispatch on a zone load, so despawning would never bring
+    // them back; the marker is non-destructive. The diff keeps steady-state command traffic at
+    // zero, and an entry whose generator died with a zone change is dropped without a command
+    // (the entity — and its marker — is already gone), which is what floods the log otherwise.
+    let halos_hidden = lamp_halos.is_some_and(|o| o.0);
+    // Wash volumes draw as authored while the row is checked; unchecked hides them (a real
+    // session has no WallWashOff and renders as authored).
+    let washes_hidden = wall_washes.is_some_and(|o| o.0);
+    let live: std::collections::BTreeSet<Entity> =
+        sim.generators.iter().map(|g| g.entity).collect();
+    let desired: std::collections::BTreeSet<Entity> = sim
+        .generators
+        .iter()
+        .filter(|g| {
+            if is_lamp_halo_def(&g.def) {
+                halos_hidden
+            } else {
+                washes_hidden && is_wall_wash_def(&g.def)
+            }
+        })
+        .map(|g| g.entity)
+        .collect();
+    let prev = &*suppressed;
+    for &e in desired.difference(prev) {
+        commands.entity(e).insert(HaloSuppressed);
+    }
+    for &e in prev.difference(&desired) {
+        if live.contains(&e) {
+            commands.entity(e).remove::<HaloSuppressed>();
+        }
+    }
+    *suppressed = desired;
+    // Advance the shared flicker wave before any draw factor samples it this frame.
+    sim.clock.lamp_flicker_phase += time.delta_secs();
     let frames = time.delta_secs() * ROUTINE_FPS;
+    // research/xim Particle.kt update — children read the parent's state before anything ages.
+    let orphans = anchor_children(&mut sim);
     for g in &mut sim.generators {
         advance_generator(g, frames);
     }
+    remove_dead_generators(&mut sim, &mut commands, orphans);
+    instantiate_child_generators(
+        &mut sim,
+        &mut commands,
+        &mut meshes,
+        trace.is_some_and(|t| t.0),
+        &mut trace_writer,
+        &mut sfx_writer,
+    );
+}
+
+// research/xim Particle.kt update — a child generator's origin is its parent particle's current
+// world position; the anchor state also carries what the sec2 0x45..0x49 copies read. A child
+// whose parent particle is gone is orphaned (research/xim removes children with their parent).
+fn anchor_children(sim: &mut ParticleSimulator) -> std::collections::BTreeSet<usize> {
+    let mut anchors = Vec::with_capacity(sim.generators.len());
+    let mut orphans = std::collections::BTreeSet::new();
+    for (gi, g) in sim.generators.iter().enumerate() {
+        if let Some((pgi, pid)) = g.parent {
+            match sim
+                .generators
+                .get(pgi)
+                .and_then(|pg| pg.particles.iter().find(|p| p.id == pid))
+            {
+                Some(p) => anchors.push(Some(AnchorState::from_particle(
+                    sim.generators[pgi].origin,
+                    p,
+                ))),
+                None => {
+                    anchors.push(None);
+                    orphans.insert(gi);
+                }
+            }
+        } else {
+            anchors.push(None);
+        }
+    }
+    // research/xim ParticleUpdaters.kt ChildGeneratorUpdater — the child emits from the parent
+    // particle's current position every frame, so the origin follows it.
+    for (g, a) in sim.generators.iter_mut().zip(anchors) {
+        if let Some(a) = a {
+            g.origin = a.pos;
+            g.anchor = Some(a);
+        }
+    }
+    orphans
+}
+
+// research/xim Particle.kt update — children are removed with their parent particle, so the
+// removal cascades through every nesting level; surviving references remap across compaction.
+fn remove_dead_generators(
+    sim: &mut ParticleSimulator,
+    commands: &mut Commands,
+    mut set: std::collections::BTreeSet<usize>,
+) {
+    for g in &mut sim.generators {
+        set.extend(std::mem::take(&mut g.dead_child_gens));
+    }
+    loop {
+        let mut added = Vec::new();
+        for &gi in set.iter() {
+            if let Some(g) = sim.generators.get(gi) {
+                for p in &g.particles {
+                    for &ci in &p.child_gens {
+                        if !set.contains(&ci) {
+                            added.push(ci);
+                        }
+                    }
+                }
+            }
+        }
+        if added.is_empty() {
+            break;
+        }
+        set.extend(added);
+    }
+    let old_len = sim.generators.len();
+    for (i, g) in sim.generators.iter().enumerate() {
+        if set.contains(&i) {
+            commands.entity(g.entity).despawn();
+        }
+    }
+    let mut remap: Vec<Option<usize>> = vec![None; old_len];
+    {
+        let mut ni = 0usize;
+        for (oi, _) in (0..old_len).enumerate() {
+            if !set.contains(&oi) {
+                remap[oi] = Some(ni);
+                ni += 1;
+            }
+        }
+    }
+    let mut idx = 0usize;
+    sim.generators.retain(|_| {
+        let keep = !set.contains(&idx);
+        idx += 1;
+        keep
+    });
+    for g in &mut sim.generators {
+        if let Some((pgi, pid)) = g.parent {
+            if let Some(n) = remap.get(pgi).copied().flatten() {
+                g.parent = Some((n, pid));
+            }
+        }
+        for p in &mut g.particles {
+            p.child_gens
+                .retain(|ci| remap.get(*ci).copied().flatten().is_some());
+            for ci in &mut p.child_gens {
+                *ci = remap[*ci].unwrap();
+            }
+        }
+    }
+}
+
+// research/xim ParticleInitializers.kt ChildGeneratorSetup / OnceChildGeneratorSetup + sec4
+// EmitChildHandler — each parent particle gets its own child generator instance; a child is an
+// ordinary LiveGenerator anchored to the parent, so nothing new in the draw path.
+fn instantiate_child_generators(
+    sim: &mut ParticleSimulator,
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    tracing: bool,
+    trace_writer: &mut MessageWriter<crate::scheduler_runtime::ParticleSpawnTrace>,
+    sfx_writer: &mut MessageWriter<crate::audio::SfxEvent>,
+) {
+    struct SpawnReq {
+        // The generator that holds child_factories[factory_idx].
+        factory_owner: usize,
+        // (generator index, particle id) the child is anchored to; None for an independent
+        // sec4 expiry spawn.
+        owner: Option<(usize, u64)>,
+        pos: Vec3,
+        anchor: Option<AnchorState>,
+        factory_idx: usize,
+        window: f32,
+    }
+    let mut reqs: Vec<SpawnReq> = Vec::new();
+    for (gi, g) in sim.generators.iter().enumerate() {
+        for &(pos, fidx) in &g.pending_expiry_spawns {
+            if g.child_factories.get(fidx).is_some_and(|f| f.on_expiry) {
+                reqs.push(SpawnReq {
+                    factory_owner: gi,
+                    owner: None,
+                    pos,
+                    anchor: None,
+                    factory_idx: fidx,
+                    // research/xim ParticleExpirationHandlers.kt EmitChildHandler — one burst at
+                    // expiry, never again (nothing re-emits the child afterwards).
+                    window: 0.0,
+                });
+            }
+        }
+        for p in &g.particles {
+            if p.pending_child_factories.is_empty() {
+                continue;
+            }
+            let anchor = AnchorState::from_particle(g.origin, p);
+            // research/xim ParticleInitializers.kt ChildGeneratorSetup — the child's max emit
+            // time is the parent particle's life (infinite for a continuous-singleton parent).
+            let window = if g.def.continuous {
+                f32::INFINITY
+            } else {
+                p.life_frames
+            };
+            for &fidx in &p.pending_child_factories {
+                if g.child_factories.get(fidx).is_some_and(|f| !f.on_expiry) {
+                    reqs.push(SpawnReq {
+                        factory_owner: gi,
+                        owner: Some((gi, p.id)),
+                        pos: g.origin + p.pos,
+                        anchor: Some(anchor),
+                        factory_idx: fidx,
+                        // research/xim ParticleInitializers.kt OnceChildGeneratorSetup — one
+                        // burst at init.
+                        window: if g.child_factories[fidx].once {
+                            0.0
+                        } else {
+                            window
+                        },
+                    });
+                }
+            }
+        }
+    }
+    for g in &mut sim.generators {
+        g.pending_expiry_spawns.clear();
+        for p in &mut g.particles {
+            p.pending_child_factories.clear();
+        }
+    }
+    for r in reqs {
+        let Some(f) = sim
+            .generators
+            .get(r.factory_owner)
+            .and_then(|g| g.child_factories.get(r.factory_idx))
+        else {
+            continue;
+        };
+        // Clone the factory's payload out before pushing: the push shifts every index.
+        let children = f.children.clone();
+        match &f.payload {
+            ChildPayload::Sound {
+                se_id,
+                near,
+                far,
+                vertical_weight,
+            } => {
+                if tracing {
+                    let line = format!(
+                        "child {} — SOUND se_id={} near={:.1} far={:.1}",
+                        String::from_utf8_lossy(&f.name),
+                        *se_id,
+                        *near,
+                        *far
+                    );
+                    info!("animationtest trace: {line}");
+                    trace_writer.write(crate::scheduler_runtime::ParticleSpawnTrace(line));
+                }
+                play_generator_sound(*se_id, *near, *far, *vertical_weight, r.pos, sfx_writer);
+            }
+            ChildPayload::Distortion {
+                haze_offset_x,
+                life_frames,
+                envelope,
+            } => {
+                if tracing {
+                    let line = format!(
+                        "child {} — DISTORTION armed haze_x={:.3} life {:.1}s",
+                        String::from_utf8_lossy(&f.name),
+                        *haze_offset_x,
+                        *life_frames / ROUTINE_FPS
+                    );
+                    info!("animationtest trace: {line}");
+                    trace_writer.write(crate::scheduler_runtime::ParticleSpawnTrace(line));
+                }
+                arm_distortion_effect(*haze_offset_x, *life_frames, envelope.clone(), commands);
+            }
+            ChildPayload::Rumble {
+                envelope,
+                near,
+                far,
+                life_frames,
+            } => {
+                if tracing {
+                    let line = format!(
+                        "child {} — RUMBLE armed near={:.1} far={:.1} life {:.1}s",
+                        String::from_utf8_lossy(&f.name),
+                        *near,
+                        *far,
+                        *life_frames / ROUTINE_FPS
+                    );
+                    info!("animationtest trace: {line}");
+                    trace_writer.write(crate::scheduler_runtime::ParticleSpawnTrace(line));
+                }
+                arm_rumble_effect(envelope.clone(), *near, *far, *life_frames, r.pos, commands);
+            }
+            ChildPayload::Draw(d) => {
+                let (def, template, sprite_frames, mat) = (
+                    d.def,
+                    d.template.clone(),
+                    d.sprite_frames.clone(),
+                    d.mat.clone(),
+                );
+                let (
+                    scale_x,
+                    scale_y,
+                    position_x,
+                    position_y,
+                    position_z,
+                    dampening_factor,
+                    alpha,
+                    tod_color,
+                ) = (
+                    d.scale_x.clone(),
+                    d.scale_y.clone(),
+                    d.position_x.clone(),
+                    d.position_y.clone(),
+                    d.position_z.clone(),
+                    d.dampening_factor.clone(),
+                    d.alpha.clone(),
+                    d.tod_color.clone(),
+                );
+                let mesh = meshes.add(empty_mesh());
+                let entity = commands
+                    .spawn((
+                        InGameEntity,
+                        Mesh3d(mesh.clone()),
+                        MeshMaterial3d(mat),
+                        Transform::IDENTITY,
+                        Visibility::default(),
+                        bevy::camera::visibility::NoFrustumCulling,
+                        bevy::light::NotShadowCaster,
+                        bevy::light::NotShadowReceiver,
+                    ))
+                    .id();
+                let new_idx = sim.generators.len();
+                sim.generators.push(LiveGenerator {
+                    def,
+                    solid_mesh: is_solid_mesh(&template),
+                    bound_radius: template_bound_radius(&template, &sprite_frames),
+                    template,
+                    draw_path: D3mDrawPath::D3m,
+                    sprite_frames,
+                    scale_x,
+                    scale_y,
+                    position_x,
+                    position_y,
+                    position_z,
+                    dampening_factor,
+                    alpha,
+                    tod_color,
+                    origin: r.pos,
+                    particles: Vec::new(),
+                    emit_accum: def.frames_per_emission,
+                    age_frames: 0.0,
+                    emit_window_frames: r.window,
+                    mesh,
+                    entity,
+                    auto_run: false,
+                    orientation: None,
+                    actor_local: false,
+                    tex_translate: Vec2::ZERO,
+                    vel_basis: WORLD_PARTICLE_VEL_BASIS,
+                    origin_routine: None,
+                    stopped: false,
+                    camera_relative: false,
+                    emit_culled: false,
+                    emit_scale: UNSCALED_EMISSION,
+                    emit_rng: emit_seed(entity),
+                    elements_emitted: 0,
+                    cam_view: Quat::IDENTITY,
+                    actor_rot: Quat::IDENTITY,
+                    entity_world: GlobalTransform::IDENTITY,
+                    parent: r.owner,
+                    anchor: r.anchor,
+                    child_factories: children,
+                    next_particle_id: 0,
+                    dead_child_gens: Vec::new(),
+                    pending_expiry_spawns: Vec::new(),
+                    built_key: MeshKey::Empty,
+                });
+                if let Some((ogi, pid)) = r.owner {
+                    if let Some(p) = sim
+                        .generators
+                        .get_mut(ogi)
+                        .and_then(|g| g.particles.iter_mut().find(|p| p.id == pid))
+                    {
+                        p.child_gens.push(new_idx);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// research/xim ParticleInitializers.kt ChildGeneratorSetup — localDir.getNullableChildRecursivelyAs,
+// then root().getNullableChildRecursivelyAs. DAT directories are flat 4-char names, so the
+// recursion degenerates to a scoped lookup (own dir first, then any dir of the same tier).
+// OnceChildGeneratorSetup resolves its direct child against the parent's tier and falls through
+// to the global effect dir.
+fn resolve_child_factories(
+    def: &ParticleGeneratorDef,
+    assets: &ActionAssets,
+    global: Option<&ActionAssets>,
+    def_dir: [u8; 4],
+    images: &mut Assets<Image>,
+    mats: &mut Assets<FfxiParticleMaterial>,
+) -> Vec<ChildFactory> {
+    let mut visited = std::collections::HashSet::new();
+    resolve_child_bindings(def, assets, global, def_dir, images, mats, &mut visited)
+}
+
+fn resolve_child_bindings(
+    def: &ParticleGeneratorDef,
+    assets: &ActionAssets,
+    global: Option<&ActionAssets>,
+    def_dir: [u8; 4],
+    images: &mut Assets<Image>,
+    mats: &mut Assets<FfxiParticleMaterial>,
+    visited: &mut std::collections::HashSet<([u8; 4], [u8; 4])>,
+) -> Vec<ChildFactory> {
+    // (id, once, on_expiry): the sec2 per-particle bindings in authored order, then the sec4
+    // expiry binding.
+    let mut out = Vec::new();
+    for (id_opt, once, on_expiry) in [
+        (def.child_generator, false, false),
+        (def.child_generator_2, false, false),
+        (def.child_generator_3, false, false),
+        (def.once_child_generator, true, false),
+        (def.emit_child_id, false, true),
+    ] {
+        let Some(id) = id_opt else { continue };
+        // research/xim ParticleInitializers.kt — the 0x44 family stays in the parent's tier;
+        // 0x3C falls through to the global effect dir.
+        let resolved = if on_expiry || !once {
+            assets
+                .particle_def_scoped(def_dir, &id)
+                .map(|(dir, d)| (assets, dir, d))
+        } else {
+            assets
+                .particle_defs_by_dir
+                .get(&(def_dir, id))
+                .map(|d| (assets, def_dir, d))
+                .or_else(|| {
+                    global.and_then(|g| {
+                        g.particle_def_scoped(def_dir, &id)
+                            .map(|(dir, d)| (g, dir, d))
+                    })
+                })
+        };
+        let Some((tier, child_dir, child_def)) = resolved else {
+            // Not a particle def: the same id may name a sound or distortion generator — those
+            // kinds spawn through the shared dispatch too (ai90 in the zone DATs is a 0x22
+            // distortion bound by i900's sec2 0x44).
+            if let Some(sound) = assets
+                .sound_defs
+                .get(&id)
+                .or_else(|| global.and_then(|g| g.sound_defs.get(&id)))
+            {
+                let se_id = assets.seps.get(&sound.sep_id).map(|s| s.se_id).or_else(|| {
+                    global
+                        .and_then(|g| g.seps.get(&sound.sep_id))
+                        .map(|s| s.se_id)
+                });
+                if let Some(se_id) = se_id {
+                    out.push(ChildFactory {
+                        name: id,
+                        once,
+                        on_expiry,
+                        payload: ChildPayload::Sound {
+                            se_id,
+                            near: sound.near,
+                            far: sound.far,
+                            vertical_weight: if sound.attach_type
+                                == ffxi_dat::particle_gen::AttachType::None
+                            {
+                                crate::audio::UNATTACHED_VERTICAL_WEIGHT
+                            } else {
+                                crate::audio::ATTACHED_VERTICAL_WEIGHT
+                            },
+                        },
+                        children: Vec::new(),
+                    });
+                }
+            } else if let Some(dist) = assets
+                .distortion_defs
+                .get(&id)
+                .or_else(|| global.and_then(|g| g.distortion_defs.get(&id)))
+            {
+                out.push(ChildFactory {
+                    name: id,
+                    once,
+                    on_expiry,
+                    payload: ChildPayload::Distortion {
+                        haze_offset_x: dist.haze_offset_x,
+                        life_frames: dist.max_life_frames,
+                        envelope: keyframe(assets, global, dist.envelope_track)
+                            .map(|t| rescale_track(&t)),
+                    },
+                    children: Vec::new(),
+                });
+            } else {
+                error!(
+                    "child generator '{}' of gen '{}' [{}] unresolved — no tier holds a particle, sound or distortion def; parent keeps running",
+                    String::from_utf8_lossy(&id),
+                    String::from_utf8_lossy(&def.mesh_id),
+                    String::from_utf8_lossy(&def_dir),
+                );
+            }
+            continue;
+        };
+        // A cycle in the binding chain would recurse forever; retail data has none.
+        if !visited.insert((child_dir, id)) {
+            error!(
+                "child generator '{}' of gen '{}' [{}] forms a binding cycle — chain dropped",
+                String::from_utf8_lossy(&id),
+                String::from_utf8_lossy(&def.mesh_id),
+                String::from_utf8_lossy(&def_dir),
+            );
+            continue;
+        }
+        // sec2 0x82 + sec3 0x5F: a rumble child never draws — same dispatch as the routine path.
+        if let (Some(track_id), Some([near, far, _])) =
+            (child_def.rumble_track, child_def.rumble_falloff)
+        {
+            out.push(ChildFactory {
+                name: id,
+                once,
+                on_expiry,
+                payload: ChildPayload::Rumble {
+                    envelope: keyframe(tier, global, Some(track_id))
+                        .map(|t| rescale_track(&t))
+                        .unwrap_or_else(|| ffxi_dat::particle_gen::KeyFrameTrack {
+                            points: vec![(0.0, 1.0), (1.0, 0.0)],
+                        }),
+                    near,
+                    far,
+                    life_frames: child_def.max_life_frames,
+                },
+                children: Vec::new(),
+            });
+            continue;
+        }
+        let Some((template, sprite_frames, tex)) =
+            resolve_mesh(tier, global, child_dir, child_def, images, false)
+        else {
+            error!(
+                "child generator '{}' of gen '{}' [{}] has no drawable mesh — binding dropped",
+                String::from_utf8_lossy(&id),
+                String::from_utf8_lossy(&def.mesh_id),
+                String::from_utf8_lossy(&def_dir),
+            );
+            continue;
+        };
+        let mat = mats.add(FfxiParticleMaterial::for_def(
+            child_def,
+            tex,
+            NO_DAT_ORDER,
+            D3mDrawPath::D3m,
+        ));
+        let resolve = |id: Option<[u8; 4]>| -> Option<KeyFrameTrack> {
+            id.and_then(|i| tier.keyframes.get(&i).cloned())
+        };
+        out.push(ChildFactory {
+            name: id,
+            children: resolve_child_bindings(
+                child_def, tier, global, child_dir, images, mats, visited,
+            ),
+            once,
+            on_expiry,
+            payload: ChildPayload::Draw(Box::new(ChildDraw {
+                def: *child_def,
+                template,
+                sprite_frames,
+                mat,
+                scale_x: resolve(child_def.scale_x_track),
+                scale_y: resolve(child_def.scale_y_track),
+                position_x: resolve(child_def.position_x_track),
+                position_y: resolve(child_def.position_y_track),
+                position_z: resolve(child_def.position_z_track),
+                dampening_factor: if child_def.dampening_factor_applier {
+                    resolve(child_def.velocity_dampener_track)
+                } else {
+                    None
+                },
+                alpha: resolve(child_def.alpha_track),
+                tod_color: resolve_tod_tracks(child_def, tier),
+            })),
+        });
+    }
+    out
 }
 
 fn advance_generator(g: &mut LiveGenerator, frames: f32) {
@@ -1037,9 +2223,7 @@ fn advance_generator(g: &mut LiveGenerator, frames: f32) {
 
     // research/xim: a maxLifeSpan of 0 marks a singleton — emit one particle once.
     let singleton = g.def.is_singleton();
-    let emitting = !g.stopped
-        && !g.emit_culled
-        && (g.auto_run || g.age_frames <= g.emit_window_frames.max(1.0));
+    let emitting = !g.stopped && !g.emit_culled && !emit_done(g);
     if singleton {
         // `age_frames <= frames` already pins this to the first tick, so the emit window must not
         // gate it: a long frame (the blocking action-DAT read precedes these) makes age_frames
@@ -1101,8 +2285,48 @@ fn advance_generator(g: &mut LiveGenerator, frames: f32) {
         if let Some(a) = accel {
             p.vel += a;
         }
+        // sec3 0x26 VelocityRotator: rotateAmount × (0.5 × dt) into the velocity rotation; an
+        // actor-attached generator authors it in actor space, where z is forward — xim swaps
+        // the axes to (-z, y, x) for those (research/xim ParticleUpdaters.kt VelocityRotator,
+        // flagged for retail verification).
+        if let Some(amount) = g.def.velocity_rotator {
+            let hacked = if g.actor_local {
+                Vec3::new(-amount[2], amount[1], amount[0])
+            } else {
+                Vec3::from_array(amount)
+            };
+            p.vel_rot += hacked * (VELOCITY_ROTATOR_RATE_HALF * frames);
+        }
+        // sec3 0x2F VelocityRotationUpdater: collapse all velocity into +x and copy the
+        // particle rotation into the velocity rotation (research/xim ParticleUpdaters.kt
+        // VelocityRotationUpdater).
+        if g.def.velocity_rotation_updater {
+            let magnitude = p.vel.length() + p.rel_vel.length();
+            p.vel = Vec3::new(magnitude, 0.0, 0.0);
+            p.rel_vel = Vec3::ZERO;
+            p.vel_rot = p.rotation;
+        }
+        // sec3 0x2C VelocityDampener: velocity ×= factor^dt, the per-frame-sampled sec2 0x69
+        // track overriding the authored base (research/xim ParticleUpdaters.kt
+        // VelocityDampener getDampeningFactor).
+        if let Some([dampen, _]) = g.def.velocity_dampener {
+            let progress = (p.age_frames / p.life_frames).clamp(0.0, 1.0);
+            let factor = g
+                .dampening_factor
+                .as_ref()
+                .map(|t| t.sample(progress))
+                .unwrap_or(dampen);
+            let f = factor.powf(frames);
+            p.vel *= f;
+            p.rel_vel *= f;
+        }
         if position_updater {
-            p.pos += p.vel * frames;
+            let step = if p.vel_rot == Vec3::ZERO {
+                p.vel
+            } else {
+                velocity_rotation(p.vel_rot, p.negate_rotation_y) * p.vel
+            };
+            p.pos += step * frames;
         }
         // sec3 0x29/0x2A/0x2B OscillationApplier (X/Y/Z): after the base position step, add
         // the amplitude change over the tick per active axis (research/xim
@@ -1132,6 +2356,29 @@ fn advance_generator(g: &mut LiveGenerator, frames: f32) {
                 p.scale_vel += Vec2::new(accel[0], accel[1]) * frames;
             }
         }
+        // sec3 0x0C ColorTransformModifier: the transform itself drifts — floor(modifier ×
+        // dt/30) per channel (research/xim ParticleUpdaters.kt ColorTransformModifier). The
+        // applier reads the drifted value; no shipped generator carries both a nonzero base
+        // and a modifier, so xim's table order between them is unobservable in the data.
+        if let Some(ct) = p.color_transform.as_mut() {
+            if let Some(modifier) = g.def.color_transform_modifier {
+                for (ch, m) in ct.iter_mut().zip(modifier) {
+                    *ch +=
+                        (m as f32 * frames / COLOR_TRANSFORM_MODIFIER_RATE_FRAMES).floor() as i32;
+                }
+            }
+            // sec3 0x0B ColorTransformApplier: color += (transform shr 7) × (0.5 × dt), in
+            // xim's raw byte space — normalised by the full D3DCOLOR range so it lands on this
+            // particle's rgb (research/xim ParticleUpdaters.kt ColorTransformApplier).
+            if g.def.color_transform_applier {
+                p.rgb.x += (ct[0] >> 7) as f32 * COLOR_TRANSFORM_STEP_HALF * frames
+                    / COLOR_TRANSFORM_BYTE_SCALE;
+                p.rgb.y += (ct[1] >> 7) as f32 * COLOR_TRANSFORM_STEP_HALF * frames
+                    / COLOR_TRANSFORM_BYTE_SCALE;
+                p.rgb.z += (ct[2] >> 7) as f32 * COLOR_TRANSFORM_STEP_HALF * frames
+                    / COLOR_TRANSFORM_BYTE_SCALE;
+            }
+        }
     }
     reap_expired(g);
 
@@ -1145,8 +2392,16 @@ fn advance_generator(g: &mut LiveGenerator, frames: f32) {
     }
 }
 
+// research/xim ParticleGenerator.kt isDoneEmitting — a scheduled generator stops once its
+// emit window has elapsed AND it has emitted at least one burst; the primed accumulator gives
+// that first burst on the generator's first tick whatever that frame's length (a 30 fps tick
+// advances two frames and would otherwise skip past a dur=0/1 window before ever emitting).
+fn emit_done(g: &LiveGenerator) -> bool {
+    !g.auto_run && g.age_frames > g.emit_window_frames && g.elements_emitted > 0
+}
+
 fn continuous_active(g: &LiveGenerator) -> bool {
-    !g.stopped && (g.auto_run || g.age_frames <= g.emit_window_frames.max(1.0))
+    !g.stopped && !emit_done(g)
 }
 
 // research/xim ParticleUpdaters.kt OscillationApplier — the position delta the applier adds
@@ -1207,12 +2462,13 @@ fn oscillation_delta(
 }
 
 // research/XIClient/src/XIClient/source/World/Generator/CYyGenerator.cpp CYyGenerator::Idle counter — the emit loop
-// runs `for counter in 0..=floor(v161)` over `v161 = (flags & 0x1FF) * scale`, i.e. floor + 1. That
-// trailing +1 is deliberately not reproduced: it would raise every already-tuned non-weather
-// population (10740 shipped generators author a non-zero count) by one particle, so the floor of 1
-// below stands in for it and keeps an authored count of 0 emitting the single particle retail
-// gives it.
+// runs `for counter in 0..=floor(v161)` over `v161 = (flags & 0x1FF) * scale`, i.e. floor + 1: a ppe=0 def
+// (hit2's g020/g022 spark emitters) fires one particle every period, and every other burst carries its full
+// authored count plus the loop's closing iteration.
 fn emission_count(g: &LiveGenerator) -> u32 {
+    if g.emit_scale == UNSCALED_EMISSION {
+        return g.def.particles_per_emission + 1;
+    }
     ((g.def.particles_per_emission as f32 * g.emit_scale) as u32).max(1)
 }
 
@@ -1267,6 +2523,12 @@ fn emit(g: &mut LiveGenerator, life_frames: f32) {
             (next_unit(&mut g.emit_rng) * 2.0 - 1.0) * var[1],
             (next_unit(&mut g.emit_rng) * 2.0 - 1.0) * var[2],
         );
+    }
+    // sec2 0x31 RandomVelocitySetup: one [0, v) draw written to every axis — replaces the
+    // base-plus-variance velocity transform; the relative-velocity portion is a separate
+    // transform and survives (research/xim ParticleInitializers.kt RandomVelocitySetup).
+    if let Some(v) = g.def.random_velocity {
+        vel = Vec3::splat(v * next_unit(&mut g.emit_rng));
     }
     // 0x08 RelativeVelocitySetup: the payload speed along the spawn offset's direction; with
     // no offset there is no direction and the block contributes nothing (research/xim
@@ -1379,6 +2641,8 @@ fn emit(g: &mut LiveGenerator, life_frames: f32) {
     // 0x17 ColorVarianceSetup: each rgb channel gains its bound times one [0, 1) draw, on top
     // of the 0x16 base (research/xim ParticleInitializers.kt ColorVarianceSetup — the shipped
     // alpha byte is always 0 and the engine's alpha comes from the 0x16 base / alpha track).
+    // Both are raw D3DCOLOR bytes/255: sum in that space. The PS2 half-scale doubling happens
+    // in the fixed-function stages (ffxi_particle.wgsl), so nothing rescales here.
     let mut rgb = Vec3::from_slice(&g.def.init_color[..3]);
     if let Some(var) = g.def.color_variance {
         rgb += Vec3::new(
@@ -1387,6 +2651,18 @@ fn emit(g: &mut LiveGenerator, life_frames: f32) {
             var[2] * next_unit(&mut g.emit_rng),
         );
     }
+    // sec2 0x19 ColorTransformSetup + 0x1A ColorTransformVariance: the per-element transform
+    // — base plus one round(posRand(1) × variance) draw per channel (research/xim
+    // ParticleInitializers.kt ColorTransformSetup / ColorTransformVariance).
+    let color_transform = g.def.color_transform.map(|base| {
+        let mut ct: [i32; 4] = base.map(i32::from);
+        if let Some(var) = g.def.color_transform_variance {
+            for (ch, v) in ct.iter_mut().zip(var) {
+                *ch += (next_unit(&mut g.emit_rng) * v as f32).round() as i32;
+            }
+        }
+        ct
+    });
     // sec2 0x3D OscillationSetup + 0x3E/0x3F/0x40 OscillationAccelerationSetup: the
     // per-particle oscillation state — each present axis gets acceleration + one [−1, 1)
     // variance draw, absent axes stay 0 (research/xim ParticleInitializers.kt
@@ -1407,13 +2683,43 @@ fn emit(g: &mut LiveGenerator, life_frames: f32) {
             prev_amplitude: [0.0; 3],
         }
     });
+    // sec2 0x45..0x49 parent-copy blocks (research/xim ParticleInitializers.kt Parent*Config):
+    // a child particle copies its anchor's state at init. World space, applied after every
+    // other initializer so the copy wins.
+    let mut vel_world = vel * g.vel_basis;
+    if let Some(a) = g.anchor {
+        if g.def.parent_position_copy {
+            pos = a.pos - g.origin;
+        }
+        if let Some(mult) = g.def.parent_velocity {
+            vel_world += a.vel * mult;
+        }
+        if g.def.parent_rotate {
+            rotation = a.rotation;
+        }
+        if g.def.parent_color {
+            rgb = a.rgb;
+        }
+        if g.def.parent_scale {
+            scale = a.scale;
+        }
+    }
+    let id = g.next_particle_id;
+    g.next_particle_id += 1;
+    // research/xim ParticleInitializers.kt ChildGeneratorSetup / OnceChildGeneratorSetup — each
+    // particle gets its own child generator instance at init; the tick system spawns it.
+    let pending_child_factories: Vec<usize> = (0..g.child_factories.len())
+        .filter(|i| !g.child_factories[*i].on_expiry)
+        .collect();
     g.particles.push(Particle {
         pos,
+        spawn_pos: pos,
         spawn_origin: g.origin,
-        vel: vel * g.vel_basis,
+        vel: vel_world,
         age_frames: 0.0,
         life_frames: life_frames.max(1.0),
         rgb,
+        color_transform,
         scale,
         scale_seed: scale,
         scale_vel,
@@ -1421,13 +2727,20 @@ fn emit(g: &mut LiveGenerator, life_frames: f32) {
         spin,
         negate_rotation_y,
         rel_vel: rel_vel * g.vel_basis,
+        vel_rot: Vec3::ZERO,
         osc,
+        id,
+        child_gens: Vec::new(),
+        pending_child_factories,
     });
 }
 
 // CYyGenerator.cpp CYyGenerator::ElemDie case 5 — a relife generator resets an expiring element's
 // life and keeps it (its rotation, position and UV state carry on); any other generator's
 // expired particles are swept.
+// research/xim Particle.kt update — children live on the parent particle and die with it, so a
+// reaped particle takes its child generators with it; sec4 0x01 (research/xim
+// ParticleExpirationHandlers.kt EmitChildHandler) queues one burst at the death position.
 fn reap_expired(g: &mut LiveGenerator) {
     if g.def.relife_on_expiry {
         for p in &mut g.particles {
@@ -1435,9 +2748,23 @@ fn reap_expired(g: &mut LiveGenerator) {
                 p.age_frames = p.age_frames.rem_euclid(p.life_frames);
             }
         }
-    } else {
-        g.particles.retain(|p| p.age_frames < p.life_frames);
+        return;
     }
+    let dead: Vec<&Particle> = g
+        .particles
+        .iter()
+        .filter(|p| p.age_frames >= p.life_frames)
+        .collect();
+    for p in &dead {
+        g.dead_child_gens.extend_from_slice(&p.child_gens);
+        for (fidx, f) in g.child_factories.iter().enumerate() {
+            if f.on_expiry {
+                g.pending_expiry_spawns.push((g.origin + p.pos, fidx));
+            }
+        }
+    }
+    let dead_ids: std::collections::HashSet<u64> = dead.iter().map(|p| p.id).collect();
+    g.particles.retain(|p| !dead_ids.contains(&p.id));
 }
 
 fn trace_celestial() -> bool {
@@ -1474,7 +2801,7 @@ pub fn sync_particle_meshes(
         With<OperatorCamera>,
     >,
     q_mesh_xf: Query<&GlobalTransform, With<Mesh3d>>,
-    mut q_vis: Query<&mut Visibility, With<Mesh3d>>,
+    mut q_vis: Query<(&mut Visibility, Option<&HaloSuppressed>), With<Mesh3d>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut sim: ResMut<ParticleSimulator>,
     mut commands: Commands,
@@ -1509,6 +2836,7 @@ pub fn sync_particle_meshes(
         // rotation; sync runs after tick, so both reach emit() one frame behind like
         // `emit_culled` (research/xim ParticleGeneratorParser.kt SphericalPositionVarianceFull).
         g.cam_view = cam_rot;
+        g.entity_world = *entity_xf;
         if g.actor_local {
             g.actor_rot = entity_xf.rotation();
         }
@@ -1572,8 +2900,11 @@ pub fn sync_particle_meshes(
                     .iter()
                     .any(|f| f.intersects_obb(&b, &entity_xf.affine(), true, false))
             });
-        if let Ok(mut v) = q_vis.get_mut(g.entity) {
-            v.set_if_neq(if drawable {
+        if let Ok((mut v, suppressed)) = q_vis.get_mut(g.entity) {
+            // Suppressed halos stay hidden even while in frustum; the frame the marker comes off,
+            // culling resumes normal per-frame control.
+            let visible = drawable && suppressed.is_none();
+            v.set_if_neq(if visible {
                 Visibility::Inherited
             } else {
                 Visibility::Hidden
@@ -1639,11 +2970,9 @@ struct ParticleDraw {
     flipbook_frame: usize,
     scale: Vec2,
     // Stage 1's F argument (TEXTUREFACTOR): the generator colour after the time-of-day,
-    // day-of-week and moon-phase modulations.
+    // day-of-week and moon-phase modulations, in raw byte/255 space.
     factor_rgb: Vec3,
     factor_alpha: f32,
-    // The raw life curve, before the saturating stage-1 alpha gain.
-    life_alpha: f32,
     world: Vec3,
 }
 
@@ -1670,29 +2999,35 @@ fn particle_draw(g: &LiveGenerator, p: &Particle, clock: &CelestialClock) -> Par
         .as_ref()
         .map(|t| t.sample_from(progress, Some(p.scale_seed.y)))
         .unwrap_or(p.scale.y);
-    // research/XIClient/src/XIClient/source/World/Generator/CYyGenerator.cpp HandleOne
-    // initializes field_F8 from opcode 0x16; persistent effects retain its authored alpha.
+    // research/XIClient CMoElem.cpp VirtOt1: the element's draw colour is field_F8 (the 0x16
+    // ColorSetup RGBA, CYyGenerator.cpp ElemGenerate) with alpha scaled by field_138 * field_134.
+    // field_138 is set to 1.0 in ElemIdle and field_134 is initialised to 1.0 (CMoElem ctor)
+    // and never written, so retail applies no life-based fade: the authored alpha holds for the
+    // whole element life; fades come from explicit keyframe tracks, sampled above.
+    // Alpha is a raw D3DCOLOR byte/255: the 0x16 base and the alpha track's points share that
+    // space (the seed must stay in it for the opening-segment override), and the PS2 half-scale
+    // doubling happens in the fixed-function stages, not here.
     let alpha = g
         .alpha
         .as_ref()
         .map(|t| t.sample_from(progress, Some(g.def.init_color[3])))
-        .unwrap_or(if g.def.continuous || g.def.is_singleton() {
-            g.def.init_color[3]
-        } else {
-            1.0 - progress
-        });
+        .unwrap_or(g.def.init_color[3]);
     // research/xim ParticleGeneratorParser.kt sec3Handler ClockValueUpdater — 0x3C/0x3D/0x3E
     // assign the particle's colour channel from a time-of-day curve, 0x3F multiplies alpha.
     // This is the sun's authored dawn/noon/dusk ramp: the disc is not tinted by a formula.
     let mut rgb = p.rgb;
     let mut alpha = alpha;
+    let mut tod_alpha_gate = 1.0f32;
     for (channel, track) in g.tod_color.iter().enumerate() {
         let Some(track) = track.as_ref().filter(|_| g.def.tod_color_driven[channel]) else {
             continue;
         };
         let v = track.sample(clock.day_fraction);
         match channel {
-            TOD_ALPHA_CHANNEL => alpha *= v,
+            TOD_ALPHA_CHANNEL => {
+                alpha *= v;
+                tod_alpha_gate *= v;
+            }
             _ => rgb[channel] = v,
         }
     }
@@ -1716,13 +3051,78 @@ fn particle_draw(g: &LiveGenerator, p: &Particle, clock: &CelestialClock) -> Par
         alpha = (alpha * table[TOD_ALPHA_CHANNEL] * CELESTIAL_MODULATE).min(1.0);
     }
 
+    // Enhanced build only: lift every particle's final alpha by 20% (clamped) — a deliberate
+    // non-retail brightness tuning for the hit flashes retail authors at ~50%.
+    #[cfg(feature = "enhanced-particle-alpha-20")]
+    let alpha = (alpha * ENHANCED_ALPHA_GAIN).min(1.0);
+
+    // sec3 0x0F..0x11 ProgressValueUpdater (research/xim ParticleUpdaters.kt — p.position.x = v):
+    // a bound track replaces the channel each frame; key 0 is seeded from the particle's
+    // spawn-time value, so the curve starts where the element was emitted.
+    let origin = particle_origin(g, p);
+    let mut world = origin + p.pos;
+    if let Some(t) = &g.position_x {
+        world.x = origin.x + t.sample_from(progress, Some(p.spawn_pos.x));
+    }
+    if let Some(t) = &g.position_y {
+        world.y = origin.y + t.sample_from(progress, Some(p.spawn_pos.y));
+    }
+    if let Some(t) = &g.position_z {
+        world.z = origin.z + t.sample_from(progress, Some(p.spawn_pos.z));
+    }
+
+    let lamp_halo = is_lamp_halo_def(&g.def);
+    let factor_alpha = if lamp_halo {
+        // PATH_LAMP_ALPHAMAP multiplies this against the texel's own alpha in the shader; the
+        // day gate (tkaa) is what turns lamps on at night and off by day. Retail's visible
+        // wavering is runtime behavior (no flicker keyframes ship), so retail mode rides the
+        // same hand-tuned lamp_flicker model as the Enhanced lights — a timer going up/down.
+        let seed: f32 = g.def.mesh_id.iter().map(|b| *b as f32).sum::<f32>() * 0.37;
+        (clock.lamp_halos_lift
+            * tod_alpha_gate
+            * crate::zone_point_lights::lamp_flicker(clock.lamp_flicker_phase, seed))
+        .clamp(0.0, 1.0)
+    } else if is_wall_wash_def(&g.def) {
+        // Wash volumes keep the authored D3m alpha path; the slider multiplies it (1.0 = as
+        // authored) so the test box can dial the wash down without touching retail defaults.
+        tfactor_alpha(&g.def, g.draw_path, alpha) * clock.wash_alpha_lift
+    } else {
+        tfactor_alpha(&g.def, g.draw_path, alpha)
+    };
+
     ParticleDraw {
         flipbook_frame,
-        scale: Vec2::new(sx, sy),
-        factor_rgb: rgb,
-        factor_alpha: tfactor_alpha(&g.def, g.draw_path, alpha),
-        life_alpha: alpha,
-        world: particle_origin(g, p) + p.pos,
+        // The range knob scales each halo quad from its authored extents; brightness rides
+        // in.factor.rgb to the shader's lamp branch (1.0 = the white it drew before the knob).
+        scale: if lamp_halo {
+            Vec2::new(sx * clock.lamp_halos_radius, sy * clock.lamp_halos_radius)
+        } else {
+            Vec2::new(sx, sy)
+        },
+        factor_rgb: if lamp_halo {
+            Vec3::splat(clock.lamp_halos_gain)
+        } else {
+            rgb
+        },
+        factor_alpha,
+        world,
+    }
+}
+
+#[cfg(feature = "enhanced-particle-alpha-20")]
+const ENHANCED_ALPHA_GAIN: f32 = 1.2;
+
+// Retail pins assert the raw authored alpha; under the enhancement the same build lifts it,
+// so tests compare against whichever value this feature set produces.
+#[cfg(test)]
+fn expected_factor_alpha(raw: f32) -> f32 {
+    #[cfg(feature = "enhanced-particle-alpha-20")]
+    {
+        (raw * ENHANCED_ALPHA_GAIN).min(1.0)
+    }
+    #[cfg(not(feature = "enhanced-particle-alpha-20"))]
+    {
+        raw
     }
 }
 
@@ -1731,40 +3131,6 @@ fn particle_origin(g: &LiveGenerator, p: &Particle) -> Vec3 {
         p.spawn_origin
     } else {
         g.origin
-    }
-}
-
-// D3D interpolates stage 0's D argument across the primitive, so the stage chain runs once per
-// vertex against the template's authored colour — not once per particle against a single
-// representative vertex.
-fn vertex_color(g: &LiveGenerator, draw: &ParticleDraw, vertex: Vec4) -> [f32; 4] {
-    let (stage_rgb, stage_alpha) = d3m_stage_chain(
-        vertex.truncate(),
-        vertex.w,
-        draw.factor_rgb,
-        draw.factor_alpha,
-        ignores_texture_alpha(&g.def, g.draw_path),
-        g.draw_path,
-    );
-    // An additive/subtractive element draws `SRCALPHA * colour`, so its alpha channel is a
-    // brightness factor rather than a coverage one. We stand the raw life curve in for
-    // retail's alpha stage chain there, and hand it to the blend state as the src alpha the
-    // shader premultiplies with — the multiply then lands on the saturated stage-1 colour,
-    // which is where retail applies it. Alpha-blended elements use the real stage-1 alpha.
-    match (g.def.blend, g.draw_path) {
-        (ffxi_dat::particle_gen::ParticleBlend::Blend, _) => {
-            [stage_rgb.x, stage_rgb.y, stage_rgb.z, stage_alpha]
-        }
-        // An MMB's own vertex alpha is the shape, not a uniform: the sun/moon glow domes are
-        // untextured gradients that ramp 128 at the centre to 0 at the rim, so folding the life
-        // curve onto a flat 1.0 would draw them as hard-edged discs.
-        (_, D3mDrawPath::Mmb | D3mDrawPath::MmbUntextured) => [
-            stage_rgb.x,
-            stage_rgb.y,
-            stage_rgb.z,
-            draw.life_alpha * vertex.w.min(D3M_STAGE_CLAMP),
-        ],
-        _ => [stage_rgb.x, stage_rgb.y, stage_rgb.z, draw.life_alpha],
     }
 }
 
@@ -1810,12 +3176,23 @@ struct ParticleKey {
     // half is fixed once `flipbook_frame` is, so these are the only terms that can move it.
     factor_rgb: [i32; 3],
     factor_alpha: i32,
-    life_alpha: i32,
     rotation: [i32; 3],
 }
 
 fn quantized(v: f32, quantum: f32) -> i32 {
     (v / quantum).round() as i32
+}
+
+// sec3 0x2E DrawDistanceUpdater's per-frame alpha multiplier from camera-to-particle distance;
+// 1.0 for a generator that carries no updater (research/xim ParticleUpdaters.kt
+// DrawDistanceUpdater — the multiplier lands on the element's colour alpha).
+fn draw_distance_alpha(g: &LiveGenerator, world_pos: Vec3, cam_pos: Vec3) -> f32 {
+    match (g.def.draw_distance_near, g.def.draw_distance_far) {
+        (Some(near), Some(far)) => {
+            crate::rumble::distance_falloff(cam_pos.distance(world_pos), near, far)
+        }
+        _ => 1.0,
+    }
 }
 
 fn mesh_key(g: &LiveGenerator, cam: CameraView, clock: &CelestialClock) -> MeshKey {
@@ -1833,13 +3210,15 @@ fn mesh_key(g: &LiveGenerator, cam: CameraView, clock: &CelestialClock) -> MeshK
             .iter()
             .map(|p| {
                 let draw = particle_draw(g, p, clock);
+                // sec3 0x2E: the key quantizes the same falloff-multiplied alphas rebuild_mesh
+                // draws, so a camera move that fades an element by one colour step rebuilds.
+                let m = draw_distance_alpha(g, g.entity_world.transform_point(draw.world), cam.pos);
                 ParticleKey {
                     world: draw.world.to_array().map(spatial),
                     flipbook_frame: draw.flipbook_frame,
                     scale: [spatial(draw.scale.x), spatial(draw.scale.y)],
                     factor_rgb: draw.factor_rgb.to_array().map(color),
-                    factor_alpha: color(draw.factor_alpha),
-                    life_alpha: color(draw.life_alpha),
+                    factor_alpha: color(draw.factor_alpha * m),
                     rotation: p.rotation.to_array().map(spatial),
                 }
             })
@@ -1940,25 +3319,71 @@ fn axial_camera_rotation(particle_world: Vec3, cam_pos: Vec3, vel_basis: Vec3) -
     Quat::from_axis_angle(left, angle) * Quat::from_rotation_y(-m.z.atan2(m.x))
 }
 
+// research/xim Particle.kt applyMovementOrientation — the Movement billboard's world basis from its
+// velocity (identity while the element stands still). The rotateY post-multiply lands leftmost in
+// column convention because GLDrawer uploads xim's row-major matrices untransposed. `vel_basis` is an
+// involution, so a Bevy-space velocity folds into the DAT frame the template lives in.
+fn movement_orientation(movement: Vec3) -> Quat {
+    const AXIS_ALIGNED_Y: f32 = 0.999;
+    if movement.length_squared() == 0.0 {
+        return Quat::IDENTITY;
+    }
+    let m = movement.normalize();
+    if m.y.abs() >= AXIS_ALIGNED_Y {
+        return Quat::from_rotation_z(m.y.signum() * std::f32::consts::FRAC_PI_2);
+    }
+    let left = Vec3::Y.cross(m).normalize();
+    let up = m.cross(left).normalize();
+    let angle = -up.dot(Vec3::Y).clamp(-1.0, 1.0).acos() * m.y.signum();
+    Quat::from_rotation_y(-m.z.atan2(m.x)) * Quat::from_axis_angle(left, angle)
+}
+
 fn rebuild_mesh(g: &LiveGenerator, cam: CameraView, clock: &CelestialClock, mesh: &mut Mesh) {
     let verts_per = g.template.positions.len();
     let n = g.particles.len();
     let mut positions = Vec::with_capacity(n * verts_per);
     let mut uvs = Vec::with_capacity(n * verts_per);
     let mut colors = Vec::with_capacity(n * verts_per);
+    let mut factors = Vec::with_capacity(n * verts_per);
     let mut indices = Vec::with_capacity(n * g.template.indices.len());
     let axial = is_axial_camera_billboard(g);
 
     for p in &g.particles {
-        let draw = particle_draw(g, p, clock);
+        let mut draw = particle_draw(g, p, clock);
+        // sec3 0x2E DrawDistanceUpdater: fade the element's alpha by camera distance and cull
+        // it at zero (research/XIClient/src/XIClient/source/World/Generator/CYyGenerator.cpp
+        // CYyGenerator::ElemIdle case 0x2E; research/xim ParticleUpdaters.kt
+        // DrawDistanceUpdater — drawDistanceCulled skips the element in the draw list).
+        let m = draw_distance_alpha(g, g.entity_world.transform_point(draw.world), cam.pos);
+        if m == 0.0 {
+            continue;
+        }
+        draw.factor_alpha *= m;
         let tpl = flipbook_template(g, draw.flipbook_frame);
 
+        // research/xim Particle.kt applyMovementOrientation — a Movement billboard keeps its world
+        // orientation (identity while the element stands still) and carries the full per-particle
+        // Euler; hi14's g140 authors a ±π x-variance, so its burst fans out into retail's crit flash.
+        let movement_bb = matches!(
+            g.def.billboard,
+            ParticleBillboard::Movement | ParticleBillboard::MovementHorizontal
+        );
         let rot = if axial {
             axial_camera_rotation(draw.world, cam.pos, g.vel_basis)
         } else if g.orientation.is_some() {
             particle_rotation(p)
+        } else if movement_bb {
+            let mut vel_dat = p.vel * g.vel_basis;
+            if g.def.billboard == ParticleBillboard::MovementHorizontal {
+                vel_dat.y = 0.0;
+            }
+            movement_orientation(vel_dat) * particle_rotation(p)
         } else {
-            cam.rot
+            // A screen billboard re-faces the camera every frame and keeps the element's full Euler in
+            // the view basis (research/xim GLDrawer.kt drawXimParticle XYZ branch). hit1's g010 authors
+            // a ±π z-variance, so its burst fans out into retail's starburst; without it every particle
+            // of a burst lies along the same line.
+            cam.rot * particle_rotation(p)
         };
         // Billboard sprites are flat (z unused); a 3-D particle mesh — a fixed-orientation
         // one, or an axial camera billboard, which stays a world-oriented solid — keeps its
@@ -1973,13 +3398,13 @@ fn rebuild_mesh(g: &LiveGenerator, cam: CameraView, clock: &CelestialClock, mesh
         // dat_mzb.rs to_bevy) so a falling water sheet hangs down into the basin
         // instead of standing up above the emitter. Actor-local generators integrate in the
         // actor frame, whose parent transform already carries the dat_mzb.rs to_bevy basis.
-        let world_basis = (g.orientation.is_some() || axial) && !g.actor_local;
+        let world_basis = (g.orientation.is_some() || axial || movement_bb) && !g.actor_local;
         // A screen billboard's template is DAT-frame geometry too (Y down: the campfire flame
         // `hi12` rises toward negative y). An actor-local generator inherits the FFXI->Bevy basis
         // from its parent transform; a world-space one folds it into the template before the
         // view rotation, or the flame hangs below its wick (the same flip dat_mzb.rs to_bevy
         // applies to zone origins).
-        let screen_basis = g.orientation.is_none() && !axial && !g.actor_local;
+        let screen_basis = g.orientation.is_none() && !axial && !movement_bb && !g.actor_local;
         let base = positions.len() as u32;
         for ((tp, uv), vertex) in tpl.positions.iter().zip(&tpl.uvs).zip(&tpl.colors) {
             let local = Vec3::new(tp.x * draw.scale.x, tp.y * draw.scale.y, tp.z * sz);
@@ -1996,18 +3421,29 @@ fn rebuild_mesh(g: &LiveGenerator, cam: CameraView, clock: &CelestialClock, mesh
             };
             positions.push((draw.world + oriented).to_array());
             uvs.push([uv[0] + g.tex_translate.x, uv[1] + g.tex_translate.y]);
-            colors.push(vertex_color(g, &draw, *vertex));
+            // The template colour is stage 0's D argument verbatim (D3m/sheet: /128-normalised,
+            // MMB: raw byte/255); the per-particle F rides its own attribute. ffxi_particle.wgsl
+            // runs the selected table against both, so nothing is folded in here.
+            colors.push(vertex.to_array());
+            factors.push(draw.factor_rgb.extend(draw.factor_alpha).to_array());
         }
         indices.extend(tpl.indices.iter().map(|&idx| base + idx));
     }
 
     if positions.is_empty() {
-        push_hidden_primitive(&mut positions, &mut uvs, &mut colors, &mut indices);
+        push_hidden_primitive(
+            &mut positions,
+            &mut uvs,
+            &mut colors,
+            &mut factors,
+            &mut indices,
+        );
     }
 
     mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
     mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
     mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_TANGENT, factors);
     mesh.insert_indices(Indices::U32(indices));
 }
 
@@ -2023,6 +3459,7 @@ fn push_hidden_primitive(
     positions: &mut Vec<[f32; 3]>,
     uvs: &mut Vec<[f32; 2]>,
     colors: &mut Vec<[f32; 4]>,
+    factors: &mut Vec<[f32; 4]>,
     indices: &mut Vec<u32>,
 ) {
     let base = positions.len() as u32;
@@ -2030,6 +3467,7 @@ fn push_hidden_primitive(
         positions.push([0.0, 0.0, 0.0]);
         uvs.push([0.0, 0.0]);
         colors.push([0.0, 0.0, 0.0, 0.0]);
+        factors.push([0.0, 0.0, 0.0, 0.0]);
     }
     indices.extend([base, base + 1, base + 2]);
 }
@@ -2076,9 +3514,18 @@ fn resolve_zone_mesh(
     // Zone and weather generators are collected by chunk name without their directory
     // (zone_particles.rs `zone_static_defs`), so there is no scope to resolve the mesh in and
     // the lookup falls through to the flat tier.
-    if let Some((template, frames, tex)) = resolve_mesh(assets, NO_LOCAL_DIR, def, images, undither)
+    // The caller (zone_static_defs dispatch) retries against the global tier itself.
+    if let Some((template, frames, tex)) =
+        resolve_mesh(assets, None, NO_LOCAL_DIR, def, images, undither)
     {
-        return Some((template, frames, tex, D3mDrawPath::D3m));
+        // A textureless D3m submesh (the Bastok tunnel `ligh` lamp fixtures) takes the
+        // ZeroOneTSS one-stage table; on the textured chain it would sample a null texture.
+        let path = if tex.is_some() {
+            D3mDrawPath::D3m
+        } else {
+            D3mDrawPath::Untextured
+        };
+        return Some((template, frames, tex, path));
     }
     let mmb = assets.mmbs.get(&def.mesh_id)?;
     let template = mmb_sprite_template(mmb)?;
@@ -2089,7 +3536,7 @@ fn resolve_zone_mesh(
     let path = if tex.is_some() {
         D3mDrawPath::Mmb
     } else {
-        D3mDrawPath::MmbUntextured
+        D3mDrawPath::Untextured
     };
     Some((template, Vec::new(), tex, path))
 }
@@ -2120,42 +3567,64 @@ fn to_image(t: &ffxi_dat::texture::DecodedTexture, undither: bool) -> Image {
 // across effect directories, so the flat maps alone bind whichever copy the walk saw last.
 fn resolve_mesh(
     assets: &ActionAssets,
+    global: Option<&ActionAssets>,
     local_dir: [u8; 4],
     def: &ParticleGeneratorDef,
     images: &mut Assets<Image>,
     undither: bool,
 ) -> Option<(SpriteTemplate, Vec<SpriteTemplate>, Option<Handle<Image>>)> {
+    // research/xim ParticleLinkedDataProviders.kt resolveStaticMeshLink — the effect directory
+    // first, wider scopes after. Retail's tree is one merged virtual filesystem, so a mesh or
+    // texture absent from this tier resolves against the global effect dir: i900 in 120.DAT
+    // binds asi1, which exists only under syst/effe of 0.DAT.
+    let tiers = [Some(assets), global];
+    // research/xim ParticleGeneratorSettings.kt LinkedDataType: WeightedMesh(0x1D) resolves like
+    // StaticMesh; the draw path is identical.
     match def.mesh_kind {
-        ParticleMeshKind::StaticMesh => {
-            let d3m = assets.d3m(local_dir, &def.mesh_id)?;
+        ParticleMeshKind::StaticMesh | ParticleMeshKind::WeightedMesh => {
+            let d3m = tiers
+                .into_iter()
+                .flatten()
+                .find_map(|a| a.d3m(local_dir, &def.mesh_id))?;
             let template = sprite_template(d3m)?;
             let (namespace, local) = d3m.texture_name_tokens();
             // research/xim DatResource.kt getTextureResourceByNameAs — qualified (namespace, local) match, then
             // local-only. The truncated DatId stays as a last tier: a few meshes name a
             // texture whose local token outruns the Img chunk id (`kumori` vs `kumo`) and
             // resolve only that way.
-            let by_name = (!local.is_empty()).then(|| {
-                assets
-                    .images_by_qualified_name
-                    .get(&(namespace, local.clone()))
-                    .or_else(|| assets.images_by_name.get(&local))
-            });
-            let tex = by_name
+            let tex = tiers
+                .into_iter()
                 .flatten()
-                .or_else(|| assets.images.get(&d3m.texture_dat_id()))
+                .find_map(|a| {
+                    let by_name = (!local.is_empty()).then(|| {
+                        a.images_by_qualified_name
+                            .get(&(namespace.clone(), local.clone()))
+                            .or_else(|| a.images_by_name.get(&local))
+                    });
+                    by_name
+                        .flatten()
+                        .or_else(|| a.images.get(&d3m.texture_dat_id()))
+                })
                 .map(|t| images.add(to_image(t, undither)));
             Some((template, Vec::new(), tex))
         }
         ParticleMeshKind::SpriteSheet => {
-            let ss = assets.sprite_sheet(local_dir, &def.mesh_id)?;
+            let ss = tiers
+                .into_iter()
+                .flatten()
+                .find_map(|a| a.sprite_sheet(local_dir, &def.mesh_id))?;
             let frames = sprite_sheet_templates(ss);
             let first = frames.first().cloned()?;
             // research/xim DatResource.kt getTextureResourceByNameAs — try the qualified (namespace, local) pair
             // first, then fall back to a local-name-only match.
-            let tex = assets
-                .images_by_qualified_name
-                .get(&(ss.category.clone(), ss.id.clone()))
-                .or_else(|| assets.images_by_name.get(&ss.id))
+            let tex = tiers
+                .into_iter()
+                .flatten()
+                .find_map(|a| {
+                    a.images_by_qualified_name
+                        .get(&(ss.category.clone(), ss.id.clone()))
+                        .or_else(|| a.images_by_name.get(&ss.id))
+                })
                 .map(|t| images.add(to_image(t, undither)));
             Some((first, frames, tex))
         }
@@ -2219,12 +3688,19 @@ fn empty_mesh() -> Mesh {
         PrimitiveTopology::TriangleList,
         RenderAssetUsages::default(),
     );
-    let (mut positions, mut uvs, mut colors, mut indices) =
-        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-    push_hidden_primitive(&mut positions, &mut uvs, &mut colors, &mut indices);
+    let (mut positions, mut uvs, mut colors, mut factors, mut indices) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    push_hidden_primitive(
+        &mut positions,
+        &mut uvs,
+        &mut colors,
+        &mut factors,
+        &mut indices,
+    );
     mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
     mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
     mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_TANGENT, factors);
     mesh.insert_indices(Indices::U32(indices));
     mesh
 }
@@ -2257,8 +3733,7 @@ mod tests {
             tod_color_tracks: [None; ffxi_dat::particle_gen::TOD_COLOR_CHANNELS],
             tod_color_driven: [false; ffxi_dat::particle_gen::TOD_COLOR_CHANNELS],
             moon_phase_sprite: false,
-            attach_joint_source: 0,
-            attach_joint_target: 0,
+            attach_eid: 0,
             attach_source_oriented: false,
             init_scale: [0.1, 0.1, 1.0],
             single_scale_variance: None,
@@ -2266,6 +3741,8 @@ mod tests {
             init_color: [0.2, 0.2, 0.6, 0.5],
             color_variance: None,
             color_transform: None,
+            color_transform_variance: None,
+            color_transform_applier: false,
             color_transform_modifier: None,
             init_velocity: [0.0, 0.01, 0.0],
             velocity_variance: None,
@@ -2320,18 +3797,34 @@ mod tests {
             specular_element: false,
             specular: None,
             specular_rot_y_track: None,
-            camera_shake_track: None,
-            camera_shake: None,
+            rumble_track: None,
+            rumble_falloff: None,
+            draw_distance_near: None,
+            draw_distance_far: None,
+            position_x_track: None,
+            position_y_track: None,
+            position_z_track: None,
+            weighted_mesh_weight_tracks: [None; ffxi_dat::particle_gen::WEIGHTED_MESH_WEIGHTS],
+            tod_volume_track: None,
             haze_offset_x: None,
             parent_rotate: false,
             parent_color: false,
             parent_scale: false,
             velocity_dampener_track: None,
+            dampening_factor_applier: false,
             velocity_dampener: None,
             velocity_rotator: None,
+            velocity_rotation_updater: false,
+            random_velocity: None,
             fixed_point_position_variance: None,
             fixed_point_position_variance_2: None,
             child_generator_2: None,
+            child_generator_3: None,
+            once_child_generator: None,
+            emit_child_id: None,
+            child_emit_basic: false,
+            child_emit_full: false,
+            child_emit_billboard: false,
             specular_rot_z_track: None,
             specular_color_a_track: None,
             parent_rotate_2: false,
@@ -2358,6 +3851,10 @@ mod tests {
             tod_color: [None, None, None, None],
             scale_x: None,
             scale_y: None,
+            position_x: None,
+            position_y: None,
+            position_z: None,
+            dampening_factor: None,
             alpha: None,
             origin: Vec3::ZERO,
             particles: Vec::new(),
@@ -2381,6 +3878,13 @@ mod tests {
             elements_emitted: 0,
             cam_view: Quat::IDENTITY,
             actor_rot: Quat::IDENTITY,
+            entity_world: GlobalTransform::IDENTITY,
+            parent: None,
+            anchor: None,
+            child_factories: Vec::new(),
+            next_particle_id: 0,
+            dead_child_gens: Vec::new(),
+            pending_expiry_spawns: Vec::new(),
             built_key: MeshKey::Empty,
             bound_radius: 0.0,
         }
@@ -2391,6 +3895,26 @@ mod tests {
         advance_generator(g, frames);
     }
 
+    // The scheduled spawn path's wiring for a real def (spawn_particle_generators): the
+    // world-space velocity basis plus the keyframe tracks resolved against the DAT, so a test
+    // drives a shipped generator exactly as the live client does.
+    fn live_scheduled(
+        def: ParticleGeneratorDef,
+        window: f32,
+        assets: &crate::scheduler_runtime::ActionAssets,
+    ) -> LiveGenerator {
+        let mut g = live(def, window);
+        g.vel_basis = WORLD_PARTICLE_VEL_BASIS;
+        let resolve = |id: Option<[u8; 4]>| id.and_then(|i| assets.keyframes.get(&i).cloned());
+        g.scale_x = resolve(def.scale_x_track);
+        g.scale_y = resolve(def.scale_y_track);
+        g.position_x = resolve(def.position_x_track);
+        g.position_y = resolve(def.position_y_track);
+        g.position_z = resolve(def.position_z_track);
+        g.alpha = resolve(def.alpha_track);
+        g
+    }
+
     // 0x1E ParticleDampen: emission stops and the already-live particles are force-expired
     // at once (research/xim EffectRoutineInstance.kt handleParticleEffectDampen), unlike
     // StopParticle which lets them play out.
@@ -2399,7 +3923,7 @@ mod tests {
         let owner = Entity::from_raw_u32(1).unwrap();
         let mut sim = ParticleSimulator {
             generators: vec![live(def(60.0, 1.0, 1), 60.0)],
-            ..ParticleSimulator::default()
+            clock: CelestialClock::default(),
         };
         sim.generators[0].origin_routine = Some(RoutineOrigin {
             owner,
@@ -2480,7 +4004,11 @@ mod tests {
         assert_eq!(g.age_frames, 30.0, "but the clock still runs");
         g.emit_culled = false;
         advance(&mut g, 30.0);
-        assert_eq!(g.particles.len(), 30, "back in band: emits again");
+        assert_eq!(
+            g.particles.len(),
+            60,
+            "back in band: emits again (two per period)"
+        );
     }
 
     #[test]
@@ -2691,11 +4219,58 @@ mod tests {
         g.template.colors = vec![rgba; g.template.positions.len()];
     }
 
-    /// The colour a particle actually draws with: `particle_draw` returns only the
-    /// per-particle half, and the template's per-vertex half folds in at `vertex_color`.
-    fn drawn_color(g: &LiveGenerator, clock: &CelestialClock) -> Vec4 {
+    // The per-particle factor after ToD/day-of-week/moon modulation — what the shader's stage 1
+    // multiplies against the template colour.
+    fn drawn_factor(g: &LiveGenerator, clock: &CelestialClock) -> Vec4 {
         let draw = particle_draw(g, &g.particles[0], clock);
-        Vec4::from_array(vertex_color(g, &draw, g.template.colors[0]))
+        draw.factor_rgb.extend(draw.factor_alpha)
+    }
+
+    // Lamp halos (`lig*` sprite sheets) are LIGHTS: their drawn alpha is the lift knob times the
+    // ToD gate and must not carry the `enhanced-particle-alpha-20` boost — that enhancement is
+    // for hit-flash and other effect particles. Pins both sides so either half drifting fails a
+    // test whichever feature set hits it.
+    #[test]
+    fn lamp_halo_alpha_bypasses_enhanced_particle_gain() {
+        let mut g = live(def(60.0, 1.0, 1), 60.0);
+        advance(&mut g, 2.0);
+        assert!(!g.particles.is_empty(), "two frames emit");
+
+        // The wash-alpha slider multiplies authored alpha on the D3m path (this StaticMesh def
+        // rides it); pin a neutral lift so each assertion measures its own knob.
+        let clock = CelestialClock {
+            wash_alpha_lift: 1.0,
+            ..CelestialClock::default()
+        };
+        let raw_alpha = g.def.init_color[3];
+        let plain = drawn_factor(&g, &clock);
+        assert_eq!(
+            plain.w,
+            expected_factor_alpha(raw_alpha),
+            "non-halo particles carry the build's alpha gain"
+        );
+
+        g.def.mesh_id = *b"lig0";
+        g.def.mesh_kind = ffxi_dat::particle_gen::ParticleMeshKind::SpriteSheet;
+        // The content rule: ToD-gated alpha over a near-zero authored alpha.
+        g.def.tod_color_driven[TOD_ALPHA_CHANNEL] = true;
+        g.def.init_color[TOD_ALPHA_CHANNEL] = 0.071;
+        let halo = drawn_factor(&g, &clock);
+        assert!(
+            is_lamp_halo_def(&g.def),
+            "ToD-gated low-alpha sheet must hit the halo branch"
+        );
+        // No ToD track here: gate holds at 1.0, so alpha is the lift knob times the flicker wave
+        // at this phase — still independent of the build's alpha gain.
+        let seed: f32 = g.def.mesh_id.iter().map(|b| *b as f32).sum::<f32>() * 0.37;
+        assert_eq!(
+            halo.w,
+            (clock.lamp_halos_lift
+                * crate::zone_point_lights::lamp_flicker(clock.lamp_flicker_phase, seed))
+            .clamp(0.0, 1.0)
+        );
+        let gain = clock.lamp_halos_gain;
+        assert_eq!(halo.xyz(), Vec3::splat(gain));
     }
 
     // A generator stage's duration is authored in 60 fps frames (research/xim util/Fps.kt Fps internalFps),
@@ -2747,6 +4322,14 @@ mod tests {
         let mut time = Time::<()>::default();
         time.advance_by(Duration::from_secs_f32(TICK_SECS));
         world.insert_resource(time);
+        // Messages<T> has no FromWorld, so the bare test world inserts it for the SfxEvent writer.
+        world.insert_resource(bevy::ecs::message::Messages::<crate::audio::SfxEvent>::default());
+        world.insert_resource(bevy::ecs::message::Messages::<
+            crate::scheduler_runtime::ParticleSpawnTrace,
+        >::default());
+        // tick reads the Dynamic Lights setting (Default = Vanilla, texture path).
+        world.insert_resource(crate::graphics_settings::GraphicsSettings::default());
+        world.insert_resource(Assets::<Mesh>::default());
         world.insert_resource(sim);
         world.run_system_once(tick_particle_simulator).unwrap();
 
@@ -2757,7 +4340,8 @@ mod tests {
         };
         assert_eq!(ambient.age_frames, frames);
         assert_eq!(ambient.age_frames, routine.age_frames);
-        assert_eq!(ambient.particles.len(), frames as usize);
+        // ppe=1 emits two per period (authored count plus retail's closing iteration).
+        assert_eq!(ambient.particles.len(), (frames * 2.0) as usize);
         assert_eq!(ambient.particles.len(), routine.particles.len());
     }
 
@@ -2871,13 +4455,13 @@ mod tests {
         assert_eq!(g.particles.len(), 2 * SCALED);
     }
 
-    // Everything outside weat/ keeps its authored count exactly, and an authored count of 0 still
-    // emits the one particle retail's `floor(count) + 1` loop gives it.
+    // Everything outside weat/ emits its authored count plus retail's closing iteration, and an
+    // authored count of 0 still emits the one particle that loop gives it.
     #[test]
     fn non_weather_emission_counts_are_unscaled() {
         let mut g = live(def(600.0, 1.0, 5), f32::MAX);
         advance(&mut g, 1.0);
-        assert_eq!(g.particles.len(), 5);
+        assert_eq!(g.particles.len(), 6);
 
         let mut g = live(def(600.0, 1.0, 0), f32::MAX);
         advance(&mut g, 1.0);
@@ -2888,7 +4472,7 @@ mod tests {
     #[test]
     fn position_variance_spreads_emissions_through_the_sphere() {
         const RADIUS: f32 = 20.0;
-        let mut d = def(60.0, 1.0, 200);
+        let mut d = def(60.0, 1.0, 199);
         d.init_velocity = [0.0; 3];
         d.position_variance = Some(ffxi_dat::particle_gen::PositionVariance {
             radius_variance: RADIUS,
@@ -2916,7 +4500,8 @@ mod tests {
     #[test]
     fn spherical_full_stepped_azimuth_walks_the_ring() {
         const STEPS: u32 = 6;
-        let mut d = def(60.0, 1.0, STEPS);
+        // Authored count plus retail's closing iteration lands exactly one particle per step.
+        let mut d = def(60.0, 1.0, STEPS - 1);
         d.init_velocity = [0.0; 3];
         d.spherical_full = Some(ffxi_dat::particle_gen::SphericalPositionVarianceFull {
             radius_variance: 0.0,
@@ -3004,118 +4589,186 @@ mod tests {
         );
     }
 
-    // research/XIClient/src/XIClient/source/Resource/Derived/CMoD3m.cpp ZeroOneTSS. A template
-    // colour already carries stage 0's MODULATE2X (the /128 normalise), so an input of 0.25
-    // here stands for a retail D of 0.125.
+    // ffxi_particle.wgsl runs retail's fixed-function tables per stage with D3D8 saturation
+    // after every op; this mirror reproduces that math in Rust so the canonical values are
+    // pinned without a GPU. The WGSL is the source of truth — keep the two in lockstep.
     mod stage_chain {
         use super::*;
 
-        // NonZeroTwoTSS: rgb = 4*D*T*F, alpha = 8*D.a*T.a*F.a, with T left to the sampler.
-        #[test]
-        fn textured_default_reaches_the_retail_totals_below_saturation() {
-            let (rgb, alpha) = d3m_stage_chain(
-                Vec3::splat(0.25),
-                0.25,
-                Vec3::splat(0.25),
-                0.25,
-                false,
-                D3mDrawPath::D3m,
-            );
-            assert_eq!(rgb, Vec3::splat(4.0 * 0.125 * 0.25));
-            assert_eq!(alpha, 8.0 * 0.125 * 0.25);
+        const STAGE_MODULATE_2X: f32 = 2.0;
+        const STAGE_MODULATE_4X: f32 = 4.0;
+
+        // Mirror of ffxi_particle.wgsl fragment(): d is the template colour (D3m/sheet stored
+        // /128, MMB raw byte/255), texel the sampled T (white on untextured paths), f the
+        // per-particle factor in raw byte/255. DoD3mDraw's textured table modulates TEXTURE
+        // against CURRENT with a4 set and against TFACTOR with it clear, stage 1 taking the
+        // other argument — both channels.
+        fn retail_stages(
+            path: D3mDrawPath,
+            ignore_texture_alpha: bool,
+            d: Vec4,
+            texel: Vec4,
+            f: Vec4,
+        ) -> [f32; 4] {
+            let d = d.min(Vec4::ONE);
+            let (s0_rgb, s0_a) = match path {
+                D3mDrawPath::D3m => (
+                    Vec3::new(
+                        (STAGE_MODULATE_2X * d.x * texel.x).min(1.0),
+                        (STAGE_MODULATE_2X * d.y * texel.y).min(1.0),
+                        (STAGE_MODULATE_2X * d.z * texel.z).min(1.0),
+                    ),
+                    if ignore_texture_alpha {
+                        d.w
+                    } else {
+                        (STAGE_MODULATE_2X * d.w * texel.w).min(1.0)
+                    },
+                ),
+                D3mDrawPath::Mmb => (
+                    if ignore_texture_alpha {
+                        Vec3::new(d.x * texel.x, d.y * texel.y, d.z * texel.z)
+                    } else {
+                        Vec3::new(texel.x * f.x, texel.y * f.y, texel.z * f.z)
+                    },
+                    if ignore_texture_alpha {
+                        d.w
+                    } else {
+                        (STAGE_MODULATE_2X * f.w * texel.w).min(1.0)
+                    },
+                ),
+                D3mDrawPath::Untextured => (Vec3::new(d.x, d.y, d.z), d.w),
+            };
+            let (rgb_gain, arg) = match path {
+                D3mDrawPath::Mmb => (STAGE_MODULATE_4X, if ignore_texture_alpha { f } else { d }),
+                _ => (STAGE_MODULATE_2X, f),
+            };
+            [
+                (rgb_gain * s0_rgb.x * arg.x).min(1.0),
+                (rgb_gain * s0_rgb.y * arg.y).min(1.0),
+                (rgb_gain * s0_rgb.z * arg.z).min(1.0),
+                (STAGE_MODULATE_4X * s0_a * arg.w).min(1.0),
+            ]
         }
 
-        // NonZeroOneTSS (renderStateFlags 0x1000): stage 0 selects D.a instead of modulating it
-        // with the texture alpha, so the total is 4*D.a*F.a — half the default, rgb untouched.
+        // NonZeroTwoTSS: rgb = 4*D*T*F, alpha = 8*D.a*T.a*F.a below saturation. A template
+        // colour of 0.25 is a D3m byte-64 vertex — stage 0's MODULATE2X already folded in by
+        // the /128 normalise.
         #[test]
-        fn ignoring_texture_alpha_halves_the_alpha_total() {
-            let two = d3m_stage_chain(
-                Vec3::splat(0.25),
-                0.25,
-                Vec3::splat(0.25),
-                0.25,
-                false,
+        fn d3m_textured_default_reaches_the_retail_totals() {
+            let out = retail_stages(
                 D3mDrawPath::D3m,
+                false,
+                Vec4::splat(0.25),
+                Vec4::ONE,
+                Vec4::splat(0.25),
             );
-            let one = d3m_stage_chain(
-                Vec3::splat(0.25),
-                0.25,
-                Vec3::splat(0.25),
-                0.25,
+            assert_eq!(out[..3], [4.0 * 0.25 * 1.0 * 0.25; 3]);
+            assert!((out[3] - 8.0 * 0.25 * 1.0 * 0.25).abs() < 1e-6);
+        }
+
+        // NonZeroOneTSS (renderStateFlags 0x1000): stage 0's alpha is SELECTARG1(D.a) — no
+        // texture alpha, no doubling — so with a full-alpha texel the TwoTSS table doubles
+        // the vertex alpha and OneTSS halves the total; rgb untouched.
+        #[test]
+        fn d3m_ignoring_texture_alpha_halves_the_alpha_total() {
+            let texel = Vec4::new(1.0, 1.0, 1.0, 1.0);
+            let two = retail_stages(
+                D3mDrawPath::D3m,
+                false,
+                Vec4::splat(0.25),
+                texel,
+                Vec4::splat(0.25),
+            );
+            let one = retail_stages(
+                D3mDrawPath::D3m,
                 true,
-                D3mDrawPath::D3m,
+                Vec4::splat(0.25),
+                texel,
+                Vec4::splat(0.25),
             );
-            assert_eq!(one.1, two.1 / 2.0);
-            assert_eq!(one.0, two.0);
+            assert_eq!(one[..3], two[..3]);
+            assert!((one[3] - two[3] / 2.0).abs() < 1e-6);
         }
 
-        // D3D saturates each stage on its own: a 0xFF vertex byte clips at stage 0, so stage 1's
-        // MODULATE4X starts from 1.0 instead of carrying the excess through it.
+        // D3D saturates each stage on its own: a byte-255 vertex (stored 2.0 at /128) clips to
+        // 1.0 before the texel multiply, so stage 1 starts from the clamped value.
         #[test]
-        fn stage_zero_saturates_before_the_stage_one_gain() {
-            let vert = u8::MAX as f32 / ffxi_dat::d3m::VERTEX_COLOR_DIVISOR;
-            let (rgb, alpha) = d3m_stage_chain(
-                Vec3::splat(vert),
-                vert,
-                Vec3::ONE,
-                0.15,
+        fn d3m_stage_zero_saturates_before_the_texel_and_factor() {
+            let out = retail_stages(
+                D3mDrawPath::D3m,
                 false,
-                D3mDrawPath::D3m,
+                Vec4::splat(u8::MAX as f32 / ffxi_dat::d3m::VERTEX_COLOR_DIVISOR),
+                Vec4::ONE,
+                Vec4::new(1.0, 1.0, 1.0, 0.15),
             );
-            assert_eq!(alpha, D3M_STAGE_CLAMP * 0.15 * D3M_STAGE1_ALPHA_GAIN);
-            assert_eq!(rgb, Vec3::splat(D3M_STAGE_CLAMP * D3M_STAGE1_RGB_GAIN));
+            assert_eq!(out[..3], [1.0; 3]);
+            assert!((out[3] - STAGE_MODULATE_4X * 0.15).abs() < 1e-6);
         }
 
-        // Stage 1's own saturation is ffxi_particle.wgsl's, because it has to land after the
-        // texel multiply. Clamping the gain away here is what left the D3m 4x/8x MODULATE
-        // unable to lift a sub-unit texel to retail's ceiling.
+        // ZeroOneTSS: a textureless D3m submesh is one stage against TFACTOR. An identity
+        // (byte-128) vertex stores as 1.0 at /128, so under an identity raw factor the rgb
+        // saturates to retail's full — the PS2 "0x80 = 1.0" convention expressed in stages.
         #[test]
-        fn the_stage_one_gain_leaves_the_cpu_unsaturated_for_the_shader_to_clamp() {
-            let (rgb, alpha) =
-                d3m_stage_chain(Vec3::ONE, 1.0, Vec3::ONE, 1.0, false, D3mDrawPath::D3m);
-            assert_eq!(rgb, Vec3::splat(D3M_STAGE1_RGB_GAIN));
-            assert_eq!(alpha, D3M_STAGE1_ALPHA_GAIN);
-        }
-
-        // ZoneRenderer.cpp ZoneRenderer::DoD3mDraw — with no texture bound the chain is a single
-        // MODULATE2X / MODULATE4X stage against TEXTUREFACTOR, so an identity (0x80) vertex under
-        // an identity generator colour stays mid-grey rather than doubling to white. Lower
-        // Jeuno's sea base plane (`col1` -> tshimonolowcol, untextured) is exactly that case.
-        #[test]
-        fn an_untextured_mmb_takes_the_one_stage_table() {
-            let identity = 0x80 as f32 / ffxi_dat::d3m::VERTEX_COLOR_DIVISOR;
+        fn d3m_untextured_identity_vertex_reaches_full() {
+            let stored = 0x80 as f32 / ffxi_dat::d3m::VERTEX_COLOR_DIVISOR;
             let factor = 0x80 as f32 / u8::MAX as f32;
-            let (rgb, alpha) = d3m_stage_chain(
-                Vec3::splat(identity),
-                identity,
-                Vec3::splat(factor),
-                factor,
+            let out = retail_stages(
+                D3mDrawPath::Untextured,
                 false,
-                D3mDrawPath::MmbUntextured,
+                Vec4::splat(stored),
+                Vec4::ONE,
+                Vec4::splat(factor),
             );
-            assert!((rgb.x - identity * factor).abs() < 1e-6, "rgb {rgb}");
-            assert!(
-                (alpha - identity * factor * 2.0).abs() < 1e-6,
-                "alpha {alpha}"
-            );
-            let (textured, _) = d3m_stage_chain(
-                Vec3::splat(identity),
-                identity,
-                Vec3::splat(factor),
-                factor,
+            // The unsaturated products run past 1.0; D3D clamps at the stage boundary.
+            assert!((out[0] - (STAGE_MODULATE_2X * stored * factor).min(1.0)).abs() < 1e-6);
+            assert_eq!(out[0], 1.0, "byte-128 vertex under byte-128 factor is full");
+            assert!((out[3] - (STAGE_MODULATE_4X * stored * factor).min(1.0)).abs() < 1e-6);
+        }
+
+        // DoD3mDraw untextured: MMB colours are raw byte/255 (no upload doubling), so the same
+        // identity inputs land at half the D3m brightness — 0.504 rgb, saturated alpha.
+        #[test]
+        fn mmb_untextured_runs_the_raw_byte_tables() {
+            let identity = 0x80 as f32 / u8::MAX as f32;
+            let out = retail_stages(
+                D3mDrawPath::Untextured,
                 false,
+                Vec4::splat(identity),
+                Vec4::ONE,
+                Vec4::splat(identity),
+            );
+            assert!((out[0] - STAGE_MODULATE_2X * identity * identity).abs() < 1e-6);
+            assert_eq!(out[3], 1.0, "alpha saturates: 4 * (128/255)^2 > 1");
+        }
+
+        // DoD3mDraw textured: with a full-alpha/full-colour texel the a4-clear ordering
+        // (stage 0 MODULATE(T,TFACTOR), stage 1 MODULATE4X(CURRENT, DIFFUSE)) lands on the
+        // same total as T*D*F — the doubling lives at stage 1 only.
+        #[test]
+        fn mmb_textured_doubles_only_at_stage_one() {
+            let out = retail_stages(
                 D3mDrawPath::Mmb,
+                false,
+                Vec4::splat(0.5),
+                Vec4::ONE,
+                Vec4::splat(0.25),
             );
-            assert!((textured.x - rgb.x * 2.0).abs() < 1e-6);
-            let (_, forced) = d3m_stage_chain(
-                Vec3::splat(identity),
-                identity,
-                Vec3::splat(factor),
-                factor,
-                true,
-                D3mDrawPath::MmbUntextured,
+            assert!((out[0] - STAGE_MODULATE_4X * 0.5 * 1.0 * 0.25).abs() < 1e-6);
+        }
+
+        // DoD3mDraw a4-clear alpha lane: MODULATE2X(TEXTURE, TFACTOR) at stage 0 — the factor,
+        // not the vertex alpha — then MODULATE4X(CURRENT, DIFFUSE).
+        #[test]
+        fn mmb_a4_clear_alpha_takes_the_factor_at_stage_zero() {
+            let out = retail_stages(
+                D3mDrawPath::Mmb,
+                false,
+                Vec4::new(1.0, 1.0, 1.0, 0.5),
+                Vec4::new(1.0, 1.0, 1.0, 0.5),
+                Vec4::new(1.0, 1.0, 1.0, 0.25),
             );
-            assert_eq!(forced, alpha);
+            let s0a = (STAGE_MODULATE_2X * 0.25 * 0.5).min(1.0);
+            assert!((out[3] - (STAGE_MODULATE_4X * s0a * 0.5).min(1.0)).abs() < 1e-6);
         }
 
         // CMoD3mElem.cpp CMoD3mElem::DoMMBDraw — DoMMBDraw forces the ignore-texture-alpha table at blend byte
@@ -3148,21 +4801,30 @@ mod tests {
             assert_eq!(promote(0x03, D3mDrawPath::D3m, at_threshold), at_threshold);
         }
 
-        fn vertex_colors(g: &LiveGenerator) -> Vec<[f32; 4]> {
+        // The mesh carries D (template colour, COLOR) and F (per-particle factor, TANGENT
+        // slot) as separate attributes — the shader runs the table against both.
+        fn mesh_colors_and_factors(g: &LiveGenerator) -> (Vec<[f32; 4]>, Vec<[f32; 4]>) {
             let mut mesh = empty_mesh();
-            rebuild_mesh(
-                g,
-                view(Quat::IDENTITY),
-                &CelestialClock::default(),
-                &mut mesh,
-            );
-            match mesh.attribute(Mesh::ATTRIBUTE_COLOR) {
+            // Authored fixed-function factors are the subject here — pin a neutral wash lift
+            // (the default carries the box's slider seed, which multiplies this D3m path).
+            let clock = CelestialClock {
+                wash_alpha_lift: 1.0,
+                ..CelestialClock::default()
+            };
+            rebuild_mesh(g, view(Quat::IDENTITY), &clock, &mut mesh);
+            let colors = match mesh.attribute(Mesh::ATTRIBUTE_COLOR) {
                 Some(bevy::mesh::VertexAttributeValues::Float32x4(v)) => v.clone(),
                 _ => panic!("expected Float32x4 vertex colours"),
-            }
+            };
+            let factors = match mesh.attribute(Mesh::ATTRIBUTE_TANGENT) {
+                Some(bevy::mesh::VertexAttributeValues::Float32x4(v)) => v.clone(),
+                _ => panic!("expected Float32x4 particle factors"),
+            };
+            (colors, factors)
         }
 
-        // One particle at half life, where the untracked alpha curve gives F.a = 0.5.
+        // One particle at half life; a trackless generator holds its authored init_color[3]
+        // (1.0 here) as F.a for the whole element life — retail has no life-based fade.
         fn half_life_gen(blend: ffxi_dat::particle_gen::ParticleBlend, byte: u8) -> LiveGenerator {
             let mut d = def(100.0, 1.0, 1);
             d.blend = blend;
@@ -3172,11 +4834,13 @@ mod tests {
             set_template_color(&mut g, Vec3::ONE.extend(0.5));
             g.particles.push(Particle {
                 pos: Vec3::ZERO,
+                spawn_pos: Vec3::ZERO,
                 spawn_origin: Vec3::ZERO,
                 vel: Vec3::ZERO,
                 age_frames: 50.0,
                 life_frames: 100.0,
                 rgb: Vec3::ONE,
+                color_transform: None,
                 scale: Vec2::ONE,
                 scale_seed: Vec2::ONE,
                 scale_vel: Vec2::ZERO,
@@ -3184,59 +4848,83 @@ mod tests {
                 spin: Vec3::ZERO,
                 negate_rotation_y: false,
                 rel_vel: Vec3::ZERO,
+                vel_rot: Vec3::ZERO,
                 osc: None,
+                id: 0,
+                child_gens: Vec::new(),
+                pending_child_factories: Vec::new(),
             });
             g
         }
 
+        // The template colour reaches the mesh verbatim as D; the stage gains live in the
+        // shader, so nothing is folded into the attribute here.
         #[test]
-        fn blended_particle_carries_the_stage_one_rgb_gain() {
+        fn blended_particle_carries_the_template_colour_verbatim() {
             let mut g = half_life_gen(ffxi_dat::particle_gen::ParticleBlend::Blend, 0x03);
             set_template_color(&mut g, Vec3::splat(0.25).extend(0.5));
-            for c in vertex_colors(&g) {
-                assert_eq!([c[0], c[1], c[2]], [0.5, 0.5, 0.5]);
+            let (colors, _) = mesh_colors_and_factors(&g);
+            for c in &colors {
+                assert_eq!(*c, [0.25, 0.25, 0.25, 0.5]);
             }
         }
 
+        // The factor attribute carries the authored init_color (F.a = 1.0 here, held constant
+        // over life — retail has no life fade), and the template's vertex alpha stays its own
+        // value in COLOR; the shader's MODULATE4X does the combining.
         #[test]
-        fn blended_particle_alpha_scales_with_vertex_alpha() {
+        fn blended_particle_factor_carries_the_authored_alpha() {
             let mut g = half_life_gen(ffxi_dat::particle_gen::ParticleBlend::Blend, 0x03);
             set_template_color(&mut g, Vec3::ONE.extend(0.25));
-            for c in vertex_colors(&g) {
-                assert_eq!(c[3], 0.5);
+            let (colors, factors) = mesh_colors_and_factors(&g);
+            for c in &colors {
+                assert_eq!(c[3], 0.25);
+            }
+            for f in &factors {
+                assert_eq!(f[3], 1.0);
             }
         }
 
-        // The 0x44 promotion lifts F.a 0.5 -> 1.0 before the stage math.
+        // The 0x44 promotion lifts F.a from its raw byte value to full before the stage math.
         #[test]
         fn blend_byte_44_promotes_the_particle_alpha() {
             let mut g = half_life_gen(ffxi_dat::particle_gen::ParticleBlend::Blend, 0x44);
+            // The authored alpha (retail's constant field_F8.a) the promotion acts on.
+            g.def.init_color[3] = 0.5;
             set_template_color(&mut g, Vec3::ONE.extend(0.125));
-            let promoted = vertex_colors(&g)[0][3];
+            let (_, promoted) = mesh_colors_and_factors(&g);
             g.def.blend_byte = 0x03;
-            let unpromoted = vertex_colors(&g)[0][3];
-            assert_eq!(promoted, 0.5);
-            assert_eq!(unpromoted, 0.25);
+            let (_, unpromoted) = mesh_colors_and_factors(&g);
+            assert_eq!(promoted[0][3], 1.0, "byte >= 0x7F promotes to full");
+            assert!(
+                (unpromoted[0][3] - expected_factor_alpha(0.5)).abs() < 1e-6,
+                "raw byte/255 stays raw"
+            );
         }
 
-        // An additive element hands the life curve to the blend state as src alpha instead of
+        // An additive element hands its alpha to the blend state as src alpha instead of
         // pre-multiplying it into rgb, so the shader's premultiply applies it to the colour
-        // stage 1 already saturated — retail's order.
+        // stage 1 already saturated — retail's order. The factor is the authored 0x16 value,
+        // held constant mid-life (CMoElem.cpp VirtOt1: no life-based fade).
         #[test]
-        fn additive_particle_carries_the_life_curve_as_src_alpha() {
+        fn additive_particle_carries_the_authored_alpha_as_src_alpha() {
             let mut g = half_life_gen(ffxi_dat::particle_gen::ParticleBlend::Additive, 0x48);
             set_template_color(&mut g, Vec3::splat(0.25).extend(0.5));
-            for c in vertex_colors(&g) {
-                assert_eq!([c[0], c[1], c[2]], [0.5, 0.5, 0.5]);
-                assert_eq!(c[3], 0.5);
+            let (colors, factors) = mesh_colors_and_factors(&g);
+            for c in &colors {
+                assert_eq!(*c, [0.25, 0.25, 0.25, 0.5]);
+            }
+            for f in &factors {
+                assert_eq!(f[3], 1.0);
             }
         }
 
         // The home point's `sil` curtain (ROM/3/25.DAT) authors its plume as a per-vertex
-        // white -> purple -> black ramp up each strip. Folding the stage chain once per
-        // particle instead of once per vertex drew the whole strip at the first vertex's
-        // white, which is what made the rising streaks read as lit rectangles with no purple
-        // and no fade-out at the top.
+        // white -> purple -> black ramp up each strip. Folding the colour once per particle
+        // instead of keeping it per vertex drew the whole strip at the first vertex's white,
+        // which is what made the rising streaks read as lit rectangles with no purple and no
+        // fade-out at the top. The mesh carries the gradient verbatim; the shader applies the
+        // table against it per fragment.
         #[test]
         fn a_template_colour_gradient_survives_into_the_mesh() {
             const WHITE: Vec4 = Vec4::ONE;
@@ -3246,29 +4934,27 @@ mod tests {
             let mut g = half_life_gen(ffxi_dat::particle_gen::ParticleBlend::Additive, 0x48);
             g.template.colors = vec![WHITE, PURPLE, BLACK];
 
-            let drawn = vertex_colors(&g);
+            let (drawn, _) = mesh_colors_and_factors(&g);
             assert_eq!(drawn.len(), 3, "one colour per template vertex");
-            assert!(drawn[0][0] > drawn[1][0], "white end outshines the purple");
-            assert!(
-                drawn[1][2] > drawn[1][0] && drawn[1][2] > drawn[1][1],
-                "the purple vertex stays blue-dominant: {:?}",
-                drawn[1]
-            );
+            assert_eq!(drawn[0], WHITE.to_array());
+            assert_eq!(drawn[1], PURPLE.to_array());
             assert_eq!(
-                [drawn[2][0], drawn[2][1], drawn[2][2]],
-                [0.0, 0.0, 0.0],
+                drawn[2],
+                BLACK.to_array(),
                 "the black end adds nothing, so an additive plume fades out"
             );
         }
 
-        // The life curve is the raw one, not the saturating stage-1 alpha — that would hold an
-        // additive spray at full brightness until the last quarter of its life.
+        // Retail applies no life-based fade: VirtOt1 scales field_F8's alpha by field_138 *
+        // field_134, both 1.0 (CYyGenerator.cpp ElemIdle sets field_138; the CMoElem ctor
+        // initialises field_134 and nothing writes it), so a trackless additive spray holds its
+        // authored brightness to end of life.
         #[test]
-        fn additive_brightness_still_fades_late_in_life() {
+        fn additive_brightness_holds_the_authored_alpha_to_end_of_life() {
             let mut g = half_life_gen(ffxi_dat::particle_gen::ParticleBlend::Additive, 0x48);
             g.particles[0].age_frames = 90.0;
-            let late = vertex_colors(&g)[0][3];
-            assert!((late - (1.0 - 0.9f32)).abs() < 1e-6, "{late}");
+            let (_, factors) = mesh_colors_and_factors(&g);
+            assert_eq!(factors[0][3], 1.0, "no life fade: the authored alpha holds");
         }
     }
 
@@ -3313,7 +4999,7 @@ mod tests {
     // would otherwise add behind them.
     #[test]
     fn rotation_velocity_variance_spreads_the_spin_per_particle() {
-        let mut d = def(120.0, 1.0, 8);
+        let mut d = def(120.0, 1.0, 7);
         d.camera_billboard = false;
         d.rotation_velocity = Some([0.0, 0.01, 0.0]);
         d.rotation_velocity_variance = Some([0.0, 0.005, 0.0]);
@@ -3355,7 +5041,7 @@ mod tests {
     // original eight, not the re-emissions it would otherwise add behind them.
     #[test]
     fn scale_velocity_variance_spreads_the_rate_per_particle() {
-        let mut d = def(120.0, 1.0, 8);
+        let mut d = def(120.0, 1.0, 7);
         d.scale_velocity = Some([0.0, 0.01, 0.0]);
         d.scale_velocity_variance = Some([0.0, 0.005, 0.0]);
         d.scale_updater = true;
@@ -3393,7 +5079,7 @@ mod tests {
     // — scale += posRand(v); retail's ElemGenerate case 0x11 adds a single ufrand to x, y, z).
     #[test]
     fn single_scale_variance_spreads_the_scale_per_particle() {
-        let mut d = def(120.0, 1.0, 8);
+        let mut d = def(120.0, 1.0, 7);
         d.single_scale_variance = Some(0.05);
         let mut g = live(d, 1000.0);
         advance(&mut g, 1.0);
@@ -3419,7 +5105,7 @@ mod tests {
     // CYyGenerator::ElemGenerate case 0x10 — field_EC.x/y/z += ufrand(payload)).
     #[test]
     fn scale_variance_spreads_each_axis_independently() {
-        let mut d = def(120.0, 1.0, 16);
+        let mut d = def(120.0, 1.0, 15);
         d.scale_variance = Some([0.2, 0.1, 0.0]);
         let mut g = live(d, 1000.0);
         advance(&mut g, 1.0);
@@ -3473,7 +5159,7 @@ mod tests {
     // would otherwise add behind them.
     #[test]
     fn scale_velocity_grows_the_scale_per_frame() {
-        let mut d = def(120.0, 1.0, 8);
+        let mut d = def(120.0, 1.0, 7);
         d.scale_velocity = Some([0.0, 0.01, 0.0]);
         d.scale_updater = true;
         let mut g = live(d, 1000.0);
@@ -3585,6 +5271,308 @@ mod tests {
         assert!(count(&mesh) > 0, "empty rebuild must not be zero-length");
     }
 
+    // sec3 0x2E DrawDistanceUpdater: the element's alpha fades linearly from full at `near`
+    // to zero at `far` by camera distance and is culled beyond (research/XIClient/src/
+    // XIClient/source/World/Generator/CYyGenerator.cpp CYyGenerator::ElemIdle case 0x2E;
+    // research/xim ParticleUpdaters.kt DrawDistanceUpdater).
+    #[test]
+    fn draw_distance_fades_alpha_and_culls_beyond_far() {
+        let make = |near: Option<f32>, far: Option<f32>| -> LiveGenerator {
+            let mut d = def(120.0, 1.0, 1);
+            d.camera_billboard = false;
+            d.continuous = true;
+            d.draw_distance_near = near;
+            d.draw_distance_far = far;
+            let mut g = live(d, 1000.0);
+            advance(&mut g, 1.0);
+            assert_eq!(g.particles.len(), 1);
+            g
+        };
+        let clock = CelestialClock::default();
+        let cam = view(Quat::IDENTITY);
+        let alphas = |g: &LiveGenerator| -> Vec<f32> {
+            use bevy::mesh::VertexAttributeValues;
+            let mut mesh = empty_mesh();
+            rebuild_mesh(g, cam, &clock, &mut mesh);
+            match mesh.attribute(Mesh::ATTRIBUTE_TANGENT) {
+                Some(VertexAttributeValues::Float32x4(v)) => v.iter().map(|c| c[3]).collect(),
+                _ => panic!("rebuilt mesh has f32x4 factors"),
+            }
+        };
+
+        // Inside `near` the fade is 1.0: identical to a generator without the updater.
+        let mut plain = make(None, None);
+        plain.origin = Vec3::new(5.0, 0.0, 0.0);
+        let mut faded = make(Some(10.0), Some(20.0));
+        faded.origin = Vec3::new(5.0, 0.0, 0.0);
+        assert_eq!(alphas(&plain), alphas(&faded));
+
+        // Mid-band: the fade is (far - dist) / (far - near) = 0.5.
+        plain.origin = Vec3::new(15.0, 0.0, 0.0);
+        faded.origin = Vec3::new(15.0, 0.0, 0.0);
+        let full = alphas(&plain);
+        let half = alphas(&faded);
+        assert!(
+            full.iter().all(|a| *a > 0.0),
+            "the plain generator draws at mid-band"
+        );
+        for (f, h) in full.iter().zip(half.iter()) {
+            assert!((h - f * 0.5).abs() < 1e-6, "mid-band fade: {f} vs {h}");
+        }
+
+        // Beyond `far` the element is culled from the draw list: only the hidden primitive.
+        faded.origin = Vec3::new(30.0, 0.0, 0.0);
+        let mut mesh = empty_mesh();
+        rebuild_mesh(&faded, cam, &clock, &mut mesh);
+        assert_eq!(mesh.count_vertices(), HIDDEN_PRIMITIVE_VERTS);
+    }
+
+    // sec2 0x21..0x23 + sec3 0x0F..0x11: a bound track replaces the position channel each
+    // frame, key 0 seeded from the spawn-time value (research/xim ParticleUpdaters.kt
+    // ProgressValueUpdater — p.position.x = v).
+    #[test]
+    fn position_tracks_replace_the_channel() {
+        let make = |track: Option<ffxi_dat::particle_gen::KeyFrameTrack>| -> LiveGenerator {
+            let mut d = def(120.0, 1.0, 1);
+            d.camera_billboard = false;
+            d.continuous = true;
+            let mut g = live(d, 1000.0);
+            g.position_x = track;
+            advance(&mut g, 1.0);
+            assert_eq!(g.particles.len(), 1);
+            // Pin the element at half life: progress is what the track samples.
+            g.particles[0].age_frames = g.particles[0].life_frames * 0.5;
+            g
+        };
+        let cam = view(Quat::IDENTITY);
+        let x_at = |g: &LiveGenerator| rebuilt(g, cam).0[0].x;
+
+        // No track: the channel keeps its spawn value.
+        assert_eq!(x_at(&make(None)), 0.0);
+
+        // Track (0 -> 5): key 0 is overridden by the spawn value 0, so at half life the
+        // channel is halfway to 5.
+        let g = make(Some(ffxi_dat::particle_gen::KeyFrameTrack {
+            points: vec![(0.0, 99.0), (1.0, 5.0)],
+        }));
+        assert!((x_at(&g) - 2.5).abs() < 1e-6);
+    }
+
+    // sec3 0x2C VelocityDampener: each frame the velocity is scaled by dampen^dt before the
+    // position step, so the displacement is a geometric series (research/xim
+    // ParticleUpdaters.kt VelocityDampener).
+    #[test]
+    fn velocity_dampener_decays_the_velocity() {
+        let make = |dampen: Option<f32>| -> LiveGenerator {
+            let mut d = def(100.0, 1.0, 1);
+            d.continuous = true;
+            d.init_velocity = [1.0, 0.0, 0.0];
+            d.velocity_dampener = dampen.map(|v| [v, 0.0]);
+            let mut g = live(d, 1000.0);
+            advance(&mut g, 1.0);
+            assert_eq!(g.particles.len(), 1);
+            g.stopped = true;
+            for _ in 0..3 {
+                advance(&mut g, 1.0);
+            }
+            g
+        };
+        // No dampener: three unit steps.
+        let plain = make(None);
+        assert!((plain.particles[0].pos.x - 3.0).abs() < 1e-6);
+        // Dampen 0.5: the step halves each tick — 0.5 + 0.25 + 0.125.
+        let damped = make(Some(0.5));
+        assert!((damped.particles[0].pos.x - 0.875).abs() < 1e-6);
+    }
+
+    // sec2 0x69 + sec3 0x44: the bound track overrides the authored base factor per frame —
+    // a constant-1.0 track disables the decay entirely (research/xim ParticleUpdaters.kt
+    // VelocityDampener getDampeningFactor).
+    #[test]
+    fn dampening_factor_track_overrides_the_base() {
+        let mut d = def(100.0, 1.0, 1);
+        d.continuous = true;
+        d.init_velocity = [1.0, 0.0, 0.0];
+        d.velocity_dampener = Some([0.5, 0.0]);
+        d.dampening_factor_applier = true;
+        let mut g = live(d, 1000.0);
+        g.dampening_factor = Some(ffxi_dat::particle_gen::KeyFrameTrack {
+            points: vec![(0.0, 1.0), (1.0, 1.0)],
+        });
+        advance(&mut g, 1.0);
+        assert_eq!(g.particles.len(), 1);
+        g.stopped = true;
+        for _ in 0..3 {
+            advance(&mut g, 1.0);
+        }
+        assert!((g.particles[0].pos.x - 3.0).abs() < 1e-6);
+    }
+
+    // sec3 0x26 VelocityRotator: the rotateAmount accumulates into the velocity rotation at
+    // half rate per frame and turns the trajectory; an actor-local generator authors it in
+    // actor space, where z is forward — xim swaps the axes to (-z, y, x) for those
+    // (research/xim ParticleUpdaters.kt VelocityRotator).
+    #[test]
+    fn velocity_rotator_turns_the_trajectory() {
+        let make = |actor_local: bool| -> LiveGenerator {
+            let mut d = def(100.0, 1.0, 1);
+            d.continuous = true;
+            if actor_local {
+                d.init_velocity = [0.0, 1.0, 0.0];
+            } else {
+                d.init_velocity = [1.0, 0.0, 0.0];
+            }
+            d.velocity_rotator = Some([0.0, 0.0, std::f32::consts::FRAC_PI_2]);
+            let mut g = live(d, 1000.0);
+            g.actor_local = actor_local;
+            advance(&mut g, 1.0);
+            assert_eq!(g.particles.len(), 1);
+            g.stopped = true;
+            for _ in 0..4 {
+                advance(&mut g, 1.0);
+            }
+            g
+        };
+        // World-space: the authored z amount rotates about z — four half-rate quarter-turns
+        // land the +x velocity on −x.
+        let world = make(false);
+        assert!((world.particles[0].pos.x - (-1.0)).abs() < 1e-5);
+        // Actor-local: the same authored z amount becomes a negative x rotation — the y
+        // velocity swings through +z and ends on −y.
+        let local = make(true);
+        assert!((local.particles[0].pos.y - (-1.0)).abs() < 1e-5);
+        assert!(
+            (local.particles[0].pos.z - (std::f32::consts::SQRT_2 + 1.0)).abs() < 1e-5,
+            "actor-local z sweep: {}",
+            local.particles[0].pos.z
+        );
+    }
+
+    // sec3 0x2F VelocityRotationUpdater: all velocity collapses into +x and the particle's
+    // rotation becomes the velocity rotation (research/xim ParticleUpdaters.kt
+    // VelocityRotationUpdater).
+    #[test]
+    fn velocity_rotation_updater_collapses_into_x() {
+        let mut d = def(100.0, 1.0, 1);
+        d.continuous = true;
+        d.init_velocity = [3.0, 4.0, 0.0];
+        d.velocity_rotation_updater = true;
+        let mut g = live(d, 1000.0);
+        advance(&mut g, 1.0);
+        assert_eq!(g.particles.len(), 1);
+        g.stopped = true;
+        advance(&mut g, 1.0);
+        let p = &g.particles[0];
+        // |vel| + |rel_vel| = 5 on +x; the zero rotation keeps it there.
+        assert!((p.vel.x - 5.0).abs() < 1e-6 && p.vel.y.abs() < 1e-6);
+        assert!((p.pos.x - 5.0).abs() < 1e-6);
+    }
+
+    // sec2 0x31 RandomVelocitySetup: the base velocity is replaced by one [0, v) draw shared
+    // by all three axes (research/xim ParticleInitializers.kt RandomVelocitySetup).
+    #[test]
+    fn random_velocity_replaces_the_base() {
+        let make = |random: Option<f32>| -> LiveGenerator {
+            let mut d = def(100.0, 1.0, 1);
+            d.init_velocity = [9.0, 9.0, 9.0];
+            d.random_velocity = random;
+            let mut g = live(d, 1000.0);
+            advance(&mut g, 1.0);
+            // One burst: ppe plus retail's closing iteration.
+            assert_eq!(g.particles.len(), 2);
+            g
+        };
+        // Without the block the base survives.
+        for p in &make(None).particles {
+            assert!((p.vel - Vec3::new(9.0, 9.0, 9.0)).length() < 1e-6);
+        }
+        // With it, every axis carries the same draw in [0, v).
+        for p in &make(Some(2.0)).particles {
+            assert!((p.vel.x - p.vel.y).abs() < 1e-6 && (p.vel.y - p.vel.z).abs() < 1e-6);
+            assert!(
+                p.vel.x >= 0.0 && p.vel.x < 2.0,
+                "draw out of range: {}",
+                p.vel.x
+            );
+        }
+    }
+
+    // sec2 0x19 + sec3 0x0B: each frame rgb += (transform shr 7) × 0.5, in xim's raw byte
+    // space divided by the PS2 half-scale — a red transform of 256 adds 2 × 0.5 / 128 per
+    // frame (research/xim ParticleUpdaters.kt ColorTransformApplier).
+    #[test]
+    fn color_transform_applies_the_shifted_rate() {
+        let make = |applier: bool| -> LiveGenerator {
+            let mut d = def(100.0, 1.0, 1);
+            d.continuous = true;
+            d.color_transform = Some([256, -256, 0, 0]);
+            d.color_transform_applier = applier;
+            let mut g = live(d, 1000.0);
+            advance(&mut g, 1.0);
+            assert_eq!(g.particles.len(), 1);
+            g.stopped = true;
+            for _ in 0..4 {
+                advance(&mut g, 1.0);
+            }
+            g
+        };
+        let plain = make(false);
+        let applied = make(true);
+        // Four frames × (256 shr 7) × 0.5 / 255 on red, the negative of it on green.
+        let step = 4.0 * 2.0 * COLOR_TRANSFORM_STEP_HALF / COLOR_TRANSFORM_BYTE_SCALE;
+        assert!((applied.particles[0].rgb.x - plain.particles[0].rgb.x - step).abs() < 1e-6);
+        assert!((plain.particles[0].rgb.y - applied.particles[0].rgb.y - step).abs() < 1e-6);
+        // Blue untouched.
+        assert_eq!(applied.particles[0].rgb.z, plain.particles[0].rgb.z);
+    }
+
+    // sec3 0x0C: the transform drifts by floor(modifier × dt/30) per frame and the applier
+    // reads the drifted value — a red modifier of 960 adds 32/frame, so shr-7 stays 0 until
+    // frame 4 (research/xim ParticleUpdaters.kt ColorTransformModifier).
+    #[test]
+    fn color_transform_modifier_drifts_the_transform() {
+        let make = |modifier: Option<[i16; 4]>| -> LiveGenerator {
+            let mut d = def(100.0, 1.0, 1);
+            d.continuous = true;
+            d.color_transform = Some([0, 0, 0, 0]);
+            d.color_transform_applier = true;
+            d.color_transform_modifier = modifier;
+            let mut g = live(d, 1000.0);
+            advance(&mut g, 1.0);
+            assert_eq!(g.particles.len(), 1);
+            g.stopped = true;
+            for _ in 0..5 {
+                advance(&mut g, 1.0);
+            }
+            g
+        };
+        let plain = make(None);
+        let drifted = make(Some([960, 0, 0, 0]));
+        // Frames 4 and 5 each add 1 × 0.5 / 255 to red.
+        let expected = 2.0 * COLOR_TRANSFORM_STEP_HALF / COLOR_TRANSFORM_BYTE_SCALE;
+        assert!(
+            (drifted.particles[0].rgb.x - plain.particles[0].rgb.x - expected).abs() < 1e-6,
+            "drifted: {}",
+            drifted.particles[0].rgb.x
+        );
+    }
+
+    // sec2 0x1A: each element's transform gains round(posRand(1) × variance) per channel on
+    // top of the base (research/xim ParticleInitializers.kt ColorTransformVariance).
+    #[test]
+    fn color_transform_variance_spreads_the_base() {
+        let mut d = def(100.0, 1.0, 1);
+        d.color_transform = Some([100, 0, 0, 0]);
+        d.color_transform_variance = Some([-100, 0, 0, 0]);
+        let mut g = live(d, 1000.0);
+        advance(&mut g, 1.0);
+        assert!(!g.particles.is_empty());
+        for p in &g.particles {
+            let ct = p.color_transform.expect("setup allocates the transform");
+            assert!(ct[0] >= 0 && ct[0] <= 100, "draw out of range: {}", ct[0]);
+        }
+    }
+
     // sec2 0x3D + 0x3E with the sec3 0x29 applier: the particle's x position sways with the
     // applier's amplitude curve (research/xim ParticleUpdaters.kt OscillationApplier —
     // rate = 180f / 2 = 90, baseOffset 0, so the amplitude peaks at half a period, 90 frames,
@@ -3597,7 +5585,11 @@ mod tests {
         d.oscillation_applier_x = Some([2.0, 0.0, 0.0]);
         let mut g = live(d, 1000.0);
         advance(&mut g, 1.0);
-        assert_eq!(g.particles.len(), 1, "one particle");
+        assert_eq!(
+            g.particles.len(),
+            2,
+            "one per period plus retail's closing iteration"
+        );
         g.stopped = true;
         for _ in 0..90 {
             advance(&mut g, 1.0);
@@ -3623,7 +5615,11 @@ mod tests {
         d.oscillation_applier_z = Some([2.0, 0.0, 0.0]);
         let mut g = live(d, 1000.0);
         advance(&mut g, 1.0);
-        assert_eq!(g.particles.len(), 1, "one particle");
+        assert_eq!(
+            g.particles.len(),
+            2,
+            "one per period plus retail's closing iteration"
+        );
         g.stopped = true;
         for _ in 0..90 {
             advance(&mut g, 1.0);
@@ -3651,7 +5647,11 @@ mod tests {
         d.oscillation_applier_y = Some([2.0, 0.0, 0.0]);
         let mut g = live(d, 1000.0);
         advance(&mut g, 1.0);
-        assert_eq!(g.particles.len(), 1, "one particle");
+        assert_eq!(
+            g.particles.len(),
+            2,
+            "one per period plus retail's closing iteration"
+        );
         g.stopped = true;
         for _ in 0..90 {
             advance(&mut g, 1.0);
@@ -3693,6 +5693,7 @@ mod tests {
         g.stopped = true;
         g.particles.push(Particle {
             pos: Vec3::ZERO,
+            spawn_pos: Vec3::ZERO,
             spawn_origin: Vec3::ZERO,
             vel: Vec3::ZERO,
             age_frames: 0.0,
@@ -3705,10 +5706,15 @@ mod tests {
             spin: Vec3::ZERO,
             negate_rotation_y: false,
             rel_vel: Vec3::Y,
+            vel_rot: Vec3::ZERO,
+            color_transform: None,
             osc: Some(Oscillation {
                 accel: [0.5, 0.0, 0.0],
                 prev_amplitude: [0.0; 3],
             }),
+            id: 0,
+            child_gens: Vec::new(),
+            pending_child_factories: Vec::new(),
         });
         for _ in 0..90 {
             advance(&mut g, 1.0);
@@ -3732,11 +5738,13 @@ mod tests {
             let mut g = live(def(100.0, 1.0, 1), 100.0);
             g.particles.push(Particle {
                 pos: Vec3::new(1.0, 2.0, 3.0),
+                spawn_pos: Vec3::new(1.0, 2.0, 3.0),
                 spawn_origin: Vec3::ZERO,
                 vel: Vec3::ZERO,
                 age_frames: 50.0,
                 life_frames: 100.0,
                 rgb: Vec3::ONE,
+                color_transform: None,
                 scale: Vec2::ONE,
                 scale_seed: Vec2::ONE,
                 scale_vel: Vec2::ZERO,
@@ -3744,7 +5752,11 @@ mod tests {
                 spin: Vec3::ZERO,
                 negate_rotation_y: false,
                 rel_vel: Vec3::ZERO,
+                vel_rot: Vec3::ZERO,
                 osc: None,
+                id: 0,
+                child_gens: Vec::new(),
+                pending_child_factories: Vec::new(),
             });
             g
         }
@@ -3788,11 +5800,15 @@ mod tests {
             ));
         }
 
-        // Ageing feeds the untracked additive life curve through tfactor_alpha and the D3m
-        // stage chain into the key's colour, so an alpha change alone dirties the mesh.
+        // The D3m stage chain folds the element's alpha into the key's colour, so an alpha
+        // change alone dirties the mesh. Retail fades come from an explicit keyframe track
+        // (CMoElem.cpp VirtOt1 has no life-based fade), so drive the change through one.
         #[test]
         fn alpha_stage_change_rebuilds() {
             let mut g = one_particle_gen();
+            g.alpha = Some(ffxi_dat::particle_gen::KeyFrameTrack {
+                points: vec![(0.0, 1.0), (1.0, 0.25)],
+            });
             let built = mesh_key(&g, view(Quat::IDENTITY), &CelestialClock::default());
             g.particles[0].age_frames = 90.0;
             assert!(needs_rebuild(
@@ -3905,11 +5921,12 @@ mod tests {
     #[test]
     fn emits_one_per_period_over_window() {
         let mut g = live(def(100.0, 5.0, 1), 20.0);
-        // 20 frames at 1/frame, period 5 -> 4 emits within window (the emit at accum reset).
+        // 20 frames at 1/frame, period 5 -> 4 emits within window (the emit at accum reset),
+        // two particles each.
         for _ in 0..20 {
             advance(&mut g, 1.0);
         }
-        assert_eq!(g.particles.len(), 4);
+        assert_eq!(g.particles.len(), 8);
     }
 
     #[test]
@@ -3920,6 +5937,26 @@ mod tests {
         }
         // window 3 -> ~3 emitted, each lives 2 frames, all expired by frame 10.
         assert!(g.particles.is_empty());
+    }
+
+    // A dur=0 stage (hit1's g01x) must land its primed burst on the first tick even when that
+    // tick advances more than one frame — at 30 fps every tick is two frames.
+    #[test]
+    fn zero_window_emits_first_burst_on_a_long_first_tick() {
+        let mut g = live(def(20.0, 5.0, 3), 0.0);
+        g.emit_accum = def(20.0, 5.0, 3).frames_per_emission;
+        advance(&mut g, 2.0); // one 30 fps tick
+        assert_eq!(
+            g.particles.len(),
+            4,
+            "the primed burst lands on the first tick"
+        );
+        advance(&mut g, 2.0);
+        assert_eq!(
+            g.particles.len(),
+            4,
+            "a dur=0 generator emits exactly one burst"
+        );
     }
 
     // research/xim EffectRoutineParser.kt parseSection2 StopParticleGeneratorRoutine: the cast aura's
@@ -4096,7 +6133,7 @@ mod tests {
         // An infinite life pins life progress at 0, which is what keeps a keyframe-tracked
         // channel on the curve's opening value instead of racing to its end.
         assert!(
-            drawn_color(&g, &CelestialClock::default()).is_finite(),
+            drawn_factor(&g, &CelestialClock::default()).is_finite(),
             "infinite life must not poison the draw"
         );
     }
@@ -4157,7 +6194,11 @@ mod tests {
         d.velocity_variance = Some([0.001, 0.002, 0.003]);
         let mut g = live(d, 30.0);
         advance(&mut g, 5.0);
-        assert_eq!(g.particles.len(), 5, "one draw per particle");
+        assert_eq!(
+            g.particles.len(),
+            10,
+            "one draw per particle (two per period)"
+        );
         for p in &g.particles {
             assert!(
                 (-0.001..=0.001).contains(&p.vel.x)
@@ -4213,7 +6254,7 @@ mod tests {
         d.relative_velocity = Some(0.5);
         let mut g = live(d, 30.0);
         advance(&mut g, 1.0);
-        assert_eq!(g.particles.len(), 1);
+        assert_eq!(g.particles.len(), 2);
         let p = &g.particles[0];
         let extra = p.vel - Vec3::from_array([0.0, 0.01, 0.0]);
         let offset = p.pos;
@@ -4250,7 +6291,7 @@ mod tests {
         d.relative_velocity_variance = Some(0.2);
         let mut g = live(d, 30.0);
         advance(&mut g, 3.0);
-        assert_eq!(g.particles.len(), 3);
+        assert_eq!(g.particles.len(), 6);
         for p in &g.particles {
             let dir = p.pos.normalize();
             let extra = p.vel - Vec3::from_array([0.0, 0.01, 0.0]);
@@ -4268,28 +6309,30 @@ mod tests {
     }
 
     // 0x17 ColorVarianceSetup: each rgb channel gains its bound times one [0, 1) draw on top
-    // of the 0x16 base (research/xim ParticleInitializers.kt ColorVarianceSetup).
+    // of the 0x16 base (research/xim ParticleInitializers.kt ColorVarianceSetup). Both are raw
+    // D3DCOLOR bytes/255 and stay that way — the stage doubling happens in the shader.
     #[test]
     fn color_variance_spreads_each_channel_upward() {
         let mut d = def(10.0, 1.0, 1);
-        d.init_color = [0.5, 0.5, 0.5, 1.0];
-        d.color_variance = Some([0.5, 0.25, 0.125, 0.0]);
+        d.init_color = [0.2, 0.2, 0.2, 1.0];
+        d.color_variance = Some([0.3, 0.15, 0.075, 0.0]);
         let mut g = live(d, 30.0);
         advance(&mut g, 3.0);
-        assert_eq!(g.particles.len(), 3);
+        assert_eq!(g.particles.len(), 6);
         for p in &g.particles {
             let c = p.rgb;
+            // raw [base, base + bound) per channel.
             assert!(
-                (0.5..1.0).contains(&c.x),
-                "the red channel stays in [base, base + bound): {c:?}"
+                (0.2..0.5).contains(&c.x),
+                "the red channel stays in the raw [base, base + bound): {c:?}"
             );
             assert!(
-                (0.5..0.75).contains(&c.y),
-                "the green channel stays in [base, base + bound): {c:?}"
+                (0.2..0.35).contains(&c.y),
+                "the green channel stays in the raw [base, base + bound): {c:?}"
             );
             assert!(
-                (0.5..0.625).contains(&c.z),
-                "the blue channel stays in [base, base + bound): {c:?}"
+                (0.2..0.275).contains(&c.z),
+                "the blue channel stays in the raw [base, base + bound): {c:?}"
             );
         }
     }
@@ -4303,6 +6346,7 @@ mod tests {
         d.relative_velocity_variance = Some(0.2);
         let mut g = live(d, 30.0);
         advance(&mut g, 1.0);
+        // life=0 is retail's singleton marker: one particle, not the ppe+1 burst.
         assert_eq!(g.particles.len(), 1);
         assert_eq!(g.particles[0].vel, Vec3::from_array([0.0, 0.01, 0.0]));
     }
@@ -4317,7 +6361,7 @@ mod tests {
         d.reverse_displacement = Some(0.0);
         let mut g = live(d, 30.0);
         advance(&mut g, 1.0);
-        assert_eq!(g.particles.len(), 1);
+        assert_eq!(g.particles.len(), 2);
         let p = &g.particles[0];
         assert_eq!(p.vel, Vec3::from_array([0.0, -0.1, 0.0]));
         assert_eq!(p.pos, Vec3::from_array([0.0, 1.0, 0.0]));
@@ -4335,7 +6379,7 @@ mod tests {
         d.incremental_rotation = Some([0.0, 0.1, 0.0]);
         let mut g = live(d, 30.0);
         advance(&mut g, 3.0);
-        assert_eq!(g.particles.len(), 3);
+        assert_eq!(g.particles.len(), 6);
         for (i, p) in g.particles.iter().enumerate() {
             let y = 0.05 + 0.1 * (i + 1) as f32;
             assert_eq!(p.rotation, Vec3::new(0.0, y, 0.0));
@@ -4357,7 +6401,7 @@ mod tests {
         d.rotation_variance = Some([0.05, 0.1, 0.15]);
         let mut g = live(d, 30.0);
         advance(&mut g, 3.0);
-        assert_eq!(g.particles.len(), 3);
+        assert_eq!(g.particles.len(), 6);
         let bounds = [
             (0.1f32 - 0.05f32, 0.1f32 + 0.05f32),
             (0.2f32 - 0.1f32, 0.2f32 + 0.1f32),
@@ -4410,11 +6454,13 @@ mod tests {
         g.auto_run = true;
         g.particles.push(Particle {
             pos: Vec3::ZERO,
+            spawn_pos: Vec3::ZERO,
             spawn_origin: Vec3::ZERO,
             vel: Vec3::ZERO,
             age_frames: 0.0,
             life_frames: 1.0,
             rgb: Vec3::from_slice(&g.def.init_color[..3]),
+            color_transform: None,
             scale: Vec2::ONE,
             scale_seed: Vec2::ONE,
             scale_vel: Vec2::ZERO,
@@ -4422,7 +6468,11 @@ mod tests {
             spin: Vec3::ZERO,
             negate_rotation_y: false,
             rel_vel: Vec3::ZERO,
+            vel_rot: Vec3::ZERO,
             osc: None,
+            id: 0,
+            child_gens: Vec::new(),
+            pending_child_factories: Vec::new(),
         });
         g
     }
@@ -4487,6 +6537,30 @@ mod tests {
         (
             pos.iter().copied().map(Vec3::from_array).collect(),
             col.iter().copied().map(Vec4::from_array).collect(),
+        )
+    }
+
+    // The same rebuild, reading D (template colour) and F (per-particle factor) as separate
+    // attributes — the shader runs the table against both.
+    fn rebuilt_colors_and_factors(g: &LiveGenerator, cam: CameraView) -> (Vec<Vec4>, Vec<Vec4>) {
+        use bevy::mesh::VertexAttributeValues::Float32x4;
+        let mut mesh = empty_mesh();
+        // These tests assert authored fixed-function factors; the wash-alpha slider multiplies
+        // them on the D3m path, so pin a neutral lift (the default carries the box's seed).
+        let clock = CelestialClock {
+            wash_alpha_lift: 1.0,
+            ..CelestialClock::default()
+        };
+        rebuild_mesh(g, cam, &clock, &mut mesh);
+        let Some(Float32x4(col)) = mesh.attribute(Mesh::ATTRIBUTE_COLOR) else {
+            panic!("rebuilt mesh has f32x4 colours");
+        };
+        let Some(Float32x4(fac)) = mesh.attribute(Mesh::ATTRIBUTE_TANGENT) else {
+            panic!("rebuilt mesh has f32x4 particle factors");
+        };
+        (
+            col.iter().copied().map(Vec4::from_array).collect(),
+            fac.iter().copied().map(Vec4::from_array).collect(),
         )
     }
 
@@ -4570,8 +6644,10 @@ mod tests {
         const SUN_DOME_GEN: [u8; 4] = *b"sun0";
         const SPRITE_SHEET_ZONE: u32 = 230;
         const SPRITE_SHEET_GEN: [u8; 4] = *b"bun4";
-        // Far enough along +Z that the eye direction is that axis to well inside FACING.
-        const EYE_DISTANCE: f32 = 500.0;
+        // Along +Z so the eye direction is that axis to well inside FACING, and inside
+        // bun4's authored sec3 0x2E draw-distance band (near 20 / far 30), beyond which the
+        // sheet is culled from the draw list.
+        const EYE_DISTANCE: f32 = 15.0;
         const FACING: f32 = 0.999;
 
         let (Some(dome_assets), Some(sheet_assets)) = (
@@ -4644,13 +6720,54 @@ mod tests {
         assert_eq!(at(&screen, 10.0), at(&screen, 20.0));
     }
 
+    // research/xim Particle.kt applyMovementOrientation through GLDrawer's untransposed upload — pin
+    // the full basis by its images of the local axes so both order and sign show up.
+    #[test]
+    fn movement_orientation_matches_the_viewers_fold() {
+        assert_eq!(movement_orientation(Vec3::ZERO), Quat::IDENTITY);
+        let vertical = movement_orientation(Vec3::new(0.0, -1.0, 0.0));
+        assert!((vertical - Quat::from_rotation_z(-std::f32::consts::FRAC_PI_2)).length() < 1e-5);
+        let q = movement_orientation(Vec3::new(0.0, -0.4472136, 0.8944272));
+        assert!((q * Vec3::X - Vec3::Z).length() < 1e-4);
+        assert!((q * Vec3::Y - Vec3::new(-0.4472136, 0.8944272, 0.0)).length() < 1e-4);
+        assert!((q * Vec3::Z - Vec3::new(-0.8944272, -0.4472136, 0.0)).length() < 1e-4);
+    }
+
+    // hi14's g140 shape: a Movement billboard whose ±π x-variance must fan the burst out of one ray —
+    // the screen-billboard fold stacked every band on the same line (the single-ray crit).
+    #[test]
+    fn movement_billboard_fans_the_rotation_variance_out() {
+        let mut d = def(10.0, 1.0, 3);
+        d.billboard = ParticleBillboard::Movement;
+        d.camera_billboard = false;
+        d.init_velocity = [0.0; 3];
+        d.rotation_variance = Some([std::f32::consts::PI, 0.0, 0.0]);
+        let mut g = live(d, 100.0);
+        g.template.positions = vec![
+            Vec3::new(-1.0, -0.5, 0.0),
+            Vec3::new(1.0, -0.5, 0.0),
+            Vec3::new(0.0, 0.5, 0.0),
+        ];
+        advance(&mut g, 1.0);
+        assert_eq!(g.particles.len(), 4);
+        let (pos, _) = rebuilt(&g, view(Quat::IDENTITY));
+        // First vertex of each band: the x-rotation tilts it out of the XY plane by -0.05·sin(θ).
+        let zs: Vec<f32> = pos.iter().step_by(3).map(|p| p.z).collect();
+        let spread = (zs.iter().cloned().fold(f32::INFINITY, f32::min)
+            - zs.iter().cloned().fold(f32::NEG_INFINITY, f32::max))
+        .abs();
+        assert!(spread > 1e-3, "the bands fan out: {zs:?}");
+    }
+
     // The sun/moon domes are untextured meshes whose whole shape is a vertex-alpha ramp (128 at
-    // the centre to 0 at the rim), so substituting the flat life curve on the MMB draw path
-    // renders them as hard-edged discs. The D3m path keeps the substitution.
+    // the centre to 0 at the rim). Folding the per-particle factor into that colour on the CPU
+    // flattens the ramp; the mesh carries D (template, verbatim) and F (factor) as separate
+    // attributes and ffxi_particle.wgsl runs the table against both. Nothing is rescaled here:
+    // F.a is def()'s raw init alpha byte (0.5), held for the whole life — independent of
+    // progress, on every draw path.
     #[test]
     fn mmb_additive_keeps_the_vertex_alpha_gradient() {
         const VERTEX_ALPHAS: [f32; 3] = [1.0, 0.75, 0.0];
-        const HALF_LIFE_ALPHA: f32 = 0.5;
         let mut g = axial_celestial([1.0; 3], Vec3::X);
         g.template.positions = vec![Vec3::X; VERTEX_ALPHAS.len()];
         g.template.uvs = vec![[0.0, 0.0]; VERTEX_ALPHAS.len()];
@@ -4659,27 +6776,27 @@ mod tests {
             .iter()
             .map(|&a| Vec4::new(1.0, 1.0, 1.0, a))
             .collect();
-        g.particles[0].age_frames = HALF_LIFE_ALPHA;
 
         let cam = CameraView {
             rot: Quat::IDENTITY,
             pos: Vec3::new(900.0, 0.0, 0.0),
         };
 
-        g.draw_path = D3mDrawPath::Mmb;
-        let (_, colors) = rebuilt(&g, cam);
-        for (c, a) in colors.iter().zip(VERTEX_ALPHAS) {
-            assert!(
-                (c.w - HALF_LIFE_ALPHA * a).abs() < 1e-6,
-                "mmb alpha {}",
-                c.w
-            );
-        }
-
-        g.draw_path = D3mDrawPath::D3m;
-        let (_, colors) = rebuilt(&g, cam);
-        for c in &colors {
-            assert!((c.w - HALF_LIFE_ALPHA).abs() < 1e-6, "d3m alpha {}", c.w);
+        for path in [D3mDrawPath::Mmb, D3mDrawPath::D3m] {
+            g.draw_path = path;
+            let (colors, factors) = rebuilt_colors_and_factors(&g, cam);
+            for ((c, f), a) in colors.iter().zip(factors).zip(VERTEX_ALPHAS) {
+                assert!(
+                    (c.w - a).abs() < 1e-6,
+                    "{path:?} colour keeps the vertex ramp: {}",
+                    c.w
+                );
+                assert!(
+                    (f[3] - expected_factor_alpha(g.def.init_color[3])).abs() < 1e-6,
+                    "{path:?} factor is the raw init alpha byte: {}",
+                    f[3]
+                );
+            }
         }
     }
 
@@ -4705,7 +6822,7 @@ mod tests {
 
         // The particle never ages (life_frames == 1, age 0), so any change here is the clock.
         let at = |day_fraction: f32| {
-            drawn_color(
+            drawn_factor(
                 &g,
                 &CelestialClock {
                     day_fraction,
@@ -4728,8 +6845,7 @@ mod tests {
     fn celestial_tints_apply_day_of_week_then_moon_phase_at_2x() {
         let mut def = def(1.0, 1.0, 1);
         def.blend = ffxi_dat::particle_gen::ParticleBlend::Blend;
-        // Low enough that the D3M stage-1 2x gain does not saturate the channel and hide
-        // the tint (a 0.5 base already clamps to 1.0 untinted).
+        // Low enough that the 2x modulates do not saturate the channel and hide the tint.
         def.init_color = [0.2, 0.2, 0.2, 1.0];
         // A 2x modulate makes 0.5 the identity entry, so 0.25 is the one that halves.
         // Weekday 3 halves red, phase 6 halves it again: 0.2 * 0.5 * 0.5 = 0.05.
@@ -4740,10 +6856,11 @@ mod tests {
             day_fraction: 0.5,
             day_of_week: 3,
             moon_phase: 6,
+            ..Default::default()
         };
         let untinted = celestial(blended_celestial_def());
-        let plain = drawn_color(&untinted, &clock).x;
-        let tinted = drawn_color(&g, &clock).x;
+        let plain = drawn_factor(&untinted, &clock).x;
+        let tinted = drawn_factor(&g, &clock).x;
         assert!(
             (tinted - plain * 0.25).abs() < 1e-5,
             "two halving tables at 2x modulate should quarter the channel: {tinted} vs {plain}"
@@ -4774,9 +6891,10 @@ mod tests {
                     day_fraction: 0.5,
                     day_of_week: 0,
                     moon_phase: 11,
+                    ..Default::default()
                 },
             )
-            .life_alpha
+            .factor_alpha
         };
 
         assert_eq!(
@@ -4813,30 +6931,33 @@ mod tests {
         particle_draw(
             &g,
             &g.particles[0],
+            // Neutral wash lift: the assertion is on the DAT's own alpha lane.
             &CelestialClock {
                 day_fraction: 0.5,
                 day_of_week: 0,
                 moon_phase,
+                wash_alpha_lift: 1.0,
+                ..Default::default()
             },
         )
-        .life_alpha
+        .factor_alpha
     }
 
-    // The shipped f_ro (zone DAT 210) tables: `kasa`, the lunar halo MMB, carries a 0x4F alpha
-    // lane that is zero outside phases 5..=7, while the `moon` sprite's never drops below 0.42.
-    // With the alpha lane dropped, the halo drew as a saturated disc ~20 degrees across that
-    // swamped the moon at every phase. The drawn alpha is pinned to a value, not just to
-    // "> 0", so a halo that regressed to near-invisible near full moon also fails.
-    // Skips without a retail install.
+    // The shipped f_ro (zone DAT 210) tables: `kasa`, the lunar halo, carries a phase alpha
+    // lane that is zero outside phases 5..=7, while the `moon` sprite's never drops below its
+    // byte-108 entry. With the alpha lane dropped, the halo drew as a saturated disc ~20
+    // degrees across that swamped the moon at every phase. Every value here is a raw D3DCOLOR
+    // byte /255 and each tint table is one saturating 2x modulate (research/xim Particle.kt
+    // getColor), weekday first then phase — the same chain particle_draw runs, so the expected
+    // values mirror it in byte space. The drawn alpha is pinned to a value, not just "> 0",
+    // so a halo that regressed to near-invisible near full moon also fails. Skips without a
+    // retail install.
     #[test]
     fn zone_210_lunar_halo_is_dark_except_near_full_moon() {
         const F_RO: u32 = 210;
-        const SPRITE_MIN_ALPHA: f32 = 0.42;
-        // `kasa`'s 0x4F alpha lane as shipped, dumped byte-for-byte from f_ro.
+        // `kasa`'s phase alpha lane as shipped, dumped byte-for-byte from f_ro.
         const HALO_PHASE_ALPHA_BYTE: [u8; ffxi_dat::particle_gen::MOON_PHASES] =
             [0, 0, 0, 0, 0, 60, 128, 60, 0, 0, 0, 0];
-        /// DAT 210 kasa: initializer alpha 128/255 and weekday/phase modulation gain 160/255.
-        const HALO_CHAIN_GAIN: f32 = (128.0 / 255.0) * (160.0 / 255.0);
         const ALPHA_EPS: f32 = 1e-6;
 
         let Some(bytes) = zone_bytes(F_RO) else {
@@ -4851,6 +6972,19 @@ mod tests {
             .moon_phase_color
             .expect("the halo generator carries a moon-phase colour table");
 
+        // particle_draw's tint chain in raw byte space: each present table is a saturating
+        // 2x modulate, weekday (day 0 here) first, then the phase lane.
+        let tinted = |def: &ParticleGeneratorDef, phase: usize| {
+            let mut a = def.init_color[3];
+            if let Some(t) = &def.day_of_week_color {
+                a = (a * t[0][TOD_ALPHA_CHANNEL] * CELESTIAL_MODULATE).min(1.0);
+            }
+            if let Some(t) = &def.moon_phase_color {
+                a = (a * t[phase][TOD_ALPHA_CHANNEL] * CELESTIAL_MODULATE).min(1.0);
+            };
+            a
+        };
+
         for phase in 0..ffxi_dat::particle_gen::MOON_PHASES {
             let lane = HALO_PHASE_ALPHA_BYTE[phase] as f32 / u8::MAX as f32;
             assert!(
@@ -4861,32 +6995,38 @@ mod tests {
             );
 
             let halo_alpha = phase_alpha(&halo, phase);
-            let expected = lane * HALO_CHAIN_GAIN;
+            let expected = expected_factor_alpha(tinted(&halo, phase));
             assert!(
                 (halo_alpha - expected).abs() < ALPHA_EPS,
                 "halo draws its DAT alpha lane, phase {phase}: {halo_alpha} vs {expected}"
             );
+
+            let sprite_alpha = phase_alpha(&sprite, phase);
+            let sprite_expected = expected_factor_alpha(tinted(&sprite, phase));
             assert!(
-                phase_alpha(&sprite, phase) > SPRITE_MIN_ALPHA,
-                "moon phase {phase}: alpha {}, initializer {}",
-                phase_alpha(&sprite, phase),
-                sprite.init_color[3]
+                (sprite_alpha - sprite_expected).abs() < ALPHA_EPS,
+                "moon draws its own table, phase {phase}: {sprite_alpha} vs {sprite_expected}"
             );
+
+            if (5..=7).contains(&phase) {
+                assert!(halo_alpha > 0.0, "halo is lit near full moon");
+            } else {
+                assert_eq!(halo_alpha, 0.0, "halo is dark outside the full-moon phases");
+            }
         }
     }
 
-    // The alpha lattice a decoded-then-remapped DXT3 texture can sit on: the 4-bit plane holds
-    // multiples of the dither step, and `apply_ffxi_alpha_remap` doubles with saturation
-    // (ffxi-dat/src/texture.rs DXT3_ALPHA_DITHER_STEP, ffxi_alpha_remap). Any other value is a
-    // neighbourhood mean, i.e. proof the undither ran.
+    // The alpha lattice a decoded DXT3 texture sits on before conversion: the 4-bit plane holds
+    // multiples of the dither step (ffxi-dat/src/texture.rs DXT3_ALPHA_DITHER_STEP), so any other
+    // value is a neighbourhood mean, i.e. proof the undither ran.
     fn off_nibble_lattice(alpha: &[u8]) -> usize {
-        use ffxi_dat::texture::{ffxi_alpha_remap, DXT3_ALPHA_DITHER_STEP};
+        use ffxi_dat::texture::DXT3_ALPHA_DITHER_STEP;
 
-        let lattice: Vec<u8> = (0..=u8::MAX)
-            .step_by(DXT3_ALPHA_DITHER_STEP as usize)
-            .map(ffxi_alpha_remap)
-            .collect();
-        alpha.iter().filter(|a| !lattice.contains(a)).count()
+        let step = DXT3_ALPHA_DITHER_STEP as usize;
+        alpha
+            .iter()
+            .filter(|a| !(**a as usize).is_multiple_of(step))
+            .count()
     }
 
     fn image_alpha(images: &Assets<Image>, handle: &Handle<Image>) -> Vec<u8> {
@@ -4901,9 +7041,9 @@ mod tests {
 
     // Read off the shipped f_ro DAT: the lunar halo sheet `kasa` is a DXT3 whose alpha is
     // entirely the nibble 7/8 dithered-opaque pair (ffxi-dat/examples/dat-sky-alpha-histogram.rs
-    // on zone files 210/331), so the plain particle converter hands the GPU a 238/255
-    // per-texel stipple and only the celestial converter averages it back to the authored
-    // half-step. Skips without a retail install.
+    // on zone files 210/331), so the plain particle converter hands the GPU the stored 119/136
+    // per-texel stipple as-is and only the celestial converter undithers and expands it to the
+    // authored half-step. Skips without a retail install.
     #[test]
     fn zone_210_halo_sheet_is_dithered_and_only_the_celestial_converter_resolves_it() {
         const F_RO: u32 = 210;
@@ -4938,16 +7078,16 @@ mod tests {
         let sky = images.add(decoded_sky_texture_to_image(&tex));
 
         let plain_alpha = image_alpha(&images, &plain);
-        let lo = ffxi_dat::texture::ffxi_alpha_remap(DITHER_LO);
-        let hi = ffxi_dat::texture::ffxi_alpha_remap(DITHER_HI);
         assert!(
-            plain_alpha.contains(&lo) && plain_alpha.contains(&hi),
-            "the shared particle converter keeps the stipple"
+            plain_alpha.contains(&DITHER_LO) && plain_alpha.contains(&DITHER_HI),
+            "the shared particle converter passes the stored stipple through as-is"
         );
 
         let sky_alpha = image_alpha(&images, &sky);
         let spread =
             sky_alpha.iter().max().expect("non-empty") - sky_alpha.iter().min().expect("non-empty");
+        // The celestial path still expands: the undithered mean 127.5 doubles to a 254/255 split.
+        let lo = ffxi_dat::texture::ffxi_alpha_remap(DITHER_LO);
         assert!(
             spread <= RESOLVED_RESIDUAL_MAX && *sky_alpha.iter().min().expect("non-empty") > lo,
             "the celestial converter left alpha spread {spread}"
@@ -4985,7 +7125,7 @@ mod tests {
         assert_eq!(
             off_nibble_lattice(&alpha(false)),
             0,
-            "the shared particle converter only ever emits remapped nibble alpha"
+            "the shared particle converter passes stored nibble alpha through as-is"
         );
         assert!(
             off_nibble_lattice(&alpha(true)) > 0,
@@ -5079,10 +7219,11 @@ mod tests {
         use ffxi_dat::particle_gen::ParticleBlend;
         let mut base = def(4.0, 1.0, 1);
         base.blend = ParticleBlend::Blend;
-        base.init_color = [1.0, 1.0, 1.0, 0.8];
+        // Raw alpha byte/255: the factor carries it verbatim for the whole life — retail has
+        // no CPU rescale and no life fade (CMoElem.cpp VirtOt1).
+        base.init_color = [1.0, 1.0, 1.0, 0.25];
 
-        // Vertex alpha well under the D3m stage clamp, so the two curves stay distinguishable
-        // after the 4x TEXTUREFACTOR alpha gain instead of both saturating at 1.
+        // Vertex alpha stays its own value in COLOR; only the factor is asserted here.
         const VERT_ALPHA: f32 = 0.125;
         let mut cont = live(base, 1.0);
         cont.def.continuous = true;
@@ -5092,11 +7233,13 @@ mod tests {
 
         let particle = |age: f32| Particle {
             pos: Vec3::ZERO,
+            spawn_pos: Vec3::ZERO,
             spawn_origin: Vec3::ZERO,
             vel: Vec3::ZERO,
             age_frames: age,
             life_frames: 4.0,
             rgb: Vec3::ONE,
+            color_transform: None,
             scale: Vec2::splat(0.1),
             scale_seed: Vec2::splat(0.1),
             scale_vel: Vec2::ZERO,
@@ -5104,36 +7247,45 @@ mod tests {
             spin: Vec3::ZERO,
             negate_rotation_y: false,
             rel_vel: Vec3::ZERO,
+            vel_rot: Vec3::ZERO,
             osc: None,
+            id: 0,
+            child_gens: Vec::new(),
+            pending_child_factories: Vec::new(),
         };
         cont.particles = vec![particle(3.0)];
         spray.particles = vec![particle(3.0)];
 
-        let alpha_of = |g: &LiveGenerator| -> f32 {
+        let expected_alpha = expected_factor_alpha(base.init_color[3]);
+
+        // The wash-alpha slider multiplies authored alpha on this D3m path; the assertion is on
+        // the factor itself, so pin a neutral lift (the clock default carries the box's seed).
+        let clock = CelestialClock {
+            wash_alpha_lift: 1.0,
+            ..CelestialClock::default()
+        };
+        let factor_alpha_of = |g: &LiveGenerator| -> f32 {
             let mut mesh = empty_mesh();
-            rebuild_mesh(
-                g,
-                view(Quat::IDENTITY),
-                &CelestialClock::default(),
-                &mut mesh,
-            );
-            match mesh.attribute(Mesh::ATTRIBUTE_COLOR).unwrap() {
-                bevy::mesh::VertexAttributeValues::Float32x4(c) => c[0][3],
-                _ => panic!("expected Float32x4 colours"),
+            rebuild_mesh(g, view(Quat::IDENTITY), &clock, &mut mesh);
+            match mesh.attribute(Mesh::ATTRIBUTE_TANGENT).unwrap() {
+                bevy::mesh::VertexAttributeValues::Float32x4(f) => f[0][3],
+                _ => panic!("expected Float32x4 particle factors"),
             }
         };
 
-        let expected = |curve: f32| VERT_ALPHA * curve * D3M_STAGE1_ALPHA_GAIN;
         assert!(
-            (alpha_of(&cont) - expected(base.init_color[3])).abs() < 1e-4,
+            (factor_alpha_of(&cont) - expected_alpha).abs() < 1e-6,
             "continuous body keeps authored opacity"
         );
         assert!(
-            (alpha_of(&spray) - expected(0.25)).abs() < 1e-4,
-            "a transient spray still fades 1.0-progress over life"
+            (factor_alpha_of(&spray) - expected_alpha).abs() < 1e-6,
+            "a transient spray holds the authored alpha too — retail has no life fade"
         );
     }
 
+    // The authored byte 50/255 is raw D3DCOLOR space: particle_draw carries it verbatim (no CPU
+    // rescale — the fixed-function stages do the doubling). Pinned here is that the value holds
+    // for the whole life — retail has no life-based fade.
     #[test]
     fn real_dat_monument_shaft_retains_authored_alpha() {
         const LOWER_JEUNO_DAT: u32 = 345;
@@ -5144,20 +7296,27 @@ mod tests {
         let def = *assets.particle_defs.get(b"SPLT").expect("monument shaft");
         assert!(def.is_singleton());
         assert_eq!(def.init_color[3], SHAFT_ALPHA);
+        let expected = expected_factor_alpha(SHAFT_ALPHA);
+        // Neutral wash lift: the assertion is on the authored byte holding for the whole life,
+        // not on the slider seed that multiplies it.
+        let clock = CelestialClock {
+            wash_alpha_lift: 1.0,
+            ..CelestialClock::default()
+        };
         let mut g = celestial(def);
         g.particles[0].life_frames = f32::INFINITY;
         for age in [0.0, 300.0, 30_000.0] {
             g.particles[0].age_frames = age;
-            let draw = particle_draw(&g, &g.particles[0], &CelestialClock::default());
-            assert_eq!(draw.factor_alpha, SHAFT_ALPHA);
+            let draw = particle_draw(&g, &g.particles[0], &clock);
+            assert_eq!(draw.factor_alpha, expected);
         }
     }
 
     #[test]
     fn particle_expires_at_life() {
         let mut g = live(def(3.0, 1.0, 1), 1.0);
-        advance(&mut g, 1.0); // emit one at age 0
-        assert_eq!(g.particles.len(), 1);
+        advance(&mut g, 1.0); // emit the period's pair at age 0
+        assert_eq!(g.particles.len(), 2);
         advance(&mut g, 5.0); // past life
         assert!(g.particles.is_empty());
     }
@@ -5220,7 +7379,7 @@ mod tests {
 
         fn resolved_texture(assets: &ActionAssets) -> Option<Handle<Image>> {
             let mut images = Assets::<Image>::default();
-            resolve_mesh(assets, NO_LOCAL_DIR, &sheet_def(), &mut images, false)
+            resolve_mesh(assets, None, NO_LOCAL_DIR, &sheet_def(), &mut images, false)
                 .expect("sheet mesh resolves")
                 .2
         }
@@ -5268,7 +7427,7 @@ mod tests {
             def.mesh_id = SMOKE_SHEET_ID;
             let mut images = Assets::<Image>::default();
             assert!(
-                resolve_mesh(&assets, NO_LOCAL_DIR, &def, &mut images, false)
+                resolve_mesh(&assets, None, NO_LOCAL_DIR, &def, &mut images, false)
                     .expect("smok sheet resolves")
                     .2
                     .is_some()
@@ -5292,7 +7451,7 @@ mod tests {
             def: &ParticleGeneratorDef,
         ) -> Vec3 {
             let mut images = Assets::<Image>::default();
-            resolve_mesh(assets, local_dir, def, &mut images, false)
+            resolve_mesh(assets, None, local_dir, def, &mut images, false)
                 .expect("the linked mesh resolves")
                 .0
                 .positions[0]
@@ -5459,7 +7618,7 @@ mod tests {
 
         fn resolved_texture(assets: &ActionAssets) -> Option<Handle<Image>> {
             let mut images = Assets::<Image>::default();
-            resolve_mesh(assets, NO_LOCAL_DIR, &mesh_def(), &mut images, false)
+            resolve_mesh(assets, None, NO_LOCAL_DIR, &mesh_def(), &mut images, false)
                 .expect("static mesh resolves")
                 .2
         }
@@ -5499,6 +7658,28 @@ mod tests {
             assert!(resolved_texture(&mesh_assets(false, false, false)).is_none());
         }
 
+        // i900 (120.DAT fefr/fefs) binds asi1, which exists only under syst/effe of 0.DAT — a
+        // mesh absent from this tier must resolve through the global effect dir.
+        #[test]
+        fn static_mesh_resolves_through_the_global_tier() {
+            let empty = ActionAssets::default();
+            assert!(empty.d3m(NO_LOCAL_DIR, &MESH_ID).is_none());
+            let global = mesh_assets(true, false, false);
+            let mut images = Assets::<Image>::default();
+            let Some((template, _, tex)) = resolve_mesh(
+                &empty,
+                Some(&global),
+                NO_LOCAL_DIR,
+                &mesh_def(),
+                &mut images,
+                false,
+            ) else {
+                panic!("the mesh must resolve through the global tier")
+            };
+            assert!(!template.positions.is_empty());
+            assert!(tex.is_some());
+        }
+
         // A mesh that names no texture must not claim the blank key: 44 d3ms in this install
         // carry an all-blank qualified name, and a single blank-keyed Img would give every one
         // of them the same wrong texture.
@@ -5516,7 +7697,7 @@ mod tests {
 
         fn texture_for(assets: &ActionAssets, def: &ParticleGeneratorDef) -> Option<Handle<Image>> {
             let mut images = Assets::<Image>::default();
-            resolve_mesh(assets, NO_LOCAL_DIR, def, &mut images, false)
+            resolve_mesh(assets, None, NO_LOCAL_DIR, def, &mut images, false)
                 .expect("mesh resolves")
                 .2
         }
@@ -5566,17 +7747,13 @@ mod tests {
         }
     }
 
-    // research/xim ParticleGeneratorAttachment.kt updateAssociatedPosition jointRefIdx,103,111,125 — which of the def's two joint
-    // fields an attach type reads is fixed by the type, and the celestial/unattached ones read
-    // neither.
+    // research/XIClient Attachment.cpp MakeAttachMatrix — every actor attach type resolves the
+    // def's single EID index; the celestial/unattached ones read none.
     #[test]
-    fn attach_joint_reference_follows_the_attach_type() {
+    fn attach_joint_reference_reads_the_single_eid_index() {
         use ffxi_dat::particle_gen::AttachType;
-        const SOURCE_JOINT: u8 = 48;
-        const TARGET_JOINT: u8 = 49;
         let mut d = def(1.0, 1.0, 1);
-        d.attach_joint_source = SOURCE_JOINT;
-        d.attach_joint_target = TARGET_JOINT;
+        d.attach_eid = 49;
 
         for attach in [
             AttachType::SourceActor,
@@ -5585,25 +7762,12 @@ mod tests {
             AttachType::ZoneActorA,
             AttachType::ZoneActorB,
             AttachType::ZoneActorC,
-        ] {
-            d.attach_type = attach;
-            assert_eq!(
-                attach_joint_reference(&d),
-                Some(SOURCE_JOINT as usize),
-                "{attach:?}"
-            );
-        }
-        for attach in [
             AttachType::TargetActor,
             AttachType::TargetActorSourceFacing,
             AttachType::TargetToSourceBasis,
         ] {
             d.attach_type = attach;
-            assert_eq!(
-                attach_joint_reference(&d),
-                Some(TARGET_JOINT as usize),
-                "{attach:?}"
-            );
+            assert_eq!(attach_joint_reference(&d), Some(49), "{attach:?}");
         }
         for attach in [
             AttachType::None,
@@ -5625,7 +7789,7 @@ mod tests {
         let mut d = def(1.0, 1.0, 1);
         d.attach_type = AttachType::SourceActor;
         for joint in MOUNT_FOOTSTEP_JOINTS {
-            d.attach_joint_source = joint;
+            d.attach_eid = joint;
             assert_eq!(
                 attach_joint_reference(&d),
                 Some(MOUNT_FOOTSTEP_REFERENCE),
@@ -5635,7 +7799,7 @@ mod tests {
 
         d.attach_type = AttachType::SourceActorWeapon;
         for joint in [31u8, 32, 33, 34, 35, 36, 37, 54, 55, 56, 57, 58, 59, 60] {
-            d.attach_joint_source = joint;
+            d.attach_eid = joint;
             assert_eq!(attach_joint_reference(&d), None, "weapon joint {joint}");
         }
     }
@@ -5655,10 +7819,11 @@ mod tests {
     }
 
     // ROM/0/0.DAT as shipped (scheduler_runtime.rs parse_action_bytes,
-    // GLOBAL_EFFECT_DIR_FILE_ID): the melee hit sparks the `chit` chain reaches, each attaching
-    // to the victim at a nearest-joint selector.
+    // GLOBAL_EFFECT_DIR_FILE_ID): the melee hit sparks the `chit` chain reaches. Pinned against
+    // Attachment.cpp MakeAttachMatrix's index formula: every one of them carries EID 0, and the
+    // word's bits 10-15 (which read as a phantom "joint 49") are not part of the index.
     const HIT_SPARK_DIR: [u8; 4] = *b"hit1";
-    const HIT_SPARK_JOINT_REFERENCE: u8 = 49;
+    const HIT_SPARK_EID_INDEX: u8 = 0;
     const HIT_SPARK_GENERATORS: [([u8; 4], ffxi_dat::particle_gen::AttachType); 4] = [
         (*b"g010", ffxi_dat::particle_gen::AttachType::TargetActor),
         (*b"g011", ffxi_dat::particle_gen::AttachType::TargetActor),
@@ -5680,6 +7845,149 @@ mod tests {
 
     // Directory-scoped, because ROM/0/0.DAT defines `g010` several times over and only the `hit1`
     // copy is the spark (scheduler_runtime.rs tests).
+    // research/xim ParticleGenerator.kt emit — framesUntilNextParticle starts at 0, so a
+    // scheduled generator's first burst lands on its first tick. hit1's g01x stages all carry
+    // zero duration: their flash IS that one immediate burst (s5c/s7 pin the landing).
+    #[test]
+    fn real_dat_hit_sparks_burst_on_their_first_tick() {
+        let Some(defs) = retail_hit_spark_defs() else {
+            return;
+        };
+        for (name, def) in &defs {
+            let mut g = live(*def, 0.0);
+            g.emit_accum = def.frames_per_emission;
+            advance(&mut g, 1.0);
+            assert!(
+                !g.particles.is_empty(),
+                "{} must burst on its first tick",
+                String::from_utf8_lossy(name)
+            );
+        }
+    }
+
+    // Retail steps elements in FFXI space, where -Y is up (CYyGenerator.cpp ElemIdle case 0x02):
+    // a world-space generator's DAT velocity integrates through WORLD_PARTICLE_VEL_BASIS, so a
+    // +Y drift settles toward the ground. With the old unit basis it rose — the vertical arc.
+    #[test]
+    fn world_space_velocity_integrates_through_the_mzb_bevy_basis() {
+        let Some(assets) = retail_global_effect_assets() else {
+            return;
+        };
+        let mut d = def(1.0, 1.0, 1);
+        d.init_velocity = [0.0, 0.5, 0.0];
+        d.position_updater = true;
+        let mut g = live_scheduled(d, 60.0, &assets);
+        emit(&mut g, 60.0);
+        advance(&mut g, 10.0);
+        assert!(
+            (g.particles[0].pos.y - (-5.0)).abs() < 1e-3,
+            "the +Y DAT drift must integrate downward in Bevy space: {:?}",
+            g.particles[0].pos
+        );
+    }
+
+    // Pinned against the install: hit1's g010 authors a ±π rotation variance on all axes — each
+    // streak of the 11-particle burst fans out at its own angle into retail's starburst. A screen
+    // billboard must keep that per-particle spin about the view axis; without it every particle
+    // of a burst lies along the same line.
+    #[test]
+    fn real_dat_hit_spark_streaks_fan_out_per_particle() {
+        let Some(assets) = retail_global_effect_assets() else {
+            return;
+        };
+        let def = assets
+            .particle_def(HIT_SPARK_DIR, b"g010")
+            .expect("hit1 defines g010");
+        assert!(
+            def.rotation_variance.is_some(),
+            "the DAT authors a per-particle rotation variance"
+        );
+        let mut g = live_scheduled(*def, 60.0, &assets);
+        // A horizontal streak: with identity camera the only thing that can turn it is the
+        // particle's own spin about the view axis.
+        g.template.positions = vec![
+            Vec3::new(-1.0, 0.0, 0.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(0.0, 0.0, 0.0),
+        ];
+        emit(&mut g, def.max_life_frames);
+        // Mid-life: the resolved scale tracks are non-zero here (init scale is (0,0)).
+        advance(&mut g, def.max_life_frames * 0.5);
+        let view = CameraView {
+            rot: Quat::IDENTITY,
+            pos: Vec3::ZERO,
+        };
+        let clock = ParticleSimulator::default().clock;
+
+        g.particles[0].rotation.z = 0.0;
+        let mut mesh_a = empty_mesh();
+        rebuild_mesh(&g, view, &clock, &mut mesh_a);
+        g.particles[0].rotation.z = std::f32::consts::FRAC_PI_4;
+        let mut mesh_b = empty_mesh();
+        rebuild_mesh(&g, view, &clock, &mut mesh_b);
+
+        let a: Vec<[f32; 3]> = mesh_a
+            .attribute(Mesh::ATTRIBUTE_POSITION)
+            .and_then(|v| v.as_float3())
+            .expect("positions")
+            .to_vec();
+        let b: Vec<[f32; 3]> = mesh_b
+            .attribute(Mesh::ATTRIBUTE_POSITION)
+            .and_then(|v| v.as_float3())
+            .expect("positions")
+            .to_vec();
+        assert_ne!(
+            a, b,
+            "the per-particle spin must turn the streak about the view axis"
+        );
+    }
+
+    // Pinned against the install: the crit burst's gs11 (sho1) rides the same eis1 streak sheet
+    // as g010, but is fixed-orientation with no per-particle rotation — its 19 particles stack
+    // into one streak that the scale velocity grows wide and thin over life.
+    #[test]
+    fn real_dat_crit_spark_streak_is_fixed_orientation() {
+        let Some(assets) = retail_global_effect_assets() else {
+            return;
+        };
+        // Directory-scoped: ROM/0/0.DAT defines these generator names in several directories.
+        let def = assets
+            .particle_def_scoped(*b"sho1", b"gs11")
+            .expect("sho1 defines gs11")
+            .1;
+        assert_eq!(
+            def.mesh_id, *b"eis1",
+            "the crit streak rides the same sheet as g010"
+        );
+        assert!(
+            def.rotation_variance.is_none(),
+            "no per-particle rotation: the burst is one stacked streak"
+        );
+        let Some(vel) = def.scale_velocity else {
+            panic!("the streak's growth is authored as a scale velocity");
+        };
+        assert!(
+            vel[0] > 0.0 && vel[1] < 0.0,
+            "it grows wide and thin: {vel:?}"
+        );
+    }
+
+    // Pinned against the install: hit1's dust g012 authors a +Y base drift — settling from the
+    // contact point toward the ground in retail's -Y-up frame (its spherical scatter rides on
+    // top, so per-particle motion is not monotonic).
+    #[test]
+    fn real_dat_hit_dust_authors_a_downward_drift() {
+        let Some(defs) = retail_hit_spark_defs() else {
+            return;
+        };
+        let def = defs
+            .iter()
+            .find(|(name, _)| *name == *b"g012")
+            .expect("hit1 defines g012")
+            .1;
+        assert!(def.init_velocity[1] > 0.0, "the DAT authors a +Y drift");
+    }
+
     fn retail_hit_spark_defs() -> Option<Vec<([u8; 4], ParticleGeneratorDef)>> {
         let assets = retail_global_effect_assets()?;
         Some(
@@ -5695,33 +8003,35 @@ mod tests {
         )
     }
 
-    // Pinned against the install: every `hit1` spark generator attaches to the TARGET actor and
-    // names a nearest-joint selector there (ffxi-dat/src/particle_gen.rs
-    // ParticleGeneratorDef attach fields), so the spawn origin cannot be the victim's root
-    // transform alone.
+    // Pinned against the install: every `hit1` spark generator attaches to the TARGET actor
+    // with EID index 0 (Attachment.cpp MakeAttachMatrix formula). Placement resolves that plain
+    // index through the nearest-ring selector — retail puts the flash at the contact point, not
+    // the victim's root
+    // (.agents/skills/retail-observe/references/2026-09-27-hit-effect-contact-point.md).
     #[test]
-    fn real_dat_hit_sparks_name_a_target_joint_reference() {
+    fn real_dat_hit_sparks_carry_the_retail_eid_index() {
         let Some(defs) = retail_hit_spark_defs() else {
             return;
         };
         for ((name, def), (_, attach)) in defs.iter().zip(HIT_SPARK_GENERATORS) {
             let name = String::from_utf8_lossy(name).to_string();
             assert_eq!(def.attach_type, attach, "{name}");
-            assert_eq!(def.attach_joint_target, HIT_SPARK_JOINT_REFERENCE, "{name}");
+            assert_eq!(def.attach_eid, HIT_SPARK_EID_INDEX, "{name}");
             assert_eq!(
                 attach_joint_reference(def),
-                Some(HIT_SPARK_JOINT_REFERENCE as usize),
-                "{name} reads the target-side joint field"
+                Some(*ffxi_actor::skeleton_instance::NEAREST_JOINT_REFERENCES.start()),
+                "{name} resolves through the nearest-ring selector"
             );
             assert_eq!(def.base_position, [0.0; 3], "{name}");
         }
     }
 
-    // The joint the def names is resolved in the actor's pose frame (FFXI axes, -Y up) and must
-    // arrive in Bevy world space (ffxi-actor/src/skeleton_instance.rs pose_world), i.e. ABOVE
-    // the victim's feet and on the side the attacker stands on.
+    // The plain EID index resolves through the nearest-ring selector toward the attacker: the
+    // offset is a ring locator at torso height on the struck side, at every victim facing and
+    // attacker bearing
+    // (.agents/skills/retail-observe/references/2026-09-27-hit-effect-contact-point.md).
     #[test]
-    fn real_dat_hit_spark_offset_lands_on_the_struck_side_in_bevy_space() {
+    fn real_dat_hit_spark_offset_is_the_contact_point() {
         let (Some(skeleton), Some(defs)) = (retail_hume_m_skeleton(), retail_hit_spark_defs())
         else {
             return;
@@ -5734,21 +8044,6 @@ mod tests {
         );
         const VICTIM_WORLD: Vec3 = Vec3::new(30.0, 2.0, -14.0);
         const ATTACKER_REACH: f32 = 3.0;
-        // Read off the same install the pose came from; the ring geometry itself is pinned by
-        // ffxi-actor's `real_dat_retail_skeleton_resolves_the_nearest_joint_selector_onto_its_ring`
-        // (ffxi-actor/src/skeleton_instance.rs). Pose space is -Y up, so the Bevy-space height is
-        // its negation; anything at or below 0 is the feet bug.
-        let ring_height_above_root = -ffxi_actor::skeleton_instance::standard_joint_world_position(
-            &pose,
-            &skeleton,
-            *ffxi_actor::skeleton_instance::RING_JOINT_REFERENCES.start(),
-        )
-        .expect("the retail HumeM skeleton files its ring references")
-        .y;
-        assert!(
-            ring_height_above_root > 0.0,
-            "the ring must sit above the root, not at the feet: {ring_height_above_root}"
-        );
 
         for victim_facing in [0.0, 1.0, 2.5, -2.0] {
             let root = Transform {
@@ -5774,13 +8069,16 @@ mod tests {
                     );
                     let name = String::from_utf8_lossy(name).to_string();
                     assert!(
-                        (offset.y - ring_height_above_root).abs() < 1e-3,
-                        "{name} spawned {offset:?}, not {ring_height_above_root} above the root"
+                        offset.y.abs() > 0.5,
+                        "{name} offset {offset:?} is not at torso height"
                     );
-                    assert!(
-                        offset.dot(toward) > 0.0,
-                        "{name} spawned {offset:?} away from the attacker at {attacker:?}"
-                    );
+                    let horizontal = Vec3::new(offset.x, 0.0, offset.z);
+                    if horizontal.length_squared() > 1e-6 {
+                        assert!(
+                            horizontal.normalize().dot(toward) > 0.5,
+                            "{name} offset {offset:?} does not face the attacker at bearing {a:.2}"
+                        );
+                    }
                 }
             }
         }
@@ -5833,6 +8131,8 @@ mod tests {
                 flinch_duration: None,
                 model_visibility: None,
                 spell_effect: None,
+                sound_range: None,
+                control_flow: None,
             },
         }
     }
@@ -5853,6 +8153,8 @@ mod tests {
             .init_asset::<FfxiParticleMaterial>()
             .init_resource::<ParticleSimulator>()
             .add_message::<crate::scheduler_runtime::SchedulerStageEvent>()
+            .add_message::<crate::scheduler_runtime::ParticleSpawnTrace>()
+            .add_message::<crate::audio::SfxEvent>()
             .add_systems(Update, spawn_particle_generators);
 
         let attacker = spawn_posed_actor(&mut app, skeleton, pose, attacker_world);
@@ -5881,12 +8183,13 @@ mod tests {
     /// The whole wiring, driven through the real system rather than through
     /// `attach_joint_offset` alone: the actor root carrying the pose is a CHILD of the wire
     /// entity the stage fires on and PostUpdate has propagated nothing on the frame it is
-    /// inserted, so the child descent, the local-transform composition, the source/target side
-    /// of the selector and the `+ joint_offset` at the spawn site all have to hold for the
-    /// spark to leave the victim's feet.
+    /// inserted, so the child descent, the local-transform composition and the
+    /// `+ joint_offset` at the spawn site all have to hold for the spark to land at the
+    /// contact point — the victim's ring locator nearest the attacker
+    /// (.agents/skills/retail-observe/references/2026-09-27-hit-effect-contact-point.md).
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
-    fn real_dat_hit_spark_spawns_on_the_victims_ring_not_its_root() {
+    fn real_dat_hit_spark_spawns_at_the_contact_point() {
         let (Some(skeleton), Some(defs)) = (retail_hume_m_skeleton(), retail_hit_spark_defs())
         else {
             return;
@@ -5900,16 +8203,10 @@ mod tests {
             ffxi_actor::skeleton_instance::RootTransform::identity(),
             &[],
         );
-        let ring_height_above_root = -ffxi_actor::skeleton_instance::standard_joint_world_position(
-            &pose,
-            &skeleton,
-            *ffxi_actor::skeleton_instance::RING_JOINT_REFERENCES.start(),
-        )
-        .expect("the retail HumeM skeleton files its ring references")
-        .y;
 
         const VICTIM_WORLD: Vec3 = Vec3::new(30.0, 2.0, -14.0);
         const ATTACKER_WORLD: Vec3 = Vec3::new(33.0, 2.0, -14.0);
+        let toward_attacker = (ATTACKER_WORLD - VICTIM_WORLD).normalize();
         for (gen_id, _) in &defs {
             let name = String::from_utf8_lossy(gen_id).to_string();
             let origin = run_hit_spark_stage(
@@ -5921,17 +8218,21 @@ mod tests {
                 VICTIM_WORLD,
             )
             .unwrap_or_else(|| panic!("{name} spawned no generator"));
+            let offset = origin - VICTIM_WORLD;
             assert!(
-                (origin.y - (VICTIM_WORLD.y + ring_height_above_root)).abs() < 1e-3,
-                "{name} spawned at {origin:?}, not {ring_height_above_root} above the victim"
+                offset.y.abs() > 0.5,
+                "{name} spawned at {origin:?}, not at torso height"
             );
-            assert!(
-                origin.x > VICTIM_WORLD.x,
-                "{name} spawned at {origin:?}, not on the attacker's side of the victim"
-            );
+            let horizontal = Vec3::new(offset.x, 0.0, offset.z);
+            if horizontal.length_squared() > 1e-6 {
+                assert!(
+                    horizontal.normalize().dot(toward_attacker) > 0.5,
+                    "{name} spawned at {origin:?}, not on the attacker's side"
+                );
+            }
 
-            // research/xim SkeletonInstance.kt getStandardJointExtended runs the same selector when source and target
-            // are one actor (a self-cast Cure), so a self-targeted def still leaves the feet.
+            // A self-targeted def resolves against the same actor: the ring point nearest its own
+            // origin, torso height above the root.
             let self_origin = run_hit_spark_stage(
                 &skeleton,
                 &pose,
@@ -5942,8 +8243,8 @@ mod tests {
             )
             .unwrap_or_else(|| panic!("{name} spawned no self-targeted generator"));
             assert!(
-                (self_origin.y - (VICTIM_WORLD.y + ring_height_above_root)).abs() < 1e-3,
-                "self-targeted {name} spawned at {self_origin:?}, not on the ring"
+                (self_origin - VICTIM_WORLD).y.abs() > 0.5,
+                "self-targeted {name} spawned at {self_origin:?}, not at torso height"
             );
         }
     }
@@ -5964,8 +8265,7 @@ mod tests {
         );
         let mut d = def(1.0, 1.0, 1);
         d.attach_type = ffxi_dat::particle_gen::AttachType::TargetActor;
-        d.attach_joint_target =
-            *ffxi_actor::skeleton_instance::NEAREST_JOINT_REFERENCES.start() as u8;
+        d.attach_eid = *ffxi_actor::skeleton_instance::NEAREST_JOINT_REFERENCES.start() as u8;
 
         assert_eq!(attach_joint_offset(&d, None, Some(Vec3::X)), Vec3::ZERO);
         assert_eq!(
@@ -5980,5 +8280,279 @@ mod tests {
             ),
             Vec3::ZERO
         );
+    }
+
+    fn child_factory(once: bool, on_expiry: bool) -> ChildFactory {
+        ChildFactory {
+            name: *b"tst1",
+            once,
+            on_expiry,
+            payload: ChildPayload::Draw(Box::new(ChildDraw {
+                // fpe=30: only the primed first burst fires within the test's few ticks.
+                def: def(30.0, 30.0, 1),
+                template: SpriteTemplate {
+                    positions: vec![Vec3::ZERO; 3],
+                    uvs: vec![[0.0, 0.0]; 3],
+                    indices: vec![0, 1, 2],
+                    colors: vec![Vec4::ONE; 3],
+                },
+                sprite_frames: Vec::new(),
+                mat: Handle::default(),
+                scale_x: None,
+                scale_y: None,
+                position_x: None,
+                position_y: None,
+                position_z: None,
+                dampening_factor: None,
+                alpha: None,
+                tod_color: std::array::from_fn(|_| None),
+            })),
+            children: Vec::new(),
+        }
+    }
+
+    // One full tick (anchor, advance, reap-removal, child instantiation) through the real system.
+    fn tick_world(world: &mut World, secs: f32) {
+        use bevy::ecs::system::RunSystemOnce;
+        world
+            .resource_mut::<Time>()
+            .advance_by(Duration::from_secs_f32(secs));
+        world.run_system_once(tick_particle_simulator).unwrap();
+    }
+
+    fn child_test_world(sim: ParticleSimulator) -> World {
+        let mut world = World::new();
+        // Messages<T> has no FromWorld, so the bare test world inserts it for the SfxEvent writer.
+        world.insert_resource(bevy::ecs::message::Messages::<crate::audio::SfxEvent>::default());
+        world.insert_resource(bevy::ecs::message::Messages::<
+            crate::scheduler_runtime::ParticleSpawnTrace,
+        >::default());
+        world.insert_resource(Time::<()>::default());
+        world.insert_resource(Assets::<Mesh>::default());
+        // tick reads the Dynamic Lights setting for its enhance-mode suppression (Default =
+        // Vanilla, so these tests exercise the texture path exactly as before).
+        world.insert_resource(crate::graphics_settings::GraphicsSettings::default());
+        world.insert_resource(sim);
+        world
+    }
+
+    // The production spawn path primes the accumulator to one full period; `live()` does not.
+    fn prime(g: &mut LiveGenerator) {
+        g.emit_accum = g.def.frames_per_emission;
+    }
+
+    // research/xim ParticleInitializers.kt ChildGeneratorSetup — each parent particle gets its own
+    // child generator instance, anchored at the particle's position. fpe=30 keeps emission to the
+    // primed first burst so one frame tick emits exactly ppe+1 = 2 particles.
+    #[test]
+    fn child_generator_spawns_per_parent_particle() {
+        let mut sim = ParticleSimulator::default();
+        let mut parent = live(def(60.0, 30.0, 1), f32::MAX);
+        prime(&mut parent);
+        parent.child_factories.push(child_factory(false, false));
+        sim.generators.push(parent);
+
+        let mut world = child_test_world(sim);
+        tick_world(&mut world, 1.0 / 60.0);
+
+        let sim = world.resource::<ParticleSimulator>();
+        assert_eq!(sim.generators.len(), 3);
+        for (ci, g) in sim.generators.iter().enumerate().skip(1) {
+            let Some((pgi, pid)) = g.parent else {
+                panic!("child {ci} has no parent")
+            };
+            assert_eq!(pgi, 0);
+            let p = &sim.generators[0]
+                .particles
+                .iter()
+                .find(|p| p.id == pid)
+                .expect("parent particle exists");
+            assert_eq!(g.origin, sim.generators[0].origin + p.pos);
+        }
+    }
+
+    // research/xim Particle.kt update — children are removed with their parent particle.
+    #[test]
+    fn child_generator_dies_with_its_parent_particle() {
+        let mut sim = ParticleSimulator::default();
+        let mut parent = live(def(1.0, 30.0, 1), f32::MAX);
+        prime(&mut parent);
+        parent.child_factories.push(child_factory(false, false));
+        sim.generators.push(parent);
+
+        let mut world = child_test_world(sim);
+        tick_world(&mut world, 1.0 / 60.0); // emit + spawn children
+        assert!(world.resource::<ParticleSimulator>().generators.len() > 1);
+        tick_world(&mut world, 1.0 / 60.0); // particles expire (life 1 frame) -> children die
+
+        let sim = world.resource::<ParticleSimulator>();
+        assert_eq!(
+            sim.generators.len(),
+            1,
+            "children must die with their parent particle"
+        );
+    }
+
+    // research/xim ParticleInitializers.kt OnceChildGeneratorSetup — one burst at init, never again.
+    #[test]
+    fn once_child_emits_exactly_one_burst() {
+        let mut sim = ParticleSimulator::default();
+        let mut parent = live(def(60.0, 30.0, 1), f32::MAX);
+        prime(&mut parent);
+        parent.child_factories.push(child_factory(true, false));
+        sim.generators.push(parent);
+
+        let mut world = child_test_world(sim);
+        tick_world(&mut world, 1.0 / 60.0); // children spawn
+        tick_world(&mut world, 1.0 / 60.0); // first (and only) burst
+        let count = world.resource::<ParticleSimulator>().generators[1]
+            .particles
+            .len();
+        assert_eq!(
+            count,
+            emission_count(&world.resource::<ParticleSimulator>().generators[1]) as usize
+        );
+        tick_world(&mut world, 1.0 / 60.0);
+        assert_eq!(
+            world.resource::<ParticleSimulator>().generators[1]
+                .particles
+                .len(),
+            count,
+            "a once-child must not re-emit"
+        );
+    }
+
+    // research/xim ParticleExpirationHandlers.kt EmitChildHandler — one burst at the parent's
+    // death position, independent of it.
+    #[test]
+    fn expiry_child_spawns_at_the_death_position() {
+        let mut sim = ParticleSimulator::default();
+        // ppe=0: the primed burst emits exactly one particle, so one death position.
+        let mut parent = live(def(1.0, 30.0, 0), f32::MAX);
+        prime(&mut parent);
+        parent.child_factories.push(child_factory(false, true));
+        sim.generators.push(parent);
+
+        let mut world = child_test_world(sim);
+        tick_world(&mut world, 1.0 / 60.0); // emit
+        tick_world(&mut world, 1.0 / 60.0); // particle expires -> expiry spawn
+
+        let sim = world.resource::<ParticleSimulator>();
+        assert_eq!(sim.generators.len(), 2);
+        let child = &sim.generators[1];
+        assert!(
+            child.parent.is_none(),
+            "an expiry child is independent of the dead particle"
+        );
+        assert_eq!(child.emit_window_frames, 0.0);
+    }
+
+    // A distortion child (the ai90 shape: i900 binds it via sec2 0x44) arms the same screen-space
+    // pass a 0x02 stage would — no mesh, no MissingResource.
+    #[test]
+    fn distortion_child_arms_the_shared_dispatch() {
+        let mut sim = ParticleSimulator::default();
+        let mut parent = live(def(60.0, 30.0, 1), f32::MAX);
+        prime(&mut parent);
+        parent.child_factories.push(ChildFactory {
+            name: *b"ai90",
+            once: false,
+            on_expiry: false,
+            payload: ChildPayload::Distortion {
+                haze_offset_x: 0.02,
+                life_frames: 60.0,
+                envelope: None,
+            },
+            children: Vec::new(),
+        });
+        sim.generators.push(parent);
+
+        let mut world = child_test_world(sim);
+        tick_world(&mut world, 1.0 / 60.0); // parent emits; the child arms on instantiation
+
+        let dist = world.resource::<crate::distortion_pass::ActiveDistortion>();
+        assert_eq!(dist.haze_offset_x, 0.02);
+    }
+
+    // A sound child writes the same SfxEvent a 0x02 stage naming that generator would.
+    #[test]
+    fn sound_child_writes_the_sfx_event() {
+        let mut sim = ParticleSimulator::default();
+        let mut parent = live(def(60.0, 30.0, 1), f32::MAX);
+        prime(&mut parent);
+        parent.child_factories.push(ChildFactory {
+            name: *b"g14s",
+            once: false,
+            on_expiry: false,
+            payload: ChildPayload::Sound {
+                se_id: 5008,
+                near: 0.0,
+                far: 30.0,
+                vertical_weight: crate::audio::UNATTACHED_VERTICAL_WEIGHT,
+            },
+            children: Vec::new(),
+        });
+        sim.generators.push(parent);
+
+        let mut world = child_test_world(sim);
+        tick_world(&mut world, 1.0 / 60.0); // parent emits; the child plays on instantiation
+
+        // The primed first tick emits ppe+1 = 2 parent particles (see
+        // child_generator_spawns_per_parent_particle), so the child plays once per particle.
+        let msgs = world.resource::<bevy::ecs::message::Messages<crate::audio::SfxEvent>>();
+        assert_eq!(msgs.len(), 2);
+        for ev in msgs.iter_current_update_messages() {
+            assert_eq!(ev.se_id, 5008);
+        }
+    }
+
+    // sec2 0x45..0x49 (research/xim ParticleInitializers.kt Parent*Config) — a child particle
+    // copies its anchor's state at init.
+    #[test]
+    fn parent_copy_blocks_copy_the_anchor_state() {
+        let mut pd = def(60.0, 30.0, 1);
+        pd.init_velocity = [2.0, 0.0, 0.0];
+        pd.init_color = [0.5, 0.25, 0.125, 1.0];
+        pd.init_scale = [0.3, 0.4, 1.0];
+        pd.init_rotation = [0.1, 0.2, 0.3];
+
+        let mut cd = def(30.0, 30.0, 1);
+        // The child's own init velocity would pass through the world basis; zero it so the
+        // assertion isolates the anchor copy.
+        cd.init_velocity = [0.0; 3];
+        cd.parent_position_copy = true;
+        cd.parent_velocity = Some(1.0);
+        cd.parent_rotate = true;
+        cd.parent_color = true;
+        cd.parent_scale = true;
+
+        let mut sim = ParticleSimulator::default();
+        let mut parent = live(pd, f32::MAX);
+        prime(&mut parent);
+        let mut cf = child_factory(false, false);
+        if let ChildPayload::Draw(d) = &mut cf.payload {
+            d.def = cd;
+        }
+        parent.child_factories.push(cf);
+        sim.generators.push(parent);
+
+        let mut world = child_test_world(sim);
+        tick_world(&mut world, 1.0 / 60.0); // parent emits; children spawn with the anchor
+        tick_world(&mut world, 1.0 / 60.0); // children emit through the copy blocks
+
+        let sim = world.resource::<ParticleSimulator>();
+        let p = &sim.generators[0].particles[0];
+        let c = &sim.generators[1].particles;
+        assert!(!c.is_empty(), "the child must have emitted");
+        let cp = &c[0];
+        // 0x45: the particle spawns exactly at the anchor (zero local offset).
+        assert_eq!(cp.pos, Vec3::ZERO);
+        // 0x46: the parent's total velocity is added through the multiplier.
+        assert_eq!(cp.vel, p.vel + p.rel_vel);
+        // 0x47/0x48/0x49: rotation, color and scale are copied wholesale (the anchor carries
+        // the parent's rescaled rgb).
+        assert_eq!(cp.rotation, p.rotation);
+        assert_eq!(cp.rgb, p.rgb);
+        assert_eq!(cp.scale, Vec2::new(0.3, 0.4));
     }
 }

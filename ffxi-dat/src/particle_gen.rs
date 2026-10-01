@@ -26,8 +26,6 @@ pub enum GeneratorSection {
     Updaters,
     /// Section 4 — the element-die script.
     ElementDie,
-    /// `SoundGeneratorDef`'s section 2.
-    SoundSetup,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash, PartialOrd, Ord)]
@@ -42,15 +40,28 @@ pub enum GeneratorOpcodeOutcome {
 /// what it discards instead of inferring either from a missing visual.
 pub type GeneratorOpcodeSink<'a> = &'a mut dyn FnMut(GeneratorSection, u8, GeneratorOpcodeOutcome);
 
+/// The block-level view: the same notification plus the block's size in 4-byte words (header
+/// word included) and its raw payload after that header — what an unknown opcode actually
+/// carried, for a diagnostics table instead of a guess.
+pub type GeneratorBlockSink<'a> =
+    &'a mut dyn FnMut(GeneratorSection, u8, usize, &[u8], GeneratorOpcodeOutcome);
+
+/// One decoded opcode block buffered until the claiming parser flushes it: section, opcode,
+/// size in 4-byte words (header included), raw payload after that header, and whether an arm
+/// decoded it.
+pub(crate) type DecodedBlock<'a> = (GeneratorSection, u8, usize, &'a [u8], bool);
+
 /// A generator chunk is offered to every def parser in turn and only one claims it, so a block
 /// is only honestly this parse's business once the parse that saw it returns a def. Blocks are
 /// buffered until then; a sound generator must not report its whole stream as particle
 /// initializers.
-pub(crate) fn flush_blocks(sink: GeneratorOpcodeSink<'_>, blocks: &[(GeneratorSection, u8, bool)]) {
-    for &(section, opcode, decoded) in blocks {
+pub(crate) fn flush_blocks(sink: GeneratorBlockSink<'_>, blocks: &[DecodedBlock<'_>]) {
+    for &(section, opcode, size_words, payload, decoded) in blocks {
         sink(
             section,
             opcode,
+            size_words,
+            payload,
             if decoded {
                 GeneratorOpcodeOutcome::Decoded
             } else {
@@ -69,22 +80,84 @@ const ALLOCATION_MASK: u32 = 0x3F;
 pub(crate) const OPCODE_END: u8 = 0x00;
 pub(crate) const OPCODE_STANDARD_SETUP: u8 = 0x01;
 pub(crate) const SIZE_WORDS_MASK: u8 = 0x1F;
-// research/xim ParticleGeneratorSettings.kt LinkedDataType — the StandardParticleSetup linked_data_type
-// (setup byte payload+29) selects the particle's mesh source: 0x0B StaticMesh (a D3M billboard),
-// 0x0E SpriteSheet (a 0x21 flipbook quad). 0x57 Null / 0x47 PointLight and any other value are
-// non-visual particle types and are rejected (parse returns None).
-const LINKED_DATA_STATIC_MESH: u8 = 0x0B;
-const LINKED_DATA_SPRITE_SHEET: u8 = 0x0E;
+// research/xim ParticleGeneratorSettings.kt LinkedDataType — the StandardParticleSetup
+// linked_data_type (setup byte payload+29) is EXPLICIT in the data and selects what the generator
+// links. It must be read, not inferred from which resource names happen to exist: names collide
+// across chunk types (hit3 exists as dir, routine 0x07, mesh 0x1F, texture 0x20 and sheet 0x21).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkedDataKind {
+    /// 0x01 — links an actor; no resource lookup.
+    Actor,
+    /// 0x0B — a type-0x1F quad/mesh named linkedDataId (per-vertex colour + uv); its texture is
+    /// the type-0x20 chunk of the same name.
+    StaticMesh,
+    /// 0x0E — a type-0x21 flipbook named linkedDataId; texture type 0x20 same name.
+    SpriteSheet,
+    /// 0x1D — weighted mesh: resolved exactly like StaticMesh (multiple weights).
+    WeightedMesh,
+    /// 0x22 — screen-space distortion. linkedDataId is the placeholder string `dist`; no chunk
+    /// exists and none must be looked up.
+    Distortion,
+    /// 0x24 — generated ring mesh; nothing to resolve.
+    RingMesh,
+    /// 0x39 — lens flare; nothing to resolve.
+    LensFlare,
+    /// 0x3D — a type-0x3D sound pointer named linkedDataId (e.g. `5008` -> se/005/005008.spw).
+    Audio,
+    /// 0x47 — point light; nothing to resolve.
+    PointLight,
+    /// 0x57 — null particle; nothing to resolve.
+    Null,
+}
+
+impl LinkedDataKind {
+    pub const ACTOR: u8 = 0x01;
+    pub const STATIC_MESH: u8 = 0x0B;
+    pub const SPRITE_SHEET: u8 = 0x0E;
+    pub const WEIGHTED_MESH: u8 = 0x1D;
+    pub const DISTORTION: u8 = 0x22;
+    pub const RING_MESH: u8 = 0x24;
+    pub const LENS_FLARE: u8 = 0x39;
+    pub const AUDIO: u8 = 0x3D;
+    pub const POINT_LIGHT: u8 = 0x47;
+    pub const NULL_PARTICLE: u8 = 0x57;
+
+    /// `None` for a byte no shipped kind uses — the caller must hard-error, not guess.
+    pub fn from_byte(b: u8) -> Option<Self> {
+        match b {
+            Self::ACTOR => Some(Self::Actor),
+            Self::STATIC_MESH => Some(Self::StaticMesh),
+            Self::SPRITE_SHEET => Some(Self::SpriteSheet),
+            Self::WEIGHTED_MESH => Some(Self::WeightedMesh),
+            Self::DISTORTION => Some(Self::Distortion),
+            Self::RING_MESH => Some(Self::RingMesh),
+            Self::LENS_FLARE => Some(Self::LensFlare),
+            Self::AUDIO => Some(Self::Audio),
+            Self::POINT_LIGHT => Some(Self::PointLight),
+            Self::NULL_PARTICLE => Some(Self::Null),
+            _ => None,
+        }
+    }
+
+    /// Kinds that own a dedicated def parser and decline the mesh path cleanly (no lookup, no
+    /// warning): sound and distortion chunks are claimed by SoundGeneratorDef /
+    /// DistortionGeneratorDef.
+    pub fn is_deferred(&self) -> bool {
+        matches!(self, Self::Audio | Self::Distortion)
+    }
+}
 
 // research/xim ParticleGeneratorSettings.kt LinkedDataType (mesh source) + Particle.kt Particle spriteSheetIndex (the per-particle
 // spriteSheetIndex cursor) + ParticleUpdaters.kt (SpriteSheetFrameUpdater advances it over
-// life). StaticMesh binds a D3M; SpriteSheet binds a 0x21 sprite-sheet whose frames flipbook
-// across the particle's lifetime.
+// life). StaticMesh/WeightedMesh bind a type-0x1F mesh; SpriteSheet binds a 0x21 sprite-sheet
+// whose frames flipbook across the particle's lifetime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ParticleMeshKind {
     #[default]
     StaticMesh,
     SpriteSheet,
+    /// LinkedDataKind::WeightedMesh — resolved through the same type-0x1F path as StaticMesh.
+    WeightedMesh,
 }
 // research/xim ParticleGeneratorSettings.kt `enum class AttachType(val flag: Int)` — which
 // actor (and whose facing) a generator's emission origin is bound to.
@@ -127,13 +200,17 @@ impl AttachType {
     }
 }
 
-// research/xim ParticleGeneratorParser.kt — attachFlags bit layout, then
-// additionalAttachFlags bit 0x0001 = attachSourceOriented.
+// research/XIClient Attachment.cpp MakeAttachMatrix — the attach word carries ONE EID index,
+// not two joint fields: bits 4-9 of attachFlags plus bit 18 (bit 2 of additionalAttachFlags)
+// as its top bit. The index resolves through the actor's locator table with special semantics
+// at 48..=53 (ground/nearest/floor/water) — EID_INDEX.h.
 const ATTACH_TYPE_MASK: u16 = 0x000F;
-pub const ATTACH_JOINT0_MASK: u16 = 0x03F0;
-pub const ATTACH_JOINT0_SHIFT: u32 = 4;
+pub const ATTACH_EID_LOW_MASK: u16 = 0x03F0;
+pub const ATTACH_EID_LOW_SHIFT: u32 = 4;
 pub const ATTACH_JOINT1_MASK: u16 = 0xFC00;
 pub const ATTACH_JOINT1_SHIFT: u32 = 10;
+// Bit 18 of the combined attach word, i.e. bit 2 of additionalAttachFlags.
+const ADDITIONAL_ATTACH_EID_TOP_BIT: u16 = 0x0004;
 const ATTACH_SOURCE_ORIENTED: u16 = 0x0001;
 
 // research/xim ParticleInitializers.kt — the StandardParticleSetup renderStateFlags u16
@@ -327,6 +404,10 @@ pub const MOON_PHASES: usize = 12;
 // RGBA — one time-of-day keyframe track per channel (0x60 r .. 0x63 a).
 pub const TOD_COLOR_CHANNELS: usize = 4;
 
+/// The blend weights a weighted mesh carries (research/xim ParticleGeneratorParser.kt
+/// sec2Handler — Weight Mesh[0..4]).
+pub const WEIGHTED_MESH_WEIGHTS: usize = 5;
+
 fn rgba_u8(b: &[u8], o: usize) -> [f32; 4] {
     std::array::from_fn(|i| b[o + i] as f32 / 255.0)
 }
@@ -387,8 +468,9 @@ pub struct ParticleGeneratorDef {
     pub batched: bool,
 
     pub attach_type: AttachType,
-    pub attach_joint_source: u8,
-    pub attach_joint_target: u8,
+    // research/XIClient Attachment.cpp MakeAttachMatrix — the single EID locator index
+    // (bits 4-9 + bit 18 of the attach word); see ATTACH_EID_LOW_MASK.
+    pub attach_eid: u8,
     pub attach_source_oriented: bool,
 
     pub init_scale: [f32; 3],
@@ -410,16 +492,22 @@ pub struct ParticleGeneratorDef {
     // xim's mapping is the available evidence).
     pub color_variance: Option<[f32; 4]>,
     // sec2 0x19 ColorTransformSetup: four i16s (r,g,b,a) written to the element's allocation
-    // slot. Parsed, not applied: the retail decompile's ElemGenerate has no 0x19 case
-    // (XICLIENT_CODE_MISSING) and xim allocates the transform but its drawers never read it
-    // (research/xim ParticleInitializers.kt ColorTransformSetup — particle.allocate only), so
-    // the application is unknown and the shipped alpha is always 0.
+    // slot at emit (research/xim ParticleInitializers.kt ColorTransformSetup). The retail
+    // decompile's ElemGenerate has no 0x19 case, so xim's mapping is the available evidence;
+    // every shipped alpha channel is 0.
     pub color_transform: Option<[i16; 4]>,
+    // sec2 0x1A ColorTransformVariance: four i16s — each emitted element's transform gains
+    // round(posRand(1) × variance) per channel on top of the 0x19 base (research/xim
+    // ParticleInitializers.kt ColorTransformVariance).
+    pub color_transform_variance: Option<[i16; 4]>,
+    // sec3 0x0B ColorTransformApplier: no payload — arms the per-frame application of the
+    // transform to the element's colour (research/xim ParticleUpdaters.kt
+    // ColorTransformApplier).
+    pub color_transform_applier: bool,
     // sec3 0x0C ColorTransformModifier: four i16s [r, g, b, a] — the per-frame rate on the
     // sec2 0x19 color transform over the particle's life (research/xim
     // ParticleUpdaters.kt ColorTransformModifier — colorTransform += floor(modifier ×
-    // frames/30) per frame). The engine does not model the color transform's
-    // application, so parse-only.
+    // frames/30) per frame).
     pub color_transform_modifier: Option<[i16; 4]>,
     pub init_velocity: [f32; 3],
     // sec2 0x03 VelocityVarianceSetup (position): the per-axis bound of the uniform random
@@ -495,6 +583,17 @@ pub struct ParticleGeneratorDef {
     pub depth_write: bool,
 
     // Per-particle keyframe tracks referenced by DAT-id (resolved against the action's 0x19 chunks).
+    // sec2 0x21/0x22/0x23 KeyFrameValueSetup: a keyframe track on the element's position
+    // x/y/z; the section-3 ProgressValueUpdater 0x0F/0x10/0x11 replaces the channel each
+    // frame, key 0 overridden by the particle's spawn-time value (research/xim
+    // ParticleGeneratorParser.kt sec2Handler/sec3Handler — p.position.x = v).
+    pub position_x_track: Option<[u8; 4]>,
+    pub position_y_track: Option<[u8; 4]>,
+    pub position_z_track: Option<[u8; 4]>,
+    // sec2 0x33..0x37 KeyFrameValueSetup (Weight Mesh[0..4]): the weighted-mesh blend-weight
+    // tracks, read back by the section-3 ProgressValueUpdater 0x1E..0x22. Parsed but not
+    // applied until the weighted-mesh draw path lands.
+    pub weighted_mesh_weight_tracks: [Option<[u8; 4]>; WEIGHTED_MESH_WEIGHTS],
     pub scale_x_track: Option<[u8; 4]>,
     pub scale_y_track: Option<[u8; 4]>,
     // sec2 0x29 KeyFrameValueSetup (scale.z): retail captures field_EC.z, the element's
@@ -530,6 +629,12 @@ pub struct ParticleGeneratorDef {
     // research/xim ParticleGeneratorParser.kt sec2Handler,431-434
     pub tod_color_tracks: [Option<[u8; 4]>; TOD_COLOR_CHANNELS],
     pub tod_color_driven: [bool; TOD_COLOR_CHANNELS],
+
+    // sec2 0x68 KeyFrameValueSetup ("ToD Volume") + section-3 ClockValueUpdater 0x43: a
+    // keyframe track sampled at the full-day interpolation that multiplies the element's
+    // volume — on sound generators this is the ambient gain (research/xim
+    // ParticleGeneratorParser.kt sec2Handler/sec3Handler — audioConfiguration.volumeMultiplier).
+    pub tod_volume_track: Option<[u8; 4]>,
 
     // research/xim ParticleGeneratorParser.kt sec3Handler MoonPhaseSpriteSheetUpdater (0x45): the
     // sprite-sheet frame is the current moon phase, not the particle's life progress.
@@ -583,6 +688,31 @@ pub struct ParticleGeneratorDef {
     // Parsed but not applied until the child-generator runtime lands (the sec3 0x25/0x33
     // child updaters).
     pub child_generator: Option<[u8; 4]>,
+
+    // sec2 0x6A — the third block of the child-generator family (see SEC2_OPCODE_CHILD_GENERATOR_3):
+    // a per-particle child like `child_generator`.
+    pub child_generator_3: Option<[u8; 4]>,
+
+    // sec2 0x3C OnceChildGeneratorSetup: [expectZero32, child generator DAT id] — the sibling
+    // emitted once at each particle's init (research/xim ParticleInitializers.kt
+    // OnceChildGeneratorSetup).
+    pub once_child_generator: Option<[u8; 4]>,
+
+    // sec4 0x01 EmitChildHandler: [expectZero32, child generator DAT id] — the sibling emitted
+    // once at each particle's expiry (research/xim ParticleExpirationHandlers.kt
+    // EmitChildHandler).
+    pub emit_child_id: Option<[u8; 4]>,
+
+    // sec3 0x25 ChildGeneratorBasicUpdater: per frame the sec2 child generator emits with the
+    // parent particle's position only (research/xim ParticleUpdaters.kt
+    // ChildGeneratorBasicUpdater).
+    pub child_emit_basic: bool,
+    // sec3 0x33 ChildGeneratorUpdater at BillBoardType.None: per-frame emission with the parent
+    // particle's full transform.
+    pub child_emit_full: bool,
+    // sec3 0x46 — the same updater at BillBoardType.XYZ (research/xim ParticleUpdaters.kt
+    // ChildGeneratorUpdater).
+    pub child_emit_billboard: bool,
 
     // sec2 0x40 OscillationAccelerationSetup (Z): [acceleration, accelerationVariance]; the
     // particle's Z oscillation acceleration is acceleration + variance × one [−1, 1) draw
@@ -657,16 +787,25 @@ pub struct ParticleGeneratorDef {
     // inputs only).
     pub specular_rot_y_track: Option<[u8; 4]>,
     // sec2 0x82 CameraShakeSetup: [expectZero32, keyframe track id, unk0 u32, unk1 f32,
-    // unk2 u32] — the keyframe DAT id the section-3 0x5F CameraShakeUpdater samples at the
-    // particle's progress (research/xim ParticleInitializers.kt CameraShakeSetup). Parsed
-    // but not applied until the section-3 updater lands.
-    pub camera_shake_track: Option<[u8; 4]>,
+    // unk2 u32] — the keyframe DAT id the section-3 0x5F updater samples at the particle's
+    // progress (research/xim ParticleInitializers.kt CameraShakeSetup). xim labels this pair
+    // "camera shake"; retail applies it as gamepad vibration, and kuluu-render/src/rumble.rs
+    // update_rumble_system drives bevy's rumble pipeline from the track.
+    pub rumble_track: Option<[u8; 4]>,
     // sec3 0x5F CameraShakeUpdater: near, far, and — only in the 4-word form — shakeFactor
-    // (research/xim ParticleUpdaters.kt CameraShakeUpdater — the opCodeSize == 4 branch). The
-    // runtime application (sampling the sec2 0x82 track at the particle's progress with the
-    // distance falloff × 1000×progress×distance×shakeFactor capped at 0.33, then
-    // camera.applyShake) is unmodeled, so parse-only.
-    pub camera_shake: Option<[f32; 3]>,
+    // (research/xim ParticleUpdaters.kt CameraShakeUpdater — the opCodeSize == 4 branch).
+    // Rumble intensity falloff by camera-to-particle distance: full inside `near`, zero
+    // beyond `far` (kuluu-render/src/rumble.rs update_rumble_system).
+    pub rumble_falloff: Option<[f32; 3]>,
+
+    // sec3 0x2E DrawDistanceUpdater: [near, far, kill-flag u32] — per frame the element's alpha
+    // multiplier fades linearly from full at `near` to zero at `far` by camera-to-particle
+    // distance; retail zeroes it (and kills the element when the flag is set) beyond `far`
+    // (research/XIClient/src/XIClient/source/World/Generator/CYyGenerator.cpp CYyGenerator::ElemIdle
+    // case 0x2E; research/xim ParticleUpdaters.kt DrawDistanceUpdater). The kill flag is 0 in
+    // every shipped DAT, so kuluu culls at zero alpha without killing.
+    pub draw_distance_near: Option<f32>,
+    pub draw_distance_far: Option<f32>,
 
     // sec2 0x32 HazeOffsetInitializer: two floats, of which xim applies only the second,
     // as particle.hazeOffset.x — a draw-time x translate the haze/distortion shader pass
@@ -695,21 +834,33 @@ pub struct ParticleGeneratorDef {
     pub parent_scale: bool,
 
     // sec2 0x69 KeyFrameValueSetup (velocity dampener): the 0x27/0x28/0x29 track shape
-    // bound to the element's velocity dampener (research/xim ParticleGeneratorParser.kt
-    // sec2Handler 0x69; retail's keyframe pre-load pass references the same blocks as
-    // Keyframe resources). Parsed but not applied: the engine does not model the velocity
-    // dampener.
+    // bound to the element's velocity dampener, sampled per frame by the sec3 0x44
+    // applier and overriding the 0x2C base factor (research/xim
+    // ParticleGeneratorParser.kt sec2Handler 0x69; retail's keyframe pre-load pass
+    // references the same blocks as Keyframe resources).
     pub velocity_dampener_track: Option<[u8; 4]>,
+    // sec3 0x44 ProgressValueUpdater (dampening factor): no payload — arms the per-frame
+    // sampling of the sec2 0x69 track into VelocityDampener's factor (research/xim
+    // ParticleGeneratorParser.kt sec3Handler).
+    pub dampening_factor_applier: bool,
     // sec3 0x2C VelocityDampener: [dampen, unk] — velocity ×= dampeningFactor^dt, the
     // factor coming from the sec2 0x69 track when present, else dampen (research/xim
-    // ParticleUpdaters.kt VelocityDampener). The engine does not model the velocity
-    // dampener, so parse-only.
+    // ParticleUpdaters.kt VelocityDampener).
     pub velocity_dampener: Option<[f32; 2]>,
     // sec3 0x26 VelocityRotator: three floats, the rotateAmount added to the velocity
     // rotation × (0.5 × dt) per frame (research/xim ParticleUpdaters.kt VelocityRotator —
-    // the actor-space axis hack and the 0.5 factor are unmodeled). The engine has no
-    // velocityRotation, so parse-only.
+    // the actor-space axis swap and the 0.5 factor are kept as named consts in
+    // particle_sim.rs, flagged for retail verification).
     pub velocity_rotator: Option<[f32; 3]>,
+    // sec3 0x2F VelocityRotationUpdater: no payload — collapses all velocity into +x and
+    // copies the particle rotation into the velocity rotation (research/xim
+    // ParticleUpdaters.kt VelocityRotationUpdater).
+    pub velocity_rotation_updater: bool,
+    // sec2 0x31 RandomVelocitySetup: one float bound; each emitted element's base velocity
+    // is replaced by value × rand() on all three axes — the relative-velocity portion is a
+    // separate transform and survives (research/xim ParticleInitializers.kt
+    // RandomVelocitySetup).
+    pub random_velocity: Option<f32>,
 
     // sec2 0x4E FixedPointPositionVarianceSetup: [expectZero32, point list DAT id,
     // expect32(0, 1)] — the point list whose points cycle as per-emitted-particle
@@ -853,13 +1004,30 @@ const SEC2_OPCODE_SCALE_VELOCITY: u8 = 0x12;
 const SEC2_OPCODE_SCALE_VEL_VARIANCE: u8 = 0x13;
 const SEC2_OPCODE_COLOR_VARIANCE: u8 = 0x17;
 const SEC2_OPCODE_COLOR_TRANSFORM_SETUP: u8 = 0x19;
+// research/xim ParticleGeneratorParser.kt sec2Handler — ColorTransformVariance.
+const SEC2_OPCODE_COLOR_TRANSFORM_VARIANCE: u8 = 0x1A;
 const SEC2_OPCODE_SPRITE_SHEET_INIT: u8 = 0x1D;
 const SEC2_OPCODE_SPHERICAL_VARIANCE_FULL: u8 = 0x1F;
+// research/xim ParticleGeneratorParser.kt sec2Handler — KeyFrameValueSetup bound to the
+// element's position channels, read back by the section-3 ProgressValueUpdater 0x0F..0x11.
+const SEC2_OPCODE_POSITION_X_TRACK: u8 = 0x21;
+const SEC2_OPCODE_POSITION_Y_TRACK: u8 = 0x22;
+const SEC2_OPCODE_POSITION_Z_TRACK: u8 = 0x23;
 const SEC2_OPCODE_SCALE_Z_TRACK: u8 = 0x29;
 const SEC2_OPCODE_COLOR_R_TRACK: u8 = 0x2A;
 const SEC2_OPCODE_COLOR_G_TRACK: u8 = 0x2B;
 const SEC2_OPCODE_COLOR_B_TRACK: u8 = 0x2C;
 const SEC2_OPCODE_HAZE_OFFSET: u8 = 0x32;
+// research/xim ParticleGeneratorParser.kt sec2Handler — Weight Mesh[0..4] KeyFrameValueSetup,
+// read back by the section-3 ProgressValueUpdater 0x1E..0x22.
+const SEC2_OPCODE_WEIGHTED_MESH_WEIGHT_FIRST: u8 = 0x33;
+const SEC2_OPCODE_WEIGHTED_MESH_WEIGHT_LAST: u8 = 0x37;
+// research/xim ParticleGeneratorParser.kt sec2Handler — RandomVelocitySetup.
+const SEC2_OPCODE_RANDOM_VELOCITY: u8 = 0x31;
+// research/XIClient CYyGenerator.cpp ElemGenerate — 0x3C/0x44/0x53/0x6A share one case
+// (InitiateAllContainerSearch Generater): a sibling generator chunk bound by id. xim splits the
+// family into OnceChildGeneratorSetup (this opcode, emit once at init) and ChildGeneratorSetup.
+const SEC2_OPCODE_ONCE_CHILD_GENERATOR: u8 = 0x3C;
 const SEC2_OPCODE_INCREMENTAL_ROTATION: u8 = 0x3B;
 const SEC2_OPCODE_OSCILLATION_SETUP: u8 = 0x3D;
 const SEC2_OPCODE_OSCILLATION_ACCEL_X: u8 = 0x3E;
@@ -885,7 +1053,11 @@ const SEC2_OPCODE_SPECULAR_ROT_Z_TRACK: u8 = 0x5B;
 const SEC2_OPCODE_SPECULAR_COLOR_G_TRACK: u8 = 0x5D;
 const SEC2_OPCODE_SPECULAR_COLOR_A_TRACK: u8 = 0x5F;
 const SEC2_OPCODE_REVERSE_DISPLACEMENT: u8 = 0x67;
+// research/XIClient CYyGenerator.cpp ElemGenerate case 0x6A — the third block of the
+// child-generator family (see SEC2_OPCODE_ONCE_CHILD_GENERATOR); xim maps it to
+// ChildGeneratorSetup.
 const SEC2_OPCODE_VELOCITY_DAMPENER_TRACK: u8 = 0x69;
+const SEC2_OPCODE_CHILD_GENERATOR_3: u8 = 0x6A;
 const SEC2_OPCODE_PROJECTION_BIAS: u8 = 0x72;
 const SEC2_OPCODE_PARENT_ROTATE_2: u8 = 0x79;
 const SEC2_OPCODE_CAMERA_SHAKE_SETUP: u8 = 0x82;
@@ -904,23 +1076,528 @@ const SEC3_OPCODE_SCALE_PROGRESS_LAST: u8 = 0x17;
 const SEC3_OPCODE_COLOR_RGB_PROGRESS_FIRST: u8 = 0x18;
 const SEC3_OPCODE_COLOR_RGB_PROGRESS_LAST: u8 = 0x1A;
 const SEC3_OPCODE_ALPHA_UPDATER: u8 = 0x1B;
+// research/xim ParticleGeneratorParser.kt sec3Handler — ProgressValueUpdater position.x/y/z.
+const SEC3_OPCODE_POSITION_X_APPLIER: u8 = 0x0F;
+const SEC3_OPCODE_POSITION_Y_APPLIER: u8 = 0x10;
+const SEC3_OPCODE_POSITION_Z_APPLIER: u8 = 0x11;
+// research/xim ParticleGeneratorParser.kt sec3Handler — weighted-mesh weight appliers.
+const SEC3_OPCODE_WEIGHTED_MESH_WEIGHT_FIRST: u8 = 0x1E;
+const SEC3_OPCODE_WEIGHTED_MESH_WEIGHT_LAST: u8 = 0x22;
 const SEC3_OPCODE_CHILD_GENERATOR_BASIC: u8 = 0x25;
 const SEC3_OPCODE_VELOCITY_ROTATOR: u8 = 0x26;
 const SEC3_OPCODE_OSCILLATION_APPLIER_X: u8 = 0x29;
 const SEC3_OPCODE_OSCILLATION_APPLIER_Y: u8 = 0x2A;
 const SEC3_OPCODE_OSCILLATION_APPLIER_Z: u8 = 0x2B;
 const SEC3_OPCODE_VELOCITY_DAMPENER: u8 = 0x2C;
+// research/XIClient/src/XIClient/source/World/Generator/CYyGenerator.cpp CYyGenerator::ElemIdle
+// case 0x2E; research/xim ParticleUpdaters.kt DrawDistanceUpdater.
+pub const SEC3_OPCODE_DRAW_DISTANCE: u8 = 0x2E;
 const SEC3_OPCODE_VELOCITY_ROTATION_UPDATER: u8 = 0x2F;
 const SEC3_OPCODE_CHILD_GENERATOR: u8 = 0x33;
 const SEC3_OPCODE_POINT_LIST_POSITION: u8 = 0x34;
 const SEC3_OPCODE_SPECULAR_ROT_Y_PROGRESS: u8 = 0x36;
 const SEC3_OPCODE_SPECULAR_ROT_Z_PROGRESS: u8 = 0x37;
+// research/xim ParticleGeneratorParser.kt sec2Handler ("ToD Volume") + sec3Handler
+// ClockValueUpdater — the time-of-day volume track on sound generators.
+pub const SEC2_OPCODE_TOD_VOLUME_TRACK: u8 = 0x68;
+pub const SEC3_OPCODE_TOD_VOLUME_APPLIER: u8 = 0x43;
 const SEC3_OPCODE_SPECULAR_COLOR_A_PROGRESS: u8 = 0x3B;
 const SEC3_OPCODE_DAMPENING_FACTOR: u8 = 0x44;
+// research/xim ParticleUpdaters.kt ChildGeneratorUpdater — the sec3 child-emission updater with
+// BillBoardType.XYZ (SEC3_OPCODE_CHILD_GENERATOR is the same updater at BillBoardType.None).
+const SEC3_OPCODE_CHILD_GENERATOR_BILLBOARD: u8 = 0x46;
 const SEC3_OPCODE_CAMERA_SHAKE_UPDATER: u8 = 0x5F;
 const SEC4_OFFSET: usize = 0x7C;
 const SEC4_OPCODE_RELIFE: u8 = 0x05;
 const SEC4_OPCODE_EMIT_CHILD: u8 = 0x01;
+
+/// Everything one section walk decodes from a generator chunk body, before any kind-specific
+/// consumer runs: the field set of [`ParticleGeneratorDef`] plus the claim byte and the
+/// sound/distortion-only values. The three def parsers map out of this; none re-walks the
+/// sections (research/xim ParticleGeneratorParser.kt — one parser per chunk, kind selects
+/// consumers).
+#[derive(Debug)]
+pub(crate) struct GeneratorSections {
+    pub(crate) frames_per_emission: f32,
+    pub(crate) particles_per_emission: u32,
+    pub(crate) emission_variance: f32,
+
+    pub(crate) mesh_id: [u8; 4],
+    pub(crate) mesh_kind: ParticleMeshKind,
+    pub(crate) base_position: [f32; 3],
+    pub(crate) max_life_frames: f32,
+    pub(crate) camera_billboard: bool,
+    pub(crate) billboard: ParticleBillboard,
+    // `base_position` is an offset from the camera rather than a world placement. Two independent
+    // flags express it: the billboard word's followCamera bit and the render-state's
+    // cameraAttachedBasePosition bit (La Theine's rain uses the first for the `~1ra` curtain and
+    // the second for the `rai2` mist puff). They place differently — followCamera pins the
+    // generator to the camera position outright, cameraAttachedBasePosition rotates the offset
+    // by the view matrix (research/xim Particle.kt updateAssociatedPosition) — so both are kept alongside the
+    // union.
+    pub(crate) camera_relative: bool,
+    pub(crate) follow_camera: bool,
+    pub(crate) camera_attached_base: bool,
+    // The spawn spread applied to every emitted particle; None puts them all on one point.
+    pub(crate) position_variance: Option<PositionVariance>,
+
+    // sec2 0x1F SphericalPositionVarianceFull: the spherical spawn spread whose azimuth is a
+    // random draw or one of the generator's evenly spaced steps (CYyGenerator.cpp
+    // CYyGenerator::ElemGenerate case 0x1F — the stepped azimuth indexes the generator's
+    // element counter; the camera flag maps the ring into the camera's frame).
+    pub(crate) spherical_full: Option<SphericalPositionVarianceFull>,
+
+    pub(crate) continuous: bool,
+    pub(crate) auto_run: bool,
+    pub(crate) batched: bool,
+
+    pub(crate) attach_type: AttachType,
+    // research/XIClient Attachment.cpp MakeAttachMatrix — the single EID locator index
+    // (bits 4-9 + bit 18 of the attach word); see ATTACH_EID_LOW_MASK.
+    pub(crate) attach_eid: u8,
+    pub(crate) attach_source_oriented: bool,
+
+    pub(crate) init_scale: [f32; 3],
+
+    // sec2 0x11 SingleScaleVarianceInitializer: one ufrand(payload) draw shared by every scale
+    // axis, per particle (research/xim ParticleInitializers.kt — scale += posRand(v);
+    // CYyGenerator.cpp CYyGenerator::ElemGenerate case 0x11 — a single ufrand added to x, y, z).
+    pub(crate) single_scale_variance: Option<f32>,
+    // sec2 0x10 ScaleVarianceInitializer: three floats, the per-axis ufrand bound added to the
+    // 0x0F base scale per particle (CYyGenerator.cpp CYyGenerator::ElemGenerate case 0x10 —
+    // field_EC.x/y/z += ufrand(payload); research/xim ParticleInitializers.kt
+    // ScaleVarianceInitializer — scale += variance * posRand(1f) per axis).
+    pub(crate) scale_variance: Option<[f32; 3]>,
+    pub(crate) init_color: [f32; 4],
+    // sec2 0x17 ColorVarianceSetup: four bytes (R,G,B,A) / 255 — the per-channel bound of the
+    // upward color draw added to the 0x16 base per particle (research/xim
+    // ParticleInitializers.kt ColorVarianceSetup — color.rgba[i] += (byte/255) * posRand(1f),
+    // one [0, 1) draw per channel; the retail decompile's ElemGenerate has no 0x17 case, so
+    // xim's mapping is the available evidence).
+    pub(crate) color_variance: Option<[f32; 4]>,
+    // sec2 0x19 ColorTransformSetup: four i16s (r,g,b,a) written to the element's allocation
+    // slot at emit (research/xim ParticleInitializers.kt ColorTransformSetup). The retail
+    // decompile's ElemGenerate has no 0x19 case, so xim's mapping is the available evidence;
+    // every shipped alpha channel is 0.
+    pub(crate) color_transform: Option<[i16; 4]>,
+    // sec2 0x1A ColorTransformVariance: four i16s — each emitted element's transform gains
+    // round(posRand(1) × variance) per channel on top of the 0x19 base (research/xim
+    // ParticleInitializers.kt ColorTransformVariance).
+    pub(crate) color_transform_variance: Option<[i16; 4]>,
+    // sec3 0x0B ColorTransformApplier: no payload — arms the per-frame application of the
+    // transform to the element's colour (research/xim ParticleUpdaters.kt
+    // ColorTransformApplier).
+    pub(crate) color_transform_applier: bool,
+    // sec3 0x0C ColorTransformModifier: four i16s [r, g, b, a] — the per-frame rate on the
+    // sec2 0x19 color transform over the particle's life (research/xim
+    // ParticleUpdaters.kt ColorTransformModifier — colorTransform += floor(modifier ×
+    // frames/30) per frame).
+    pub(crate) color_transform_modifier: Option<[i16; 4]>,
+    pub(crate) init_velocity: [f32; 3],
+    // sec2 0x03 VelocityVarianceSetup (position): the per-axis bound of the uniform random
+    // velocity added to the 0x02 base per particle (research/xim ParticleInitializers.kt
+    // VelocityVarianceSetup — the allocationOffset binds it to the position transform).
+    pub(crate) velocity_variance: Option<[f32; 3]>,
+    // sec2 0x08 RelativeVelocitySetup: the magnitude of the per-particle velocity added along
+    // the spawn offset's direction (research/xim ParticleInitializers.kt RelativeVelocitySetup —
+    // direction = normalize of the initial position relative to the spawn point; research/XIClient
+    // CYyGenerator.cpp CYyGenerator::ElemGenerate case 0x08 normalizes field_54 minus the
+    // position captured at element spawn, i.e. the offsets the earlier blocks added).
+    pub(crate) relative_velocity: Option<f32>,
+    // sec2 0x41 RelativeVelocityVarianceSetup: the bound of the uniform random magnitude added
+    // to the 0x08 relative velocity along the spawn offset's direction per particle
+    // (research/xim ParticleInitializers.kt RelativeVelocityVarianceSetup; the retail
+    // decompile's CYyGenerator.cpp CYyGenerator::ElemGenerate case 0x41 scales the normalized
+    // spawn offset by frand of this value and adds it to the same allocation vector as 0x08).
+    pub(crate) relative_velocity_variance: Option<f32>,
+    // sec2 0x67 ReverseDisplacementSetup: the block's presence arms the spawn-at-endpoint
+    // behavior; its single float payload is never read by the effect
+    // (research/xim ParticleInitializers.kt ReverseDisplacementSetup — the read float is
+    // stored but unused in apply; the retail decompile's ElemGenerate has no 0x67 case,
+    // so xim's mapping is the available evidence).
+    pub(crate) reverse_displacement: Option<f32>,
+    // sec3 0x02 PositionUpdater: a no-payload marker — retail's ElemIdle case 0x02 adds the
+    // element's total velocity × dt to its position, and only while the block is present
+    // (research/xim ParticleUpdaters.kt PositionUpdater; CYyGenerator.cpp
+    // CYyGenerator::ElemIdle case 0x02). A generator that carries a base velocity without
+    // the block is not position-stepped by retail, so the flag gates the engine's velocity
+    // integration.
+    pub(crate) position_updater: bool,
+    // sec2 0x0A RotationVarianceInitializer: the per-axis bound of the uniform random rotation
+    // added to the 0x09 base per particle (research/xim ParticleInitializers.kt
+    // RotationVarianceInitializer — the retail decompile's ElemGenerate default is
+    // XICLIENT_CODE_MISSING, so xim's mapping is the available evidence).
+    pub(crate) rotation_variance: Option<[f32; 3]>,
+    pub(crate) init_rotation: [f32; 3],
+    // sec2 0x3B IncrementalRotationApplier: the per-axis increment added to the 0x09 base
+    // rotation, scaled by one plus the particles emitted before this one (research/xim
+    // ParticleInitializers.kt IncrementalRotationApplier — rotation += incr × (1 +
+    // totalParticlesEmitted); its apply also arms the render-time rotation-y negation, even
+    // for an all-zero payload. The retail decompile's ElemGenerate has no 0x3B case, so xim
+    // is the available evidence.
+    pub(crate) incremental_rotation: Option<[f32; 3]>,
+    pub(crate) blend: ParticleBlend,
+    // The raw BlendFuncInitializer p0 (retail `field_16C & 0xFF`), kept alongside the collapsed
+    // `blend` because the TEXTUREFACTOR-alpha promotion is keyed on byte 0x44 exactly.
+    // research/XIClient/src/XIClient/source/Resource/Derived/CMoD3m.cpp CMoD3m::Draw
+    pub(crate) blend_byte: u8,
+
+    // Selects the D3m texture-stage table: set = NonZeroOneTSS (texture alpha ignored,
+    // alpha = 4*D.a*F.a), clear = NonZeroTwoTSS (alpha = 8*D.a*T.a*F.a).
+    // research/XIClient/src/XIClient/source/Resource/Derived/CMoD3m.cpp ZeroOneTSS
+    pub(crate) ignore_texture_alpha: bool,
+
+    // Clear = the element fogs toward the area's fog colour like terrain (CMoElem.cpp
+    // CMoElem::PrepDX); the weat/ sky layers past the fog range set the bit.
+    pub(crate) fog_enabled: bool,
+
+    pub(crate) draw_priority: DrawPriority,
+    // CYyGenerator.cpp CYyGenerator::ElemGenerate opcode 0x30 — the element's `field_128`
+    // sort-key offset (research/xim Particle.kt `projectionBias`).
+    pub(crate) sort_offset: f32,
+    // sec2 0x72 ProjectionBiasInitializer: two floats. param0 is the same `field_128` 0x30
+    // writes (the ordering-table key via CMoElem.cpp CMoElem::CheckSomethingWasTrue ->
+    // OT->Insert), so it lands in `sort_offset`; param1 is the attached SkeletalMeshActor
+    // depth-scale factor (CYyGenerator.cpp CYyGenerator::ElemGenerate case 0x72 —
+    // field_128 *= (GetDepthScale() - 1) * (param1 != 0 ? param1 : 1) + 1), which the engine
+    // does not reproduce (no actor depth scale) and xim ignores (research/xim
+    // ParticleInitializers.kt ProjectionBiasInitializer — only param0 reaches the draw bias).
+    pub(crate) projection_bias: Option<[f32; 2]>,
+    // CMoElem.cpp CMoElem::PrepDX — D3DRS_ZWRITEENABLE for the element.
+    pub(crate) depth_write: bool,
+
+    // Per-particle keyframe tracks referenced by DAT-id (resolved against the action's 0x19 chunks).
+    pub(crate) position_x_track: Option<[u8; 4]>,
+    pub(crate) position_y_track: Option<[u8; 4]>,
+    pub(crate) position_z_track: Option<[u8; 4]>,
+    pub(crate) weighted_mesh_weight_tracks: [Option<[u8; 4]>; WEIGHTED_MESH_WEIGHTS],
+    pub(crate) scale_x_track: Option<[u8; 4]>,
+    pub(crate) scale_y_track: Option<[u8; 4]>,
+    // sec2 0x29 KeyFrameValueSetup (scale.z): retail captures field_EC.z, the element's
+    // scale z, as the track's initial value (CYyGenerator.cpp CYyGenerator::ElemGenerate
+    // case 0x29 — same shape as 0x27/0x28). Parsed but not applied: the engine's 2D sprite
+    // has no z axis (as for the 0x10/0x11 z bound).
+    pub(crate) scale_z_track: Option<[u8; 4]>,
+    pub(crate) alpha_track: Option<[u8; 4]>,
+    // sec2 0x2A KeyFrameValueSetup (color.r): a keyframe track on the element's red channel
+    // (research/xim ParticleGeneratorParser.kt — 0x2A/0x2B/0x2C are the Color.r/g/b
+    // KeyFrameValueSetup; retail's keyframe pre-load pass references the same blocks as
+    // Keyframe resources). Parsed but not applied: the engine sets the particle's rgb at
+    // spawn from the 0x16 base / 0x17 variance and has no per-frame rgb track path.
+    pub(crate) color_r_track: Option<[u8; 4]>,
+    // sec2 0x2B KeyFrameValueSetup (color.g): the green-channel twin of 0x2A
+    // (research/xim ParticleGeneratorParser.kt). Parsed but not applied, as for 0x2A.
+    pub(crate) color_g_track: Option<[u8; 4]>,
+    // sec2 0x2C KeyFrameValueSetup (color.b): the blue-channel twin of 0x2A
+    // (research/xim ParticleGeneratorParser.kt). Parsed but not applied, as for 0x2A.
+    pub(crate) color_b_track: Option<[u8; 4]>,
+
+    // research/xim ParticleUpdaters.kt DayOfWeekColorUpdater (0x4E, 8xRGBA) and
+    // MoonPhaseColorUpdater (0x4F, 12xRGBA): indexed by day-of-week / moon-phase frame and
+    // applied as a 2x modulate (Particle.kt getColor). RGBA in 0..=1.
+    pub(crate) day_of_week_color: Option<[[f32; 4]; DAYS_OF_WEEK]>,
+    pub(crate) moon_phase_color: Option<[[f32; 4]; MOON_PHASES]>,
+
+    // The time-of-day color curves: initializer 0x60..0x63 name a keyframe track per RGBA
+    // channel, and section-3 ClockValueUpdater 0x3C..0x3F sample it at the Vana'diel day
+    // fraction rather than the particle's life progress. This is how retail authors the
+    // sun's dawn/noon/dusk ramp and the moon's daytime fade — 0x3F multiplies alpha, the
+    // other three assign their channel.
+    // research/xim ParticleGeneratorParser.kt sec2Handler,431-434
+    pub(crate) tod_color_tracks: [Option<[u8; 4]>; TOD_COLOR_CHANNELS],
+    pub(crate) tod_color_driven: [bool; TOD_COLOR_CHANNELS],
+    pub(crate) tod_volume_track: Option<[u8; 4]>,
+
+    // research/xim ParticleGeneratorParser.kt sec3Handler MoonPhaseSpriteSheetUpdater (0x45): the
+    // sprite-sheet frame is the current moon phase, not the particle's life progress.
+    pub(crate) moon_phase_sprite: bool,
+
+    // research/xim ParticleUpdaters.kt section-3 updaters (offset at body[0x78], same
+    // sectionHeader+offset-0x10 convention as the setup section). TextureCoordinateUpdater
+    // 0x27/0x28 carry the per-frame UV-translate velocity that scrolls the sprite/sheet
+    // texture (cascade/moat water). VelocityAccelerator 0x03/0x06/0x09 read a Vector3f at
+    // payload+0 and target their own transform allocation. [0,0]/None = static.
+    pub(crate) uv_scroll: [f32; 2],
+    pub(crate) accel: Option<[f32; 3]>,
+    pub(crate) rotation_accel: Option<[f32; 3]>,
+    pub(crate) scale_accel: Option<[f32; 3]>,
+
+    // Section 1 (body[0x70]) generator-level updater 0x0A, research/xim
+    // ParticleGeneratorParser.kt sec1Handler GeneratorCullUpdater.
+    pub(crate) emit_cull: Option<EmitCull>,
+
+    // Section 1 generator-level updater 0x11, research/xim ParticleGeneratorParser.kt
+    // sec1Handler AssociationUpdater.
+    pub(crate) association: Option<AssociationFollow>,
+
+    // sec2 0x8E FootMarkEffectSetup (research/xim ParticleInitializers.kt): a no-payload marker.
+    // The particle snaps to the actor's position + joint and facing on the spawn frame, then
+    // stops following the generator (research/xim Particle.kt updateAssociatedPosition /
+    // updateAssociatedFacing footMarkEffect branches).
+    pub(crate) foot_mark: bool,
+
+    // sec2 0x3D OscillationSetup: a no-payload marker allocating the particle's oscillation
+    // state (research/xim ParticleInitializers.kt OscillationSetup — NoDataParticleInitializer,
+    // apply is particle.allocate(allocationOffset, OscillationParams())); the 0x3E/0x3F/0x40
+    // acceleration setups write it and the section-3 0x29/0x2A/0x2B appliers integrate it.
+    pub(crate) oscillation: bool,
+
+    // sec2 0x45 ParentPositionCopyConfig: a no-payload marker — the particle's associated
+    // position copies its parent's (research/xim ParticleInitializers.kt
+    // ParentPositionCopyConfig; apply is a no-op without a parent). Parsed but not applied
+    // until the child-generator path lands (the sec2 0x44 ChildGeneratorSetup).
+    pub(crate) parent_position_copy: bool,
+
+    // sec2 0x46 ParentVelocityConfig: one float, the multiplier on the parent's total
+    // velocity copied into the child's velocity transform (research/xim
+    // ParticleInitializers.kt ParentVelocityConfig; apply is a no-op without a parent).
+    // Parsed but not applied until the child-generator path lands.
+    pub(crate) parent_velocity: Option<f32>,
+
+    // sec2 0x44 ChildGeneratorSetup: [expectZero32, child generator DAT id] — the sibling
+    // generator chunk emitted as a child of each particle of this one (research/xim
+    // ParticleInitializers.kt ChildGeneratorSetup; the sec2 0x53 block is the same shape).
+    // Parsed but not applied until the child-generator runtime lands (the sec3 0x25/0x33
+    // child updaters).
+    pub(crate) child_generator: Option<[u8; 4]>,
+    pub(crate) child_generator_3: Option<[u8; 4]>,
+    pub(crate) once_child_generator: Option<[u8; 4]>,
+    pub(crate) child_emit_basic: bool,
+    pub(crate) child_emit_full: bool,
+    pub(crate) child_emit_billboard: bool,
+
+    // sec2 0x40 OscillationAccelerationSetup (Z): [acceleration, accelerationVariance]; the
+    // particle's Z oscillation acceleration is acceleration + variance × one [−1, 1) draw
+    // (research/xim ParticleInitializers.kt OscillationAccelerationSetup — RandHelper rand()
+    // in [−1, 1)). Parsed but not applied until the section-3 applier lands.
+    pub(crate) oscillation_accel_z: Option<[f32; 2]>,
+    // sec2 0x3E OscillationAccelerationSetup (X): the X-axis twin of 0x40
+    // (research/xim ParticleInitializers.kt OscillationAccelerationSetup). Parsed but not
+    // applied until the section-3 applier lands.
+    pub(crate) oscillation_accel_x: Option<[f32; 2]>,
+    // sec2 0x3F OscillationAccelerationSetup (Y): the Y-axis twin of 0x40 (research/xim
+    // ParticleInitializers.kt OscillationAccelerationSetup). Present in 30 shipped generators
+    // though absent from the launch log. Parsed but not applied until the section-3 applier
+    // lands.
+    pub(crate) oscillation_accel_y: Option<[f32; 2]>,
+
+    // sec3 0x29 OscillationApplier (X): [rate-divisor, base-offset, unused-in-xim] — the
+    // integrator for the 0x3E acceleration: oscillationRate = 180f / payload0, baseOffset =
+    // payload1, payload2 has no effect (research/xim ParticleUpdaters.kt OscillationApplier).
+    // The acceleration is parsed but never moves a particle without it.
+    pub(crate) oscillation_applier_x: Option<[f32; 3]>,
+    // sec3 0x2B OscillationApplier (Z): the Z-axis twin of 0x29 (research/xim
+    // ParticleUpdaters.kt OscillationApplier), the integrator for the 0x40 acceleration.
+    pub(crate) oscillation_applier_z: Option<[f32; 3]>,
+    // sec3 0x2A OscillationApplier (Y): the Y-axis twin of 0x29 (research/xim
+    // ParticleUpdaters.kt OscillationApplier), the integrator for the 0x3F acceleration.
+    pub(crate) oscillation_applier_y: Option<[f32; 3]>,
+
+    // sec2 0x0B RotationVelocitySetup: radians per 60 Hz frame, stored on the element
+    // (CYyGenerator.cpp CYyGenerator::ElemGenerate case 0x0B). It only turns the particle when the
+    // sec3 0x05 RotationUpdater integrates it (CYyGenerator.cpp CYyGenerator::ElemIdle case 0x05;
+    // research/xim ParticleGeneratorParser.kt sec3Handler RotationUpdater), so read [`Self::spin`].
+    pub(crate) rotation_velocity: Option<[f32; 3]>,
+
+    // sec2 0x0C VelocityVarianceSetup (rotation): per-particle uniform [-v, v] draw added to each
+    // axis of the 0x0B spin rate (research/xim ParticleInitializers.kt — the allocationOffset
+    // binds it to the rotation transform; CYyGenerator.cpp CYyGenerator::ElemGenerate shares one
+    // frand-add body across 0x03/0x0C/0x13).
+    pub(crate) rotation_velocity_variance: Option<[f32; 3]>,
+    pub(crate) rotation_updater: bool,
+
+    // sec2 0x12 ScaleVelocitySetup: scale units per 60 Hz frame on each axis. Retail's
+    // ElemGenerate shares the 0x0B/0x12 case (a 12-byte memcpy into the scale transform's
+    // velocity at the allocation offset); only the sec3 0x08 ScaleUpdater integrates it
+    // (research/xim ParticleUpdaters.kt — scale += velocity × elapsedFrames), so read
+    // [`Self::scale_rate`].
+    pub(crate) scale_velocity: Option<[f32; 3]>,
+    pub(crate) scale_updater: bool,
+
+    // sec2 0x13 VelocityVarianceSetup (scale): a per-particle uniform [-v, v] draw added to
+    // each axis of the 0x12 scale velocity (research/xim ParticleInitializers.kt
+    // VelocityVarianceSetup — the allocationOffset binds it to the scale transform; retail's
+    // shared 0x03/0x0C/0x13 case adds frand(bounds) to the transform's velocity).
+    pub(crate) scale_velocity_variance: Option<[f32; 3]>,
+
+    // Section 4 (body[0x7C]) opcode 0x05, CYyGenerator.cpp CYyGenerator::ElemDie case 5 — an expiring
+    // element gets its life reset instead of dying, keeping its position, rotation and UV state.
+    // Every idle Home Point layer authors it; without it the crystal would snap back to its
+    // spawn rotation every 120 frames.
+    pub(crate) relife_on_expiry: bool,
+
+    // CYyGenerator.cpp CYyGenerator::HandleOne 0x01000000 — the element renders through
+    // CMoD3mSpecularElem, whose draw the XIClient decompile leaves as missing code; the sec2 0x55
+    // record is kept alongside so the reconstruction has its inputs.
+    pub(crate) specular_element: bool,
+    pub(crate) specular: Option<SpecularParams>,
+    // sec2 0x5A KeyFrameValueSetup (specular rotation.y): a keyframe track on the specular
+    // element's rotation y (research/xim ParticleGeneratorParser.kt — 0x59/0x5A/0x5B are the
+    // Specular Rotation x/y/z KeyFrameValueSetup; retail's keyframe pre-load pass references
+    // the same blocks as Keyframe resources). Parsed but not applied: the engine does not
+    // model the specular element's rotation (the 0x55 record is kept for reconstruction
+    // inputs only).
+    pub(crate) specular_rot_y_track: Option<[u8; 4]>,
+    // sec2 0x82 CameraShakeSetup: [expectZero32, keyframe track id, unk0 u32, unk1 f32,
+    // unk2 u32] — the keyframe DAT id the section-3 0x5F updater samples at the particle's
+    // progress (research/xim ParticleInitializers.kt CameraShakeSetup). xim labels this pair
+    // "camera shake"; retail applies it as gamepad vibration, and kuluu-render/src/rumble.rs
+    // update_rumble_system drives bevy's rumble pipeline from the track.
+    pub(crate) rumble_track: Option<[u8; 4]>,
+    // sec3 0x5F CameraShakeUpdater: near, far, and — only in the 4-word form — shakeFactor
+    // (research/xim ParticleUpdaters.kt CameraShakeUpdater — the opCodeSize == 4 branch).
+    // Rumble intensity falloff by camera-to-particle distance: full inside `near`, zero
+    // beyond `far` (kuluu-render/src/rumble.rs update_rumble_system).
+    pub(crate) rumble_falloff: Option<[f32; 3]>,
+    pub(crate) draw_distance_near: Option<f32>,
+    pub(crate) draw_distance_far: Option<f32>,
+
+    // sec2 0x32 HazeOffsetInitializer: two floats, of which xim applies only the second,
+    // as particle.hazeOffset.x — a draw-time x translate the haze/distortion shader pass
+    // offsets the previous-frame transform by (research/xim ParticleInitializers.kt
+    // HazeOffsetInitializer; GLDrawer.kt previousFrameTransform). Parsed but not applied:
+    // the engine has no haze/distortion pass yet; the sec3 0x24 ProgressValueUpdater
+    // animates the same value over life.
+    pub(crate) haze_offset_x: Option<f32>,
+
+    // sec2 0x47 ParentRotateConfig: a no-payload marker — the child particle copies its
+    // parent's rotation (research/xim ParticleInitializers.kt ParentRotateConfig; apply is
+    // a no-op without a parent). Parsed but not applied until the child-generator path
+    // lands (the sec2 0x44 ChildGeneratorSetup).
+    pub(crate) parent_rotate: bool,
+
+    // sec2 0x48 ParentColorConfig: a no-payload marker — the child particle copies its
+    // parent's color (research/xim ParticleInitializers.kt ParentColorConfig; apply is a
+    // no-op without a parent). Parsed but not applied until the child-generator path
+    // lands (the sec2 0x44 ChildGeneratorSetup).
+    pub(crate) parent_color: bool,
+
+    // sec2 0x49 ParentScaleConfig: a no-payload marker — the child particle copies its
+    // parent's scale (research/xim ParticleInitializers.kt ParentScaleConfig; apply is a
+    // no-op without a parent). Parsed but not applied until the child-generator path
+    // lands (the sec2 0x44 ChildGeneratorSetup).
+    pub(crate) parent_scale: bool,
+
+    // sec2 0x69 KeyFrameValueSetup (velocity dampener): the 0x27/0x28/0x29 track shape
+    // bound to the element's velocity dampener, sampled per frame by the sec3 0x44
+    // applier and overriding the 0x2C base factor (research/xim
+    // ParticleGeneratorParser.kt sec2Handler 0x69; retail's keyframe pre-load pass
+    // references the same blocks as Keyframe resources).
+    pub(crate) velocity_dampener_track: Option<[u8; 4]>,
+    // sec3 0x44 ProgressValueUpdater (dampening factor): no payload — arms the per-frame
+    // sampling of the sec2 0x69 track into VelocityDampener's factor (research/xim
+    // ParticleGeneratorParser.kt sec3Handler).
+    pub(crate) dampening_factor_applier: bool,
+    // sec3 0x2C VelocityDampener: [dampen, unk] — velocity ×= dampeningFactor^dt, the
+    // factor coming from the sec2 0x69 track when present, else dampen (research/xim
+    // ParticleUpdaters.kt VelocityDampener).
+    pub(crate) velocity_dampener: Option<[f32; 2]>,
+    // sec3 0x26 VelocityRotator: three floats, the rotateAmount added to the velocity
+    // rotation × (0.5 × dt) per frame (research/xim ParticleUpdaters.kt VelocityRotator —
+    // the actor-space axis swap and the 0.5 factor are kept as named consts in
+    // particle_sim.rs, flagged for retail verification).
+    pub(crate) velocity_rotator: Option<[f32; 3]>,
+    // sec3 0x2F VelocityRotationUpdater: no payload — collapses all velocity into +x and
+    // copies the particle rotation into the velocity rotation (research/xim
+    // ParticleUpdaters.kt VelocityRotationUpdater).
+    pub(crate) velocity_rotation_updater: bool,
+    // sec2 0x31 RandomVelocitySetup: one float bound; each emitted element's base velocity
+    // is replaced by value × rand() on all three axes — the relative-velocity portion is a
+    // separate transform and survives (research/xim ParticleInitializers.kt
+    // RandomVelocitySetup).
+    pub(crate) random_velocity: Option<f32>,
+
+    // sec2 0x4E FixedPointPositionVarianceSetup: [expectZero32, point list DAT id,
+    // expect32(0, 1)] — the point list whose points cycle as per-emitted-particle
+    // position offsets (research/xim ParticleInitializers.kt
+    // FixedPointPositionVarianceSetup). Retail's sec2 walk handles neither 0x4E nor 0x4F
+    // (research/XIClient CYyGenerator.cpp ElemGenerate), so the id is kept for
+    // reconstruction only.
+    pub(crate) fixed_point_position_variance: Option<[u8; 4]>,
+    // sec2 0x4F: the twin of 0x4E — xim maps both opcodes to the same class
+    // (research/xim ParticleGeneratorParser.kt sec2Handler); a second slot so a
+    // generator carrying both keeps both ids.
+    pub(crate) fixed_point_position_variance_2: Option<[u8; 4]>,
+
+    // sec2 0x53 ChildGeneratorSetup: [expectZero32, child generator DAT id] — xim maps
+    // both 0x44 and 0x53 to the same class (research/xim ParticleGeneratorParser.kt
+    // sec2Handler); a second slot so a generator carrying both keeps both ids. Parsed
+    // but not applied until the child-generator runtime lands (the sec3 0x25/0x33 child
+    // updaters).
+    pub(crate) child_generator_2: Option<[u8; 4]>,
+
+    // sec2 0x5B KeyFrameValueSetup (specular rotation.z): the 0x27/0x28/0x29 track shape
+    // bound to the specular element's rotation z (research/xim ParticleGeneratorParser.kt
+    // — 0x59/0x5A/0x5B are the Specular Rotation x/y/z KeyFrameValueSetup). Parsed but
+    // not applied: the engine does not model the specular element's rotation.
+    pub(crate) specular_rot_z_track: Option<[u8; 4]>,
+
+    // sec2 0x5F KeyFrameValueSetup (specular color.a): the 0x27/0x28/0x29 track shape
+    // bound to the specular element's color alpha (research/xim
+    // ParticleGeneratorParser.kt — 0x5C..0x5F are the Specular Color r/g/b/a
+    // KeyFrameValueSetup). Parsed but not applied: the engine does not model the
+    // specular element's color.
+    pub(crate) specular_color_a_track: Option<[u8; 4]>,
+
+    // sec2 0x79 ParentRotateConfig: a no-payload marker — xim maps 0x79 to the same
+    // class as 0x47 (research/xim ParticleGeneratorParser.kt sec2Handler, comment
+    // "How does it differ from 0x47?"); a second slot so a generator carrying both
+    // keeps both. Parsed but not applied until the child-generator path lands (the
+    // sec2 0x44 ChildGeneratorSetup).
+    pub(crate) parent_rotate_2: bool,
+
+    // sec2 0x56 BatchingSetup: one expectZero32 word — xim's apply sets the particle's
+    // batched flag, which skips movement-orientation (research/xim ParticleInitializers.kt
+    // BatchingSetup; Particle.kt applyMovementOrientation). Kept separate from `batched`:
+    // retail's generator walk has no 0x56 case (research/XIClient CYyGenerator.cpp), so the
+    // block does not arm the GEN_FLAG_BATCHED flag's CheckFlag29 behavior — parsed only.
+    pub(crate) batching_setup: bool,
+
+    // sec2 0x4A ParentTexCoordConfig: a no-payload marker — a child particle copies the
+    // parent's tex-coord translate (research/xim ParticleInitializers.kt
+    // ParentTexCoordConfig). A no-op without a parent, so parsed but not applied until the
+    // child-generator path lands (as for the 0x45 marker).
+    pub(crate) parent_tex_coord: bool,
+
+    // sec2 0x54 PointListPositionSetup: [in-mem ptr, keyframe DAT id, expect zero, in-mem
+    // ptr, point list DAT id] — the spline a particle follows, the keyframe id remapping
+    // its progress and zero when the raw progress drives it (research/xim
+    // ParticleInitializers.kt PointListPositionSetup; retail's ElemGenerate case 0x54
+    // offsets the first emitted elem by the spline's start point, a shared allocation slot
+    // zeroing the delta for later elems). Parsed but not applied until the sec3 0x34
+    // PointListPositionUpdater lands.
+    pub(crate) point_list_position: Option<([u8; 4], [u8; 4])>,
+
+    // sec2 0x51 KeyFrameValueSetup (velocity.y): the 0x27/0x28/0x29 track shape bound to
+    // the element's velocity y (research/xim ParticleGeneratorParser.kt sec2Handler —
+    // 0x50/0x51/0x52 are the Velocity x/y/z KeyFrameValueSetup). Parsed but not applied:
+    // the engine does not model a per-frame velocity track.
+    pub(crate) velocity_y_track: Option<[u8; 4]>,
+
+    // sec2 0x59 KeyFrameValueSetup (specular rot.x): the 0x27/0x28/0x29 track shape bound
+    // to the specular element's rotation x (research/xim ParticleGeneratorParser.kt —
+    // 0x59/0x5A/0x5B are the Specular Rotation x/y/z KeyFrameValueSetup). Parsed but not
+    // applied: the engine does not model the specular element's rotation.
+    pub(crate) specular_rot_x_track: Option<[u8; 4]>,
+
+    // sec2 0x5D KeyFrameValueSetup (specular color.g): the 0x27/0x28/0x29 track shape
+    // bound to the specular element's color green (research/xim
+    // ParticleGeneratorParser.kt — 0x5C..0x5F are the Specular Color r/g/b/a
+    // KeyFrameValueSetup). Parsed but not applied: the engine does not model the
+    // specular element's color.
+    pub(crate) specular_color_g_track: Option<[u8; 4]>,
+    /// The raw StandardParticleSetup kind byte — which def parser claims this chunk.
+    pub(crate) kind_byte: u8,
+    /// sec4 0x01 EmitChildHandler's child generator id (research/xim ParticleExpirationHandlers.kt).
+    #[allow(dead_code)]
+    pub(crate) emit_child_id: Option<[u8; 4]>,
+    /// sec2 0x4C audio range — the sound consumer's near/far.
+    pub(crate) sound_far: f32,
+    pub(crate) sound_near: f32,
+    /// sec2 0x6B — the Sph rail resource (chunk kind 0x4A) whose nearest point to the camera eye
+    /// is a sound generator's attenuation origin (CYyGenerator.cpp ElemGenerate case 0x6B).
+    pub(crate) sound_path_ref: Option<[u8; 4]>,
+}
 
 impl ParticleGeneratorDef {
     pub fn parse(body: &[u8]) -> Result<Option<Self>> {
@@ -928,120 +1605,842 @@ impl ParticleGeneratorDef {
     }
 
     pub fn parse_reporting(body: &[u8], sink: GeneratorOpcodeSink<'_>) -> Result<Option<Self>> {
-        let mut blocks: Vec<(GeneratorSection, u8, bool)> = Vec::new();
-        if body.len() < HEADER_LEN {
-            return Err(DatError::TruncatedChunk {
-                offset: 0,
-                needed: HEADER_LEN,
-                available: body.len(),
-            });
-        }
+        Self::parse_detailed(body, &mut |section, opcode, _size_words, _args, outcome| {
+            sink(section, opcode, outcome)
+        })
+    }
 
-        let attach_flags = u16_le(body, 0x00);
-        let additional_attach = u16_le(body, 0x02);
-        let attach_type =
-            AttachType::from_flag(attach_flags & ATTACH_TYPE_MASK).unwrap_or_default();
-        let attach_joint_source =
-            ((attach_flags & ATTACH_JOINT0_MASK) >> ATTACH_JOINT0_SHIFT) as u8;
-        let attach_joint_target =
-            ((attach_flags & ATTACH_JOINT1_MASK) >> ATTACH_JOINT1_SHIFT) as u8;
-        let attach_source_oriented = additional_attach & ATTACH_SOURCE_ORIENTED != 0;
-
-        let frames_per_emission = u16_le(body, 0x66) as f32 + 1.0;
-        let emission_variance = u16_le(body, 0x64) as f32;
-        let flags = u32_le(body, GEN_FLAGS_OFFSET);
-        let particles_per_emission = flags & PARTICLE_COUNT_MASK;
-        let continuous = flags & GEN_FLAG_CONTINUOUS != 0;
-        let auto_run = flags & GEN_FLAG_AUTO_RUN != 0;
-        let batched = flags & GEN_FLAG_BATCHED != 0;
-
-        // Section 2 = particle initializers.
-        let sec2_raw = u32_le(body, 0x74) as usize;
-        if sec2_raw < CHUNK_HEADER_LEN || sec2_raw - CHUNK_HEADER_LEN >= body.len() {
+    pub fn parse_detailed(body: &[u8], sink: GeneratorBlockSink<'_>) -> Result<Option<Self>> {
+        let Some((sections, blocks)) = parse_sections(body)? else {
             return Ok(None);
+        };
+        match LinkedDataKind::from_byte(sections.kind_byte) {
+            // Mesh kinds claim the particle path.
+            Some(
+                LinkedDataKind::StaticMesh
+                | LinkedDataKind::WeightedMesh
+                | LinkedDataKind::SpriteSheet,
+            ) => {
+                flush_blocks(sink, &blocks);
+                Ok(Some(Self::from_sections(&sections)))
+            }
+            // Non-visual kinds decline cleanly (no lookup, no warning).
+            Some(_) => Ok(None),
+            // A byte no shipped kind uses is a hard error: refuse the chunk and name it.
+            None => Err(DatError::UnknownLinkedDataType {
+                name: sections.mesh_id,
+                kind: sections.kind_byte,
+                linked_id: sections.mesh_id,
+            }),
         }
-        let mut cursor = sec2_raw - CHUNK_HEADER_LEN;
+    }
 
-        let mut mesh_id = [0u8; 4];
-        let mut mesh_kind = ParticleMeshKind::StaticMesh;
-        let mut base_position = [0.0f32; 3];
-        let mut max_life_frames = 0.0f32;
-        let mut camera_billboard = false;
-        let mut billboard = ParticleBillboard::None;
-        let mut follow_camera = false;
-        let mut camera_attached_base = false;
-        let mut position_variance = None;
-        let mut spherical_full = None;
-        let mut is_particle = false;
-        let mut init_scale = [1.0f32; 3];
-        let mut single_scale_variance = None;
-        let mut scale_variance = None;
-        let mut init_color = [1.0f32; 4];
-        let mut color_variance = None;
-        let mut color_transform = None;
-        let mut init_velocity = [0.0f32; 3];
-        let mut position_allocation = None;
-        let mut rotation_allocation = None;
-        let mut scale_allocation = None;
-        let mut velocity_variance = None;
-        let mut relative_velocity = None;
-        let mut relative_velocity_variance = None;
-        let mut reverse_displacement = None;
-        let mut rotation_variance = None;
-        let mut init_rotation = [0.0f32; 3];
-        let mut incremental_rotation = None;
-        let mut scale_x_track = None;
-        let mut scale_y_track = None;
-        let mut scale_z_track = None;
-        let mut alpha_track = None;
-        let mut color_r_track = None;
-        let mut color_g_track = None;
-        let mut color_b_track = None;
-        let mut blend = ParticleBlend::Additive;
-        let mut blend_byte = 0u8;
-        let mut ignore_texture_alpha = false;
-        let mut fog_enabled = true;
-        let mut draw_priority = DrawPriority::Depth;
-        let mut sort_offset = 0.0;
-        let mut projection_bias = None;
-        let mut depth_write = false;
-        let mut tod_color_tracks: [Option<[u8; 4]>; TOD_COLOR_CHANNELS] =
-            [None; TOD_COLOR_CHANNELS];
-        let mut rotation_velocity = None;
-        let mut rotation_velocity_variance = None;
-        let mut scale_velocity = None;
-        let mut scale_updater = false;
-        let mut scale_velocity_variance = None;
-        let mut specular = None;
-        let mut specular_element = false;
-        let mut specular_rot_y_track = None;
-        let mut specular_rot_z_track = None;
-        let mut specular_color_a_track = None;
-        let mut camera_shake_track = None;
-        let mut haze_offset_x = None;
-        let mut parent_rotate = false;
-        let mut parent_rotate_2 = false;
-        let mut batching_setup = false;
-        let mut parent_tex_coord = false;
-        let mut point_list_position = None;
-        let mut velocity_y_track = None;
-        let mut specular_rot_x_track = None;
-        let mut specular_color_g_track = None;
-        let mut parent_color = false;
-        let mut parent_scale = false;
-        let mut velocity_dampener_track = None;
-        let mut fixed_point_position_variance = None;
-        let mut fixed_point_position_variance_2 = None;
-        let mut foot_mark = false;
-        let mut oscillation = false;
-        let mut parent_position_copy = false;
-        let mut parent_velocity = None;
-        let mut child_generator = None;
-        let mut child_generator_2 = None;
-        let mut oscillation_accel_z = None;
-        let mut oscillation_accel_x = None;
-        let mut oscillation_accel_y = None;
+    fn from_sections(s: &GeneratorSections) -> Self {
+        Self {
+            frames_per_emission: s.frames_per_emission,
+            particles_per_emission: s.particles_per_emission,
+            emission_variance: s.emission_variance,
+            mesh_id: s.mesh_id,
+            mesh_kind: s.mesh_kind,
+            base_position: s.base_position,
+            max_life_frames: s.max_life_frames,
+            camera_billboard: s.camera_billboard,
+            billboard: s.billboard,
+            camera_relative: s.camera_relative,
+            follow_camera: s.follow_camera,
+            camera_attached_base: s.camera_attached_base,
+            position_variance: s.position_variance,
+            spherical_full: s.spherical_full,
+            continuous: s.continuous,
+            auto_run: s.auto_run,
+            batched: s.batched,
+            attach_type: s.attach_type,
+            attach_eid: s.attach_eid,
+            attach_source_oriented: s.attach_source_oriented,
+            init_scale: s.init_scale,
+            single_scale_variance: s.single_scale_variance,
+            scale_variance: s.scale_variance,
+            init_color: s.init_color,
+            color_variance: s.color_variance,
+            color_transform: s.color_transform,
+            color_transform_variance: s.color_transform_variance,
+            color_transform_applier: s.color_transform_applier,
+            color_transform_modifier: s.color_transform_modifier,
+            init_velocity: s.init_velocity,
+            velocity_variance: s.velocity_variance,
+            relative_velocity: s.relative_velocity,
+            relative_velocity_variance: s.relative_velocity_variance,
+            reverse_displacement: s.reverse_displacement,
+            position_updater: s.position_updater,
+            rotation_variance: s.rotation_variance,
+            init_rotation: s.init_rotation,
+            incremental_rotation: s.incremental_rotation,
+            blend: s.blend,
+            blend_byte: s.blend_byte,
+            ignore_texture_alpha: s.ignore_texture_alpha,
+            fog_enabled: s.fog_enabled,
+            draw_priority: s.draw_priority,
+            sort_offset: s.sort_offset,
+            projection_bias: s.projection_bias,
+            depth_write: s.depth_write,
+            position_x_track: s.position_x_track,
+            position_y_track: s.position_y_track,
+            position_z_track: s.position_z_track,
+            weighted_mesh_weight_tracks: s.weighted_mesh_weight_tracks,
+            scale_x_track: s.scale_x_track,
+            scale_y_track: s.scale_y_track,
+            scale_z_track: s.scale_z_track,
+            alpha_track: s.alpha_track,
+            color_r_track: s.color_r_track,
+            color_g_track: s.color_g_track,
+            color_b_track: s.color_b_track,
+            day_of_week_color: s.day_of_week_color,
+            moon_phase_color: s.moon_phase_color,
+            tod_color_tracks: s.tod_color_tracks,
+            tod_color_driven: s.tod_color_driven,
+            tod_volume_track: s.tod_volume_track,
+            moon_phase_sprite: s.moon_phase_sprite,
+            uv_scroll: s.uv_scroll,
+            accel: s.accel,
+            rotation_accel: s.rotation_accel,
+            scale_accel: s.scale_accel,
+            emit_cull: s.emit_cull,
+            association: s.association,
+            foot_mark: s.foot_mark,
+            oscillation: s.oscillation,
+            parent_position_copy: s.parent_position_copy,
+            parent_velocity: s.parent_velocity,
+            child_generator: s.child_generator,
+            child_generator_3: s.child_generator_3,
+            once_child_generator: s.once_child_generator,
+            emit_child_id: s.emit_child_id,
+            child_emit_basic: s.child_emit_basic,
+            child_emit_full: s.child_emit_full,
+            child_emit_billboard: s.child_emit_billboard,
+            oscillation_accel_z: s.oscillation_accel_z,
+            oscillation_accel_x: s.oscillation_accel_x,
+            oscillation_accel_y: s.oscillation_accel_y,
+            oscillation_applier_x: s.oscillation_applier_x,
+            oscillation_applier_z: s.oscillation_applier_z,
+            oscillation_applier_y: s.oscillation_applier_y,
+            rotation_velocity: s.rotation_velocity,
+            rotation_velocity_variance: s.rotation_velocity_variance,
+            rotation_updater: s.rotation_updater,
+            scale_velocity: s.scale_velocity,
+            scale_updater: s.scale_updater,
+            scale_velocity_variance: s.scale_velocity_variance,
+            relife_on_expiry: s.relife_on_expiry,
+            specular_element: s.specular_element,
+            specular: s.specular,
+            specular_rot_y_track: s.specular_rot_y_track,
+            rumble_track: s.rumble_track,
+            rumble_falloff: s.rumble_falloff,
+            draw_distance_near: s.draw_distance_near,
+            draw_distance_far: s.draw_distance_far,
+            haze_offset_x: s.haze_offset_x,
+            parent_rotate: s.parent_rotate,
+            parent_color: s.parent_color,
+            parent_scale: s.parent_scale,
+            velocity_dampener_track: s.velocity_dampener_track,
+            dampening_factor_applier: s.dampening_factor_applier,
+            velocity_dampener: s.velocity_dampener,
+            velocity_rotator: s.velocity_rotator,
+            velocity_rotation_updater: s.velocity_rotation_updater,
+            random_velocity: s.random_velocity,
+            fixed_point_position_variance: s.fixed_point_position_variance,
+            fixed_point_position_variance_2: s.fixed_point_position_variance_2,
+            child_generator_2: s.child_generator_2,
+            specular_rot_z_track: s.specular_rot_z_track,
+            specular_color_a_track: s.specular_color_a_track,
+            parent_rotate_2: s.parent_rotate_2,
+            batching_setup: s.batching_setup,
+            parent_tex_coord: s.parent_tex_coord,
+            point_list_position: s.point_list_position,
+            velocity_y_track: s.velocity_y_track,
+            specular_rot_x_track: s.specular_rot_x_track,
+            specular_color_g_track: s.specular_color_g_track,
+        }
+    }
 
+    // The per-frame rotation the element actually turns by: a 0x0B rate with no sec3 0x05
+    // updater never turns (research/xi-tools/docs/fx/effects.md "What MOVES an effect").
+    pub fn spin(&self) -> Option<[f32; 3]> {
+        self.rotation_velocity.filter(|_| self.rotation_updater)
+    }
+
+    // The per-frame scale rate the element actually changes: a 0x12 rate with no sec3 0x08
+    // updater is never integrated (research/xim ParticleUpdaters.kt ScaleUpdater is the only
+    // consumer of the scale transform's velocity).
+    pub fn scale_rate(&self) -> Option<[f32; 3]> {
+        self.scale_velocity.filter(|_| self.scale_updater)
+    }
+
+    pub fn is_singleton(&self) -> bool {
+        self.max_life_frames == 0.0
+    }
+}
+/// One section walk for every generator kind (research/xim ParticleGeneratorParser.kt shape):
+/// the kind byte only selects which def parser claims the result, never how the sections are
+/// read. Blocks come back unflushed so the claiming parser reports them — a sound chunk must
+/// not surface its stream as particle initializers of a parse that declined it.
+fn parse_sections(body: &[u8]) -> Result<Option<(GeneratorSections, Vec<DecodedBlock<'_>>)>> {
+    let mut blocks: Vec<DecodedBlock<'_>> = Vec::new();
+    if body.len() < HEADER_LEN {
+        return Err(DatError::TruncatedChunk {
+            offset: 0,
+            needed: HEADER_LEN,
+            available: body.len(),
+        });
+    }
+
+    let attach_flags = u16_le(body, 0x00);
+    let additional_attach = u16_le(body, 0x02);
+    let attach_type = AttachType::from_flag(attach_flags & ATTACH_TYPE_MASK).unwrap_or_default();
+    let attach_eid = (((attach_flags & ATTACH_EID_LOW_MASK) >> ATTACH_EID_LOW_SHIFT)
+        | ((additional_attach & ADDITIONAL_ATTACH_EID_TOP_BIT) >> 2) << 6)
+        as u8;
+    let attach_source_oriented = additional_attach & ATTACH_SOURCE_ORIENTED != 0;
+
+    let frames_per_emission = u16_le(body, 0x66) as f32 + 1.0;
+    let emission_variance = u16_le(body, 0x64) as f32;
+    let flags = u32_le(body, GEN_FLAGS_OFFSET);
+    let particles_per_emission = flags & PARTICLE_COUNT_MASK;
+    let continuous = flags & GEN_FLAG_CONTINUOUS != 0;
+    let auto_run = flags & GEN_FLAG_AUTO_RUN != 0;
+    let batched = flags & GEN_FLAG_BATCHED != 0;
+
+    // Section 2 = particle initializers.
+    let sec2_raw = u32_le(body, 0x74) as usize;
+    if sec2_raw < CHUNK_HEADER_LEN || sec2_raw - CHUNK_HEADER_LEN >= body.len() {
+        return Ok(None);
+    }
+    let mut cursor = sec2_raw - CHUNK_HEADER_LEN;
+
+    let mut mesh_id = [0u8; 4];
+    let mut mesh_kind = ParticleMeshKind::StaticMesh;
+    let mut base_position = [0.0f32; 3];
+    let mut max_life_frames = 0.0f32;
+    let mut camera_billboard = false;
+    let mut billboard = ParticleBillboard::None;
+    let mut follow_camera = false;
+    let mut camera_attached_base = false;
+    let mut position_variance = None;
+    let mut spherical_full = None;
+    let mut kind_byte = 0u8;
+    let mut sound_far = 0.0f32;
+    let mut sound_near = 0.0f32;
+    let mut sound_path_ref: Option<[u8; 4]> = None;
+    let mut emit_child_id: Option<[u8; 4]> = None;
+    let mut init_scale = [1.0f32; 3];
+    let mut single_scale_variance = None;
+    let mut scale_variance = None;
+    let mut init_color = [1.0f32; 4];
+    let mut color_variance = None;
+    let mut color_transform = None;
+    let mut color_transform_variance = None;
+    let mut init_velocity = [0.0f32; 3];
+    let mut position_allocation = None;
+    let mut rotation_allocation = None;
+    let mut scale_allocation = None;
+    let mut velocity_variance = None;
+    let mut relative_velocity = None;
+    let mut relative_velocity_variance = None;
+    let mut reverse_displacement = None;
+    let mut rotation_variance = None;
+    let mut init_rotation = [0.0f32; 3];
+    let mut incremental_rotation = None;
+    let mut position_x_track = None;
+    let mut position_y_track = None;
+    let mut position_z_track = None;
+    let mut weighted_mesh_weight_tracks: [Option<[u8; 4]>; WEIGHTED_MESH_WEIGHTS] =
+        [None; WEIGHTED_MESH_WEIGHTS];
+    let mut tod_volume_track = None;
+    let mut scale_x_track = None;
+    let mut scale_y_track = None;
+    let mut scale_z_track = None;
+    let mut alpha_track = None;
+    let mut color_r_track = None;
+    let mut color_g_track = None;
+    let mut color_b_track = None;
+    let mut blend = ParticleBlend::Additive;
+    let mut blend_byte = 0u8;
+    let mut ignore_texture_alpha = false;
+    let mut fog_enabled = true;
+    let mut draw_priority = DrawPriority::Depth;
+    let mut sort_offset = 0.0;
+    let mut projection_bias = None;
+    let mut depth_write = false;
+    let mut tod_color_tracks: [Option<[u8; 4]>; TOD_COLOR_CHANNELS] = [None; TOD_COLOR_CHANNELS];
+    let mut rotation_velocity = None;
+    let mut rotation_velocity_variance = None;
+    let mut scale_velocity = None;
+    let mut scale_updater = false;
+    let mut scale_velocity_variance = None;
+    let mut specular = None;
+    let mut specular_element = false;
+    let mut specular_rot_y_track = None;
+    let mut specular_rot_z_track = None;
+    let mut specular_color_a_track = None;
+    let mut rumble_track = None;
+    let mut haze_offset_x = None;
+    let mut parent_rotate = false;
+    let mut parent_rotate_2 = false;
+    let mut batching_setup = false;
+    let mut parent_tex_coord = false;
+    let mut point_list_position = None;
+    let mut velocity_y_track = None;
+    let mut specular_rot_x_track = None;
+    let mut specular_color_g_track = None;
+    let mut parent_color = false;
+    let mut parent_scale = false;
+    let mut velocity_dampener_track = None;
+    let mut random_velocity = None;
+    let mut fixed_point_position_variance = None;
+    let mut fixed_point_position_variance_2 = None;
+    let mut foot_mark = false;
+    let mut oscillation = false;
+    let mut parent_position_copy = false;
+    let mut parent_velocity = None;
+    let mut child_generator = None;
+    let mut child_generator_2 = None;
+    let mut child_generator_3 = None;
+    let mut once_child_generator = None;
+    let mut oscillation_accel_z = None;
+    let mut oscillation_accel_x = None;
+    let mut oscillation_accel_y = None;
+
+    while cursor + 4 <= body.len() {
+        let cfg = u32_le(body, cursor);
+        let opcode = (cfg & OPCODE_MASK) as u8;
+        let size_words = ((cfg >> 8) & u32::from(SIZE_WORDS_MASK)) as usize;
+        if opcode == OPCODE_END || size_words == 0 {
+            break;
+        }
+        let block_len = size_words * 4;
+        let payload = cursor + 4;
+        if cursor + block_len > body.len() {
+            break;
+        }
+        let mut decoded = true;
+        match opcode {
+            0x01 if payload + 32 <= body.len() => {
+                let bb = u16_le(body, payload);
+                billboard = ParticleBillboard::from_flags(bb);
+                camera_billboard =
+                    bb & BILLBOARD_XYZ != 0 || bb & BILLBOARD_CAMERA_MASK == BILLBOARD_CAMERA_MASK;
+                let render_state = u16_le(body, payload + 2);
+                ignore_texture_alpha = render_state & RENDER_STATE_IGNORE_TEXTURE_ALPHA != 0;
+                fog_enabled = render_state & RENDER_STATE_FOG_DISABLED == 0;
+                draw_priority = if render_state & RENDER_STATE_LOW_PRIORITY_DRAW != 0 {
+                    DrawPriority::Low
+                } else if render_state & RENDER_STATE_PINNED_DRAW != 0 {
+                    DrawPriority::Pinned
+                } else {
+                    DrawPriority::Depth
+                };
+                depth_write = bb & BILLBOARD_DEPTH_WRITE != 0;
+                follow_camera = bb & BILLBOARD_FOLLOW_CAMERA != 0;
+                camera_attached_base = render_state & RENDER_STATE_CAMERA_ATTACHED_BASE != 0;
+                specular_element = render_state & RENDER_STATE_SPECULAR_ELEMENT != 0;
+                mesh_id = [
+                    body[payload + 8],
+                    body[payload + 9],
+                    body[payload + 10],
+                    body[payload + 11],
+                ];
+                base_position = [
+                    f32_le(body, payload + 16),
+                    f32_le(body, payload + 20),
+                    f32_le(body, payload + 24),
+                ];
+                // The kind byte is explicit data (research/xim ParticleGeneratorSettings.kt
+                // LinkedDataType): it selects which def parser claims this chunk. Mesh kinds
+                // map to a mesh kind here; sound/distortion/other kinds keep their own
+                // consumers — the claim decision and its hard error live in the parsers.
+                kind_byte = body[payload + 29];
+                mesh_kind = match LinkedDataKind::from_byte(kind_byte) {
+                    Some(LinkedDataKind::WeightedMesh) => ParticleMeshKind::WeightedMesh,
+                    Some(LinkedDataKind::SpriteSheet) => ParticleMeshKind::SpriteSheet,
+                    _ => ParticleMeshKind::StaticMesh,
+                };
+                max_life_frames = u16_le(body, payload + 30) as f32;
+            }
+            0x02 if payload + 12 <= body.len() => {
+                position_allocation = Some((cfg >> ALLOCATION_SHIFT) & ALLOCATION_MASK);
+                init_velocity = [
+                    f32_le(body, payload),
+                    f32_le(body, payload + 4),
+                    f32_le(body, payload + 8),
+                ];
+            }
+            SEC2_OPCODE_VELOCITY_VARIANCE if payload + 12 <= body.len() => {
+                velocity_variance = Some([
+                    f32_le(body, payload),
+                    f32_le(body, payload + 4),
+                    f32_le(body, payload + 8),
+                ]);
+            }
+            0x06 if payload + 8 <= body.len() => {
+                position_variance = Some(PositionVariance {
+                    radius_variance: f32_le(body, payload),
+                    base_radius: f32_le(body, payload + 4),
+                    axis_scale: [1.0; 3],
+                });
+            }
+            0x07 if payload + 20 <= body.len() => {
+                position_variance = Some(PositionVariance {
+                    radius_variance: f32_le(body, payload),
+                    base_radius: f32_le(body, payload + 4),
+                    axis_scale: [
+                        f32_le(body, payload + 8),
+                        f32_le(body, payload + 12),
+                        f32_le(body, payload + 16),
+                    ],
+                });
+            }
+            0x08 if payload + 4 <= body.len() => {
+                relative_velocity = Some(f32_le(body, payload));
+            }
+            // CYyGenerator.cpp CYyGenerator::ElemGenerate case 0x1F: a raw 0 azimuth
+            // step means random azimuth.
+            SEC2_OPCODE_SPHERICAL_VARIANCE_FULL if payload + 42 <= body.len() => {
+                spherical_full = Some(SphericalPositionVarianceFull {
+                    radius_variance: f32_le(body, payload),
+                    base_radius: f32_le(body, payload + 4),
+                    axis_scale: [
+                        f32_le(body, payload + 8),
+                        f32_le(body, payload + 12),
+                        f32_le(body, payload + 16),
+                    ],
+                    rotation_z: f32_le(body, payload + 20),
+                    rotation_y: f32_le(body, payload + 24),
+                    tilt: f32_le(body, payload + 28),
+                    tilt_variance: f32_le(body, payload + 32),
+                    camera_oriented: u32_le(body, payload + 36) & 1 != 0,
+                    azimuth_steps: {
+                        let raw = u16_le(body, payload + 40);
+                        if raw == 0 {
+                            0
+                        } else {
+                            raw as u32 + 1
+                        }
+                    },
+                });
+            }
+            0x09 if payload + 12 <= body.len() => {
+                init_rotation = [
+                    f32_le(body, payload),
+                    f32_le(body, payload + 4),
+                    f32_le(body, payload + 8),
+                ];
+            }
+            SEC2_OPCODE_ROTATION_VARIANCE if payload + 12 <= body.len() => {
+                rotation_variance = Some([
+                    f32_le(body, payload),
+                    f32_le(body, payload + 4),
+                    f32_le(body, payload + 8),
+                ]);
+            }
+            0x0B if payload + 12 <= body.len() => {
+                rotation_allocation = Some((cfg >> ALLOCATION_SHIFT) & ALLOCATION_MASK);
+                rotation_velocity = Some([
+                    f32_le(body, payload),
+                    f32_le(body, payload + 4),
+                    f32_le(body, payload + 8),
+                ]);
+            }
+            SEC2_OPCODE_ROTATION_VEL_VARIANCE if payload + 12 <= body.len() => {
+                rotation_velocity_variance = Some([
+                    f32_le(body, payload),
+                    f32_le(body, payload + 4),
+                    f32_le(body, payload + 8),
+                ]);
+            }
+            // research/xim ParticleInitializers.kt VelocityVarianceSetup: the
+            // allocationOffset binds the variance to the scale velocity.
+            SEC2_OPCODE_SCALE_VEL_VARIANCE if payload + 12 <= body.len() => {
+                scale_velocity_variance = Some([
+                    f32_le(body, payload),
+                    f32_le(body, payload + 4),
+                    f32_le(body, payload + 8),
+                ]);
+            }
+            // research/xim ParticleInitializers.kt IncrementalRotationApplier.
+            SEC2_OPCODE_INCREMENTAL_ROTATION if payload + 12 <= body.len() => {
+                incremental_rotation = Some([
+                    f32_le(body, payload),
+                    f32_le(body, payload + 4),
+                    f32_le(body, payload + 8),
+                ]);
+            }
+            0x0F if payload + 12 <= body.len() => {
+                init_scale = [
+                    f32_le(body, payload),
+                    f32_le(body, payload + 4),
+                    f32_le(body, payload + 8),
+                ];
+            }
+            // CYyGenerator.cpp CYyGenerator::ElemGenerate case 0x10.
+            SEC2_OPCODE_SCALE_VARIANCE if payload + 12 <= body.len() => {
+                scale_variance = Some([
+                    f32_le(body, payload),
+                    f32_le(body, payload + 4),
+                    f32_le(body, payload + 8),
+                ]);
+            }
+            SEC2_OPCODE_SINGLE_SCALE_VARIANCE if payload + 4 <= body.len() => {
+                single_scale_variance = Some(f32_le(body, payload));
+            }
+            SEC2_OPCODE_SCALE_VELOCITY if payload + 12 <= body.len() => {
+                scale_allocation = Some((cfg >> ALLOCATION_SHIFT) & ALLOCATION_MASK);
+                scale_velocity = Some([
+                    f32_le(body, payload),
+                    f32_le(body, payload + 4),
+                    f32_le(body, payload + 8),
+                ]);
+            }
+            0x55 if payload + 36 <= body.len() => {
+                specular = Some(SpecularParams {
+                    vector: [
+                        f32_le(body, payload),
+                        f32_le(body, payload + 4),
+                        f32_le(body, payload + 8),
+                    ],
+                    texture: track_id(body, payload + 12),
+                    unknown_a: f32_le(body, payload + 20),
+                    unknown_b: f32_le(body, payload + 24),
+                    color_bgra: [
+                        body[payload + 28],
+                        body[payload + 29],
+                        body[payload + 30],
+                        body[payload + 31],
+                    ],
+                    flags: u32_le(body, payload + 32),
+                });
+            }
+            // research/xim ParticleGeneratorParser.kt sec2Handler: the keyframe
+            // track bound to the specular element's rotation y.
+            SEC2_OPCODE_SPECULAR_ROT_Y_TRACK if payload + 8 <= body.len() => {
+                specular_rot_y_track = track_id(body, payload + 4);
+            }
+            // research/xim ParticleGeneratorParser.kt sec2Handler: the keyframe
+            // track bound to the specular element's rotation z.
+            SEC2_OPCODE_SPECULAR_ROT_Z_TRACK if payload + 8 <= body.len() => {
+                specular_rot_z_track = track_id(body, payload + 4);
+            }
+            // research/xim ParticleGeneratorParser.kt sec2Handler: the keyframe
+            // track bound to the specular element's color alpha.
+            SEC2_OPCODE_SPECULAR_COLOR_A_TRACK if payload + 8 <= body.len() => {
+                specular_color_a_track = track_id(body, payload + 4);
+            }
+            // research/xim ParticleInitializers.kt CameraShakeSetup: the DAT id of
+            // the keyframe track SEC3_OPCODE_CAMERA_SHAKE_UPDATER samples at the
+            // particle's progress; the block's other words are consumed, not kept.
+            SEC2_OPCODE_CAMERA_SHAKE_SETUP if payload + 8 <= body.len() => {
+                rumble_track = track_id(body, payload + 4);
+            }
+            // research/xim ParticleInitializers.kt HazeOffsetInitializer: xim applies
+            // only the second float, as particle.hazeOffset.x.
+            SEC2_OPCODE_HAZE_OFFSET if payload + 8 <= body.len() => {
+                haze_offset_x = Some(f32_le(body, payload + 4));
+            }
+            // research/xim ParticleGeneratorParser.kt sec2Handler — Weight Mesh[0..4].
+            SEC2_OPCODE_WEIGHTED_MESH_WEIGHT_FIRST..=SEC2_OPCODE_WEIGHTED_MESH_WEIGHT_LAST
+                if payload + 8 <= body.len() =>
+            {
+                weighted_mesh_weight_tracks
+                    [(opcode - SEC2_OPCODE_WEIGHTED_MESH_WEIGHT_FIRST) as usize] =
+                    track_id(body, payload + 4);
+            }
+            0x30 if payload + 4 <= body.len() => sort_offset = f32_le(body, payload),
+            // research/xim ParticleInitializers.kt RelativeVelocityVarianceSetup: the
+            // bound of the random magnitude added to the relative velocity.
+            SEC2_OPCODE_RELATIVE_VEL_VARIANCE if payload + 4 <= body.len() => {
+                relative_velocity_variance = Some(f32_le(body, payload));
+            }
+            // research/xim ParticleInitializers.kt ProjectionBiasInitializer: param0
+            // sets the same field as the sort offset (last write in stream order wins,
+            // as in retail's sequential walk; the shipped data never carries both),
+            // param1 is the actor depth-scale factor.
+            SEC2_OPCODE_PROJECTION_BIAS if payload + 8 <= body.len() => {
+                let p0 = f32_le(body, payload);
+                let p1 = f32_le(body, payload + 4);
+                sort_offset = p0;
+                projection_bias = Some([p0, p1]);
+            }
+            0x16 if payload + 4 <= body.len() => {
+                init_color = [
+                    body[payload] as f32 / 255.0,
+                    body[payload + 1] as f32 / 255.0,
+                    body[payload + 2] as f32 / 255.0,
+                    body[payload + 3] as f32 / 255.0,
+                ];
+            }
+            // research/xim ParticleInitializers.kt ColorVarianceSetup.
+            SEC2_OPCODE_COLOR_VARIANCE if payload + 4 <= body.len() => {
+                color_variance = Some([
+                    body[payload] as f32 / 255.0,
+                    body[payload + 1] as f32 / 255.0,
+                    body[payload + 2] as f32 / 255.0,
+                    body[payload + 3] as f32 / 255.0,
+                ]);
+            }
+            // research/xim ParticleInitializers.kt ColorTransformSetup: four signed i16s
+            // (r,g,b,a) written to the element's allocation slot at emit. CYyGenerator.cpp
+            // ElemGenerate has no 0x19 case, so xim's mapping is the available evidence.
+            SEC2_OPCODE_COLOR_TRANSFORM_SETUP if payload + 8 <= body.len() => {
+                color_transform = Some([
+                    i16::from_le_bytes([body[payload], body[payload + 1]]),
+                    i16::from_le_bytes([body[payload + 2], body[payload + 3]]),
+                    i16::from_le_bytes([body[payload + 4], body[payload + 5]]),
+                    i16::from_le_bytes([body[payload + 6], body[payload + 7]]),
+                ]);
+            }
+            // research/xim ParticleInitializers.kt ColorTransformVariance: four signed i16s;
+            // each emitted element's transform gains round(posRand(1) × variance) per channel.
+            SEC2_OPCODE_COLOR_TRANSFORM_VARIANCE if payload + 8 <= body.len() => {
+                color_transform_variance = Some([
+                    i16::from_le_bytes([body[payload], body[payload + 1]]),
+                    i16::from_le_bytes([body[payload + 2], body[payload + 3]]),
+                    i16::from_le_bytes([body[payload + 4], body[payload + 5]]),
+                    i16::from_le_bytes([body[payload + 6], body[payload + 7]]),
+                ]);
+            }
+            // KeyFrameValueSetup: opcode selects the target channel; the track id is at payload+4.
+            SEC2_OPCODE_POSITION_X_TRACK if payload + 8 <= body.len() => {
+                position_x_track = track_id(body, payload + 4)
+            }
+            SEC2_OPCODE_POSITION_Y_TRACK if payload + 8 <= body.len() => {
+                position_y_track = track_id(body, payload + 4)
+            }
+            SEC2_OPCODE_POSITION_Z_TRACK if payload + 8 <= body.len() => {
+                position_z_track = track_id(body, payload + 4)
+            }
+            0x27 if payload + 8 <= body.len() => scale_x_track = track_id(body, payload + 4),
+            0x28 if payload + 8 <= body.len() => scale_y_track = track_id(body, payload + 4),
+            SEC2_OPCODE_SCALE_Z_TRACK if payload + 8 <= body.len() => {
+                scale_z_track = track_id(body, payload + 4)
+            }
+            0x2D if payload + 8 <= body.len() => alpha_track = track_id(body, payload + 4),
+            // research/xim ParticleGeneratorParser.kt sec2Handler: the keyframe track
+            // bound to the element's red channel.
+            SEC2_OPCODE_COLOR_R_TRACK if payload + 8 <= body.len() => {
+                color_r_track = track_id(body, payload + 4)
+            }
+            // research/xim ParticleGeneratorParser.kt sec2Handler: the keyframe track
+            // bound to the element's green channel.
+            SEC2_OPCODE_COLOR_G_TRACK if payload + 8 <= body.len() => {
+                color_g_track = track_id(body, payload + 4)
+            }
+            // research/xim ParticleGeneratorParser.kt sec2Handler: the keyframe track
+            // bound to the element's blue channel.
+            SEC2_OPCODE_COLOR_B_TRACK if payload + 8 <= body.len() => {
+                color_b_track = track_id(body, payload + 4)
+            }
+            // research/xim ParticleGeneratorParser.kt sec2Handler — 0x60..0x63 are the same
+            // KeyFrameValueSetup shape bound to the time-of-day color channels, read back by
+            // the section-3 ClockValueUpdater 0x3C..0x3F.
+            0x60..=0x63 if payload + 8 <= body.len() => {
+                tod_color_tracks[(opcode - 0x60) as usize] = track_id(body, payload + 4);
+            }
+            // research/xim ParticleGeneratorParser.kt sec2Handler — "ToD Volume".
+            SEC2_OPCODE_TOD_VOLUME_TRACK if payload + 8 <= body.len() => {
+                tod_volume_track = track_id(body, payload + 4)
+            }
+            // research/xim ParticleInitializers.kt ReverseDisplacementSetup: parsed,
+            // never read by the effect.
+            SEC2_OPCODE_REVERSE_DISPLACEMENT if payload + 4 <= body.len() => {
+                reverse_displacement = Some(f32_le(body, payload));
+            }
+            // research/XIClient CYyGenerator.cpp CYyGenerator::ElemGenerate case 0x1D
+            // retail derives the flipbook's per-frame interval from the CMoD3a resource's
+            // frame count, not the DAT, so the payload word is never read.
+            SEC2_OPCODE_SPRITE_SHEET_INIT if payload + 4 <= body.len() => {}
+            // research/xim Particle.kt updateAssociatedPosition / updateAssociatedFacing
+            // footMarkEffect branches: the particle snaps to the actor's position + joint
+            // and facing on the spawn frame, then stops following the generator.
+            SEC2_OPCODE_FOOT_MARK => foot_mark = true,
+            // research/xim ParticleInitializers.kt OscillationSetup: the marker that
+            // allocates the particle's oscillation state.
+            SEC2_OPCODE_OSCILLATION_SETUP => oscillation = true,
+            // research/xim ParticleInitializers.kt ParentPositionCopyConfig: the marker
+            // that makes a child particle copy its parent's position.
+            SEC2_OPCODE_PARENT_POSITION_COPY => parent_position_copy = true,
+            // research/xim ParticleInitializers.kt ParentVelocityConfig: the multiplier
+            // on the parent's total velocity copied into the child's velocity.
+            SEC2_OPCODE_PARENT_VELOCITY if payload + 4 <= body.len() => {
+                parent_velocity = Some(f32_le(body, payload));
+            }
+            // research/xim ParticleInitializers.kt ChildGeneratorSetup: the sibling
+            // generator emitted as a child of each particle.
+            SEC2_OPCODE_CHILD_GENERATOR if payload + 8 <= body.len() => {
+                child_generator = track_id(body, payload + 4);
+            }
+            // research/xim ParticleGeneratorParser.kt sec2Handler: xim maps this opcode
+            // to the same ChildGeneratorSetup as SEC2_OPCODE_CHILD_GENERATOR.
+            SEC2_OPCODE_CHILD_GENERATOR_2 if payload + 8 <= body.len() => {
+                child_generator_2 = track_id(body, payload + 4);
+            }
+            // research/XIClient CYyGenerator.cpp ElemGenerate case 0x6A — the third block of
+            // the shared child-generator family; xim maps it to ChildGeneratorSetup.
+            SEC2_OPCODE_CHILD_GENERATOR_3 if payload + 8 <= body.len() => {
+                child_generator_3 = track_id(body, payload + 4);
+            }
+            // research/XIClient CYyGenerator.cpp ElemGenerate case 0x3C — the once-at-init
+            // member of the family (research/xim ParticleInitializers.kt
+            // OnceChildGeneratorSetup: expectZero32 then the child id).
+            SEC2_OPCODE_ONCE_CHILD_GENERATOR if payload + 8 <= body.len() => {
+                once_child_generator = track_id(body, payload + 4);
+            }
+            // research/xim ParticleInitializers.kt ParentRotateConfig: the marker that
+            // makes a child particle copy its parent's rotation.
+            SEC2_OPCODE_PARENT_ROTATE => parent_rotate = true,
+            // research/xim ParticleGeneratorParser.kt sec2Handler: xim maps this opcode
+            // to the same ParentRotateConfig as SEC2_OPCODE_PARENT_ROTATE.
+            SEC2_OPCODE_PARENT_ROTATE_2 => parent_rotate_2 = true,
+            // research/xim ParticleInitializers.kt BatchingSetup: the word is an
+            // expectZero32; only the marker is kept.
+            SEC2_OPCODE_BATCHING_SETUP if payload + 4 <= body.len() => batching_setup = true,
+            // research/xim ParticleInitializers.kt ParentColorConfig: the marker that
+            // makes a child particle copy its parent's color.
+            SEC2_OPCODE_PARENT_COLOR => parent_color = true,
+            // research/xim ParticleInitializers.kt ParentScaleConfig: the marker that
+            // makes a child particle copy its parent's scale.
+            SEC2_OPCODE_PARENT_SCALE => parent_scale = true,
+            // research/xim ParticleInitializers.kt ParentTexCoordConfig: the marker that
+            // makes a child particle copy its parent's tex-coord translate.
+            SEC2_OPCODE_PARENT_TEX_COORD => parent_tex_coord = true,
+            // research/xim ParticleInitializers.kt PointListPositionSetup: the keyframe
+            // and point-list DAT ids; the in-mem pointer words are consumed, not kept.
+            SEC2_OPCODE_POINT_LIST_POSITION if payload + 20 <= body.len() => {
+                point_list_position = Some((
+                    DatId::from(body, payload + 4).0,
+                    DatId::from(body, payload + 16).0,
+                ));
+            }
+            // research/xim ParticleGeneratorParser.kt sec2Handler: the keyframe track
+            // bound to the element's velocity y.
+            SEC2_OPCODE_VELOCITY_Y_TRACK if payload + 8 <= body.len() => {
+                velocity_y_track = track_id(body, payload + 4);
+            }
+            // research/xim ParticleGeneratorParser.kt sec2Handler: the keyframe track
+            // bound to the specular element's rotation x.
+            SEC2_OPCODE_SPECULAR_ROT_X_TRACK if payload + 8 <= body.len() => {
+                specular_rot_x_track = track_id(body, payload + 4);
+            }
+            // research/xim ParticleGeneratorParser.kt sec2Handler: the keyframe track
+            // bound to the specular element's color green.
+            SEC2_OPCODE_SPECULAR_COLOR_G_TRACK if payload + 8 <= body.len() => {
+                specular_color_g_track = track_id(body, payload + 4);
+            }
+            // research/xim ParticleGeneratorParser.kt sec2Handler: the keyframe track
+            // bound to the element's velocity dampener.
+            SEC2_OPCODE_VELOCITY_DAMPENER_TRACK if payload + 8 <= body.len() => {
+                velocity_dampener_track = track_id(body, payload + 4);
+            }
+            // research/xim ParticleInitializers.kt RandomVelocitySetup: one float bound;
+            // each emitted element's base velocity becomes value × rand() on all axes.
+            SEC2_OPCODE_RANDOM_VELOCITY if payload + 4 <= body.len() => {
+                random_velocity = Some(f32_le(body, payload));
+            }
+            // research/xim ParticleInitializers.kt FixedPointPositionVarianceSetup: the
+            // point list a per-emitted-particle position offset cycles through.
+            SEC2_OPCODE_FIXED_POINT_POSITION_VARIANCE if payload + 12 <= body.len() => {
+                fixed_point_position_variance = track_id(body, payload + 4);
+            }
+            // research/xim ParticleGeneratorParser.kt sec2Handler: xim maps this opcode
+            // to the same FixedPointPositionVarianceSetup as 0x4E.
+            SEC2_OPCODE_FIXED_POINT_POSITION_VARIANCE_2 if payload + 12 <= body.len() => {
+                fixed_point_position_variance_2 = track_id(body, payload + 4);
+            }
+            // research/xim ParticleInitializers.kt OscillationAccelerationSetup (Z)
+            // [acceleration, variance].
+            SEC2_OPCODE_OSCILLATION_ACCEL_Z if payload + 8 <= body.len() => {
+                oscillation_accel_z = Some([f32_le(body, payload), f32_le(body, payload + 4)]);
+            }
+            // research/xim ParticleInitializers.kt OscillationAccelerationSetup (X).
+            SEC2_OPCODE_OSCILLATION_ACCEL_X if payload + 8 <= body.len() => {
+                oscillation_accel_x = Some([f32_le(body, payload), f32_le(body, payload + 4)]);
+            }
+            // research/xim ParticleInitializers.kt OscillationAccelerationSetup (Y).
+            SEC2_OPCODE_OSCILLATION_ACCEL_Y if payload + 8 <= body.len() => {
+                oscillation_accel_y = Some([f32_le(body, payload), f32_le(body, payload + 4)]);
+            }
+            // BlendFuncInitializer: p0 @payload+0 — high nibble bit 0x01 = opaque, else low
+            // nibble selects (0x8 additive, 0x4/0x6 alpha blend, 0x1/0x2 reverse-subtract).
+            0x1E if payload < body.len() => {
+                let p0 = body[payload];
+                blend_byte = p0;
+                blend = if (p0 >> 4) & BLEND_FUNC_OPAQUE_BIT != 0 {
+                    ParticleBlend::Blend
+                } else {
+                    match p0 & BLEND_FUNC_MODE_MASK {
+                        0x8 => ParticleBlend::Additive,
+                        0x1 | 0x2 => ParticleBlend::Subtract,
+                        _ => ParticleBlend::Blend,
+                    }
+                };
+            }
+            // research/XIClient CYyGenerator.cpp CYyGenerator::ElemGenerate 0x4Cu — the audio
+            // range of a sound generator (kind 0x3D); one table for every kind, so mesh
+            // chunks that carry it parse identically.
+            SOUND_SETUP_OPCODE if payload + 8 <= body.len() => {
+                sound_far = f32_le(body, payload);
+                sound_near = f32_le(body, payload + 4);
+            }
+            // research/XIClient CYyGenerator.cpp ElemGenerate case 0x6B — path_id char[4] plus
+            // two zero words; only a sound elem consumes the resolved rail.
+            SOUND_PATH_REF_OPCODE if payload + 12 <= body.len() => {
+                sound_path_ref = Some([
+                    body[payload],
+                    body[payload + 1],
+                    body[payload + 2],
+                    body[payload + 3],
+                ]);
+            }
+            _ => decoded = false,
+        }
+        blocks.push((
+            GeneratorSection::Initializers,
+            opcode,
+            size_words,
+            &body[payload..payload + block_len - 4],
+            decoded,
+        ));
+        cursor += block_len;
+    }
+
+    // Section 3 (body[0x78]) — per-frame updaters (same walk as
+    // generator.rs::parse_cloud_generator). 0x27/0x28 TextureCoordinateUpdater UV
+    // scroll; 0x03 VelocityAccelerator gravity (Vector3f at payload+0).
+    let mut uv_scroll = [0.0f32; 2];
+    let mut accel = None;
+    let mut rotation_accel = None;
+    let mut scale_accel = None;
+    let mut oscillation_applier_x = None;
+    let mut oscillation_applier_z = None;
+    let mut oscillation_applier_y = None;
+    let mut day_of_week_color = None;
+    let mut moon_phase_color = None;
+    let mut moon_phase_sprite = false;
+    let mut rotation_updater = false;
+    let mut position_updater = false;
+    let mut rumble_falloff = None;
+    let mut draw_distance_near = None;
+    let mut draw_distance_far = None;
+    let mut velocity_dampener = None;
+    let mut velocity_rotator = None;
+    let mut dampening_factor_applier = false;
+    let mut velocity_rotation_updater = false;
+    let mut color_transform_applier = false;
+    let mut child_emit_basic = false;
+    let mut child_emit_full = false;
+    let mut child_emit_billboard = false;
+    let mut color_transform_modifier = None;
+    let mut tod_color_driven = [false; TOD_COLOR_CHANNELS];
+    let sec3_raw = u32_le(body, 0x78) as usize;
+    if sec3_raw >= CHUNK_HEADER_LEN && sec3_raw - CHUNK_HEADER_LEN < body.len() {
+        let mut cursor = sec3_raw - CHUNK_HEADER_LEN;
         while cursor + 4 <= body.len() {
             let cfg = u32_le(body, cursor);
             let opcode = (cfg & OPCODE_MASK) as u8;
@@ -1056,712 +2455,322 @@ impl ParticleGeneratorDef {
             }
             let mut decoded = true;
             match opcode {
-                0x01 if payload + 32 <= body.len() => {
-                    let bb = u16_le(body, payload);
-                    billboard = ParticleBillboard::from_flags(bb);
-                    camera_billboard = bb & BILLBOARD_XYZ != 0
-                        || bb & BILLBOARD_CAMERA_MASK == BILLBOARD_CAMERA_MASK;
-                    let render_state = u16_le(body, payload + 2);
-                    ignore_texture_alpha = render_state & RENDER_STATE_IGNORE_TEXTURE_ALPHA != 0;
-                    fog_enabled = render_state & RENDER_STATE_FOG_DISABLED == 0;
-                    draw_priority = if render_state & RENDER_STATE_LOW_PRIORITY_DRAW != 0 {
-                        DrawPriority::Low
-                    } else if render_state & RENDER_STATE_PINNED_DRAW != 0 {
-                        DrawPriority::Pinned
+                SEC3_OPCODE_POSITION => position_updater = true,
+                SEC3_OPCODE_ROTATION_UPDATER => rotation_updater = true,
+                SEC3_OPCODE_SCALE_UPDATER => scale_updater = true,
+                0x27 if payload + 4 <= body.len() => uv_scroll[0] = f32_le(body, payload),
+                0x28 if payload + 4 <= body.len() => uv_scroll[1] = f32_le(body, payload),
+                // research/xim ParticleUpdaters.kt OscillationApplier: oscillationRate =
+                // 180f / payload0, baseOffset = payload1, payload2 has no effect.
+                SEC3_OPCODE_OSCILLATION_APPLIER_X if payload + 12 <= body.len() => {
+                    oscillation_applier_x = Some([
+                        f32_le(body, payload),
+                        f32_le(body, payload + 4),
+                        f32_le(body, payload + 8),
+                    ]);
+                }
+                SEC3_OPCODE_OSCILLATION_APPLIER_Z if payload + 12 <= body.len() => {
+                    oscillation_applier_z = Some([
+                        f32_le(body, payload),
+                        f32_le(body, payload + 4),
+                        f32_le(body, payload + 8),
+                    ]);
+                }
+                SEC3_OPCODE_OSCILLATION_APPLIER_Y if payload + 12 <= body.len() => {
+                    oscillation_applier_y = Some([
+                        f32_le(body, payload),
+                        f32_le(body, payload + 4),
+                        f32_le(body, payload + 8),
+                    ]);
+                }
+                0x03 if payload + 12 <= body.len() => {
+                    accel = Some([
+                        f32_le(body, payload),
+                        f32_le(body, payload + 4),
+                        f32_le(body, payload + 8),
+                    ]);
+                }
+                // research/XIClient/src/XIClient/source/World/Generator/CYyGenerator.cpp
+                // CYyGenerator::ElemIdle uses Get11FC to address separate transform allocations.
+                SEC3_OPCODE_VELOCITY_ACCELERATOR_UNGATED_FIRST
+                | SEC3_OPCODE_VELOCITY_ACCELERATOR_UNGATED_LAST
+                    if payload + 12 <= body.len() =>
+                {
+                    let allocation = Some((cfg >> ALLOCATION_SHIFT) & ALLOCATION_MASK);
+                    let target = if allocation == rotation_allocation {
+                        Some(&mut rotation_accel)
+                    } else if allocation == scale_allocation {
+                        Some(&mut scale_accel)
+                    } else if allocation == position_allocation {
+                        Some(&mut accel)
                     } else {
-                        DrawPriority::Depth
+                        None
                     };
-                    depth_write = bb & BILLBOARD_DEPTH_WRITE != 0;
-                    follow_camera = bb & BILLBOARD_FOLLOW_CAMERA != 0;
-                    camera_attached_base = render_state & RENDER_STATE_CAMERA_ATTACHED_BASE != 0;
-                    specular_element = render_state & RENDER_STATE_SPECULAR_ELEMENT != 0;
-                    mesh_id = [
-                        body[payload + 8],
-                        body[payload + 9],
-                        body[payload + 10],
-                        body[payload + 11],
-                    ];
-                    base_position = [
-                        f32_le(body, payload + 16),
-                        f32_le(body, payload + 20),
-                        f32_le(body, payload + 24),
-                    ];
-                    (is_particle, mesh_kind) = match body[payload + 29] {
-                        LINKED_DATA_STATIC_MESH => (true, ParticleMeshKind::StaticMesh),
-                        LINKED_DATA_SPRITE_SHEET => (true, ParticleMeshKind::SpriteSheet),
-                        _ => (false, ParticleMeshKind::StaticMesh),
-                    };
-                    max_life_frames = u16_le(body, payload + 30) as f32;
+                    if let Some(target) = target {
+                        let value = target.get_or_insert([0.0; 3]);
+                        for (axis, value) in value.iter_mut().enumerate() {
+                            *value += f32_le(body, payload + axis * size_of::<f32>());
+                        }
+                    } else {
+                        decoded = false;
+                    }
                 }
-                0x02 if payload + 12 <= body.len() => {
-                    position_allocation = Some((cfg >> ALLOCATION_SHIFT) & ALLOCATION_MASK);
-                    init_velocity = [
-                        f32_le(body, payload),
-                        f32_le(body, payload + 4),
-                        f32_le(body, payload + 8),
-                    ];
+                // research/xim ParticleUpdaters.kt VelocityDampener: velocity is scaled
+                // by dampeningFactor^dt, the factor from
+                // SEC2_OPCODE_VELOCITY_DAMPENER_TRACK when present (particle_sim.rs).
+                SEC3_OPCODE_VELOCITY_DAMPENER if payload + 8 <= body.len() => {
+                    velocity_dampener = Some([f32_le(body, payload), f32_le(body, payload + 4)]);
                 }
-                SEC2_OPCODE_VELOCITY_VARIANCE if payload + 12 <= body.len() => {
-                    velocity_variance = Some([
-                        f32_le(body, payload),
-                        f32_le(body, payload + 4),
-                        f32_le(body, payload + 8),
-                    ]);
+                // research/xim ParticleGeneratorParser.kt sec3Handler: the dampening-factor
+                // ProgressValueUpdater: no payload, it samples
+                // SEC2_OPCODE_VELOCITY_DAMPENER_TRACK per frame (particle_sim.rs).
+                SEC3_OPCODE_DAMPENING_FACTOR => {
+                    dampening_factor_applier = true;
                 }
-                0x06 if payload + 8 <= body.len() => {
-                    position_variance = Some(PositionVariance {
-                        radius_variance: f32_le(body, payload),
-                        base_radius: f32_le(body, payload + 4),
-                        axis_scale: [1.0; 3],
-                    });
+                // research/xim ParticleGeneratorParser.kt sec3Handler — ClockValueUpdater ToD
+                // volume: no payload; the ambient mixer samples the sec2 0x68 track at the
+                // full-day interpolation (zone_sfx.rs).
+                SEC3_OPCODE_TOD_VOLUME_APPLIER => {}
+                // research/XIClient/src/XIClient/source/World/Generator/CYyGenerator.cpp
+                // CYyGenerator::ElemIdle case 0x2E: [near, far, kill-flag] — the third word is
+                // 0 in every shipped DAT (research/xim ParticleUpdaters.kt DrawDistanceUpdater
+                // reads it as an unused 32-bit value).
+                SEC3_OPCODE_DRAW_DISTANCE if payload + 8 <= body.len() => {
+                    draw_distance_near = Some(f32_le(body, payload));
+                    draw_distance_far = Some(f32_le(body, payload + 4));
                 }
-                0x07 if payload + 20 <= body.len() => {
-                    position_variance = Some(PositionVariance {
-                        radius_variance: f32_le(body, payload),
-                        base_radius: f32_le(body, payload + 4),
-                        axis_scale: [
-                            f32_le(body, payload + 8),
-                            f32_le(body, payload + 12),
-                            f32_le(body, payload + 16),
-                        ],
-                    });
-                }
-                0x08 if payload + 4 <= body.len() => {
-                    relative_velocity = Some(f32_le(body, payload));
-                }
-                // CYyGenerator.cpp CYyGenerator::ElemGenerate case 0x1F: a raw 0 azimuth
-                // step means random azimuth.
-                SEC2_OPCODE_SPHERICAL_VARIANCE_FULL if payload + 42 <= body.len() => {
-                    spherical_full = Some(SphericalPositionVarianceFull {
-                        radius_variance: f32_le(body, payload),
-                        base_radius: f32_le(body, payload + 4),
-                        axis_scale: [
-                            f32_le(body, payload + 8),
-                            f32_le(body, payload + 12),
-                            f32_le(body, payload + 16),
-                        ],
-                        rotation_z: f32_le(body, payload + 20),
-                        rotation_y: f32_le(body, payload + 24),
-                        tilt: f32_le(body, payload + 28),
-                        tilt_variance: f32_le(body, payload + 32),
-                        camera_oriented: u32_le(body, payload + 36) & 1 != 0,
-                        azimuth_steps: {
-                            let raw = u16_le(body, payload + 40);
-                            if raw == 0 {
-                                0
-                            } else {
-                                raw as u32 + 1
-                            }
-                        },
-                    });
-                }
-                0x09 if payload + 12 <= body.len() => {
-                    init_rotation = [
-                        f32_le(body, payload),
-                        f32_le(body, payload + 4),
-                        f32_le(body, payload + 8),
-                    ];
-                }
-                SEC2_OPCODE_ROTATION_VARIANCE if payload + 12 <= body.len() => {
-                    rotation_variance = Some([
-                        f32_le(body, payload),
-                        f32_le(body, payload + 4),
-                        f32_le(body, payload + 8),
-                    ]);
-                }
-                0x0B if payload + 12 <= body.len() => {
-                    rotation_allocation = Some((cfg >> ALLOCATION_SHIFT) & ALLOCATION_MASK);
-                    rotation_velocity = Some([
-                        f32_le(body, payload),
-                        f32_le(body, payload + 4),
-                        f32_le(body, payload + 8),
-                    ]);
-                }
-                SEC2_OPCODE_ROTATION_VEL_VARIANCE if payload + 12 <= body.len() => {
-                    rotation_velocity_variance = Some([
-                        f32_le(body, payload),
-                        f32_le(body, payload + 4),
-                        f32_le(body, payload + 8),
-                    ]);
-                }
-                // research/xim ParticleInitializers.kt VelocityVarianceSetup: the
-                // allocationOffset binds the variance to the scale velocity.
-                SEC2_OPCODE_SCALE_VEL_VARIANCE if payload + 12 <= body.len() => {
-                    scale_velocity_variance = Some([
-                        f32_le(body, payload),
-                        f32_le(body, payload + 4),
-                        f32_le(body, payload + 8),
-                    ]);
-                }
-                // research/xim ParticleInitializers.kt IncrementalRotationApplier.
-                SEC2_OPCODE_INCREMENTAL_ROTATION if payload + 12 <= body.len() => {
-                    incremental_rotation = Some([
-                        f32_le(body, payload),
-                        f32_le(body, payload + 4),
-                        f32_le(body, payload + 8),
-                    ]);
-                }
-                0x0F if payload + 12 <= body.len() => {
-                    init_scale = [
-                        f32_le(body, payload),
-                        f32_le(body, payload + 4),
-                        f32_le(body, payload + 8),
-                    ];
-                }
-                // CYyGenerator.cpp CYyGenerator::ElemGenerate case 0x10.
-                SEC2_OPCODE_SCALE_VARIANCE if payload + 12 <= body.len() => {
-                    scale_variance = Some([
-                        f32_le(body, payload),
-                        f32_le(body, payload + 4),
-                        f32_le(body, payload + 8),
-                    ]);
-                }
-                SEC2_OPCODE_SINGLE_SCALE_VARIANCE if payload + 4 <= body.len() => {
-                    single_scale_variance = Some(f32_le(body, payload));
-                }
-                SEC2_OPCODE_SCALE_VELOCITY if payload + 12 <= body.len() => {
-                    scale_allocation = Some((cfg >> ALLOCATION_SHIFT) & ALLOCATION_MASK);
-                    scale_velocity = Some([
-                        f32_le(body, payload),
-                        f32_le(body, payload + 4),
-                        f32_le(body, payload + 8),
-                    ]);
-                }
-                0x55 if payload + 36 <= body.len() => {
-                    specular = Some(SpecularParams {
-                        vector: [
-                            f32_le(body, payload),
-                            f32_le(body, payload + 4),
-                            f32_le(body, payload + 8),
-                        ],
-                        texture: track_id(body, payload + 12),
-                        unknown_a: f32_le(body, payload + 20),
-                        unknown_b: f32_le(body, payload + 24),
-                        color_bgra: [
-                            body[payload + 28],
-                            body[payload + 29],
-                            body[payload + 30],
-                            body[payload + 31],
-                        ],
-                        flags: u32_le(body, payload + 32),
-                    });
-                }
-                // research/xim ParticleGeneratorParser.kt sec2Handler: the keyframe
-                // track bound to the specular element's rotation y.
-                SEC2_OPCODE_SPECULAR_ROT_Y_TRACK if payload + 8 <= body.len() => {
-                    specular_rot_y_track = track_id(body, payload + 4);
-                }
-                // research/xim ParticleGeneratorParser.kt sec2Handler: the keyframe
-                // track bound to the specular element's rotation z.
-                SEC2_OPCODE_SPECULAR_ROT_Z_TRACK if payload + 8 <= body.len() => {
-                    specular_rot_z_track = track_id(body, payload + 4);
-                }
-                // research/xim ParticleGeneratorParser.kt sec2Handler: the keyframe
-                // track bound to the specular element's color alpha.
-                SEC2_OPCODE_SPECULAR_COLOR_A_TRACK if payload + 8 <= body.len() => {
-                    specular_color_a_track = track_id(body, payload + 4);
-                }
-                // research/xim ParticleInitializers.kt CameraShakeSetup: the DAT id of
-                // the keyframe track SEC3_OPCODE_CAMERA_SHAKE_UPDATER samples at the
-                // particle's progress; the block's other words are consumed, not kept.
-                SEC2_OPCODE_CAMERA_SHAKE_SETUP if payload + 8 <= body.len() => {
-                    camera_shake_track = track_id(body, payload + 4);
-                }
-                // research/xim ParticleInitializers.kt HazeOffsetInitializer: xim applies
-                // only the second float, as particle.hazeOffset.x.
-                SEC2_OPCODE_HAZE_OFFSET if payload + 8 <= body.len() => {
-                    haze_offset_x = Some(f32_le(body, payload + 4));
-                }
-                0x30 if payload + 4 <= body.len() => sort_offset = f32_le(body, payload),
-                // research/xim ParticleInitializers.kt RelativeVelocityVarianceSetup: the
-                // bound of the random magnitude added to the relative velocity.
-                SEC2_OPCODE_RELATIVE_VEL_VARIANCE if payload + 4 <= body.len() => {
-                    relative_velocity_variance = Some(f32_le(body, payload));
-                }
-                // research/xim ParticleInitializers.kt ProjectionBiasInitializer: param0
-                // sets the same field as the sort offset (last write in stream order wins,
-                // as in retail's sequential walk; the shipped data never carries both),
-                // param1 is the actor depth-scale factor.
-                SEC2_OPCODE_PROJECTION_BIAS if payload + 8 <= body.len() => {
-                    let p0 = f32_le(body, payload);
-                    let p1 = f32_le(body, payload + 4);
-                    sort_offset = p0;
-                    projection_bias = Some([p0, p1]);
-                }
-                0x16 if payload + 4 <= body.len() => {
-                    init_color = [
-                        body[payload] as f32 / 255.0,
-                        body[payload + 1] as f32 / 255.0,
-                        body[payload + 2] as f32 / 255.0,
-                        body[payload + 3] as f32 / 255.0,
-                    ];
-                }
-                // research/xim ParticleInitializers.kt ColorVarianceSetup.
-                SEC2_OPCODE_COLOR_VARIANCE if payload + 4 <= body.len() => {
-                    color_variance = Some([
-                        body[payload] as f32 / 255.0,
-                        body[payload + 1] as f32 / 255.0,
-                        body[payload + 2] as f32 / 255.0,
-                        body[payload + 3] as f32 / 255.0,
-                    ]);
-                }
-                // Parsed only: CYyGenerator.cpp CYyGenerator::ElemGenerate has no 0x19
-                // case, so the transform's application is unknown.
-                SEC2_OPCODE_COLOR_TRANSFORM_SETUP if payload + 8 <= body.len() => {
-                    color_transform = Some([
+                // research/xim ParticleUpdaters.kt ColorTransformModifier: the per-frame
+                // rate on the SEC2_OPCODE_COLOR_TRANSFORM_SETUP transform (particle_sim.rs).
+                SEC3_OPCODE_COLOR_TRANSFORM_MODIFIER if payload + 8 <= body.len() => {
+                    color_transform_modifier = Some([
                         i16::from_le_bytes([body[payload], body[payload + 1]]),
                         i16::from_le_bytes([body[payload + 2], body[payload + 3]]),
                         i16::from_le_bytes([body[payload + 4], body[payload + 5]]),
                         i16::from_le_bytes([body[payload + 6], body[payload + 7]]),
                     ]);
                 }
-                // KeyFrameValueSetup: opcode selects the target channel; the track id is at payload+4.
-                0x27 if payload + 8 <= body.len() => scale_x_track = track_id(body, payload + 4),
-                0x28 if payload + 8 <= body.len() => scale_y_track = track_id(body, payload + 4),
-                SEC2_OPCODE_SCALE_Z_TRACK if payload + 8 <= body.len() => {
-                    scale_z_track = track_id(body, payload + 4)
+                // research/xim ParticleGeneratorParser.kt sec3Handler: the scale.x/y/z
+                // ProgressValueUpdaters: no payload, they sample the sec2 scale tracks at
+                // life progress, which the render path already does from
+                // def.scale_x_track/scale_y_track; the engine's 2D sprite has no z axis,
+                // so the blocks arm nothing and only consume.
+                // research/xim ParticleGeneratorParser.kt sec3Handler — ProgressValueUpdater
+                // position.x/y/z: no payload; each frame the bound sec2 0x21..0x23 track replaces
+                // the channel (particle_draw applies it, key 0 seeded from the spawn value).
+                SEC3_OPCODE_POSITION_X_APPLIER
+                | SEC3_OPCODE_POSITION_Y_APPLIER
+                | SEC3_OPCODE_POSITION_Z_APPLIER => {}
+                SEC3_OPCODE_SCALE_PROGRESS_FIRST..=SEC3_OPCODE_SCALE_PROGRESS_LAST => {}
+                // research/xim ParticleGeneratorParser.kt sec3Handler: the color.r/g/b
+                // ProgressValueUpdaters: no payload, they sample the sec2 color tracks at
+                // life progress. The engine sets the particle's rgb at spawn from the 0x16
+                // base / 0x17 variance and has no per-frame rgb track path, so the blocks
+                // arm nothing and only consume.
+                SEC3_OPCODE_COLOR_RGB_PROGRESS_FIRST..=SEC3_OPCODE_COLOR_RGB_PROGRESS_LAST => {}
+                // research/xim ParticleGeneratorParser.kt sec3Handler: the specular
+                // rotation.y/z and color.a ProgressValueUpdaters: no payload, they sample
+                // the sec2 specular tracks. The engine does not model the specular
+                // element, so the blocks arm nothing and only consume.
+                SEC3_OPCODE_SPECULAR_ROT_Y_PROGRESS
+                | SEC3_OPCODE_SPECULAR_ROT_Z_PROGRESS
+                | SEC3_OPCODE_SPECULAR_COLOR_A_PROGRESS => {}
+                // research/xim ParticleUpdaters.kt ColorTransformApplier: no payload —
+                // color += (transform shr 7) * (0.5 * dt) per frame (particle_sim.rs).
+                SEC3_OPCODE_COLOR_TRANSFORM_APPLIER => {
+                    color_transform_applier = true;
                 }
-                0x2D if payload + 8 <= body.len() => alpha_track = track_id(body, payload + 4),
-                // research/xim ParticleGeneratorParser.kt sec2Handler: the keyframe track
-                // bound to the element's red channel.
-                SEC2_OPCODE_COLOR_R_TRACK if payload + 8 <= body.len() => {
-                    color_r_track = track_id(body, payload + 4)
+                // research/xim ParticleUpdaters.kt ChildGeneratorBasicUpdater: no payload —
+                // per frame the sec2 child generator emits with the parent particle's
+                // position only (particle_sim.rs).
+                SEC3_OPCODE_CHILD_GENERATOR_BASIC => {
+                    child_emit_basic = true;
                 }
-                // research/xim ParticleGeneratorParser.kt sec2Handler: the keyframe track
-                // bound to the element's green channel.
-                SEC2_OPCODE_COLOR_G_TRACK if payload + 8 <= body.len() => {
-                    color_g_track = track_id(body, payload + 4)
+                // research/xim ParticleUpdaters.kt ChildGeneratorUpdater at BillBoardType.None:
+                // per-frame emission with the parent particle's full transform.
+                SEC3_OPCODE_CHILD_GENERATOR => {
+                    child_emit_full = true;
                 }
-                // research/xim ParticleGeneratorParser.kt sec2Handler: the keyframe track
-                // bound to the element's blue channel.
-                SEC2_OPCODE_COLOR_B_TRACK if payload + 8 <= body.len() => {
-                    color_b_track = track_id(body, payload + 4)
+                // research/xim ParticleUpdaters.kt ChildGeneratorUpdater at BillBoardType.XYZ.
+                SEC3_OPCODE_CHILD_GENERATOR_BILLBOARD => {
+                    child_emit_billboard = true;
                 }
-                // research/xim ParticleGeneratorParser.kt sec2Handler — 0x60..0x63 are the same
-                // KeyFrameValueSetup shape bound to the time-of-day color channels, read back by
-                // the section-3 ClockValueUpdater 0x3C..0x3F.
-                0x60..=0x63 if payload + 8 <= body.len() => {
-                    tod_color_tracks[(opcode - 0x60) as usize] = track_id(body, payload + 4);
+                // research/xim ParticleUpdaters.kt VelocityRotationUpdater: no payload —
+                // collapses all velocity into +x and copies the particle's rotation into
+                // the velocity rotation (particle_sim.rs).
+                SEC3_OPCODE_VELOCITY_ROTATION_UPDATER => {
+                    velocity_rotation_updater = true;
                 }
-                // research/xim ParticleInitializers.kt ReverseDisplacementSetup: parsed,
-                // never read by the effect.
-                SEC2_OPCODE_REVERSE_DISPLACEMENT if payload + 4 <= body.len() => {
-                    reverse_displacement = Some(f32_le(body, payload));
+                // research/xim ParticleUpdaters.kt PointListPositionUpdater: no payload
+                // samples the SEC2_OPCODE_POINT_LIST_POSITION spline at the particle's
+                // progress and copies it to the position. The engine has no point-list
+                // spline runtime, so the block arms nothing and only consumes.
+                SEC3_OPCODE_POINT_LIST_POSITION => {}
+                // research/xim ParticleUpdaters.kt VelocityRotator: the rotateAmount
+                // added to the velocity rotation * (0.5 * dt) per frame (particle_sim.rs).
+                SEC3_OPCODE_VELOCITY_ROTATOR if payload + 12 <= body.len() => {
+                    velocity_rotator = Some([
+                        f32_le(body, payload),
+                        f32_le(body, payload + 4),
+                        f32_le(body, payload + 8),
+                    ]);
                 }
-                // research/XIClient CYyGenerator.cpp CYyGenerator::ElemGenerate case 0x1D
-                // retail derives the flipbook's per-frame interval from the CMoD3a resource's
-                // frame count, not the DAT, so the payload word is never read.
-                SEC2_OPCODE_SPRITE_SHEET_INIT if payload + 4 <= body.len() => {}
-                // research/xim Particle.kt updateAssociatedPosition / updateAssociatedFacing
-                // footMarkEffect branches: the particle snaps to the actor's position + joint
-                // and facing on the spawn frame, then stops following the generator.
-                SEC2_OPCODE_FOOT_MARK => foot_mark = true,
-                // research/xim ParticleInitializers.kt OscillationSetup: the marker that
-                // allocates the particle's oscillation state.
-                SEC2_OPCODE_OSCILLATION_SETUP => oscillation = true,
-                // research/xim ParticleInitializers.kt ParentPositionCopyConfig: the marker
-                // that makes a child particle copy its parent's position.
-                SEC2_OPCODE_PARENT_POSITION_COPY => parent_position_copy = true,
-                // research/xim ParticleInitializers.kt ParentVelocityConfig: the multiplier
-                // on the parent's total velocity copied into the child's velocity.
-                SEC2_OPCODE_PARENT_VELOCITY if payload + 4 <= body.len() => {
-                    parent_velocity = Some(f32_le(body, payload));
+                // research/xim ParticleGeneratorParser.kt sec3Handler ClockValueUpdater
+                // no payload; marks which 0x60..0x63 track drives its channel.
+                0x3C..=0x3F => tod_color_driven[(opcode - 0x3C) as usize] = true,
+                // research/xim ParticleGeneratorParser.kt sec3Handler MoonPhaseSpriteSheetUpdater.
+                0x45 => moon_phase_sprite = true,
+                // research/xim ParticleUpdaters.kt SpriteSheetFrameUpdater: no payload
+                // the flipbook frame advances across the particle's life, which the
+                // engine's flipbook_index already does for every SpriteSheet (retail's
+                // ElemIdle case 0x0D accumulator is the same sequence).
+                SEC3_OPCODE_SPRITE_SHEET_FRAME => {}
+                // research/xim ParticleUpdaters.kt NoOpParticleUpdater: no payload
+                // retail's ElemIdle case 0x0E computes the keyframe progress as
+                // 1.0 - (Life / field_114), the elapsed-life fraction the engine's
+                // `progress` (age/life, particle_sim.rs) already is, so the block arms
+                // nothing and only consumes.
+                SEC3_OPCODE_NO_OP => {}
+                // research/xim ParticleGeneratorParser.kt sec3Handler: the color.a
+                // ProgressValueUpdater: no payload. It samples the sec2 alpha track at
+                // life progress, which particle_draw already does from def.alpha_track, so
+                // the block arms nothing and only consumes.
+                SEC3_OPCODE_ALPHA_UPDATER => {}
+                // research/xim ParticleGeneratorParser.kt sec3Handler — weighted-mesh weight
+                // appliers: no payload, they sample the sec2 0x33..0x37 tracks. The engine does
+                // not model the weighted-mesh draw path, so the blocks arm nothing and only
+                // consume.
+                SEC3_OPCODE_WEIGHTED_MESH_WEIGHT_FIRST..=SEC3_OPCODE_WEIGHTED_MESH_WEIGHT_LAST => {}
+                // research/xim ParticleUpdaters.kt DayOfWeekColorUpdater: the zero u32
+                // is at payload+0, then 8 RGBA quads (u8x4, 0..=255).
+                0x4E if payload + 4 + 4 * DAYS_OF_WEEK <= body.len() => {
+                    day_of_week_color =
+                        Some(std::array::from_fn(|i| rgba_u8(body, payload + 4 + i * 4)));
                 }
-                // research/xim ParticleInitializers.kt ChildGeneratorSetup: the sibling
-                // generator emitted as a child of each particle.
-                SEC2_OPCODE_CHILD_GENERATOR if payload + 8 <= body.len() => {
-                    child_generator = track_id(body, payload + 4);
+                // research/xim ParticleUpdaters.kt MoonPhaseColorUpdater: same shape,
+                // 12 quads.
+                0x4F if payload + 4 + 4 * MOON_PHASES <= body.len() => {
+                    moon_phase_color =
+                        Some(std::array::from_fn(|i| rgba_u8(body, payload + 4 + i * 4)));
                 }
-                // research/xim ParticleGeneratorParser.kt sec2Handler: xim maps this opcode
-                // to the same ChildGeneratorSetup as SEC2_OPCODE_CHILD_GENERATOR.
-                SEC2_OPCODE_CHILD_GENERATOR_2 if payload + 8 <= body.len() => {
-                    child_generator_2 = track_id(body, payload + 4);
-                }
-                // research/xim ParticleInitializers.kt ParentRotateConfig: the marker that
-                // makes a child particle copy its parent's rotation.
-                SEC2_OPCODE_PARENT_ROTATE => parent_rotate = true,
-                // research/xim ParticleGeneratorParser.kt sec2Handler: xim maps this opcode
-                // to the same ParentRotateConfig as SEC2_OPCODE_PARENT_ROTATE.
-                SEC2_OPCODE_PARENT_ROTATE_2 => parent_rotate_2 = true,
-                // research/xim ParticleInitializers.kt BatchingSetup: the word is an
-                // expectZero32; only the marker is kept.
-                SEC2_OPCODE_BATCHING_SETUP if payload + 4 <= body.len() => batching_setup = true,
-                // research/xim ParticleInitializers.kt ParentColorConfig: the marker that
-                // makes a child particle copy its parent's color.
-                SEC2_OPCODE_PARENT_COLOR => parent_color = true,
-                // research/xim ParticleInitializers.kt ParentScaleConfig: the marker that
-                // makes a child particle copy its parent's scale.
-                SEC2_OPCODE_PARENT_SCALE => parent_scale = true,
-                // research/xim ParticleInitializers.kt ParentTexCoordConfig: the marker that
-                // makes a child particle copy its parent's tex-coord translate.
-                SEC2_OPCODE_PARENT_TEX_COORD => parent_tex_coord = true,
-                // research/xim ParticleInitializers.kt PointListPositionSetup: the keyframe
-                // and point-list DAT ids; the in-mem pointer words are consumed, not kept.
-                SEC2_OPCODE_POINT_LIST_POSITION if payload + 20 <= body.len() => {
-                    point_list_position = Some((
-                        DatId::from(body, payload + 4).0,
-                        DatId::from(body, payload + 16).0,
-                    ));
-                }
-                // research/xim ParticleGeneratorParser.kt sec2Handler: the keyframe track
-                // bound to the element's velocity y.
-                SEC2_OPCODE_VELOCITY_Y_TRACK if payload + 8 <= body.len() => {
-                    velocity_y_track = track_id(body, payload + 4);
-                }
-                // research/xim ParticleGeneratorParser.kt sec2Handler: the keyframe track
-                // bound to the specular element's rotation x.
-                SEC2_OPCODE_SPECULAR_ROT_X_TRACK if payload + 8 <= body.len() => {
-                    specular_rot_x_track = track_id(body, payload + 4);
-                }
-                // research/xim ParticleGeneratorParser.kt sec2Handler: the keyframe track
-                // bound to the specular element's color green.
-                SEC2_OPCODE_SPECULAR_COLOR_G_TRACK if payload + 8 <= body.len() => {
-                    specular_color_g_track = track_id(body, payload + 4);
-                }
-                // research/xim ParticleGeneratorParser.kt sec2Handler: the keyframe track
-                // bound to the element's velocity dampener.
-                SEC2_OPCODE_VELOCITY_DAMPENER_TRACK if payload + 8 <= body.len() => {
-                    velocity_dampener_track = track_id(body, payload + 4);
-                }
-                // research/xim ParticleInitializers.kt FixedPointPositionVarianceSetup: the
-                // point list a per-emitted-particle position offset cycles through.
-                SEC2_OPCODE_FIXED_POINT_POSITION_VARIANCE if payload + 12 <= body.len() => {
-                    fixed_point_position_variance = track_id(body, payload + 4);
-                }
-                // research/xim ParticleGeneratorParser.kt sec2Handler: xim maps this opcode
-                // to the same FixedPointPositionVarianceSetup as 0x4E.
-                SEC2_OPCODE_FIXED_POINT_POSITION_VARIANCE_2 if payload + 12 <= body.len() => {
-                    fixed_point_position_variance_2 = track_id(body, payload + 4);
-                }
-                // research/xim ParticleInitializers.kt OscillationAccelerationSetup (Z)
-                // [acceleration, variance].
-                SEC2_OPCODE_OSCILLATION_ACCEL_Z if payload + 8 <= body.len() => {
-                    oscillation_accel_z = Some([f32_le(body, payload), f32_le(body, payload + 4)]);
-                }
-                // research/xim ParticleInitializers.kt OscillationAccelerationSetup (X).
-                SEC2_OPCODE_OSCILLATION_ACCEL_X if payload + 8 <= body.len() => {
-                    oscillation_accel_x = Some([f32_le(body, payload), f32_le(body, payload + 4)]);
-                }
-                // research/xim ParticleInitializers.kt OscillationAccelerationSetup (Y).
-                SEC2_OPCODE_OSCILLATION_ACCEL_Y if payload + 8 <= body.len() => {
-                    oscillation_accel_y = Some([f32_le(body, payload), f32_le(body, payload + 4)]);
-                }
-                // BlendFuncInitializer: p0 @payload+0 — high nibble bit 0x01 = opaque, else low
-                // nibble selects (0x8 additive, 0x4/0x6 alpha blend, 0x1/0x2 reverse-subtract).
-                0x1E if payload < body.len() => {
-                    let p0 = body[payload];
-                    blend_byte = p0;
-                    blend = if (p0 >> 4) & BLEND_FUNC_OPAQUE_BIT != 0 {
-                        ParticleBlend::Blend
+                // research/xim ParticleUpdaters.kt CameraShakeUpdater: near and far
+                // always; shakeFactor only in the 4-word form (the opCodeSize == 4
+                // branch).
+                SEC3_OPCODE_CAMERA_SHAKE_UPDATER if payload + 8 <= body.len() => {
+                    let shake_factor = if size_words == 4 && payload + 12 <= body.len() {
+                        f32_le(body, payload + 8)
                     } else {
-                        match p0 & BLEND_FUNC_MODE_MASK {
-                            0x8 => ParticleBlend::Additive,
-                            0x1 | 0x2 => ParticleBlend::Subtract,
-                            _ => ParticleBlend::Blend,
-                        }
+                        0.0
                     };
+                    rumble_falloff = Some([
+                        f32_le(body, payload),
+                        f32_le(body, payload + 4),
+                        shake_factor,
+                    ]);
                 }
                 _ => decoded = false,
             }
-            blocks.push((GeneratorSection::Initializers, opcode, decoded));
+            blocks.push((
+                GeneratorSection::Updaters,
+                opcode,
+                size_words,
+                &body[payload..payload + block_len - 4],
+                decoded,
+            ));
             cursor += block_len;
         }
+    }
 
-        if !is_particle {
-            return Ok(None);
-        }
-
-        // Section 3 (body[0x78]) — per-frame updaters (same walk as
-        // generator.rs::parse_cloud_generator). 0x27/0x28 TextureCoordinateUpdater UV
-        // scroll; 0x03 VelocityAccelerator gravity (Vector3f at payload+0).
-        let mut uv_scroll = [0.0f32; 2];
-        let mut accel = None;
-        let mut rotation_accel = None;
-        let mut scale_accel = None;
-        let mut oscillation_applier_x = None;
-        let mut oscillation_applier_z = None;
-        let mut oscillation_applier_y = None;
-        let mut day_of_week_color = None;
-        let mut moon_phase_color = None;
-        let mut moon_phase_sprite = false;
-        let mut rotation_updater = false;
-        let mut position_updater = false;
-        let mut camera_shake = None;
-        let mut velocity_dampener = None;
-        let mut velocity_rotator = None;
-        let mut color_transform_modifier = None;
-        let mut tod_color_driven = [false; TOD_COLOR_CHANNELS];
-        let sec3_raw = u32_le(body, 0x78) as usize;
-        if sec3_raw >= CHUNK_HEADER_LEN && sec3_raw - CHUNK_HEADER_LEN < body.len() {
-            let mut cursor = sec3_raw - CHUNK_HEADER_LEN;
-            while cursor + 4 <= body.len() {
-                let cfg = u32_le(body, cursor);
-                let opcode = (cfg & OPCODE_MASK) as u8;
-                let size_words = ((cfg >> 8) & u32::from(SIZE_WORDS_MASK)) as usize;
-                if opcode == OPCODE_END || size_words == 0 {
-                    break;
-                }
-                let block_len = size_words * 4;
-                let payload = cursor + 4;
-                if cursor + block_len > body.len() {
-                    break;
-                }
-                let mut decoded = true;
-                match opcode {
-                    SEC3_OPCODE_POSITION => position_updater = true,
-                    SEC3_OPCODE_ROTATION_UPDATER => rotation_updater = true,
-                    SEC3_OPCODE_SCALE_UPDATER => scale_updater = true,
-                    0x27 if payload + 4 <= body.len() => uv_scroll[0] = f32_le(body, payload),
-                    0x28 if payload + 4 <= body.len() => uv_scroll[1] = f32_le(body, payload),
-                    // research/xim ParticleUpdaters.kt OscillationApplier: oscillationRate =
-                    // 180f / payload0, baseOffset = payload1, payload2 has no effect.
-                    SEC3_OPCODE_OSCILLATION_APPLIER_X if payload + 12 <= body.len() => {
-                        oscillation_applier_x = Some([
-                            f32_le(body, payload),
-                            f32_le(body, payload + 4),
-                            f32_le(body, payload + 8),
-                        ]);
-                    }
-                    SEC3_OPCODE_OSCILLATION_APPLIER_Z if payload + 12 <= body.len() => {
-                        oscillation_applier_z = Some([
-                            f32_le(body, payload),
-                            f32_le(body, payload + 4),
-                            f32_le(body, payload + 8),
-                        ]);
-                    }
-                    SEC3_OPCODE_OSCILLATION_APPLIER_Y if payload + 12 <= body.len() => {
-                        oscillation_applier_y = Some([
-                            f32_le(body, payload),
-                            f32_le(body, payload + 4),
-                            f32_le(body, payload + 8),
-                        ]);
-                    }
-                    0x03 if payload + 12 <= body.len() => {
-                        accel = Some([
-                            f32_le(body, payload),
-                            f32_le(body, payload + 4),
-                            f32_le(body, payload + 8),
-                        ]);
-                    }
-                    // research/XIClient/src/XIClient/source/World/Generator/CYyGenerator.cpp
-                    // CYyGenerator::ElemIdle uses Get11FC to address separate transform allocations.
-                    SEC3_OPCODE_VELOCITY_ACCELERATOR_UNGATED_FIRST
-                    | SEC3_OPCODE_VELOCITY_ACCELERATOR_UNGATED_LAST
-                        if payload + 12 <= body.len() =>
-                    {
-                        let allocation = Some((cfg >> ALLOCATION_SHIFT) & ALLOCATION_MASK);
-                        let target = if allocation == rotation_allocation {
-                            Some(&mut rotation_accel)
-                        } else if allocation == scale_allocation {
-                            Some(&mut scale_accel)
-                        } else if allocation == position_allocation {
-                            Some(&mut accel)
-                        } else {
-                            None
-                        };
-                        if let Some(target) = target {
-                            let value = target.get_or_insert([0.0; 3]);
-                            for (axis, value) in value.iter_mut().enumerate() {
-                                *value += f32_le(body, payload + axis * size_of::<f32>());
-                            }
-                        } else {
-                            decoded = false;
-                        }
-                    }
-                    // research/xim ParticleUpdaters.kt VelocityDampener: velocity is scaled
-                    // by dampeningFactor^dt, the factor from
-                    // SEC2_OPCODE_VELOCITY_DAMPENER_TRACK when present. The engine does not
-                    // model the dampener, so parse-only.
-                    SEC3_OPCODE_VELOCITY_DAMPENER if payload + 8 <= body.len() => {
-                        velocity_dampener =
-                            Some([f32_le(body, payload), f32_le(body, payload + 4)]);
-                    }
-                    // research/xim ParticleGeneratorParser.kt sec3Handler: the dampening-factor
-                    // ProgressValueUpdater: no payload, it samples
-                    // SEC2_OPCODE_VELOCITY_DAMPENER_TRACK. The engine does not model the
-                    // dampener, so the block arms nothing and only consumes.
-                    SEC3_OPCODE_DAMPENING_FACTOR => {}
-                    // research/xim ParticleUpdaters.kt ColorTransformModifier: the per-frame
-                    // rate on the SEC2_OPCODE_COLOR_TRANSFORM_SETUP transform. The engine does
-                    // not model the transform's application, so parse-only.
-                    SEC3_OPCODE_COLOR_TRANSFORM_MODIFIER if payload + 8 <= body.len() => {
-                        color_transform_modifier = Some([
-                            i16::from_le_bytes([body[payload], body[payload + 1]]),
-                            i16::from_le_bytes([body[payload + 2], body[payload + 3]]),
-                            i16::from_le_bytes([body[payload + 4], body[payload + 5]]),
-                            i16::from_le_bytes([body[payload + 6], body[payload + 7]]),
-                        ]);
-                    }
-                    // research/xim ParticleGeneratorParser.kt sec3Handler: the scale.x/y/z
-                    // ProgressValueUpdaters: no payload, they sample the sec2 scale tracks at
-                    // life progress, which the render path already does from
-                    // def.scale_x_track/scale_y_track; the engine's 2D sprite has no z axis,
-                    // so the blocks arm nothing and only consume.
-                    SEC3_OPCODE_SCALE_PROGRESS_FIRST..=SEC3_OPCODE_SCALE_PROGRESS_LAST => {}
-                    // research/xim ParticleGeneratorParser.kt sec3Handler: the color.r/g/b
-                    // ProgressValueUpdaters: no payload, they sample the sec2 color tracks at
-                    // life progress. The engine sets the particle's rgb at spawn from the 0x16
-                    // base / 0x17 variance and has no per-frame rgb track path, so the blocks
-                    // arm nothing and only consume.
-                    SEC3_OPCODE_COLOR_RGB_PROGRESS_FIRST..=SEC3_OPCODE_COLOR_RGB_PROGRESS_LAST => {}
-                    // research/xim ParticleGeneratorParser.kt sec3Handler: the specular
-                    // rotation.y/z and color.a ProgressValueUpdaters: no payload, they sample
-                    // the sec2 specular tracks. The engine does not model the specular
-                    // element, so the blocks arm nothing and only consume.
-                    SEC3_OPCODE_SPECULAR_ROT_Y_PROGRESS
-                    | SEC3_OPCODE_SPECULAR_ROT_Z_PROGRESS
-                    | SEC3_OPCODE_SPECULAR_COLOR_A_PROGRESS => {}
-                    // research/xim ParticleUpdaters.kt ColorTransformApplier: no payload —
-                    // color += (transform shr 7) * (0.5 * dt) per frame. The engine does
-                    // not model the transform's application, so the block arms nothing and
-                    // only consumes.
-                    SEC3_OPCODE_COLOR_TRANSFORM_APPLIER => {}
-                    // research/xim ParticleGeneratorParser.kt sec3Handler: ChildGeneratorBasicUpdater
-                    // / ChildGeneratorUpdater: no payload, they emit/update the sec2 child
-                    // generator per particle. The engine has no child-particle path, so the
-                    // blocks arm nothing and only consume.
-                    SEC3_OPCODE_CHILD_GENERATOR_BASIC | SEC3_OPCODE_CHILD_GENERATOR => {}
-                    // research/xim ParticleUpdaters.kt VelocityRotationUpdater: no payload
-                    // converts all velocity into the +x axis and copies the particle's
-                    // rotation into the velocity rotation. The engine has no velocityRotation,
-                    // so the block arms nothing and only consumes.
-                    SEC3_OPCODE_VELOCITY_ROTATION_UPDATER => {}
-                    // research/xim ParticleUpdaters.kt PointListPositionUpdater: no payload
-                    // samples the SEC2_OPCODE_POINT_LIST_POSITION spline at the particle's
-                    // progress and copies it to the position. The engine has no point-list
-                    // spline runtime, so the block arms nothing and only consumes.
-                    SEC3_OPCODE_POINT_LIST_POSITION => {}
-                    // research/xim ParticleUpdaters.kt VelocityRotator: the rotateAmount
-                    // added to the velocity rotation * (0.5 * dt) per frame. The engine has
-                    // no velocityRotation, so parse-only.
-                    SEC3_OPCODE_VELOCITY_ROTATOR if payload + 12 <= body.len() => {
-                        velocity_rotator = Some([
-                            f32_le(body, payload),
-                            f32_le(body, payload + 4),
-                            f32_le(body, payload + 8),
-                        ]);
-                    }
-                    // research/xim ParticleGeneratorParser.kt sec3Handler ClockValueUpdater
-                    // no payload; marks which 0x60..0x63 track drives its channel.
-                    0x3C..=0x3F => tod_color_driven[(opcode - 0x3C) as usize] = true,
-                    // research/xim ParticleGeneratorParser.kt sec3Handler MoonPhaseSpriteSheetUpdater.
-                    0x45 => moon_phase_sprite = true,
-                    // research/xim ParticleUpdaters.kt SpriteSheetFrameUpdater: no payload
-                    // the flipbook frame advances across the particle's life, which the
-                    // engine's flipbook_index already does for every SpriteSheet (retail's
-                    // ElemIdle case 0x0D accumulator is the same sequence).
-                    SEC3_OPCODE_SPRITE_SHEET_FRAME => {}
-                    // research/xim ParticleUpdaters.kt NoOpParticleUpdater: no payload
-                    // retail's ElemIdle case 0x0E computes the keyframe progress as
-                    // 1.0 - (Life / field_114), the elapsed-life fraction the engine's
-                    // `progress` (age/life, particle_sim.rs) already is, so the block arms
-                    // nothing and only consumes.
-                    SEC3_OPCODE_NO_OP => {}
-                    // research/xim ParticleGeneratorParser.kt sec3Handler: the color.a
-                    // ProgressValueUpdater: no payload. It samples the sec2 alpha track at
-                    // life progress, which particle_draw already does from def.alpha_track, so
-                    // the block arms nothing and only consumes.
-                    SEC3_OPCODE_ALPHA_UPDATER => {}
-                    // research/xim ParticleUpdaters.kt DayOfWeekColorUpdater: the zero u32
-                    // is at payload+0, then 8 RGBA quads (u8x4, 0..=255).
-                    0x4E if payload + 4 + 4 * DAYS_OF_WEEK <= body.len() => {
-                        day_of_week_color =
-                            Some(std::array::from_fn(|i| rgba_u8(body, payload + 4 + i * 4)));
-                    }
-                    // research/xim ParticleUpdaters.kt MoonPhaseColorUpdater: same shape,
-                    // 12 quads.
-                    0x4F if payload + 4 + 4 * MOON_PHASES <= body.len() => {
-                        moon_phase_color =
-                            Some(std::array::from_fn(|i| rgba_u8(body, payload + 4 + i * 4)));
-                    }
-                    // research/xim ParticleUpdaters.kt CameraShakeUpdater: near and far
-                    // always; shakeFactor only in the 4-word form (the opCodeSize == 4
-                    // branch).
-                    SEC3_OPCODE_CAMERA_SHAKE_UPDATER if payload + 8 <= body.len() => {
-                        let shake_factor = if size_words == 4 && payload + 12 <= body.len() {
-                            f32_le(body, payload + 8)
-                        } else {
-                            0.0
-                        };
-                        camera_shake = Some([
-                            f32_le(body, payload),
-                            f32_le(body, payload + 4),
-                            shake_factor,
-                        ]);
-                    }
-                    _ => decoded = false,
-                }
-                blocks.push((GeneratorSection::Updaters, opcode, decoded));
-                cursor += block_len;
+    let mut emit_cull = None;
+    let mut association = None;
+    let sec1_raw = u32_le(body, 0x70) as usize;
+    if sec1_raw >= CHUNK_HEADER_LEN && sec1_raw - CHUNK_HEADER_LEN < body.len() {
+        let mut cursor = sec1_raw - CHUNK_HEADER_LEN;
+        while cursor + 4 <= body.len() {
+            let cfg = u32_le(body, cursor);
+            let opcode = (cfg & OPCODE_MASK) as u8;
+            let size_words = ((cfg >> 8) & u32::from(SIZE_WORDS_MASK)) as usize;
+            if opcode == OPCODE_END || size_words == 0 {
+                break;
             }
-        }
-
-        let mut emit_cull = None;
-        let mut association = None;
-        let sec1_raw = u32_le(body, 0x70) as usize;
-        if sec1_raw >= CHUNK_HEADER_LEN && sec1_raw - CHUNK_HEADER_LEN < body.len() {
-            let mut cursor = sec1_raw - CHUNK_HEADER_LEN;
-            while cursor + 4 <= body.len() {
-                let cfg = u32_le(body, cursor);
-                let opcode = (cfg & OPCODE_MASK) as u8;
-                let size_words = ((cfg >> 8) & u32::from(SIZE_WORDS_MASK)) as usize;
-                if opcode == OPCODE_END || size_words == 0 {
-                    break;
-                }
-                let block_len = size_words * 4;
-                let payload = cursor + 4;
-                if cursor + block_len > body.len() {
-                    break;
-                }
-                let mut decoded = true;
-                match opcode {
-                    SEC1_OPCODE_EMIT_CULL if payload + 12 <= body.len() => {
-                        emit_cull = Some(EmitCull {
-                            max_distance: f32_le(body, payload),
-                            min_distance: f32_le(body, payload + 4),
-                            unlink_out_of_range: u32_le(body, payload + 8) & 1 != 0,
-                        });
-                    }
-                    // research/xim ParticleGeneratorUpdaters.kt AssociationUpdater read:
-                    // followPosition(0x1), followFacing(0x2), followFactor(>>2).
-                    SEC1_OPCODE_ASSOCIATION if payload + 4 <= body.len() => {
-                        let cfg = u32_le(body, payload);
-                        association = Some(AssociationFollow {
-                            follow_position: cfg & 1 != 0,
-                            follow_facing: cfg & 2 != 0,
-                            factor: cfg >> 2,
-                        });
-                    }
-                    _ => decoded = false,
-                }
-                blocks.push((GeneratorSection::Setup, opcode, decoded));
-                cursor += block_len;
+            let block_len = size_words * 4;
+            let payload = cursor + 4;
+            if cursor + block_len > body.len() {
+                break;
             }
-        }
-
-        let mut relife_on_expiry = false;
-        let sec4_raw = u32_le(body, SEC4_OFFSET) as usize;
-        if sec4_raw >= CHUNK_HEADER_LEN && sec4_raw - CHUNK_HEADER_LEN < body.len() {
-            let mut cursor = sec4_raw - CHUNK_HEADER_LEN;
-            while cursor + 4 <= body.len() {
-                let cfg = u32_le(body, cursor);
-                let opcode = (cfg & OPCODE_MASK) as u8;
-                let size_words = ((cfg >> 8) & u32::from(SIZE_WORDS_MASK)) as usize;
-                if opcode == OPCODE_END || size_words == 0 {
-                    break;
+            let mut decoded = true;
+            match opcode {
+                SEC1_OPCODE_EMIT_CULL if payload + 12 <= body.len() => {
+                    emit_cull = Some(EmitCull {
+                        max_distance: f32_le(body, payload),
+                        min_distance: f32_le(body, payload + 4),
+                        unlink_out_of_range: u32_le(body, payload + 8) & 1 != 0,
+                    });
                 }
-                // 0x01 is the child-emitter block (research/xim ParticleExpirationHandlers.kt
-                // EmitChildHandler: [expectZero32, child generator DAT id]); retail's ElemDie has
-                // no case for it and the engine has no child-particle path, so decode-only.
-                let decoded = opcode == SEC4_OPCODE_RELIFE || opcode == SEC4_OPCODE_EMIT_CHILD;
-                relife_on_expiry |= opcode == SEC4_OPCODE_RELIFE;
-                blocks.push((GeneratorSection::ElementDie, opcode, decoded));
-                cursor += size_words * 4;
+                // research/xim ParticleGeneratorUpdaters.kt AssociationUpdater read:
+                // followPosition(0x1), followFacing(0x2), followFactor(>>2).
+                SEC1_OPCODE_ASSOCIATION if payload + 4 <= body.len() => {
+                    let cfg = u32_le(body, payload);
+                    association = Some(AssociationFollow {
+                        follow_position: cfg & 1 != 0,
+                        follow_facing: cfg & 2 != 0,
+                        factor: cfg >> 2,
+                    });
+                }
+                _ => decoded = false,
             }
+            blocks.push((
+                GeneratorSection::Setup,
+                opcode,
+                size_words,
+                &body[payload..payload + block_len - 4],
+                decoded,
+            ));
+            cursor += block_len;
         }
+    }
 
-        flush_blocks(sink, &blocks);
-        Ok(Some(Self {
+    let mut relife_on_expiry = false;
+    let sec4_raw = u32_le(body, SEC4_OFFSET) as usize;
+    if sec4_raw >= CHUNK_HEADER_LEN && sec4_raw - CHUNK_HEADER_LEN < body.len() {
+        let mut cursor = sec4_raw - CHUNK_HEADER_LEN;
+        while cursor + 4 <= body.len() {
+            let cfg = u32_le(body, cursor);
+            let opcode = (cfg & OPCODE_MASK) as u8;
+            let size_words = ((cfg >> 8) & u32::from(SIZE_WORDS_MASK)) as usize;
+            if opcode == OPCODE_END || size_words == 0 {
+                break;
+            }
+            // 0x01 is the child-emitter block (research/xim ParticleExpirationHandlers.kt
+            // EmitChildHandler: [expectZero32, child generator DAT id]); retail's ElemDie has
+            // no case for it and the engine has no child-particle path, so decode-only.
+            let payload = cursor + 4;
+            let block_len = size_words * 4;
+            if cursor + block_len > body.len() {
+                break;
+            }
+            if opcode == SEC4_OPCODE_EMIT_CHILD && payload + 8 <= body.len() {
+                emit_child_id = Some([
+                    body[payload + 4],
+                    body[payload + 5],
+                    body[payload + 6],
+                    body[payload + 7],
+                ]);
+            }
+            let decoded = opcode == SEC4_OPCODE_RELIFE || opcode == SEC4_OPCODE_EMIT_CHILD;
+            relife_on_expiry |= opcode == SEC4_OPCODE_RELIFE;
+            blocks.push((
+                GeneratorSection::ElementDie,
+                opcode,
+                size_words,
+                &body[payload..payload + block_len - 4],
+                decoded,
+            ));
+            cursor += block_len;
+        }
+    }
+
+    Ok(Some((
+        GeneratorSections {
             frames_per_emission,
             particles_per_emission,
             emission_variance,
@@ -1780,8 +2789,7 @@ impl ParticleGeneratorDef {
             auto_run,
             batched,
             attach_type,
-            attach_joint_source,
-            attach_joint_target,
+            attach_eid,
             attach_source_oriented,
             init_scale,
             single_scale_variance,
@@ -1789,6 +2797,8 @@ impl ParticleGeneratorDef {
             init_color,
             color_variance,
             color_transform,
+            color_transform_variance,
+            color_transform_applier,
             color_transform_modifier,
             init_velocity,
             velocity_variance,
@@ -1806,6 +2816,11 @@ impl ParticleGeneratorDef {
             sort_offset,
             projection_bias,
             depth_write,
+            position_x_track,
+            position_y_track,
+            position_z_track,
+            weighted_mesh_weight_tracks,
+            tod_volume_track,
             scale_x_track,
             scale_y_track,
             scale_z_track,
@@ -1829,6 +2844,11 @@ impl ParticleGeneratorDef {
             parent_position_copy,
             parent_velocity,
             child_generator,
+            child_generator_3,
+            once_child_generator,
+            child_emit_basic,
+            child_emit_full,
+            child_emit_billboard,
             oscillation_accel_z,
             oscillation_accel_x,
             oscillation_accel_y,
@@ -1846,15 +2866,20 @@ impl ParticleGeneratorDef {
             specular_element,
             specular,
             specular_rot_y_track,
-            camera_shake_track,
-            camera_shake,
+            rumble_track,
+            rumble_falloff,
+            draw_distance_near,
+            draw_distance_far,
             haze_offset_x,
             parent_rotate,
             parent_color,
             parent_scale,
             velocity_dampener_track,
+            dampening_factor_applier,
             velocity_dampener,
             velocity_rotator,
+            velocity_rotation_updater,
+            random_velocity,
             fixed_point_position_variance,
             fixed_point_position_variance_2,
             child_generator_2,
@@ -1867,25 +2892,14 @@ impl ParticleGeneratorDef {
             velocity_y_track,
             specular_rot_x_track,
             specular_color_g_track,
-        }))
-    }
-
-    // The per-frame rotation the element actually turns by: a 0x0B rate with no sec3 0x05
-    // updater never turns (research/xi-tools/docs/fx/effects.md "What MOVES an effect").
-    pub fn spin(&self) -> Option<[f32; 3]> {
-        self.rotation_velocity.filter(|_| self.rotation_updater)
-    }
-
-    // The per-frame scale rate the element actually changes: a 0x12 rate with no sec3 0x08
-    // updater is never integrated (research/xim ParticleUpdaters.kt ScaleUpdater is the only
-    // consumer of the scale transform's velocity).
-    pub fn scale_rate(&self) -> Option<[f32; 3]> {
-        self.scale_velocity.filter(|_| self.scale_updater)
-    }
-
-    pub fn is_singleton(&self) -> bool {
-        self.max_life_frames == 0.0
-    }
+            kind_byte,
+            emit_child_id,
+            sound_far,
+            sound_near,
+            sound_path_ref,
+        },
+        blocks,
+    )))
 }
 
 // research/XIClient/src/XIClient/include/Resource/ResourceType.h `Sep = 61`, dispatched
@@ -1898,6 +2912,12 @@ pub(crate) const LINKED_DATA_SOUND: u8 = 0x3D;
 // `s_width = 0.0` unconditionally, so the third shipped word (non-zero in 22 of the 5,895
 // generators) is discarded rather than read.
 const SOUND_SETUP_OPCODE: u8 = 0x4C;
+
+// research/XIClient CYyGenerator.cpp ElemGenerate case 0x6B — a sound elem binds its attenuation
+// origin to an Sph rail resource (ResourceType.h `Sph = 74`): at generation the resolved
+// CMoSphRes's nearest point to the camera eye replaces the generator position. The two trailing
+// words are zero in every shipped use.
+const SOUND_PATH_REF_OPCODE: u8 = 0x6B;
 
 /// A 0x05 Generator whose setup links a 0x3D `Sep` — a placed sound emitter rather than a
 /// particle. [`ParticleGeneratorDef::parse`] rejects the same chunks, so the two views
@@ -1926,6 +2946,16 @@ pub struct SoundGeneratorDef {
     pub max_life_frames: f32,
 
     pub attach_type: AttachType,
+
+    /// sec2 0x68 KeyFrameValueSetup ("ToD Volume") + section-3 ClockValueUpdater 0x43 — the
+    /// keyframe track sampled at the full-day interpolation that multiplies the emitter's gain
+    /// (research/xim ParticleGeneratorParser.kt — audioConfiguration.volumeMultiplier).
+    pub tod_volume_track: Option<[u8; 4]>,
+
+    /// sec2 0x6B — the Sph rail resource (chunk kind 0x4A) whose nearest point to the camera eye
+    /// is this emitter's attenuation origin. No parser for that chunk exists yet, so the engine
+    /// falls back to the generator origin and diagnostics records the gap.
+    pub path_ref: Option<[u8; 4]>,
 }
 
 impl SoundGeneratorDef {
@@ -1934,87 +2964,37 @@ impl SoundGeneratorDef {
     }
 
     pub fn parse_reporting(body: &[u8], sink: GeneratorOpcodeSink<'_>) -> Result<Option<Self>> {
-        let mut blocks: Vec<(GeneratorSection, u8, bool)> = Vec::new();
-        if body.len() < HEADER_LEN {
-            return Err(DatError::TruncatedChunk {
-                offset: 0,
-                needed: HEADER_LEN,
-                available: body.len(),
-            });
-        }
+        Self::parse_detailed(body, &mut |section, opcode, _size_words, _args, outcome| {
+            sink(section, opcode, outcome)
+        })
+    }
 
-        let attach_flags = u16_le(body, 0x00);
-        let flags = u32_le(body, GEN_FLAGS_OFFSET);
-
-        let sec2_raw = u32_le(body, 0x74) as usize;
-        if sec2_raw < CHUNK_HEADER_LEN || sec2_raw - CHUNK_HEADER_LEN >= body.len() {
+    pub fn parse_detailed(body: &[u8], sink: GeneratorBlockSink<'_>) -> Result<Option<Self>> {
+        let Some((sections, blocks)) = parse_sections(body)? else {
+            return Ok(None);
+        };
+        if sections.kind_byte != LINKED_DATA_SOUND {
             return Ok(None);
         }
-        let mut cursor = sec2_raw - CHUNK_HEADER_LEN;
-
-        let mut is_sound = false;
-        let mut sep_id = [0u8; 4];
-        let mut base_position = [0.0f32; 3];
-        let mut max_life_frames = 0.0f32;
-        let mut far = 0.0f32;
-        let mut near = 0.0f32;
-
-        while cursor + 4 <= body.len() {
-            let cfg = u32_le(body, cursor);
-            let opcode = (cfg & OPCODE_MASK) as u8;
-            let size_words = ((cfg >> 8) & u32::from(SIZE_WORDS_MASK)) as usize;
-            if opcode == OPCODE_END || size_words == 0 {
-                break;
-            }
-            let block_len = size_words * 4;
-            let payload = cursor + 4;
-            if cursor + block_len > body.len() {
-                break;
-            }
-            let mut decoded = true;
-            match opcode {
-                0x01 if payload + 32 <= body.len() => {
-                    sep_id = [
-                        body[payload + 8],
-                        body[payload + 9],
-                        body[payload + 10],
-                        body[payload + 11],
-                    ];
-                    base_position = [
-                        f32_le(body, payload + 16),
-                        f32_le(body, payload + 20),
-                        f32_le(body, payload + 24),
-                    ];
-                    is_sound = body[payload + 29] == LINKED_DATA_SOUND;
-                    max_life_frames = u16_le(body, payload + 30) as f32;
-                }
-                SOUND_SETUP_OPCODE if payload + 8 <= body.len() => {
-                    far = f32_le(body, payload);
-                    near = f32_le(body, payload + 4);
-                }
-                _ => decoded = false,
-            }
-            blocks.push((GeneratorSection::SoundSetup, opcode, decoded));
-            cursor += block_len;
-        }
-
-        if !is_sound {
-            return Ok(None);
-        }
-
         flush_blocks(sink, &blocks);
-        Ok(Some(Self {
-            sep_id,
-            base_position,
-            far,
-            near,
-            frames_per_emission: u16_le(body, 0x66) as f32 + 1.0,
-            emission_variance: u16_le(body, 0x64) as f32,
-            auto_run: flags & GEN_FLAG_AUTO_RUN != 0,
-            continuous: flags & GEN_FLAG_CONTINUOUS != 0,
-            max_life_frames,
-            attach_type: AttachType::from_flag(attach_flags & ATTACH_TYPE_MASK).unwrap_or_default(),
-        }))
+        Ok(Some(Self::from_sections(&sections)))
+    }
+
+    fn from_sections(s: &GeneratorSections) -> Self {
+        Self {
+            sep_id: s.mesh_id,
+            base_position: s.base_position,
+            far: s.sound_far,
+            near: s.sound_near,
+            frames_per_emission: s.frames_per_emission,
+            emission_variance: s.emission_variance,
+            auto_run: s.auto_run,
+            continuous: s.continuous,
+            max_life_frames: s.max_life_frames,
+            attach_type: s.attach_type,
+            tod_volume_track: s.tod_volume_track,
+            path_ref: s.sound_path_ref,
+        }
     }
 
     pub fn is_placed(&self) -> bool {
@@ -2026,6 +3006,89 @@ impl SoundGeneratorDef {
     pub fn is_singleton(&self) -> bool {
         self.continuous || self.max_life_frames == 0.0
     }
+}
+
+// research/xim ParticleGeneratorSettings.kt LinkedDataType — 0x22 is a screen-space distortion
+// (haze/smear) element, not a mesh particle. [`ParticleGeneratorDef::parse`] rejects the same chunks.
+pub const LINKED_DATA_DISTORTION: u8 = 0x22;
+
+/// A 0x05 Generator whose setup links a 0x22 `Distortion` — a screen-space haze/smear element
+/// rather than a particle. [`ParticleGeneratorDef::parse`] rejects the same chunks, so the two
+/// views never overlap (mirrors [`SoundGeneratorDef`]).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct DistortionGeneratorDef {
+    pub base_position: [f32; 3],
+
+    /// CYyGenerator.cpp Idle — re-emission period `frames_per_emission + uirand(emission_variance)`.
+    pub frames_per_emission: f32,
+    pub emission_variance: f32,
+
+    pub auto_run: bool,
+    pub continuous: bool,
+    pub max_life_frames: f32,
+
+    /// sec2 0x32 HazeOffsetInitializer horizontal offset — biases the smear direction.
+    pub haze_offset_x: f32,
+
+    /// sec2 0x2D KeyFrameValueSetup — the strength/alpha envelope over life (g142 binds k143:
+    /// 0 -> 0.48 hold -> 0.01). The screen-space pass scales its haze by this curve; a PS2
+    /// half-scale value like 0.502 is full strength.
+    pub envelope_track: Option<[u8; 4]>,
+
+    pub attach_type: AttachType,
+}
+
+impl DistortionGeneratorDef {
+    pub fn parse(body: &[u8]) -> Result<Option<Self>> {
+        Self::parse_reporting(body, &mut |_, _, _| {})
+    }
+
+    pub fn parse_reporting(body: &[u8], sink: GeneratorOpcodeSink<'_>) -> Result<Option<Self>> {
+        Self::parse_detailed(body, &mut |section, opcode, _size_words, _args, outcome| {
+            sink(section, opcode, outcome)
+        })
+    }
+
+    pub fn parse_detailed(body: &[u8], sink: GeneratorBlockSink<'_>) -> Result<Option<Self>> {
+        let Some((sections, blocks)) = parse_sections(body)? else {
+            return Ok(None);
+        };
+        if sections.kind_byte != LINKED_DATA_DISTORTION {
+            return Ok(None);
+        }
+        flush_blocks(sink, &blocks);
+        Ok(Some(Self::from_sections(&sections)))
+    }
+
+    fn from_sections(s: &GeneratorSections) -> Self {
+        Self {
+            base_position: s.base_position,
+            frames_per_emission: s.frames_per_emission,
+            emission_variance: s.emission_variance,
+            auto_run: s.auto_run,
+            continuous: s.continuous,
+            max_life_frames: s.max_life_frames,
+            haze_offset_x: s.haze_offset_x.unwrap_or(0.0),
+            envelope_track: s.alpha_track,
+            attach_type: s.attach_type,
+        }
+    }
+
+    pub fn is_placed(&self) -> bool {
+        self.base_position != [0.0, 0.0, 0.0]
+    }
+}
+
+/// PS2 colour convention for particle colour/alpha bytes: they are authored at half scale,
+/// 0x80 is full, not 0xFF. Raw bytes decode as `min(1, b / 128)`; keyframe chunks store the
+/// byte/255 float form of the same values (0.502 == full), so a stored value rescales as
+/// `min(1, v * 255 / 128)`. This is for consumers OUTSIDE the fixed-function stage chain —
+/// the rumble intensity envelope (k144's 0x80 byte must read as full) and the distortion
+/// strength track. Rendered particle colour/alpha goes through ffxi_particle.wgsl's stages,
+/// which do this doubling themselves, so those stay raw byte/255 end to end. Scale tracks are
+/// genuine floats and must NOT go through this.
+pub fn ps2_float_rescale(v: f32) -> f32 {
+    (v * 255.0 / 128.0).min(1.0)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2168,7 +3231,7 @@ pub(crate) mod test_support {
         day_of_week: &[[u8; 4]; DAYS_OF_WEEK],
         moon_phase: &[[u8; 4]; MOON_PHASES],
     ) -> Vec<u8> {
-        let sec2 = setup_with_link(LINKED_DATA_STATIC_MESH);
+        let sec2 = setup_with_link(LinkedDataKind::STATIC_MESH);
         let mut body = build(&sec2, 1, 1);
         body.extend_from_slice(&SEC2_TERMINATOR);
         let sec3_at = body.len();
@@ -2202,7 +3265,7 @@ mod tests {
 
     #[test]
     fn parses_particle_generator_header_and_setup() {
-        let mut setup = setup_with_link(LINKED_DATA_STATIC_MESH);
+        let mut setup = setup_with_link(LinkedDataKind::STATIC_MESH);
         // billboard XYZ
         setup[4] = 0x01;
         // mesh id at payload+8 (payload = cursor+4 = setup index 4)
@@ -2255,7 +3318,7 @@ mod tests {
     fn parses_section3_uv_scroll_and_accel() {
         // Minimal particle setup in section 2, terminated, then a section-3 stream at
         // body[0x78] with TextureCoordinateUpdater 0x27/0x28 and VelocityAccelerator 0x03.
-        let setup = setup_with_link(LINKED_DATA_STATIC_MESH);
+        let setup = setup_with_link(LinkedDataKind::STATIC_MESH);
         let mut body = build(&setup, 1, 1);
         body.extend_from_slice(&SEC2_TERMINATOR);
         let sec3_body_index = body.len();
@@ -2291,7 +3354,7 @@ mod tests {
             block[..4].copy_from_slice(&cfg.to_le_bytes());
             block
         };
-        let mut setup = setup_with_link(LINKED_DATA_STATIC_MESH);
+        let mut setup = setup_with_link(LinkedDataKind::STATIC_MESH);
         setup.extend(allocated(0x02, 1, &[0; 12]));
         setup.extend(allocated(0x0B, 2, &[0; 12]));
         setup.extend(allocated(SEC2_OPCODE_SCALE_VELOCITY, 3, &[0; 12]));
@@ -2339,7 +3402,7 @@ mod tests {
     // real DAT, which is what left the moon on hand-tuned fallback tints.
     #[test]
     fn celestial_updaters_come_from_section3_only() {
-        let setup = setup_with_link(LINKED_DATA_STATIC_MESH);
+        let setup = setup_with_link(LinkedDataKind::STATIC_MESH);
 
         let dow = |base: u8| {
             let mut p = vec![0u8; 4];
@@ -2388,7 +3451,7 @@ mod tests {
     // time-of-day RGBA curves; the section-3 ClockValueUpdater 0x3C..0x3F arms each channel.
     #[test]
     fn tod_color_tracks_pair_setup_with_updater() {
-        let mut sec2 = setup_with_link(LINKED_DATA_STATIC_MESH);
+        let mut sec2 = setup_with_link(LinkedDataKind::STATIC_MESH);
         for (opcode, id) in [(0x60u8, b"ksr1"), (0x61, b"ksg1"), (0x62, b"ksb1")] {
             let mut p = vec![0u8; 4];
             p.extend_from_slice(id);
@@ -2463,7 +3526,7 @@ mod tests {
 
     #[test]
     fn no_section3_leaves_defaults() {
-        let setup = setup_with_link(LINKED_DATA_STATIC_MESH);
+        let setup = setup_with_link(LinkedDataKind::STATIC_MESH);
         let body = build(&setup, 1, 1);
         let def = ParticleGeneratorDef::parse(&body).unwrap().unwrap();
         assert_eq!(def.uv_scroll, [0.0, 0.0]);
@@ -2472,7 +3535,7 @@ mod tests {
 
     #[test]
     fn gen_flags_decode_auto_run_and_continuous() {
-        let setup = setup_with_link(LINKED_DATA_STATIC_MESH);
+        let setup = setup_with_link(LinkedDataKind::STATIC_MESH);
         let body = build(&setup, 1, GEN_FLAG_AUTO_RUN | GEN_FLAG_CONTINUOUS | 1);
         let def = ParticleGeneratorDef::parse(&body).unwrap().unwrap();
         assert!(def.auto_run);
@@ -2495,7 +3558,7 @@ mod tests {
     // curtains: La Theine's `~1ra` authors 299 and an 8-bit read yields 43.
     #[test]
     fn particle_count_is_nine_bits_wide() {
-        let setup = setup_with_link(LINKED_DATA_STATIC_MESH);
+        let setup = setup_with_link(LinkedDataKind::STATIC_MESH);
         let def = ParticleGeneratorDef::parse(&build(&setup, 30, 0x2000_112B))
             .unwrap()
             .unwrap();
@@ -2516,11 +3579,11 @@ mod tests {
         assert!(ParticleGeneratorDef::parse(&body).unwrap().is_none());
     }
 
-    /// Poison's venom cloud pin: a `LINKED_DATA_SPRITE_SHEET` generator parses to Some with
-    /// `mesh_kind == SpriteSheet`, not just the `LINKED_DATA_STATIC_MESH` kind.
+    /// Poison's venom cloud pin: a `LinkedDataKind::SPRITE_SHEET` generator parses to Some with
+    /// `mesh_kind == SpriteSheet`, not just the `LinkedDataKind::STATIC_MESH` kind.
     #[test]
     fn sprite_sheet_setup_parses_with_mesh_kind() {
-        let mut setup = setup_with_link(LINKED_DATA_SPRITE_SHEET);
+        let mut setup = setup_with_link(LinkedDataKind::SPRITE_SHEET);
         setup[4 + 8..4 + 12].copy_from_slice(b"fir ");
         setup[4 + 30..4 + 32].copy_from_slice(&24u16.to_le_bytes());
         let body = build(&setup, 1, 1);
@@ -2536,7 +3599,7 @@ mod tests {
     // the blocks after it.
     #[test]
     fn sprite_sheet_initializer_consumes_the_block_without_state() {
-        let setup = setup_with_link(LINKED_DATA_SPRITE_SHEET);
+        let setup = setup_with_link(LinkedDataKind::SPRITE_SHEET);
         let mut sec2 = setup;
         sec2.extend(op(SEC2_OPCODE_SPRITE_SHEET_INIT, 2, &0u32.to_le_bytes()));
         let vel: [f32; 3] = [1.0, 2.0, 3.0];
@@ -2572,7 +3635,7 @@ mod tests {
     // advances the frame, so the arm only consumes the block.
     #[test]
     fn sprite_sheet_frame_updater_consumes_the_block_without_state() {
-        let setup = setup_with_link(LINKED_DATA_SPRITE_SHEET);
+        let setup = setup_with_link(LinkedDataKind::SPRITE_SHEET);
         let mut sec2 = setup.clone();
         sec2.extend(op(OPCODE_END, 0, &[]));
         let mut body = build(&sec2, 1, 1);
@@ -2606,7 +3669,7 @@ mod tests {
     // as for 0x0D.
     #[test]
     fn no_op_particle_updater_consumes_the_block_without_state() {
-        let setup = setup_with_link(LINKED_DATA_SPRITE_SHEET);
+        let setup = setup_with_link(LinkedDataKind::SPRITE_SHEET);
         let mut sec2 = setup.clone();
         sec2.extend(op(OPCODE_END, 0, &[]));
         let mut body = build(&sec2, 1, 1);
@@ -2638,7 +3701,7 @@ mod tests {
     // The flag is set only while the block is present, so a generator without it stays off.
     #[test]
     fn position_updater_flag_arms_only_with_the_block() {
-        let setup = setup_with_link(LINKED_DATA_SPRITE_SHEET);
+        let setup = setup_with_link(LinkedDataKind::SPRITE_SHEET);
         let mut sec2 = setup.clone();
         sec2.extend(op(OPCODE_END, 0, &[]));
         let mut body = build(&sec2, 1, 1);
@@ -2679,7 +3742,7 @@ mod tests {
     // nothing and only consumes.
     #[test]
     fn alpha_updater_consumes_the_block_without_state() {
-        let setup = setup_with_link(LINKED_DATA_SPRITE_SHEET);
+        let setup = setup_with_link(LinkedDataKind::SPRITE_SHEET);
         let mut sec2 = setup.clone();
         sec2.extend(op(OPCODE_END, 0, &[]));
         let mut body = build(&sec2, 1, 1);
@@ -2711,7 +3774,7 @@ mod tests {
     // sprite-sheet initializer and the end of section 2.
     #[test]
     fn foot_mark_setup_sets_the_flag_without_payload() {
-        let setup = setup_with_link(LINKED_DATA_SPRITE_SHEET);
+        let setup = setup_with_link(LinkedDataKind::SPRITE_SHEET);
         let mut sec2 = setup;
         sec2.extend(op(SEC2_OPCODE_FOOT_MARK, 1, &[]));
         let vel: [f32; 3] = [1.0, 2.0, 3.0];
@@ -2747,7 +3810,7 @@ mod tests {
     // OscillationSetup), ahead of its 0x3E/0x40 acceleration setup in the section-2 stream.
     #[test]
     fn oscillation_setup_sets_the_flag_without_payload() {
-        let setup = setup_with_link(LINKED_DATA_SPRITE_SHEET);
+        let setup = setup_with_link(LinkedDataKind::SPRITE_SHEET);
         let mut sec2 = setup.clone();
         sec2.extend(op(SEC2_OPCODE_OSCILLATION_SETUP, 1, &[]));
         let vel: [f32; 3] = [1.0, 2.0, 3.0];
@@ -2787,7 +3850,7 @@ mod tests {
     // (research/xim ParticleInitializers.kt OscillationAccelerationSetup), behind a 0x3D marker.
     #[test]
     fn oscillation_accel_z_reads_the_two_floats() {
-        let setup = setup_with_link(LINKED_DATA_STATIC_MESH);
+        let setup = setup_with_link(LinkedDataKind::STATIC_MESH);
         let mut sec2 = setup.clone();
         sec2.extend(op(SEC2_OPCODE_OSCILLATION_SETUP, 1, &[]));
         let mut p = Vec::new();
@@ -2809,7 +3872,7 @@ mod tests {
     // ParticleInitializers.kt OscillationAccelerationSetup), behind a 0x3D marker.
     #[test]
     fn oscillation_accel_x_reads_the_two_floats() {
-        let setup = setup_with_link(LINKED_DATA_STATIC_MESH);
+        let setup = setup_with_link(LinkedDataKind::STATIC_MESH);
         let mut sec2 = setup.clone();
         sec2.extend(op(SEC2_OPCODE_OSCILLATION_SETUP, 1, &[]));
         let mut p = Vec::new();
@@ -2831,7 +3894,7 @@ mod tests {
     // ParticleInitializers.kt OscillationAccelerationSetup), behind a 0x3D marker.
     #[test]
     fn oscillation_accel_y_reads_the_two_floats() {
-        let setup = setup_with_link(LINKED_DATA_STATIC_MESH);
+        let setup = setup_with_link(LinkedDataKind::STATIC_MESH);
         let mut sec2 = setup.clone();
         sec2.extend(op(SEC2_OPCODE_OSCILLATION_SETUP, 1, &[]));
         let mut p = Vec::new();
@@ -2855,7 +3918,7 @@ mod tests {
     // 0x3E acceleration, behind the 0x3D marker.
     #[test]
     fn oscillation_applier_x_reads_the_three_floats() {
-        let setup = setup_with_link(LINKED_DATA_STATIC_MESH);
+        let setup = setup_with_link(LinkedDataKind::STATIC_MESH);
         let mut p = Vec::new();
         p.extend_from_slice(&0.44f32.to_le_bytes());
         p.extend_from_slice(&0.6f32.to_le_bytes());
@@ -2889,7 +3952,7 @@ mod tests {
     // behind the 0x3D marker.
     #[test]
     fn oscillation_applier_z_reads_the_three_floats() {
-        let setup = setup_with_link(LINKED_DATA_STATIC_MESH);
+        let setup = setup_with_link(LinkedDataKind::STATIC_MESH);
         let mut p = Vec::new();
         p.extend_from_slice(&0.9f32.to_le_bytes());
         p.extend_from_slice(&0.5f32.to_le_bytes());
@@ -2923,7 +3986,7 @@ mod tests {
     // behind the 0x3D marker.
     #[test]
     fn oscillation_applier_y_reads_the_three_floats() {
-        let setup = setup_with_link(LINKED_DATA_STATIC_MESH);
+        let setup = setup_with_link(LinkedDataKind::STATIC_MESH);
         let mut p = Vec::new();
         p.extend_from_slice(&0.44f32.to_le_bytes());
         p.extend_from_slice(&0.6f32.to_le_bytes());
@@ -2957,7 +4020,7 @@ mod tests {
     // VelocityVarianceSetup), after its generator's 0x02.
     #[test]
     fn velocity_variance_reads_the_three_axis_bounds() {
-        let setup = setup_with_link(LINKED_DATA_STATIC_MESH);
+        let setup = setup_with_link(LinkedDataKind::STATIC_MESH);
         let mut sec2 = setup.clone();
         let axis = |values: [f32; 3], block: &mut Vec<u8>, opcode: u8| {
             let mut bytes = Vec::new();
@@ -2986,7 +4049,7 @@ mod tests {
     // RelativeVelocitySetup), after its generator's 0x02 base-velocity block.
     #[test]
     fn relative_velocity_reads_the_single_float() {
-        let setup = setup_with_link(LINKED_DATA_STATIC_MESH);
+        let setup = setup_with_link(LinkedDataKind::STATIC_MESH);
         let mut sec2 = setup.clone();
         let mut base: Vec<u8> = Vec::new();
         for f in [0.5f32, -0.25, 0.0] {
@@ -3009,7 +4072,7 @@ mod tests {
     // (research/xim ParticleInitializers.kt RelativeVelocityVarianceSetup).
     #[test]
     fn relative_velocity_variance_reads_the_single_float() {
-        let setup = setup_with_link(LINKED_DATA_STATIC_MESH);
+        let setup = setup_with_link(LinkedDataKind::STATIC_MESH);
         let mut sec2 = setup.clone();
         sec2.extend(op(0x41, 2, &0.2f32.to_le_bytes()));
         sec2.extend(op(OPCODE_END, 0, &[]));
@@ -3027,7 +4090,7 @@ mod tests {
     // (research/xim ParticleInitializers.kt ReverseDisplacementSetup).
     #[test]
     fn reverse_displacement_reads_the_single_float() {
-        let setup = setup_with_link(LINKED_DATA_STATIC_MESH);
+        let setup = setup_with_link(LinkedDataKind::STATIC_MESH);
         let mut sec2 = setup.clone();
         sec2.extend(op(0x67, 2, &0.0f32.to_le_bytes()));
         sec2.extend(op(OPCODE_END, 0, &[]));
@@ -3045,7 +4108,7 @@ mod tests {
     // (CYyGenerator.cpp CYyGenerator::ElemGenerate case 0x29).
     #[test]
     fn scale_z_track_reads_the_keyframe_id() {
-        let setup = setup_with_link(LINKED_DATA_STATIC_MESH);
+        let setup = setup_with_link(LinkedDataKind::STATIC_MESH);
         let mut sec2 = setup.clone();
         sec2.extend(op(0x29, 4, &[0, 0, 0, 0, b'k', b'1', b'z', b'0']));
         sec2.extend(op(OPCODE_END, 0, &[]));
@@ -3064,7 +4127,7 @@ mod tests {
     // a 0x55 SpecularParams record in the same generator.
     #[test]
     fn specular_rot_y_track_reads_the_keyframe_id() {
-        let setup = setup_with_link(LINKED_DATA_STATIC_MESH);
+        let setup = setup_with_link(LinkedDataKind::STATIC_MESH);
         let mut sec2 = setup.clone();
         sec2.extend(op(0x5A, 4, &[0, 0, 0, 0, b'n', b'0', b'r', b'y']));
         sec2.extend(op(OPCODE_END, 0, &[]));
@@ -3081,8 +4144,8 @@ mod tests {
     // u32] (research/xim ParticleInitializers.kt CameraShakeSetup); the generator also
     // carries the section-3 0x5F CameraShakeUpdater.
     #[test]
-    fn camera_shake_setup_reads_the_keyframe_id() {
-        let setup = setup_with_link(LINKED_DATA_STATIC_MESH);
+    fn rumble_setup_reads_the_keyframe_id() {
+        let setup = setup_with_link(LinkedDataKind::STATIC_MESH);
         let mut sec2 = setup.clone();
         let mut payload = [0u8; 20];
         payload[4..8].copy_from_slice(b"shak");
@@ -3090,19 +4153,19 @@ mod tests {
         sec2.extend(op(OPCODE_END, 0, &[]));
         let body = build(&sec2, 1, 1);
         let def = ParticleGeneratorDef::parse(&body).unwrap().unwrap();
-        assert_eq!(def.camera_shake_track, Some(*b"shak"));
+        assert_eq!(def.rumble_track, Some(*b"shak"));
         let plain = ParticleGeneratorDef::parse(&build(&setup, 1, 1))
             .unwrap()
             .unwrap();
-        assert_eq!(plain.camera_shake_track, None);
+        assert_eq!(plain.rumble_track, None);
     }
 
     // sec3 0x5F CameraShakeUpdater: near, far, and shakeFactor only in the 4-word form
     // (research/xim ParticleUpdaters.kt CameraShakeUpdater — the opCodeSize == 4 branch,
     // behind a sec2 0x82).
     #[test]
-    fn camera_shake_updater_reads_the_payload_shape() {
-        let setup = setup_with_link(LINKED_DATA_STATIC_MESH);
+    fn rumble_updater_reads_the_payload_shape() {
+        let setup = setup_with_link(LinkedDataKind::STATIC_MESH);
         let vec3 = |x: f32, y: f32, z: f32| -> [u8; 12] {
             let mut p = [0u8; 12];
             p[0..4].copy_from_slice(&x.to_le_bytes());
@@ -3117,7 +4180,7 @@ mod tests {
         body[0x78..0x7C].copy_from_slice(&((sec3_body_index + 0x10) as u32).to_le_bytes());
         body.extend_from_slice(&op(0x5F, 4, &vec3(2.0, 8.0, 0.001)));
         let def = ParticleGeneratorDef::parse(&body).unwrap().unwrap();
-        assert_eq!(def.camera_shake, Some([2.0, 8.0, 0.001]));
+        assert_eq!(def.rumble_falloff, Some([2.0, 8.0, 0.001]));
 
         let mut payload = [0u8; 8];
         payload[0..4].copy_from_slice(&2.0f32.to_le_bytes());
@@ -3128,12 +4191,98 @@ mod tests {
         body[0x78..0x7C].copy_from_slice(&((sec3_body_index + 0x10) as u32).to_le_bytes());
         body.extend_from_slice(&op(0x5F, 3, &payload));
         let def = ParticleGeneratorDef::parse(&body).unwrap().unwrap();
-        assert_eq!(def.camera_shake, Some([2.0, 8.0, 0.0]));
+        assert_eq!(def.rumble_falloff, Some([2.0, 8.0, 0.0]));
 
         let plain = ParticleGeneratorDef::parse(&build(&setup, 1, 1))
             .unwrap()
             .unwrap();
-        assert_eq!(plain.camera_shake, None);
+        assert_eq!(plain.rumble_falloff, None);
+    }
+
+    // sec3 0x2E DrawDistanceUpdater: [near, far, kill-flag u32] — the shipped weather value
+    // set is near 10 / far 20 (research/xim ParticleUpdaters.kt DrawDistanceUpdater;
+    // research/XIClient/src/XIClient/source/World/Generator/CYyGenerator.cpp CYyGenerator::ElemIdle
+    // case 0x2E).
+    #[test]
+    fn draw_distance_updater_reads_near_and_far() {
+        let setup = setup_with_link(LinkedDataKind::STATIC_MESH);
+        let mut body = build(&setup, 1, 1);
+        body.extend_from_slice(&SEC2_TERMINATOR);
+        let sec3_body_index = body.len();
+        body[0x78..0x7C].copy_from_slice(&((sec3_body_index + 0x10) as u32).to_le_bytes());
+        let mut payload = [0u8; 12];
+        payload[0..4].copy_from_slice(&10.0f32.to_le_bytes());
+        payload[4..8].copy_from_slice(&20.0f32.to_le_bytes());
+        body.extend_from_slice(&op(0x2E, 4, &payload));
+        let def = ParticleGeneratorDef::parse(&body).unwrap().unwrap();
+        assert_eq!(def.draw_distance_near, Some(10.0));
+        assert_eq!(def.draw_distance_far, Some(20.0));
+
+        let plain = ParticleGeneratorDef::parse(&build(&setup, 1, 1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(plain.draw_distance_near, None);
+        assert_eq!(plain.draw_distance_far, None);
+    }
+
+    // sec2 0x21/0x22/0x23 KeyFrameValueSetup (position.x/y/z) + the section-3 ProgressValueUpdater
+    // 0x0F..0x11 — the shipped sakura sway track is 'gjpx' on position.x.
+    #[test]
+    fn position_tracks_read_the_keyframe_ids() {
+        let setup = setup_with_link(LinkedDataKind::STATIC_MESH);
+        let mut sec2 = setup.clone();
+        for (opcode, id) in [(0x21u8, b"gjpx"), (0x22, b"gjpy"), (0x23, b"gjpz")] {
+            let mut payload = [0u8; 12];
+            payload[4..8].copy_from_slice(id);
+            sec2.extend(op(opcode, 4, &payload));
+        }
+        sec2.extend(op(OPCODE_END, 0, &[]));
+        let mut body = build(&sec2, 1, 1);
+        body.extend_from_slice(&SEC2_TERMINATOR);
+        let sec3_body_index = body.len();
+        body[0x78..0x7C].copy_from_slice(&((sec3_body_index + 0x10) as u32).to_le_bytes());
+        for opcode in [0x0Fu8, 0x10, 0x11] {
+            body.extend_from_slice(&op(opcode, 1, &[]));
+        }
+        let def = ParticleGeneratorDef::parse(&body).unwrap().unwrap();
+        assert_eq!(def.position_x_track, Some(*b"gjpx"));
+        assert_eq!(def.position_y_track, Some(*b"gjpy"));
+        assert_eq!(def.position_z_track, Some(*b"gjpz"));
+
+        let plain = ParticleGeneratorDef::parse(&build(&setup, 1, 1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(plain.position_x_track, None);
+        assert_eq!(plain.position_y_track, None);
+        assert_eq!(plain.position_z_track, None);
+    }
+
+    // sec2 0x68 KeyFrameValueSetup ("ToD Volume") + the section-3 ClockValueUpdater 0x43 —
+    // the shipped river sound authors 'kota'.
+    #[test]
+    fn tod_volume_track_reads_the_keyframe_id() {
+        let mut setup = setup_with_link(LINKED_DATA_SOUND);
+        setup[4 + 8..4 + 12].copy_from_slice(b"5008");
+        let mut payload = [0u8; 12];
+        payload[4..8].copy_from_slice(b"kota");
+        setup.extend(op(SEC2_OPCODE_TOD_VOLUME_TRACK, 4, &payload));
+
+        let body = build(&setup, 30, GEN_FLAG_AUTO_RUN);
+        let def = SoundGeneratorDef::parse(&body).unwrap().unwrap();
+        assert_eq!(def.tod_volume_track, Some(*b"kota"));
+        assert!(
+            ParticleGeneratorDef::parse(&body).unwrap().is_none(),
+            "a sound generator must never reach the particle sim"
+        );
+
+        let plain = SoundGeneratorDef::parse(&build(
+            &setup_with_link(LINKED_DATA_SOUND),
+            30,
+            GEN_FLAG_AUTO_RUN,
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(plain.tod_volume_track, None);
     }
 
     // 0x32 HazeOffsetInitializer: [unused f32, horizontal offset] — xim applies only the
@@ -3141,7 +4290,7 @@ mod tests {
     // HazeOffsetInitializer).
     #[test]
     fn haze_offset_reads_the_second_float() {
-        let setup = setup_with_link(LINKED_DATA_STATIC_MESH);
+        let setup = setup_with_link(LinkedDataKind::STATIC_MESH);
         let mut sec2 = setup.clone();
         let mut payload = [0u8; 8];
         payload[0..4].copy_from_slice(&0.5f32.to_le_bytes());
@@ -3161,7 +4310,7 @@ mod tests {
     // ParticleInitializers.kt ParentRotateConfig).
     #[test]
     fn parent_rotate_is_a_no_payload_marker() {
-        let setup = setup_with_link(LINKED_DATA_STATIC_MESH);
+        let setup = setup_with_link(LinkedDataKind::STATIC_MESH);
         let mut sec2 = setup.clone();
         sec2.extend(op(0x47, 1, &[]));
         sec2.extend(op(OPCODE_END, 0, &[]));
@@ -3178,7 +4327,7 @@ mod tests {
     // class (research/xim ParticleGeneratorParser.kt sec2Handler).
     #[test]
     fn parent_rotate_twin_is_a_no_payload_marker() {
-        let setup = setup_with_link(LINKED_DATA_STATIC_MESH);
+        let setup = setup_with_link(LinkedDataKind::STATIC_MESH);
         let mut sec2 = setup.clone();
         sec2.extend(op(0x79, 1, &[]));
         sec2.extend(op(OPCODE_END, 0, &[]));
@@ -3196,7 +4345,7 @@ mod tests {
     // BatchingSetup).
     #[test]
     fn batching_setup_is_a_single_word_marker() {
-        let setup = setup_with_link(LINKED_DATA_STATIC_MESH);
+        let setup = setup_with_link(LinkedDataKind::STATIC_MESH);
         let mut sec2 = setup.clone();
         sec2.extend(op(0x56, 2, &[0, 0, 0, 0]));
         sec2.extend(op(OPCODE_END, 0, &[]));
@@ -3213,7 +4362,7 @@ mod tests {
     // ParticleInitializers.kt ParentTexCoordConfig).
     #[test]
     fn parent_tex_coord_is_a_no_payload_marker() {
-        let setup = setup_with_link(LINKED_DATA_STATIC_MESH);
+        let setup = setup_with_link(LinkedDataKind::STATIC_MESH);
         let mut sec2 = setup.clone();
         sec2.extend(op(0x4A, 1, &[]));
         sec2.extend(op(OPCODE_END, 0, &[]));
@@ -3230,7 +4379,7 @@ mod tests {
     // point list DAT id] (research/xim ParticleInitializers.kt PointListPositionSetup).
     #[test]
     fn point_list_position_reads_the_two_dat_ids() {
-        let setup = setup_with_link(LINKED_DATA_STATIC_MESH);
+        let setup = setup_with_link(LinkedDataKind::STATIC_MESH);
         let mut sec2 = setup.clone();
         let mut payload = Vec::new();
         payload.extend_from_slice(&0u32.to_le_bytes());
@@ -3256,7 +4405,7 @@ mod tests {
     // ParticleGeneratorParser.kt sec2Handler).
     #[test]
     fn velocity_y_track_reads_the_keyframe_id() {
-        let setup = setup_with_link(LINKED_DATA_STATIC_MESH);
+        let setup = setup_with_link(LinkedDataKind::STATIC_MESH);
         let mut sec2 = setup.clone();
         sec2.extend(op(
             0x51,
@@ -3277,7 +4426,7 @@ mod tests {
     // ParticleGeneratorParser.kt sec2Handler).
     #[test]
     fn specular_rot_x_track_reads_the_keyframe_id() {
-        let setup = setup_with_link(LINKED_DATA_STATIC_MESH);
+        let setup = setup_with_link(LinkedDataKind::STATIC_MESH);
         let mut sec2 = setup.clone();
         sec2.extend(op(
             0x59,
@@ -3298,7 +4447,7 @@ mod tests {
     // (research/xim ParticleGeneratorParser.kt sec2Handler).
     #[test]
     fn specular_color_g_track_reads_the_keyframe_id() {
-        let setup = setup_with_link(LINKED_DATA_STATIC_MESH);
+        let setup = setup_with_link(LinkedDataKind::STATIC_MESH);
         let mut sec2 = setup.clone();
         sec2.extend(op(
             0x5D,
@@ -3319,7 +4468,7 @@ mod tests {
     // ParticleInitializers.kt ParentColorConfig).
     #[test]
     fn parent_color_is_a_no_payload_marker() {
-        let setup = setup_with_link(LINKED_DATA_STATIC_MESH);
+        let setup = setup_with_link(LinkedDataKind::STATIC_MESH);
         let mut sec2 = setup.clone();
         sec2.extend(op(0x48, 1, &[]));
         sec2.extend(op(OPCODE_END, 0, &[]));
@@ -3336,7 +4485,7 @@ mod tests {
     // ParticleInitializers.kt ParentScaleConfig).
     #[test]
     fn parent_scale_is_a_no_payload_marker() {
-        let setup = setup_with_link(LINKED_DATA_STATIC_MESH);
+        let setup = setup_with_link(LinkedDataKind::STATIC_MESH);
         let mut sec2 = setup.clone();
         sec2.extend(op(0x49, 1, &[]));
         sec2.extend(op(OPCODE_END, 0, &[]));
@@ -3353,7 +4502,7 @@ mod tests {
     // the element's velocity dampener (research/xim ParticleGeneratorParser.kt sec2Handler).
     #[test]
     fn velocity_dampener_track_reads_the_keyframe_id() {
-        let setup = setup_with_link(LINKED_DATA_STATIC_MESH);
+        let setup = setup_with_link(LinkedDataKind::STATIC_MESH);
         let mut sec2 = setup.clone();
         sec2.extend(op(0x69, 4, &[0, 0, 0, 0, b'v', b'd', b'm', b'0']));
         sec2.extend(op(OPCODE_END, 0, &[]));
@@ -3370,7 +4519,7 @@ mod tests {
     // ParticleUpdaters.kt VelocityDampener).
     #[test]
     fn velocity_dampener_reads_the_two_floats() {
-        let setup = setup_with_link(LINKED_DATA_STATIC_MESH);
+        let setup = setup_with_link(LinkedDataKind::STATIC_MESH);
         let mut payload = [0u8; 8];
         payload[0..4].copy_from_slice(&0.9f32.to_le_bytes());
         payload[4..8].copy_from_slice(&0.25f32.to_le_bytes());
@@ -3391,7 +4540,7 @@ mod tests {
     // ParticleUpdaters.kt VelocityRotator).
     #[test]
     fn velocity_rotator_reads_the_three_floats() {
-        let setup = setup_with_link(LINKED_DATA_STATIC_MESH);
+        let setup = setup_with_link(LinkedDataKind::STATIC_MESH);
         let mut payload = [0u8; 12];
         payload[0..4].copy_from_slice(&0.1f32.to_le_bytes());
         payload[4..8].copy_from_slice(&(-0.2f32).to_le_bytes());
@@ -3409,11 +4558,12 @@ mod tests {
         assert_eq!(plain.velocity_rotator, None);
     }
 
-    // sec3 0x44 dampening-factor ProgressValueUpdater: no payload, it samples the sec2 0x69
-    // track (research/xim ParticleGeneratorParser.kt sec3Handler 0x44), behind a sec2 0x69.
+    // sec3 0x44 dampening-factor ProgressValueUpdater: no payload — arms the per-frame
+    // sampling of the sec2 0x69 track (research/xim ParticleGeneratorParser.kt
+    // sec3Handler 0x44), behind a sec2 0x69.
     #[test]
-    fn dampening_factor_updater_consumes_the_block_without_state() {
-        let setup = setup_with_link(LINKED_DATA_STATIC_MESH);
+    fn dampening_factor_updater_arms_the_track_sampling() {
+        let setup = setup_with_link(LinkedDataKind::STATIC_MESH);
         let mut sec2 = setup.clone();
         sec2.extend(op(OPCODE_END, 0, &[]));
         let mut body = build(&sec2, 1, 1);
@@ -3430,6 +4580,11 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(def.velocity_dampener, None);
+        assert!(def.dampening_factor_applier, "sec3 0x44 arms the applier");
+        let plain = ParticleGeneratorDef::parse(&build(&setup, 1, 1))
+            .unwrap()
+            .unwrap();
+        assert!(!plain.dampening_factor_applier);
         assert!(
             outcomes.iter().any(|(s, op, o)| {
                 *s == GeneratorSection::Updaters
@@ -3440,13 +4595,32 @@ mod tests {
         );
     }
 
+    // sec2 0x31 RandomVelocitySetup: one float bound (research/xim
+    // ParticleInitializers.kt RandomVelocitySetup).
+    #[test]
+    fn random_velocity_reads_the_bound() {
+        let setup = setup_with_link(LinkedDataKind::STATIC_MESH);
+        let mut sec2 = setup.clone();
+        let payload = 1.5f32.to_le_bytes();
+        sec2.extend(op(SEC2_OPCODE_RANDOM_VELOCITY, 2, &payload));
+        sec2.extend(op(OPCODE_END, 0, &[]));
+        let def = ParticleGeneratorDef::parse(&build(&sec2, 1, 1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(def.random_velocity, Some(1.5));
+        let plain = ParticleGeneratorDef::parse(&build(&setup, 1, 1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(plain.random_velocity, None);
+    }
+
     // sec3 0x15/0x16/0x17 scale.x/y/z ProgressValueUpdaters: no payload — they sample the
     // sec2 0x27/0x28/0x29 scale tracks at life progress, which the render path already does
     // from def.scale_x_track/scale_y_track (research/xim ParticleGeneratorParser.kt
     // sec3Handler), behind their sec2 scale track.
     #[test]
     fn scale_progress_updaters_consume_the_blocks_without_state() {
-        let setup = setup_with_link(LINKED_DATA_STATIC_MESH);
+        let setup = setup_with_link(LinkedDataKind::STATIC_MESH);
         let mut sec2 = setup.clone();
         sec2.extend(op(OPCODE_END, 0, &[]));
         let mut body = build(&sec2, 1, 1);
@@ -3482,7 +4656,7 @@ mod tests {
     // track.
     #[test]
     fn color_rgb_progress_updaters_consume_the_blocks_without_state() {
-        let setup = setup_with_link(LINKED_DATA_STATIC_MESH);
+        let setup = setup_with_link(LinkedDataKind::STATIC_MESH);
         let mut sec2 = setup.clone();
         sec2.extend(op(OPCODE_END, 0, &[]));
         let mut body = build(&sec2, 1, 1);
@@ -3518,7 +4692,7 @@ mod tests {
     // behind their sec2 specular track.
     #[test]
     fn specular_progress_updaters_consume_the_blocks_without_state() {
-        let setup = setup_with_link(LINKED_DATA_STATIC_MESH);
+        let setup = setup_with_link(LinkedDataKind::STATIC_MESH);
         let mut sec2 = setup.clone();
         sec2.extend(op(OPCODE_END, 0, &[]));
         let mut body = build(&sec2, 1, 1);
@@ -3548,12 +4722,12 @@ mod tests {
         }
     }
 
-    // sec3 0x0B ColorTransformApplier: no payload — color += (transform shr 7) × (0.5 × dt)
-    // per frame; the engine does not model the color transform's application (research/xim
-    // ParticleUpdaters.kt ColorTransformApplier).
+    // sec3 0x0B ColorTransformApplier: no payload — arms the per-frame application of the
+    // transform to the element's colour (particle_sim.rs; research/xim ParticleUpdaters.kt
+    // ColorTransformApplier).
     #[test]
-    fn color_transform_applier_consumes_the_block_without_state() {
-        let setup = setup_with_link(LINKED_DATA_STATIC_MESH);
+    fn color_transform_applier_arms_the_application() {
+        let setup = setup_with_link(LinkedDataKind::STATIC_MESH);
         let mut sec2 = setup.clone();
         sec2.extend(op(OPCODE_END, 0, &[]));
         let mut body = build(&sec2, 1, 1);
@@ -3564,11 +4738,16 @@ mod tests {
         body.extend_from_slice(&op(OPCODE_END, 0, &[]));
 
         let mut outcomes: Vec<(GeneratorSection, u8, GeneratorOpcodeOutcome)> = Vec::new();
-        ParticleGeneratorDef::parse_reporting(&body, &mut |s, op, o| {
+        let def = ParticleGeneratorDef::parse_reporting(&body, &mut |s, op, o| {
             outcomes.push((s, op, o));
         })
         .unwrap()
         .unwrap();
+        assert!(def.color_transform_applier, "sec3 0x0B arms the applier");
+        let plain = ParticleGeneratorDef::parse(&build(&setup, 1, 1))
+            .unwrap()
+            .unwrap();
+        assert!(!plain.color_transform_applier);
         assert!(
             outcomes.iter().any(|(s, o, outcome)| {
                 *s == GeneratorSection::Updaters
@@ -3579,13 +4758,35 @@ mod tests {
         );
     }
 
+    // sec2 0x1A ColorTransformVariance: four signed i16s (research/xim ParticleInitializers.kt
+    // ColorTransformVariance).
+    #[test]
+    fn color_transform_variance_reads_the_four_i16s() {
+        let setup = setup_with_link(LinkedDataKind::STATIC_MESH);
+        let mut sec2 = setup.clone();
+        let mut payload = [0u8; 8];
+        payload[0..2].copy_from_slice(&(-48i16).to_le_bytes());
+        payload[2..4].copy_from_slice(&(-48i16).to_le_bytes());
+        payload[4..6].copy_from_slice(&(32i16).to_le_bytes());
+        sec2.extend(op(SEC2_OPCODE_COLOR_TRANSFORM_VARIANCE, 3, &payload));
+        sec2.extend(op(OPCODE_END, 0, &[]));
+        let def = ParticleGeneratorDef::parse(&build(&sec2, 1, 1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(def.color_transform_variance, Some([-48, -48, 32, 0]));
+        let plain = ParticleGeneratorDef::parse(&build(&setup, 1, 1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(plain.color_transform_variance, None);
+    }
+
     // sec3 0x25/0x33 ChildGeneratorBasicUpdater / ChildGeneratorUpdater: no payload — they
     // emit/update the sec2 0x44/0x53 child generator per particle; the engine has no
     // child-particle path (research/xim ParticleGeneratorParser.kt sec3Handler), behind
     // their sec2 child link.
     #[test]
     fn child_generator_updaters_consume_the_blocks_without_state() {
-        let setup = setup_with_link(LINKED_DATA_STATIC_MESH);
+        let setup = setup_with_link(LinkedDataKind::STATIC_MESH);
         let mut sec2 = setup.clone();
         sec2.extend(op(OPCODE_END, 0, &[]));
         let mut body = build(&sec2, 1, 1);
@@ -3614,12 +4815,12 @@ mod tests {
         }
     }
 
-    // sec3 0x2F VelocityRotationUpdater: no payload — converts all velocity into the +x
-    // axis and copies the particle's rotation into the velocity rotation; the engine has
-    // no velocityRotation (research/xim ParticleUpdaters.kt VelocityRotationUpdater).
+    // sec3 0x2F VelocityRotationUpdater: no payload — arms the per-frame collapse of all
+    // velocity into +x and the copy of the particle's rotation into the velocity rotation
+    // (particle_sim.rs; research/xim ParticleUpdaters.kt VelocityRotationUpdater).
     #[test]
-    fn velocity_rotation_updater_consumes_the_block_without_state() {
-        let setup = setup_with_link(LINKED_DATA_STATIC_MESH);
+    fn velocity_rotation_updater_arms_the_collapse() {
+        let setup = setup_with_link(LinkedDataKind::STATIC_MESH);
         let mut sec2 = setup.clone();
         sec2.extend(op(OPCODE_END, 0, &[]));
         let mut body = build(&sec2, 1, 1);
@@ -3630,11 +4831,16 @@ mod tests {
         body.extend_from_slice(&op(OPCODE_END, 0, &[]));
 
         let mut outcomes: Vec<(GeneratorSection, u8, GeneratorOpcodeOutcome)> = Vec::new();
-        ParticleGeneratorDef::parse_reporting(&body, &mut |s, op, o| {
+        let def = ParticleGeneratorDef::parse_reporting(&body, &mut |s, op, o| {
             outcomes.push((s, op, o));
         })
         .unwrap()
         .unwrap();
+        assert!(def.velocity_rotation_updater, "sec3 0x2F arms the updater");
+        let plain = ParticleGeneratorDef::parse(&build(&setup, 1, 1))
+            .unwrap()
+            .unwrap();
+        assert!(!plain.velocity_rotation_updater);
         assert!(
             outcomes.iter().any(|(s, o, outcome)| {
                 *s == GeneratorSection::Updaters
@@ -3651,7 +4857,7 @@ mod tests {
     // PointListPositionUpdater), paired with the sec2 0x54 setup.
     #[test]
     fn point_list_position_updater_consumes_the_block_without_state() {
-        let setup = setup_with_link(LINKED_DATA_STATIC_MESH);
+        let setup = setup_with_link(LinkedDataKind::STATIC_MESH);
         let mut sec2 = setup.clone();
         sec2.extend(op(OPCODE_END, 0, &[]));
         let mut body = build(&sec2, 1, 1);
@@ -3681,7 +4887,7 @@ mod tests {
     // (0, 1)] (research/xim ParticleInitializers.kt FixedPointPositionVarianceSetup).
     #[test]
     fn fixed_point_position_variance_reads_the_point_list_id() {
-        let setup = setup_with_link(LINKED_DATA_STATIC_MESH);
+        let setup = setup_with_link(LinkedDataKind::STATIC_MESH);
         let mut sec2 = setup.clone();
         let mut payload = [0u8; 12];
         payload[4..8].copy_from_slice(b"pts0");
@@ -3701,7 +4907,7 @@ mod tests {
     // the same class (research/xim ParticleGeneratorParser.kt sec2Handler).
     #[test]
     fn fixed_point_position_variance_twin_reads_the_point_list_id() {
-        let setup = setup_with_link(LINKED_DATA_STATIC_MESH);
+        let setup = setup_with_link(LinkedDataKind::STATIC_MESH);
         let mut sec2 = setup.clone();
         let mut payload = [0u8; 12];
         payload[4..8].copy_from_slice(b"pts1");
@@ -3722,7 +4928,7 @@ mod tests {
     // (research/xim ParticleGeneratorParser.kt sec2Handler).
     #[test]
     fn child_generator_twin_reads_the_child_id() {
-        let setup = setup_with_link(LINKED_DATA_STATIC_MESH);
+        let setup = setup_with_link(LinkedDataKind::STATIC_MESH);
         let mut sec2 = setup.clone();
         sec2.extend(op(0x53, 3, &[0, 0, 0, 0, b'k', b'i', b'd', b'2']));
         sec2.extend(op(OPCODE_END, 0, &[]));
@@ -3740,7 +4946,7 @@ mod tests {
     // element's rotation z (research/xim ParticleGeneratorParser.kt).
     #[test]
     fn specular_rot_z_track_reads_the_keyframe_id() {
-        let setup = setup_with_link(LINKED_DATA_STATIC_MESH);
+        let setup = setup_with_link(LinkedDataKind::STATIC_MESH);
         let mut sec2 = setup.clone();
         sec2.extend(op(0x5B, 4, &[0, 0, 0, 0, b'n', b'0', b'r', b'z']));
         sec2.extend(op(OPCODE_END, 0, &[]));
@@ -3757,7 +4963,7 @@ mod tests {
     // element's color alpha (research/xim ParticleGeneratorParser.kt).
     #[test]
     fn specular_color_a_track_reads_the_keyframe_id() {
-        let setup = setup_with_link(LINKED_DATA_STATIC_MESH);
+        let setup = setup_with_link(LinkedDataKind::STATIC_MESH);
         let mut sec2 = setup.clone();
         sec2.extend(op(0x5F, 4, &[0, 0, 0, 0, b's', b'p', b'a', b'0']));
         sec2.extend(op(OPCODE_END, 0, &[]));
@@ -3775,7 +4981,7 @@ mod tests {
     // a child by a sec2 0x44 link.
     #[test]
     fn parent_position_copy_is_a_no_payload_marker() {
-        let setup = setup_with_link(LINKED_DATA_STATIC_MESH);
+        let setup = setup_with_link(LinkedDataKind::STATIC_MESH);
         let mut sec2 = setup.clone();
         sec2.extend(op(0x45, 1, &[]));
         sec2.extend(op(OPCODE_END, 0, &[]));
@@ -3792,7 +4998,7 @@ mod tests {
     // (research/xim ParticleInitializers.kt ParentVelocityConfig).
     #[test]
     fn parent_velocity_reads_the_single_float() {
-        let setup = setup_with_link(LINKED_DATA_STATIC_MESH);
+        let setup = setup_with_link(LinkedDataKind::STATIC_MESH);
         let mut sec2 = setup.clone();
         sec2.extend(op(0x46, 2, &2.5f32.to_le_bytes()));
         sec2.extend(op(OPCODE_END, 0, &[]));
@@ -3809,7 +5015,7 @@ mod tests {
     // ParticleInitializers.kt ChildGeneratorSetup).
     #[test]
     fn child_generator_setup_reads_the_child_id() {
-        let setup = setup_with_link(LINKED_DATA_STATIC_MESH);
+        let setup = setup_with_link(LinkedDataKind::STATIC_MESH);
         let mut sec2 = setup.clone();
         sec2.extend(op(0x44, 3, &[0, 0, 0, 0, b'k', b'i', b'd', b'0']));
         sec2.extend(op(OPCODE_END, 0, &[]));
@@ -3822,11 +5028,69 @@ mod tests {
         assert_eq!(plain.child_generator, None);
     }
 
+    // 0x6A — the third block of the child-generator family (research/XIClient CYyGenerator.cpp
+    // ElemGenerate case 0x6A; research/xim ParticleInitializers.kt ChildGeneratorSetup).
+    #[test]
+    fn child_generator_third_block_reads_the_child_id() {
+        let setup = setup_with_link(LinkedDataKind::STATIC_MESH);
+        let mut sec2 = setup.clone();
+        sec2.extend(op(0x6A, 3, &[0, 0, 0, 0, b'k', b'i', b'd', b'3']));
+        sec2.extend(op(OPCODE_END, 0, &[]));
+        let body = build(&sec2, 1, 1);
+        let def = ParticleGeneratorDef::parse(&body).unwrap().unwrap();
+        assert_eq!(def.child_generator_3, Some(*b"kid3"));
+        let plain = ParticleGeneratorDef::parse(&build(&setup, 1, 1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(plain.child_generator_3, None);
+    }
+
+    // 0x3C OnceChildGeneratorSetup: [expectZero32, child generator DAT id] (research/xim
+    // ParticleInitializers.kt OnceChildGeneratorSetup).
+    #[test]
+    fn once_child_generator_reads_the_child_id() {
+        let setup = setup_with_link(LinkedDataKind::STATIC_MESH);
+        let mut sec2 = setup.clone();
+        sec2.extend(op(0x3C, 3, &[0, 0, 0, 0, b'a', b'8', b'0', b'2']));
+        sec2.extend(op(OPCODE_END, 0, &[]));
+        let body = build(&sec2, 1, 1);
+        let def = ParticleGeneratorDef::parse(&body).unwrap().unwrap();
+        assert_eq!(def.once_child_generator, Some(*b"a802"));
+        let plain = ParticleGeneratorDef::parse(&build(&setup, 1, 1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(plain.once_child_generator, None);
+    }
+
+    // sec3 0x25/0x33/0x46 child-emission updaters: no-payload markers (research/xim
+    // ParticleUpdaters.kt ChildGeneratorBasicUpdater / ChildGeneratorUpdater).
+    #[test]
+    fn child_emit_updaters_arm_their_flags() {
+        let setup = setup_with_link(LinkedDataKind::STATIC_MESH);
+        for opcode in [0x25u8, 0x33, 0x46] {
+            let mut body = build(&setup, 1, 1);
+            body.extend_from_slice(&SEC2_TERMINATOR);
+            let sec3_body_index = body.len();
+            body[0x78..0x7C].copy_from_slice(&((sec3_body_index + 0x10) as u32).to_le_bytes());
+            body.extend_from_slice(&op(opcode, 1, &[]));
+            let def = ParticleGeneratorDef::parse(&body).unwrap().unwrap();
+            match opcode {
+                0x25 => assert!(def.child_emit_basic),
+                0x33 => assert!(def.child_emit_full),
+                _ => assert!(def.child_emit_billboard),
+            }
+        }
+        let plain = ParticleGeneratorDef::parse(&build(&setup, 1, 1))
+            .unwrap()
+            .unwrap();
+        assert!(!plain.child_emit_basic && !plain.child_emit_full && !plain.child_emit_billboard);
+    }
+
     // 0x2A KeyFrameValueSetup (color.r): the 0x27/0x28/0x29 track shape bound to the
     // element's red channel (research/xim ParticleGeneratorParser.kt).
     #[test]
     fn color_r_track_reads_the_keyframe_id() {
-        let setup = setup_with_link(LINKED_DATA_STATIC_MESH);
+        let setup = setup_with_link(LinkedDataKind::STATIC_MESH);
         let mut sec2 = setup.clone();
         sec2.extend(op(0x2A, 4, &[0, 0, 0, 0, b'c', b'r', b'0', b'1']));
         sec2.extend(op(OPCODE_END, 0, &[]));
@@ -3843,7 +5107,7 @@ mod tests {
     // element's green channel (research/xim ParticleGeneratorParser.kt).
     #[test]
     fn color_g_track_reads_the_keyframe_id() {
-        let setup = setup_with_link(LINKED_DATA_STATIC_MESH);
+        let setup = setup_with_link(LinkedDataKind::STATIC_MESH);
         let mut sec2 = setup.clone();
         sec2.extend(op(0x2B, 4, &[0, 0, 0, 0, b'c', b'g', b'0', b'1']));
         sec2.extend(op(OPCODE_END, 0, &[]));
@@ -3860,7 +5124,7 @@ mod tests {
     // element's blue channel (research/xim ParticleGeneratorParser.kt).
     #[test]
     fn color_b_track_reads_the_keyframe_id() {
-        let setup = setup_with_link(LINKED_DATA_STATIC_MESH);
+        let setup = setup_with_link(LinkedDataKind::STATIC_MESH);
         let mut sec2 = setup.clone();
         sec2.extend(op(0x2C, 4, &[0, 0, 0, 0, b'c', b'b', b'0', b'1']));
         sec2.extend(op(OPCODE_END, 0, &[]));
@@ -3878,7 +5142,7 @@ mod tests {
     // radian angles.
     #[test]
     fn incremental_rotation_reads_the_three_floats() {
-        let setup = setup_with_link(LINKED_DATA_STATIC_MESH);
+        let setup = setup_with_link(LinkedDataKind::STATIC_MESH);
         let mut sec2 = setup.clone();
         sec2.extend(op(0x3B, 4, &{
             let mut p = Vec::new();
@@ -3902,7 +5166,7 @@ mod tests {
     // RotationVarianceInitializer); the payloads are radian angles.
     #[test]
     fn rotation_variance_reads_the_three_axis_bounds() {
-        let setup = setup_with_link(LINKED_DATA_STATIC_MESH);
+        let setup = setup_with_link(LinkedDataKind::STATIC_MESH);
         let mut sec2 = setup.clone();
         let mut base: Vec<u8> = Vec::new();
         for f in [0.1f32, 0.2, 0.3] {
@@ -3930,7 +5194,7 @@ mod tests {
     // allocationOffset binds it to the rotation transform).
     #[test]
     fn rotation_velocity_variance_reads_the_three_axis_bounds() {
-        let setup = setup_with_link(LINKED_DATA_STATIC_MESH);
+        let setup = setup_with_link(LinkedDataKind::STATIC_MESH);
         let mut sec2 = setup.clone();
         let mut rate: Vec<u8> = Vec::new();
         for f in [0.0f32, 0.01, 0.0] {
@@ -3957,7 +5221,7 @@ mod tests {
     // axis per particle (research/xim ParticleInitializers.kt — scale += posRand(v)).
     #[test]
     fn single_scale_variance_reads_the_single_float() {
-        let setup = setup_with_link(LINKED_DATA_STATIC_MESH);
+        let setup = setup_with_link(LinkedDataKind::STATIC_MESH);
         let mut sec2 = setup.clone();
         let mut base: Vec<u8> = Vec::new();
         for f in [0.1f32, 0.2, 0.3] {
@@ -3981,7 +5245,7 @@ mod tests {
     // field_EC.x/y/z += ufrand(payload)), behind a 0x0F base scale.
     #[test]
     fn scale_variance_reads_the_three_floats() {
-        let mut setup = setup_with_link(LINKED_DATA_STATIC_MESH);
+        let mut setup = setup_with_link(LinkedDataKind::STATIC_MESH);
         let mut payload = Vec::new();
         for f in [0.5f32, 0.25, 0.125] {
             payload.extend_from_slice(&f.to_le_bytes());
@@ -3990,10 +5254,13 @@ mod tests {
         let body = build(&setup, 1, 1);
         let def = ParticleGeneratorDef::parse(&body).unwrap().unwrap();
         assert_eq!(def.scale_variance, Some([0.5, 0.25, 0.125]));
-        let plain =
-            ParticleGeneratorDef::parse(&build(&setup_with_link(LINKED_DATA_STATIC_MESH), 1, 1))
-                .unwrap()
-                .unwrap();
+        let plain = ParticleGeneratorDef::parse(&build(
+            &setup_with_link(LinkedDataKind::STATIC_MESH),
+            1,
+            1,
+        ))
+        .unwrap()
+        .unwrap();
         assert_eq!(plain.scale_variance, None);
     }
 
@@ -4011,7 +5278,7 @@ mod tests {
             p.extend_from_slice(&raw_steps.to_le_bytes());
             p
         };
-        let mut sec2 = setup_with_link(LINKED_DATA_STATIC_MESH);
+        let mut sec2 = setup_with_link(LinkedDataKind::STATIC_MESH);
         sec2.extend(op(0x1F, 12, &payload(1, 4)));
         let def = ParticleGeneratorDef::parse(&build(&sec2, 1, 1))
             .unwrap()
@@ -4027,7 +5294,7 @@ mod tests {
         assert!(sp.camera_oriented);
         assert_eq!(sp.azimuth_steps, 5);
 
-        let mut sec2 = setup_with_link(LINKED_DATA_STATIC_MESH);
+        let mut sec2 = setup_with_link(LinkedDataKind::STATIC_MESH);
         sec2.extend(op(0x1F, 12, &payload(0, 0)));
         let def = ParticleGeneratorDef::parse(&build(&sec2, 1, 1))
             .unwrap()
@@ -4036,10 +5303,13 @@ mod tests {
         assert!(!sp.camera_oriented);
         assert_eq!(sp.azimuth_steps, 0, "raw 0 is the random-azimuth case");
 
-        let plain =
-            ParticleGeneratorDef::parse(&build(&setup_with_link(LINKED_DATA_STATIC_MESH), 1, 1))
-                .unwrap()
-                .unwrap();
+        let plain = ParticleGeneratorDef::parse(&build(
+            &setup_with_link(LinkedDataKind::STATIC_MESH),
+            1,
+            1,
+        ))
+        .unwrap()
+        .unwrap();
         assert_eq!(plain.spherical_full, None);
     }
 
@@ -4048,7 +5318,7 @@ mod tests {
     // elapsedFrames; retail's ElemGenerate shares the 0x0B/0x12 memcpy case).
     #[test]
     fn scale_velocity_reads_the_three_axis_rate() {
-        let mut sec2 = setup_with_link(LINKED_DATA_STATIC_MESH);
+        let mut sec2 = setup_with_link(LinkedDataKind::STATIC_MESH);
         sec2.extend(op(0x12, 4, &vec3_payload([0.0, 0.01, 0.0])));
         let rate_only = ParticleGeneratorDef::parse(&build(&sec2, 120, 0x1400))
             .unwrap()
@@ -4069,14 +5339,14 @@ mod tests {
     // adds frand(bounds) to the transform's velocity).
     #[test]
     fn scale_velocity_variance_reads_the_three_floats() {
-        let mut sec2 = setup_with_link(LINKED_DATA_STATIC_MESH);
+        let mut sec2 = setup_with_link(LinkedDataKind::STATIC_MESH);
         sec2.extend(op(0x13, 4, &vec3_payload([0.0, 0.005, 0.0])));
         let def = ParticleGeneratorDef::parse(&build(&sec2, 120, 0x1400))
             .unwrap()
             .unwrap();
         assert_eq!(def.scale_velocity_variance, Some([0.0, 0.005, 0.0]));
         let plain = ParticleGeneratorDef::parse(&build(
-            &setup_with_link(LINKED_DATA_STATIC_MESH),
+            &setup_with_link(LinkedDataKind::STATIC_MESH),
             120,
             0x1400,
         ))
@@ -4090,7 +5360,7 @@ mod tests {
     #[test]
     fn render_state_flag_selects_ignore_texture_alpha_element() {
         let element = |render_state: u16| {
-            let mut setup = setup_with_link(LINKED_DATA_STATIC_MESH);
+            let mut setup = setup_with_link(LinkedDataKind::STATIC_MESH);
             setup[4 + 2..4 + 4].copy_from_slice(&render_state.to_le_bytes());
             let body = build(&setup, 1, 1);
             ParticleGeneratorDef::parse(&body)
@@ -4108,7 +5378,7 @@ mod tests {
     #[test]
     fn render_state_flag_0x0200_disables_fog() {
         let fogged = |render_state: u16| {
-            let mut setup = setup_with_link(LINKED_DATA_STATIC_MESH);
+            let mut setup = setup_with_link(LinkedDataKind::STATIC_MESH);
             setup[4 + 2..4 + 4].copy_from_slice(&render_state.to_le_bytes());
             let body = build(&setup, 1, 1);
             ParticleGeneratorDef::parse(&body)
@@ -4128,7 +5398,7 @@ mod tests {
     #[test]
     fn render_state_and_billboard_words_select_draw_priority_and_depth_write() {
         let parsed = |billboard: u16, render_state: u16| {
-            let mut setup = setup_with_link(LINKED_DATA_STATIC_MESH);
+            let mut setup = setup_with_link(LinkedDataKind::STATIC_MESH);
             setup[4..4 + 2].copy_from_slice(&billboard.to_le_bytes());
             setup[4 + 2..4 + 4].copy_from_slice(&render_state.to_le_bytes());
             let body = build(&setup, 1, 1);
@@ -4148,12 +5418,12 @@ mod tests {
     // CYyGenerator.cpp CYyGenerator::ElemGenerate opcode 0x30 — one float, the sort offset.
     #[test]
     fn opcode_0x30_sets_the_sort_offset() {
-        let mut setup = setup_with_link(LINKED_DATA_STATIC_MESH);
+        let mut setup = setup_with_link(LinkedDataKind::STATIC_MESH);
         setup.extend(op(0x30, 2, &7.5f32.to_le_bytes()));
         let body = build(&setup, 1, 1);
         let def = ParticleGeneratorDef::parse(&body).unwrap().unwrap();
         assert_eq!(def.sort_offset, 7.5);
-        let plain = setup_with_link(LINKED_DATA_STATIC_MESH);
+        let plain = setup_with_link(LinkedDataKind::STATIC_MESH);
         let body = build(&plain, 1, 1);
         let def = ParticleGeneratorDef::parse(&body).unwrap().unwrap();
         assert_eq!(def.sort_offset, 0.0);
@@ -4164,7 +5434,7 @@ mod tests {
     // (research/xim ParticleInitializers.kt ProjectionBiasInitializer); no 0x30 co-occurrence.
     #[test]
     fn projection_bias_reads_the_two_floats() {
-        let mut setup = setup_with_link(LINKED_DATA_STATIC_MESH);
+        let mut setup = setup_with_link(LinkedDataKind::STATIC_MESH);
         let mut payload = Vec::new();
         for f in [-0.5f32, 2.0] {
             payload.extend_from_slice(&f.to_le_bytes());
@@ -4174,10 +5444,13 @@ mod tests {
         let def = ParticleGeneratorDef::parse(&body).unwrap().unwrap();
         assert_eq!(def.sort_offset, -0.5);
         assert_eq!(def.projection_bias, Some([-0.5, 2.0]));
-        let plain =
-            ParticleGeneratorDef::parse(&build(&setup_with_link(LINKED_DATA_STATIC_MESH), 1, 1))
-                .unwrap()
-                .unwrap();
+        let plain = ParticleGeneratorDef::parse(&build(
+            &setup_with_link(LinkedDataKind::STATIC_MESH),
+            1,
+            1,
+        ))
+        .unwrap()
+        .unwrap();
         assert_eq!(plain.sort_offset, 0.0);
         assert_eq!(plain.projection_bias, None);
     }
@@ -4187,7 +5460,7 @@ mod tests {
     // behind a 0x16 base color.
     #[test]
     fn color_variance_reads_the_four_bytes() {
-        let mut setup = setup_with_link(LINKED_DATA_STATIC_MESH);
+        let mut setup = setup_with_link(LinkedDataKind::STATIC_MESH);
         setup.extend(op(0x17, 2, &[20u8, 10, 5, 0]));
         let body = build(&setup, 1, 1);
         let def = ParticleGeneratorDef::parse(&body).unwrap().unwrap();
@@ -4195,10 +5468,13 @@ mod tests {
             def.color_variance,
             Some([20.0 / 255.0, 10.0 / 255.0, 5.0 / 255.0, 0.0])
         );
-        let plain =
-            ParticleGeneratorDef::parse(&build(&setup_with_link(LINKED_DATA_STATIC_MESH), 1, 1))
-                .unwrap()
-                .unwrap();
+        let plain = ParticleGeneratorDef::parse(&build(
+            &setup_with_link(LinkedDataKind::STATIC_MESH),
+            1,
+            1,
+        ))
+        .unwrap()
+        .unwrap();
         assert_eq!(plain.color_variance, None);
     }
 
@@ -4208,7 +5484,7 @@ mod tests {
     // 0x16 base color.
     #[test]
     fn color_transform_reads_the_four_i16s() {
-        let mut setup = setup_with_link(LINKED_DATA_STATIC_MESH);
+        let mut setup = setup_with_link(LinkedDataKind::STATIC_MESH);
         let mut payload = Vec::new();
         for v in [-160i16, -160, 0, 0] {
             payload.extend_from_slice(&v.to_le_bytes());
@@ -4217,10 +5493,13 @@ mod tests {
         let body = build(&setup, 1, 1);
         let def = ParticleGeneratorDef::parse(&body).unwrap().unwrap();
         assert_eq!(def.color_transform, Some([-160, -160, 0, 0]));
-        let plain =
-            ParticleGeneratorDef::parse(&build(&setup_with_link(LINKED_DATA_STATIC_MESH), 1, 1))
-                .unwrap()
-                .unwrap();
+        let plain = ParticleGeneratorDef::parse(&build(
+            &setup_with_link(LinkedDataKind::STATIC_MESH),
+            1,
+            1,
+        ))
+        .unwrap()
+        .unwrap();
         assert_eq!(plain.color_transform, None);
     }
 
@@ -4228,7 +5507,7 @@ mod tests {
     // color transform (research/xim ParticleUpdaters.kt ColorTransformModifier).
     #[test]
     fn color_transform_modifier_reads_the_four_i16s() {
-        let setup = setup_with_link(LINKED_DATA_STATIC_MESH);
+        let setup = setup_with_link(LinkedDataKind::STATIC_MESH);
         let mut payload = Vec::new();
         for v in [1i16, -2, 3, 0] {
             payload.extend_from_slice(&v.to_le_bytes());
@@ -4264,7 +5543,7 @@ mod tests {
     #[test]
     fn rotation_velocity_spins_only_with_the_sec3_updater() {
         const BND0_YAW_PER_FRAME: f32 = -0.015_707_5;
-        let mut sec2 = setup_with_link(LINKED_DATA_STATIC_MESH);
+        let mut sec2 = setup_with_link(LinkedDataKind::STATIC_MESH);
         sec2.extend(op(0x0B, 4, &vec3_payload([0.0, BND0_YAW_PER_FRAME, 0.0])));
         let rate_only = ParticleGeneratorDef::parse(&build(&sec2, 120, 0x1400))
             .unwrap()
@@ -4282,7 +5561,7 @@ mod tests {
         assert_eq!(spinning.spin(), Some([0.0, BND0_YAW_PER_FRAME, 0.0]));
 
         let updater_only = ParticleGeneratorDef::parse(&with_section(
-            build(&setup_with_link(LINKED_DATA_STATIC_MESH), 120, 0x1400),
+            build(&setup_with_link(LinkedDataKind::STATIC_MESH), 120, 0x1400),
             0x78,
             &op(0x05, 1, &[]),
         ))
@@ -4300,7 +5579,7 @@ mod tests {
     #[test]
     fn section_4_relife_opcode_is_read() {
         let plain = ParticleGeneratorDef::parse(&build(
-            &setup_with_link(LINKED_DATA_STATIC_MESH),
+            &setup_with_link(LinkedDataKind::STATIC_MESH),
             120,
             0x1400,
         ))
@@ -4309,7 +5588,7 @@ mod tests {
         assert!(!plain.relife_on_expiry);
 
         let body = with_section(
-            build(&setup_with_link(LINKED_DATA_STATIC_MESH), 120, 0x1400),
+            build(&setup_with_link(LinkedDataKind::STATIC_MESH), 120, 0x1400),
             0x7C,
             &op(0x05, 1, &[]),
         );
@@ -4317,7 +5596,7 @@ mod tests {
         assert!(relife.relife_on_expiry);
 
         let other = with_section(
-            build(&setup_with_link(LINKED_DATA_STATIC_MESH), 120, 0x1400),
+            build(&setup_with_link(LinkedDataKind::STATIC_MESH), 120, 0x1400),
             0x7C,
             &op(0x04, 1, &[]),
         );
@@ -4335,7 +5614,7 @@ mod tests {
     #[test]
     fn section_4_emit_child_opcode_is_read() {
         let body = with_section(
-            build(&setup_with_link(LINKED_DATA_STATIC_MESH), 120, 0x1400),
+            build(&setup_with_link(LinkedDataKind::STATIC_MESH), 120, 0x1400),
             0x7C,
             &op(
                 SEC4_OPCODE_EMIT_CHILD,
@@ -4360,7 +5639,7 @@ mod tests {
     /// `bnd0`'s StandardSetup carries the specular selector in the high u16 of its setup dword.
     #[test]
     fn specular_selector_and_params_are_read() {
-        let mut setup = setup_with_link(LINKED_DATA_STATIC_MESH);
+        let mut setup = setup_with_link(LinkedDataKind::STATIC_MESH);
         setup[4 + 2..4 + 4].copy_from_slice(&0x0101u16.to_le_bytes());
         let mut payload = vec3_payload([0.0349, -0.5410, 0.6108]);
         payload.extend_from_slice(b"nami");
@@ -4382,7 +5661,7 @@ mod tests {
         assert_eq!(spec.flags, 3);
 
         let common = ParticleGeneratorDef::parse(&build(
-            &setup_with_link(LINKED_DATA_STATIC_MESH),
+            &setup_with_link(LinkedDataKind::STATIC_MESH),
             120,
             0x1400,
         ))
@@ -4397,7 +5676,7 @@ mod tests {
     #[test]
     fn blend_byte_survives_the_blend_func_collapse() {
         let parsed = |p0: u8| {
-            let mut setup = setup_with_link(LINKED_DATA_STATIC_MESH);
+            let mut setup = setup_with_link(LinkedDataKind::STATIC_MESH);
             setup.extend(op(0x1E, 2, &[p0, 0, 0, 0]));
             let body = build(&setup, 1, 1);
             let def = ParticleGeneratorDef::parse(&body).unwrap().unwrap();
@@ -4410,7 +5689,7 @@ mod tests {
 
     #[test]
     fn static_mesh_setup_reports_static_mesh_kind() {
-        let setup = setup_with_link(LINKED_DATA_STATIC_MESH);
+        let setup = setup_with_link(LinkedDataKind::STATIC_MESH);
         let body = build(&setup, 1, 1);
         let def = ParticleGeneratorDef::parse(&body).unwrap().unwrap();
         assert_eq!(def.mesh_kind, ParticleMeshKind::StaticMesh);
@@ -4418,7 +5697,7 @@ mod tests {
 
     #[test]
     fn singleton_when_max_life_zero() {
-        let mut setup = setup_with_link(LINKED_DATA_STATIC_MESH);
+        let mut setup = setup_with_link(LinkedDataKind::STATIC_MESH);
         setup[4 + 8..4 + 12].copy_from_slice(b"sea0");
         // max life left at 0
         let body = build(&setup, 1, 1);
@@ -4426,29 +5705,40 @@ mod tests {
         assert!(def.is_singleton());
     }
 
-    // Pins the XIM attachFlags bit layout (ParticleGeneratorParser.kt) against the
-    // ground-truth word 0x5402 read out of Poison's effect DAT (file 3020).
+    // Pins the retail attach-word layout (Attachment.cpp MakeAttachMatrix) against the
+    // ground-truth word 0x5402 read out of Poison's effect DAT (file 3020): type in the low
+    // nibble, ONE EID index in bits 4-9 plus bit 18 — bits 10-15 are not an index.
     #[test]
-    fn attach_flags_split_type_and_joints() {
-        let setup = setup_with_link(LINKED_DATA_STATIC_MESH);
+    fn attach_flags_carry_type_and_one_eid_index() {
+        let setup = setup_with_link(LinkedDataKind::STATIC_MESH);
 
+        // 0x5402: type TargetActor, EID low bits 0; the word's bits 10-15 (21) are reserved.
         let body = build_attached(&setup, 1, 1, 0x5402, ATTACH_SOURCE_ORIENTED);
         let def = ParticleGeneratorDef::parse(&body).unwrap().unwrap();
         assert_eq!(def.attach_type, AttachType::TargetActor);
-        assert_eq!(def.attach_joint_source, 0);
-        assert_eq!(def.attach_joint_target, 21);
+        assert_eq!(def.attach_eid, 0);
         assert!(def.attach_source_oriented);
 
         let body = build_attached(&setup, 1, 1, 0x5402, 0);
         let def = ParticleGeneratorDef::parse(&body).unwrap().unwrap();
         assert!(!def.attach_source_oriented);
 
-        // Joint 0 lives in bits 4..10, joint 1 in bits 10..16, type in the low nibble.
-        let body = build_attached(&setup, 1, 1, 0x0409 | (7 << ATTACH_JOINT0_SHIFT), 0);
+        // EID low bits in 4..10, type in the low nibble; bit 18 (additional word bit 2) is the top.
+        let body = build_attached(&setup, 1, 1, 0x0409 | (7 << ATTACH_EID_LOW_SHIFT), 0);
         let def = ParticleGeneratorDef::parse(&body).unwrap().unwrap();
         assert_eq!(def.attach_type, AttachType::SourceActorWeapon);
-        assert_eq!(def.attach_joint_source, 7);
-        assert_eq!(def.attach_joint_target, 1);
+        assert_eq!(def.attach_eid, 7);
+
+        // Bit 18 lifts the index past the low six bits: 0x40 in the additional word is bit 2.
+        let body = build_attached(
+            &setup,
+            1,
+            1,
+            0x0409 | (5 << ATTACH_EID_LOW_SHIFT),
+            ADDITIONAL_ATTACH_EID_TOP_BIT,
+        );
+        let def = ParticleGeneratorDef::parse(&body).unwrap().unwrap();
+        assert_eq!(def.attach_eid, 69);
 
         // 0x7 / 0x8 / 0xD are not AttachType flags; XIM warns and falls back to None.
         for unknown in [0x7u16, 0x8, 0xD] {
@@ -4460,7 +5750,9 @@ mod tests {
     }
 
     // Real-DAT guard: every generator in Poison's completion-effect file attaches to the
-    // target actor at joint 21, which is what makes the venom cloud land on the victim.
+    // target actor with EID index 0 (the word's bits 10-15 read as a phantom 21; Attachment.cpp
+    // MakeAttachMatrix only takes bits 4-9 + bit 18), so the venom cloud lands on the victim's
+    // locator 0.
     #[test]
     fn real_dat_poison_generators_attach_to_target() {
         const POISON_EFFECT_FILE_ID: u32 = 3020;
@@ -4488,7 +5780,7 @@ mod tests {
                 "generator {}",
                 String::from_utf8_lossy(&c.name)
             );
-            assert_eq!(def.attach_joint_target, 21);
+            assert_eq!(def.attach_eid, 0);
         }
         assert!(seen > 0, "no particle generators parsed from file 3020");
     }
@@ -4628,6 +5920,30 @@ mod tests {
         );
     }
 
+    // CYyGenerator.cpp ElemGenerate case 0x6B — the payload is path_id char[4] plus two words;
+    // the shipped kaw3/skw3 river emitters reference a rail no zone DAT in scope defines.
+    #[test]
+    fn sound_path_ref_reads_the_rail_name_and_ignores_the_trailing_words() {
+        let mut setup = setup_with_link(LINKED_DATA_SOUND);
+        setup[4 + 8..4 + 12].copy_from_slice(b"5009");
+        let mut p = Vec::new();
+        p.extend_from_slice(b"kaw3");
+        p.extend_from_slice(&7u32.to_le_bytes());
+        p.extend_from_slice(&9u32.to_le_bytes());
+        setup.extend(op(SOUND_PATH_REF_OPCODE, 4, &p));
+
+        let body = build(&setup, 30, GEN_FLAG_AUTO_RUN);
+        let def = SoundGeneratorDef::parse(&body).unwrap().unwrap();
+        assert_eq!(def.path_ref, Some(*b"kaw3"));
+        assert_eq!(def.sep_id, *b"5009");
+
+        // A mesh generator carrying the same block parses it and declines to claim it.
+        let mut setup = setup_with_link(LinkedDataKind::STATIC_MESH);
+        setup.extend(op(SOUND_PATH_REF_OPCODE, 4, &p));
+        let body = build(&setup, 30, GEN_FLAG_AUTO_RUN);
+        assert!(SoundGeneratorDef::parse(&body).unwrap().is_none());
+    }
+
     fn with_sec1(mut body: Vec<u8>, sec1: &[u8]) -> Vec<u8> {
         let at = body.len();
         body[0x70..0x74].copy_from_slice(&((at + 0x10) as u32).to_le_bytes());
@@ -4637,7 +5953,7 @@ mod tests {
 
     #[test]
     fn emit_cull_reads_max_then_min_then_unlink_bit_from_section_1() {
-        let setup = setup_with_link(LINKED_DATA_STATIC_MESH);
+        let setup = setup_with_link(LinkedDataKind::STATIC_MESH);
         let mut p = Vec::new();
         p.extend_from_slice(&40.0f32.to_le_bytes());
         p.extend_from_slice(&(-1.0f32).to_le_bytes());
@@ -4667,7 +5983,7 @@ mod tests {
     // ParticleGeneratorUpdaters.kt AssociationUpdater read.
     #[test]
     fn association_follow_reads_the_flags_and_factor_from_section_1() {
-        let setup = setup_with_link(LINKED_DATA_STATIC_MESH);
+        let setup = setup_with_link(LinkedDataKind::STATIC_MESH);
         let parse_cfg = |cfg: u32| {
             let mut sec1 = op(0x04, 2, &[0, 0, 0, 0]);
             sec1.extend(op(SEC1_OPCODE_ASSOCIATION, 2, &cfg.to_le_bytes()));
@@ -4725,7 +6041,7 @@ mod tests {
 
     #[test]
     fn particle_setups_are_not_sound_generators() {
-        let setup = setup_with_link(LINKED_DATA_STATIC_MESH);
+        let setup = setup_with_link(LinkedDataKind::STATIC_MESH);
         let body = build(&setup, 1, 1);
         assert!(SoundGeneratorDef::parse(&body).unwrap().is_none());
     }
