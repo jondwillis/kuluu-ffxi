@@ -307,6 +307,9 @@ pub const DEBUG_WEATHER: &str = "Weather";
 /// Debug fog gate row: [on] = every fog layer (DAT distance fog, volumetric
 /// ground haze) renders; toggling it off strips all of them. Default on.
 pub const DEBUG_FOG: &str = "Fog";
+/// Debug clock-gate row: [on] = the Vana clock is frozen at 18:00 (lamp
+/// night-scene testing); off thaws it back to live time.
+pub const DEBUG_FORCE_18: &str = "Force_18:00";
 /// Debug Entity List overlay row: [on] = the scrollable live-entity dump
 /// (id/name/kind/pos/status/hp/invis flags from the EntityTable) is shown.
 /// Mouse wheel scrolls. Default off.
@@ -348,6 +351,7 @@ const DEBUG_ENTRIES: &[&str] = &[
     DEBUG_AUTO_ENTER_CS,
     DEBUG_WEATHER,
     DEBUG_FOG,
+    DEBUG_FORCE_18,
     DEBUG_ENTITY_LIST,
     DEBUG_SOUND,
     DEBUG_VOLUME,
@@ -1549,6 +1553,7 @@ pub fn debug_panel_state(
         DEBUG_AUTO_ENTER_CS => panels.auto_enter_cs,
         DEBUG_WEATHER => !panels.weather_off,
         DEBUG_FOG => !panels.fog_off,
+        DEBUG_FORCE_18 => panels.force_18,
         DEBUG_ENTITY_LIST => panels.entity_list,
         DEBUG_NET_STATUS => net_status_on,
         DEBUG_SOUND => sound_on,

@@ -115,7 +115,7 @@ pub(super) fn confirm_menu_at_cursor(
     hud_panels: &mut kuluu_render::hud::HudPanels,
     net_status: &mut kuluu_render::hud::network_status::NetStatusVisible,
     audio_mute: &mut kuluu_render::audio::AudioMuteState,
-    vana_clock: &kuluu_render::vana_time::VanaClock,
+    vana_clock: &mut kuluu_render::vana_time::VanaClock,
     vana_clock_visible: &mut kuluu_render::hud::vana_clock::VanaClockVisible,
     dynamic: &kuluu_render::hud::menu::DynamicMenu,
     target_id: Option<u32>,
@@ -142,6 +142,7 @@ pub(super) fn confirm_menu_at_cursor(
             hud_panels,
             net_status,
             audio_mute,
+            vana_clock,
             self_pos,
             scene_state,
         );
@@ -471,16 +472,17 @@ fn toggle_debug_panel(
     hud_panels: &mut kuluu_render::hud::HudPanels,
     net_status: &mut kuluu_render::hud::network_status::NetStatusVisible,
     audio_mute: &mut kuluu_render::audio::AudioMuteState,
+    vana_clock: &mut kuluu_render::vana_time::VanaClock,
     self_pos: kuluu_snapshot::Vec3,
     scene_state: &mut SceneState,
 ) {
     #[cfg(feature = "enhanced-engage-move-lock-off")]
     use kuluu_render::hud::menu::DEBUG_ENGAGE_ANIM_LOCK;
     use kuluu_render::hud::menu::{
-        DEBUG_AUTO_ENTER_CS, DEBUG_ENTITY_LIST, DEBUG_FOG, DEBUG_GRAPHICS_DEBUG, DEBUG_MESH,
-        DEBUG_NAMEPLATES, DEBUG_NET_STATUS, DEBUG_NOCLIP, DEBUG_PERF, DEBUG_POSITION_LOG,
-        DEBUG_PRINT_POS, DEBUG_SOUND, DEBUG_STAIR_DRAW, DEBUG_STAIR_STATUS, DEBUG_TARGET_CYCLE,
-        DEBUG_UI_SETTINGS, DEBUG_WEATHER,
+        DEBUG_AUTO_ENTER_CS, DEBUG_ENTITY_LIST, DEBUG_FOG, DEBUG_FORCE_18, DEBUG_GRAPHICS_DEBUG,
+        DEBUG_MESH, DEBUG_NAMEPLATES, DEBUG_NET_STATUS, DEBUG_NOCLIP, DEBUG_PERF,
+        DEBUG_POSITION_LOG, DEBUG_PRINT_POS, DEBUG_SOUND, DEBUG_STAIR_DRAW, DEBUG_STAIR_STATUS,
+        DEBUG_TARGET_CYCLE, DEBUG_UI_SETTINGS, DEBUG_WEATHER,
     };
 
     // Print Pos is a button, not a toggle: fire and return before the
@@ -529,6 +531,17 @@ fn toggle_debug_panel(
         DEBUG_FOG => {
             hud_panels.fog_off = !hud_panels.fog_off;
             !hud_panels.fog_off
+        }
+        DEBUG_FORCE_18 => {
+            // Edge-triggered: freezing is sticky until thaw, so only act on the
+            // flip (same shape as the weather/fog gates).
+            hud_panels.force_18 = !hud_panels.force_18;
+            if hud_panels.force_18 {
+                vana_clock.freeze_at_hour_minute(18, 0);
+            } else {
+                vana_clock.thaw();
+            }
+            hud_panels.force_18
         }
         DEBUG_ENTITY_LIST => {
             hud_panels.entity_list = !hud_panels.entity_list;
@@ -598,7 +611,7 @@ pub(super) fn handle_menu_key(
     hud_panels: &mut kuluu_render::hud::HudPanels,
     net_status: &mut kuluu_render::hud::network_status::NetStatusVisible,
     audio_mute: &mut kuluu_render::audio::AudioMuteState,
-    vana_clock: &kuluu_render::vana_time::VanaClock,
+    vana_clock: &mut kuluu_render::vana_time::VanaClock,
     vana_clock_visible: &mut kuluu_render::hud::vana_clock::VanaClockVisible,
     sort_options: &mut kuluu_render::hud::item_detail::SortOptions,
     item_menu_focus: &mut kuluu_render::hud::item_detail::ItemMenuFocus,
@@ -1002,7 +1015,7 @@ mod menu_key_tests {
                 &mut self.hud_panels,
                 &mut self.net_status,
                 &mut self.audio_mute,
-                &self.vana_clock,
+                &mut self.vana_clock,
                 &mut self.vana_clock_visible,
                 &mut self.sort_options,
                 &mut self.item_menu_focus,

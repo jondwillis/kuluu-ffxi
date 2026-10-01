@@ -111,6 +111,10 @@ pub struct HudPanels {
     /// scene-graphic errors can be isolated. Independent of `weather_off`.
     /// Runtime-only, no persist.
     pub fog_off: bool,
+    /// Debug clock-gate row (Debug menu "Force_18:00"): when true the Vana
+    /// clock is frozen at 18:00 for lamp/night-scene testing; off thaws it.
+    /// Runtime-only, no persist.
+    pub force_18: bool,
     /// Debug Entity List overlay (Debug menu "Entity List" row): when true,
     /// shows a scrollable dump of every live wire entity from the
     /// EntityTable — id, name, kind, position, status byte, hp%, invis/name-
