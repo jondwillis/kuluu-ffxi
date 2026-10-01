@@ -125,6 +125,18 @@ observed (e.g. a GUI leg that needs human eyes) gets named explicitly rather
 than silently skipped. Probes off the happy path (wrong zone, dead server,
 double-send) are worth a line each even when they hold.
 
+## Visual evidence in PRs
+
+Use [kuluu-review](../kuluu-review/SKILL.md) for PR evidence criteria and claim boundaries. Open captures and inspect their contents before citing or publishing them; use the GUI reference's freshness checks and native-video fallback for black or stale frames. Keep raw artifacts locally and attach/embed reviewer-accessible media in the PR body. Record exact capture or publication blockers rather than treating a successful capture command as visual verification.
+
+Upload inspected media directly with a current GitHub CLI:
+
+```bash
+gh pr edit PR_NUMBER --attach '/absolute/path/frame.png#Observed result' --attach /absolute/path/clip.mp4
+```
+
+Without a body flag, this appends to the existing body. With `--body-file`, references to the attached local paths are rewritten to uploaded URLs. Check `gh pr edit --help` for `--attach`; older CLI versions lack it. Read back the PR body after upload, including on failure because partial uploads can still update it. See the [official command documentation](https://cli.github.com/manual/gh_pr_edit).
+
 ## Recording evidence (feeds the stop-hook gate)
 
 The stop-hook verify gate (`.agents/hooks/stop.d/25-verify.sh`) blocks session
