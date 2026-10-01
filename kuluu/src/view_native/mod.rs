@@ -417,6 +417,10 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
             // whatever the user is doing instead of yanking them out of a
             // full-screen app.
             focused: !unfocused,
+            // KULUU_WINDOW_HIDDEN=1 — verification runs: no visible window, not even a
+            // taskbar entry; rendering continues on the hidden surface and the logs carry
+            // the evidence.
+            visible: std::env::var_os("KULUU_WINDOW_HIDDEN").is_none(),
             ..default()
         }),
         ..default()
@@ -537,6 +541,11 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
     }
 
     app.add_systems(Startup, configure_gizmo_render_layer);
+    // KULUU_WINDOW_HIDDEN=1 — verification runs: park the window past every monitor and show it
+    // through winit (SW_SHOWNOACTIVATE; no focus, never on a display). A WS_VISIBLE-less HWND
+    // gets no presented frames on this render stack, so cap-window.ps1's PrintWindow readback
+    // comes back all black; shown offscreen the swapchain is live and the capture works.
+    app.add_systems(Startup, park_hidden_window_offscreen);
 
     app.add_plugins(bevy::render::diagnostic::RenderDiagnosticsPlugin);
 
@@ -1715,3 +1724,20 @@ fn bridge_connecting(
 pub(crate) struct SessionEventTx(
     #[allow(dead_code)] pub tokio::sync::broadcast::Sender<kuluu_session::state::AgentEvent>,
 );
+
+// scripts/cap-window.ps1 parks and captures from the same spot; keep them in step.
+const HIDDEN_WINDOW_PARK: i32 = -32_000;
+
+/// KULUU_WINDOW_HIDDEN=1 — move the primary window past every monitor and show it without
+/// activation (see the registration comment for why a buried HWND captures nothing). Bevy
+/// applies these field changes to the winit window on its own clock, so no OS call here.
+fn park_hidden_window_offscreen(mut q_win: Query<&mut Window, With<bevy::window::PrimaryWindow>>) {
+    if std::env::var_os("KULUU_WINDOW_HIDDEN").is_none() {
+        return;
+    }
+    if let Ok(mut win) = q_win.single_mut() {
+        win.position =
+            bevy::window::WindowPosition::At(IVec2::new(HIDDEN_WINDOW_PARK, HIDDEN_WINDOW_PARK));
+        win.visible = true;
+    }
+}

@@ -10,7 +10,7 @@
 //!   {"key":"Enter"}          tap (press + release) a named or single-char key
 //!   {"key":"W","down":true}  press and HOLD (pair with up)
 //!   {"key":"W","up":true}    release a held key
-//!   {"text":"cowpass"}       type literal text; each character becomes a tap
+//!   {"text":"abc123"}       type literal text; each character becomes a tap
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -27,6 +27,10 @@ pub enum KeyMsg {
     Press(String),
     Release(String),
     Type(String),
+    /// Internal only (never produced by [KeyMsg::from_json_line]): the
+    /// deferred release half of a typed character, re-queued one frame after
+    /// its press so `just_pressed` consumers see the edge.
+    TypedRelease(char),
 }
 
 impl KeyMsg {
@@ -87,6 +91,12 @@ impl KeyMsg {
             "f4" => (KeyCode::F4, Key::F4),
             "f5" => (KeyCode::F5, Key::F5),
             "f6" => (KeyCode::F6, Key::F6),
+            "f7" => (KeyCode::F7, Key::F7),
+            "f8" => (KeyCode::F8, Key::F8),
+            "f9" => (KeyCode::F9, Key::F9),
+            "f10" => (KeyCode::F10, Key::F10),
+            "f11" => (KeyCode::F11, Key::F11),
+            "f12" => (KeyCode::F12, Key::F12),
             "printscreen" | "prtsc" | "prtscn" => (KeyCode::PrintScreen, Key::PrintScreen),
             _ => return None,
         };
@@ -182,9 +192,10 @@ pub async fn serve_key_drive(addr: SocketAddr, queue: Arc<Mutex<Vec<KeyMsg>>>) {
 
 /// PreUpdate: drain the queue into global `KeyboardInput` events so every
 /// Update-phase consumer (launcher screens, in-game input, text buffers) sees
-/// the same frame's synthetic presses. A tap is a press+release pair queued
-/// back-to-back; holds are explicit down/up messages from the driver. On the
-/// first frame the window may not exist yet; the queue is left in place.
+/// the same frame's synthetic presses. A tap is a press now plus its release
+/// re-queued one frame later; holds are explicit down/up messages from the
+/// driver. On the first frame the window may not exist yet; the queue is left
+/// in place.
 pub fn key_drive_system(
     mut events: MessageWriter<KeyboardInput>,
     queue: Res<KeyDriveQueue>,
@@ -193,14 +204,18 @@ pub fn key_drive_system(
     let Ok(window) = windows.single() else {
         return;
     };
-    let mut batch = std::mem::take(&mut *match queue.0.lock() {
-        Ok(mut q) => q,
+    let mut batch = match queue.0.lock() {
+        Ok(mut q) => std::mem::take(&mut *q),
         Err(_) => return,
-    });
+    };
 
+    // A tap's release half is deferred one frame (re-queued below): bevy_input
+    // folds a same-frame press+release into a net no-op, so `just_pressed`
+    // consumers never see the edge. Real keys span at least two frames.
+    let mut deferred: Vec<KeyMsg> = Vec::new();
     for msg in batch.drain(..) {
         match msg {
-            KeyMsg::Tap(name) => write_tap(&mut events, window, &name),
+            KeyMsg::Tap(name) => write_tap(&mut events, window, &name, &mut deferred),
             KeyMsg::Press(name) => {
                 if let Some((kc, lk)) = KeyMsg::resolve(&name) {
                     write_state(&mut events, window, kc, lk, ButtonState::Pressed);
@@ -217,9 +232,15 @@ pub fn key_drive_system(
             }
             KeyMsg::Type(text) => {
                 for c in text.chars() {
-                    write_tap_char(&mut events, window, c);
+                    write_tap_char(&mut events, window, c, &mut deferred);
                 }
             }
+            KeyMsg::TypedRelease(c) => write_typed_release(&mut events, window, c),
+        }
+    }
+    if !deferred.is_empty() {
+        if let Ok(mut q) = queue.0.lock() {
+            q.extend(deferred);
         }
     }
 }
@@ -241,36 +262,57 @@ fn write_state(
     });
 }
 
-fn write_tap(events: &mut MessageWriter<KeyboardInput>, window: Entity, name: &str) {
+fn write_tap(
+    events: &mut MessageWriter<KeyboardInput>,
+    window: Entity,
+    name: &str,
+    deferred: &mut Vec<KeyMsg>,
+) {
     match KeyMsg::resolve(name) {
         Some(pair) => {
             write_state(events, window, pair.0, pair.1.clone(), ButtonState::Pressed);
-            write_state(events, window, pair.0, pair.1, ButtonState::Released);
+            deferred.push(KeyMsg::Release(name.to_ascii_lowercase()));
         }
         None => tracing::warn!(%name, "FFXI_KEY_DRIVE: unknown key name"),
     }
 }
 
-/// Type one character as a tap. Mapped letters/digits/symbols carry their real
-/// physical `KeyCode`; anything else rides on an inert physical code while the
-/// logical `Key::Character` + `text` fields deliver the glyph to raw-event
-/// handlers (chat buffers, launcher text fields).
-fn write_tap_char(events: &mut MessageWriter<KeyboardInput>, window: Entity, c: char) {
-    let name = c.to_string();
-    let mapped = KeyMsg::resolve(&name);
-    let (kc, lk) = match mapped {
-        Some((kc, lk)) => (kc, lk),
-        None => (KeyCode::Backquote, Key::Character(name.chars().collect())),
-    };
-    write_state(events, window, kc, lk, ButtonState::Pressed);
+/// Type one character as a tap: press now, release re-queued one frame later
+/// (same two-frame edge rule as [write_tap]). Mapped letters/digits/symbols
+/// carry their real physical `KeyCode`; anything else rides on an inert
+/// physical code while the logical `Key::Character` delivers the glyph to
+/// raw-event handlers (chat buffers, launcher text fields).
+fn write_tap_char(
+    events: &mut MessageWriter<KeyboardInput>,
+    window: Entity,
+    c: char,
+    deferred: &mut Vec<KeyMsg>,
+) {
+    let (kc, lk) = typed_key_parts(c);
+    write_state(events, window, kc, lk.clone(), ButtonState::Pressed);
+    deferred.push(KeyMsg::TypedRelease(c));
+}
+
+/// The deferred release half of [write_tap_char]. `text` rides on the release
+/// as before (chat buffers read glyphs from the press's logical key).
+fn write_typed_release(events: &mut MessageWriter<KeyboardInput>, window: Entity, c: char) {
+    let (kc, lk) = typed_key_parts(c);
     events.write(KeyboardInput {
         key_code: kc,
-        logical_key: Key::Character(name.chars().collect()),
+        logical_key: lk,
         state: ButtonState::Released,
         text: Some(std::iter::once(c).collect()),
         repeat: false,
         window,
     });
+}
+
+fn typed_key_parts(c: char) -> (KeyCode, Key) {
+    let name = c.to_string();
+    match KeyMsg::resolve(&name) {
+        Some(pair) => pair,
+        None => (KeyCode::Backquote, Key::Character(name.chars().collect())),
+    }
 }
 
 #[cfg(test)]
@@ -399,8 +441,8 @@ mod tests {
     #[test]
     fn text_line_parses() {
         assert!(matches!(
-            KeyMsg::from_json_line(r#"{"text":"cowpass"}"#),
-            Some(KeyMsg::Type(t)) if t == "cowpass"
+            KeyMsg::from_json_line(r#"{"text":"abc123"}"#),
+            Some(KeyMsg::Type(t)) if t == "abc123"
         ));
     }
 
@@ -413,6 +455,22 @@ mod tests {
         assert!(KeyMsg::from_json_line(r#"{"foo":1}"#).is_none());
     }
 
+    /// The deferral half is internal: no driver line may mint one.
+    #[test]
+    fn typed_release_is_internal_only() {
+        for line in [
+            r#"{"key":"Enter"}"#,
+            r#"{"key":"W","down":true}"#,
+            r#"{"key":"w","up":true}"#,
+            r#"{"text":"abc123"}"#,
+        ] {
+            assert!(
+                !matches!(KeyMsg::from_json_line(line), Some(KeyMsg::TypedRelease(_))),
+                "line {line} must not parse to TypedRelease"
+            );
+        }
+    }
+
     #[test]
     fn resolve_function_and_screenshot_keys() {
         let function_keys = [
@@ -422,6 +480,12 @@ mod tests {
             ("F4", KeyCode::F4, Key::F4),
             ("F5", KeyCode::F5, Key::F5),
             ("F6", KeyCode::F6, Key::F6),
+            ("F7", KeyCode::F7, Key::F7),
+            ("F8", KeyCode::F8, Key::F8),
+            ("F9", KeyCode::F9, Key::F9),
+            ("F10", KeyCode::F10, Key::F10),
+            ("F11", KeyCode::F11, Key::F11),
+            ("F12", KeyCode::F12, Key::F12),
         ];
         for (name, physical, logical) in function_keys {
             assert_eq!(KeyMsg::resolve(name), Some((physical, logical)));
