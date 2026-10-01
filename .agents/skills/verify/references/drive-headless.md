@@ -1,8 +1,8 @@
 # Headless drive — canonical recipes (single source of truth)
 
-Recipes for running Kuluu without a visible window where the host supports
-reliable readback. Choose the Windows or Unix entries for the actual host;
-macOS visual verification uses the companion native-window workflow.
+Agent runs must not open a visible window. Choose the Windows or Unix entries
+for the actual host; on macOS, render to an image target instead of capturing
+an unpresented window surface.
 Companion: `.agents/skills/verify/SKILL.md` (canonical verify recipes + evidence recording).
 
 ## Credentials
@@ -36,14 +36,16 @@ The documented local test credentials are safe for local-stack verification.
 
 1. **Build**: `cargo build -p kuluu --features native-window --release`; run
    `./target/release/kuluu`. Add only the opt-in features the check exercises.
-2. **Render box**: on macOS, use the visible, muted, unfocused native-window
-   workflow in `drive-gui.md`; warn before launch. Hidden Metal readbacks can
-   stay entirely black while the simulation advances. Other Unix hosts may use
-   Surface A with `KULUU_WINDOW_HIDDEN=1`; inspect the capture before trusting it.
-3. **Pixels**: on macOS, use `scripts/capture.sh` with the exact test socket/PID.
-   Its one-time raise can recover a black readback; if it cannot, use the
-   window-only video fallback in `drive-gui.md`. Check changing poses or scene
-   content against the command trace. `cap-window.ps1` is Windows-only.
+2. **Render box**: on macOS, use an off-screen `RenderTarget::Image` and
+   `Screenshot::image`; hidden window-surface readbacks can remain black.
+   Create no primary window, disable `WinitPlugin` and `AudioPlugin`, and use
+   `ScheduleRunnerPlugin` for a bounded run. Exercise the production systems
+   relevant to the check. The level-up orientation observation records a
+   successful scheduler/particle/material probe using this path.
+3. **Pixels**: configure the target image with `RENDER_ATTACHMENT`, `COPY_SRC`
+   and `TEXTURE_BINDING` usage. Inspect captures at multiple simulation times;
+   log dispatch/readiness separately. A successful image readback does not
+   establish a live-session or input-feel verdict.
 4. **Session, no pixels**: raw stdio with `mktemp -d` + pipe holder (§B2), MCP standalone
    (§B1), TCP injection via `nc` (§B2).
 5. **No server**: `cargo run -p kuluu_noserver_tester --features native-window` (§C).
@@ -55,9 +57,9 @@ The documented local test credentials are safe for local-stack verification.
    full local feature batch, exe synced to repo root. Never an ad-hoc `cargo build -p kuluu --features <subset>`: a
    half-feature binary is not what gets verified and behavior can differ. On other OSes,
    use the native release build above and record the features actually tested.
-2. **Use the host-appropriate capture path.** Windows Surface A/D uses
-   `KULUU_WINDOW_HIDDEN=1`; macOS visual checks follow `drive-gui.md` and warn
-   before opening or raising the test window. Surface B needs no window.
+2. **Never open a visible window for agent runs.** Windows Surface A/D uses
+   `KULUU_WINDOW_HIDDEN=1`; macOS uses the image-target recipe above. Surface B
+   needs no window. Do not fall back to raising a window when readback fails.
 3. **Always mute** launches (`--mute`): a hidden run still decodes and plays BGM/SFX.
 4. **Kill the process when done.** Windows: `taskkill //F //IM kuluu.exe`. Other OSes:
    `pkill -f kuluu`. Check first — never fire a test if one is already running
@@ -148,11 +150,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/cap-window.ps1 kuluu
   `queued ... placements` / weather lines).
 - Output is the window client area at its configured resolution (default 1280x800,
   `FFXI_WINDOW_SIZE=WxH` to change). A black frame does not establish why
-  capture failed. On macOS, follow `drive-gui.md` rather than repeatedly
-  retrying hidden readbacks.
+  capture failed. On macOS, use an image target rather than repeatedly
+  retrying window-surface readbacks.
 - These hidden-window recipes apply where readback works. For macOS, use the
-  native test window and capture fallback above; capture only that window,
-  restore focus after raising it, and stop only task-owned clients.
+  off-screen image-target path above and stop only task-owned clients.
 
 ### Kill
 
