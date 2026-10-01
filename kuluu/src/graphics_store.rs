@@ -237,7 +237,21 @@ pub fn load_or_default() -> (GraphicsSettings, GraphicsStore) {
     }
 }
 
-pub fn persist_graphics_on_change(settings: Res<GraphicsSettings>, state: Res<GraphicsStateRes>) {
+/// While set, `persist_graphics_on_change` stands down. The AnimationTest box's shadow
+/// suppression rewrites `GraphicsSettings` in memory (and hands them back afterwards); neither
+/// the override nor its restore belongs on disk — a run killed mid-box must not leave the user's
+/// own settings altered.
+#[derive(Resource, Default)]
+pub struct GraphicsPersistSuspended(pub bool);
+
+pub fn persist_graphics_on_change(
+    settings: Res<GraphicsSettings>,
+    state: Res<GraphicsStateRes>,
+    suspended: Option<Res<GraphicsPersistSuspended>>,
+) {
+    if suspended.is_some_and(|s| s.0) {
+        return;
+    }
     if !settings.is_changed() {
         return;
     }

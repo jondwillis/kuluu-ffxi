@@ -709,6 +709,7 @@ fn drive_zone_stars(
         ),
         With<StarDome>,
     >,
+    sky_fx: Option<Res<crate::sun_moon::SkyFxOverride>>,
     mut prev_visible: Local<Option<bool>>,
     mut prev_night: Local<Option<f32>>,
 ) {
@@ -725,7 +726,10 @@ fn drive_zone_stars(
     // Stars fade in as the sun drops below the horizon, in both sky styles (both
     // share the gradient dome now).
     let night = (-sky.sun_altitude / STAR_TWILIGHT_BAND_RAD).clamp(0.0, 1.0);
-    let want = if night > 0.0 {
+    // The box's stars checkbox kills the dome whatever the sky says (the clamp in
+    // sun_moon_system can't reach it: this fade reads its own raw sky copy).
+    let fx_off = sky_fx.is_some_and(|ov| ov.stars);
+    let want = if night > 0.0 && !fx_off {
         Visibility::Inherited
     } else {
         Visibility::Hidden

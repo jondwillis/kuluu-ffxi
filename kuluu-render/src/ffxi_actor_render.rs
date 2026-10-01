@@ -1420,7 +1420,9 @@ impl FfxiRenderActor {
         &self.instance_slots
     }
 
-    pub(crate) fn routines(&self) -> &HashMap<DatId, Scheduler> {
+    // pub (not pub(crate)): the AnimationTest box reads an actor's own routine table to merge it
+    // into its lookups.
+    pub fn routines(&self) -> &HashMap<DatId, Scheduler> {
         &self.routines
     }
 

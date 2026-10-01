@@ -25,10 +25,49 @@ use ffxi_dat::scheduler::{StageKind, NO_LOCAL_DIR};
 // velocity and following per-particle keyframe tracks (scale/alpha) by life progress. One retained
 // mesh entity per generator is rebuilt each frame from its live particles — not an entity per
 // particle.
+// The AnimationTest box's kill switches (panel checkboxes in
+// `kuluu::view_native::animation_test_scene`): while set, the lamp halos / wall washes stand down.
+// Only the box inserts them; without them (a real session) everything stays authored. The tick-side
+// consumption lands with the zone-lamp generator work.
 #[derive(Resource, Default)]
+pub struct LampHalosOff(pub bool);
+
+#[derive(Resource, Default)]
+pub struct WallWashOff(pub bool);
+
+/// Tester-only: generator names whose authored alpha is forced to 1.0 at spawn, so an a=0
+/// additive flash (g141/g144) can be inspected in isolation. Absent/empty in production.
+#[derive(Resource, Default)]
+pub struct TestAlphaOverride(pub std::collections::HashSet<[u8; 4]>);
+
+// Retail reference peak (user-verified against the real client at 18:00): at 0.12 the halo
+// reads as lantern light on stone without washing out the wall texture; past roughly 0.6 it
+// covers the stone instead of lighting it.
+// pub: the AnimationTest box seeds its lantern-alpha slider from this default.
+pub const LAMP_ALPHAMAP_LIFT_DEFAULT: f32 = 0.12;
+// Wall-wash slider seed (1.0 = authored alpha) and ceiling.
+pub const WASH_ALPHA_LIFT_DEFAULT: f32 = 0.18;
+pub const WASH_ALPHA_LIFT_MAX: f32 = 2.0;
+
+#[derive(Resource)]
 pub struct ParticleSimulator {
     generators: Vec<LiveGenerator>,
     clock: CelestialClock,
+    // AnimationTest box slider values; the tick-side application lands with the zone-lamp
+    // generator work, so until then these only carry what a capture script set.
+    lamp_halos_lift: f32,
+    wash_alpha_lift: f32,
+}
+
+impl Default for ParticleSimulator {
+    fn default() -> Self {
+        Self {
+            generators: Vec::new(),
+            clock: CelestialClock::default(),
+            lamp_halos_lift: LAMP_ALPHAMAP_LIFT_DEFAULT,
+            wash_alpha_lift: WASH_ALPHA_LIFT_DEFAULT,
+        }
+    }
 }
 
 // The Vana'diel clock inputs the celestial particle opcodes read. research/xim
@@ -50,6 +89,16 @@ impl ParticleSimulator {
 
     pub fn set_celestial_clock(&mut self, clock: CelestialClock) {
         self.clock = clock;
+    }
+
+    /// AnimationTest box lantern-alpha slider (0..1 over the track).
+    pub fn set_lamp_halos_lift(&mut self, lift: f32) {
+        self.lamp_halos_lift = lift.clamp(0.0, 1.0);
+    }
+
+    /// AnimationTest box wall-wash slider (0..WASH_ALPHA_LIFT_MAX over the track).
+    pub fn set_wash_alpha_lift(&mut self, lift: f32) {
+        self.wash_alpha_lift = lift.clamp(0.0, WASH_ALPHA_LIFT_MAX);
     }
 
     // research/xi-model-viewer/ui/js/particle/runtime.js updateAssociatedPosition:
@@ -2350,7 +2399,7 @@ mod tests {
         let owner = Entity::from_raw_u32(1).unwrap();
         let mut sim = ParticleSimulator {
             generators: vec![live(def(60.0, 1.0, 1), 60.0)],
-            clock: CelestialClock::default(),
+            ..ParticleSimulator::default()
         };
         sim.generators[0].origin_routine = Some(RoutineOrigin {
             owner,

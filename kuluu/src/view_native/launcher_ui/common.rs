@@ -790,6 +790,22 @@ fn spawn_titlebar(
                         next.set(LauncherState::Settings);
                     },
                 );
+                #[cfg(feature = "debug-animation_room")]
+                {
+                    bar.spawn(button_bundle(
+                        ButtonBundleProps::default(),
+                        (),
+                        Spawn((Text::new("AnimationTest"), ThemedText)),
+                    ))
+                    .observe(
+                        |_ev: On<Activate>,
+                         mut pending: ResMut<
+                            crate::view_native::animation_test_scene::PendingToggle,
+                        >| {
+                            pending.0 = true;
+                        },
+                    );
+                }
             }
             bar.spawn(Node::default()).with_children(|slot| {
                 let mut btn = slot.spawn(button_bundle(

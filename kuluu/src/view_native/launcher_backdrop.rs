@@ -20,7 +20,7 @@ pub struct LauncherBackdropZone(pub u16);
 pub struct BackdropCamera;
 
 #[derive(Component)]
-struct BackdropScoped;
+pub(crate) struct BackdropScoped;
 
 #[derive(Resource, Default)]
 struct PendingBackdropSwap {
@@ -139,6 +139,14 @@ fn spawn_backdrop_camera(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
+    spawn_backdrop_core(&mut commands, &mut meshes, &mut materials);
+}
+
+pub(crate) fn spawn_backdrop_core(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+) {
     let cam = commands
         .spawn((
             BackdropCamera,
@@ -196,12 +204,45 @@ fn despawn_backdrop_camera(mut commands: Commands, q: Query<Entity, With<Backdro
     commands.remove_resource::<BackdropFadeMaterial>();
 }
 
-fn mirror_backdrop_to_scene_state(zone: Res<LauncherBackdropZone>, mut scene: ResMut<SceneState>) {
+// The AnimationTest box owns the world while open (its teardown restores the default zone), so
+// the mirror stands down instead of reloading the block under it.
+fn mirror_backdrop_to_scene_state(
+    zone: Res<LauncherBackdropZone>,
+    mut scene: ResMut<SceneState>,
+    q_box: Query<(), With<super::animation_test_scene::TestSceneScoped>>,
+) {
+    if q_box.iter().next().is_some() {
+        return;
+    }
     let desired = Some(zone.0);
     if scene.snapshot.zone_id == desired {
         return;
     }
     scene.snapshot.zone_id = desired;
+}
+
+// The render-side backdrop goes down while the test box is open (its order-0 window camera
+// collides with the box's operator marker). Zone state stays untouched: clearing the snapshot
+// would trip the auto-load teardown (despawn + MMB queue clear) mid-session and case loads
+// depend on that bookkeeping; hiding the standing zone block is the test scene's own sweep.
+pub(crate) fn unload_for_test(
+    commands: &mut Commands,
+    q_scoped: &Query<Entity, With<BackdropScoped>>,
+) {
+    for e in q_scoped.iter() {
+        commands.entity(e).try_despawn();
+    }
+    commands.remove_resource::<BackdropFadeMaterial>();
+}
+
+/// AnimationTest close: camera/light/fade-quad come back. Zone state was never touched on open,
+/// so nothing else needs restoring.
+pub(crate) fn restore_for_test(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+) {
+    spawn_backdrop_core(commands, meshes, materials);
 }
 
 fn update_backdrop_from_selection(
