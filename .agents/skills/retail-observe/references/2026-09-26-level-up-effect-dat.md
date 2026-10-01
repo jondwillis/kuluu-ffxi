@@ -1,10 +1,11 @@
 # Level-up effect DAT, 2026-09-26
 
 Static mapping of the level-up effect routine and its file id in this install
-(`C:\PhoenixXI\SquareEnix\FINAL FANTASY XI`, VTABLE/FTABLE walk). Kuluu plays
-the SFX half of s2c `0x029` BATTLE_MESSAGE msg_num=9 already (kuluu-session
-`emit_battle_message_audio_event` → `AgentEvent::LevelUp`); this record pins the
-motion half: which file, and under what routine name.
+(`C:\PhoenixXI\SquareEnix\FINAL FANTASY XI`, VTABLE/FTABLE walk). The s2c `0x029` BATTLE_MESSAGE msg_num=9 emits a level-up notification
+(kuluu-session `emit_battle_message_audio_event` → `AgentEvent::LevelUp`); that
+notification alone does not establish sound playback. This record pins the
+effect file and routine name. See [the sound investigation](2026-10-01-level-up-sound.md)
+for the authored sound stage and playback limits.
 
 ## Findings
 

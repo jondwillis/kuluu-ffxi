@@ -1746,6 +1746,7 @@ pub fn dispatch_sound_stages(
     q_children: Query<&Children>,
     q_render: Query<&crate::ffxi_actor_render::FfxiRenderActor>,
     q_target: Query<&ActionTarget>,
+    q_self: Query<(), With<IsSelf>>,
     // `Transform`, not `GlobalTransform`, for the same reason spawn_particle_generators reads
     // it: world entities are roots, and a frame-0 stage fires on the insert frame, before
     // PostUpdate has propagated anything — a `GlobalTransform` read there is Ok-but-identity,
@@ -1762,6 +1763,20 @@ pub fn dispatch_sound_stages(
         ) {
             continue;
         }
+        if ev.stage.stage.raw_type == ffxi_dat::scheduler::PLAYER_ONLY_SOUND_OPCODE
+            && q_self
+                .get(
+                    q_target
+                        .get(ev.actor)
+                        .ok()
+                        .and_then(|t| t.0)
+                        .unwrap_or(ev.actor),
+                )
+                .is_err()
+        {
+            continue;
+        }
+
         // research/xim EffectRoutineInstance.kt appendChildSequences,592-604 — routine DAT, then the actor's
         // own resource dirs (weapon `skaz`, face `atk1..4`), then the global dir.
         let actor_assets = q_children
@@ -4161,6 +4176,52 @@ mod tests {
         std::mem::take(&mut app.world_mut().resource_mut::<CapturedSfx>().0)
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn player_only_sound_uses_the_local_target_without_gating_global_sounds() {
+        const STAGE_ID: [u8; 4] = *b"se01";
+        const SE_ID: u32 = 4242;
+        const GLOBAL_SOUND_OPCODE: u8 = 0x60;
+        for (raw_type, target_is_self, expected_count) in [
+            (ffxi_dat::scheduler::PLAYER_ONLY_SOUND_OPCODE, true, 1),
+            (ffxi_dat::scheduler::PLAYER_ONLY_SOUND_OPCODE, false, 0),
+            (GLOBAL_SOUND_OPCODE, false, 1),
+        ] {
+            let mut app = App::new();
+            app.add_message::<SchedulerStageEvent>()
+                .add_message::<crate::audio::SfxEvent>()
+                .init_resource::<CapturedSfx>()
+                .add_systems(Update, (dispatch_sound_stages, capture_sfx).chain());
+            let target = app.world_mut().spawn_empty().id();
+            if target_is_self {
+                app.world_mut().entity_mut(target).insert(IsSelf);
+            }
+            let actor = app
+                .world_mut()
+                .spawn((
+                    sep_assets(STAGE_ID, SE_ID),
+                    ActionTarget(Some(target)),
+                    IsSelf,
+                ))
+                .id();
+            app.world_mut().write_message(SchedulerStageEvent {
+                actor,
+                stage: stage(0, StageKind::SoundNonPositional, raw_type, STAGE_ID),
+                scheduler: *b"test",
+            });
+            app.update();
+            let got = &app.world().resource::<CapturedSfx>().0;
+            assert_eq!(
+                got.len(),
+                expected_count,
+                "opcode {raw_type:#x}, self={target_is_self}"
+            );
+            if let Some(sound) = got.first() {
+                assert_eq!(sound.se_id, SE_ID);
+            }
+        }
+    }
+
     /// The spatial SE path: an impact mixes from where the victim is standing, not from the
     /// attacker, and neither may fall back to a 2D cue.
     #[cfg(not(target_arch = "wasm32"))]
@@ -5008,9 +5069,29 @@ mod tests {
             "file id {LEVEL_UP_EFFECT_DAT_ID} must resolve to ROM/13/35.DAT, got {lossy}"
         );
         let bytes = std::fs::read(&path).expect("level-up DAT is readable");
-        let (schedulers, _, _) = parse_action_bytes(&bytes);
+        let (schedulers, assets, _) = parse_action_bytes(&bytes);
         let active = ActiveScheduler::from_main(&schedulers, b"main")
             .expect("the lvup DAT ships a main routine");
+        const LEVEL_UP_PINNED_SE_ID: u32 = 7;
+        let sound = active
+            .stages
+            .iter()
+            .find(|t| t.stage.raw_type == ffxi_dat::scheduler::PLAYER_ONLY_SOUND_OPCODE)
+            .expect("level-up has an authored player-only sound");
+        assert_eq!(sound.frame, 0);
+        let (se_id, _) = ffxi_dat::action::resolve_stage_to_se(
+            &sound.stage.id,
+            sound.stage.kind,
+            &assets.generators,
+            &assets.seps,
+        )
+        .expect("the sound stage resolves its local SEP");
+        assert_eq!(se_id, LEVEL_UP_PINNED_SE_ID);
+        let audio = ffxi_audio::find_audio(root.root(), ffxi_audio::AudioKind::Sfx, se_id)
+            .expect("the authored SPW is installed");
+        let decoded = ffxi_audio::decode_file(audio).expect("level-up audio decodes");
+        assert!(!decoded.samples.is_empty());
+        assert!(decoded.samples.iter().any(|s| *s != 0.0));
         assert!(
             !active.stages.is_empty(),
             "the lvup main routine has stages"
