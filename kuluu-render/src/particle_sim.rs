@@ -1066,6 +1066,10 @@ fn advance_generator(g: &mut LiveGenerator, frames: f32) {
         if position_updater {
             p.pos += p.vel * frames;
         }
+        // FFXiMain.dll retail-2026-09 VA 0x1004C6CB: authored damping raised to renderer delta.
+        if let Some([damping, _]) = g.def.velocity_dampener {
+            p.vel *= damping.powf(frames);
+        }
         // sec3 0x29/0x2A/0x2B OscillationApplier (X/Y/Z): after the base position step, add
         // the amplitude change over the tick per active axis (research/xim
         // ParticleUpdaters.kt OscillationApplier — particle.position += direction × delta).
@@ -2356,6 +2360,28 @@ mod tests {
     // 0x1E ParticleDampen: emission stops and the already-live particles are force-expired
     // at once (research/xim EffectRoutineInstance.kt handleParticleEffectDampen), unlike
     // StopParticle which lets them play out.
+    #[test]
+    fn authored_velocity_damping_applies_after_position_with_fractional_delta() {
+        const DAMPING_PER_FRAME: f32 = 0.25;
+        const HALF_FRAME: f32 = 0.5;
+        let mut d = def(60.0, 1.0, 1);
+        d.velocity_dampener = Some([DAMPING_PER_FRAME, 0.0]);
+        let mut g = live(d, 0.0);
+        emit(&mut g, 60.0);
+        g.stopped = true;
+        g.particles[0].pos = Vec3::ZERO;
+        g.particles[0].vel = Vec3::X;
+        advance_generator(&mut g, HALF_FRAME);
+        assert_eq!(g.particles[0].pos, Vec3::X * HALF_FRAME);
+        assert_eq!(g.particles[0].vel, Vec3::X * HALF_FRAME);
+        advance_generator(&mut g, HALF_FRAME);
+        assert_eq!(
+            g.particles[0].pos,
+            Vec3::X * (HALF_FRAME + DAMPING_PER_FRAME)
+        );
+        assert_eq!(g.particles[0].vel, Vec3::X * DAMPING_PER_FRAME);
+    }
+
     #[test]
     fn dampen_generator_stops_emission_and_clears_live_particles() {
         let owner = Entity::from_raw_u32(1).unwrap();
@@ -5959,6 +5985,22 @@ mod tests {
                 .path_under(&root),
         )
         .unwrap();
+        let g000_raw = ffxi_dat::chunk::walk(&bytes)
+            .flatten()
+            .find(|c| c.name == *b"g000")
+            .expect("level-up DAT contains the lettering generator");
+        const TEST_PINNED_POSITION_HEADER: u32 = 0x8102;
+        const TEST_PINNED_DAMPING_HEADER: u32 = 0x832c;
+        let header_offset = |header: u32| {
+            g000_raw
+                .data
+                .windows(size_of::<u32>())
+                .position(|bytes| bytes == header.to_le_bytes())
+                .expect("level-up DAT carries the updater header")
+        };
+        assert!(
+            header_offset(TEST_PINNED_POSITION_HEADER) < header_offset(TEST_PINNED_DAMPING_HEADER)
+        );
         let (schedulers, assets, _) = parse_action_bytes(&bytes);
         let stage = schedulers
             .iter()
@@ -5997,7 +6039,16 @@ mod tests {
         assert!(g.def.init_velocity[1] < 0.0);
         advance_generator(g, FIRST_TICK_FRAMES);
         assert_eq!(g.particles.len(), 1);
+        let initial_velocity = g.particles[0].vel;
+        let authored_damping = g
+            .def
+            .velocity_dampener
+            .expect("level-up lettering has authored damping")[0];
         advance_generator(g, FIRST_TICK_FRAMES);
+        assert_eq!(
+            g.particles[0].vel,
+            initial_velocity * authored_damping.powf(FIRST_TICK_FRAMES)
+        );
         assert_eq!(g.particles.len(), 1);
         assert!(
             g.particles[0].pos.y > 0.0,

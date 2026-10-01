@@ -46,7 +46,16 @@ Capstone, rather than accepted from those reconstructions.
   adding it to position. Opcode `0x2C`, VA `0x1004C6CB`, feeds the authored
   damping and that delta into the power routine at `0x10312C90` before scaling
   the velocity. This is exponential damping, not a constant linear slowdown.
-  The caller chain that produces the renderer delta's units was not traced.
+- Renderer update VA `0x10069F90` initially computes wall milliseconds times
+  `0.001` (constant VA `0x1032A22C`) times `60` (VA `0x10329CE8`). It then
+  overwrites the element delta with GameManager getter `0x10014CF0`.
+  That getter returns `max(GameManager + 0x28, 1)`: the x87 comparison and
+  parity branch must be interpreted together. The producer at `0x10012B35`
+  sets that field to `60 / effective_framerate`; its alternate path smooths,
+  rounds and bounds the scale. Thus ordinary 30-FPS presentation supplies two
+  60-Hz units per element update. The level-up 150-unit life is 2.5 seconds
+  at that rate. The one-unit floor is a retail high-FPS limitation, not a
+  requirement to reproduce game speed changing above 60 FPS in Kuluu.
 
 ## Actual level-up tracks
 
@@ -76,4 +85,5 @@ static frame or low-frame-rate video cannot isolate those from sampling or
 presentation artifacts. Do not add a generic shimmer or ease every track based
 on memory of the retail effect. Capture clean retail and Kuluu at matched camera,
 install, time scale and recording frame rate before judging the remaining
-appearance, and trace the renderer delta producer if timing is disputed.
+appearance. Exact frame-by-frame identity can differ with Kuluu's fractional
+high-FPS integration even when the effect's time units and duration agree.
