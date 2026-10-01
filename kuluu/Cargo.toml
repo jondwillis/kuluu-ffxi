@@ -86,6 +86,10 @@ enhanced-engage-move-lock-off = ["kuluu-render?/enhanced-engage-move-lock-off"]
 # with on-screen + stderr logging, before any server login. Kuluu-local (no render side),
 # so no sub-features; the local build script enables it. Vanilla builds omit it.
 debug-animation_room = []
+# Enhanced (non-retail) `//targetname` slash command: target the nearest
+# NPC/mob/pet by exact name. Kuluu-local (no render side), so no sub-features;
+# the local release build script enables it. Vanilla builds omit it.
+enhanced-targetname = []
 # Enable the WebSocket relay listener (`--relay-listen <addr>` global flag).
 # Publishes the same `kuluu-snapshot` frames the in-process bridge produces,
 # so external tools (and the future wasm browser viewer) can consume the
