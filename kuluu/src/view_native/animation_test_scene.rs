@@ -18,44 +18,12 @@ use kuluu_render::ffxi_actor_render::{
 };
 use kuluu_render::scene::TrackedEntities;
 use kuluu_render::scheduler_runtime::{
-    enqueue_routine, parse_action_bytes_reporting, ActionDatRoot, ActionTarget, ActiveScheduler,
-    GlobalEffectDir, RoutineLookup,
+    enqueue_routine, parse_action_bytes_reporting, stage_summary, ActionDatRoot, ActionTarget,
+    ActiveScheduler, GlobalEffectDir, ParticleSpawnTrace, RoutineLookup, VfxTrace,
+    LEVEL_UP_EFFECT_DAT_ID,
 };
 use kuluu_render::snapshot::{EventLog, SceneState};
 use kuluu_snapshot::EntityKind;
-
-/// The level-up effect DAT: the rank-up path runs its `main` routine on the local player with the
-// player as its own target — the event VM's local-player scheduler does exactly this
-// (ffxi-event opcode 0x7D, research/XiEvents/OpCodes/0x007D.md); this file is what a level-up
-// resolves to.
-const LEVEL_UP_EFFECT_DAT_ID: u32 = 3310;
-
-fn fourcc(name: [u8; 4]) -> String {
-    ffxi_dat::datid::DatId::from_name(&name).as_str()
-}
-
-// What the panel shows for each fired routine: its particle/sound/flinch stage ids, so a press's
-// path is visible next to the case log without reading stderr.
-fn stage_summary(active: &ActiveScheduler) -> String {
-    let mut parts = Vec::new();
-    for t in &active.stages {
-        match t.stage.kind {
-            ffxi_dat::scheduler::StageKind::Particle => parts.push(fourcc(t.stage.id)),
-            ffxi_dat::scheduler::StageKind::SoundOnCaster
-            | ffxi_dat::scheduler::StageKind::SoundOnTarget => {
-                parts.push(format!("sfx {}", fourcc(t.stage.id)))
-            }
-            ffxi_dat::scheduler::StageKind::FlinchOnCaster
-            | ffxi_dat::scheduler::StageKind::FlinchOnTarget => parts.push("flinch".into()),
-            _ => {}
-        }
-    }
-    if parts.is_empty() {
-        "no particle/sound/flinch stages".to_string()
-    } else {
-        parts.join(", ")
-    }
-}
 
 // Carrion Worm family model (kuluu-render/tests/rabbit_tester.rs S12 load).
 const WORM_FILE: u32 = 1724;
@@ -559,6 +527,7 @@ impl Plugin for AnimationTestScenePlugin {
                     zone_backdrop_visibility,
                     watch_wires,
                     sync_case_buttons,
+                    collect_spawn_traces,
                     sync_log_text,
                 )
                     .chain()
@@ -665,6 +634,9 @@ fn handle_toggle(
             &mut meshes,
             &mut materials,
         );
+        // The dispatch funnel's info! traces (routine resolution, particle defs/meshes) are
+        // gated on this; the box is where they earn their keep.
+        commands.insert_resource(VfxTrace(false));
         log_line(&mut log, "scene down".into());
         return;
     }
@@ -674,6 +646,7 @@ fn handle_toggle(
     drawn_check.parts_ok = true;
     hp.hume = TEST_MAX_HP;
     hp.worm = TEST_MAX_HP;
+    commands.insert_resource(VfxTrace(true));
     activate_test_scene(
         &mut commands,
         &mut meshes,
@@ -1500,6 +1473,19 @@ fn handle_case_presses(
     }
 }
 
+fn collect_spawn_traces(
+    mut traces: MessageReader<ParticleSpawnTrace>,
+    q_scoped: Query<Entity, With<TestSceneScoped>>,
+    mut log: ResMut<TestLog>,
+) {
+    if q_scoped.iter().next().is_none() {
+        return;
+    }
+    for t in traces.read() {
+        log_line(&mut log, t.0.clone());
+    }
+}
+
 // Grey the case buttons out while a case window runs; restore them when it elapses.
 fn sync_case_buttons(
     lock: Res<CaseLock>,
@@ -1906,6 +1892,8 @@ fn fire_single_gen(
         model_visibility: None,
         spell_effect: None,
         random_group: None,
+        sound_range: None,
+        control_flow: None,
         local_dir: ffxi_dat::scheduler::NO_LOCAL_DIR,
     };
     let sched = ffxi_dat::scheduler::Scheduler {
@@ -2079,6 +2067,8 @@ fn fire_zone_i900(
                 model_visibility: None,
                 spell_effect: None,
                 random_group: None,
+                sound_range: None,
+                control_flow: None,
                 local_dir: *b"fefs",
             },
         }],

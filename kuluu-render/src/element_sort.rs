@@ -31,6 +31,13 @@ pub fn transparent_sort_bias(def: &ParticleGeneratorDef, dat_offset: usize) -> f
     }
 }
 
+/// Stable pinned-priority order for the lamp glow sheets: depth-sorted halos re-sort against
+/// each other frame to frame as the camera moves (the under/over "dancing"), so they pin in
+/// chunk order like retail's fixed-lane glows.
+pub fn pinned_order_bias(dat_offset: usize) -> f32 {
+    PINNED_DISTANCE + dat_offset as f32 * DAT_ORDER_STEP
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

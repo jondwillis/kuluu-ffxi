@@ -812,6 +812,8 @@ mod tests {
                 model_visibility: None,
                 spell_effect: None,
                 random_group: None,
+                sound_range: None,
+                control_flow: None,
                 local_dir: ffxi_dat::scheduler::NO_LOCAL_DIR,
             },
         }

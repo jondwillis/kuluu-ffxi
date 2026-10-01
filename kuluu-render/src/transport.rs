@@ -397,6 +397,8 @@ mod tests {
                 }),
                 screen_color: None,
                 random_group: None,
+                sound_range: None,
+                control_flow: None,
                 local_dir: [0; 4],
             },
         }

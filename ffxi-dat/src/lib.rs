@@ -111,6 +111,16 @@ pub enum DatError {
 
     #[error("FFXiMain.dll marker {hint:#010x} not found")]
     DllMarkerNotFound { hint: u32 },
+
+    /// A generator's StandardParticleSetup linked_data_type byte names a kind the reader does
+    /// not recognise. The chunk is refused (nothing renders for it) and the caller reports this
+    /// with the generator, the raw kind byte and the linked data id — never a guessed fallback.
+    #[error("generator {name:?}: unknown linked_data_type {kind:#04x} (linked id {linked_id:?})")]
+    UnknownLinkedDataType {
+        name: [u8; 4],
+        kind: u8,
+        linked_id: [u8; 4],
+    },
 }
 
 pub type Result<T> = std::result::Result<T, DatError>;

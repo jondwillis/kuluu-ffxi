@@ -27,11 +27,11 @@ const RANDOM_BLOCK_CLOSE: u8 = 0x3E;
 
 // research/xim EffectRoutineParser.kt parseSection2 — 0x64/0x67 ControlFlowBranch, 0x69/0x6A
 // ControlFlowBlock, 0x6B ControlFlowCondition.
-const CONTROL_FLOW_BRANCH_TRUE: u8 = 0x64;
-const CONTROL_FLOW_BRANCH_FALSE: u8 = 0x67;
-const CONTROL_FLOW_BLOCK_OPEN: u8 = 0x69;
-const CONTROL_FLOW_BLOCK_CLOSE: u8 = 0x6A;
-const CONTROL_FLOW_CONDITION: u8 = 0x6B;
+pub const CONTROL_FLOW_BRANCH_TRUE: u8 = 0x64;
+pub const CONTROL_FLOW_BRANCH_FALSE: u8 = 0x67;
+pub const CONTROL_FLOW_BLOCK_OPEN: u8 = 0x69;
+pub const CONTROL_FLOW_BLOCK_CLOSE: u8 = 0x6A;
+pub const CONTROL_FLOW_CONDITION: u8 = 0x6B;
 const ANIMATION_LOCK_OPCODE: u8 = 0x07;
 const ANIMATION_LOCK_MAGIC_OPCODE: u8 = 0x59;
 // research/xim EffectRoutineParser.kt parseSection2 — the argument-less stages: StartRoutineMarker,
@@ -104,6 +104,14 @@ const MODEL_TRANSFORM_SUBCHUNK_OFFSET: usize = 20;
 const FLINCH_ANIMATION_DURATION_OFFSET: usize = 24;
 const FLINCH_PAYLOAD_LEN: usize = FLINCH_ANIMATION_DURATION_OFFSET + 4;
 
+// research/xim EffectRoutineParser.kt parseSoundEffectEmitter — after id(+8) come a zero32(+12),
+// an unused u32(+16), far f32(+20), near f32(+24) and an unused f32(+28): the emitter's own
+// AudioRangeSetup. A stage shorter than this ships no authored range; Calc3D substitutes its
+// class defaults for a 0.0 (CYySepRes.cpp CYySepRes::Calc3D).
+const SOUND_FAR_OFFSET: usize = ID_OFFSET + 12;
+const SOUND_NEAR_OFFSET: usize = ID_OFFSET + 16;
+const SOUND_EMITTER_PAYLOAD_LEN: usize = SOUND_NEAR_OFFSET + 4;
+
 // research/xim EffectRoutineParser.kt parseSection2, 0x5E / 0xBF: after delay/duration the
 // knockback payload is u16, u16, f32 animationDuration, f32, u32. The duration is how long
 // the victim's bf0? knock-down plays before the bf1? stand-up
@@ -116,7 +124,7 @@ const KNOCKBACK_DURATION_PAYLOAD_LEN: usize = KNOCKBACK_ANIMATION_DURATION_OFFSE
 pub const MODEL_TRANSFORM_SUBCHUNK_SLOTS: u32 =
     crate::mzb::UNDERSCORE_AT_GROUP_MAX_SUBCHUNKS as u32;
 
-const NO_STAGE_ID: [u8; 4] = [0; 4];
+pub const NO_STAGE_ID: [u8; 4] = [0; 4];
 
 /// The MODULATE2X argument that leaves the scene untinted. research/XIClient
 /// `GameManager::RenderSomething` composites the persistent screen colour with
@@ -258,6 +266,15 @@ pub struct SchedulerStage {
     // `NO_STAGE_ID` there.
     pub spell_effect: Option<u32>,
 
+    // `Some` for the sound-emitter kinds when the stage carries the full emitter payload:
+    // the authored AudioRangeSetup `(far, near)` floats (research/xim EffectRoutineParser.kt
+    // parseSoundEffectEmitter). A shipped 0.0 is not "silent" — Calc3D substitutes its class
+    // defaults for it (CYySepRes.cpp CYySepRes::Calc3D).
+    pub sound_range: Option<(f32, f32)>,
+
+    // `Some` for CONTROL_FLOW_CONDITION stages (ROM/0/0.DAT dam0/daml/crtl switch tests); payload, not a DatId.
+    pub control_flow: Option<ControlFlowArg>,
+
     // research/xim EffectRoutineParser.kt parseSection2,553-559 — stages between a 0x3D and its 0x3E
     // are children of one RandomChildRoutine, not siblings on the timeline: retail runs exactly
     // one of them per activation (`vatk`'s four atk1..atk4 grunts). Members of the same block
@@ -271,6 +288,18 @@ pub struct SchedulerStage {
     // on the stage because a flatten merges many routines into one timeline. All-zero when the
     // routine was parsed without directory context.
     pub local_dir: [u8; 4],
+}
+
+// ROM/0/0.DAT dam0 switch-test word ops (LE u32s of the byte runs `1C 00 03 00` / `1C 00 01 00`).
+pub const CF_FIELD_SELECTOR_OP: u32 = 0x0003_001C;
+pub const CF_COMPARE_VALUE_OP: u32 = 0x0001_001C;
+
+// One condition word of a ROM/0/0.DAT dam0/daml/crtl switch test; `op` names the field selector
+// or compare value, any other op terminates the test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ControlFlowArg {
+    pub op: u32,
+    pub operand: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -692,6 +721,27 @@ impl Scheduler {
                 let spell_effect = payload
                     .filter(|_| kind == StageKind::SpellEffect)
                     .map(u32::from_le_bytes);
+                // research/xim EffectRoutineParser.kt parseSoundEffectEmitter — id(+8),
+                // zero32(+12), unused u32(+16), far f32(+20), near f32(+24). A short stage
+                // ships no range; Calc3D substitutes the class defaults for a 0.0.
+                let sound_range = (stage_bytes >= SOUND_EMITTER_PAYLOAD_LEN
+                    && matches!(
+                        kind,
+                        StageKind::SoundOnCaster
+                            | StageKind::SoundOnTarget
+                            | StageKind::SoundNonPositional
+                    ))
+                .then(|| {
+                    (
+                        f32::from_bits(read_u32(SOUND_FAR_OFFSET)),
+                        f32::from_bits(read_u32(SOUND_NEAR_OFFSET)),
+                    )
+                });
+                // Switch-test words are payload, not a DatId.
+                let control_flow = (raw_type == CONTROL_FLOW_CONDITION).then(|| ControlFlowArg {
+                    op: read_u32(ID_OFFSET),
+                    operand: (stage_bytes >= 16).then(|| read_u32(ID_OFFSET + 4)),
+                });
                 let flinch_duration = match kind {
                     StageKind::FlinchOnCaster | StageKind::FlinchOnTarget
                         if stage_bytes >= FLINCH_PAYLOAD_LEN =>
@@ -710,6 +760,7 @@ impl Scheduler {
                     || actor_fade.is_some()
                     || idle_transition_time.is_some()
                     || model_visibility.is_some()
+                    || control_flow.is_some()
                     || matches!(
                         kind,
                         StageKind::FlinchOnCaster
@@ -761,6 +812,8 @@ impl Scheduler {
                         flinch_duration,
                         model_visibility,
                         spell_effect,
+                        sound_range,
+                        control_flow,
                         random_group: open_group,
                         local_dir,
                     },

@@ -514,6 +514,19 @@ run_comments() {
   return $bad
 }
 
+# Windows Python installs often expose only `python`; a gate must not silently
+# no-op just because the `python3` alias is absent. Prints the working
+# interpreter, or nothing if neither exists.
+python_bin() {
+  local cmd
+  for cmd in python3 python; do
+    if command -v "$cmd" >/dev/null 2>&1 && "$cmd" --version >/dev/null 2>&1; then
+      command -v "$cmd"
+      return 0
+    fi
+  done
+}
+
 run_literals() {
   # A meaningful integer literal (>= 1000, not a power of two or round number)
   # that some const in the same crate or a dependency already names must be
@@ -522,13 +535,15 @@ run_literals() {
   #   LITERALS_DIFF=staged   staged hunks (pre-commit)
   #   LITERALS_DIFF=tree     the whole tree (the debt list)
   #   default                lines added since the merge-base with origin/main
-  if ! command -v python3 >/dev/null 2>&1; then
-    echo "checks: literals - skipped (no python3)"
+  local py
+  py=$(python_bin)
+  if [ -z "$py" ]; then
+    echo "checks: literals - skipped (no python3/python)"
     return 0
   fi
   case "${LITERALS_DIFF:-}" in
-    staged) python3 scripts/literal-reuse.py --staged ;;
-    tree) python3 scripts/literal-reuse.py ;;
+    staged) "$py" scripts/literal-reuse.py --staged ;;
+    tree) "$py" scripts/literal-reuse.py ;;
     *)
       local base
       base=${COMMENTS_BASE:-$(git merge-base HEAD origin/main 2>/dev/null || true)}
@@ -536,7 +551,7 @@ run_literals() {
         echo "checks: literals - skipped (no merge-base with origin/main)"
         return 0
       fi
-      python3 scripts/literal-reuse.py --base "$base" ;;
+      "$py" scripts/literal-reuse.py --base "$base" ;;
   esac
 }
 

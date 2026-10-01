@@ -619,6 +619,14 @@ pub struct SfxEvent {
 
     // World-space emitter. `None` is a 2D cue (UI, system, zone ambient bed) that mixes dry.
     pub emitter: Option<Vec3>,
+
+    /// The authored AudioRangeSetup `(near, far)` from the routine stage payload; `None`
+    /// keeps the client point-source law in [`sfx_mix_volume`]. A shipped 0.0 is not
+    /// "unauthored" — Calc3D substitutes its class defaults for it.
+    pub range: Option<(f32, f32)>,
+
+    /// Calc3D vertical weighting: 3x for attached emitters, 1x for zone-static.
+    pub vertical_weight: f32,
 }
 
 impl SfxEvent {
@@ -627,12 +635,24 @@ impl SfxEvent {
             se_id,
             volume: 1.0,
             emitter: None,
+            range: None,
+            vertical_weight: UNATTACHED_VERTICAL_WEIGHT,
         }
     }
 
     pub fn at(se_id: u32, emitter: Vec3) -> Self {
         Self {
             emitter: Some(emitter),
+            ..Self::new(se_id)
+        }
+    }
+
+    /// A positional cue carrying its authored AudioRangeSetup falloff.
+    pub fn at_ranged(se_id: u32, emitter: Vec3, near: f32, far: f32, vertical_weight: f32) -> Self {
+        Self {
+            emitter: Some(emitter),
+            range: Some((near, far)),
+            vertical_weight,
             ..Self::new(se_id)
         }
     }
@@ -697,7 +717,14 @@ pub fn sfx_debug_line(ev: &SfxEvent, listener: Option<Vec3>, volume: f32) -> Str
 // than silent.
 pub fn sfx_mix_volume(ev: &SfxEvent, listener: Option<Vec3>) -> f32 {
     let attenuation = match (ev.emitter, listener) {
-        (Some(emitter), Some(listener)) => sfx_attenuation(listener, emitter),
+        (Some(emitter), Some(listener)) => match ev.range {
+            // Authored ranges ride the retail Calc3D law; unauthored cues keep the client
+            // point-source model so zone beds and UI-anchored emitters mix as before.
+            Some((near, far)) => {
+                sfx_attenuation_calc3d(listener, emitter, near, far, ev.vertical_weight)
+            }
+            None => sfx_attenuation(listener, emitter),
+        },
         _ => 1.0,
     };
     (ev.volume * attenuation).clamp(0.0, 1.0)
