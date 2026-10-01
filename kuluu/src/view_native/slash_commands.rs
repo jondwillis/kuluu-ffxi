@@ -134,6 +134,42 @@ fn cycle_npc(c: &SlashCtx, reverse: bool) -> SlashOutcome {
     }
 }
 
+#[cfg(feature = "enhanced-targetname")]
+fn target_by_name(c: &SlashCtx) -> SlashOutcome {
+    let name = c.rest.trim();
+    if name.is_empty() {
+        return SlashOutcome::SystemMessage("//targetname: usage: //targetname <name>".into());
+    }
+    let kinds = [
+        kuluu_snapshot::EntityKind::Npc,
+        kuluu_snapshot::EntityKind::Mob,
+        kuluu_snapshot::EntityKind::Pet,
+    ];
+    let needle = name.to_ascii_lowercase();
+    let mut matches: Vec<&WireEntity> = c
+        .entities
+        .iter()
+        .filter(|e| {
+            kinds.contains(&e.kind)
+                && e.name
+                    .as_deref()
+                    .map(|n| n.to_ascii_lowercase() == needle)
+                    .unwrap_or(false)
+        })
+        .collect();
+    if matches.is_empty() {
+        return SlashOutcome::SystemMessage(format!("//targetname: no {name} in sight"));
+    }
+    // Stable areas name several actors alike (two "Chocobo"s at the stables);
+    // the nearest is the one the player is standing in front of.
+    matches.sort_by(|a, b| {
+        let da = sq_dist(a.pos, c.self_pos);
+        let db = sq_dist(b.pos, c.self_pos);
+        da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    SlashOutcome::SetTarget(Some(matches[0].id))
+}
+
 fn unknown_command(cmd: &str) -> SlashOutcome {
     SlashOutcome::SystemMessage(format!("unknown command: /{cmd}"))
 }
@@ -385,6 +421,14 @@ const COMMANDS: &[(&str, &[Command])] = &[
                 usage: "",
                 summary: "cycle nearest NPC/mob/pet",
                 handler: |c| cycle_npc(c, false),
+            },
+            #[cfg(feature = "enhanced-targetname")]
+            Command {
+                names: &["targetname"],
+                set: CommandSet::Core,
+                usage: "<name>",
+                summary: "target the nearest NPC/mob/pet with this exact name",
+                handler: |c| target_by_name(c),
             },
             Command {
                 names: &["targetbnpc"],
@@ -3351,6 +3395,54 @@ mod tests {
             parse_slash_t("/targetnpc", &entities, origin(), Some(3), None),
             SlashOutcome::SetTarget(Some(1))
         ));
+    }
+
+    #[cfg(feature = "enhanced-targetname")]
+    #[test]
+    fn targetname_targets_the_named_entity() {
+        let entities = vec![
+            ent(1, "Goblin", EntityKind::Mob, 3.0, 0.0),
+            ent(2, "Mairee", EntityKind::Npc, 5.0, 0.0),
+            ent(3, "Chocobo", EntityKind::Npc, 7.0, 0.0),
+            ent(4, "Mairee", EntityKind::Pc, 1.0, 0.0),
+        ];
+        // Case-insensitive exact match; a PC with the same name is not a target.
+        assert!(matches!(
+            parse_slash_t("//targetname mairee", &entities, origin(), None, None),
+            SlashOutcome::SetTarget(Some(2))
+        ));
+        assert!(matches!(
+            parse_slash_t("//targetname CHOCOBO", &entities, origin(), None, None),
+            SlashOutcome::SetTarget(Some(3))
+        ));
+    }
+
+    #[cfg(feature = "enhanced-targetname")]
+    #[test]
+    fn targetname_picks_the_nearest_of_same_named() {
+        let entities = vec![
+            ent(1, "Chocobo", EntityKind::Npc, 9.0, 0.0),
+            ent(2, "Chocobo", EntityKind::Npc, 2.0, 0.0),
+            ent(3, "Goblin", EntityKind::Mob, 1.0, 0.0),
+        ];
+        assert!(matches!(
+            parse_slash_t("//targetname Chocobo", &entities, origin(), None, None),
+            SlashOutcome::SetTarget(Some(2))
+        ));
+    }
+
+    #[cfg(feature = "enhanced-targetname")]
+    #[test]
+    fn targetname_reports_misses() {
+        let entities = vec![ent(1, "Goblin", EntityKind::Mob, 3.0, 0.0)];
+        match parse_slash_t("//targetname Mairee", &entities, origin(), None, None) {
+            SlashOutcome::SystemMessage(msg) => assert!(msg.contains("no Mairee"), "{msg}"),
+            other => panic!("expected a system message, got {other:?}"),
+        }
+        match parse_slash_t("//targetname", &entities, origin(), None, None) {
+            SlashOutcome::SystemMessage(msg) => assert!(msg.contains("usage"), "{msg}"),
+            other => panic!("expected a usage message, got {other:?}"),
+        }
     }
 
     #[test]
