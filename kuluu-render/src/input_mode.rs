@@ -447,6 +447,8 @@ pub struct TargetActionState {
     pub chat_mode_idx: usize,
 
     pub abilities_group_idx: usize,
+
+    pub dismount_confirm: bool,
 }
 
 impl TargetActionState {
@@ -457,6 +459,7 @@ impl TargetActionState {
             sub: None,
             chat_mode_idx: 0,
             abilities_group_idx: 0,
+            dismount_confirm: false,
         }
     }
 }
