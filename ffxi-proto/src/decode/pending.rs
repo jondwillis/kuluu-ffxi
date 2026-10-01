@@ -249,4 +249,82 @@ mod tests {
             Err(DecodeError::Truncated(FriendPass::SIZE, _))
         ));
     }
+
+    #[test]
+    fn friendpass_preserves_signed_extremes_and_all_string_bytes() {
+        // vendor/server/src/map/packets/s2c/0x059_friendpass.h GP_SERV_COMMAND_FRIENDPASS::PacketData.
+        const LSB_PINNED_PASS_STRING: &[u8; 16] = b"0123456789ABCDEF";
+        const LSB_PINNED_TYPE: u8 = 0xFE;
+        const LSB_PINNED_TRAILER: [u8; 4] = [LSB_PINNED_TYPE, 0xA5, 0x5A, 0x5A];
+        let body = [
+            (-1i32).to_le_bytes().as_slice(),
+            i32::MIN.to_le_bytes().as_slice(),
+            i32::MAX.to_le_bytes().as_slice(),
+            LSB_PINNED_PASS_STRING.as_slice(),
+            LSB_PINNED_TRAILER.as_slice(),
+        ]
+        .concat();
+
+        let decoded = FriendPass::decode(&body).unwrap();
+        assert_eq!(decoded.left_num, -1);
+        assert_eq!(decoded.left_days, i32::MIN);
+        assert_eq!(decoded.pass_pop, i32::MAX);
+        assert_eq!(&decoded.string, LSB_PINNED_PASS_STRING);
+        assert_eq!(decoded.type_byte, LSB_PINNED_TYPE);
+    }
+
+    #[test]
+    fn recipe_detail_keeps_ingredients_before_their_counts() {
+        // vendor/server/src/map/packets/s2c/0x031_recipe.h GP_SERV_COMMAND_RECIPE_TYPE1_3.
+        const LSB_PINNED_DETAIL_PREFIX: [u16; 6] = [0x1111, 0x2222, 0x3333, 0x4444, 0x5555, 0x6666];
+        const LSB_PINNED_INGREDIENTS: [u16; 8] = [
+            0x8101, 0x8102, 0x8103, 0x8104, 0x8105, 0x8106, 0x8107, 0x8108,
+        ];
+        const LSB_PINNED_COUNTS: [u16; 8] = [
+            0x0101, 0x0102, 0x0103, 0x0104, 0x0105, 0x0106, 0x0107, 0x0108,
+        ];
+        const LSB_PINNED_DETAIL_TYPES: [u16; 2] = [1, 3];
+        const LSB_PINNED_UNKNOWN: u16 = 0xBEEF;
+
+        for type_word in LSB_PINNED_DETAIL_TYPES {
+            let body: Vec<_> = LSB_PINNED_DETAIL_PREFIX
+                .into_iter()
+                .chain(LSB_PINNED_INGREDIENTS)
+                .chain(LSB_PINNED_COUNTS)
+                .chain([type_word, LSB_PINNED_UNKNOWN])
+                .flat_map(u16::to_le_bytes)
+                .collect();
+            let decoded = Recipe::decode(&body).unwrap();
+            assert_eq!(decoded.product_item, LSB_PINNED_DETAIL_PREFIX[0]);
+            assert_eq!(decoded.type_word, type_word);
+            assert_eq!(
+                decoded.items.as_slice(),
+                [LSB_PINNED_INGREDIENTS, LSB_PINNED_COUNTS]
+                    .concat()
+                    .as_slice()
+            );
+        }
+    }
+
+    #[test]
+    fn recipe_list_keeps_all_ids_separate_from_next_page() {
+        // vendor/server/src/map/packets/s2c/0x031_recipe.h GP_SERV_COMMAND_RECIPE_TYPE2.
+        const LSB_PINNED_UNUSED: [u16; 6] = [0xA101, 0xA102, 0xA103, 0xA104, 0xA105, 0xA106];
+        const LSB_PINNED_LIST: [u16; 16] = [
+            0x9101, 0x9102, 0x9103, 0x9104, 0x9105, 0x9106, 0x9107, 0x9108, 0x9109, 0x910A, 0x910B,
+            0x910C, 0x910D, 0x910E, 0x910F, 0x9110,
+        ];
+        const LSB_PINNED_LIST_TYPE: u16 = 2;
+        const LSB_PINNED_NEXT_PAGE: u16 = 0x9111;
+        let body: Vec<_> = LSB_PINNED_UNUSED
+            .into_iter()
+            .chain(LSB_PINNED_LIST)
+            .chain([LSB_PINNED_LIST_TYPE, LSB_PINNED_NEXT_PAGE])
+            .flat_map(u16::to_le_bytes)
+            .collect();
+
+        let decoded = Recipe::decode(&body).unwrap();
+        assert_eq!(decoded.type_word, LSB_PINNED_LIST_TYPE);
+        assert_eq!(decoded.items, LSB_PINNED_LIST);
+    }
 }
