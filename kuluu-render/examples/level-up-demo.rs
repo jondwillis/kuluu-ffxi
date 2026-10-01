@@ -1,5 +1,6 @@
 use bevy::app::{AppExit, ScheduleRunnerPlugin};
 use bevy::audio::AddAudioSource;
+use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 use bevy::render::render_resource::*;
 use bevy::render::view::screenshot::{save_to_disk, Screenshot};
@@ -16,6 +17,11 @@ struct DemoOwner(Option<Entity>);
 #[derive(Resource)]
 struct DemoOptions {
     capture: Option<String>,
+}
+#[derive(SystemParam)]
+struct DemoCapture<'w> {
+    target: Option<Res<'w, Target>>,
+    options: Res<'w, DemoOptions>,
 }
 const DEMO_BACKGROUND: Color = Color::srgb(0.04, 0.04, 0.06);
 const CAMERA_POSITION: Vec3 = Vec3::new(0.0, 3.0, 8.0);
@@ -138,8 +144,7 @@ fn advance(
     time: Res<Time>,
     mut owner: ResMut<DemoOwner>,
     keys: Res<ButtonInput<KeyCode>>,
-    target: Option<Res<Target>>,
-    options: Res<DemoOptions>,
+    capture: DemoCapture,
     mut exit: MessageWriter<AppExit>,
 ) {
     let previous_frame = frame.0.floor() as u32;
@@ -172,7 +177,7 @@ fn advance(
                 .id(),
         );
     }
-    if let (Some(target), Some(dir)) = (target, options.capture.as_ref()) {
+    if let (Some(target), Some(dir)) = (capture.target, capture.options.capture.as_ref()) {
         if let Some(effect_frame) = current_frame.checked_sub(EFFECT_START_FRAME) {
             if effect_frame <= CAPTURE_END_FRAME && effect_frame.is_multiple_of(CAPTURE_INTERVAL) {
                 std::fs::create_dir_all(dir).unwrap();
@@ -187,7 +192,7 @@ fn advance(
         exit.write(AppExit::Success);
     }
     if current_frame > LAST_FRAME {
-        if options.capture.is_some() {
+        if capture.options.capture.is_some() {
             exit.write(AppExit::Success);
         } else {
             if let Some(entity) = owner.0.take() {

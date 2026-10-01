@@ -451,15 +451,19 @@ native viewer's feature set:
 cargo build -p kuluu-render -p kuluu --features native-window --example level-up-demo
 ```
 
-Run `target/debug/examples/level-up-demo` for a visible replay loop; Escape or
-closing the window exits. Pass an output directory instead for a windowless,
-deterministic image-target capture. With an isolated `CARGO_TARGET_DIR`, use
+Run `target/debug/examples/level-up-demo` for an elapsed-time replay loop with
+authored sound; Escape or closing the window exits. Pass an output directory for
+a windowless, deterministic image-target capture. With an isolated `CARGO_TARGET_DIR`, use
 that target's `debug/examples/level-up-demo` binary. The registered default
 install supplies DAT3310; `FFXI_DAT_PATH` overrides it.
 
 Captured frame numbers count demo ticks at 60 Hz after effect startup. Particle
 simulation uses the production `ROUTINE_FPS`; do not label these filenames as
-DAT simulation frames. The capture covers the authored 150-frame (2.5-second) lettering life.
+DAT simulation frames. Capture records every frame for six seconds, covering
+the authored 150-frame (2.5-second) lettering life and the 5.776-second sound.
+The demo dispatches audio through the production systems. Image capture does
+not record the output device; a clip muxed with decoded SPW audio must identify
+that source and must not claim to be an OS loopback recording.
 Inspect the resulting media before publishing it. This demo proves isolated
 rendering, not server LevelUp delivery, posed-player attachment, child-generator
 coverage or precise retail timing.

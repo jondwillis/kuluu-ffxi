@@ -5975,7 +5975,7 @@ mod tests {
         use crate::scheduler_runtime::{parse_action_bytes, LEVEL_UP_EFFECT_DAT_ID};
         const LETTERING_MESH: [u8; 4] = *b"lvu1";
         const FIRST_TICK_FRAMES: f32 = ROUTINE_FPS;
-        let Ok(root) = ffxi_dat::DatRoot::from_env_or_default() else {
+        let Some(root) = ffxi_dat::archive::open_test_install() else {
             eprintln!("SKIP: level-up DAT test needs a registered install");
             return;
         };
