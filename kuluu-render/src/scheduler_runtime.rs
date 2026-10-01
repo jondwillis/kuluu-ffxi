@@ -76,6 +76,9 @@ pub fn sound_origin_entity(on_caster: bool, caster: Entity, target: Option<Entit
 // stop live there, not in the caster's DAT). `DatRoot::resolve(0)` yields exactly that file.
 pub const GLOBAL_EFFECT_DIR_FILE_ID: u32 = 0;
 
+// .agents/skills/retail-observe/references/2026-09-26-level-up-effect-dat.md
+pub const LEVEL_UP_EFFECT_DAT_ID: u32 = 3310;
+
 #[derive(Resource, Default)]
 pub struct GlobalEffectDir {
     pub schedulers: Vec<Scheduler>,
@@ -3782,6 +3785,39 @@ pub fn dispatch_entity_emoted(
     flush_active_scheduler_inserts(&mut pending_inserts, &mut q_scheds, &mut commands);
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+pub fn dispatch_level_up(
+    events: Res<crate::snapshot::EventLog>,
+    tracked: Res<crate::scene::TrackedEntities>,
+    mut cache: ResMut<ActionDatCache>,
+    mut last_seen: Local<u64>,
+) {
+    let new_count =
+        (events.pushed_total.saturating_sub(*last_seen)).min(events.recent.len() as u64) as usize;
+    *last_seen = events.pushed_total;
+    if new_count == 0 {
+        return;
+    }
+    for ev in events.recent.iter().rev().take(new_count).rev() {
+        let kuluu_snapshot::ViewerEvent::LevelUp { player_id } = *ev else {
+            continue;
+        };
+        if !tracked.by_id.contains_key(&player_id) {
+            continue;
+        }
+        cache.defer(
+            LEVEL_UP_EFFECT_DAT_ID,
+            PendingActionDispatch::Routine {
+                actor_id: player_id,
+                target_id: 0,
+                routine: *b"main",
+                duration: ffxi_event::SCHEDULER_DURATION_FROM_DAT,
+                cutscene_actor: None,
+            },
+        );
+    }
+}
+
 // NPC casters (lua sendEmote) and PCs whose emote DAT lacks the routine:
 // play the actor's own em0N clip when it has one; silent no-op
 // otherwise (XIM findLocalAnimationRoutine, Actor.kt).
@@ -3860,6 +3896,7 @@ impl Plugin for SchedulerRuntimePlugin {
                     dispatch_cast_routine_started,
                     dispatch_melee_action_started,
                     dispatch_entity_emoted,
+                    dispatch_level_up,
                     dispatch_cutscene_motion,
                     poll_action_dat_tasks,
                 )
@@ -4897,6 +4934,86 @@ mod tests {
         assert!(
             (secs - TGT0_SECS).abs() < 0.1,
             "cure tgt0 runs {secs}s, retail authors {TGT0_SECS}s"
+        );
+    }
+
+    #[test]
+    fn level_up_event_defers_the_lvup_effect_on_the_leveling_player() {
+        const PLAYER: u32 = 0x010E_704F;
+        const UNTRACKED: u32 = 0x010E_9999;
+
+        bevy::tasks::AsyncComputeTaskPool::get_or_init(Default::default);
+        let mut app = App::new();
+        app.init_resource::<crate::snapshot::EventLog>()
+            .init_resource::<crate::scene::TrackedEntities>()
+            .init_resource::<ActionDatCache>()
+            .add_systems(Update, dispatch_level_up);
+
+        let player = app.world_mut().spawn(Transform::default()).id();
+        app.world_mut()
+            .resource_mut::<crate::scene::TrackedEntities>()
+            .by_id
+            .insert(PLAYER, player);
+
+        app.world_mut()
+            .resource_mut::<crate::snapshot::EventLog>()
+            .push(kuluu_snapshot::ViewerEvent::LevelUp { player_id: PLAYER });
+        app.update();
+
+        {
+            let cache = app.world().resource::<ActionDatCache>();
+            assert_eq!(cache.pending.len(), 1, "one level-up defers one dispatch");
+            let (file_id, dispatch) = &cache.pending[0];
+            assert_eq!(*file_id, LEVEL_UP_EFFECT_DAT_ID);
+            match dispatch {
+                PendingActionDispatch::Routine {
+                    actor_id,
+                    target_id,
+                    routine,
+                    ..
+                } => {
+                    assert_eq!(*actor_id, PLAYER);
+                    assert_eq!(*target_id, 0);
+                    assert_eq!(routine, b"main");
+                }
+                _ => panic!("level-up defers a Routine dispatch"),
+            }
+        }
+
+        app.update();
+        assert_eq!(app.world().resource::<ActionDatCache>().pending.len(), 1);
+
+        app.world_mut()
+            .resource_mut::<crate::snapshot::EventLog>()
+            .push(kuluu_snapshot::ViewerEvent::LevelUp {
+                player_id: UNTRACKED,
+            });
+        app.update();
+        let cache = app.world().resource::<ActionDatCache>();
+        assert_eq!(cache.pending.len(), 1, "an untracked id defers nothing");
+    }
+
+    #[test]
+    fn real_dat_level_up_file_resolves_to_rom_13_35_and_carries_main() {
+        let Some(root) = ffxi_dat::archive::open_test_install() else {
+            return;
+        };
+        let loc = root
+            .resolve(LEVEL_UP_EFFECT_DAT_ID)
+            .expect("installed client contains the level-up DAT");
+        let path = loc.path_under(&root);
+        let lossy = path.to_string_lossy();
+        assert!(
+            lossy.contains("ROM/13/35.DAT") || lossy.contains("ROM\\13\\35.DAT"),
+            "file id {LEVEL_UP_EFFECT_DAT_ID} must resolve to ROM/13/35.DAT, got {lossy}"
+        );
+        let bytes = std::fs::read(&path).expect("level-up DAT is readable");
+        let (schedulers, _, _) = parse_action_bytes(&bytes);
+        let active = ActiveScheduler::from_main(&schedulers, b"main")
+            .expect("the lvup DAT ships a main routine");
+        assert!(
+            !active.stages.is_empty(),
+            "the lvup main routine has stages"
         );
     }
 
