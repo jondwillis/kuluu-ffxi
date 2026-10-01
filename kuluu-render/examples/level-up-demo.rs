@@ -1,4 +1,5 @@
 use bevy::app::{AppExit, ScheduleRunnerPlugin};
+use bevy::audio::AddAudioSource;
 use bevy::prelude::*;
 use bevy::render::render_resource::*;
 use bevy::render::view::screenshot::{save_to_disk, Screenshot};
@@ -9,7 +10,7 @@ use std::time::Duration;
 #[derive(Resource)]
 struct Target(Handle<Image>);
 #[derive(Resource, Default)]
-struct Counter(u32);
+struct Counter(f64);
 #[derive(Resource, Default)]
 struct DemoOwner(Option<Entity>);
 #[derive(Resource)]
@@ -24,8 +25,8 @@ const EFFECT_START_FRAME: u32 = 120;
 const LAST_FRAME: u32 = EFFECT_START_FRAME + CAPTURE_END_FRAME + DEMO_FPS as u32;
 const IMAGE_WIDTH: u32 = 1000;
 const IMAGE_HEIGHT: u32 = 800;
-const CAPTURE_INTERVAL: u32 = 3;
-const CAPTURE_END_FRAME: u32 = 180;
+const CAPTURE_INTERVAL: u32 = 1;
+const CAPTURE_END_FRAME: u32 = 360;
 fn main() {
     let capture = std::env::args().nth(1);
     let mut app = App::new();
@@ -46,17 +47,24 @@ fn main() {
         .set(AssetPlugin {
             file_path: format!("{}/../assets", env!("CARGO_MANIFEST_DIR")),
             ..default()
-        })
-        .disable::<bevy::audio::AudioPlugin>();
+        });
     if capture.is_some() {
         app.add_plugins(plugins.disable::<bevy::winit::WinitPlugin>());
     } else {
         app.add_plugins(plugins);
     }
-    app.add_plugins(FfxiParticleMaterialPlugin)
-        .insert_resource(bevy::time::TimeUpdateStrategy::ManualDuration(
+    if capture.is_some() {
+        app.insert_resource(bevy::time::TimeUpdateStrategy::ManualDuration(
             Duration::from_secs_f64(1.0 / DEMO_FPS),
-        ))
+        ));
+    }
+    app.add_plugins(FfxiParticleMaterialPlugin)
+        .add_audio_source::<kuluu_render::audio::PcmAudio>()
+        .init_resource::<kuluu_render::audio::BgmSlots>()
+        .init_resource::<kuluu_render::audio::AudioMuteState>()
+        // The standalone demo has no session boundary; decoded audio lives until exit.
+        .init_resource::<kuluu_render::audio::SfxCache>()
+        .add_message::<kuluu_render::snapshot::ToastEvent>()
         .insert_resource(ClearColor(DEMO_BACKGROUND))
         .init_resource::<Counter>()
         .init_resource::<DemoOwner>()
@@ -71,6 +79,9 @@ fn main() {
             (
                 advance,
                 tick_active_schedulers,
+                dispatch_sound_stages,
+                report_sound,
+                kuluu_render::audio::play_sfx_system,
                 spawn_particle_generators,
                 tick_particle_simulator,
             )
@@ -124,14 +135,17 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>, options: Res
 fn advance(
     mut commands: Commands,
     mut frame: ResMut<Counter>,
+    time: Res<Time>,
     mut owner: ResMut<DemoOwner>,
     keys: Res<ButtonInput<KeyCode>>,
     target: Option<Res<Target>>,
     options: Res<DemoOptions>,
     mut exit: MessageWriter<AppExit>,
 ) {
-    frame.0 += 1;
-    if frame.0 == EFFECT_START_FRAME {
+    let previous_frame = frame.0.floor() as u32;
+    frame.0 += time.delta_secs_f64() * DEMO_FPS;
+    let current_frame = frame.0.floor() as u32;
+    if previous_frame < EFFECT_START_FRAME && current_frame >= EFFECT_START_FRAME {
         let root = ffxi_dat::DatRoot::from_env_or_default().unwrap();
         let bytes = std::fs::read(
             root.resolve(LEVEL_UP_EFFECT_DAT_ID)
@@ -149,6 +163,7 @@ fn advance(
         owner.0 = Some(
             commands
                 .spawn((
+                    kuluu_render::components::IsSelf,
                     Transform::default(),
                     GlobalTransform::default(),
                     assets,
@@ -158,7 +173,7 @@ fn advance(
         );
     }
     if let (Some(target), Some(dir)) = (target, options.capture.as_ref()) {
-        if let Some(effect_frame) = frame.0.checked_sub(EFFECT_START_FRAME) {
+        if let Some(effect_frame) = current_frame.checked_sub(EFFECT_START_FRAME) {
             if effect_frame <= CAPTURE_END_FRAME && effect_frame.is_multiple_of(CAPTURE_INTERVAL) {
                 std::fs::create_dir_all(dir).unwrap();
                 let path = format!("{dir}/frame-{effect_frame}.png");
@@ -171,14 +186,20 @@ fn advance(
     if keys.just_pressed(KeyCode::Escape) {
         exit.write(AppExit::Success);
     }
-    if frame.0 > LAST_FRAME {
+    if current_frame > LAST_FRAME {
         if options.capture.is_some() {
             exit.write(AppExit::Success);
         } else {
             if let Some(entity) = owner.0.take() {
                 commands.entity(entity).despawn();
             }
-            frame.0 = 0;
+            frame.0 = 0.0;
         }
+    }
+}
+
+fn report_sound(mut sounds: MessageReader<kuluu_render::audio::SfxEvent>) {
+    for sound in sounds.read() {
+        eprintln!("Level-up demo authored sound: SE {}", sound.se_id);
     }
 }

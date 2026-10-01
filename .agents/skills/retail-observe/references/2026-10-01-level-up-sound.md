@@ -56,3 +56,18 @@ when the caster is local, and a global sound. The real-install guard resolves
 the frame-zero SEP and decodes nonzero installed audio. Both passed against
 the clean retail install. None of this proves server-trigger delivery or the
 full visual/mixing parity with a live retail client.
+
+## Repeatable demonstration
+
+The demo advances visible playback from elapsed time; offscreen capture retains
+a deterministic 60 Hz clock and records every frame. A clean-retail run emitted
+SE 7 through the production scheduler and playback systems and captured 361
+frames from effect frame 0 through 360. The capture spans six seconds after
+effect start to retain the 5.776-second sound. Frame 100 was inspected and
+shows upright lettering. A local review clip muxes those frames with the
+authored SPW decoded by `ffxi-audio`; it is not an OS loopback recording or
+a live retail comparison. Visible replay does not depend on display refresh.
+
+The demo has no session transitions: the effect owner is despawned on replay,
+one-shot audio uses production DESPAWN playback, and its decoded-audio cache
+lives until process exit.
