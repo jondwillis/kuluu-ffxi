@@ -593,6 +593,9 @@ impl GraphicsField {
 fn default_ui_scale() -> f32 {
     1.0
 }
+fn default_vibration() -> bool {
+    true
+}
 /// The RenoDX addon's NR Intensity default: 1.0 is the parser default and can
 /// read as "no visible effect", so kuluu starts one notch above it.
 fn default_nr_intensity() -> f32 {
@@ -674,6 +677,12 @@ pub struct GraphicsSettings {
     #[serde(default)]
     pub mob_hp_under: bool,
 
+    /// Retail+ gate: the player character ignores knockback displacement (the push and the
+    /// flinch ride on, only the travel is dropped). OFF by default — retail knocks players back.
+    /// Persisted here so the choice sticks across runs.
+    #[serde(default)]
+    pub ignore_knockback_self: bool,
+
     #[serde(default)]
     pub texture_filtering: TextureFiltering,
 
@@ -687,6 +696,12 @@ pub struct GraphicsSettings {
     /// zone_draw_distance, weather.rs zone_distance_fog).
     pub draw_distance_scale: f32,
     pub vsync: bool,
+
+    /// Gamepad vibration for DAT rumble generators (kuluu-render/src/rumble.rs). Retail's
+    /// config carries a Vibration toggle; on by default — with no pad connected the system
+    /// is a silent no-op.
+    #[serde(default = "default_vibration")]
+    pub vibration: bool,
     /// 0 disables the cap (framepace Auto); RETAIL_FPS-adjacent slots otherwise.
     #[serde(default)]
     pub fps_cap: u32,
@@ -963,12 +978,14 @@ impl GraphicsSettings {
                 dlss_menu_enabled: false,
                 job_display: false,
                 mob_hp_under: false,
+                ignore_knockback_self: false,
                 texture_filtering: TextureFiltering::Vanilla,
                 bloom_intensity: 0.0,
                 volumetric_fog: false,
                 fog_step_count: 32,
                 draw_distance_scale: 0.5,
                 vsync: true,
+                vibration: true,
                 fps_cap: 0,
                 fov_deg: DEFAULT_FOV_DEG,
                 ui_scale: 1.0,
@@ -1008,12 +1025,14 @@ impl GraphicsSettings {
                 dlss_menu_enabled: false,
                 job_display: false,
                 mob_hp_under: false,
+                ignore_knockback_self: false,
                 texture_filtering: TextureFiltering::Vanilla,
                 bloom_intensity: 0.0,
                 volumetric_fog: false,
                 fog_step_count: 32,
                 draw_distance_scale: ffxi_dat::mzb::RETAIL_DRAW_DISTANCE_SCALE,
                 vsync: true,
+                vibration: true,
                 fps_cap: 0,
                 fov_deg: DEFAULT_FOV_DEG,
                 ui_scale: 1.0,
@@ -1053,12 +1072,14 @@ impl GraphicsSettings {
                 dlss_menu_enabled: false,
                 job_display: false,
                 mob_hp_under: false,
+                ignore_knockback_self: false,
                 texture_filtering: TextureFiltering::Aniso2x,
                 bloom_intensity: 0.04,
                 volumetric_fog: false,
                 fog_step_count: 64,
                 draw_distance_scale: ffxi_dat::mzb::RETAIL_DRAW_DISTANCE_SCALE,
                 vsync: true,
+                vibration: true,
                 fps_cap: 0,
                 fov_deg: DEFAULT_FOV_DEG,
                 ui_scale: 1.0,
@@ -1098,12 +1119,14 @@ impl GraphicsSettings {
                 dlss_menu_enabled: false,
                 job_display: false,
                 mob_hp_under: false,
+                ignore_knockback_self: false,
                 texture_filtering: TextureFiltering::Aniso4x,
                 bloom_intensity: 0.08,
                 volumetric_fog: false,
                 fog_step_count: 64,
                 draw_distance_scale: ffxi_dat::mzb::RETAIL_DRAW_DISTANCE_SCALE,
                 vsync: true,
+                vibration: true,
                 fps_cap: 0,
                 fov_deg: DEFAULT_FOV_DEG,
                 ui_scale: 1.0,
@@ -1147,12 +1170,14 @@ impl GraphicsSettings {
                 dlss_menu_enabled: false,
                 job_display: false,
                 mob_hp_under: false,
+                ignore_knockback_self: false,
                 texture_filtering: TextureFiltering::Aniso8x,
                 bloom_intensity: 0.12,
                 volumetric_fog: true,
                 fog_step_count: 96,
                 draw_distance_scale: 1.5,
                 vsync: true,
+                vibration: true,
                 fps_cap: 0,
                 fov_deg: DEFAULT_FOV_DEG,
                 ui_scale: 1.0,
@@ -1193,12 +1218,14 @@ impl GraphicsSettings {
                 dlss_menu_enabled: false,
                 job_display: false,
                 mob_hp_under: false,
+                ignore_knockback_self: false,
                 texture_filtering: TextureFiltering::Aniso16x,
                 bloom_intensity: 0.16,
                 volumetric_fog: true,
                 fog_step_count: 128,
                 draw_distance_scale: 2.0,
                 vsync: true,
+                vibration: true,
                 fps_cap: 0,
                 fov_deg: DEFAULT_FOV_DEG,
                 ui_scale: 1.0,

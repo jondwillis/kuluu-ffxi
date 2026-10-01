@@ -38,6 +38,11 @@ enhanced-cast-bar = []
 # light either, and the Debug -> Retail+ row does not exist.
 enhanced-mob-hp-under = []
 
+# Enhanced (non-retail): lifts every particle's final alpha by 20% (clamped to 1.0) — a
+# brightness tuning for the hit flashes retail authors at ~50%. Applied once, at the end of
+# particle_draw's alpha chain.
+enhanced-particle-alpha-20 = []
+
 # Enhanced (non-retail) numeric KO countdown: the "Home Point in M:SS" line on
 # the death prompt. The call rests on the dated 2026-06-12 HorizonXI
 # observation in .agents/skills/retail-observe/references/death-ko-behavior.md:

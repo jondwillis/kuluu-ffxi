@@ -231,6 +231,7 @@ fn track_celestial_bodies(
         day_fraction: (sky.hour / 24.0).rem_euclid(1.0),
         day_of_week: (day % ffxi_dat::particle_gen::DAYS_OF_WEEK as u64) as usize,
         moon_phase: moon_phase_frame(sky.moon_phase),
+        ..Default::default()
     });
 
     let Some(cam) = cam.iter().next() else {

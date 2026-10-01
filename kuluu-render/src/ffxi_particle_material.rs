@@ -5,7 +5,8 @@ use bevy::mesh::MeshVertexBufferLayoutRef;
 use bevy::pbr::{Material, MaterialPipeline, MaterialPipelineKey, MaterialPlugin};
 use bevy::prelude::*;
 use bevy::render::render_resource::{
-    AsBindGroup, RenderPipelineDescriptor, ShaderType, SpecializedMeshPipelineError,
+    AsBindGroup, CompareFunction, DepthBiasState, DepthStencilState, RenderPipelineDescriptor,
+    ShaderType, SpecializedMeshPipelineError, StencilFaceState, StencilState, TextureFormat,
 };
 use bevy::shader::ShaderRef;
 
@@ -13,6 +14,7 @@ use ffxi_dat::particle_gen::{ParticleBlend, ParticleGeneratorDef};
 
 use crate::dat_d3m::D3mBlendMode;
 use crate::element_sort::transparent_sort_bias;
+use crate::particle_sim::{ignores_texture_alpha, D3mDrawPath};
 
 // `ffxi_particle.wgsl`'s `PREMULTIPLY_*`: which premultiply the blend state this alpha mode
 // resolves to expects. Bevy applies these inside `pbr_functions::premultiply_alpha`, which
@@ -29,6 +31,39 @@ const FOG_BLACK: f32 = 2.0;
 // CMoElem.cpp CMoElem::PrepDX — blend byte 0x48 is the one additive case that swaps the area's
 // fog colour for black, so its far-off elements fade out instead of adding the horizon tint.
 const FOG_BLACK_BLEND_BYTE: u8 = 0x48;
+
+// `ffxi_particle.wgsl`'s PATH_*: which fixed-function table the element rides. The tables
+// differ per mesh source (CMoD3m.cpp TSS blocks vs ZoneRenderer.cpp DoD3mDraw), not per
+// generator, so the selector is a property of the resolved draw path.
+const PATH_D3M_TEXTURED: f32 = 0.0;
+const PATH_D3M_UNTEXTURED: f32 = 1.0;
+const PATH_MMB_TEXTURED: f32 = 2.0;
+const PATH_LAMP_ALPHAMAP: f32 = 3.0;
+
+// Forward depth bias for every particle element. Wash volumes like South Gustaberg's
+// ghu1 are copies of the wall geometry drawn additively on top of it; without a bias
+// they tie with the stone and depth-fight per triangle. The view depth buffer is
+// reversed-Z (compare GreaterEqual), so a positive bias moves toward the camera.
+const PARTICLE_FORWARD_BIAS: i32 = 1;
+const PARTICLE_FORWARD_SLOPE_SCALE: f32 = 1.0;
+
+fn particle_depth_bias() -> DepthBiasState {
+    DepthBiasState {
+        constant: PARTICLE_FORWARD_BIAS,
+        slope_scale: PARTICLE_FORWARD_SLOPE_SCALE,
+        clamp: 0.0,
+    }
+}
+
+impl D3mDrawPath {
+    fn selector(self) -> f32 {
+        match self {
+            Self::D3m => PATH_D3M_TEXTURED,
+            Self::Untextured => PATH_D3M_UNTEXTURED,
+            Self::Mmb => PATH_MMB_TEXTURED,
+        }
+    }
+}
 
 // research/XIClient/src/XIClient/source/World/Generator/Effects/CMoElem.cpp CMoElem::PrepDX —
 // the per-element D3DRS_FOGENABLE / D3DRS_FOGCOLOR choice.
@@ -98,19 +133,29 @@ impl FfxiParticleMaterial {
         def: &ParticleGeneratorDef,
         texture: Option<Handle<Image>>,
         dat_offset: usize,
+        path: D3mDrawPath,
     ) -> Self {
         let blend = match def.blend {
             ParticleBlend::Additive => D3mBlendMode::Additive,
             ParticleBlend::Blend => D3mBlendMode::Blended,
             ParticleBlend::Subtract => D3mBlendMode::Subtractive,
         };
-        Self::new(
+        let mut material = Self::new(
             blend,
             texture,
             ParticleFog::for_def(def),
             transparent_sort_bias(def, dat_offset),
             def.depth_write,
-        )
+            path,
+            ignores_texture_alpha(def, path),
+        );
+        if crate::particle_sim::is_lamp_halo_def(def) {
+            material.data.params.w = PATH_LAMP_ALPHAMAP;
+            // The glow sheets pin in chunk order: depth-sorted, they re-sort against each other
+            // frame to frame and dance under/over one another as the camera moves.
+            material.sort_bias = crate::element_sort::pinned_order_bias(dat_offset);
+        }
+        material
     }
 
     pub fn new(
@@ -119,6 +164,8 @@ impl FfxiParticleMaterial {
         fog: ParticleFog,
         sort_bias: f32,
         depth_write: bool,
+        path: D3mDrawPath,
+        ignore_texture_alpha: bool,
     ) -> Self {
         let alpha_mode = blend.alpha_mode();
         let premultiply = match alpha_mode {
@@ -128,7 +175,12 @@ impl FfxiParticleMaterial {
         };
         Self {
             data: ParticleUniform {
-                params: Vec4::new(premultiply, fog.selector(), 0.0, 0.0),
+                params: Vec4::new(
+                    premultiply,
+                    fog.selector(),
+                    f32::from(ignore_texture_alpha),
+                    path.selector(),
+                ),
             },
             texture,
             alpha_mode,
@@ -139,6 +191,12 @@ impl FfxiParticleMaterial {
 }
 
 impl Material for FfxiParticleMaterial {
+    // A custom @vertex stage: the per-particle factor rides the TANGENT slot (location 4),
+    // which the default mesh vertex function does not forward.
+    fn vertex_shader() -> ShaderRef {
+        "embedded://kuluu_render/ffxi_particle.wgsl".into()
+    }
+
     fn fragment_shader() -> ShaderRef {
         "embedded://kuluu_render/ffxi_particle.wgsl".into()
     }
@@ -160,14 +218,24 @@ impl Material for FfxiParticleMaterial {
         // CMoElem::PrepDX sets D3DRS_CULLMODE to D3DCULL_NONE for every particle element
         // (research/XIClient/src/XIClient/source/World/Generator/Effects/CMoElem.cpp CMoElem::PrepDX).
         descriptor.primitive.cull_mode = None;
-        // CMoElem.cpp CMoElem::PrepDX — D3DRS_ZWRITEENABLE follows the element's own bit, so a
-        // depth-writing element (Lower Jeuno's `down` sea floor) writes from the transparent
-        // pass Bevy otherwise keeps read-only.
-        if key.bind_group_data.depth_write {
-            if let Some(ds) = descriptor.depth_stencil.as_mut() {
-                ds.depth_write_enabled = Some(true);
-            }
-        }
+        // MaterialPlugin pipelines ship no depth-stencil state, and wgpu builds a pipeline with
+        // none as NO depth test at all — every additive element painted over the walls. State is
+        // explicit here: compare GreaterEqual matches bevy_pbr's 3D pipeline (reversed-Z view
+        // buffer), write follows the element's own bit (CMoElem.cpp CMoElem::PrepDX —
+        // D3DRS_ZWRITEENABLE; a depth-writing element like Lower Jeuno's `down` sea floor writes
+        // from the transparent pass Bevy otherwise keeps read-only).
+        descriptor.depth_stencil = Some(DepthStencilState {
+            format: TextureFormat::Depth32Float,
+            depth_compare: Some(CompareFunction::GreaterEqual),
+            depth_write_enabled: Some(key.bind_group_data.depth_write),
+            stencil: StencilState {
+                front: StencilFaceState::IGNORE,
+                back: StencilFaceState::IGNORE,
+                read_mask: 0,
+                write_mask: 0,
+            },
+            bias: particle_depth_bias(),
+        });
         Ok(())
     }
 }
@@ -190,10 +258,18 @@ mod tests {
     #[test]
     fn premultiply_selector_tracks_the_blend_mode() {
         let sel = |b| {
-            FfxiParticleMaterial::new(b, None, ParticleFog::Zone, 0.0, false)
-                .data
-                .params
-                .x
+            FfxiParticleMaterial::new(
+                b,
+                None,
+                ParticleFog::Zone,
+                0.0,
+                false,
+                D3mDrawPath::D3m,
+                false,
+            )
+            .data
+            .params
+            .x
         };
         assert_eq!(sel(D3mBlendMode::Additive), PREMULTIPLY_ADD);
         assert_eq!(sel(D3mBlendMode::Subtractive), PREMULTIPLY_MULTIPLY);
@@ -213,10 +289,18 @@ mod tests {
         def.fog_enabled = false;
         assert_eq!(ParticleFog::for_def(&def), ParticleFog::Off);
         let sel = |f: ParticleFog| {
-            FfxiParticleMaterial::new(D3mBlendMode::Blended, None, f, 0.0, false)
-                .data
-                .params
-                .y
+            FfxiParticleMaterial::new(
+                D3mBlendMode::Blended,
+                None,
+                f,
+                0.0,
+                false,
+                D3mDrawPath::D3m,
+                false,
+            )
+            .data
+            .params
+            .y
         };
         assert_eq!(sel(ParticleFog::Off), FOG_OFF);
         assert_eq!(sel(ParticleFog::Zone), FOG_ZONE);
@@ -232,7 +316,7 @@ mod tests {
             depth_write: true,
             ..Default::default()
         };
-        let m = FfxiParticleMaterial::for_def(&def, None, 0);
+        let m = FfxiParticleMaterial::for_def(&def, None, 0, D3mDrawPath::D3m);
         assert_eq!(m.alpha_mode, D3mBlendMode::Blended.alpha_mode());
         assert_eq!(m.data.params.y, FOG_ZONE);
         assert_eq!(m.sort_bias, transparent_sort_bias(&def, 0));
@@ -248,9 +332,26 @@ mod tests {
             D3mBlendMode::Subtractive,
         ] {
             assert_eq!(
-                FfxiParticleMaterial::new(blend, None, ParticleFog::Zone, 0.0, false).alpha_mode,
+                FfxiParticleMaterial::new(
+                    blend,
+                    None,
+                    ParticleFog::Zone,
+                    0.0,
+                    false,
+                    D3mDrawPath::D3m,
+                    false
+                )
+                .alpha_mode,
                 blend.alpha_mode()
             );
         }
+    }
+
+    #[test]
+    fn particle_elements_bias_toward_the_camera() {
+        let bias = particle_depth_bias();
+        assert!(bias.constant > 0);
+        assert!(bias.slope_scale > 0.0);
+        assert_eq!(bias.clamp, 0.0);
     }
 }
