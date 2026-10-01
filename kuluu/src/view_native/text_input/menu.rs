@@ -410,7 +410,9 @@ fn handle_retail_plus_row(
     use kuluu_render::hud::menu::RETAIL_JOB_DISPLAY;
     #[cfg(feature = "enhanced-mob-hp-under")]
     use kuluu_render::hud::menu::RETAIL_MOB_HP_UNDER;
-    use kuluu_render::hud::menu::{DEBUG_RETAIL_LABEL, DEBUG_RETAIL_SEPARATOR, RETAIL_DLSS_MENU};
+    use kuluu_render::hud::menu::{
+        DEBUG_RETAIL_LABEL, DEBUG_RETAIL_SEPARATOR, RETAIL_DLSS_MENU, RETAIL_KNOCKBACK,
+    };
     match label {
         DEBUG_RETAIL_SEPARATOR | DEBUG_RETAIL_LABEL => true,
         RETAIL_DLSS_MENU => {
@@ -456,6 +458,22 @@ fn handle_retail_plus_row(
                 format!(
                     "[menu] {label}: {}",
                     if graphics.job_display { "on" } else { "off" }
+                ),
+            );
+            true
+        }
+        RETAIL_KNOCKBACK => {
+            // [on] reports the feature live: knockback applied (the default).
+            graphics.ignore_knockback_self = !graphics.ignore_knockback_self;
+            push_system_chat_line(
+                scene_state,
+                format!(
+                    "[menu] {label}: {}",
+                    if graphics.ignore_knockback_self {
+                        "off"
+                    } else {
+                        "on"
+                    }
                 ),
             );
             true
