@@ -440,3 +440,26 @@ input-driven bugs; use `debug_drive` for those.
 - Known intermittent: a `slab_allocator Use-after-free` burst at zone-in can
   black out all zone geometry for the whole session (kuluu-172i); relaunch once
   before diagnosing a rendering change.
+
+## Isolated level-up lettering demo
+
+The developer example runs production DAT scheduling, particle simulation and
+materials without a server or player-facing debug menu. Build it with the
+native viewer's feature set:
+
+```bash
+cargo build -p kuluu-render -p kuluu --features native-window --example level-up-demo
+```
+
+Run `target/debug/examples/level-up-demo` for a visible replay loop; Escape or
+closing the window exits. Pass an output directory instead for a windowless,
+deterministic image-target capture. With an isolated `CARGO_TARGET_DIR`, use
+that target's `debug/examples/level-up-demo` binary. The registered default
+install supplies DAT3310; `FFXI_DAT_PATH` overrides it.
+
+Captured frame numbers count demo ticks at 60 Hz after effect startup. Particle
+simulation uses the production `ROUTINE_FPS`; do not label these filenames as
+DAT simulation frames. The capture covers the authored 150-frame (2.5-second) lettering life.
+Inspect the resulting media before publishing it. This demo proves isolated
+rendering, not server LevelUp delivery, posed-player attachment, child-generator
+coverage or precise retail timing.
