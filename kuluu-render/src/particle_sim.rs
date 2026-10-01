@@ -676,7 +676,11 @@ pub fn spawn_particle_generators(
             orientation: None,
             actor_local: false,
             tex_translate: Vec2::ZERO,
-            vel_basis: Vec3::ONE,
+            vel_basis: crate::scene::mzb_to_bevy(kuluu_snapshot::Vec3 {
+                x: Vec3::ONE.x,
+                y: Vec3::ONE.y,
+                z: Vec3::ONE.z,
+            }),
             origin_routine: Some(RoutineOrigin {
                 owner: ev.actor,
                 gen_id: ev.stage.stage.id,
@@ -1010,6 +1014,13 @@ fn advance_generator(g: &mut LiveGenerator, frames: f32) {
                 bounded.max(1.0)
             };
             emit(g, life);
+        }
+    } else if !g.auto_run && g.emit_window_frames <= 0.0 {
+        // .agents/skills/retail-observe/references/2026-10-01-level-up-scheduled-emission.md zero-window DAT inference.
+        if !g.stopped && !g.emit_culled && g.age_frames <= frames {
+            for _ in 0..emission_count(g) {
+                emit(g, g.def.max_life_frames);
+            }
         }
     } else if emitting {
         g.emit_accum += frames;
@@ -5930,6 +5941,81 @@ mod tests {
                 None,
             ),
             Vec3::ZERO
+        );
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn real_dat_level_up_zero_window_emits_and_rises_in_bevy_space() {
+        use crate::scheduler_runtime::{parse_action_bytes, LEVEL_UP_EFFECT_DAT_ID};
+        const LETTERING_MESH: [u8; 4] = *b"lvu1";
+        const FIRST_TICK_FRAMES: f32 = ROUTINE_FPS;
+        let Ok(root) = ffxi_dat::DatRoot::from_env_or_default() else {
+            eprintln!("SKIP: level-up DAT test needs a registered install");
+            return;
+        };
+        let bytes = std::fs::read(
+            root.resolve(LEVEL_UP_EFFECT_DAT_ID)
+                .unwrap()
+                .path_under(&root),
+        )
+        .unwrap();
+        let (schedulers, assets, _) = parse_action_bytes(&bytes);
+        let stage = schedulers
+            .iter()
+            .flat_map(|s| &s.stages)
+            .find(|s| {
+                s.stage.kind == StageKind::Particle
+                    && assets
+                        .particle_def(s.stage.local_dir, &s.stage.id)
+                        .is_some_and(|d| d.mesh_id == LETTERING_MESH)
+            })
+            .copied()
+            .expect("level-up DAT schedules its lettering generator");
+        assert_eq!(stage.stage.duration_frames, 0);
+        let mut app = App::new();
+        app.add_plugins(bevy::asset::AssetPlugin::default())
+            .init_asset::<Mesh>()
+            .init_asset::<Image>()
+            .init_asset::<FfxiParticleMaterial>()
+            .init_resource::<ParticleSimulator>()
+            .add_message::<SchedulerStageEvent>()
+            .add_systems(Update, spawn_particle_generators);
+        let actor = app.world_mut().spawn((Transform::default(), assets)).id();
+        app.world_mut().write_message(SchedulerStageEvent {
+            actor,
+            stage,
+            scheduler: *b"main",
+        });
+        app.update();
+        let mut sim = app.world_mut().resource_mut::<ParticleSimulator>();
+        let g = sim
+            .generators
+            .iter_mut()
+            .find(|g| g.def.mesh_id == LETTERING_MESH)
+            .unwrap();
+        assert!(g.def.frames_per_emission > FIRST_TICK_FRAMES);
+        assert!(g.def.init_velocity[1] < 0.0);
+        advance_generator(g, FIRST_TICK_FRAMES);
+        assert_eq!(g.particles.len(), 1);
+        advance_generator(g, FIRST_TICK_FRAMES);
+        assert_eq!(g.particles.len(), 1);
+        assert!(
+            g.particles[0].pos.y > 0.0,
+            "authored upward DAT motion rises in Bevy"
+        );
+        assert_eq!(
+            g.vel_basis,
+            crate::scene::mzb_to_bevy(kuluu_snapshot::Vec3 {
+                x: Vec3::ONE.x,
+                y: Vec3::ONE.y,
+                z: Vec3::ONE.z
+            })
+        );
+        let life_frames = g.def.max_life_frames;
+        advance_generator(g, life_frames);
+        assert!(
+            g.particles.is_empty(),
+            "zero-window burst expires without respawning"
         );
     }
 }
