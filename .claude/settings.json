@@ -4,6 +4,15 @@
       {
         "hooks": [
           {
+            "command": "${CLAUDE_PROJECT_DIR}/.agents/hooks/inspect-evidence.sh",
+            "type": "command"
+          }
+        ],
+        "matcher": "Read"
+      },
+      {
+        "hooks": [
+          {
             "command": "${CLAUDE_PROJECT_DIR}/.agents/hooks/rustfmt-on-edit.sh",
             "type": "command"
           }
@@ -81,10 +90,6 @@
         "hooks": [
           {
             "command": "${CLAUDE_PROJECT_DIR}/.agents/hooks/commit-nudge-start.sh",
-            "type": "command"
-          },
-          {
-            "command": "${CLAUDE_PROJECT_DIR}/.agents/hooks/verify-gate-start.sh",
             "type": "command"
           }
         ],

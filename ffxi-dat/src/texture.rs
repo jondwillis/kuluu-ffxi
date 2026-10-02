@@ -319,8 +319,11 @@ fn decode_palettized(
     }
     let indices = &body[pixel_off..pixel_off + n_pixels];
     let mut rgba: Vec<u8> = Vec::with_capacity(n_pixels * 4);
-    for &idx in indices {
-        rgba.extend_from_slice(&palette[idx as usize]);
+    // FFXiMain.dll retail-2026-09 RVA 0x39FF2: indexed upload reads height - row - 1.
+    for row in indices.chunks_exact(width as usize).rev() {
+        for &idx in row {
+            rgba.extend_from_slice(&palette[idx as usize]);
+        }
     }
     Ok(DecodedTexture {
         width,
@@ -604,6 +607,51 @@ pub fn decode_argb_raw(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn indexed_texture_upload_reverses_rows_without_reversing_columns() {
+        const WIDTH: u32 = 2;
+        const HEIGHT: u32 = 2;
+        let colors = [
+            [11, 21, 31, 0],
+            [12, 22, 32, 0],
+            [13, 23, 33, 0],
+            [14, 24, 34, 0],
+        ];
+        for (flag, palette_offset, pixel_offset) in [
+            (
+                imginfo::FLG_PALETTE,
+                imginfo::PALETTE_OFF,
+                imginfo::PIXELS_OFF,
+            ),
+            (
+                imginfo::FLG_PALETTE_EXT,
+                imginfo::PALETTE_OFF_EXT,
+                imginfo::PIXELS_OFF_EXT,
+            ),
+            (imginfo::FLG_FMT0, imginfo::PALETTE_OFF, imginfo::PIXELS_OFF),
+            (
+                imginfo::FLG_FMT0_COMPRESSED,
+                imginfo::PALETTE_OFF,
+                imginfo::PIXELS_OFF,
+            ),
+        ] {
+            let mut body = vec![0; pixel_offset + (WIDTH * HEIGHT) as usize];
+            body[0] = flag;
+            body[imginfo::WIDTH_OFF..imginfo::HEIGHT_OFF].copy_from_slice(&WIDTH.to_le_bytes());
+            body[imginfo::HEIGHT_OFF..imginfo::DIMS_END].copy_from_slice(&HEIGHT.to_le_bytes());
+            for (index, color) in colors.iter().enumerate() {
+                let offset = palette_offset + index * color.len();
+                body[offset..offset + color.len()].copy_from_slice(color);
+            }
+            body[pixel_offset..].copy_from_slice(&[0, 1, 2, 3]);
+            let decoded = decode_texture(&body).expect("indexed texture");
+            assert_eq!(
+                decoded.rgba,
+                [33, 23, 13, 0, 34, 24, 14, 0, 31, 21, 11, 0, 32, 22, 12, 0]
+            );
+        }
+    }
 
     // Emitter/consumer coupling guard: zone_texture, moon_material and the particle texture
     // path all read alpha out of the same decoded buffer, so the top-nibble expansion has to
