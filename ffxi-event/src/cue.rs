@@ -463,9 +463,8 @@ pub enum EventCue {
         actor: ActorLookup,
         target: ActorLookup,
     },
-    /// 0x5E / 0x6B stop action: kill the current action on `actor` and return
-    /// it to idle; `key` names the routine slot to clear when the operand is a
-    /// nonzero tag (research/XiEvents/OpCodes/0x005E.md, 0x006B.md).
+    /// Stop the current action; `key` supplies the replacement idle motion.
+    /// FFXiMain.dll retail-2026-09 RVA 0xB71E0 / 0xB7070.
     ActorStopAction {
         actor: ActorLookup,
         key: Option<FourCc>,

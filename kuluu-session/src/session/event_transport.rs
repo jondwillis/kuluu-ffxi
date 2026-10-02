@@ -55,21 +55,31 @@ pub(super) fn server_ack_matches(
             dialog.set_submap_num(result.map_num);
             dialog.pending_tag() == Some(PendingTag::SubMapNum)
         }),
-        map::s2c::FRIENDPASS => {
-            decode::FriendPass::decode(sub.data).is_ok()
-                && matches!(dialog.pending_tag(), Some(PendingTag::FriendPass { .. }))
-        }
-        map::s2c::RECIPE => {
-            decode::Recipe::decode(sub.data).is_ok()
-                && matches!(dialog.pending_tag(), Some(PendingTag::Recipe { .. }))
-        }
         map::s2c::EVENTUCOFF => {
             super::eventucoff_mode_of(sub.data)
                 == Some(map::event_position_wire::EVENT_RECV_PENDING)
-                && dialog.has_pending_tag()
+                && matches!(
+                    dialog.pending_tag(),
+                    Some(PendingTag::SendTag { .. } | PendingTag::SendXzy { .. })
+                )
         }
         _ => false,
     }
+}
+
+pub(super) fn finish_server_ack(
+    error: Option<String>,
+    scope: &mut crate::event_dialog::CutsceneScope,
+    events: &broadcast::Sender<AgentEvent>,
+) {
+    let exit = if let Some(message) = error {
+        let _ = events.send(AgentEvent::Error { message });
+        crate::event_dialog::EventSessionExit::Cancelled
+    } else {
+        crate::event_dialog::EventSessionExit::ScriptEnded
+    };
+    scope.end(exit, events);
+    let _ = events.send(AgentEvent::EventEnded);
 }
 
 pub(super) fn prepare(

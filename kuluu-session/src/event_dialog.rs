@@ -14,10 +14,7 @@ use ffxi_dat::dmsg::{
 };
 use ffxi_dat::event_dat::{EventBlockSource, EventDat};
 use ffxi_dat::DatRoot;
-use ffxi_event::{
-    ActorLookup, DialogRunner, DialogStep, EventCue, FourCc, PendingTag, SOUND_TYPE_MASTER,
-    SOUND_TYPE_ZONE,
-};
+use ffxi_event::{ActorLookup, DialogRunner, DialogStep, EventCue, FourCc, PendingTag};
 use tokio::sync::broadcast;
 
 use crate::state::{AgentEvent, CutsceneActor, CutsceneCue, DialogState};
@@ -199,10 +196,7 @@ pub struct DialogSession {
     /// Per-zone fishing-era reconciliation state, built lazily on the first
     /// TALKNUM-family message of the zone.
     fishing: std::collections::HashMap<u16, FishingEra>,
-    /// The emote-file base for the lens race, cached: `None` unattempted,
-    /// `Some(None)` no DLL, `Some(Some(base))` read. The emote hold timer
-    /// reads routine lengths from this race's DATs (race-uniform lengths).
-    emote_base_index: Option<Option<u32>>,
+
     /// Last known position of every entity the server has placed since the
     /// zone-in, in event coordinates: the source for MOVE hold lengths while a
     /// scene walks its actors.
@@ -269,7 +263,7 @@ impl DialogSession {
             active: None,
             cues: Vec::new(),
             fishing: std::collections::HashMap::new(),
-            emote_base_index: None,
+
             entity_positions: std::collections::HashMap::new(),
             entity_types: std::collections::HashMap::new(),
             weather_forecast: None,
@@ -344,6 +338,7 @@ impl DialogSession {
             return;
         }
         self.loaded_zone_rects_zone = Some(zone);
+        self.zone_rects = None;
         let Some(root) = self.dat_root.clone() else {
             return;
         };
@@ -443,14 +438,12 @@ impl DialogSession {
         self.arm_auto_advance(auto);
         self.scene_actions.extend(runner.take_scene_actions());
         let raw_cues = runner.take_cues();
-        let emote_base = self.emote_base();
         arm_motion_holds(
             &mut runner,
             &raw_cues,
             self.dat_root.as_deref(),
             unique_no,
             event_zone,
-            emote_base,
             &mut self.pending_motion_holds,
         );
         arm_move_holds(
@@ -581,7 +574,7 @@ impl DialogSession {
             self.liveness = None;
             return advance;
         }
-        let (Some(runner), Some(active)) = (self.runner.as_ref(), self.active.as_ref()) else {
+        let (Some(runner), Some(_)) = (self.runner.as_ref(), self.active.as_ref()) else {
             self.liveness = None;
             return advance;
         };
@@ -629,25 +622,6 @@ impl DialogSession {
             ffxi_event::Park::ServerAck => {
                 if since.elapsed() <= TAG_ACK_GRACE {
                     return advance;
-                }
-                // 0xA6: LSB's 0x0EB handler returns silently when the player
-                // is not npc-locked, so the answer never comes; answer the VM
-                // with the MapNum the locked case carries and let the script
-                // run on instead of stalling
-                // (vendor/server/src/map/packets/c2s/0x0eb_reqsubmapnum.cpp).
-                if runner
-                    .pending_tag()
-                    .is_some_and(|tag| matches!(tag, PendingTag::SubMapNum))
-                {
-                    tracing::debug!(
-                        event_id = active.event_id,
-                        unique_no = format!("0x{:08X}", active.unique_no),
-                        "0xA6 submap request unanswered; answering with MapNum 0"
-                    );
-                    return self.drive(|runner, strings| {
-                        runner.set_submap_num(0);
-                        runner.ack_server(strings)
-                    });
                 }
                 Some(StallReason::ServerDidNotAnswer)
             }
@@ -776,7 +750,6 @@ impl DialogSession {
 
     fn drive(&mut self, step: impl FnOnce(&mut DialogRunner, &StringDat) -> DialogStep) -> Advance {
         let types = self.entity_types.clone();
-        let emote_base = self.emote_base();
         let (Some(strings), Some(runner), Some(active)) = (
             self.strings.as_ref(),
             self.runner.as_mut(),
@@ -806,7 +779,6 @@ impl DialogSession {
             self.dat_root.as_deref(),
             event_entity,
             zone,
-            emote_base,
             &mut self.pending_motion_holds,
         );
         arm_move_holds(runner, &raw_cues, &mut self.entity_positions, event_entity);
@@ -868,22 +840,6 @@ impl DialogSession {
     /// resolves to.
     pub fn note_player_id(&mut self, id: u32) {
         self.player_id = id;
-    }
-
-    /// The emote-file base for the lens race, read once from the install's
-    /// FFXiMain.dll: the emote hold timer reads routine lengths from this
-    /// race's DATs. `None` when the install or the DLL is unavailable.
-    fn emote_base(&mut self) -> Option<u32> {
-        if self.emote_base_index.is_none() {
-            let base = self
-                .dat_root
-                .as_deref()
-                .and_then(|root| ffxi_dat::main_dll::MainDll::load(root.root()).ok())
-                .and_then(|dll| dll.base_emote_index(ffxi_vocab::emote_anim::EMOTE_LENS_RACE))
-                .map(u32::from);
-            self.emote_base_index = Some(base);
-        }
-        self.emote_base_index.and_then(|base| base)
     }
 
     /// Remember where the server placed an entity, in event coordinates:
@@ -1124,9 +1080,7 @@ pub enum ResolvedCue {
     /// [`AgentEvent::MusicVolumeChanged`] (its start volume) on the named BGM
     /// slot instead of the cue stream (research/XiEvents/OpCodes/0x005C.md).
     MusicSong { slot: u8, track: u16, volume: u8 },
-    /// 0x69/0x6A ride the existing [`AgentEvent::MusicVolumeChanged`], scoped
-    /// to the BGM slots the retail sound-type `mask` reaches
-    /// (research/XiEvents/OpCodes/0x0069.md, 0x006A.md).
+
     SoundVolume {
         mask: u8,
         volume: u8,
@@ -1390,24 +1344,6 @@ pub fn resolve_cue(cue: EventCue, event_entity: u32, zone: u16, player_id: u32) 
     })
 }
 
-/// The BGM slots a retail 0x69/0x6A sound-type `mask` reaches. 0x08 master
-/// reaches every slot; 0x04 zone reaches the day/night zone slots; 0x01
-/// effect, 0x02 system and 0x10 special chat are SFX channels kuluu has no
-/// event-scoped gain for, so they resolve to no slot.
-/// research/XiEvents/OpCodes/0x0069.md; research/XIClient/src/XIClient/include/World/Generator/Effects/CYySoundElem.h;
-/// vendor/server/data/enums/music_slot.yaml.
-fn sound_type_slots(mask: u8) -> Vec<u8> {
-    const ZONE_DAY: u8 = 0;
-    const ZONE_NIGHT: u8 = 1;
-    let mut slots = Vec::new();
-    if mask & SOUND_TYPE_MASTER != 0 {
-        slots.extend(0..crate::state::MUSIC_SLOT_COUNT);
-    } else if mask & SOUND_TYPE_ZONE != 0 {
-        slots.extend([ZONE_DAY, ZONE_NIGHT]);
-    }
-    slots
-}
-
 /// The event-entity selector and the default handler's fallback both mean "the
 /// entity this event belongs to"; only a literal server id names another.
 fn resolve_actor(lookup: ActorLookup, event_entity: u32) -> CutsceneActor {
@@ -1512,20 +1448,8 @@ impl CutsceneScope {
                 });
                 let _ = event_tx.send(AgentEvent::MusicVolumeChanged { slot, volume });
             }
-            ResolvedCue::SoundVolume {
-                mask,
-                volume,
-                fade_frames,
-            } => {
-                tracing::debug!(
-                    mask,
-                    volume,
-                    fade_frames,
-                    "event script set sound volume (0x69/0x6A)"
-                );
-                for slot in sound_type_slots(mask) {
-                    let _ = event_tx.send(AgentEvent::MusicVolumeChanged { slot, volume });
-                }
+            ResolvedCue::SoundVolume { .. } => {
+                tracing::warn!("unsupported event sound-volume cue ignored");
             }
             ResolvedCue::Map(op) => {
                 let ev = match op {
@@ -2245,7 +2169,6 @@ fn arm_motion_holds(
     root: Option<&DatRoot>,
     event_entity: u32,
     zone: u16,
-    emote_base: Option<u32>,
     pending: &mut std::collections::HashMap<
         (CutsceneActor, FourCc),
         (ActorLookup, u32, std::time::Instant, std::time::Duration),
@@ -2347,36 +2270,7 @@ fn arm_motion_holds(
                     units,
                 );
             }
-            // 0x6E/0x63: the renderer plays the emote fire-and-forget (no finish
-            // report on that path), so the 0x99 hold stays timed from the emote
-            // DAT's authored routine length, the way the 0x45 fades do. An
-            // unmapped emote or an unreadable DAT arms nothing, so the wait
-            // falls through (the fade's missing-DAT degradation).
-            // research/XiEvents/OpCodes/0x006E.md
-            EventCue::Emote {
-                actor,
-                emote_id,
-                param,
-            } => {
-                let Some(base) = emote_base else {
-                    continue;
-                };
-                let Some((file_offset, routine)) =
-                    ffxi_vocab::emote_anim::emote_routine(emote_id, param)
-                else {
-                    continue;
-                };
-                let units = runner
-                    .routine_length(
-                        base + file_offset,
-                        routine,
-                        ffxi_event::SCHEDULER_DURATION_FROM_DAT,
-                    )
-                    .map(|units| units as f32);
-                if let Some(units) = units {
-                    runner.hold_action(actor, ffxi_event::EMOTE_ANIMATION_KEY, units);
-                }
-            }
+
             _ => {}
         }
     }
@@ -2605,8 +2499,18 @@ mod zone_text_skew_tests {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn missing_new_zone_rects_discards_previous_zone_cache() {
+        let mut session = DialogSession::new(None, "Test".into());
+        session.loaded_zone_rects_zone = Some(1);
+        session.zone_rects = Some(Arc::new(Vec::new()));
+        session.ensure_zone_rects(2);
+        assert_eq!(session.loaded_zone_rects_zone, Some(2));
+        assert!(session.zone_rects.is_none());
+    }
+
     use crate::session::event_transport::contracts::NPC;
-    use ffxi_event::{SOUND_TYPE_EFFECT, SOUND_TYPE_SPECIAL_CHAT};
 
     /// A miniature fishing block: offsets relative to a base, mirroring the
     /// real layout's landmark lines.
@@ -3797,64 +3701,64 @@ pub(crate) mod tests {
         assert!(ended, "the walk must finish");
     }
 
-    /// A 0x43 tag with no s2c ack: past the tag grace the session cancels the
-    /// event with the error line; the 0xA6 submap tag is the only one answered
-    /// locally instead.
     #[test]
     fn unanswered_tag_stalls_and_cancels_with_the_error_line() {
         const NPC: u32 = 0x010E_6032;
         const EVENT: u16 = 9003;
         const ZONE: u16 = 248;
-        let block = ffxi_dat::event_dat::EventBlock {
-            actor: NPC,
-            event_ids: vec![EVENT],
-            event_offsets: vec![0],
-            references: vec![],
-            event_data: vec![0x43, 0x00, 0x43, 0x01, 0x21],
-        };
-        let mut session = DialogSession::new(None, "Test".into());
-        session.loaded_event_zone = Some(ZONE);
-        session.loaded_string_zone = Some(ZONE);
-        session.event_dat = Some(Arc::new(EventDat {
-            blocks: vec![block],
-        }));
-        session.strings = Some(StringDat::parse(&synth_dat(&[b"test"])).unwrap());
-        let trigger = EventTrigger {
-            event_zone: ZONE,
-            text_zone: ZONE,
-            unique_no: NPC,
-            act_index: 0,
-            event_id: EVENT,
-            params: vec![],
-            npc_name: None,
-        };
-        assert!(
-            matches!(session.begin(trigger), Begin::AwaitServerAck(_)),
-            "the send-tag parks on its s2c ack"
-        );
-        // First tick: records the parked tuple, still within the grace.
-        assert!(matches!(session.tick(0.5), Advance::Waiting));
-        // Age the observation past TAG_ACK_GRACE.
-        let liveness = session
-            .liveness
-            .as_mut()
-            .expect("the parked tick recorded the tuple");
-        liveness.4 =
-            std::time::Instant::now() - (TAG_ACK_GRACE + std::time::Duration::from_secs(1));
-        // The next tick: the event cancels itself.
-        let Advance::Ended {
-            end_para, error, ..
-        } = session.tick(0.5)
-        else {
-            panic!("the stalled event must end");
-        };
-        assert_eq!(end_para, ffxi_event::EVENT_CANCELLED_END_PARA);
-        let Some(line) = error else {
-            panic!("the stall must carry the cancel line");
-        };
-        assert!(line.contains("server did not answer"), "{line}");
-        assert!(line.ends_with("; cancelled."), "{line}");
-        assert!(session.active_end().is_none());
+        const OP_SUBMAP: u8 = 0xA6;
+        for program in [vec![0x43, 0x00, 0x43, 0x01, 0x21], vec![OP_SUBMAP, 0, 0x21]] {
+            let block = ffxi_dat::event_dat::EventBlock {
+                actor: NPC,
+                event_ids: vec![EVENT],
+                event_offsets: vec![0],
+                references: vec![],
+                event_data: program,
+            };
+            let mut session = DialogSession::new(None, "Test".into());
+            session.loaded_event_zone = Some(ZONE);
+            session.loaded_string_zone = Some(ZONE);
+            session.event_dat = Some(Arc::new(EventDat {
+                blocks: vec![block],
+            }));
+            session.strings = Some(StringDat::parse(&synth_dat(&[b"test"])).unwrap());
+            let trigger = EventTrigger {
+                event_zone: ZONE,
+                text_zone: ZONE,
+                unique_no: NPC,
+                act_index: 0,
+                event_id: EVENT,
+                params: vec![],
+                npc_name: None,
+            };
+            assert!(
+                matches!(session.begin(trigger), Begin::AwaitServerAck(_)),
+                "the send-tag parks on its s2c ack"
+            );
+            // First tick: records the parked tuple, still within the grace.
+            assert!(matches!(session.tick(0.5), Advance::Waiting));
+            // Age the observation past TAG_ACK_GRACE.
+            let liveness = session
+                .liveness
+                .as_mut()
+                .expect("the parked tick recorded the tuple");
+            liveness.4 =
+                std::time::Instant::now() - (TAG_ACK_GRACE + std::time::Duration::from_secs(1));
+            // The next tick: the event cancels itself.
+            let Advance::Ended {
+                end_para, error, ..
+            } = session.tick(0.5)
+            else {
+                panic!("the stalled event must end");
+            };
+            assert_eq!(end_para, ffxi_event::EVENT_CANCELLED_END_PARA);
+            let Some(line) = error else {
+                panic!("the stall must carry the cancel line");
+            };
+            assert!(line.contains("server did not answer"), "{line}");
+            assert!(line.ends_with("; cancelled."), "{line}");
+            assert!(session.active_end().is_none());
+        }
     }
 
     /// A displayed menu frame is never stale: a minute of ticks parked on it
@@ -4181,58 +4085,19 @@ pub(crate) mod tests {
         );
     }
 
-    /// 0x69/0x6A scope the volume to the BGM slots the retail sound-type mask
-    /// reaches: zone hits the day/night slots, master hits every slot, and the
-    /// SFX-only bits hit none (research/XiEvents/OpCodes/0x0069.md, 0x006A.md).
     #[test]
-    fn sound_volume_rides_the_music_event_on_the_masked_slots() {
-        const VOLUME: u8 = 64;
-        let slots_for = |mask: u8| -> Vec<u8> {
-            let (tx, mut rx) = broadcast::channel(32);
-            let mut scope = CutsceneScope::default();
-            scope.start(1, &tx);
-            scope.push(
-                ResolvedCue::SoundVolume {
-                    mask,
-                    volume: VOLUME,
-                    fade_frames: 0,
-                },
-                &tx,
-            );
-            drain(&mut rx)
-                .into_iter()
-                .filter_map(|ev| match ev {
-                    AgentEvent::MusicVolumeChanged { slot, volume } => {
-                        assert_eq!(volume, VOLUME);
-                        Some(slot)
-                    }
-                    _ => None,
-                })
-                .collect()
-        };
-        assert_eq!(
-            slots_for(SOUND_TYPE_ZONE),
-            vec![0, 1],
-            "zone -> day/night slots"
+    fn unsupported_sound_volume_does_not_apply_partial_music_changes() {
+        let (tx, mut rx) = broadcast::channel(16);
+        let mut scope = CutsceneScope::default();
+        scope.push(
+            ResolvedCue::SoundVolume {
+                mask: ffxi_event::SOUND_TYPE_MASTER,
+                volume: 0,
+                fade_frames: 60,
+            },
+            &tx,
         );
-        assert_eq!(
-            slots_for(SOUND_TYPE_MASTER),
-            (0..crate::state::MUSIC_SLOT_COUNT).collect::<Vec<_>>(),
-            "master -> every slot"
-        );
-        assert!(
-            slots_for(SOUND_TYPE_EFFECT).is_empty(),
-            "effect has no BGM slot"
-        );
-        assert!(
-            slots_for(SOUND_TYPE_SPECIAL_CHAT).is_empty(),
-            "special chat has no BGM slot"
-        );
-        assert_eq!(
-            slots_for(SOUND_TYPE_ZONE | SOUND_TYPE_MASTER),
-            (0..crate::state::MUSIC_SLOT_COUNT).collect::<Vec<_>>(),
-            "master subsumes zone"
-        );
+        assert!(drain(&mut rx).is_empty());
     }
 
     /// The VM leaves its actor operands unresolved on purpose: the local

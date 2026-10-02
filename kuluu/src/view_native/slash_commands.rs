@@ -601,6 +601,26 @@ const COMMANDS: &[(&str, &[Command])] = &[
                 handler: |c| parse_heal(c.rest),
             },
             Command {
+                names: &["dismount"],
+                set: CommandSet::Retail,
+                usage: "",
+                summary: "dismount the chocobo (must be mounted)",
+                handler: |c| {
+                    let self_id = c.self_char_id.unwrap_or(0);
+                    let self_index = c
+                        .entities
+                        .iter()
+                        .find(|e| e.id == self_id)
+                        .map(|e| e.act_index)
+                        .unwrap_or(0);
+                    SlashOutcome::Command(AgentCommand::Action {
+                        target_id: self_id,
+                        target_index: self_index,
+                        kind: ActionKind::Dismount,
+                    })
+                },
+            },
+            Command {
                 names: &["endevent", "endevt", "clearevent", "clearevt"],
                 set: CommandSet::Dev,
                 usage: "",
@@ -3380,6 +3400,34 @@ mod tests {
             })
         ));
     }
+    #[test]
+    fn dismount_targets_self() {
+        let mut me = ent(42, "Me", EntityKind::Pc, 0.0, 0.0);
+        me.act_index = 7;
+        let entities = vec![me, ent(1, "Chocobo", EntityKind::Mob, 3.0, 0.0)];
+        let outcome = parse_slash(
+            "/dismount",
+            &test_surface(),
+            &entities,
+            origin(),
+            Some(1),
+            None,
+            Some(42),
+            &[],
+            kuluu_render::fishing_spot::FishingGate::Ready,
+            None,
+            None,
+        );
+        assert!(matches!(
+            outcome,
+            SlashOutcome::Command(AgentCommand::Action {
+                target_id: 42,
+                target_index: 7,
+                kind: ActionKind::Dismount,
+            })
+        ));
+    }
+
     #[test]
     fn targetenemy_skips_npcs() {
         let entities = vec![
