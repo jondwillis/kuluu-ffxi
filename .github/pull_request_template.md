@@ -4,11 +4,11 @@
 
 ## Why this belongs in Kuluu
 
-<!-- Required beyond the issue: who benefits, why existing behavior/tooling is insufficient, and why the added scope/cost is justified. Classify client behavior as Retail parity, a modest default improvement, or opt-in Enhanced. Explain preserved gameplay, convenience/interaction tradeoffs and default activation, or the explicit Enhanced gate. Developer tooling must identify its concrete use case and activation boundary. -->
+<!-- Required beyond the issue: who benefits, the concrete task existing behavior/tooling cannot adequately perform, and why the added scope/cost is justified. Classify client behavior as Retail parity, a modest default improvement, or opt-in Enhanced. Explain interaction tradeoffs and default activation or the explicit Enhanced gate. For tooling/partial features, name the implemented consumer and activation boundary; explain why this slice is useful independently and should land separately from missing player behavior. Future usefulness, small scope and "helps verification" alone are insufficient. -->
 
 ## Evidence
 
-<!-- Link decisive sources and state exactly what each establishes: retail behavior -> original-client observation, build-scoped DLL/DAT investigation or applicable official specification; server wire semantics -> pinned LSB source/symbol. Tests, Kuluu captures and community recreations alone do not prove retail behavior. For tooling that claims to drive retail controls, ground that premise too. State material inferences or remaining gaps; a category label is not an evidence exemption. -->
+<!-- Link decisive sources and state exactly what each establishes: retail behavior -> original-client observation, build-scoped DLL/DAT investigation or applicable official specification; server wire semantics -> pinned LSB source/symbol. Tests, Kuluu captures and community recreations alone do not prove retail behavior. Tooling must demonstrate its claimed task through the production consumer, not merely parse an input; ground any retail-control premise too. State material inferences or remaining gaps; a category label is not an evidence exemption. -->
 
 ## Validation
 
