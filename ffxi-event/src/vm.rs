@@ -4096,18 +4096,16 @@ mod tests {
         assert_eq!(e.step(), StepResult::Done, "an expired hold falls through");
     }
 
-    /// A 0x9B after a 0x6E on the event entity in one pass parks on the
-    /// same-batch start, the way retail's AnimationPlay goes up at the emote
-    /// (research/XiEvents/OpCodes/0x009B.md).
     #[test]
-    fn anim_yield_parks_on_the_same_pass_emote() {
+    fn skipped_emote_does_not_arm_animation_yield() {
         let mut data = vec![OP_EMOT];
         data.extend_from_slice(&ActorLookup::EVENT_ENTITY.0.to_le_bytes());
         data.extend_from_slice(&REF0);
         data.push(OP_ANIM_YIELD);
         data.push(OP_END);
         let mut e = vm(data, vec![7]);
-        assert_eq!(e.step(), StepResult::Waiting);
+        assert_eq!(e.step(), StepResult::Done);
+        assert!(e.take_cues().is_empty());
     }
 
     #[test]
