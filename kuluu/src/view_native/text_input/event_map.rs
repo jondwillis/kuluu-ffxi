@@ -6,7 +6,8 @@ const MILLI_PER_UNIT: f32 = 1000.0;
 
 /// Drives the Map screen from event-script map opcodes, which arrive as
 /// edge-triggered ViewerEvents on the snapshot's event ring (0xC8 MAP_TUTORIAL
-/// opens, 0x8B MAP_MARKER upserts a marker, 0x8A CLOSE_MAP closes).
+/// opens, 0x8B MAP_MARKER upserts a marker, 0x8A CLOSE_MAP closes; the opcode
+/// semantics: research/XiEvents/OpCodes/0x00C8.md, 0x008B.md, 0x008A.md).
 pub fn event_map_sync_system(
     state: Res<SceneState>,
     events: Res<kuluu_render::EventLog>,
@@ -36,6 +37,9 @@ pub fn event_map_sync_system(
     *cursor = total;
 }
 
+/// Open (or keep open) the Map screen on the event's map. `viewed` stays
+/// None when the authored zone is the live one, so the surface shows the live
+/// map rather than a Change-Map override.
 fn open_event_map(
     map_id: u16,
     live_zone: Option<u16>,
@@ -51,11 +55,11 @@ fn open_event_map(
         stack.push(MenuKind::Map);
         *mode = InputMode::Menu(stack);
     }
-    // `viewed` stays None when the authored zone is the live one, so the
-    // surface shows the live map rather than a Change-Map override.
     map_state.viewed = (live_zone != Some(map_id)).then_some((map_id, 0));
 }
 
+/// Place or move the event's marker. Re-running the event replaces a
+/// same-label marker instead of stacking duplicates on top of it.
 fn upsert_event_marker(
     map_id: u16,
     x_milli: i32,
@@ -69,8 +73,6 @@ fn upsert_event_marker(
         z: y_milli as f32 / MILLI_PER_UNIT,
     };
     let zone = markers.by_zone.entry(map_id).or_default();
-    // Re-running the event replaces a same-label marker instead of stacking
-    // duplicates on top of it.
     if let Some(slot) = zone.iter_mut().find(|m| m.label == label) {
         slot.world = world;
     } else {
@@ -78,6 +80,8 @@ fn upsert_event_marker(
     }
 }
 
+/// Close the event-opened Map. An event-driven close lands back in the world
+/// even when a player-opened /map would pop to the Root command menu.
 fn close_event_map(
     mode: &mut InputMode,
     map_state: &mut kuluu_render::hud::map_screen::MapScreenState,
@@ -89,8 +93,6 @@ fn close_event_map(
     if !is_top {
         return;
     }
-    // An event-driven close lands back in the world even when a player-opened
-    // /map would pop to the Root command menu.
     *mode = InputMode::World;
     map_state.reset();
 }
@@ -197,7 +199,6 @@ mod tests {
         assert_eq!(markers.for_zone(230)[0].world.x, -10.264);
         assert_eq!(markers.for_zone(230)[0].world.z, -0.363);
 
-        // Re-running the event re-places instead of duplicating.
         push(
             &mut world,
             ViewerEvent::MapMarkerPlaced {

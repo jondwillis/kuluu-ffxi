@@ -269,19 +269,17 @@ mod tests {
         assert_eq!(c.footstep_material, 0x42);
     }
 
+    /// The bat's raw Info body as the viewer reads it (ROM/4/106.DAT, file id 1564; its
+    /// variants 1556/1561/1563/1565 carry the same bytes). All sixteen on-disk bytes are
+    /// fed in: CIB_LEN is 15 and the uninterpreted sixteenth is ignored by design.
     #[test]
     fn bat_info_chunk() {
-        // The bat's raw Info body as the viewer reads it (ROM/4/106.DAT, file id 1564; its
-        // variants 1556/1561/1563/1565 carry the same bytes). All sixteen on-disk bytes are
-        // fed in: our CIB_LEN is 15 and the uninterpreted sixteenth is ignored by design.
         let body = [
             0x03, 0x06, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x55, 0x64, 0x73, 0x8C,
             0xFF, 0xFF,
         ];
         let c = Cib::parse(*b"cib0", &body).unwrap();
         assert_eq!(c.movement_type, MovementType::Flying);
-        // The four GraphSize entries are a size ladder, which is what the
-        // field being an index rather than a multiplier looks like on disk.
         assert_eq!(c.scale, [85, 100, 115, 140]);
         assert_eq!(c.range_type, RangeType::Unset);
         assert!((c.scale_factor(0) - 0.85).abs() < f32::EPSILON);
@@ -300,7 +298,6 @@ mod tests {
         assert_eq!(RangeType::from_u8(0x06), RangeType::Archery);
         assert_eq!(RangeType::from_u8(0x0a), RangeType::HandbellIndi);
         assert_eq!(RangeType::from_u8(0x0b), RangeType::HandbellGeo);
-        // The documented gaps read as out-of-table, not Unset.
         assert_eq!(RangeType::from_u8(0x07), RangeType::Unknown(0x07));
         assert_eq!(RangeType::from_u8(0x08), RangeType::Unknown(0x08));
 

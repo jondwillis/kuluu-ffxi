@@ -14,11 +14,8 @@ use super::obstacles::{DoorObstacle, MobObstacle, ObstacleSet};
 use super::step::step;
 use super::{HorizontalOutcome, VerticalDecision, Walker};
 
-// ---------------------------------------------------------------------------
-// Geometry builders (ported from dat_mzb's wall_collision_tests)
-// ---------------------------------------------------------------------------
-
-// The longest trace covers 100 yalms; keep its landing inside the fixture.
+/// Geometry builders (ported from dat_mzb's wall_collision_tests). The
+/// longest trace covers 100 yalms; keep its landing inside the fixture.
 const TEST_FLOOR_EXTENT: f32 = 128.0;
 
 fn quad(b: &mut MzbCollisionBlock, v: [Vec3; 4], n: Vec3, link: u32) {
@@ -271,7 +268,8 @@ fn corridor(gap: f32) -> MzbCollisionGeometry {
 }
 
 /// The Bastok Mines stair as measured 2026-08-23: a level-0 terrace slab that
-/// continues UNDER the treads (the "stuff" the old walker clipped through).
+/// continues UNDER the treads — the geometry the free-move + column-snap stub
+/// clipped through.
 fn stair_with_ground_under(steps: usize, d: f32, r: f32) -> MzbCollisionGeometry {
     let mut b = MzbCollisionBlock::default();
     quad(
@@ -328,10 +326,8 @@ fn stair_with_ground_under(steps: usize, d: f32, r: f32) -> MzbCollisionGeometry
     MzbCollisionGeometry::from_block(b)
 }
 
-// ---------------------------------------------------------------------------
-// New builders: hole / ledge / nosing
-// ---------------------------------------------------------------------------
-
+/// The hole / ledge / nosing builders.
+///
 /// Flat floor at y=0 with a vertical drop of `drop` at x = edge_x.
 fn ledge(edge_x: f32, drop: f32) -> MzbCollisionGeometry {
     let mut b = MzbCollisionBlock::default();
@@ -456,7 +452,6 @@ fn nosing_flight(steps: usize, d: f32, r: f32) -> MzbCollisionGeometry {
             Vec3::Y,
             NO_SUB_AREA_LINK,
         );
-        // Nosing: a raised shelf on the first 0.15 of the tread.
         quad(
             &mut b,
             [
@@ -485,10 +480,7 @@ fn nosing_flight(steps: usize, d: f32, r: f32) -> MzbCollisionGeometry {
     MzbCollisionGeometry::from_block(b)
 }
 
-// ---------------------------------------------------------------------------
-// Obstacle builders: door_leaf / mob_circle
-// ---------------------------------------------------------------------------
-
+/// Obstacle builders: door_leaf / mob_circle.
 fn door_tri(v: [Vec3; 4]) -> ([Vec3; 3], Vec3) {
     let n = (v[1] - v[0]).cross(v[2] - v[0]).normalize();
     ([v[0], v[1], v[2]], n)
@@ -523,7 +515,7 @@ fn door_wall(wall_x: f32) -> ObstacleSet {
 }
 
 /// A closed drawbridge deck at y = deck_y spanning x in [x0, x1]: a floor for
-/// the column probe (up-facing door faces are never walls).
+/// the column probe (up-facing door faces are not walls).
 fn drawbridge(x0: f32, x1: f32, deck_y: f32) -> ObstacleSet {
     let v = [
         Vec3::new(x0, deck_y, 3.0),
@@ -550,13 +542,12 @@ fn mob_circle(id: u32, cx: f32, cz: f32, radius: f32) -> ObstacleSet {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Walk harness (wire coordinates at the boundary, like dispatch)
-// ---------------------------------------------------------------------------
-
+/// Walk harness (wire coordinates at the boundary, like dispatch).
+///
 /// One headless walk through [`step`]: `secs` of input in unit wire direction
 /// `dir` at `speed_yps`, fixed-rate `hz`. Records the wire position and the
-/// vertical decision after every tick.
+/// vertical decision after every tick. The geometry is treated as ready:
+/// these matrices exercise real floor behavior.
 fn walk(
     geom: &MzbCollisionGeometry,
     obstacles: &ObstacleSet,
@@ -584,7 +575,7 @@ fn walk(
             speed_yps,
             dt,
             false,
-            true, // geometry ready: these matrices exercise real floor behavior
+            true,
         );
         x += res.dx;
         y += res.dy;
@@ -659,7 +650,7 @@ fn max_d2(ys: &[f32]) -> f32 {
         .fold(0.0f32, f32::max)
 }
 
-// A start, stop, or landing changes velocity in one tick.
+/// A start, stop, or landing changes velocity in one tick.
 fn d2_bound(r: f32, hz: f32) -> f32 {
     let speed = if r > STEP_MAX {
         FallModel::default().v_max
@@ -669,13 +660,11 @@ fn d2_bound(r: f32, hz: f32) -> f32 {
     2.0 * speed / hz + super::consts::CHAIN_CEILING_EPS
 }
 
+/// 5.0 y/s — the production run speed.
 const RUN: f32 =
-    kuluu_session::state::move_speed_yps(kuluu_session::state::BASE_PACKET_SPEED, false); // 5.0 y/s — the production run speed
+    kuluu_session::state::move_speed_yps(kuluu_session::state::BASE_PACKET_SPEED, false);
 
-// ---------------------------------------------------------------------------
-// Staircase matrices
-// ---------------------------------------------------------------------------
-
+/// Staircase matrices.
 #[test]
 fn stairs_ascend_matrix() {
     for hz in [60.0f32, 30.0] {
@@ -742,8 +731,8 @@ fn stairs_descend_matrix() {
     }
 }
 
-/// A flight whose risers exceed STEP_MAX cannot be climbed: the walker stops at
-/// the foot of the first riser and never gains height.
+/// A flight whose risers exceed STEP_MAX cannot be climbed: the walker stops
+/// at the foot of the first riser and does not gain height.
 #[test]
 fn riser_above_step_height_blocks_ascent() {
     let g = staircase(12, 0.5, 0.5, false);
@@ -763,11 +752,12 @@ fn riser_above_step_height_blocks_ascent() {
     );
 }
 
+/// The start sits flush against the first riser: the in-game spawn was ~0.35
+/// yalms off it.
 #[test]
 fn stair_with_ground_under_climbs_and_never_dips_to_slab() {
     for (r, d) in [(0.26, 0.48), (0.35, 0.5)] {
         let g = stair_with_ground_under(8, d, r);
-        // Start flush against the first riser — his spawn was ~0.35 yalms off it.
         let start_x = -super::consts::BODY_RADIUS + 0.05;
         let t = walk(
             &g,
@@ -833,10 +823,7 @@ fn nosing_flight_climbs_like_a_clean_one() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Walls / corners / corridors
-// ---------------------------------------------------------------------------
-
+/// Walls / corners / corridors.
 #[test]
 fn tall_wall_blocks_with_standoff() {
     let g = flat_with_wall(2.0, 3.0, NO_SUB_AREA_LINK);
@@ -1003,10 +990,10 @@ fn corner_blocks_the_body() {
     );
 }
 
+/// The start sits embedded in the wall (body radius 0.4, face at x=2).
 #[test]
 fn embedded_start_recovers_and_never_tunnels() {
     let g = flat_with_wall(2.0, 3.0, NO_SUB_AREA_LINK);
-    // Start embedded in the wall (body radius 0.4, face at x=2).
     let t = walk(
         &g,
         &ObstacleSet::default(),
@@ -1073,10 +1060,7 @@ fn suppressed_shell_is_walk_through() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Ramps / slopes
-// ---------------------------------------------------------------------------
-
+/// Ramps / slopes.
 #[test]
 fn ramp_40_degrees_walks_up_free() {
     let top = 4.0 * (40f32.to_radians().tan());
@@ -1103,7 +1087,7 @@ fn ramp_40_degrees_walks_up_free() {
 }
 
 /// A 65 degree face is a wall under the 45 degree rule: it blocks, and the
-/// walker never climbs it.
+/// walker does not climb it.
 #[test]
 fn steep_65_degree_face_blocks() {
     let top = 4.0 * (65f32.to_radians().tan());
@@ -1145,8 +1129,8 @@ fn face_just_past_45_degrees_blocks_like_a_wall() {
 /// Walking off a floor onto a bank too steep to stand on (the south edge of
 /// Selbina's dock stairs, normal.y 0.35..0.6): the sweep does not stop the
 /// body, because the face is below the feet, and the support probe finds no
-/// floor-class hit, so the walker goes airborne. It must ride the bank down to
-/// the floor below, never passing through it.
+/// floor-class hit, so the walker goes airborne. It must ride the bank down
+/// to the floor below, without passing through it.
 #[test]
 fn steep_bank_descent_never_tunnels() {
     let deg = 55f32;
@@ -1186,6 +1170,10 @@ fn steep_bank_descent_never_tunnels() {
 
 /// A 30 degree oblique wall: the slide keeps full speed along it — no stall,
 /// and the walk covers the same ground as a straight one in the same time.
+/// The wall runs from (4,-6) to (8,6), 30 degrees off the x axis; the walk
+/// goes straight at its middle and slides along. The x advance over the slide
+/// must stay a large fraction of free speed: sliding along a 30 degree wall
+/// keeps cos(30) ~ 0.87 of the x component.
 #[test]
 fn oblique_wall_slide_keeps_full_speed() {
     let mut b = MzbCollisionBlock::default();
@@ -1200,7 +1188,6 @@ fn oblique_wall_slide_keeps_full_speed() {
         Vec3::Y,
         NO_SUB_AREA_LINK,
     );
-    // A wall from (4,-6) to (8,6): 30 degrees off the x axis.
     let a = Vec3::new(4.0, 0.0, -6.0);
     let c = Vec3::new(4.0 + 12.0 / 30_f32.to_radians().tan(), 0.0, 6.0);
     quad(
@@ -1210,7 +1197,6 @@ fn oblique_wall_slide_keeps_full_speed() {
         NO_SUB_AREA_LINK,
     );
     let g = MzbCollisionGeometry::from_block(b);
-    // Walk straight at the wall's middle: it slides along, never stalls.
     let t = walk(
         &g,
         &ObstacleSet::default(),
@@ -1222,19 +1208,18 @@ fn oblique_wall_slide_keeps_full_speed() {
     );
     let ys = ys(&t);
     assert_eq!(reversals(&ys), 0);
-    // The x advance over the slide must stay a large fraction of free speed:
-    // sliding along a 30 degree wall keeps cos(30) ~ 0.87 of the x component.
     let (x, _y, z) = t.last().unwrap().0;
     assert!(x > -4.0 + 0.6 * RUN * 6.0, "slide stalled: x={x:.2}");
     assert!((-z).abs() < 0.01, "no lift on the slide: h={:.3}", -z);
 }
 
-// ---------------------------------------------------------------------------
-// Falls / ledges / holes
-// ---------------------------------------------------------------------------
-
-/// Walk off a ledge: Airborne under FallModel, lands on the lower floor within
-/// one tick of the analytic time.
+/// Falls / ledges / holes.
+///
+/// Walk off a ledge: Airborne under FallModel, lands on the lower floor
+/// within one tick of the analytic time. The fall starts at the lip: the
+/// first tick below the upper floor. Analytic landing: 0.5 g t^2 = 3
+/// (pre-terminal at this height). After landing the height is flat (vy
+/// resets).
 #[test]
 fn walk_off_a_ledge_falls_and_lands() {
     let g = ledge(2.0, 3.0);
@@ -1248,14 +1233,12 @@ fn walk_off_a_ledge_falls_and_lands() {
         RUN,
     );
     let ys = ys(&t);
-    // The fall starts at the lip: find the first tick below the upper floor.
     let fall_start = t
         .iter()
         .position(|(_, decision)| matches!(decision, VerticalDecision::Airborne { .. }))
         .expect("never fell");
     assert!(fall_start > 0, "fell before reaching the lip");
     let dt = 1.0 / 60.0;
-    // Analytic landing: 0.5 g t^2 = 3 (pre-terminal at this height).
     let t_analytic = (2.0 * 3.0 / FallModel::default().g).sqrt();
     let landed_at = ys[fall_start..]
         .iter()
@@ -1266,7 +1249,6 @@ fn walk_off_a_ledge_falls_and_lands() {
         (t_landed - t_analytic).abs() <= dt + 1e-6,
         "landed at {t_landed:.3}s, analytic {t_analytic:.3}s"
     );
-    // vy resets: after landing the height is flat.
     let tail = &ys[fall_start + landed_at..];
     assert!(
         tail.windows(2).all(|w| (w[1] - w[0]).abs() < 1e-6),
@@ -1319,9 +1301,10 @@ fn ledge_just_past_step_band_falls_just_under_steps() {
 
 /// A hole wider than the footprint: fall through it and land on the lower
 /// floor; a hole narrower than the footprint is bridged by the ring probes.
+/// 0.8 wide > footprint diameter 0.5: falls. 0.4 wide < footprint: bridged,
+/// no fall at all.
 #[test]
 fn wide_hole_falls_narrow_hole_bridges() {
-    // 0.8 wide > footprint diameter 0.5: falls.
     let g = hole(2.0, 0.8, Some(1.0));
     let t = walk(
         &g,
@@ -1344,7 +1327,6 @@ fn wide_hole_falls_narrow_hole_bridges() {
         -z
     );
 
-    // 0.4 wide < footprint: bridged, no fall at all.
     let g = hole(2.0, 0.4, None);
     let t = walk(
         &g,
@@ -1383,7 +1365,7 @@ fn shallow_trench_follows_its_floor() {
     assert!(trace.last().unwrap().0 .2.abs() < 0.01);
 }
 
-/// A cliff descent is a fall, never a wall: the walker walks off and lands.
+/// A cliff descent is a fall, not a wall: the walker walks off and lands.
 #[test]
 fn cliff_descent_is_never_a_wall() {
     let g = ledge(2.0, 2.0);
@@ -1404,16 +1386,14 @@ fn cliff_descent_is_never_a_wall() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Stop / resume / settle
-// ---------------------------------------------------------------------------
-
+/// Stop / resume / settle.
+///
 /// Stop mid-flight: the walker settles onto the tread at speed, then resumes
-/// climbing smoothly — no dip below the current tread, no zig.
+/// climbing smoothly — no dip below the current tread, no zig. The walk
+/// climbs ~2 treads, stops for a second on the flight, then finishes.
 #[test]
 fn stop_mid_flight_settles_then_resumes() {
     let g = staircase(8, 0.5, 0.3, false);
-    // Climb ~2 treads, stop for a second on the flight, then finish.
     let t = walk_with_stops(
         &g,
         &ObstacleSet::default(),
@@ -1444,12 +1424,13 @@ fn stop_mid_flight_settles_then_resumes() {
     );
 }
 
-/// A 0.1 sill (dead band) snaps in one tick — no ramp, no rate-limited crawl.
+/// A 0.1 sill (dead band) snaps in one tick — no ramp, no rate-limited
+/// crawl. The walk goes up to the lip and stops just past it: the first
+/// grounded tick on the platform must already be at full height (poof snaps
+/// instantly).
 #[test]
 fn sill_snaps_in_one_tick() {
     let g = parapet_platform(2.0, 0.1, 0.1);
-    // Walk up to the lip and stop just past it: the first grounded tick on the
-    // platform must already be at full height (poof snaps instantly).
     let t = walk(
         &g,
         &ObstacleSet::default(),
@@ -1470,7 +1451,7 @@ fn sill_snaps_in_one_tick() {
     );
 }
 
-/// Landing at the top of a flight never overshoots: y <= top + 0.01.
+/// Landing at the top of a flight does not overshoot: y <= top + 0.01.
 #[test]
 fn landing_at_top_never_overshoots() {
     let g = staircase(8, 0.5, 0.3, false);
@@ -1495,14 +1476,12 @@ fn landing_at_top_never_overshoots() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Doors / mobs
-// ---------------------------------------------------------------------------
-
-/// A closed door leaf blocks the sweep like a wall...
+/// Doors / mobs.
+///
+/// A closed door leaf blocks the sweep like a wall... A backstop wall sits
+/// far ahead: the DOOR is what must stop the walk.
 #[test]
 fn door_leaf_blocks() {
-    // Backstop wall far ahead: the DOOR is what must stop the walk.
     let g = flat_with_wall(12.0, 3.0, NO_SUB_AREA_LINK);
     let doors = door_wall(5.0);
     let t = walk(&g, &doors, (-2.0, 0.0, 0.0), (1.0, 0.0), 8.0, 60.0, RUN);
@@ -1514,11 +1493,12 @@ fn door_leaf_blocks() {
 }
 
 /// ...and a closed drawbridge deck is a floor: the walker crosses it without
-/// falling where an open gap would drop it.
+/// falling where an open gap would drop it. The hole leaves no MZB floor over
+/// x in [0, 4]; without the leaf that is a fall through the gap, with it a
+/// straight crossing at floor level.
 #[test]
 fn door_leaf_is_a_floor() {
-    let g = hole(2.0, 4.0, None); // no MZB floor over x in [0, 4]
-                                  // Without the leaf: a fall through the gap.
+    let g = hole(2.0, 4.0, None);
     let t = walk(
         &g,
         &ObstacleSet::default(),
@@ -1533,7 +1513,6 @@ fn door_leaf_is_a_floor() {
             .any(|(_, d)| matches!(d, VerticalDecision::Airborne { .. })),
         "open gap must drop the walker"
     );
-    // With it: straight across at floor level.
     let deck = drawbridge(0.0, 4.0, 0.0);
     let t = walk(&g, &deck, (-3.0, 0.0, 0.0), (1.0, 0.0), 6.0, 60.0, RUN);
     assert!(
@@ -1549,21 +1528,21 @@ fn door_leaf_is_a_floor() {
     );
 }
 
-/// Retail's actor contact: the move is withheld for the budget, then released.
+/// Retail's actor contact: the move is withheld for the budget, then
+/// released. The backstop wall sits far ahead, so the MOB is what must
+/// stop the walker: 1.5 s of travel reaches the mob with the block budget
+/// still live; 6.0 s outlasts the budget, so the block expires and the
+/// path crosses the mob rather than skirting it.
 #[test]
 fn mob_circle_blocks_then_walks_through() {
-    // Backstop wall far ahead: the MOB is what must stop phase 1.
     let g = flat_with_wall(30.0, 3.0, NO_SUB_AREA_LINK);
     let mobs = mob_circle(1, 4.0, 0.0, 0.5);
-    // 1.5 s of travel reaches the mob with the block budget still live.
     let t = walk(&g, &mobs, (-2.0, 0.0, 0.0), (1.0, 0.0), 1.5, 60.0, RUN);
     assert!(
         t.last().unwrap().0 .0 < 4.0 - 0.85,
         "mob held: x={:.2}",
         t.last().unwrap().0 .0
     );
-    // 6.0 s outlasts the budget: the block expires and the path crosses the
-    // mob rather than skirting it.
     let t = walk(&g, &mobs, (-2.0, 0.0, 0.0), (1.0, 0.0), 6.0, 60.0, RUN);
     let (x, y, _) = t.last().unwrap().0;
     assert!(x > 4.5, "contact budget did not expire: x={x:.2}");
@@ -1578,13 +1557,13 @@ fn mob_circle_blocks_then_walks_through() {
     );
 }
 
-/// Retail never depenetrates: standing still inside an actor's circle must not
-/// shove the player out. research/XIClient/src/XIClient/source/World/Actor/ControllableActor.cpp
-/// ControllableActor::HandleThirdPersonControl only withholds the move.
+/// Retail does not depenetrate: standing still inside an actor's circle must
+/// not shove the player out. research/XIClient/src/XIClient/source/World/Actor/ControllableActor.cpp
+/// ControllableActor::HandleThirdPersonControl only withholds the move. The
+/// mob circle is centered a hair away: deeply overlapping at standoff.
 #[test]
 fn mob_circle_does_not_shove_an_idle_player() {
     let g = flat_with_wall(30.0, 3.0, NO_SUB_AREA_LINK);
-    // Mob circle centered a hair away: deeply overlapping at standoff.
     let mobs = mob_circle(1, 0.1, 0.0, 0.5);
     let t = walk(&g, &mobs, (0.0, 0.0, 0.0), (0.0, 0.0), 2.0, 60.0, RUN);
     let (x, y, _) = t.last().unwrap().0;
@@ -1594,16 +1573,16 @@ fn mob_circle_does_not_shove_an_idle_player() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Diagonals / strafes
-// ---------------------------------------------------------------------------
-
-/// Diagonal ascent at 30/45/60 degrees to the flight: the plane fit carries it.
+/// Diagonals / strafes.
+///
+/// Diagonal ascent at 30/45/60 degrees to the flight: the plane fit carries
+/// it. The wire direction is +x with a -y component (bevy +z); the full
+/// diagonal stays on the fixture so the stair motion is measurable.
 #[test]
 fn diagonal_ascent() {
     for deg in [30.0f32, 45.0, 60.0] {
         let a = deg.to_radians();
-        let dir = (a.cos(), -a.sin()); // wire: +x with a -y component (bevy +z)
+        let dir = (a.cos(), -a.sin());
         let g = staircase_width(10, 0.5, 0.3, false, TEST_FLOOR_EXTENT);
         let t = walk(
             &g,
@@ -1614,7 +1593,6 @@ fn diagonal_ascent() {
             60.0,
             RUN,
         );
-        // Keep the full diagonal on the fixture to measure stair motion.
         let z = t.last().unwrap().0 .2;
         let ys = ys(&t);
         assert_eq!(reversals(&ys), 0, "zig on diagonal {deg}");
@@ -1622,11 +1600,12 @@ fn diagonal_ascent() {
     }
 }
 
-/// Strafe along a tread edge: the lateral gradient keeps the target continuous.
+/// Strafe along a tread edge: the lateral gradient keeps the target
+/// continuous. The walk goes +x hugging the flight's near side (z = -2.6 in
+/// bevy = wire y +2.6).
 #[test]
 fn strafe_along_tread_edge() {
     let g = staircase(8, 0.5, 0.3, false);
-    // Walk +x hugging the flight's near side (z = -2.6 in bevy = wire y +2.6).
     let t = walk(
         &g,
         &ObstacleSet::default(),
@@ -1646,10 +1625,9 @@ fn strafe_along_tread_edge() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Horizontal outcomes: the panel's "why am I stopped"
-// ---------------------------------------------------------------------------
-
+/// Horizontal outcomes: the panel's "why am I stopped".
+///
+/// Flat test floor.
 fn flat_floor() -> MzbCollisionGeometry {
     let mut b = MzbCollisionBlock::default();
     quad(
@@ -1713,6 +1691,9 @@ fn tick(
     )
 }
 
+/// Open ground: every tick honors the full input (Moved). The idle tick
+/// carries no input (NoInput). Noclip bypasses the sweep and the contact
+/// check.
 #[test]
 fn horizontal_outcome_moved_no_input_noclip() {
     let g = flat_floor();
@@ -1720,7 +1701,6 @@ fn horizontal_outcome_moved_no_input_noclip() {
     let mut state = Walker::default();
     let dt = 1.0 / 60.0;
     let mut x = 0.0f32;
-    // Open ground: every tick honors the full input.
     for _ in 0..30 {
         let res = tick(
             &g,
@@ -1740,14 +1720,12 @@ fn horizontal_outcome_moved_no_input_noclip() {
         );
         x += res.dx;
     }
-    // Idle tick: no input.
     let res = tick(&g, &obstacles, &mut state, x, 0.0, 0.0, 0.0, 0.0, false);
     assert!(
         matches!(res.outcome, HorizontalOutcome::NoInput),
         "idle tick must be NoInput, got {:?}",
         res.outcome
     );
-    // Noclip bypasses the sweep and the contact check.
     let res = tick(&g, &obstacles, &mut state, x, 0.0, 0.0, RUN * dt, 0.0, true);
     assert!(
         matches!(res.outcome, HorizontalOutcome::Noclip),
@@ -1756,6 +1734,9 @@ fn horizontal_outcome_moved_no_input_noclip() {
     );
 }
 
+/// Approach the wall, then keep pushing head-on at standoff. The bisection
+/// leaves the body a hair off the face, so the tick creeps by a sliver; it
+/// must not be a real advance.
 #[test]
 fn horizontal_outcome_wall_hold_at_flat_wall() {
     let g = flat_with_wall(2.0, 3.0, NO_SUB_AREA_LINK);
@@ -1763,7 +1744,6 @@ fn horizontal_outcome_wall_hold_at_flat_wall() {
     let mut state = Walker::default();
     let dt = 1.0 / 60.0;
     let mut x = -2.0f32;
-    // Approach the wall, then keep pushing head-on at standoff.
     for _ in 0..60 {
         let res = tick(
             &g,
@@ -1792,8 +1772,6 @@ fn horizontal_outcome_wall_hold_at_flat_wall() {
     match res.outcome {
         HorizontalOutcome::WallHold { contact } => {
             assert!(contact.is_some(), "wall hold must carry the contact");
-            // The bisection leaves the body a hair off the face, so the tick
-            // creeps by a sliver; it must not be a real advance.
             assert!(
                 res.dx.abs() < RUN * dt / 100.0,
                 "held: dx={:.6} (input {:.4})",
@@ -1805,17 +1783,18 @@ fn horizontal_outcome_wall_hold_at_flat_wall() {
     }
 }
 
+/// Walk diagonally into the corner's point from the open quadrant: the slide
+/// along the first wall dead-ends on the second, so the body stops at the
+/// corner's standoff. The tick displacement must not exceed the input. The
+/// body ends at the corner's standoff, well short of the start: it advanced
+/// toward the point and then held.
 #[test]
 fn horizontal_outcome_wall_hold_at_inside_corner() {
     let g = inside_corner();
     let obstacles = ObstacleSet::default();
     let mut state = Walker::default();
     let dt = 1.0 / 60.0;
-    let m = RUN * dt / 2.0f32.sqrt(); // diagonal at run speed
-                                      // Walk diagonally into the corner's point from the open quadrant: the
-                                      // slide along the first wall dead-ends on the second, so the body stops
-                                      // at the corner's standoff. The tick displacement must never exceed the
-                                      // input.
+    let m = RUN * dt / 2.0f32.sqrt();
     let mut x = 2.0f32;
     let mut y = -2.0f32;
     for _ in 0..60 {
@@ -1829,8 +1808,6 @@ fn horizontal_outcome_wall_hold_at_inside_corner() {
             res.dy
         );
     }
-    // Stopped at the corner's standoff, well short of the start: the body
-    // advanced toward the point and then held.
     assert!(
         (0.2..0.8).contains(&x) && (-0.8..-0.2).contains(&y),
         "corner: body at wire ({x:.3}, {y:.3})"
@@ -1844,9 +1821,11 @@ fn horizontal_outcome_wall_hold_at_inside_corner() {
     }
 }
 
+/// The 30 degree wall from `oblique_wall_slide_keeps_full_speed`. Sliding
+/// along a wall 30 degrees off the input keeps cos(30) ~ 0.87 of it; the
+/// ratio must sit in the slide band, not read as a full move or a stop.
 #[test]
 fn horizontal_outcome_slid_along_oblique_wall() {
-    // The 30 degree wall from `oblique_wall_slide_keeps_full_speed`.
     let mut b = MzbCollisionBlock::default();
     quad(
         &mut b,
@@ -1882,9 +1861,6 @@ fn horizontal_outcome_slid_along_oblique_wall() {
             slid = Some(ratio);
         }
     }
-    // Sliding along a wall 30 degrees off the input keeps cos(30) ~ 0.87 of
-    // it; the ratio must sit in the slide band, not read as a full move or a
-    // stop.
     let ratio = slid.expect("never slid along the oblique wall");
     assert!(
         (0.7..0.95).contains(&ratio),
@@ -1892,15 +1868,15 @@ fn horizontal_outcome_slid_along_oblique_wall() {
     );
 }
 
+/// One tick into the mob's circle: the move is withheld, not deflected. The
+/// projected body (one tick ahead) must sit inside the circle: the standoff
+/// gap must stay under the 0.9 combined radii or nothing blocks.
 #[test]
 fn horizontal_outcome_actor_contact_carries_the_mob() {
     let g = flat_with_wall(30.0, 3.0, NO_SUB_AREA_LINK);
-    // The projected body (one tick ahead) must sit inside the circle: the
-    // standoff gap must stay under the 0.9 combined radii or nothing blocks.
     let mobs = mob_circle(7, 0.8, 0.0, 0.5);
     let mut state = Walker::default();
     let dt = 1.0 / 60.0;
-    // One tick into the mob's circle: the move is withheld, not deflected.
     let res = tick(&g, &mobs, &mut state, 0.0, 0.0, 0.0, RUN * dt, 0.0, false);
     match res.outcome {
         HorizontalOutcome::ActorContact { mob, contact } => {

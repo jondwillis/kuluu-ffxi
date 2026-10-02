@@ -17,6 +17,8 @@ if ! LITERALS_DIFF=staged scripts/checks.sh literals; then
   exit 1
 fi
 
+README_DIFF=staged scripts/checks.sh readme
+
 contract_paths=$(git diff --cached --name-only -- ffxi-event ffxi-proto ffxi-dat ffxi-vocab kuluu-session kuluu-render kuluu-snapshot kuluu scripts/checks.sh .githooks)
 if [[ -n "$contract_paths" ]]; then
   scripts/checks.sh contracts

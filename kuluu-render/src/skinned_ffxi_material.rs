@@ -188,10 +188,10 @@ const SKIN_JOINTS_BYTES: u64 = <FfxiJointMatrices as encase::ShaderSize>::SHADER
 const JOINT_MATRIX_STRIDE: u64 = <Mat4 as encase::ShaderSize>::SHADER_SIZE.get();
 const INSTANCE_STRIDE: u64 = <FfxiInstance as encase::ShaderSize>::SHADER_SIZE.get();
 
-// Merging two dirty slab ranges re-copies the clean gap between them twice
-// (encase encode, then wgpu staging) to save one wgpu staging allocation and
-// one copy command. One page is the starting balance point; re-profile to
-// retune. Raising it toward SKIN_STRIDE degenerates to one coalesced write.
+/// Merging two dirty slab ranges re-copies the clean gap between them twice
+/// (encase encode, then wgpu staging) to save one wgpu staging allocation and
+/// one copy command. One page is the starting balance point; re-profile to
+/// retune. Raising it toward SKIN_STRIDE degenerates to one coalesced write.
 const SLAB_WRITE_MERGE_GAP_BYTES: u64 = 4096;
 
 /// Actor-root marker carrying the actor's slot in the shared skins array.
@@ -206,7 +206,7 @@ pub struct FfxiInstanceSlot(pub u32);
 
 /// Per-slot upload bookkeeping. The epochs advance only when a write actually
 /// changed bytes, so a slot whose meta the render world has already uploaded is
-/// byte-identical on the GPU. All-zero is the "never uploaded" sentinel.
+/// byte-identical on the GPU. All-zero is the "not yet uploaded" sentinel.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct SkinSlotMeta {
     alloc_gen: u64,
@@ -259,9 +259,9 @@ impl Default for FfxiSkinRegistry {
 }
 
 impl FfxiSkinRegistry {
-    // Increment-then-return keeps 0 out of the live epoch space, so the
-    // all-zero sentinel the render world starts from (and resets to on a buffer
-    // realloc) can never match a live slot and skip its first upload.
+    /// Increment-then-return keeps 0 out of the live epoch space, so the
+    /// all-zero sentinel the render world starts from (and resets to on a
+    /// buffer realloc) cannot match a live slot and skip its first upload.
     fn next_epoch(&mut self) -> u64 {
         self.write_counter += 1;
         self.write_counter
@@ -678,8 +678,9 @@ fn encode_append<T: ?Sized + ShaderType + encase::internal::WriteInto>(
     value.write_into(&mut writer);
 }
 
-// SKIN_STRIDE is not a multiple of JOINT_MATRIX_STRIDE, so every index is taken
-// relative to the slot base; a global division would misindex odd slots' joints.
+/// SKIN_STRIDE is not a multiple of JOINT_MATRIX_STRIDE, so every index is
+/// taken relative to the slot base; a global division would misindex odd
+/// slots' joints.
 fn encode_skin_range(skins: &[FfxiSkin], write: SlabWrite, out: &mut Vec<u8>) {
     let end = write.offset + write.len;
     let mut off = write.offset;
@@ -1029,10 +1030,10 @@ mod tests {
         );
     }
 
-    // A per-actor slot knows its light only by world position, so the shared module
-    // must resolve the clusterable id by position match before it can sample the cube
-    // map; the skinned loop has to route every slot through it, gated by the same
-    // receive flag as the sun.
+    /// A per-actor slot knows its light only by world position, so the shared
+    /// module must resolve the clusterable id by position match before it can
+    /// sample the cube map; the skinned loop has to route every slot through
+    /// it, gated by the same receive flag as the sun.
     #[test]
     fn point_slots_receive_shadows_through_the_shared_module() {
         let skinned = include_str!("skinned_ffxi.wgsl");
@@ -1132,10 +1133,10 @@ mod tests {
         writes
     }
 
-    // The partial encoder must reproduce the whole-slab encoder byte for byte,
-    // including for ranges that start mid-slot or straddle a slot boundary:
-    // SKIN_STRIDE is not a multiple of JOINT_MATRIX_STRIDE, so a global rather
-    // than slot-relative index would misalign every odd slot.
+    /// The partial encoder must reproduce the whole-slab encoder byte for
+    /// byte, including for ranges that start mid-slot or straddle a slot
+    /// boundary: SKIN_STRIDE is not a multiple of JOINT_MATRIX_STRIDE, so a
+    /// global rather than slot-relative index would misalign every odd slot.
     #[test]
     fn partial_encode_matches_reference_encoder() {
         let reg = distinct_skins(3);
@@ -1254,8 +1255,8 @@ mod tests {
         );
     }
 
-    // A recycled slot must re-upload its whole record, or the joint tail above
-    // the new tenant's joint count would still read as the previous tenant's.
+    /// A recycled slot re-uploads its whole record, or the joint tail above
+    /// the new tenant's joint count would still read as a prior tenant's.
     #[test]
     fn reused_slot_uploads_the_full_record() {
         let mut reg = FfxiSkinRegistry::default();
@@ -1304,9 +1305,9 @@ mod tests {
         );
     }
 
-    // The production path end to end: plan, merge at the shipped gap budget,
-    // encode. A merged range folds in clean bytes, so every write must still
-    // match the whole-slab encoder at its own offset.
+    /// The production path end to end: plan, merge at the shipped gap budget,
+    /// encode. A merged range folds in clean bytes, so every write must still
+    /// match the whole-slab encoder at its own offset.
     #[test]
     fn merged_plan_encodes_the_same_bytes_as_the_whole_slab() {
         let mut reg = distinct_skins(4);
@@ -1520,7 +1521,13 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(modified, handles.iter().map(Handle::id).collect());
+        assert_eq!(
+            modified,
+            handles
+                .iter()
+                .map(Handle::id)
+                .collect::<std::collections::HashSet<_>>()
+        );
         app.update();
         assert!(app
             .world_mut()

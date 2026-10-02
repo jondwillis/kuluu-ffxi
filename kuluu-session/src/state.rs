@@ -134,9 +134,9 @@ pub fn model_radius(kind: EntityKind) -> f32 {
     }
 }
 
-// The wire speed decode lives in kuluu-snapshot so the render layer (which cannot depend on
-// kuluu-session at runtime) and the session reactor share one source of truth; re-exported here
-// for the existing `kuluu_session::state::{...}` call sites.
+/// The wire speed decode lives in kuluu-snapshot so the render layer (which cannot depend on
+/// kuluu-session at runtime) and the session reactor share one source of truth; re-exported here
+/// for the existing `kuluu_session::state::{...}` call sites.
 pub use kuluu_snapshot::speed::{
     move_speed_ratio, move_speed_yps, walk_speed_yps, AUTHORED_ANIM_RATE, BASE_PACKET_SPEED,
     MAX_MOVE_SPEED_YPS, MOUNTED_SPEED_MULTIPLIER, SPEED_TO_YPS, WALK_SPEED_DIVISOR,
@@ -446,7 +446,8 @@ pub struct SessionState {
     /// Wire-id → index into [`Self::entities`]. Maintained in lockstep by every
     /// `apply_event` arm that mutates the Vec, so self/lookup paths are O(1)
     /// instead of O(N) scans. Transient: not serialized (nothing deserializes
-    /// `SessionState` today); rebuilt from scratch on zone change.
+    /// `SessionState` today); rebuilt from scratch on zone change, and after a
+    /// single removal, since `retain` shifts every index after the removed slot.
     #[serde(skip)]
     pub entity_index: HashMap<u32, usize>,
 
@@ -470,7 +471,7 @@ pub struct SessionState {
 
     /// Monotonically increasing counter, bumped on every `ZoneChanged`. The
     /// renderer's party-frame content key includes this so a zone transition
-    /// always forces a UI rebuild, even when the party data looks identical.
+    /// forces a UI rebuild, even when the party data looks identical.
     #[serde(default)]
     pub zone_generation: u64,
 
@@ -530,7 +531,8 @@ pub struct SessionState {
     #[serde(default)]
     pub death_homepoint_secs: Option<u32>,
 
-    /// Server-offered alternative to returning home while dead (s2c 0x0F9).
+    /// Server-offered alternative to returning home while dead (s2c 0x0F9,
+    /// vendor/server/src/map/packets/s2c/0x0f9_res.cpp).
     /// `None` is the ordinary home-point-only menu.
     #[serde(default)]
     pub death_menu_offer: Option<ffxi_proto::decode::DeathMenuOffer>,
@@ -976,7 +978,9 @@ pub struct DialogState {
     pub custom_menu: bool,
     /// Whether ESC may cancel this event (retail's CliEventCancelFlag; the VM's
     /// 0x42 disarms it in cutscenes that lock you in, 0x2E re-arms). Defaults to
-    /// true so frames from an unknown producer stay cancellable.
+    /// true so frames from an unknown producer stay cancellable. A customMenu
+    /// frame keeps it armed so ESC answers "Canceled." through the customMenu
+    /// branch.
     #[serde(default = "cancel_armed_default")]
     pub cancel_armed: bool,
     /// The speaking entity's target index for this frame; `None` is a line the
@@ -1047,20 +1051,39 @@ pub enum CutsceneCue {
         target: CutsceneActor,
         hide: bool,
     },
+    /// 0x6C TRANSPAR: fade `target`'s alpha to `end_alpha` (0..=255) over
+    /// `duration_frames` frames (research/XiEvents/OpCodes/0x006C.md).
+    Transpar {
+        target: CutsceneActor,
+        end_alpha: i32,
+        duration_frames: i32,
+    },
     CameraLock {
         lock: bool,
+    },
+    /// 0x20: write retail's `CliEventUcFlag`; while it holds, the player's
+    /// `CanIMove` is false (research/XiEvents/OpCodes/0x0020.md,
+    /// research/XIClient ActorTelemetry::CanIMove).
+    PlayerControl {
+        locked: bool,
     },
     /// 0x67/0x68 HIDE_HUD/SHOW_HUD: hide or show the entire HUD UI for the
     /// rest of the cutscene (research/XiEvents/OpCodes/0x0067.md, 0x0068.md).
     HudHide {
         hide: bool,
     },
-    /// 0x77/0x78 STOP_CLOCK/RESTORE_CLOCK: hold the game clock at Vana'diel
-    /// hour `hour`, or release it back to server time
-    /// (research/XiEvents/OpCodes/0x0077.md, 0x0078.md).
+    /// 0x77/0x78/0xA9/0xC9 game-clock holds: hold the clock at Vana'diel hour
+    /// `hour`, minute `minute`, on Vana day `day_from_epoch` from the calendar
+    /// epoch when set (else the current day), or release it back to server
+    /// time (research/XiEvents/OpCodes/0x0077.md, 0x0078.md, 0x00A9.md,
+    /// 0x00C9.md).
     ClockHold {
         stop: bool,
         hour: Option<u32>,
+        #[serde(default)]
+        minute: u8,
+        #[serde(default)]
+        day_from_epoch: Option<u32>,
     },
     Mount {
         target: CutsceneActor,
@@ -1090,8 +1113,8 @@ pub enum CutsceneCue {
         y: i32,
         z: i32,
         heading: i32,
-        /// Raw 0x32 MainSpeed operand; the renderer scales it with
-        /// `ffxi_event::vm::scene::EVENT_SPEED_SCALE`.
+        /// Raw 0x32 MainSpeed operand (research/XiEvents/OpCodes/0x0032.md);
+        /// the renderer scales it with `ffxi_event::vm::scene::EVENT_SPEED_SCALE`.
         speed: i32,
     },
     /// Snap `actor` to `(x, y, z)` facing `heading`, in event-coordinate
@@ -1113,15 +1136,16 @@ pub enum CutsceneCue {
         actor: CutsceneActor,
         target: CutsceneActor,
     },
-    /// Stop the named routine on `actor`, or every routine when `key` is
-    /// None, and return it to idle.
+    /// Stop the current action; `key` supplies the replacement idle motion.
     ActorStopAction {
         actor: CutsceneActor,
         key: Option<ffxi_event::FourCc>,
     },
-    /// 0xB5 case 0: set `actor`'s display name to `name` (the event's work
-    /// string, filled from an inline literal or the s2c 0x005D PENDINGSTR
-    /// table). The nameplate re-rasters from it until the event ends.
+    /// 0xB5 case 0 (research/XiEvents/OpCodes/0x00B5.md): set `actor`'s display
+    /// name to `name` (the event's work string, filled from an inline literal
+    /// or the s2c 0x005D PENDINGSTR table,
+    /// research/XiPackets/world/server/0x005D). The nameplate re-rasters from
+    /// it until the event ends.
     EntityName {
         actor: CutsceneActor,
         name: [u8; 16],
@@ -1141,20 +1165,24 @@ pub const SHOP_TABLE_CAPACITY: usize = 80;
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ShopState {
-    /// `ShopItemOffsetIndex` of the most recent s2c 0x03C. Rows accumulate at
-    /// that offset rather than replacing the table, so a shop wider than one
-    /// packet lists in full.
+    /// `ShopItemOffsetIndex` of the most recent s2c 0x03C
+    /// (vendor/server/src/map/packets/s2c/0x03c_shop_list.cpp). Rows accumulate
+    /// at that offset rather than replacing the table, so a shop wider than
+    /// one packet lists in full.
     pub offset_index: u16,
     pub items: Vec<ShopItem>,
-    /// s2c 0x03E SHOP_OPEN arrived: the window is up even before any row does.
+    /// s2c 0x03E SHOP_OPEN (vendor/server/src/map/packets/s2c/0x03e_shop_open.cpp)
+    /// arrived: the window is up even before any row does.
     pub opened: bool,
 
-    /// `ShopListNum` from s2c 0x03E — how many rows the server intends to send.
+    /// `ShopListNum` from s2c 0x03E (vendor/server/src/map/packets/s2c/0x03e_shop_open.cpp)
+    /// — how many rows the server intends to send.
     #[serde(default)]
     pub expected_items: u16,
 
-    /// The final s2c 0x03C (Flags bit 0) has landed, so `items` is the whole
-    /// stock.
+    /// The final s2c 0x03C (Flags bit 0,
+    /// vendor/server/src/map/packets/s2c/0x03c_shop_list.cpp) has landed, so
+    /// `items` is the whole stock.
     #[serde(default)]
     pub complete: bool,
 
@@ -1165,7 +1193,8 @@ pub struct ShopState {
     #[serde(default)]
     pub vendor_id: u32,
 
-    /// The appraisal a SHOP_SELL_REQ came back with (s2c 0x03D), awaiting the
+    /// The appraisal a SHOP_SELL_REQ came back with (s2c 0x03D,
+    /// vendor/server/src/map/packets/s2c/0x03d_shop_sell.cpp), awaiting the
     /// player's yes/no before the SHOP_SELL_SET that completes the sale.
     #[serde(default)]
     pub pending_sale: Option<ShopSale>,
@@ -1415,6 +1444,14 @@ pub enum ReactorGoalSnapshot {
         attack_issued: bool,
     },
 
+    /// The Attack has been sent and the server has not answered. Readers that
+    /// mean "the server has us engaged" match `Engaged` only; this variant
+    /// exists so nothing reads as engaged on a refusal.
+    Engaging {
+        target_id: u32,
+        attack_issued: bool,
+    },
+
     Pathing {
         x: f32,
         y: f32,
@@ -1605,10 +1642,11 @@ impl SessionState {
                 self.death_homepoint_secs = None;
                 self.death_menu_offer = None;
 
-                // Every live id is gone: stamp them all as removals so a delta
-                // drained before the repopulating upserts still sees the wipe,
-                // and drop pending upserts (they belong to the old zone). The
-                // index dies with the Vec.
+                // Every live id is gone (vendor/server/src/map/packets/s2c/0x008_enterzone.cpp):
+                // stamp them all as removals so a delta drained before the
+                // repopulating upserts still sees the wipe, and drop pending
+                // upserts (they belong to the zone being left). The index dies
+                // with the Vec.
                 self.pending_entity_removals = self.entities.iter().map(|e| e.id).collect();
                 self.pending_entity_upserts.clear();
                 self.entity_index.clear();
@@ -1701,9 +1739,9 @@ impl SessionState {
                             flags.job_master_display = job_master;
                             Some(flags)
                         }
-                        // No General update has arrived yet (a spawn always
-                        // carries one, so this is defensive): materialize the
-                        // flags with just the star.
+                        // No General update has arrived yet — a spawn carries
+                        // one, so this is defensive (char_update.cpp).
+                        // Materialize the flags with just the star.
                         (None, Some(true)) => Some(ffxi_proto::decode::CharFlags {
                             job_master_display: true,
                             ..Default::default()
@@ -1779,9 +1817,6 @@ impl SessionState {
                 let before = self.entities.len();
                 self.entities.retain(|e| e.id != *id);
                 if self.entities.len() != before {
-                    // retain shifted every index after the removed slot, so
-                    // rebuild rather than patch; an upsert pending for this id
-                    // in the same batch is voided — removal wins.
                     self.entity_index = self
                         .entities
                         .iter()
@@ -1813,8 +1848,6 @@ impl SessionState {
                 hp_pct,
                 allegiance,
             } => {
-                // Index first (the common case: the patcher knows the wire id);
-                // fall back to a scan when only an act_index was given.
                 let idx = match (id, act_index) {
                     (Some(wire_id), _) => self.entity_index.get(wire_id).copied(),
                     (None, Some(act)) => self.entities.iter().position(|e| e.act_index == *act),
@@ -1843,8 +1876,9 @@ impl SessionState {
                         }
                     }
                     if let Some(a) = allegiance {
-                        // Self's entity may still carry no flags at all (it never
-                        // receives its own 0x0D), so materialize rather than skip.
+                        // Self's entity may still carry no flags at all (it does not
+                        // receive its own 0x0D, research/XiPackets/world/server/0x000D),
+                        // so materialize rather than skip.
                         if existing.char_flags.as_ref().map(|f| f.allegiance) != Some(*a) {
                             let flags = existing.char_flags.get_or_insert_with(Default::default);
                             flags.allegiance = *a;
@@ -2043,15 +2077,27 @@ impl SessionState {
                 }
                 changed
             }
+            // 0x058 (GP_SERV_COMMAND_ASSIST) is pushed by
+            // vendor/server/src/map/ai/controllers/player_controller.cpp
+            // CPlayerController::Engage only after its IsValidTarget,
+            // distance and MsgBasic::WaitLonger checks pass and
+            // CController::Engage returns true. It is therefore the server's
+            // accept, and the synchronous one: 0x037 CHAR_STATUS carries the
+            // same byte from entities/char_entity.cpp CCharEntity::PostTick
+            // behind m_nextUpdateTimer. A refused engage sends neither. The
+            // write is gated on our own pending or standing engage goal
+            // because battleutils::assistTarget pushes the same packet for
+            // /assist.
             AgentEvent::TargetChanged { target_id } => {
-                // The server's engage truth for self: it never sends its own 0x0E
-                // update (zone_entities.cpp UpdateEntityPacket skips the entity's
-                // own player), so the 0x058 battle-target push is what flips this
-                // byte to ATTACK on an accepted engage and back to NONE on a
-                // disengage. A "wait longer" rejection sends no 0x058, so the byte
-                // stays NONE and the weapon never draws.
+                let engaged = matches!(
+                    self.current_goal,
+                    Some(
+                        ReactorGoalSnapshot::Engaging { .. } | ReactorGoalSnapshot::Engaged { .. }
+                    )
+                );
                 let status = match target_id {
-                    Some(_) => ffxi_proto::decode::animation::ATTACK,
+                    Some(_) if engaged => ffxi_proto::decode::animation::ATTACK,
+                    Some(_) => return false,
                     None => ffxi_proto::decode::animation::NONE,
                 };
                 let changed = self.self_server_status != status;
@@ -2071,6 +2117,8 @@ impl SessionState {
             | AgentEvent::MusicVolumeChanged { .. }
             | AgentEvent::LevelUp { .. }
             | AgentEvent::SkillLevelUp { .. }
+            | AgentEvent::EngageRefused { .. }
+            | AgentEvent::Knockbacks { .. }
             | AgentEvent::VanaTimeSynced { .. } => false,
             AgentEvent::InventoryUpdated { container, update } => {
                 let entry = self.inventory.containers.entry(*container).or_default();
@@ -2424,9 +2472,6 @@ impl SessionState {
                 self.shop = None;
                 changed
             }
-            // The appraisal reaches `shop.pending_sale` on the `ShopUpdated`
-            // that follows this event, and the shop window puts the price on the
-            // item's row. Retail shows a quote there, not in the chat log.
             AgentEvent::ShopSellAppraisal { .. } => false,
             AgentEvent::StatusIconsUpdated { icons, expiries } => {
                 let changed = self.status_icons != *icons || self.status_icon_expiries != *expiries;
@@ -2681,6 +2726,14 @@ impl SessionState {
     }
 }
 
+/// One target's knockback out of a 0x028: `level` is the wire's 3-bit
+/// Knockback (vendor/server/src/map/enums/action/knockback.h), 1..=7.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KnockbackHit {
+    pub target_id: u32,
+    pub level: u8,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {
@@ -2741,6 +2794,9 @@ pub enum AgentEvent {
         miss: NameExtractionMiss,
     },
 
+    /// Partial field patch: resolved by wire id first (the common case — the
+    /// patcher knows the wire id), falling back to an `act_index` scan when
+    /// only one was given.
     EntityPatched {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<u32>,
@@ -2752,8 +2808,10 @@ pub enum AgentEvent {
         kind: Option<EntityKind>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         hp_pct: Option<u8>,
-        /// Self allegiance out of 0x037 `Flags2.BallistaFlg` — the only channel
-        /// for self (the server skips its own 0x0D).
+        /// Self allegiance out of 0x037 `Flags2.BallistaFlg`
+        /// (vendor/server/src/map/packets/char_status.cpp) — the only channel
+        /// for self (the server skips its own 0x0D,
+        /// research/XiPackets/world/server/0x000D).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         allegiance: Option<u8>,
     },
@@ -2807,7 +2865,10 @@ pub enum AgentEvent {
     /// `count` is the quantity the request asked for — LSB leaves the packet's
     /// `Count` at 0 (vendor/server/src/map/packets/s2c/0x03d_shop_sell.cpp sets
     /// only Price/PropertyItemIndex/Type), so the session substitutes the
-    /// quantity it sent.
+    /// quantity it sent. The appraisal reaches `shop.pending_sale` on the
+    /// `ShopUpdated` that follows this event, and the shop window puts the
+    /// price on the item's row; retail shows the quote there, not in the chat
+    /// log, so `apply_event` records no state change for it.
     ShopSellAppraisal {
         price: u32,
         item_index: u8,
@@ -2859,8 +2920,9 @@ pub enum AgentEvent {
     },
     /// Stand-up cancels leavegame server-side (`MakeEntityStandUp` drops the
     /// HEALING effect, `healing.onEffectLose` removes LEAVEGAME) without any
-    /// 0x053 cancel packet — the client sees it as its own CHAR_PC status
-    /// flipping off HEALING and clears the countdown here.
+    /// 0x053 cancel packet (vendor/server/src/map/packets/s2c/0x053_systemmes.cpp)
+    /// — the client sees it as its own CHAR_PC status flipping off HEALING
+    /// and clears the countdown here.
     LogoutCountdownCancelled,
     EventEnded,
 
@@ -2933,9 +2995,11 @@ pub enum AgentEvent {
         member: PartyMember,
     },
 
-    /// GROUP_TBL (s2c 0x0C8) arrived: the server is sending a fresh party
-    /// definition. Clear the party list and seed it with the skeleton entries
-    /// from the table; the full stats follow in GROUP_LIST (0x0DD) packets.
+    /// GROUP_TBL (s2c 0x0C8, vendor/server/src/map/packets/s2c/0x0c8_group_tbl.cpp)
+    /// arrived: the server is sending a fresh party definition. Clear the party
+    /// list and seed it with the skeleton entries from the table; the full
+    /// stats follow in GROUP_LIST (0x0DD,
+    /// vendor/server/src/map/packets/s2c/0x0dd_group_list.cpp) packets.
     PartyTableReset {
         members: Vec<ffxi_proto::decode::GroupTblEntry>,
     },
@@ -3049,8 +3113,9 @@ pub enum AgentEvent {
         seconds_until_homepoint: Option<u32>,
     },
 
-    /// s2c 0x0F9 `GP_SERV_COMMAND_RES`: `None` restores the default
-    /// home-point-only menu; `Some` offers Raise/Reraise or Tractor.
+    /// s2c 0x0F9 `GP_SERV_COMMAND_RES`
+    /// (vendor/server/src/map/packets/s2c/0x0f9_res.cpp): `None` restores the
+    /// default home-point-only menu; `Some` offers Raise/Reraise or Tractor.
     DeathMenuUpdated {
         offer: Option<ffxi_proto::decode::DeathMenuOffer>,
     },
@@ -3060,14 +3125,15 @@ pub enum AgentEvent {
         volume: u8,
     },
 
-    /// Event script 0xC8 MAP_TUTORIAL: open the Map screen on zone `map_id`.
+    /// Event script 0xC8 MAP_TUTORIAL (research/XiEvents/OpCodes/0x00C8.md):
+    /// open the Map screen on zone `map_id`.
     MapOpen {
         map_id: u16,
         tutorial: bool,
     },
 
-    /// Event script 0x8B MAP_MARKER: place a named marker at milli-unit
-    /// coordinates on zone `map_id`'s map.
+    /// Event script 0x8B MAP_MARKER (research/XiEvents/OpCodes/0x008B.md):
+    /// place a named marker at milli-unit coordinates on zone `map_id`'s map.
     MapMarkerPlaced {
         map_id: u16,
         x_milli: i32,
@@ -3075,7 +3141,8 @@ pub enum AgentEvent {
         label: String,
     },
 
-    /// Event script 0x8A CLOSE_MAP: close the Map screen.
+    /// Event script 0x8A CLOSE_MAP (research/XiEvents/OpCodes/0x008A.md):
+    /// close the Map screen.
     MapClosed,
 
     LevelUp {
@@ -3085,6 +3152,25 @@ pub enum AgentEvent {
     SkillLevelUp {
         skill_id: u16,
         level: u32,
+    },
+
+    /// s2c 0x029 with a MsgBasic that
+    /// vendor/server/src/map/ai/controllers/player_controller.cpp
+    /// CPlayerController::Engage (or entities/char_entity.cpp
+    /// CCharEntity::applyTargetRestrictions under it) answers a 0x01A Attack
+    /// with instead of the 0x058 accept. Emitted only for our own casts.
+    EngageRefused {
+        message_num: u16,
+    },
+
+    /// Every target result of one s2c 0x028 that carried a knockback level on
+    /// a hit (vendor/server/src/map/packets/s2c/0x028_battle2.cpp
+    /// GP_SERV_COMMAND_BATTLE2::pack, the 3 knockback bits per result). The
+    /// server moves nobody for it; the client shoves the victim when the
+    /// skill routine's knockback stage fires.
+    Knockbacks {
+        actor_id: u32,
+        hits: Vec<KnockbackHit>,
     },
 
     /// Self has cast a line: the server set FISHING_START with this hook delay (frames).
@@ -3417,7 +3503,8 @@ pub enum AgentCommand {
     },
 
     /// The renderer finished (or could not start) the 0x2C SCHEDULOR routine
-    /// this `(actor, key)` named: releases the event VM's pending hold on it.
+    /// (research/XiEvents/OpCodes/0x002C.md) this `(actor, key)` named:
+    /// releases the event VM's pending hold on it.
     /// Carries the wire actor the cue named, so the session matches the same
     /// value it resolved the cue with.
     CutsceneMotionDone {

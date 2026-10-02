@@ -6,15 +6,37 @@ description: >
   tests), bring the stack up, drive the change, capture evidence. Use this
   whenever asked to verify a change works, confirm a bug fix, run/launch/drive
   the client, screenshot the game, test against the local server, or observe
-  protocol/rendering behavior live — even if the word "verify" isn't used.
+  protocol/rendering behavior live. Also use before implementing or completing
+  rendering, HUD, menu, camera, animation, or input changes, even when the user
+  only asks for a visual fix and never says "verify".
   Also the recipe for just getting a live session up for exploration.
 ---
 
 # Verifying client changes against the live LSB stack
 
-Verification here means **observing the change at a running surface** — a real
-session against the real server — not re-running tests or reading code. The
-work splits into four steps; each has a reference file with the exact recipes.
+Verification here means **observing the change at a running production surface**.
+Session behavior requires a real session against the server; cosmetic widgets
+can use the production fixture described below. Tests and source inspection
+alone do not establish the visible result.
+
+For UI work, choose the drive and expected visible result before editing.
+Completion requires the changed build, an affected-view capture, and opening
+that capture with `view_image` (Codex) or `Read` (Claude) to inspect the pixels.
+Prefer evidence captured directly from the game or derived from its production
+rendering pipeline, with that provenance stated. A fixture can establish a
+cosmetic result when it renders the real production widget and covers the
+reported defect; it does not establish the live game's navigation or session
+behavior. Secondary evidence is a fallback when direct evidence cannot be
+gathered: record the specific reason and limit the claim to what it demonstrates.
+An independently drawn mockup cannot verify the game's pixels. Keep
+navigation/session checks on the live stack. Exercise the
+shared widget's affected consumers and the cases that motivated the fix, such
+as quantity text over bright/dark art, empty slots, and single-item stacks.
+
+Do not close the bead or declare a visual fix complete from green unit tests.
+Slow builds and time spent are not blockers. If building, launching, driving,
+or capturing actually fails, retain the diagnostic, record a blocked verdict,
+leave verification work open, and state the exact blocker in the final report.
 
 ```
 1. Stack up      → scripts/lsb-stack.sh up   (references/stack.md: env gotchas)
@@ -125,24 +147,46 @@ observed (e.g. a GUI leg that needs human eyes) gets named explicitly rather
 than silently skipped. Probes off the happy path (wrong zone, dead server,
 double-send) are worth a line each even when they hold.
 
+## Visual evidence in PRs
+
+Use [kuluu-review](../kuluu-review/SKILL.md) for PR evidence criteria and claim boundaries. Open captures and inspect their contents before citing or publishing them; use the GUI reference's freshness checks and native-video fallback for black or stale frames. Keep raw artifacts locally and attach/embed reviewer-accessible media in the PR body. Record exact capture or publication blockers rather than treating a successful capture command as visual verification.
+
+Upload inspected media directly with a current GitHub CLI:
+
+```bash
+gh pr edit PR_NUMBER --attach '/absolute/path/frame.png#Observed result' --attach /absolute/path/clip.mp4
+```
+
+Without a body flag, this appends to the existing body. With `--body-file`, references to the attached local paths are rewritten to uploaded URLs. Check `gh pr edit --help` for `--attach`; older CLI versions lack it. Read back the PR body after upload, including on failure because partial uploads can still update it. See the [official command documentation](https://cli.github.com/manual/gh_pr_edit).
+
 ## Recording evidence (feeds the stop-hook gate)
 
 The stop-hook verify gate (`.agents/hooks/stop.d/25-verify.sh`) blocks session
 end when gated source (`*.rs`/`*.wgsl` outside tests/vendor) changed but no
-fresh evidence exists. After delivering the report, record the session:
+fresh evidence exists, including edits already committed and edits in other
+worktrees. Record evidence before the final report:
 
 ```
 .agents/skills/verify/scripts/record-evidence.sh \
-  --verdict pass --summary "<what was OBSERVED, one line>" \
-  --artifact artifacts/verify/events.jsonl --artifact artifacts/verify/zone.png
+  --verdict pass --surface visual --summary "<what was OBSERVED>" \
+  --build target/release/kuluu --inspection "<what the captured pixels show>" \
+  --artifact artifacts/verify/zone.png
 ```
 
-Rules the recorder enforces: `pass` requires ≥1 artifact; artifacts must exist
-non-empty; `--summary` records observations, not intentions. If runtime
-verification genuinely doesn't apply, `--verdict waived --summary "<why>"` —
-a waiver goes stale like any marker, so it only covers edits made before it.
-The marker (`.verify/latest.json`) is stale the moment gated source is edited
-after it; verify last, record last of all.
+Open the image first: the inspection hook records its content hash. Video checks
+include inspected frame captures as artifacts. Use `--surface session` with
+captured event/log evidence for protocol work, or `--surface audio` with a
+recording and `--inspection` describing what was heard. Repeat `--surface` for
+changes spanning surfaces. Log files and passing unit tests cannot satisfy a
+visual pass. Source, build, and artifact hashes bind the marker to the inspected
+worktree; the build and capture must postdate the relevant edit.
+
+For a concrete blocker, use `--verdict blocked --summary "<exact failure>"
+--artifact <diagnostic.log>`. The final report must say verification is blocked
+and include that exact summary; keep the bead open. `fail` never passes the
+completion gate. A `waived` marker requires `--authorization "<user's explicit
+opt-out>"` and disclosure of that quote in the final report. Do not self-waive
+visual changes. Verify and record after the final source edit.
 
 ## Maintenance
 

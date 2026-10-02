@@ -252,6 +252,8 @@ impl Layouts {
 
     /// Runs the allocator over one struct's members, returning its size and
     /// alignment and appending `(member index, byte offset, bit span)` per member.
+    /// An unnamed zero-width bit-field exists only to close the current storage
+    /// unit, so the next one starts fresh.
     fn place_members(
         &self,
         raw: &RawStruct,
@@ -285,8 +287,6 @@ impl Layouts {
             if !decl.dims.is_empty() {
                 bail!("`{}::{}` is an array of bit-fields", raw.name, decl.name);
             }
-            // An unnamed zero-width bit-field exists only to close the current
-            // storage unit, so the next one starts fresh.
             if width == 0 {
                 if !decl.name.is_empty() {
                     bail!(
@@ -826,13 +826,14 @@ mod tests {
         #pragma once
         #include "base.h"
 
-        // A nested struct, an array, a bit-field run and explicit u8 padding.
+        // A synthetic LSB-style header: nested struct, array, bit-field run,
+        // explicit u8 padding.
         struct Inner
         {
-            uint16_t a;      // 0x00
-            uint8_t  b[3];   // 0x02
-            uint8_t  pad05;  // 0x05
-            uint32_t c;      // 0x08
+            uint16_t a;      /* 0x00 */
+            uint8_t  b[3];   /* 0x02 */
+            uint8_t  pad05;  /* 0x05 */
+            uint32_t c;      /* 0x08 */
         };
 
         enum class Mode : uint16_t
@@ -854,12 +855,12 @@ mod tests {
             struct PacketData
             {
                 uint8_t  lead;       /* 0x00 */
-                Inner    inner;      // 0x04
-                Attr     attr;       // 0x10
-                Mode     mode;       // 0x14
-                uint8_t  pad16;      // 0x16
-                Inner    table[2];   // 0x18
-                float    tail;       // 0x30
+                Inner    inner;      /* 0x04 */
+                Attr     attr;       /* 0x10 */
+                Mode     mode;       /* 0x14 */
+                uint8_t  pad16;      /* 0x16 */
+                Inner    table[2];   /* 0x18 */
+                float    tail;       /* 0x30 */
             };
 
             Outer(const char* name, int count);

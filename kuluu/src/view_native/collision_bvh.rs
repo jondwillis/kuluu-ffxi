@@ -473,8 +473,8 @@ mod bvh_tests {
         );
     }
 
-    /// A zone whose triangles are all filtered out by the camera skip set must
-    /// yield a BVH that simply never hits, not a panic.
+    /// A zone whose triangles are all filtered out by the camera skip set
+    /// yields an empty BVH: the ray casts come back None.
     #[test]
     fn empty_triangle_list_builds_a_bvh_that_never_hits() {
         let bvh = CollisionBvh::from_world_triangles(Vec::new());

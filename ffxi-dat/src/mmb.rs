@@ -1030,10 +1030,10 @@ mod tests {
         );
     }
 
-    // An authored D3DCOLOR lands in the file as B,G,R,A, and every consumer of `MmbVertex::rgba`
-    // indexes it as (r,g,b,a) -- `vertex_color_to_linear`, and through it kuluu-render's
-    // zone/cloud meshes. The fixture is deliberately asymmetric in every channel so a swapped
-    // pair cannot pass.
+    /// An authored D3DCOLOR lands in the file as B,G,R,A, and every consumer of `MmbVertex::rgba`
+    /// indexes it as (r,g,b,a) -- `vertex_color_to_linear`, and through it kuluu-render's
+    /// zone/cloud meshes. The fixture is deliberately asymmetric in every channel so a swapped
+    /// pair cannot pass.
     const AUTHORED_ARGB: u32 = 0x6040_80C0;
     const EXPECTED_RGBA: [u8; 4] = [0x40, 0x80, 0xC0, 0x60];
 
@@ -1072,7 +1072,7 @@ mod tests {
         assert_eq!(v[0].rgba, EXPECTED_RGBA);
     }
 
-    // SMMB with one piece holding one model of three plain-stride vertices and a 3-index strip.
+    /// SMMB with one piece holding one model of three plain-stride vertices and a 3-index strip.
     fn smmb_one_triangle(argb: u32) -> Vec<u8> {
         const HEAD: usize = 16;
         const PIECE_OFF: usize = 64;

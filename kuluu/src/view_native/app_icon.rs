@@ -43,9 +43,9 @@ fn set_window_icons(
     }
 }
 
-// `Window::set_window_icon` is a documented no-op on macOS, and an unbundled
-// `cargo run` binary has no CFBundleIconFile, so the dock icon comes from
-// NSApplication at runtime.
+/// `Window::set_window_icon` is a documented no-op on macOS, and an
+/// unbundled `cargo run` binary has no CFBundleIconFile, so the dock icon
+/// comes from NSApplication at runtime.
 #[cfg(target_os = "macos")]
 fn set_dock_icon() {
     use objc2::AnyThread;

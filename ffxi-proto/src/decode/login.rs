@@ -524,6 +524,9 @@ mod server_login_tests {
         );
     }
 
+    /// A living character carries the very same counter (PosHead.HpMax is
+    /// GetHPP()), so hpp alone decides whether the dead counter means anything,
+    /// and the neighbouring PlayTime / MyroomSubMapNumber bytes must not bleed in.
     #[test]
     fn server_login_dead_counter_only_reads_as_a_timer_while_ko() {
         let mut buf = vec![0u8; 0x100];
@@ -533,13 +536,10 @@ mod server_login_tests {
                 &(DEAD_COUNTER_UNITS_PER_SECOND * (DEAD_COUNTER_PADDING_SECS + REMAINING_SECS))
                     .to_le_bytes(),
             );
-        // Neighbouring PlayTime / MyroomSubMapNumber must not bleed in.
         buf[ServerLogin::DEAD_COUNTER_OFFSET - 4..ServerLogin::DEAD_COUNTER_OFFSET]
             .copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
         buf[ServerLoginMyroom::SUB_MAP_NUMBER_OFFSET] = 0xAB;
 
-        // PosHead.HpMax is GetHPP(); a living character carries the very same
-        // counter, so hpp alone decides whether it means anything.
         const FULL_HP_PCT: u8 = 100;
         buf[PosHead::HPP_OFFSET] = FULL_HP_PCT;
         let alive = ServerLogin::decode(&buf).unwrap();

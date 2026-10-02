@@ -39,6 +39,9 @@ fn door_routines(bytes: &[u8]) -> HashMap<u32, Vec<Scheduler>> {
     out
 }
 
+/// Each door panel reaches from its own hinge toward its partner's, so the
+/// hinge-to-hinge axis stands in for the free edge and its perpendicular is
+/// the doorway's through-direction.
 fn main() {
     let root = DatRoot::from_env_or_default().expect("FFXI_DAT_PATH");
     let only: Option<u32> = std::env::args().nth(1).and_then(|a| a.parse().ok());
@@ -113,9 +116,6 @@ fn main() {
                 .map(|l| l.posed_transform(DoorPose::default()).w_axis.xyz())
                 .collect();
 
-            // Each panel reaches from its own hinge toward its partner's, so the
-            // hinge-to-hinge axis stands in for the free edge and its perpendicular
-            // is the doorway's through-direction.
             let axis = (hinges[1] - hinges[0]).normalize_or_zero();
             if axis == Vec3::ZERO {
                 continue;

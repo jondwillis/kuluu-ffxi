@@ -297,9 +297,9 @@ fn icon_at_matches_lookup_icon() {
     }
 }
 
-/// Legacy blocks spaced at the Retail2026 stride never decode through the
+/// Legacy blocks spaced at the Retail2026 stride do not decode through the
 /// Retail2026 path: the first reads as a lone Legacy block (trailer then
-/// zeros), and the second is unreachable at either stride.
+/// zeros), and the second sits past both strides.
 #[test]
 fn legacy_blocks_at_the_retail_stride_do_not_decode_as_retail() {
     let legacy = ItemBlockLayout::Legacy;

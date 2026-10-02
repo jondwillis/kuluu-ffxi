@@ -4,7 +4,8 @@ include!(concat!(env!("OUT_DIR"), "/xiloader_version_table.rs"));
 include!(concat!(env!("OUT_DIR"), "/login_settings_table.rs"));
 include!(concat!(env!("OUT_DIR"), "/lobby_tables.rs"));
 
-/// Overrides the patch stamp the lobby login (C2S 0x26 versionCode) carries.
+/// Overrides the patch stamp the lobby login (C2S 0x26 versionCode) carries
+/// (research/XiPackets/lobby/C2S_0x0026_RequestLobbyLogin.md).
 pub const CLIENT_VER_ENV: &str = "FFXI_CLIENT_VER";
 
 pub const IXFF_TERMINATOR: u32 = u32::from_le_bytes(*b"IXFF");
@@ -15,7 +16,8 @@ pub const IXFF_TERMINATOR: u32 = u32::from_le_bytes(*b"IXFF");
 pub const CLIENT_VER_ERA_LEN: usize = 6;
 pub const CLIENT_VER_KEY_SUFFIX: &str = "xx_x";
 
-/// login.VER_LOCK as view_session::read_func case 0x26 switches on it.
+/// login.VER_LOCK as view_session::read_func case 0x26 switches on it
+/// (vendor/server/src/login/view_session.cpp view_session::read_func).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VerLock {
     Off,

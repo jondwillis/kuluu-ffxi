@@ -126,6 +126,8 @@ pub struct DialogSession {
     dat_root: Option<Arc<DatRoot>>,
     /// Logged-in character name, substituted for the `{PlayerName}` dialog marker.
     player_name: String,
+    /// The player's server id: the wire id a LocalPlayer emote cue resolves to.
+    player_id: u32,
     loaded_event_zone: Option<u16>,
     loaded_string_zone: Option<u16>,
     event_dat: Option<Arc<EventDat>>,
@@ -153,6 +155,7 @@ pub struct DialogSession {
     /// the entity's server id and target index: the input the VM's 0x5B/0x66
     /// load gate reads. Fed from
     /// [`crate::session::event_transport::receive`]; an absent entry is Type 0.
+    /// research/XiEvents/OpCodes/0x005B.md
     entity_types: std::collections::HashMap<u32, u8>,
     /// Motion holds awaiting the renderer's finish report, keyed by the wire
     /// actor the cue named plus its key: the value is the VM's own unresolved
@@ -179,6 +182,7 @@ impl DialogSession {
         Self {
             dat_root,
             player_name,
+            player_id: 0,
             loaded_event_zone: None,
             loaded_string_zone: None,
             event_dat: None,
@@ -300,7 +304,7 @@ impl DialogSession {
         self.cues.extend(
             raw_cues
                 .into_iter()
-                .map(|c| resolve_cue(c, unique_no, event_zone)),
+                .map(|c| resolve_cue(c, unique_no, event_zone, self.player_id)),
         );
         let active = ActiveEvent {
             unique_no,
@@ -469,7 +473,7 @@ impl DialogSession {
         arm_move_holds(runner, &raw_cues, &self.entity_positions, event_entity);
         let cues: Vec<ResolvedCue> = raw_cues
             .into_iter()
-            .map(|c| resolve_cue(c, event_entity, zone))
+            .map(|c| resolve_cue(c, event_entity, zone, self.player_id))
             .collect();
         let advance = match outcome {
             DialogStep::Frame(frame) => Advance::Frame(frame_to_dialog(
@@ -504,6 +508,12 @@ impl DialogSession {
 
     pub fn set_player_position(&mut self, position: ffxi_event::vm::scene::EventPosition) {
         self.player_position = Some(position);
+    }
+
+    /// Remember the player's server id: the wire id a LocalPlayer emote cue
+    /// resolves to.
+    pub fn note_player_id(&mut self, id: u32) {
+        self.player_id = id;
     }
 
     /// Remember where the server placed an entity, in event coordinates:
@@ -633,7 +643,7 @@ impl DialogSession {
     /// client-era skew between the server's dialog numbering and this install's
     /// ([`ZoneTextSkew`]). An entry carrying a Selection control code is a menu
     /// — prompt plus options — which retail drives through the event VM; a menu
-    /// entry is never a chat line, and returning `None` keeps the caller's
+    /// entry is not a chat line, and returning `None` keeps the caller's
     /// placeholder.
     pub fn zone_chat_text(&mut self, zone: u16, mes_num: u16, nums: &[i32]) -> Option<String> {
         self.ensure_strings(zone);
@@ -738,9 +748,23 @@ pub enum ResolvedCue {
     /// 0x5D rides the existing [`AgentEvent::MusicVolumeChanged`] instead of
     /// the cue stream.
     MusicVolume { volume: u8, fade_frames: u16 },
+    SoundVolume {
+        mask: u8,
+        volume: u8,
+        fade_frames: u16,
+    },
     /// 0xC8/0x8B/0x8A ride their own map AgentEvents: the Map screen is client
     /// UI state, not scene state.
+    /// research/XiEvents/OpCodes/0x00C8.md
     Map(MapOp),
+    /// 0x6E/0x63 ride the existing [`AgentEvent::EntityEmoted`] (the same event
+    /// a server MOTIONMES sends): the renderer's emote dispatcher already plays
+    /// the DAT routine, so no new wire shape is needed.
+    Emote {
+        actor_id: u32,
+        emote_id: u16,
+        param: u16,
+    },
 }
 
 /// One event-script ask on the player's Map screen (research/XiEvents/OpCodes/
@@ -774,10 +798,12 @@ fn snapshot_motion(motion: ffxi_event::ExtSchedulerMotion) -> kuluu_snapshot::Ex
 }
 
 /// Resolve one VM cue against `event_entity`, the server id of the entity the
-/// running event belongs to. `zone` is the event's zone, carried on the 0x2D
+/// running event belongs to, and `player_id`, the server id the LocalPlayer
+/// lookup resolves to. `zone` is the event's zone, carried on the 0x2D
 /// ZoneScheduler cue so the host resolves its key out of the zone's own model
 /// DAT (the VM does not know it).
-pub fn resolve_cue(cue: EventCue, event_entity: u32, zone: u16) -> ResolvedCue {
+/// research/XiEvents/OpCodes/0x002D.md
+pub fn resolve_cue(cue: EventCue, event_entity: u32, zone: u16, player_id: u32) -> ResolvedCue {
     let actor = |lookup| resolve_actor(lookup, event_entity);
     ResolvedCue::Scene(match cue {
         EventCue::ActorMotion {
@@ -827,9 +853,29 @@ pub fn resolve_cue(cue: EventCue, event_entity: u32, zone: u16) -> ResolvedCue {
             target: actor(target),
             hide,
         },
+        EventCue::Transpar {
+            actor: target,
+            end_alpha,
+            duration_frames,
+        } => CutsceneCue::Transpar {
+            target: actor(target),
+            end_alpha,
+            duration_frames,
+        },
         EventCue::CameraLock { lock } => CutsceneCue::CameraLock { lock },
+        EventCue::PlayerControl { locked } => CutsceneCue::PlayerControl { locked },
         EventCue::HudHide { hide } => CutsceneCue::HudHide { hide },
-        EventCue::ClockHold { stop, hour } => CutsceneCue::ClockHold { stop, hour },
+        EventCue::ClockHold {
+            stop,
+            hour,
+            minute,
+            day_from_epoch,
+        } => CutsceneCue::ClockHold {
+            stop,
+            hour,
+            minute,
+            day_from_epoch,
+        },
         EventCue::Mount {
             target,
             status_event,
@@ -888,6 +934,17 @@ pub fn resolve_cue(cue: EventCue, event_entity: u32, zone: u16) -> ResolvedCue {
                 fade_frames,
             }
         }
+        EventCue::SoundVolume {
+            mask,
+            volume,
+            fade_frames,
+        } => {
+            return ResolvedCue::SoundVolume {
+                mask,
+                volume,
+                fade_frames,
+            }
+        }
         EventCue::MapOpen { map_id, tutorial } => {
             return ResolvedCue::Map(MapOp::Open {
                 map_id: map_id as u16,
@@ -902,6 +959,7 @@ pub fn resolve_cue(cue: EventCue, event_entity: u32, zone: u16) -> ResolvedCue {
         } => {
             // The 16-byte field is NUL-padded; retail's underscore rewrite
             // already happened in the VM.
+            // research/XiEvents/OpCodes/0x008B.md
             let label = String::from_utf8_lossy(&name)
                 .trim_end_matches('\0')
                 .trim()
@@ -914,6 +972,21 @@ pub fn resolve_cue(cue: EventCue, event_entity: u32, zone: u16) -> ResolvedCue {
             });
         }
         EventCue::MapClose => return ResolvedCue::Map(MapOp::Close),
+        EventCue::Emote {
+            actor,
+            emote_id,
+            param,
+        } => {
+            let actor_id = match resolve_actor(actor, event_entity) {
+                CutsceneActor::LocalPlayer => player_id,
+                CutsceneActor::Entity { server_id } => server_id,
+            };
+            return ResolvedCue::Emote {
+                actor_id,
+                emote_id,
+                param,
+            };
+        }
         EventCue::EntityName {
             actor: target,
             name,
@@ -992,6 +1065,9 @@ impl CutsceneScope {
                     let _ = event_tx.send(AgentEvent::MusicVolumeChanged { slot, volume });
                 }
             }
+            ResolvedCue::SoundVolume { .. } => {
+                tracing::warn!("unsupported event sound-volume cue ignored");
+            }
             ResolvedCue::Map(op) => {
                 let ev = match op {
                     MapOp::Open { map_id, tutorial } => AgentEvent::MapOpen { map_id, tutorial },
@@ -1009,6 +1085,23 @@ impl CutsceneScope {
                     MapOp::Close => AgentEvent::MapClosed,
                 };
                 let _ = event_tx.send(ev);
+            }
+            ResolvedCue::Emote {
+                actor_id,
+                emote_id,
+                param,
+            } => {
+                // The MOTIONMES shape with no target: the renderer's emote
+                // dispatcher plays the routine on `actor_id`.
+                let _ = event_tx.send(AgentEvent::EntityEmoted {
+                    actor_id,
+                    actor_index: 0,
+                    target_id: 0,
+                    target_index: 0,
+                    emote_id,
+                    param,
+                    mode: ffxi_proto::map::emote::mode::MOTION,
+                });
             }
         }
     }
@@ -1158,8 +1251,8 @@ fn apply_skew(mes_num: u16, delta: i32) -> Option<usize> {
 /// shape is exactly what the packet filled. `shape` reports an entry's
 /// [`StringDat::param_slots`], `None` for one out of range or carrying a menu.
 /// The delta the zone has already settled on is tried first, then the wire
-/// index, then outward — so an era-matched install never moves and a skewed one
-/// moves the same way twice. Pure, so the search is testable without a DAT.
+/// index, then outward — so an era-matched install does not move and a skewed
+/// one moves the same way twice. Pure, so the search is testable without a DAT.
 fn resolve_shaped_index(
     shape: &dyn Fn(usize) -> Option<u32>,
     skew: &ZoneTextSkew,
@@ -1680,6 +1773,7 @@ fn arm_motion_holds(
         match *cue {
             // 0x2C: the routine is in the actor's own model DAT, which this
             // session does not open: no DAT length, so [`PENDING_MOTION_HOLD_MAX`] stands.
+            // research/XiEvents/OpCodes/0x002C.md
             EventCue::ActorMotion { actor1, key, .. } => {
                 arm_pending_motion_hold(
                     runner,
@@ -1725,6 +1819,7 @@ fn arm_motion_holds(
                 // both the 0x5B single file and the 0x66 package name. An
                 // out-of-range 0x66 package names no container: the renderer
                 // plays nothing and reports nothing, so arm nothing.
+                // research/XiEvents/OpCodes/0x005B.md
                 let file_id = match motion {
                     Some(ffxi_event::ExtSchedulerMotion::Event(id)) => Some(id),
                     Some(ffxi_event::ExtSchedulerMotion::Tpc(pkgs)) => Some(pkgs.a),
@@ -1754,6 +1849,7 @@ fn arm_motion_holds(
             // the file the key resolved in; retail waits on it via the zone object, so
             // the VM's hold keys on the zone sentinel while the renderer's report keys
             // on the cue's actor1.
+            // research/XiEvents/OpCodes/0x002D.md
             EventCue::ZoneScheduler { key, actor1, .. } => {
                 let units = root
                     .and_then(|root| ffxi_dat::scheduler::zone_scene_file_id(root, zone, key))
@@ -1787,6 +1883,7 @@ fn arm_motion_holds(
 /// [`PENDING_MOTION_HOLD_MAX`]. `wire` is the cue's own resolved actor - the
 /// value the renderer's report carries back - which for the 0x2D zone
 /// sentinel is not the VM's hold key.
+/// research/XiEvents/OpCodes/0x002D.md
 fn arm_pending_motion_hold(
     runner: &mut DialogRunner,
     pending: &mut std::collections::HashMap<
@@ -1816,6 +1913,7 @@ fn arm_pending_motion_hold(
 /// authored timing, anything else IS the total frame count. Cached per
 /// (dat_id, tag) with misses included so a re-issued routine does not
 /// re-read its file; a missing DAT arms nothing and the wait falls through.
+/// research/XiEvents/OpCodes/0x0045.md
 fn routine_units(
     root: Option<&DatRoot>,
     cache: &mut std::collections::HashMap<(u32, FourCc), Option<f32>>,
@@ -1996,6 +2094,7 @@ mod zone_text_skew_tests {
             ITEM,           // You set the {KeyItem:0} in the warhorse hoofprint.
             ITEM,           // The {Item:0} is returned to you.
             ITEM_AND_COUNT, // The {Num:1} {Item:0} are returned to you.
+                            // dat-zone-string-grep.rs readout of zone 245: each entry's line text.
         ],
     );
     const RETAIL_2026_09_BLOCK: (usize, &[u32]) = (6395, HORIZONXI_2023_BLOCK.1);
@@ -2030,10 +2129,10 @@ mod zone_text_skew_tests {
         }
     }
 
+    /// The same message on an install that numbers the block the way the
+    /// server does: the entry under the wire index already fits.
     #[test]
     fn an_era_matched_install_keeps_the_wire_index() {
-        // The same message on an install that numbers the block the way the
-        // server does: the entry under the wire index already fits.
         let matched: (usize, &[u32]) = (6391, HORIZONXI_2023_BLOCK.1);
         assert_eq!(
             resolve_shaped_index(
@@ -2046,12 +2145,12 @@ mod zone_text_skew_tests {
         );
     }
 
+    /// ITEM_OBTAINED itself: 6391 on the wire fits both the install's
+    /// "Obtained: {Item:0}." at 6390 and its "Obtained {Num:0} gil." at
+    /// 6391, and the nearer one is the wrong line. The delta the zone has
+    /// already proven breaks the tie.
     #[test]
     fn a_settled_delta_wins_over_a_nearer_same_shaped_entry() {
-        // ITEM_OBTAINED itself: 6391 on the wire fits both the install's
-        // "Obtained: {Item:0}." at 6390 and its "Obtained {Num:0} gil." at
-        // 6391, and the nearer one is the wrong line. The delta the zone has
-        // already proven breaks the tie.
         let obtained: u16 = 6391;
         let mut skew = ZoneTextSkew::default();
         assert_eq!(
@@ -2087,10 +2186,10 @@ mod zone_text_skew_tests {
         assert_eq!(skew.settled(), None, "a split vote settles nothing");
     }
 
+    /// Nothing in range reads three parameters, so there is no line to
+    /// prefer and the caller falls back to the index the server sent.
     #[test]
     fn a_message_no_entry_fits_leaves_the_wire_index_standing() {
-        // Nothing in range reads three parameters, so there is no line to
-        // prefer and the caller falls back to the index the server sent.
         assert_eq!(
             resolve_shaped_index(
                 &shape_of(HORIZONXI_2023_BLOCK),
@@ -2114,6 +2213,7 @@ mod zone_text_skew_tests {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::session::event_transport::contracts::NPC;
 
     /// A miniature fishing block: offsets relative to a base, mirroring the
     /// real layout's landmark lines.
@@ -2353,12 +2453,11 @@ pub(crate) mod tests {
     }
 
     /// Build a synthetic DialogTable from per-entry (already-plain) text
-    /// bytes. Mirrors ffxi_dat::dmsg's own test helper; the format constants
-    /// duplicate `StringDat::parse`'s (TEXT_XOR / OFFSET_XOR / MAGIC_BASE),
-    /// which are pub(crate) to ffxi-dat — ffxi-dat's tests pin the format.
+    /// bytes. Mirrors ffxi_dat::dmsg's own test helper; the offset XOR is
+    /// imported from the format's owner, the magic and text-xor values are
+    /// small enough to stay local.
     fn synth_dat(entries: &[&[u8]]) -> Vec<u8> {
         const STRING_DAT_MAGIC_BASE: u32 = 0x1000_0000;
-        const STRING_DAT_OFFSET_XOR: u32 = 0x8080_8080;
         const STRING_DAT_TEXT_XOR: u8 = 0x80;
         let count = entries.len();
         let table_size = 4 * count;
@@ -2372,7 +2471,7 @@ pub(crate) mod tests {
         let mut buf = Vec::new();
         buf.extend_from_slice(&(STRING_DAT_MAGIC_BASE.wrapping_add(data_len)).to_le_bytes());
         for off in &offsets {
-            buf.extend_from_slice(&(off ^ STRING_DAT_OFFSET_XOR).to_le_bytes());
+            buf.extend_from_slice(&(off ^ ffxi_dat::dmsg::OFFSET_XOR).to_le_bytes());
         }
         for e in entries {
             buf.extend(e.iter().map(|b| b ^ STRING_DAT_TEXT_XOR));
@@ -2402,10 +2501,9 @@ pub(crate) mod tests {
 
     fn position_update_session() -> (DialogSession, EventTrigger) {
         const ZONE: u16 = 248;
-        const ACTOR: u32 = 17_793_078;
         const EVENT: u16 = 221;
         let block = ffxi_dat::event_dat::EventBlock {
-            actor: ACTOR,
+            actor: NPC,
             event_ids: vec![EVENT],
             event_offsets: vec![0],
             references: vec![33_762, (-31_432i32) as u32, (-2_558i32) as u32, 0],
@@ -2422,7 +2520,7 @@ pub(crate) mod tests {
         let trigger = EventTrigger {
             event_zone: ZONE,
             text_zone: ZONE,
-            unique_no: ACTOR,
+            unique_no: NPC,
             act_index: 54,
             event_id: EVENT,
             params: vec![],
@@ -2434,6 +2532,7 @@ pub(crate) mod tests {
     /// Event 503's master block runs 0x42 as its second opcode (the VM's cancel
     /// disarm). The first dialog frame must carry cancel_armed=false so the
     /// client's ESC gate holds; a program without it stays cancellable.
+    /// research/XiEvents/OpCodes/0x0042.md
     #[test]
     fn cancel_disarm_opcodes_flow_into_the_first_frame() {
         const NPC: u32 = 0x010E_6032;
@@ -2468,25 +2567,33 @@ pub(crate) mod tests {
         }
 
         // 0x42 disarm, then a chat line (0x1D, ref[0]) + MESWAIT.
+        // research/XiEvents/OpCodes/0x0042.md
         let Begin::Frame(dialog) = begin_with(vec![0x42, 0x1D, 0x00, 0x80, 0x23, 0x21]) else {
             panic!("the disarmed program produced no frame");
         };
         assert!(!dialog.cancel_armed);
-        // The trigger's target index rides the frame as its speaker.
-        assert_eq!(dialog.speaker_index, Some(54));
+        assert_eq!(
+            dialog.speaker_index,
+            Some(54),
+            "the trigger's target index rides the frame as its speaker"
+        );
 
-        // Same line without the disarm opcode stays cancellable.
         let Begin::Frame(dialog) = begin_with(vec![0x1D, 0x00, 0x80, 0x23, 0x21]) else {
             panic!("the armed program produced no frame");
         };
-        assert!(dialog.cancel_armed);
+        assert!(
+            dialog.cancel_armed,
+            "without the disarm opcode the program stays cancellable"
+        );
     }
 
     /// Event 503's map beat (master +045D9..+04606): the coupon line parks on its MESWAIT
     /// with the map open, and CLOSE_MAP only runs after dismissal. The up→down edge detector
     /// must fire exactly once — on the step that dismisses the parked frame into a timed hold —
-    /// and never again while the scene stays parked: ticks parked with the frame still up also
+    /// and not again while the scene stays parked: ticks parked with the frame still up also
     /// report Waiting, so a plain Advance::Waiting cannot carry this signal.
+    /// refs[0] is the string index; refs[1] a long WAIT in 1/60s units so the
+    /// post-dismissal hold outlives every tick this test runs.
     #[test]
     fn message_closed_fires_exactly_once_per_up_down_transition() {
         const NPC: u32 = 0x010E_6032;
@@ -2497,14 +2604,13 @@ pub(crate) mod tests {
             actor: NPC,
             event_ids: vec![EVENT],
             event_offsets: vec![0],
-            // refs[0] is the string index; refs[1] a long WAIT in 1/60s units so the
-            // post-dismissal hold outlives every tick this test runs.
             references: vec![900, 60 * 100],
             event_data: vec![
                 0x1D, 0x00, 0x80, // MESSAGE refs[0]
                 0x23, // MESWAIT
                 0x1C, 0x01, 0x80, // WAIT refs[1] (timed hold after dismissal)
                 0x21, // END
+                      // research/XiEvents/OpCodes/0x001D.md
             ],
         };
         let mut session = DialogSession::new(None, "Test".into());
@@ -2524,34 +2630,32 @@ pub(crate) mod tests {
             npc_name: None,
         };
 
-        // First frame up: the detector syncs on this call, nothing has closed yet.
         let Begin::Frame(_dialog) = session.begin(trigger) else {
             panic!("the program produced no first frame");
         };
         assert!(
             !session.take_frame_closed(),
-            "no close before any dismissal"
+            "the first frame syncs the detector; no close before any dismissal"
         );
 
-        // Parked on the MESWAIT with the frame still displayed: ticks report Waiting and
-        // must not fire the detector.
         for _ in 0..3 {
             let Advance::Waiting = session.tick(1.0 / 60.0) else {
                 panic!("parked tick should wait");
             };
             assert!(
                 !session.take_frame_closed(),
-                "frame still up, nothing closed"
+                "parked on the MESWAIT with the frame still displayed: ticks must not fire the detector"
             );
         }
 
-        // Dismissal: the box hides and the scene parks on its timed WAIT — exactly one fire.
         let Advance::Waiting = session.advance(None) else {
             panic!("dismissal should park on the hold");
         };
-        assert!(session.take_frame_closed(), "the dismissal must fire once");
+        assert!(
+            session.take_frame_closed(),
+            "the box hides and the scene parks on its timed WAIT — exactly one fire"
+        );
 
-        // Further ticks parked after it: no re-fire.
         for _ in 0..3 {
             let Advance::Waiting = session.tick(1.0 / 60.0) else {
                 panic!("parked tick should wait");
@@ -2565,6 +2669,8 @@ pub(crate) mod tests {
     /// flag the detector reads, so an answered menu produced no up→down edge and stayed on
     /// screen for the rest of the event — the chocobo rental's "Do you wish to rent a
     /// chocobo?" sat over the whole rental cutscene.
+    /// refs[0] is the string index; refs[1] a long WAIT so the post-answer hold
+    /// outlives every tick this test runs.
     #[test]
     fn answering_a_menu_closes_its_frame() {
         const NPC: u32 = 0x010E_6032;
@@ -2575,14 +2681,13 @@ pub(crate) mod tests {
             actor: NPC,
             event_ids: vec![EVENT],
             event_offsets: vec![0],
-            // refs[0] is the string index; refs[1] a long WAIT so the post-answer hold
-            // outlives every tick this test runs.
             references: vec![900, 60 * 100],
             event_data: vec![
                 0x24, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, // QUERY refs[0], default 0
                 0x25, // QUERYWAIT
                 0x1C, 0x01, 0x80, // WAIT refs[1] (timed hold after the answer)
                 0x21, // END
+                      // research/XiEvents/OpCodes/0x0024.md
             ],
         };
         let mut session = DialogSession::new(None, "Test".into());
@@ -2607,24 +2712,22 @@ pub(crate) mod tests {
         };
         assert!(!session.take_frame_closed(), "no close before any answer");
 
-        // Parked on the QUERYWAIT with the menu still displayed.
         for _ in 0..3 {
             let Advance::Waiting = session.tick(1.0 / 60.0) else {
                 panic!("parked tick should wait");
             };
             assert!(
                 !session.take_frame_closed(),
-                "menu still up, nothing closed"
+                "parked on the QUERYWAIT with the menu still displayed: ticks must not fire the detector"
             );
         }
 
-        // The answer closes the menu and parks on the timed WAIT — exactly one fire.
         let Advance::Waiting = session.advance(Some(0)) else {
             panic!("the answer should park on the hold");
         };
         assert!(
             session.take_frame_closed(),
-            "answering the menu must close its frame"
+            "the answer closes the menu and parks on the timed WAIT — exactly one fire"
         );
 
         for _ in 0..3 {
@@ -2641,10 +2744,12 @@ pub(crate) mod tests {
     fn motion_dat_root(dat_id: u32, tag: [u8; 4], frames: u16) -> (tempfile::TempDir, DatRoot) {
         let dir = tempfile::tempdir().unwrap();
         // VTABLE.DAT: byte[file_id] is the ROM index that claims it.
+        // ffxi-dat/src/vtable.rs
         let mut vtable = vec![0u8; dat_id as usize + 1];
         vtable[dat_id as usize] = 1;
         std::fs::write(dir.path().join("VTABLE.DAT"), &vtable).unwrap();
         // FTABLE.DAT: one u16 word per file id, dir << 7 | file.
+        // ffxi-dat/src/ftable.rs
         let mut ftable = vec![0u16; dat_id as usize + 1];
         ftable[dat_id as usize] = (21u16) << 7 | 39;
         std::fs::write(
@@ -2658,6 +2763,7 @@ pub(crate) mod tests {
         // Chunk: a 64-byte scheduler header whose section table points at one
         // stage, that stage (0x59 AnimationLock, delay 0, duration `frames`),
         // then the end-of-section opcode.
+        // research/XiEvents/OpCodes/0x0059.md
         let mut body = vec![0u8; 64];
         // The section table measures offsets from the chunk header
         // (ffxi-dat/src/scheduler.rs effect_section_start), so the stage at body
@@ -2696,6 +2802,7 @@ pub(crate) mod tests {
         const ZONE: u16 = 248;
         const KEY: [u8; 4] = *b"abcd";
         // 0x5B file operand 5 -> band 0 -> dat id 32109.
+        // research/XiEvents/OpCodes/0x005B.md
         let (dat_id, frames) = (32_109u32, 60u16);
         let (_dir, root) = motion_dat_root(dat_id, KEY, frames);
         let mut program = vec![0x5B];
@@ -2708,6 +2815,7 @@ pub(crate) mod tests {
         program.extend(0u32.to_le_bytes()); // actor2 @20
         program.extend(KEY); // key @24
         program.push(0x21); // END @28
+                            // research/XiEvents/OpCodes/0x005B.md
         let block = ffxi_dat::event_dat::EventBlock {
             actor: NPC,
             event_ids: vec![EVENT],
@@ -2725,7 +2833,8 @@ pub(crate) mod tests {
         // The 0x5B gate loads only for entity Type {1,2,7,8}; feed the NPC's
         // Type the way a 0x0E CHAR_NPC would, under its target index (the
         // server id's low 10 bits, retail's GetActorIndex).
-        session.note_entity_type(NPC, (NPC & 0x3FF) as u16, 2);
+        // research/XiEvents/OpCodes/0x005B.md
+        session.note_entity_type(NPC, (NPC & 1023) as u16, 2);
         let trigger = EventTrigger {
             event_zone: ZONE,
             text_zone: ZONE,
@@ -2749,9 +2858,10 @@ pub(crate) mod tests {
         );
         assert_eq!(*actor, CutsceneActor::Entity { server_id: NPC });
         assert_eq!(*key, KEY);
-        // The hold parks on the renderer's finish report; its deadline is the
-        // 60-frame = one-second DAT length.
-        assert!(matches!(session.tick(0.5), Advance::Waiting));
+        assert!(
+            matches!(session.tick(0.5), Advance::Waiting),
+            "the hold parks on the renderer's finish report; its deadline is the 60-frame = one-second DAT length"
+        );
         let entry = session.pending_motion_holds.values().next().unwrap();
         assert_eq!(entry.3, std::time::Duration::from_secs(1));
         session.motion_done(CutsceneActor::Entity { server_id: NPC }, KEY);
@@ -2764,8 +2874,6 @@ pub(crate) mod tests {
         const EVENT: u16 = 503;
         const ZONE: u16 = 248;
         const KEY: [u8; 4] = *b"mov1";
-        // The synthetic root resolves the zone's own model DAT (zone 248's
-        // mzb file id) to the one-chunk routine of `frames` length.
         let frames = 60u16;
         let (_dir, root) = motion_dat_root(
             ffxi_dat::zone_dat::zone_id_to_mzb_file_id(ZONE).expect("zone 248"),
@@ -2781,6 +2889,7 @@ pub(crate) mod tests {
         program.extend(0u32.to_le_bytes()); // actor2 @18
         program.extend(KEY); // key @22
         program.push(0x21); // END @26
+                            // research/XiEvents/OpCodes/0x002D.md
         let block = ffxi_dat::event_dat::EventBlock {
             actor: NPC,
             event_ids: vec![EVENT],
@@ -2812,9 +2921,10 @@ pub(crate) mod tests {
         };
         assert_eq!(*key, KEY);
         assert_eq!(*actor, CutsceneActor::Entity { server_id: NPC });
-        // The hold parks on the renderer's finish report; its deadline is the
-        // 60-frame = one-second DAT length.
-        assert!(matches!(session.tick(0.5), Advance::Waiting));
+        assert!(
+            matches!(session.tick(0.5), Advance::Waiting),
+            "the hold parks on the renderer's finish report; its deadline is the 60-frame = one-second DAT length"
+        );
         let entry = session.pending_motion_holds.values().next().unwrap();
         assert_eq!(entry.3, std::time::Duration::from_secs(1));
         session.motion_done(CutsceneActor::Entity { server_id: NPC }, KEY);
@@ -2857,9 +2967,10 @@ pub(crate) mod tests {
         }
     }
 
-    /// 0x2C names a routine in the actor's model DAT, which the session never
-    /// opens: its 0x53 parks on the pending hold until the renderer's finish
+    /// 0x2C names a routine in the actor's model DAT, which the session does
+    /// not open: its 0x53 parks on the pending hold until the renderer's finish
     /// report, no matter how much host clock elapses.
+    /// research/XiEvents/OpCodes/0x002C.md
     #[test]
     fn schedulor_hold_parks_until_the_renderer_reports_done() {
         const NPC: u32 = 0x010E_6032;
@@ -2873,6 +2984,7 @@ pub(crate) mod tests {
         program.extend(0u32.to_le_bytes()); // actor2 @18
         program.extend(KEY); // key @22
         program.push(0x21); // END @26
+                            // research/XiEvents/OpCodes/0x002C.md
         let mut session = schedulor_session(program);
         assert!(matches!(session.begin(schedulor_trigger()), Begin::Waiting));
         let cues = session.take_cues();
@@ -2882,11 +2994,15 @@ pub(crate) mod tests {
         };
         assert_eq!(*actor, CutsceneActor::Entity { server_id: NPC });
         assert_eq!(*key, KEY);
-        // The pending hold has no length: no ticking releases it.
-        assert!(matches!(session.tick(3600.0), Advance::Waiting));
-        // The renderer's finish report releases it; the 0x53 advances next tick.
+        assert!(
+            matches!(session.tick(3600.0), Advance::Waiting),
+            "the pending hold has no length: no ticking releases it"
+        );
         session.motion_done(CutsceneActor::Entity { server_id: NPC }, KEY);
-        assert!(matches!(session.tick(0.1), Advance::Ended { .. }));
+        assert!(
+            matches!(session.tick(0.1), Advance::Ended { .. }),
+            "the renderer's finish report releases it; the 0x53 advances next tick"
+        );
     }
 
     #[test]
@@ -2895,36 +3011,42 @@ pub(crate) mod tests {
         const KEY: [u8; 4] = *b"kue0";
         // Two 0x2C issues of the same key, then the 0x53: each 13-byte opcode
         // carries its own actor1 @1 / actor2 @5 / key @9.
+        // research/XiEvents/OpCodes/0x002C.md
         let mut program = Vec::new();
         for op in [0x2C, 0x2C, 0x53] {
             program.push(op);
             program.extend(NPC.to_le_bytes()); // actor1 @1
             program.extend(0u32.to_le_bytes()); // actor2 @5
             program.extend(KEY); // key @9
+                                 // research/XiEvents/OpCodes/0x002C.md
         }
-        program.push(0x21); // END @39
+        program.push(0x21); // END @39 — research/XiEvents/OpCodes/0x0021.md
         let mut session = schedulor_session(program);
         assert!(matches!(session.begin(schedulor_trigger()), Begin::Waiting));
         let cues = session.take_cues();
         assert_eq!(cues.len(), 2, "both 0x2C cues drain in one pass");
         let actor = CutsceneActor::Entity { server_id: NPC };
-        // The first report leaves the second issue still outstanding.
         session.motion_done(actor, KEY);
-        assert!(matches!(session.tick(0.1), Advance::Waiting));
-        // The second releases the hold.
+        assert!(
+            matches!(session.tick(0.1), Advance::Waiting),
+            "the first report leaves the second issue still outstanding"
+        );
         session.motion_done(actor, KEY);
-        assert!(matches!(session.tick(0.1), Advance::Ended { .. }));
+        assert!(
+            matches!(session.tick(0.1), Advance::Ended { .. }),
+            "the second report releases the hold"
+        );
     }
 
+    /// Stray reports (event ended, routine stopped) must not panic.
     #[test]
     fn motion_done_is_a_noop_for_an_unknown_pair() {
         let mut session = DialogSession::new(None, "Test".into());
-        // Stray reports (event ended, routine stopped) must not panic.
         session.motion_done(CutsceneActor::Entity { server_id: 1 }, *b"kue0");
         session.motion_done(CutsceneActor::LocalPlayer, *b"kue0");
     }
 
-    /// A stopped routine or a headless session never gets the renderer's
+    /// A stopped routine or a headless session does not get the renderer's
     /// report: the deadline sweep in the tick releases the hold instead.
     #[test]
     fn schedulor_hold_releases_on_its_deadline_without_a_report() {
@@ -2939,14 +3061,17 @@ pub(crate) mod tests {
         program.extend(0u32.to_le_bytes()); // actor2 @18
         program.extend(KEY); // key @22
         program.push(0x21); // END @26
+                            // research/XiEvents/OpCodes/0x002C.md
         let mut session = schedulor_session(program);
         assert!(matches!(session.begin(schedulor_trigger()), Begin::Waiting));
         let _ = session.take_cues();
-        // Age the entry past its deadline: the renderer never reported.
         let entry = session.pending_motion_holds.values_mut().next().unwrap();
         entry.2 = std::time::Instant::now()
             - (PENDING_MOTION_HOLD_MAX + std::time::Duration::from_secs(1));
-        assert!(matches!(session.tick(0.1), Advance::Ended { .. }));
+        assert!(
+            matches!(session.tick(0.1), Advance::Ended { .. }),
+            "aged past its deadline with no report: the sweep releases the hold"
+        );
         assert!(session.pending_motion_holds.is_empty());
     }
 
@@ -3205,6 +3330,18 @@ pub(crate) mod tests {
         assert_eq!(camera_locks(&events), vec![true, false], "{events:?}");
     }
 
+    /// 0x20 carries no actor: the flag write crosses the boundary as-is.
+    /// research/XiEvents/OpCodes/0x0020.md
+    #[test]
+    fn the_player_control_cue_resolves_without_an_actor() {
+        for locked in [true, false] {
+            assert_eq!(
+                resolve_cue(EventCue::PlayerControl { locked }, 0, 1, 0),
+                ResolvedCue::Scene(CutsceneCue::PlayerControl { locked })
+            );
+        }
+    }
+
     /// 0x5D is a master volume, so it rides the existing music-volume event on
     /// every slot rather than a cue of its own.
     #[test]
@@ -3236,6 +3373,21 @@ pub(crate) mod tests {
         );
     }
 
+    #[test]
+    fn unsupported_sound_volume_does_not_apply_partial_music_changes() {
+        let (tx, mut rx) = broadcast::channel(16);
+        let mut scope = CutsceneScope::default();
+        scope.push(
+            ResolvedCue::SoundVolume {
+                mask: ffxi_event::SOUND_TYPE_MASTER,
+                volume: 0,
+                fade_frames: 60,
+            },
+            &tx,
+        );
+        assert!(drain(&mut rx).is_empty());
+    }
+
     /// The VM leaves its actor operands unresolved on purpose: the local
     /// player, the event's own entity and a named entity all have to stay
     /// distinguishable here (hiding the posed NPC vs mounting the player).
@@ -3251,6 +3403,7 @@ pub(crate) mod tests {
                     hide: true,
                 },
                 EVENT_ENTITY,
+                0,
                 0,
             )
         };
@@ -3277,8 +3430,44 @@ pub(crate) mod tests {
         );
     }
 
+    /// 0x6C rides the same actor resolution as the other actor cues: the fade
+    /// targets the running event's entity, not the VM's own sentinel
+    /// (research/XiEvents/OpCodes/0x006C.md).
+    #[test]
+    fn transpar_cue_resolves_its_actor_against_the_running_event() {
+        const EVENT_ENTITY: u32 = 0x010E_602F;
+        let cue = resolve_cue(
+            EventCue::Transpar {
+                actor: ActorLookup::EVENT_ENTITY,
+                end_alpha: 0,
+                duration_frames: 60,
+            },
+            EVENT_ENTITY,
+            0,
+            0,
+        );
+        match cue {
+            ResolvedCue::Scene(CutsceneCue::Transpar {
+                target,
+                end_alpha,
+                duration_frames,
+            }) => {
+                assert_eq!(
+                    target,
+                    CutsceneActor::Entity {
+                        server_id: EVENT_ENTITY
+                    }
+                );
+                assert_eq!(end_alpha, 0);
+                assert_eq!(duration_frames, 60);
+            }
+            other => panic!("not a transpar cue: {other:?}"),
+        }
+    }
+
     /// 0xB5 names the event entity by default: the rename cue rides the
     /// running event's own server id.
+    /// research/XiEvents/OpCodes/0x00B5.md
     #[test]
     fn entity_name_cue_resolves_to_the_running_events_entity() {
         const EVENT_ENTITY: u32 = 0x010E_602F;
@@ -3289,6 +3478,7 @@ pub(crate) mod tests {
                 name,
             },
             EVENT_ENTITY,
+            0,
             0,
         );
         match cue {
@@ -3303,6 +3493,50 @@ pub(crate) mod tests {
             }
             other => panic!("not a name cue: {other:?}"),
         }
+    }
+
+    /// An emote cue resolves its actor to a wire id: the LocalPlayer lookup to
+    /// the session's player id, a named entity to its own server id.
+    #[test]
+    fn emote_cue_resolves_the_actor_to_a_wire_id() {
+        const EVENT_ENTITY: u32 = 0x010E_602F;
+        const PLAYER: u32 = 0x010E_0001;
+        let player_emote = resolve_cue(
+            EventCue::Emote {
+                actor: ActorLookup::LOCAL_PLAYER,
+                emote_id: 7,
+                param: 0,
+            },
+            EVENT_ENTITY,
+            0,
+            PLAYER,
+        );
+        assert_eq!(
+            player_emote,
+            ResolvedCue::Emote {
+                actor_id: PLAYER,
+                emote_id: 7,
+                param: 0,
+            }
+        );
+        let npc_emote = resolve_cue(
+            EventCue::Emote {
+                actor: ActorLookup::EVENT_ENTITY,
+                emote_id: 1,
+                param: 0,
+            },
+            EVENT_ENTITY,
+            0,
+            PLAYER,
+        );
+        assert_eq!(
+            npc_emote,
+            ResolvedCue::Emote {
+                actor_id: EVENT_ENTITY,
+                emote_id: 1,
+                param: 0,
+            }
+        );
     }
 
     /// PENDINGSTR can land before the event's VM exists: it is accepted and

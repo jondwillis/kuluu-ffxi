@@ -381,6 +381,8 @@ mod tests {
                 actor_fade: None,
                 idle_transition_time: None,
                 flinch_duration: None,
+                model_visibility: None,
+                spell_effect: None,
                 delay_frames: 0,
                 duration_frames: 60,
                 id,
@@ -447,8 +449,9 @@ mod tests {
         assert_eq!(voyage_progress(228, 1450.0, Some(timing)), (0.5, true, 2));
         assert_eq!(voyage_progress(228, 999.0, Some(timing)).0, 0.0);
         assert_eq!(voyage_progress(228, 2000.0, Some(timing)).0, 1.0);
-        // data/zones/mhaura/zone.yaml mhaura_selbina_boat: every 1152, offset 920,
-        // docked ends at 233, departing hides the ship at 272, riders ashore at 26.
+        // vendor/server/data/zones/mhaura/zone.yaml mhaura_selbina_boat: every 1152,
+        // offset 920, docked ends at 233, departing hides the ship at 272, riders
+        // ashore at 26.
         let s = ffxi_vocab::transport::voyage(228).unwrap();
         assert_eq!(
             (s.every, s.offset, s.boarding_ends, s.departs, s.disembark),

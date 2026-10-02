@@ -354,7 +354,8 @@ pub struct CharFlags {
 impl CharFlags {
     /// `flags4` is the decoded `Flags4.JobMasterFlag` bit — `None` when the packet
     /// stops short of body offset 0x2F or the caller is not on a CHAR_PC (the byte
-    /// means something else in a 0x0E), which reads as "not set".
+    /// means something else in a 0x0E), which reads as "not set"
+    /// (vendor/server/src/map/packets/char_update.cpp `flags4_t`).
     pub fn from_pos_head(head: &PosHead, flags4_job_master: Option<bool>) -> Self {
         let (f1, f2, f3) = (head.flags1, head.flags2, head.flags3);
         Self {
@@ -541,6 +542,10 @@ pub enum LookData {
         model_id: Option<u32>,
         #[serde(default)]
         animation_start: Option<u32>,
+        /// Seconds a lift spends between floors, elevators only
+        /// (`getTransportNPCName` writes it at name+8).
+        #[serde(default)]
+        travel_secs: Option<u8>,
     },
 }
 
@@ -598,14 +603,19 @@ impl LookData {
                 // vendor/server/src/map/packets/entity_update.cpp getTransportNPCName
                 const MODEL_OFFSET: usize = 0x30;
                 const TIME_OFFSET: usize = 0x34;
+                const TRAVEL_OFFSET: usize = 0x38;
                 let word = |offset| {
                     body.get(offset..offset + 4)
                         .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
                 };
+                let travel_secs = (size == ffxi_vocab::transport::MODEL_ELEVATOR)
+                    .then(|| body.get(TRAVEL_OFFSET).copied())
+                    .flatten();
                 Some(LookData::Transport {
                     size,
                     model_id: word(MODEL_OFFSET),
                     animation_start: word(TIME_OFFSET),
+                    travel_secs,
                 })
             }
             _ => None,
@@ -1069,7 +1079,8 @@ mod char_flags_tests {
             "FLAG_UNTARGETABLE did not light TargetOffFlag"
         );
         // The neighbouring ENTITYFLAGS bits (HIDE_NAME 0x8, CALL_FOR_HELP 0x20,
-        // HIDE_MODEL 0x80, HIDE_HP 0x100) must not bleed into any decoded field.
+        // HIDE_MODEL 0x80, HIDE_HP 0x100) must not bleed into any decoded field
+        // (vendor/server/data/enums/entity_flags.yaml).
         for m_flags in [0x008u32, 0x020, 0x080, 0x100] {
             let mut body = vec![0u8; PosHead::SIZE];
             body[M_FLAGS_OFFSET..M_FLAGS_OFFSET + 4].copy_from_slice(&m_flags.to_le_bytes());
@@ -1164,19 +1175,20 @@ mod char_flags_tests {
     }
 
     /// `Flags4.JobMasterFlag` — bit 6 of the u8 at body offset 0x2F, past
-    /// `PosHead`. Unlike the flags1..3 words it is not part of any decoded word,
-    /// so a lone set bit must light exactly one field.
+    /// `PosHead` (vendor/server/src/map/packets/char_update.cpp `flags4_t`).
+    /// Unlike the flags1..3 words it is not part of any decoded word, so a lone
+    /// set bit must light exactly one field, and the neighbouring bits of the
+    /// same byte (unknown_0_0, TrialFlag, unknown_0_2/0_4, unknown_0_7) must
+    /// not bleed in.
     #[test]
     fn flags4_job_master_bit_lights_the_field() {
-        let mut body = vec![0u8; 0x30]; // ≥ 0x30 so byte 0x2F is present
+        let mut body = vec![0u8; 48];
         body[0x2F] |= 1 << flags4::JOB_MASTER;
         let head = PosHead::decode(&body).unwrap();
         assert_eq!(PosHead::flags4_job_master(&body), Some(true));
         let flags = CharFlags::from_pos_head(&head, PosHead::flags4_job_master(&body));
         assert!(flags.job_master_display);
 
-        // The neighbouring bits of the same byte (unknown_0_0, TrialFlag,
-        // unknown_0_2/0_4, unknown_0_7) must not bleed in.
         for bit in [0u32, 1, 2, 3, 4, 5, 7] {
             let mut body = vec![0u8; 0x30];
             body[0x2F] |= 1 << bit;
@@ -1185,10 +1197,11 @@ mod char_flags_tests {
     }
 
     /// A body that stops short of byte 0x2F decodes to "not set" rather than
-    /// erroring — `from_pos_head` treats it as false.
+    /// erroring — `from_pos_head` treats it as false
+    /// (vendor/server/src/map/packets/char_update.cpp `flags4_t`).
     #[test]
     fn flags4_job_master_is_none_when_the_body_stops_short() {
-        let body = vec![0u8; PosHead::SIZE]; // 40 bytes: no byte at 0x2F
+        let body = vec![0u8; PosHead::SIZE];
         assert_eq!(PosHead::flags4_job_master(&body), None);
         let head = PosHead::decode(&body).unwrap();
         let flags = CharFlags::from_pos_head(&head, PosHead::flags4_job_master(&body));
@@ -1572,6 +1585,8 @@ mod pos_head_tests {
         assert_eq!(PosHead::mount_index(&short), None);
     }
 
+    /// A General-only update stops before the Model block's field, so the
+    /// short body reads as "not a monstrosity".
     #[test]
     fn char_pc_monstrosity_reads_the_model_block_flags() {
         // MonstrosityFlags is the int16 at body 0x3A; LSB writes `0x8000 | Species`
@@ -1584,7 +1599,6 @@ mod pos_head_tests {
         buf[PosHead::MONSTROSITY_FLAGS_OFFSET..].copy_from_slice(&0x8005u16.to_le_bytes());
         assert_eq!(PosHead::monstrosity(&buf), Some(true));
 
-        // A General-only update stops before the Model block's field.
         let short = vec![0u8; PosHead::SIZE_WITH_BT_TARGET];
         assert_eq!(PosHead::monstrosity(&short), None);
     }
@@ -1949,13 +1963,20 @@ mod transport_tests {
         const MODEL: usize = 44;
         const SELECTOR: usize = 48;
         const START: usize = 52;
-        const FULL: usize = 56;
+        const TRAVEL: usize = 56;
+        const FULL: usize = 57;
         const STAMP: u32 = 0x1200_3400;
-        for size in [3u16, 4] {
+        const TRAVEL_SECS: u8 = 8;
+        for size in [
+            ffxi_vocab::transport::MODEL_ELEVATOR,
+            ffxi_vocab::transport::MODEL_SHIP,
+        ] {
+            let elevator = size == ffxi_vocab::transport::MODEL_ELEVATOR;
             let mut body = [0u8; FULL];
             body[MODEL..MODEL + 2].copy_from_slice(&size.to_le_bytes());
-            body[SELECTOR] = 14;
-            body[START..].copy_from_slice(&STAMP.to_le_bytes());
+            body[SELECTOR..SELECTOR + 4].copy_from_slice(b"@6l0");
+            body[START..START + 4].copy_from_slice(&STAMP.to_le_bytes());
+            body[TRAVEL] = TRAVEL_SECS;
             for length in 0..=FULL {
                 let decoded = LookData::decode_char_npc(&body[..length]);
                 if length < SELECTOR {
@@ -1965,9 +1986,11 @@ mod transport_tests {
                         decoded,
                         Some(LookData::Transport {
                             size,
-                            model_id: (length >= START).then_some(14),
-                            animation_start: (length == FULL).then_some(STAMP),
-                        })
+                            model_id: (length >= START).then_some(u32::from_le_bytes(*b"@6l0")),
+                            animation_start: (length >= TRAVEL).then_some(STAMP),
+                            travel_secs: (elevator && length == FULL).then_some(TRAVEL_SECS),
+                        }),
+                        "size {size} length {length}"
                     );
                 }
             }
@@ -1978,6 +2001,7 @@ mod transport_tests {
                     size,
                     model_id: Some(0),
                     animation_start: Some(0),
+                    travel_secs: elevator.then_some(0),
                 })
             );
         }

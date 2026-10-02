@@ -70,7 +70,9 @@ impl MapClient {
 
     /// Sync variant of [`Self::connect_with_local`] for offline test fixtures:
     /// binds the same ephemeral UDP socket without a runtime. No datagram is
-    /// sent until one is explicitly requested.
+    /// sent until one is explicitly requested. The std socket is flipped to
+    /// non-blocking first: tokio's `from_std` debug-asserts on Unix that the
+    /// fd is already non-blocking, and the std bind is blocking.
     pub fn connect_with_local_sync(
         server: SocketAddr,
         seed: [u8; 20],
@@ -78,8 +80,6 @@ impl MapClient {
     ) -> Result<Self> {
         let std_socket =
             std::net::UdpSocket::bind(local).with_context(|| format!("UDP bind {local}"))?;
-        // tokio's `from_std` debug-asserts on Unix that the fd is already
-        // non-blocking; the std bind above is blocking, so flip it first.
         std_socket
             .set_nonblocking(true)
             .with_context(|| "set UDP socket non-blocking")?;
@@ -360,14 +360,15 @@ mod tests {
         assert_eq!(&seed[16..20], &1u32.to_le_bytes());
     }
 
+    /// Ephemeral local port: the test must not inherit FFXI_MAP_LOCAL_PORT
+    /// (the Docker/WSL2 DNAT pin), or parallel test tasks collide on the
+    /// pinned port.
     #[tokio::test]
     async fn retarget_preserves_local_socket_port() {
         let server_a: SocketAddr = "127.0.0.1:1".parse().unwrap();
         let server_b: SocketAddr = "127.0.0.2:2".parse().unwrap();
         let seed_a = [1u8; 20];
         let seed_b = [2u8; 20];
-        // Ephemeral local port: tests must not inherit FFXI_MAP_LOCAL_PORT (the Docker/WSL2
-        // DNAT pin), or parallel test tasks collide on the pinned port.
         let mut client = MapClient::connect_with_local(server_a, seed_a, "0.0.0.0:0")
             .await
             .unwrap();

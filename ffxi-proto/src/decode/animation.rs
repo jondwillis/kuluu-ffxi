@@ -17,6 +17,14 @@ pub const SIT: u8 = 47;
 pub const OPEN_DOOR: u8 = 8;
 pub const CLOSE_DOOR: u8 = 9;
 
+/// A lift platform's leg (`enum ANIMATIONTYPE`, vendor/server/data/enums/animation.yaml
+/// `elevator_up` / `elevator_down`). The server sets the byte when a leg starts and
+/// never moves the platform or its riders
+/// (vendor/server/src/map/transports/elevator_handler.cpp `start`); the client runs the
+/// zone DAT's `mv01` / `mv10` routine between the RID chunk's two floor heights.
+pub const ELEVATOR_UP: u8 = 10;
+pub const ELEVATOR_DOWN: u8 = 11;
+
 /// Riding a chocobo — the classic mount, which retail renders from a dedicated
 /// PC race config rather than the generic mount model block. Noble Chocobo also
 /// arrives as `CHOCOBO`; the two differ only in `CustomProperties[1]`

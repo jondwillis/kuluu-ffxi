@@ -294,8 +294,8 @@ mod tests {
         assert_eq!(cib.motion_option, 1);
     }
 
-    // A scheduler chunk whose parse fails must not vanish silently: the clean set keeps only
-    // what parsed, and the rejection carries the chunk name plus why parse failed.
+    /// A scheduler chunk whose parse fails must not vanish silently: the clean set keeps only
+    /// what parsed, and the rejection carries the chunk name plus why parse failed.
     #[test]
     fn collect_schedulers_reports_rejected_chunks() {
         let mut dat = synth_chunk(b"file", ChunkKind::Rmp as u8, &[]);
@@ -304,7 +304,6 @@ mod tests {
             ChunkKind::Scheduler as u8,
             &synth_scheduler_body(b"at0?"),
         ));
-        // Truncated body: below SCHEDULER_HEADER_LEN, so parse_in_dir rejects it.
         dat.extend(synth_chunk(b"bad1", ChunkKind::Scheduler as u8, &[0u8; 4]));
         dat.extend(synth_chunk(b"end\0", ChunkKind::Terminate as u8, &[]));
 

@@ -356,7 +356,8 @@ mod tests {
     // 0x7FFFFFFF must not resolve as the master.
     #[test]
     fn zone_player_actor_is_the_retail_literal() {
-        assert_eq!(ZONE_PLAYER_ACTOR, 0x7FFF_FFF0);
+        const ZONE_PLAYER_ACTOR_PINNED: u32 = 0x7FFF_FFF0;
+        assert_eq!(ZONE_PLAYER_ACTOR, ZONE_PLAYER_ACTOR_PINNED);
         let dat = EventDat::parse(&dat_bytes(&[block_bytes(
             0x7FFF_FFFF,
             &[(1, 0)],

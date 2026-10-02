@@ -4,27 +4,22 @@ use std::path::{Path, PathBuf};
 use crate::client_profile::ItemBlockLayout;
 use crate::map_image::{self, GraphicImage};
 
-// vendor/POLUtils/PlayOnline.FFXI/Things/Item.cs Item: per-type item arrays keyed by the first block's id.
-/// General items, ids from 0x0000.
+// vendor/POLUtils/PlayOnline.FFXI/Things/Item.cs Item: per-type item arrays keyed by the
+// first block's id — general from 0x0000, usable from 0x1000, weapons from 0x4000, armor
+// from 0x2800, puppet from 0x2000, vouchers and slips from 0x7000, monipulator from 0xF000,
+// instincts from 0x7400.
 pub const ITEM_DAT_GENERAL: u32 = 73;
-/// Usable items, ids from 0x1000.
 pub const ITEM_DAT_USABLE: u32 = 74;
-/// Weapons, ids from 0x4000.
 pub const ITEM_DAT_WEAPON: u32 = 75;
-/// Armor, ids from 0x2800.
 pub const ITEM_DAT_ARMOR: u32 = 76;
-/// Puppet items, ids from 0x2000.
 pub const ITEM_DAT_PUPPET: u32 = 77;
 /// Currency.
 pub const ITEM_DAT_CURRENCY: u32 = 91;
-/// Vouchers and slips (maze tabulae and runes, storage slips, legion passes,
-/// grimoires), ids from 0x7000.
+/// Vouchers and slips (maze tabulae and runes, storage slips, legion passes, grimoires).
 pub const ITEM_DAT_VOUCHERS_AND_SLIPS: u32 = 55667;
 /// Expansion armor.
 pub const ITEM_DAT_ARMOR_EXPANSION: u32 = 55668;
-/// Monipulator species, ids from 0xF000.
 pub const ITEM_DAT_MONIPULATOR: u32 = 55669;
-/// Instincts, ids from 0x7400.
 pub const ITEM_DAT_INSTINCT: u32 = 55670;
 /// Expansion items.
 pub const ITEM_DAT_ITEMS_EXPANSION: u32 = 55671;
@@ -71,8 +66,7 @@ pub(crate) fn era_rom_path(file_id: u32) -> Option<&'static str> {
     })
 }
 
-/// Same on both layouts: the extra 0x800 bytes of a `Retail2026` block are
-/// trailing pad after the icon.
+/// Icon offset; identical on both [`ItemBlockLayout`]s, the `Retail2026` pad follows it.
 pub const ITEM_ICON_OFFSET: usize = 0x280;
 
 const ITEM_BLOCK_SHIFT: u32 = crate::client_profile::ITEM_BYTE_SHIFT;

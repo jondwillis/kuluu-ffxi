@@ -34,37 +34,40 @@ use common::EphemeralChar;
 // Raw event id of the SSD new-character cutscene (vendor/server/scripts/quests/
 // hiddenQuests/New_Character_Cutscenes.lua SOUTHERN_SAN_DORIA onZoneIn).
 const EVENT_503: u16 = 503;
-// xi.item.ADVENTURER_COUPON, granted by onEventFinish[503].
+/// xi.item.ADVENTURER_COUPON, granted by onEventFinish[503]
+/// (vendor/server/scripts/quests/hiddenQuests/New_Character_Cutscenes.lua).
 const COUPON_ITEM_NO: u16 = 536;
-// The char_vars row that arms the trigger (quest var 'notSeen' of hidden quest
-// newCharacterCS).
+/// The char_vars row that arms the trigger (quest var 'notSeen' of hidden
+/// quest newCharacterCS,
+/// vendor/server/scripts/quests/hiddenQuests/New_Character_Cutscenes.lua).
 const NOT_SEEN_VAR: &str = "HQuest[newCharacterCS]notSeen";
 
-// onEventFinish[503] setPos(-100, 1, -40, 224): native (x=-100, y=+1, z=-40)
-// arrives as wire Position pos = (-100, -40, +1); the wire .y is horizontal Z
-// and .z is vertical.
+/// onEventFinish[503] setPos(-100, 1, -40, 224)
+/// (vendor/server/scripts/quests/hiddenQuests/New_Character_Cutscenes.lua):
+/// native (x=-100, y=+1, z=-40) arrives as wire Position pos = (-100, -40, +1);
+/// the wire .y is horizontal Z and .z is vertical.
 const GATE_WIRE_X: f32 = -100.0;
 const GATE_WIRE_Y: f32 = -40.0;
 const GATE_WIRE_Z: f32 = 1.0;
 const GATE_TOLERANCE: f32 = 0.5;
 
-// A full playback must take at least this long from CutsceneStarted to end:
-// the authored holds alone exceed it by a wide margin (an 8 s WAIT plus every
-// camera/fade routine hold at its DAT-authored length). An event ending faster
-// than this means the holds did not run — the skip-to-end failure mode.
+/// A full playback must take at least this long from CutsceneStarted to end:
+/// the authored holds alone exceed it by a wide margin (an 8 s WAIT plus every
+/// camera/fade routine hold at its DAT-authored length). An event ending faster
+/// than this means the holds did not run — the skip-to-end failure mode.
 const MIN_PLAYBACK_SECS: f32 = 60.0;
 
-// The G1 -> "adventuring" -> G4a path carries ~45 input-gated frames in the
-// authored script; allow for lines that merge into one frame.
+/// The G1 -> "adventuring" -> G4a path carries ~45 input-gated frames in the
+/// authored script; allow for lines that merge into one frame.
 const MIN_DIALOG_FRAMES: u32 = 25;
 
 const LOGIN_DEADLINE: Duration = Duration::from_secs(90);
 const PLAYBACK_DEADLINE: Duration = Duration::from_secs(8 * 60);
-// After the event ends, onEventFinish rewards (item grant + setPos) arrive as
-// ordinary s2c traffic; allow this long before giving up on them.
+/// After the event ends, onEventFinish rewards (item grant + setPos) arrive
+/// as ordinary s2c traffic; allow this long before giving up on them.
 const SERVER_RESPONSE_GRACE: Duration = Duration::from_secs(30);
-// The zone-in event fires on entry; no start within a minute of InZone means
-// the trigger did not fire and waiting longer changes nothing.
+/// The zone-in event fires on entry; no start within a minute of InZone means
+/// the trigger did not fire and waiting longer changes nothing.
 const NO_EVENT_GRACE: Duration = Duration::from_secs(60);
 
 fn open_dat_root() -> Option<ffxi_dat::DatRoot> {
@@ -111,8 +114,8 @@ fn fourcc_to_string(cc: [u8; 4]) -> String {
     String::from_utf8_lossy(&cc).into_owned()
 }
 
-// G1 main menu: take the "adventuring" branch so the nested G4a menu runs;
-// G4a sub-menu: "Helping people". Text frames (no choices) dismiss with 0.
+/// G1 main menu: take the "adventuring" branch so the nested G4a menu runs;
+/// G4a sub-menu: "Helping people". Text frames (no choices) dismiss with 0.
 fn pick_choice(dialog: &DialogState) -> u32 {
     for (i, label) in dialog.choices.iter().enumerate() {
         if label.contains("adventuring") {
@@ -127,6 +130,10 @@ fn pick_choice(dialog: &DialogState) -> u32 {
     0
 }
 
+/// Tallys the 503 run. The end is gated on the cutscene having started:
+/// `EventEnded` is a unit variant carrying no event id, so this ignores any
+/// unrelated event that ends around zone-in; the first end after start is the
+/// one tallied.
 fn handle_event(tally: &mut Tally, ev: &AgentEvent, now: Instant) {
     match ev {
         AgentEvent::StageChanged { stage } => {
@@ -139,7 +146,7 @@ fn handle_event(tally: &mut Tally, ev: &AgentEvent, now: Instant) {
             }
         }
         AgentEvent::CutsceneStarted { event_id } => {
-            if *event_id & 0xFFFF == u32::from(EVENT_503) && tally.cutscene_started_at.is_none() {
+            if *event_id & 65535 == u32::from(EVENT_503) && tally.cutscene_started_at.is_none() {
                 tally.cutscene_started_at = Some(now);
                 eprintln!(
                     "[live] CutsceneStarted (agent id 0x{event_id:08X}) at t+{:.1}s",
@@ -148,9 +155,6 @@ fn handle_event(tally: &mut Tally, ev: &AgentEvent, now: Instant) {
             }
         }
         AgentEvent::EventEnded => {
-            // EventEnded is a unit variant carrying no event id, so gate on the 503
-            // cutscene having started to ignore any unrelated event that ends around
-            // zone-in. First end after start is the one we tally.
             if tally.event_ended_at.is_none() && tally.cutscene_started_at.is_some() {
                 tally.event_ended_at = Some(now);
                 eprintln!("[live] EventEnded at t+{:.1}s", now.elapsed().as_secs_f32());
@@ -196,7 +200,8 @@ fn handle_event(tally: &mut Tally, ev: &AgentEvent, now: Instant) {
                 tally.scheduler_cues.push((*dat_id, fourcc_to_string(*tag)));
             }
             kuluu_session::state::CutsceneCue::ExtScheduler { motion, key, .. } => {
-                // The 0x66 package 20 gesture cues: container A is 32732.
+                // The 0x66 LOADEXTSCHEDULER2 gesture cues
+                // (research/XiEvents/OpCodes/0x0066.md): container A is 32732.
                 if matches!(
                     motion,
                     Some(kuluu_snapshot::ExtSchedulerMotion::Tpc { a: 32_732, .. })

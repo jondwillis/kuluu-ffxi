@@ -30,7 +30,7 @@ fn install() -> Option<(DatRoot, MainDll)> {
 
 /// Every id of every (race, slot) row: the resolver is the dll walk, and past
 /// the row's last band it is the row's model 0 (retail's "wrong GRP number"
-/// clamp), never a dropped part. A full sweep covers every band's first id,
+/// clamp), not a dropped part. A full sweep covers every band's first id,
 /// last id and the one past it without knowing where the bands fall.
 #[test]
 fn equipment_resolver_is_the_dll_walk_with_the_model_zero_clamp() {
@@ -112,8 +112,11 @@ fn measured_equipment_cells() {
     );
     assert_ne!(main_1000, dll.equipment_model_index(HUME_M, MAIN_SLOT, 0));
 
-    // The environment-resolved wrappers read this same install.
-    assert_eq!(install_root_from_env().as_deref(), Some(root.root()));
+    assert_eq!(
+        install_root_from_env().as_deref(),
+        Some(root.root()),
+        "the environment-resolved wrappers read this same install"
+    );
     assert_eq!(resolve_face(0, TARUTARU_F), Some(22952));
     assert_eq!(resolve_equipment_model(MAIN_SLOT, 1000, HUME_M), main_1000);
 }
@@ -156,7 +159,7 @@ fn race_tables_match_the_dll_and_the_fallbacks() {
 /// four range starts, plus 3192, the last model id the 3000 range registers on
 /// KNOWN_CLIENTS horizonxi-2023 and retail-2026-09 (3193..=3499 are VTABLE-absent
 /// on both, which is why the split at 3500 can only come from the disassembly
-/// cited at `NPC_DAT_ID_BASES`, never from the registered extent).
+/// cited at `NPC_DAT_ID_BASES`, not from the registered extent).
 #[test]
 fn npc_formula_ranges_resolve_to_skeleton_dats() {
     let Some((root, _)) = install() else {

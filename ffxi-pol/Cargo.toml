@@ -1,0 +1,24 @@
+[package]
+name = "ffxi-pol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The PlayOnline account services (profile and chat) as a client library: cipher suite, key agreement, transaction framing, lobby session derivation."
+
+[dependencies]
+hex.workspace = true
+md-5.workspace = true
+num-bigint.workspace = true
+num-integer.workspace = true
+rand = { workspace = true, features = ["std_rng"] }
+sha1.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, optional = true }
+tracing.workspace = true
+
+[features]
+default = ["client"]
+client = ["dep:tokio"]
+
+[dev-dependencies]
+tokio = { workspace = true }

@@ -94,8 +94,8 @@ pub fn build_subpacket_action(
 
 pub const C2S_ACTION_LOG_TARGET: &str = "c2s_action";
 
-// Call only after the transport reports the datagram written, so the line is
-// evidence the packet left the client, not merely that it was built.
+/// Call only after the transport reports the datagram written, so the line is
+/// evidence the packet left the client, not merely that it was built.
 pub fn log_action_sent(unique_no: u32, act_index: u16, kind: &crate::state::ActionKind) {
     tracing::debug!(
         target: C2S_ACTION_LOG_TARGET,
@@ -627,7 +627,6 @@ pub(crate) fn build_subpacket_clistatus(sync: u16) -> Vec<u8> {
         2,
         sync,
     ));
-    // unknown00 stays 0 (validate: range 0..=1).
     buf
 }
 

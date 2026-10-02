@@ -5,7 +5,9 @@ use ffxi_dat::event_dat::{EventBlock, EventDat, ZONE_PLAYER_ACTOR};
 use ffxi_proto::{decode::PosMode, framing, map};
 
 const PLAYER: u32 = 17_455_719;
-const NPC: u32 = 17_793_078;
+/// The retail NPC these fixtures key off; other session tests name the same
+/// actor, so the id is importable rather than re-typed.
+pub(crate) const NPC: u32 = 17_793_078;
 const INDEX: u16 = 54;
 const EVENT: u16 = 221;
 const ZONE: u16 = 248;
@@ -43,6 +45,9 @@ const OP_END: u8 = 0x21;
 const OP_REQUEST_WAIT: u8 = 0x29;
 const OP_POSITION: u8 = 0x47;
 const COMPARE_LESS: u8 = 4;
+/// The position fixture's heading, in event units; the value coincides with
+/// ffxi-event's motion band edge, which is unrelated.
+const HEADING_EVENT_UNITS_PINNED: u32 = 3072;
 const WORK_GIL: u16 = 0x1002;
 const WORK_FARE: u16 = 0x1003;
 const REFERENCE: u16 = 0x8000;
@@ -97,7 +102,12 @@ fn position_dat(child: bool) -> EventDat {
     program.extend([OP_POSITION, 1, OP_END]);
     let movement = block(
         program,
-        vec![33_762, (-31_432i32) as u32, (-2_558i32) as u32, 3072],
+        vec![
+            33_762,
+            (-31_432i32) as u32,
+            (-2_558i32) as u32,
+            HEADING_EVENT_UNITS_PINNED,
+        ],
     );
     if !child {
         return EventDat {
@@ -145,10 +155,10 @@ struct Host {
     map: MapClient,
 }
 impl Host {
+    /// Offline fixture socket: an ephemeral UDP bind with no server behind
+    /// it; a tag send from Begin::AwaitServerAck just drops.
     async fn new(dat: EventDat, gil: i32) -> Self {
         let (events, receiver) = broadcast::channel(64);
-        // Offline fixture socket: an ephemeral UDP bind with no server behind
-        // it; a tag send from Begin::AwaitServerAck just drops.
         let map = MapClient::connect_with_local_sync(
             std::net::SocketAddr::from(([127, 0, 0, 1], 9)),
             [0u8; 20],
@@ -462,6 +472,7 @@ fn action_kinds() -> Vec<(ActionKind, bool)> {
 
 /// Drive a fixture event to its end, asserting it emits 0x05B EVENT_END and
 /// releases the in-event state.
+/// vendor/server/src/map/packets/c2s/0x05b_eventend.cpp
 fn end_event(host: &mut Host) {
     let step = host.step(Drive::Cancel);
     assert!(matches!(step.advance, Advance::Ended { .. }));
@@ -573,10 +584,10 @@ fn pos_finite_contract() {
     }
 }
 
+/// bootstrap_acceptance_contract blocks on its own current-thread runtime,
+/// so it must run outside an active tokio context.
 #[test]
 fn ferry_and_bootstrap_contracts_hold() {
-    // bootstrap_acceptance_contract blocks on its own current-thread runtime,
-    // so it must run outside an active tokio context.
     super::super::tests::ferry_packet_state_contract();
     super::super::tests::bootstrap_acceptance_contract();
     super::super::tests::bootstrap_enterzone_contract();

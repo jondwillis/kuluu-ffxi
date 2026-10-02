@@ -8,8 +8,6 @@ pub const NO_PARTY: u8 = 3;
 /// `GROUP_TBL.PartyNo : 2` (vendor/server/src/map/packets/s2c/0x0c8_group_tbl.h GROUP_TBL).
 pub const PARTY_NO_MASK: u8 = 0x03;
 
-// ---- GROUP_TBL (0x0C8) — party definition -----------------------------------
-
 /// One entry in the GROUP_TBL packet (12 bytes each, up to 20 entries).
 /// vendor/server/src/map/packets/s2c/0x0c8_group_tbl.h.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -31,7 +29,7 @@ pub enum GroupKind {
     Unknown(u8),
 }
 
-/// Decoded GROUP_TBL (s2c 0x0C8) packet.
+/// Decoded GROUP_TBL (s2c 0x0C8, vendor/server/src/map/packets/s2c/0x0c8_group_tbl.h) packet.
 #[derive(Debug, Clone)]
 pub struct GroupTbl {
     pub kind: GroupKind,
@@ -76,7 +74,6 @@ impl GroupTbl {
             let e = &entry_data[off..off + ENTRY_SIZE];
             let unique_no = u32::from_le_bytes(e[0..4].try_into().unwrap());
             if unique_no == 0 {
-                // Remaining entries are empty (zero-padded).
                 continue;
             }
             let act_index = u16::from_le_bytes(e[4..6].try_into().unwrap());
@@ -108,8 +105,6 @@ impl GroupTbl {
         Ok(Self { kind, members })
     }
 }
-
-// ---- GROUP_LIST (0x0DD) / GROUP_ATTR (0x0DF) --------------------------------
 
 #[derive(Debug, Clone)]
 pub struct PartyAttrs {
@@ -441,23 +436,22 @@ mod group_tbl_tests {
         assert_eq!(tbl.kind, GroupKind::None);
         assert!(tbl.members.is_empty());
 
-        // The minimal shape (kind + pad only) decodes the same.
         let tbl = GroupTbl::decode(&[0, 0, 0, 0]).unwrap();
         assert_eq!(tbl.kind, GroupKind::None);
         assert!(tbl.members.is_empty());
     }
 
+    /// Fixture: slot 0 is party_no=1 with PartyLeaderFlg (bit 2) set, so flags
+    /// 0b101; slot 1 is party_no=2 with no leader flags and ZoneNo 0, which is
+    /// legal; slot 3 stays zero-filled and stops the scan.
     #[test]
     fn group_tbl_party_parses_flags_and_zones() {
         let mut body = vec![0u8; 4 + 20 * 12];
         // PartyKind::Party == 0 (vendor/server/src/map/enums/party_kind.h) — the
         // old test pinned 1, a value LSB never sends.
         body[0] = 0;
-        // party_no=1, PartyLeaderFlg set (bit2) -> flags 0b101
         body[4..16].copy_from_slice(&entry(0x0010_0042, 7, 0b101, 235));
-        // party_no=2 (bits0-1), no leader flags; ZoneNo 0 is legal here
         body[16..28].copy_from_slice(&entry(0x0010_0007, 9, 0b010, 0));
-        // slot 3 stays zero-filled -> stop
 
         let tbl = GroupTbl::decode(&body).unwrap();
         assert_eq!(tbl.kind, GroupKind::Party);
@@ -484,7 +478,7 @@ mod group_tbl_tests {
         // PartyKind::Alliance == 5 (vendor/server/src/map/enums/party_kind.h) — the
         // old test pinned 2, a value LSB never sends.
         body[0] = 5;
-        body[4..16].copy_from_slice(&entry(5, 1, 0b1000, 1)); // AllianceLeaderFlg (bit3)
+        body[4..16].copy_from_slice(&entry(5, 1, 0b1000, 1));
         let tbl = GroupTbl::decode(&body).unwrap();
         assert_eq!(tbl.kind, GroupKind::Alliance);
         assert!(tbl.members[0].is_alliance_leader);

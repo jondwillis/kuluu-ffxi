@@ -56,7 +56,9 @@ resolve_config() {
   LOADER_ARGS=${FFXI_OBSERVE_LOADER_ARGS:-${P_loader_args:-}}
   SERVER=${FFXI_OBSERVE_SERVER:-${P_server:-}}
   VM_NAME=${FFXI_OBSERVE_VM_NAME:-${HXI_VM_NAME:-${P_vm_name:-}}}
-  ARTIFACTS=${FFXI_OBSERVE_ARTIFACTS:-artifacts/retail}
+  # Anchor captures to the repository rather than the caller's directory, so a
+  # burst driven from the scripts directory does not scatter PNGs into the skill.
+  ARTIFACTS=${FFXI_OBSERVE_ARTIFACTS:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)/artifacts/retail}
 }
 
 detect_host() {
@@ -127,6 +129,11 @@ select_window() {
   [ -n "$hit" ] || return 1
   printf '%s\n' "$hit"
 }
+
+# Backends override this where the host can be in a state that accepts
+# captures but silently discards synthesized input. Defaulting to "fine" keeps
+# a backend that cannot detect such a state from blocking every drive loop.
+host_input_or_die() { :; }
 
 need_window() {
   WIN=$(select_window) || {

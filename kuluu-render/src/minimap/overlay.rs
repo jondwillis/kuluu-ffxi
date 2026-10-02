@@ -119,9 +119,10 @@ const ALL_CATEGORIES_MASK: u8 = (1 << MarkerCategory::ALL.len()) - 1;
 /// The grounded retail fact is a negative: the summoned map is not a live
 /// entity radar, so every kind-keyed dot and the current-target/lock-on
 /// highlight are Enhanced. `Party` is an unverified inference pending a retail
-/// map-screen observation (kuluu-7cqw); `SelfMarker` is the floor. The 0x0F5
+/// map-screen observation; `SelfMarker` is the floor. The 0x0F5
 /// tracked marker and the 0x0F4 wide-scan hits are separate nodes in
 /// `hud::map_screen` that this mask does not gate.
+/// .agents/skills/retail-observe/references/2026-09-09-compass-radar.md
 const VANILLA_CATEGORIES_MASK: u8 = MarkerCategory::SelfMarker.bit() | MarkerCategory::Party.bit();
 
 /// Session-persistent per-category visibility bitset; a cleared bit hides that
@@ -186,9 +187,9 @@ fn marker_category(kind: EntityKind, is_party: bool, is_role_target: bool) -> Ma
 }
 
 /// Whether a world dot is drawn at all. The `Target` role is an additive
-/// highlight, never a reclassification: selecting or locking on an actor can
-/// only add its dot, so a party member keeps hers under the vanilla mask the
-/// moment she is targeted (kuluu-7cqw).
+/// highlight, not a reclassification: selecting or locking on an actor only
+/// adds its dot, so a party member keeps hers under the vanilla mask the
+/// moment she is targeted.
 fn marker_visible(
     filters: &MarkerFilters,
     kind: EntityKind,
@@ -715,7 +716,7 @@ mod tests {
 
     /// The live NPC/mob/PC radar and the current-target highlight are the
     /// Enhanced opt-in; `Target` here is whatever the player has selected or
-    /// locked on, not the 0x0F5 tracked entity, so it is not a vanilla mark.
+    /// locked on, not the map-screen tracked marker, so it is not a vanilla mark.
     #[test]
     fn vanilla_radar_marks_only_self_and_party() {
         let vanilla = MarkerFilters::for_radar(MinimapRadar::Vanilla);

@@ -253,6 +253,8 @@ fn bag_counter(
         .map(|c| (c.items.len(), c.capacity))
 }
 
+/// The /check window is titled with the target's name and their jobs in
+/// retail; observed on the horizonxi-2023 client.
 #[allow(clippy::type_complexity)]
 pub fn update_menu_help_bar(
     mode: Res<InputMode>,
@@ -327,8 +329,6 @@ pub fn update_menu_help_bar(
         InputMode::PassiveCursor(s) if s.focus == PassiveCursorFocus::StatusIcons => {
             (buff_bar_content(&scene.snapshot, s.status_cursor), false)
         }
-        // Retail titles the /check window with the target's name and their jobs;
-        // observed on the horizonxi-2023 client.
         InputMode::Check => (
             check.target_id.map(|id| BarContent {
                 title: crate::hud::check_view::target_name(&scene.snapshot, id),

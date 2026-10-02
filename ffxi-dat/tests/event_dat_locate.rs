@@ -1,6 +1,6 @@
 //! Pins [`event_dat_file_id`] against a real install: the ids it computes must
 //! resolve, through the install's own VTABLE/FTABLE, to the event DATs a
-//! hand-materialised zone -> ROM-path table used to name. Self-skips without an
+//! hand-materialised zone -> ROM-path table names. Self-skips without an
 //! install.
 
 use std::path::{Path, PathBuf};

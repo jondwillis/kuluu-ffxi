@@ -157,9 +157,6 @@ pub fn ingest_system<
         state.observe_server_chat();
         state.dirty = true;
         table.apply_snapshot(&state.snapshot);
-        // char_id only changes on connect/zone entry, and full snapshots
-        // carry it. `0` is not a valid character id, so filtering it keeps
-        // is_self() false for an unstamped slot.
         table.set_self_id(state.snapshot.self_char_id.filter(|&c| c != 0));
     }
 

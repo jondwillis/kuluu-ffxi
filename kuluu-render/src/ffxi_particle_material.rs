@@ -21,7 +21,7 @@ const PREMULTIPLY_NONE: f32 = 0.0;
 const PREMULTIPLY_ADD: f32 = 1.0;
 const PREMULTIPLY_MULTIPLY: f32 = 2.0;
 
-// `ffxi_particle.wgsl`'s `FOG_*`: params.y selects the element's distance fog.
+/// `ffxi_particle.wgsl`'s `FOG_*`: params.y selects the element's distance fog.
 const FOG_OFF: f32 = 0.0;
 const FOG_ZONE: f32 = 1.0;
 const FOG_BLACK: f32 = 2.0;

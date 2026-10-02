@@ -66,11 +66,7 @@ pub const GRAD_SLEW: f32 = 0.15;
 /// `dat_mzb::STEP_UP_REACH_EPSILON`.
 pub const CHAIN_CEILING_EPS: f32 = 5e-4;
 
-// ---------------------------------------------------------------------------
-// Sweep
-// ---------------------------------------------------------------------------
-
-/// Slide re-projection passes per tick (wall, then crease).
+/// Sweep: slide re-projection passes per tick (wall, then crease).
 pub const SLIDE_ITERATIONS: usize = 3;
 
 /// Penetration depth at which a face we are NOT moving into still blocks the
@@ -91,16 +87,12 @@ pub const DEPEN_SLOP: f32 = 0.02;
 /// which reads as the "pop" and sideways drift on descent.
 pub const DEPEN_MAX_PUSH: f32 = 0.15;
 
-// ---------------------------------------------------------------------------
-// Dynamic obstacles
-// ---------------------------------------------------------------------------
-
 // Actor contact, from research/XIClient/src/XIClient/source/World/Actor/ControllableActor.cpp
 // ControllableActor::CheckContactActor.
 
-/// Search radius for the contact candidate: retail seeds its nearest-actor
-/// scan with a squared distance of 64, so only actors within 8 yalms of the
-/// projected position are ever candidates.
+/// Dynamic obstacles: search radius for the contact candidate: retail seeds
+/// its nearest-actor scan with a squared distance of 64, so only actors
+/// within 8 yalms of the projected position are ever candidates.
 pub const CONTACT_SEARCH_RADIUS: f32 = 8.0;
 
 /// Retail's contact block budget, decremented each tick by
@@ -114,11 +106,7 @@ pub const CONTACT_BLOCK_TICKS: f32 = 30.0;
 /// side rather than re-typed.
 pub const CONTACT_TICKS_PER_SEC: f32 = crate::view_native::input::RETAIL_MOVE_TICKS_PER_SEC;
 
-// ---------------------------------------------------------------------------
-// Falling
-// ---------------------------------------------------------------------------
-
-/// Retail's fall, read from
+/// Falling: retail's fall, read from
 /// research/XIClient/src/XIClient/source/World/Actor/CollidableActor.cpp
 /// CollidableActor::OnMove: the actor carries a downward step that grows by
 /// `FALL_STEP_GAIN_PER_TICK` per tick, is clamped to `FALL_STEP_MAX`, and is

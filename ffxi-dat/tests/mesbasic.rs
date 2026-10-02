@@ -42,8 +42,10 @@ fn numbers(pairs: &[(usize, i64)]) -> [i64; PARAM_SLOTS] {
     out
 }
 
-/// Four ids the session used to carry hand-pinned wording for, and the four
-/// era-divergent indices whose wording the two rows disagree on.
+/// Four ids the session carries hand-pinned wording for, and the four
+/// era-divergent indices whose wording the two rows disagree on; the skill-up
+/// tenths diverge because the horizon table has no fractional skill-up and
+/// spells them behind a literal "0.".
 fn cases() -> Vec<Case> {
     vec![
         Case {
@@ -94,8 +96,6 @@ fn cases() -> Vec<Case> {
                 (RETAIL, "Rock Lizard obtains 1,200 gil."),
             ],
         },
-        // Era-divergent: the older table has no fractional skill-up, spelling
-        // the tenths behind a literal "0.".
         Case {
             index: 38,
             numbers: numbers(&[(ACTION_ID, 2), (MAIN_VALUE, 15)]),

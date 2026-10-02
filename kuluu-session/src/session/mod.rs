@@ -470,6 +470,7 @@ async fn run_map_session(
 
     // Set by drain_zone_flood when ENTERZONE (s2c 0x008) lands inside a flood;
     // consumed by keepalive_loop to fire the post-GAMEOK handshake.
+    // vendor/server/src/map/packets/s2c/0x008_enterzone.cpp
     let mut enterzone_seen = false;
 
     let mut flood_in_mog_house = false;
@@ -547,11 +548,11 @@ async fn run_map_session(
 
     let mut sub_seq: u16 = map_client::BOOTSTRAP_SUB_SYNC.wrapping_add(1);
 
-    // Each c2s below is followed by a quiescence drain of the server's reply:
-    // parse() advances server_packet_id once per processed c2s and stamps that
-    // value on its response, so the next send must carry the ack observed in
-    // that reply — firing back-to-back with one captured ack gets every send
-    // after the first eaten by the retransmit guard above.
+    /// Each c2s below is followed by a quiescence drain of the server's reply:
+    /// parse() advances server_packet_id once per processed c2s and stamps that
+    /// value on its response, so the next send must carry the ack observed in
+    /// that reply — firing back-to-back with one captured ack gets every send
+    /// after the first eaten by the retransmit guard above.
     macro_rules! quiesce {
         () => {
             drain_zone_flood(
@@ -597,8 +598,6 @@ async fn run_map_session(
         sub_seq = sub_seq.wrapping_add(1);
         map.send_encrypted(&payload, datagram_header_id(sub_seq), server_last_seq)
             .await?;
-        // `ack` must equal the server's current server_packet_id or parse()
-        // drops this c2s and re-sends its cached last s2c instead.
         tracing::info!(
             sub_seq,
             ack = server_last_seq,
@@ -661,8 +660,9 @@ async fn run_map_session(
     // landed: without it the session cannot spawn the player, so it must not
     // present itself as connected. The seed is the sole hard bootstrap
     // requirement (the s2c 0x00A LOGIN is tracked but not gated), so a server
-    // that never sends a self CHAR_PC leaves the session in Zoning rather than
-    // a false InZone.
+    // that does not send a self CHAR_PC leaves the session in Zoning rather
+    // than a false InZone.
+    // vendor/server/src/map/packets/s2c/0x00a_login.cpp
     if self_pos_seeded {
         emit_stage(event_tx, Stage::InZone);
         let _ = event_tx.send(AgentEvent::Diagnostics {
@@ -735,6 +735,7 @@ fn should_break_flood(break_on_idle: bool, self_pos_seeded: bool) -> bool {
 /// not a break condition — it rides a second datagram behind the zone-in burst,
 /// so gating the break on it stalls the whole bootstrap when that datagram is
 /// late or lost.
+/// vendor/server/src/map/packets/s2c/0x00a_login.cpp
 /// When `ack_at_send` is Some (post-send quiescence), also breaks as soon as a
 /// datagram stamped differently from that ack arrives — the server's id only
 /// advances when it accepts one of our c2s, so any post-acceptance stamp is
@@ -1089,6 +1090,7 @@ fn handle_sub_packet(
                 // 0x037 CHAR_STATUS is only re-sent on a status *change*, so a
                 // character who zoned in still KO'd would carry no homepoint
                 // timer until then. Emitted after ZoneChanged, which clears it.
+                // vendor/server/src/map/packets/char_status.cpp
                 if let Some(secs) = login.seconds_until_homepoint() {
                     tracing::info!(seconds_until_homepoint = secs, "0x00A LOGIN zoned in KO'd");
                     let _ = event_tx.send(AgentEvent::DeathTimerUpdated {
@@ -1295,6 +1297,7 @@ fn handle_sub_packet(
                 // wire that field carries the door FourCC for doors ("_6i3")
                 // and the internal script name for helpers ("blank"). DAT
                 // first; wire only as fallback for ids the DAT does not cover.
+                // ffxi-dat/src/npc_names.rs
                 let name = if op == s2c::CHAR_NPC {
                     npc_name_resolver
                         .lookup(head.unique_no)
@@ -1335,6 +1338,7 @@ fn handle_sub_packet(
                 // logs once per real change. If these lines stop arriving while
                 // you hit a mob, the break is upstream of the fold; if they
                 // arrive but the bar still does not move, it is downstream.
+                // vendor/server/src/map/packets/char_update.cpp
                 if hp_pct.is_some() && matches!(kind, EntityKind::Mob | EntityKind::Pet) {
                     tracing::info!(
                         target: "mob_hp",
@@ -1366,6 +1370,7 @@ fn handle_sub_packet(
                 // Flags4.JobMasterFlag is a CHAR_PC-only byte — in a 0x0E that
                 // offset sits inside the SubKind/Status word, so it decodes to
                 // "not set" for NPCs.
+                // vendor/server/src/map/packets/char_update.cpp
                 let char_flags = (send_flag & UPDATE_HP != 0).then(|| {
                     decode::CharFlags::from_pos_head(
                         &head,
@@ -1384,6 +1389,7 @@ fn handle_sub_packet(
                 // Special-pose wire probe (RUST_LOG=special=debug): raw status/sub for every update
                 // that could drive a transition: sub set while visible, buried ticks (status
                 // INVISIBLE), resurface/settle. Answers "what does the server actually send?"
+                // vendor/server/src/map/packets/char_update.cpp
                 if op == s2c::CHAR_NPC
                     && matches!(kind, EntityKind::Mob | EntityKind::Pet)
                     && special_wire_log_enabled()
@@ -1523,6 +1529,7 @@ fn handle_sub_packet(
                 let _ = event_tx.send(AgentEvent::ChatLine { line });
             }
             emit_battle_message_audio_event(sub.data, true, event_tx);
+            emit_engage_refusal_event(sub.data, self_char_id, event_tx);
         }
         s2c::BATTLE_MESSAGE2 => {
             for line in
@@ -1600,6 +1607,9 @@ fn handle_sub_packet(
             }
             for line in decode_battle2_action(sub.data, name_cache, kind_cache, mes_basic.table()) {
                 let _ = event_tx.send(AgentEvent::ChatLine { line });
+            }
+            if let Some((actor_id, hits)) = decode_battle2_knockbacks(sub.data) {
+                let _ = event_tx.send(AgentEvent::Knockbacks { actor_id, hits });
             }
         }
         s2c::ASSIST => {
@@ -1975,7 +1985,7 @@ fn handle_sub_packet(
                     prompt: Some(title),
                     choices: options,
                     custom_menu: true,
-                    cancel_armed: true, // ESC answers "Canceled." via the customMenu branch
+                    cancel_armed: true,
                     ..Default::default()
                 };
                 let _ = event_tx.send(AgentEvent::EventDialog { dialog });
@@ -2449,7 +2459,6 @@ async fn begin_server_event(
     );
     let outcome = dialog_session.begin(trigger);
     let cues = dialog_session.take_cues();
-    // Syncs the up→down edge detector for this event's first frame.
     if dialog_session.take_frame_closed() {
         let _ = event_tx.send(AgentEvent::DialogDismissed);
     }
@@ -2490,6 +2499,7 @@ async fn begin_server_event(
             // The script opened on a pending tag (0x43/0x47 case 0): the event
             // is live server-side and owes its first frame to the s2c ack, so
             // it tracks like Waiting until then.
+            // research/XiEvents/OpCodes/0x0043.md
             let id = crate::event_dialog::agent_event_id(unique_no, event_id);
             cutscene.start(id, event_tx);
             let _ = event_tx.send(AgentEvent::EventStart { event_id: id });
@@ -2643,8 +2653,6 @@ async fn keepalive_loop(
     event_tx: broadcast::Sender<AgentEvent>,
     user_driven_events: bool,
     mut name_cache: std::collections::HashMap<u32, String>,
-    // Target index -> unique_no for live entities; resolves a VM frame's
-    // speaker_index to the entity that speaks it.
     mut target_cache: std::collections::HashMap<u16, u32>,
     mut kind_cache: std::collections::HashMap<u32, crate::state::EntityKind>,
     mut claim_cache: std::collections::HashMap<u32, u32>,
@@ -2702,6 +2710,7 @@ async fn keepalive_loop(
     // character list, so the terminal 0x00B LOGOUT reason carries which one was
     // requested (issue #156). A server-initiated logout (no client request) keeps
     // the logout flavor.
+    // vendor/server/src/map/packets/c2s/0x0e7_reqlogout.cpp
     let mut last_reqlogout_shutdown = false;
 
     let mut pending_maprect: Option<(std::time::Instant, u32)> = None;
@@ -2772,12 +2781,6 @@ async fn keepalive_loop(
     let mut rubber_band_target: Option<Vec3> = None;
     let mut last_rubber_band_step: std::time::Instant = std::time::Instant::now();
 
-    // Post-zone-in settle window (see ZONE_IN_SETTLE): for the first moments of a
-    // zone-generation, refuse to snap self_pos to a far-away carrier so an
-    // out-of-order/duplicate position from around the transition cannot drop us in
-    // the wrong zone. Anchored at main-loop start — by then the flood has seeded (or
-    // will shortly), and this covers the vulnerable period while late carriers can
-    // still arrive.
     let zone_in_settle_until = std::time::Instant::now() + ZONE_IN_SETTLE;
 
     let mut self_in_mog_house = false;
@@ -3216,9 +3219,6 @@ async fn keepalive_loop(
                         target_index,
                         kind,
                     }) => {
-                        // A shop opens off a Talk trigger, so the NPC we are
-                        // about to greet is the vendor any SHOP_OPEN that follows
-                        // belongs to.
                         if matches!(kind, crate::state::ActionKind::Talk) {
                             shop_session.last_talk_target = target_id;
                         }
@@ -3982,6 +3982,7 @@ async fn keepalive_loop(
                     // The renderer's finish report for a 0x2C SCHEDULOR routine:
                     // releases the event VM's pending hold on it so the 0x53
                     // past it advances on the next tick. No server traffic.
+                    // research/XiEvents/OpCodes/0x002C.md
                     Some(AgentCommand::CutsceneMotionDone { actor, key }) => {
                         dialog_session.motion_done(actor, key);
                     }
@@ -4446,8 +4447,6 @@ async fn keepalive_loop(
                 });
                 let walked_away = !dialog_session.controls_player_position()
                     && should_release_on_walkaway(user_driven_events, walk_dist);
-                // Auto/headless mode never releases on drift (user_driven is false), so a
-                // pinned event can sit while the player moves: warn once per episode.
                 let moved_during_event = !walked_away
                     && !dialog_session.controls_player_position()
                     && walk_dist.is_some_and(|d| d > EVENT_WALKAWAY_YALMS);
@@ -4823,9 +4822,6 @@ async fn keepalive_loop(
                                             )
                                             .await;
                                         }
-                                        // A PostClose with an open already in
-                                        // flight is the in-window Receive/Send
-                                        // switch, not the player leaving.
                                         if out.settled
                                             && dbox.open().is_none()
                                             && !dbox.reopening()
@@ -4944,11 +4940,6 @@ async fn keepalive_loop(
 
                             event_transport::receive(&mut dialog_session, &sub, self_char_id, self_pos);
 
-                            // The ack both c2s event-end process() functions push after
-                            // handling a pending tag: release the VM's hold and run on to
-                            // the next frame. Gated on has_pending_tag so an EventRecvPending
-                            // with no held tag is only the scene-module acknowledgement in
-                            // event_transport::receive.
                             if sub.opcode == ffxi_proto::map::s2c::EVENTUCOFF
                                 && eventucoff_mode_of(sub.data)
                                     == Some(ffxi_proto::map::eventucoff_mode::EVENT_RECV_PENDING)
@@ -4981,8 +4972,6 @@ async fn keepalive_loop(
                                         cutscene.end(crate::event_dialog::EventSessionExit::ScriptEnded, &event_tx);
                                         let _ = event_tx.send(AgentEvent::EventEnded);
                                     }
-                                    // Chained tag: the next hold in the same script. Send it
-                                    // now; its own EventRecvPending drives the next ack.
                                     crate::event_dialog::Advance::AwaitServerAck(tag) => {
                                         send_pending_tag(map, &mut sub_seq, server_last_seq, current_zone_id, u, a, n, &tag).await;
                                     }
@@ -5076,10 +5065,6 @@ async fn keepalive_loop(
                                 if let Ok(head) = decode::PosHead::decode(sub.data) {
                                     if head.unique_no == self_char_id {
                                         let server_pos = self_pos.pos;
-                                        // During the post-zone-in settle window a far (>snap)
-                                        // carrier is an out-of-order/duplicate position from around
-                                        // the transition, not a real teleport — keep our local seed
-                                        // (see ZONE_IN_SETTLE).
                                         let refuse_snap = self_pos_seeded
                                             && std::time::Instant::now() < zone_in_settle_until;
                                         match reconcile_self_pos(prev_self_pos, server_pos, refuse_snap) {
@@ -5143,6 +5128,7 @@ async fn keepalive_loop(
                                             // server-side with no 0x053 cancel packet, so a
                                             // heal→walk transition is the client-visible
                                             // "logout/shutdown cancelled" signal.
+                                            // vendor/server/src/map/packets/s2c/0x053_systemmes.cpp
                                             if !server_healing {
                                                 let _ =
                                                     event_tx.send(AgentEvent::LogoutCountdownCancelled);
@@ -5241,8 +5227,9 @@ pub async fn run_event_folder(
                 // translator falls back to a full snapshot (SceneDelta cannot
                 // express clears/evictions of non-entity fields). The send runs
                 // inside the fold closure — before watch bumps its version — so
-                // a translator that observes this event's state is guaranteed
-                // to find its batch already in the channel.
+                // a translator that observes this event's state is certain to
+                // find its batch already in the channel.
+                // kuluu-snapshot/src/lib.rs
                 let entity_only = matches!(
                     event,
                     AgentEvent::EntityUpserted { .. }
@@ -5541,6 +5528,41 @@ fn emit_battle_message_audio_event(
     }
 }
 
+// vendor/server/src/map/enums/msg_basic.h MsgBasic: the answers
+// vendor/server/src/map/ai/controllers/player_controller.cpp
+// CPlayerController::Engage and entities/char_entity.cpp
+// CCharEntity::applyTargetRestrictions give a 0x01A Attack in place of the
+// 0x058 accept. pub(crate) so the reactor tests name them.
+pub(crate) const MSG_BASIC_ALREADY_CLAIMED: u16 = 12;
+pub(crate) const MSG_BASIC_TOO_FAR_AWAY: u16 = 78;
+pub(crate) const MSG_BASIC_WAIT_LONGER: u16 = 94;
+pub(crate) const MSG_BASIC_CANNOT_ON_THAT_TARGET: u16 = 155;
+pub(crate) const MSG_BASIC_CANNOT_ATTACK_TARGET: u16 = 446;
+const ENGAGE_REFUSAL_IDS: [u16; 5] = [
+    MSG_BASIC_ALREADY_CLAIMED,
+    MSG_BASIC_TOO_FAR_AWAY,
+    MSG_BASIC_WAIT_LONGER,
+    MSG_BASIC_CANNOT_ON_THAT_TARGET,
+    MSG_BASIC_CANNOT_ATTACK_TARGET,
+];
+
+/// A 0x029 from CPlayerController::Engage carries cas = self; the refusal
+/// events of other casters are theirs, not ours.
+fn emit_engage_refusal_event(
+    data: &[u8],
+    self_char_id: u32,
+    event_tx: &tokio::sync::broadcast::Sender<AgentEvent>,
+) {
+    if data.len() < 24 {
+        return;
+    }
+    let cas_id = u32::from_le_bytes(data[0..4].try_into().unwrap());
+    let message_num = u16::from_le_bytes(data[20..22].try_into().unwrap());
+    if cas_id == self_char_id && ENGAGE_REFUSAL_IDS.contains(&message_num) {
+        let _ = event_tx.send(AgentEvent::EngageRefused { message_num });
+    }
+}
+
 // vendor/server/src/map/enums/msg_basic.h MsgBasic — the ids whose client text reports a
 // refused action (the engage refusals "Unable to see <target>." / "<target> is out of
 // range.", plus the spell/item/pet refusal family). The Battle tab is display-hidden by
@@ -5680,10 +5702,16 @@ impl<'a> BattleBitReader<'a> {
             }
             u32::from_le_bytes(self.data[byte_offset..byte_offset + 4].try_into().ok()?) as u64
         } else {
-            if byte_offset + 8 > self.data.len() {
+            // A read starting mid-byte spans at most five bytes (32 bits at bit 7), so bound
+            // on that span: exact-length packets end right after the last result block, and
+            // a wider fetch would reject reads that fit.
+            let span = total_bits.div_ceil(8);
+            if byte_offset + span > self.data.len() {
                 return None;
             }
-            u64::from_le_bytes(self.data[byte_offset..byte_offset + 8].try_into().ok()?)
+            let mut buf = [0u8; 8];
+            buf[..span].copy_from_slice(&self.data[byte_offset..byte_offset + span]);
+            u64::from_le_bytes(buf)
         };
         let mask = if bits == 64 {
             u64::MAX
@@ -5721,8 +5749,8 @@ pub struct Battle2Header {
     // is what the client resolves against its file table rather than the action id.
     pub animation: Option<u16>,
 
-    // The first result block's outcome bits, read for every category (unlike `first_result`,
-    // which is gated to basic attacks). Absent when no result block was read.
+    /// The first result block's outcome bits, read for every category (unlike `first_result`,
+    /// which is gated to basic attacks). Absent when no result block was read.
     pub first_outcome: Option<ffxi_proto::melee::ResultOutcome>,
 }
 
@@ -5753,6 +5781,7 @@ fn battle2_debug_dump(data: &[u8]) {
             br.read(5),  // info
             br.read(2),  // hitDistortion
             br.read(3),  // knockback
+                         // vendor/server/src/map/packets/s2c/0x028_battle2.cpp
         )
     });
     tracing::debug!(
@@ -5888,6 +5917,7 @@ fn decode_battle2_action(
             // One parameter array per result, so an entry reads whichever
             // block's value it names — the additional-effect and spikes lines
             // address slots of their own.
+            // ffxi-dat/src/sysmes.rs
             let mut numbers = [0i64; sysmes::PARAM_SLOTS];
             numbers[MES_PARAM_ACTION_ID] = cmd_arg as i64;
             numbers[MES_PARAM_MAIN_VALUE] = value as i64;
@@ -5915,6 +5945,61 @@ fn decode_battle2_action(
 
 fn is_start_category(cmd_no: u8) -> bool {
     matches!(cmd_no, 7 | 8 | 9 | 10 | 12)
+}
+
+/// Walks every target and result of a 0x028 (the same bit layout
+/// `decode_battle2_action` reads, vendor/server/src/map/packets/s2c/0x028_battle2.cpp
+/// GP_SERV_COMMAND_BATTLE2::pack) and collects the targets whose result landed
+/// with a knockback level. A miss carries no shove (research/xim
+/// EffectRoutineInstance.kt handleKnockBackRoutine, `context.missed()`), and
+/// LSB zeroes the level on an evade anyway (entities/battle_entity.cpp).
+/// `None` when nothing knocked back, so the caller sends nothing.
+fn decode_battle2_knockbacks(data: &[u8]) -> Option<(u32, Vec<crate::state::KnockbackHit>)> {
+    use ffxi_proto::melee::ActionResolution;
+    let mut br = BattleBitReader::new(data, 8);
+    let actor_id = br.read(32)? as u32;
+    let trg_sum = br.read(6)? as usize;
+    let _res_sum = br.read(4)?;
+    let _cmd_no = br.read(4)?;
+    let _cmd_arg = br.read(32)?;
+    let _info = br.read(32)?;
+
+    let mut hits = Vec::new();
+    for _t in 0..trg_sum.min(15) {
+        let target_id = br.read(32)? as u32;
+        let result_sum = br.read(4)? as usize;
+        for _r in 0..result_sum.min(8) {
+            let resolution = br.read(3)? as u8;
+            let _kind = br.read(2)?;
+            let _animation = br.read(12)?;
+            let _info = br.read(5)?;
+            let _hit_distortion = br.read(2)?;
+            let level = br.read(3)? as u8;
+            let _param = br.read(17)?;
+            let _message = br.read(10)?;
+            let _modifier = br.read(31)?;
+            if br.read(1)? != 0 {
+                let _proc_kind = br.read(6)?;
+                let _proc_info = br.read(4)?;
+                let _proc_param = br.read(17)?;
+                let _proc_message = br.read(10)?;
+            }
+            if br.read(1)? != 0 {
+                let _react_kind = br.read(6)?;
+                let _react_info = br.read(4)?;
+                let _react_value = br.read(14)?;
+                let _react_message = br.read(10)?;
+            }
+            let landed = !matches!(
+                ActionResolution::from_wire(resolution),
+                Some(ActionResolution::Miss) | None
+            );
+            if landed && level > 0 {
+                hits.push(crate::state::KnockbackHit { target_id, level });
+            }
+        }
+    }
+    (!hits.is_empty()).then_some((actor_id, hits))
 }
 
 fn build_battle2_line(
@@ -6013,7 +6098,6 @@ fn compose_mes_basic(
     let mut params = sysmes::SysMesParams {
         numbers,
         caster_name: Some(cas_name),
-        // Retail drops "the" for anything it refers to by name.
         caster_article: !cas_is_pc,
         target_name: Some(tar_name),
         target_article: !tar_is_pc,
@@ -6746,6 +6830,7 @@ fn decode_shop_open(data: &[u8]) -> Option<u16> {
 
 /// One s2c 0x03C page: its `ShopItemOffsetIndex`, whether it is the final page,
 /// and the rows it carries.
+/// vendor/server/src/map/packets/s2c/0x03c_shop_list.cpp
 struct ShopListPage {
     offset_index: u16,
     last: bool,
@@ -6804,6 +6889,7 @@ fn decode_shop_list(data: &[u8]) -> Option<ShopListPage> {
 /// indices so a shop wider than a single packet lists in full. Rows past the
 /// client's fixed table (`SHOP_TABLE_CAPACITY`) are dropped, as the retail
 /// client's fixed-size array would.
+/// vendor/server/src/map/packets/s2c/0x03c_shop_list.cpp
 fn merge_shop_page(shop: &mut ShopState, page: ShopListPage) {
     shop.offset_index = page.offset_index;
     shop.complete = page.last;
@@ -7400,9 +7486,9 @@ const MOVE_BIG_JUMP_YALMS: f32 = 0.5;
 /// re-floods, and pre-transition echoes can land late). Within this window a carrier
 /// whose position is far (> snap threshold) from where we actually stand is treated as
 /// stale — an old-zone coordinate or re-sent snapshot — and must not yank us across
-/// zones (see reconcile_self_pos `refuse_snap`). A legitimate server teleport never
-/// happens in the first moments of a zone, so refusing Snap here cannot mask a real
-/// correction.
+/// zones (see reconcile_self_pos `refuse_snap`). A legitimate server teleport does
+/// not happen in the first moments of a zone, so refusing Snap here cannot mask a
+/// real correction.
 const ZONE_IN_SETTLE: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -7425,12 +7511,6 @@ fn reconcile_self_pos(local: Vec3, server: Vec3, refuse_snap: bool) -> SelfPosRe
     } else if dist_sq <= 10.0 * 10.0 {
         SelfPosReconcile::Rubberband { target: server }
     } else if refuse_snap {
-        // Post-zone-in settle window: a far (>snap) self-position carrier is an
-        // out-of-order/duplicate position from around the transition (an old-zone
-        // coordinate or re-sent pre-transition snapshot), not a real teleport —
-        // keep our local seed instead of snapping across zones. A legitimate server
-        // teleport never lands in the first moments of a zone, so this cannot mask a
-        // genuine correction.
         SelfPosReconcile::KeepLocal
     } else {
         SelfPosReconcile::Snap
@@ -7474,6 +7554,9 @@ fn should_emit_pos(
     elapsed >= MOVE_EMISSION_PERIOD || pos_delta_yalms > MOVE_BIG_JUMP_YALMS || heading_changed
 }
 
+/// Release a pinned event when the player walks away from it. Auto/headless
+/// mode does not release on drift (user_driven is false); there the caller
+/// warns once per episode instead.
 fn should_release_on_walkaway(user_driven: bool, walk_dist: Option<f32>) -> bool {
     user_driven && walk_dist.is_some_and(|d| d > EVENT_WALKAWAY_YALMS)
 }

@@ -24,6 +24,11 @@ fn minimap_retail_desc(state: &kuluu_render::minimap::MinimapState, zone: Option
     )
 }
 
+/// Apply a parsed slash-command outcome. Disengage (/disengage, /cancel)
+/// releases the camera lock like the H toggle; the lock is a client-side
+/// latch the wire cancel does not touch. Quit sends ReqLogout and Disconnect
+/// over the one command channel; the session transmits before it reads again,
+/// so the server learns we are leaving rather than seeing a dropped link.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn apply_slash_outcome(
     outcome: SlashOutcome,
@@ -55,8 +60,6 @@ pub(super) fn apply_slash_outcome(
                     .write(kuluu_render::hud::logout_countdown::LogoutRequested { shutdown });
             }
             mirror_heal_stance(&cmd, &mut slash_writers.rest_stance);
-            // Disengage (/disengage, /cancel) releases the camera lock like the
-            // H toggle; the lock is a client-side latch the wire cancel never touches.
             if matches!(cmd, AgentCommand::Cancel) {
                 slash_writers.lock_on.target_id = None;
             }
@@ -89,9 +92,6 @@ pub(super) fn apply_slash_outcome(
             target.id = id;
         }
         SlashOutcome::Quit => {
-            // Both ride the one command channel and the session transmits
-            // before it reads again, so the server learns we are leaving
-            // rather than seeing a dropped link.
             let _ = cmd_tx.try_send(AgentCommand::ReqLogout {
                 kind: kuluu_session::state::ReqLogoutKind::ShutdownOn,
             });
@@ -807,6 +807,10 @@ pub(super) fn apply_slash_outcome(
                 kuluu_render::MenuKind::Map => "Map".into(),
             };
             push_system_chat_line(scene_state, format!("[menu] opened {label}"));
+        }
+        SlashOutcome::OpenSubTarget { .. } => {
+            // The caller's mode override opens the sub-target cursor; there is
+            // no command to apply until it is confirmed.
         }
     }
 }

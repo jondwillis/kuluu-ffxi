@@ -32,8 +32,9 @@ pub fn preflight_bind(addr: SocketAddr) -> Result<()> {
 }
 
 /// `debug_ctrl` (native GUI builds only) receives the viewer's
-/// [`wire::ViewerCommand::Screenshot`] requests — they drive Bevy render-target
-/// readback and must never reach the session, which treats them as a no-op.
+/// [`wire::ViewerCommand::Screenshot`] requests: the relay bumps the shared
+/// handle's seq and a Bevy system fires the render-target readback, so the
+/// requests do not reach the session, which has no such command.
 pub async fn serve(
     addr: SocketAddr,
     state_rx: watch::Receiver<SessionState>,
@@ -162,8 +163,6 @@ async fn handle_connection(
                 Some(Ok(Message::Binary(data))) => {
                     match postcard::from_bytes::<ClientFrame>(&data) {
                         Ok(ClientFrame::Command(cmd)) => match &cmd {
-                            // GUI-side only: bump the shared handle's seq; the Bevy
-                            // system fires the capture. Never forwarded to the session.
                             wire::ViewerCommand::Screenshot { path } => {
                                 if let Some(ctrl) = debug_ctrl.as_ref() {
                                     if let Ok(mut c) = ctrl.lock() {
@@ -233,6 +232,9 @@ where
     Ok(())
 }
 
+/// The session-side half of a viewer command. `None` for the GUI-side
+/// Screenshot: handle_connection routes it into DebugControl before it
+/// reaches this fn, and the session has no such command.
 fn viewer_command_to_agent(cmd: wire::ViewerCommand) -> Option<AgentCommand> {
     use crate::state::ActionKind;
     Some(match cmd {
@@ -335,8 +337,6 @@ fn viewer_command_to_agent(cmd: wire::ViewerCommand) -> Option<AgentCommand> {
             },
         },
 
-        // GUI-side only: handle_connection routes it into DebugControl before
-        // reaching here. Never a session command.
         wire::ViewerCommand::Screenshot { .. } => return None,
     })
 }

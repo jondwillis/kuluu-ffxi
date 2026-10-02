@@ -10,7 +10,9 @@ use bevy::image::ImageSampler;
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use ffxi_dat::texture::TexFormat;
-use ffxi_dat::ui_element::{crop_sprite, find_texture, find_ui_element_group, ui_sprite, UiSprite};
+use ffxi_dat::ui_element::{
+    crop_sprite, find_texture, find_ui_element_group, ui_sprite, UiSprite, UI_SHEET_FILE_ID,
+};
 use ffxi_dat::DatRoot;
 
 // The four "static resource" menu UI DATs. XIM hardcodes their ROM paths
@@ -19,7 +21,7 @@ use ffxi_dat::DatRoot;
 // VTABLE/FTABLE to file ids, the version-stable handle, so an install whose
 // patch level shuffles the physical ROM layout still resolves. The
 // day-of-week orbs and weather element icons live in id 39542 (ROM/119/51).
-pub const UI_DAT_FILE_IDS: [u32; 4] = [13, 39542, 39551, 39560];
+pub const UI_DAT_FILE_IDS: [u32; 4] = [13, UI_SHEET_FILE_ID, 39551, 39560];
 
 pub fn read_ui_dats(root: &DatRoot) -> Vec<(u32, Vec<u8>)> {
     UI_DAT_FILE_IDS
@@ -151,9 +153,9 @@ impl UiElementAtlas {
     }
 }
 
+/// DXT3 decoding preserves raw alpha; palette decoding already doubles it.
+/// Clamp after modulation so partially transparent vertices retain bright texels.
 fn modulate_dxt3_ui_alpha(sprite: &mut UiSprite, vertex_alpha: f32) {
-    // DXT3 decoding preserves raw alpha; palette decoding already doubles it.
-    // Clamp after modulation so partially transparent vertices retain bright texels.
     for pixel in sprite.rgba.chunks_exact_mut(4) {
         pixel[3] = (f32::from(pixel[3]) * vertex_alpha * UI_ALPHA_MODULATE_2X)
             .round()

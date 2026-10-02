@@ -33,7 +33,7 @@ pub mod c2s {
         /// End the event (OnEventFinish).
         pub const END: u16 = 0;
         /// Update a pending event state (OnEventUpdate); also the only Mode
-        /// the 0x05C validator accepts.
+        /// the `EVENT_END_XZY` validator accepts.
         pub const UPDATE_PENDING: u16 = 1;
     }
 

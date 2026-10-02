@@ -186,7 +186,7 @@ fn env_path() -> Option<PathBuf> {
 }
 
 /// `env_path` (the shell's `FFXI_DAT_PATH`) else the `default` install in
-/// `dir`; a set-but-unusable value is an error, never a fallthrough.
+/// `dir`; a set-but-unusable value errors instead of falling through.
 pub fn resolve_in(dir: Option<&Path>, env_path: Option<PathBuf>) -> Result<Resolved, Unresolved> {
     if let Some(path) = env_path {
         if !install_detect::is_ffxi_root(&path) {
@@ -259,14 +259,66 @@ fn symlink_dir(src: &Path, dst: &Path) -> io::Result<()> {
 
 #[cfg(windows)]
 fn symlink_dir(src: &Path, dst: &Path) -> io::Result<()> {
-    std::os::windows::fs::symlink_dir(src, dst).map_err(|e| {
-        io::Error::new(
+    match std::os::windows::fs::symlink_dir(src, dst) {
+        Ok(()) => Ok(()),
+        Err(e) if e.raw_os_error() == Some(ERROR_PRIVILEGE_NOT_HELD) => junction_dir(src, dst),
+        Err(e) => Err(io::Error::new(
             e.kind(),
             format!(
                 "{e} (directory symlinks need Developer Mode or an elevated shell; link with copy instead)"
             ),
+        )),
+    }
+}
+
+/// CreateSymbolicLink's refusal when the shell lacks SeCreateSymbolicLinkPrivilege
+/// and Developer Mode is off.
+#[cfg(windows)]
+const ERROR_PRIVILEGE_NOT_HELD: i32 = 1314;
+
+/// A directory symlink needs SeCreateSymbolicLinkPrivilege (Developer Mode or an elevated
+/// shell). A junction (mount-point reparse point) does not: it binds two local roots, which
+/// is all this tree's links need. std has no junction constructor, so the system's own
+/// mount-point tool is the privilege-free way to make one.
+#[cfg(windows)]
+fn junction_dir(src: &Path, dst: &Path) -> io::Result<()> {
+    let target = src.canonicalize().map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("a junction needs an absolute target: {e}"),
         )
-    })
+    })?;
+    mklink_junction(&target, dst).and_then(|()| link_exists(dst))
+}
+
+/// A blocked machine can report success without creating anything, so the
+/// reparse point has to exist before the link counts.
+#[cfg(windows)]
+fn link_exists(dst: &Path) -> io::Result<()> {
+    is_symlink(dst)
+        .then_some(())
+        .ok_or_else(|| io::Error::other(format!("no link at {}", dst.display())))
+}
+
+/// The system's own mount-point tool: it creates the junction without the symlink
+/// privilege, where the raw reparse APIs and std's symlink_dir both refuse an
+/// unsigned, unelevated process.
+#[cfg(windows)]
+fn mklink_junction(target: &Path, dst: &Path) -> io::Result<()> {
+    let out = std::process::Command::new("cmd")
+        .args(["/c", "mklink", "/J"])
+        .arg(dst)
+        .arg(target)
+        .output()
+        .map_err(|e| io::Error::new(e.kind(), format!("launching cmd for mklink: {e}")))?;
+    if !out.status.success() {
+        return Err(io::Error::other(format!(
+            "mklink /J exited with {}: {}",
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(not(any(unix, windows)))]

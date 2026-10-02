@@ -7,7 +7,7 @@
 # the *exact* fmt/clippy invocation CI will, and vice versa.
 #
 # Usage: scripts/checks.sh <stage>...
-#   stage ∈ {harness, comments, fmt, clippy, style, contracts, install, test, enhanced, build, wasm, doc, sweep}
+#   stage ∈ {harness, readme, comments, fmt, clippy, style, contracts, install, test, enhanced, build, wasm, doc, sweep}
 #   scripts/checks.sh harness comments fmt contracts clippy  # pre-push default
 #   COMMENTS_DIFF=staged scripts/checks.sh comments  # pre-commit (staged hunks)
 #   scripts/checks.sh harness fmt clippy test # the CI gate (ci.yml runs these)
@@ -52,6 +52,15 @@ GUARD="$PWD/scripts/cargo-guard.sh"
 if [ "${CARGO_GUARD:-1}" = "1" ] && [ -x "$GUARD" ]; then
   cargo() { "$GUARD" "$@"; }
 fi
+
+run_readme() {
+  python3 scripts/check-readme.test.py
+  if [[ "${README_DIFF:-tree}" == "staged" ]]; then
+    python3 scripts/check-readme.py --staged
+  else
+    python3 scripts/check-readme.py
+  fi
+}
 
 run_fmt() {
   cargo fmt --all --check
@@ -215,6 +224,18 @@ run_harness() {
     echo "checks: harness — $settings must register exactly one Beads SessionStart hook" >&2
     bad=1
   fi
+  if ! python3 .agents/hooks/install-codex-project-hooks.py --check; then
+    bad=1
+  fi
+  if ! jq -e '
+      ([.hooks.PostToolUse[]? | select(.matcher == "Read") | .hooks[]? |
+          select(.command == "${CLAUDE_PROJECT_DIR}/.agents/hooks/inspect-evidence.sh")] | length == 1) and
+      ([.hooks.Stop[]?.hooks[]? |
+          select(.command == "${CLAUDE_PROJECT_DIR}/.agents/hooks/stop-dispatcher.sh")] | length == 1)
+    ' "$settings" >/dev/null 2>&1; then
+    echo "checks: harness - Claude visual inspection or verification stop hook missing" >&2
+    bad=1
+  fi
   if ! grep -q '<!-- BEGIN BEADS CODEX SETUP:' AGENTS.md \
     || ! grep -q '<!-- BEGIN BEADS INTEGRATION ' AGENTS.md; then
     echo "checks: harness — AGENTS.md is missing a Beads-managed Codex or AGENTS-aware section" >&2
@@ -314,6 +335,11 @@ run_harness() {
     bad=1
   elif ! check_output=$(bash "$hook_tests" 2>&1); then
     echo "checks: harness — session-edit attribution hooks are broken:" >&2
+    echo "$check_output" >&2
+    bad=1
+  fi
+  if ! check_output=$(python3 .agents/hooks/tests/runtime-verification.test.py 2>&1); then
+    echo "checks: harness - runtime verification gates are broken:" >&2
     echo "$check_output" >&2
     bad=1
   fi
@@ -532,6 +558,7 @@ run_contracts() {
   listing=$(cargo test -p kuluu-render -p kuluu --lib --locked "${FEATURES[@]}" -- --list)
   for contract in \
     transport::tests::transport_state_contract \
+    elevators::tests::elevator_state_contract \
     view_native::input::tests::scripted_walk_render_contract \
     view_native::walker::obstacles::tests::transport_dock_collision_contract \
     view_native::navmesh_overlay::tests::remote_passenger_keeps_reported_height_under_unloaded_interior_shell \
@@ -614,7 +641,7 @@ run_enhanced() {
   # enhanced-neural-uplift is the one exclusion, because it implies dlss and so
   # needs the SDK that KULUU_CHECK_DLSS gates.
   local enhanced
-  enhanced=$(grep -oE '^enhanced-[a-z-]+' kuluu/Cargo.toml \
+  enhanced=$(grep -oE '^enhanced-[a-z0-9-]+' kuluu/Cargo.toml \
     | grep -v '^enhanced-neural-uplift$' | paste -sd, - || true)
   if [[ -z "$enhanced" ]]; then
     echo "checks: enhanced — no enhanced-* features found in kuluu/Cargo.toml" >&2
@@ -744,12 +771,13 @@ run_doc() {
 }
 
 if [[ $# -eq 0 ]]; then
-  echo "checks: no stage given (expected one or more of: fmt clippy style harness comments contracts install test enhanced build wasm doc sweep)" >&2
+  echo "checks: no stage given (expected one or more of: fmt clippy style harness readme comments contracts install test enhanced build wasm doc sweep)" >&2
   exit 2
 fi
 
 for stage in "$@"; do
   case "$stage" in
+    readme) echo "checks: readme"; run_readme ;;
     fmt)    echo "checks: fmt";    run_fmt ;;
     clippy) echo "checks: clippy"; run_clippy ;;
     style)  echo "checks: style";  run_style ;;

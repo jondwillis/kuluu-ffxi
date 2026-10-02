@@ -77,6 +77,8 @@ enhanced-job-display = ["kuluu-render?/enhanced-job-display"]
 # Enhanced (non-retail) on-screen shutdown/logout countdown banner; retail shows
 # only the 0x053 system chat lines. See kuluu-render for details.
 enhanced-shutdown-counter = ["kuluu-render?/enhanced-shutdown-counter"]
+# Enhanced (non-retail) free movement during the weapon draw/sheathe. See kuluu-render.
+enhanced-engage-move-lock-off = ["kuluu-render?/enhanced-engage-move-lock-off"]
 # Enable the WebSocket relay listener (`--relay-listen <addr>` global flag).
 # Publishes the same `kuluu-snapshot` frames the in-process bridge produces,
 # so external tools (and the future wasm browser viewer) can consume the
@@ -115,6 +117,7 @@ debug-menu = ["kuluu-render?/debug-menu"]
 [dependencies]
 winit = { version = "0.30", default-features = false, optional = true }
 kuluu-session = { path = "../kuluu-session" }
+ffxi-pol = { path = "../ffxi-pol" }
 ffxi-proto = { path = "../ffxi-proto" }
 ffxi-vocab = { path = "../ffxi-vocab" }
 kuluu-nav = { path = "../kuluu-nav" }

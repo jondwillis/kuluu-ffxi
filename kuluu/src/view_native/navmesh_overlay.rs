@@ -115,7 +115,8 @@ fn ground_snap_needed(current_y: f32, ground_y: f32) -> bool {
 // CPathFind::StepTo walks Y to a waypoint from detour_navmesh.cpp), so the POS packet Y only picks the
 // level. This system keeps two jobs: snapping self onto its wire Y when no collision is loaded,
 // and grounding the static Other kind (doors/transports), whose wire position is an authored
-// placement rather than a pathfind step.
+// placement rather than a pathfind step. Under an unloaded interior shell the entity keeps
+// its reported pose: the shell cannot supply a floor.
 fn snap_entities_to_mzb_floor_system(
     collision_geom: Res<kuluu_render::dat_mzb::MzbCollisionGeometry>,
     interiors: Res<kuluu_render::sub_area_activation::SubAreaActivation>,
@@ -144,8 +145,6 @@ fn snap_entities_to_mzb_floor_system(
         if is_self || kuluu_render::scene::mount_actor_rider(world.id).is_some() {
             continue;
         }
-        // Unloaded interior shells cannot supply a floor for what stands under
-        // them; retain the reported pose.
         if interiors.unloaded_interior_at([t.translation.x, -t.translation.y, -t.translation.z]) {
             continue;
         }
@@ -215,6 +214,8 @@ mod tests {
         MzbCollisionGeometry::from_block(block)
     }
 
+    /// Minimal app for the snap tests: predict_entities_system reads the probe,
+    /// which production inserts in the render plugin.
     fn remote_app(geometry: MzbCollisionGeometry, kind: EntityKind) -> (App, Entity) {
         let mut app = App::new();
         app.init_resource::<Time>()
@@ -223,7 +224,6 @@ mod tests {
             .init_resource::<kuluu_render::scheduler_runtime::CutsceneActorState>()
             .init_resource::<TrackedEntities>()
             .init_resource::<kuluu_render::sub_area_activation::SubAreaActivation>()
-            // predict_entities_system reads the probe; production inserts it in the render plugin.
             .insert_resource(MotionProbe::init())
             .insert_resource(geometry)
             .add_systems(
@@ -254,13 +254,14 @@ mod tests {
         (app, entity)
     }
 
+    /// Advance one frame with a synthetic POS update. These updates carry no
+    /// wire speed byte; zero-speed-with-move is the case CPathFind::StepTo
+    /// substitutes its own speed for, so nothing here is invented.
     fn frame(app: &mut App, entity: Entity, incoming: Vec3) -> Vec3 {
         app.world_mut()
             .resource_mut::<Time>()
             .advance_by(std::time::Duration::from_secs_f32(1.0 / 60.0));
         let mut prediction = app.world_mut().resource_mut::<EntityPrediction>();
-        // These synthetic updates carry no wire speed byte; zero-speed-with-move is the case
-        // CPathFind::StepTo substitutes its own speed for, so nothing here is invented.
         prediction.observe(REMOTE_ID, incoming, 0, 0, 0);
         prediction.by_id.get_mut(&REMOTE_ID).unwrap().rendered_pos = incoming;
         app.update();
@@ -388,14 +389,14 @@ mod tests {
         activation
     }
 
-    // Pinned by scripts/checks.sh run_contracts (the ferry passenger guarantee from
-    // main): a remote passenger under an unloaded interior shell keeps its reported pose.
+    /// Pinned by scripts/checks.sh run_contracts (the ferry passenger guarantee
+    /// from main): a remote passenger under an unloaded interior shell keeps
+    /// its reported pose. Y is server-resolved: the wire height holds even over
+    /// a loaded floor; no client re-grounding happens for the battle kinds.
     #[test]
     fn remote_passenger_keeps_reported_height_under_unloaded_interior_shell() {
         let (mut app, passenger) =
             remote_app(floors(&[(0.0, 4.0, TEST_UPPER_FLOOR)]), EntityKind::Pc);
-        // Y is server-resolved: the wire height holds even over a loaded floor; no client
-        // re-grounding happens for the battle kinds anymore.
         assert_eq!(
             frame(&mut app, passenger, BOARDING_POSITION).y,
             TEST_WIRE_HEIGHT
@@ -409,25 +410,26 @@ mod tests {
         assert_eq!(frame(&mut app, passenger, moved), moved);
     }
 
+    /// sync_entities_system owns the Other kind's x/z; this harness runs only
+    /// the snap system, so the transform is seeded the way sync writes it on
+    /// ingest. Outside the shell the door grounds onto the upper floor by the
+    /// direct probe; under the unloaded shell a fresh ingest must retain the
+    /// reported (wire) pose instead of probing a floor the observer does not
+    /// have loaded.
     #[test]
     fn other_entity_keeps_reported_pose_under_unloaded_interior_shell() {
         let (mut app, door) =
             remote_app(floors(&[(0.0, 4.0, TEST_UPPER_FLOOR)]), EntityKind::Other);
-        // sync_entities_system owns the Other kind's x/z; this harness runs only the snap
-        // system, so seed the transform the way sync writes it on ingest.
         app.world_mut()
             .get_mut::<Transform>(door)
             .unwrap()
             .translation = BOARDING_POSITION;
-        // Outside the shell: grounded onto the upper floor by the direct probe.
         app.update();
         assert_eq!(
             app.world().get::<Transform>(door).unwrap().translation.y,
             TEST_UPPER_FLOOR
         );
         app.insert_resource(boarding_activation());
-        // Under the unloaded shell: a fresh ingest must retain the reported (wire) pose
-        // instead of probing a floor the observer does not have loaded.
         let seed = |app: &mut App, door: Entity, pose: Vec3| {
             app.world_mut()
                 .get_mut::<Transform>(door)
@@ -449,6 +451,9 @@ mod tests {
         );
     }
 
+    /// sync_entities_system owns the Other kind's x/z; this harness runs only
+    /// the snap system, so the transform is seeded the way sync writes it on
+    /// ingest.
     #[test]
     fn other_entity_grounds_on_loaded_interior_floor() {
         use bevy::ecs::system::RunSystemOnce;
@@ -460,8 +465,6 @@ mod tests {
         };
         let (mut app, door) =
             remote_app(floors(&[(0.0, 4.0, TEST_UPPER_FLOOR)]), EntityKind::Other);
-        // sync_entities_system owns the Other kind's x/z; this harness runs only the snap
-        // system, so seed the transform the way sync writes it on ingest.
         app.world_mut()
             .get_mut::<Transform>(door)
             .unwrap()

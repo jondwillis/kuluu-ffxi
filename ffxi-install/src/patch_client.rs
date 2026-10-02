@@ -155,7 +155,9 @@ impl Session {
 }
 
 /// A `Direct` download is a flag byte and then the file stored, zlib-deflated,
-/// or `.slc`-coded (app.dll FUN_1029cd5a case 0x5df).
+/// or `.slc`-coded (app.dll FUN_1029cd5a case 0x5df). The chunk response and
+/// its optional compression: research/XiPackets/patch/packets/0x0004/README.md
+/// and research/XiPackets/patch/Protocol.md.
 pub fn decode_direct_payload(data: &[u8]) -> Result<Vec<u8>, String> {
     let (&flag, payload) = data.split_first().ok_or("empty file download")?;
     match flag {

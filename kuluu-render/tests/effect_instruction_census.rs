@@ -4,7 +4,7 @@
 //! instructions the parsers understand. Self-skips without an install
 //! (`DatRoot::from_env_or_default`), so point `FFXI_DAT_PATH` at each install in turn.
 //!
-//! The handled sets are derived, never listed here: scheduler opcodes by probing
+//! The handled sets are derived rather than listed here: scheduler opcodes by probing
 //! `StageKind::from_stage` over the opcode/length space, generator opcodes by the
 //! decoded/dropped outcome the parsers report per block.
 
@@ -73,8 +73,8 @@ fn fourcc(name: [u8; 4]) -> String {
         .collect()
 }
 
-/// Every (opcode, length) the classifier answers with a real kind. This is the handled set, read
-/// out of the match arms by asking them, so it can never drift from a list kept here.
+/// Every (opcode, length) the classifier answers with a real kind. This is the handled set,
+/// read out of the match arms by asking them, so it stays in step with the classifier.
 fn probe_handled() -> BTreeMap<u8, BTreeSet<usize>> {
     let mut handled: BTreeMap<u8, BTreeSet<usize>> = BTreeMap::new();
     for raw in 0..=u8::MAX {
@@ -94,6 +94,8 @@ struct Corpus {
     rows: Vec<CorpusRow>,
 }
 
+/// Categories 11 and 13 share one table and one resolver, so the mob-skill rows
+/// stand for both; a pet skill resolves to the same file its animation index names.
 fn build_corpus(dll: &MainDll) -> Corpus {
     let mut rows = Vec::new();
     for &(spell_id, animation) in ffxi_vocab::action_anim::SPELL_ANIMATION {
@@ -124,8 +126,6 @@ fn build_corpus(dll: &MainDll) -> Corpus {
             ),
         ));
     }
-    // Categories 11 and 13 share one table and one resolver, so the mob-skill rows stand for both;
-    // a pet skill resolves to the same file its animation index names.
     for &(skill_id, animation) in ffxi_vocab::action_anim::MOB_SKILL_ANIMATION {
         for category in [CATEGORY_MOB_SKILL, CATEGORY_PET_SKILL] {
             rows.push((

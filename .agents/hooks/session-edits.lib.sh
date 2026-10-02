@@ -30,6 +30,15 @@
 # whole seconds, so a same-second in-place edit of equal length (sed -i on
 # one word) is invisible to mtime+size.
 
+# shasum is absent on some git-bash installs (Windows); sha256sum is always
+# there. Both print "<hash>  -" for stdin, so the key derivation below is
+# identical either way.
+if command -v shasum >/dev/null 2>&1; then
+  SESSION_EDITS_DIGEST='shasum -a 256'
+else
+  SESSION_EDITS_DIGEST='sha256sum'
+fi
+
 # Above this many paths the pre-command signature snapshot is skipped, and
 # attribution falls back to the porcelain delta of paths the command names.
 SESSION_EDITS_MAX_SIG_PATHS_DEFAULT=200
@@ -44,6 +53,16 @@ SESSION_EDITS_SNAP_TTL="${SESSION_EDITS_SNAP_TTL:-$SESSION_EDITS_SNAP_TTL_DEFAUL
 # write to stderr, and a hook may never speak. Every numeric knob is guarded.
 case "$SESSION_EDITS_SNAP_TTL" in
   ''|*[!0-9]*) SESSION_EDITS_SNAP_TTL=$SESSION_EDITS_SNAP_TTL_DEFAULT ;;
+esac
+# A session's ledger and suspect log outlive its last tool call by no more
+# than this. Every hook touch refreshes the mtime, so the TTL only ever reaps
+# a session that has stopped calling tools; it is session scale, not the
+# command-window scale of the snapshot TTL, and a live multi-hour session can
+# never reach it.
+SESSION_EDITS_LEDGER_TTL_DEFAULT=604800
+SESSION_EDITS_LEDGER_TTL="${SESSION_EDITS_LEDGER_TTL:-$SESSION_EDITS_LEDGER_TTL_DEFAULT}"
+case "$SESSION_EDITS_LEDGER_TTL" in
+  ''|*[!0-9]*) SESSION_EDITS_LEDGER_TTL=$SESSION_EDITS_LEDGER_TTL_DEFAULT ;;
 esac
 case "$SESSION_EDITS_MAX_SIG_PATHS" in
   ''|*[!0-9]*) SESSION_EDITS_MAX_SIG_PATHS=$SESSION_EDITS_MAX_SIG_PATHS_DEFAULT ;;
@@ -72,11 +91,30 @@ SESSION_EDITS_CMD_START_RE=$'((^|[;&|(\n])[[:space:]]*([A-Za-z_][A-Za-z0-9_]*=[^
 SESSION_EDITS_WRITER_OPERAND="[[:space:]]+(-[^[:space:]]+[[:space:]]+)*[^-[:space:]]"
 SESSION_EDITS_WRITER_RE="${SESSION_EDITS_CMD_START_RE}((sed|perl)[[:space:]]+(-[^[:space:]]+[[:space:]]+)*-[a-zA-Z]*i|(mv|cp|rm|touch|install|patch|rmcm|rustfmt)${SESSION_EDITS_WRITER_OPERAND}|cargo[[:space:]]+(fmt|fix)([[:space:]]|\$)|cargo[[:space:]]+clippy[[:space:]].*--fix|git[[:space:]]+(apply|checkout|restore|mv|rm)${SESSION_EDITS_WRITER_OPERAND}|git[[:space:]]+stash([[:space:]]+(push|save|pop|apply|drop|clear)([[:space:]]|\$)|[[:space:]]*\$))"
 
+# The cargo fmt/fix arm of the writer form, on its own: these shapes carry no
+# file operand, so the writer bit must not credit every dirty path in their
+# window (a peer write during a long cargo fmt --all is not this session's).
+# Spelled as a separate pattern because the writer form's alternation cannot
+# be tested for one arm in isolation.
+SESSION_EDITS_CARGO_FMT_RE='cargo[[:space:]]+(fmt|fix)([[:space:]]|\$)'
+
 # Tools that write files they never name on the command line, paired with the
 # directory each one owns. Crediting is scoped to that directory, so the
 # window of a tool nobody can predict the outputs of still withholds a peer's
 # concurrent write elsewhere.
 SESSION_EDITS_OWNED_WRITES='bd:.beads/'
+
+# Programs that only read the paths they name: while one of these runs, a
+# peer's concurrent write to a named path is a suspect, not a ledger line.
+# The list is an allowlist - a program missing from it keeps the naming arm
+# alive, because an unknown tool may write from its code (python, perl, awk,
+# find -delete), and miscrediting one peer write is cheaper than silencing
+# every real edit an unusual tool makes.
+SESSION_EDITS_READONLY_PROGRAMS='basename cat comm cmp cut date df du dirname echo egrep file fgrep grep head less ls md5sum more nproc od printf pwd readlink realpath sha256sum shasum stat strings tail tr uname wc which'
+# git writes through most of its subcommands, so it is judged by the first
+# bare argument after the global options (-C, -c, --git-dir, --work-tree).
+# `stash` additionally needs its own sub-argument: bare `git stash` pushes.
+SESSION_EDITS_GIT_READONLY_SUBCMDS='blame cat-file describe diff grep hash-object log ls-files ls-tree rev-parse shortlog show status var help'
 
 ledger_dir() { printf '%s/claude-session-edits' "${TMPDIR:-/tmp}"; }
 
@@ -97,7 +135,7 @@ suspect_path() {
 snap_dir() { printf '%s/bashpre' "$(ledger_dir)"; }
 
 snap_key() {
-  printf '%s' "${1:-}" | shasum -a 256 | cut -c"1-$SESSION_EDITS_SNAP_KEY_CHARS"
+  printf '%s' "${1:-}" | $SESSION_EDITS_DIGEST | cut -c"1-$SESSION_EDITS_SNAP_KEY_CHARS"
 }
 
 # snap_path <session_id> <cmd>
@@ -127,6 +165,20 @@ snap_sweep() {
   dir=$(snap_dir)
   [ -d "$dir" ] || return 0
   find "$dir" -type f -mmin "+$(((SESSION_EDITS_SNAP_TTL + 59) / 60))" -delete 2>/dev/null
+  return 0
+}
+
+# ledger_sweep: reap ledger and suspect logs whose owner has made no tool call
+# for the ledger TTL. A stale <sid>.suspect must not keep counting into the
+# commit nudge if the session id is reused. find's minute granularity is
+# rounded UP, as in snap_sweep, so the sweep can only ever run later than the
+# TTL asks.
+ledger_sweep() {
+  local dir
+  dir=$(ledger_dir)
+  [ -d "$dir" ] || return 0
+  find "$dir" -maxdepth 1 -type f \( -name '*.paths' -o -name '*.suspect' \) \
+    -mmin "+$(((SESSION_EDITS_LEDGER_TTL + 59) / 60))" -delete 2>/dev/null
   return 0
 }
 
@@ -179,7 +231,26 @@ ledger_add() {
   for file in "$@"; do
     [ -n "$file" ] || continue
     printf '%s\n' "$(_rel "$cwd" "$file")" >> "$out"
+    case "$file" in
+      *.rs|*.wgsl)
+        python3 "$(dirname "${BASH_SOURCE[0]}")/runtime-verification.py" track \
+          --session "$sid" --cwd "$cwd" "$file" >/dev/null || return 1
+        ;;
+    esac
   done
+}
+
+# ledger_touch <session_id>: refresh the mtime of this session's ledger and
+# suspect log on every hook call, so the sweep's TTL measures time since the
+# session last called a tool, not since it last wrote a file: a live session
+# in a long read-only phase must not lose its ledger.
+ledger_touch() {
+  local f
+  [ -n "${1:-}" ] || return 0
+  for f in "$(ledger_path "$1")" "$(suspect_path "$1")"; do
+    [ -f "$f" ] && touch "$f" 2>/dev/null
+  done
+  return 0
 }
 
 # ledger_read <session_id>: sorted unique paths, empty when absent.
@@ -319,13 +390,139 @@ cmd_mentions() {
   done
 }
 
+# git_subcommand <cmd>: the first bare argument after git's global options,
+# or empty when the command runs no git at a command boundary. The walk is
+# boundary-aware, so a `git` that is only an argument of another program
+# (echo git status) never starts it, and -C/-c and friends consume their
+# value so `git -C repo stash list` reads as stash.
+git_subcommand() {
+  local cmd="$1" t seen=0 skip=0 sub=""
+  set -f
+  for t in $cmd; do
+    if [ "$skip" = 1 ]; then skip=0; continue; fi
+    case "$t" in
+      ';'*) seen=0; skip=0; case "$t" in *git) [ "${t#*;}" = "git" ] && seen=1 ;; esac; continue ;;
+    esac
+    if [ "$seen" = 1 ]; then
+      case "$t" in
+        -C|-c|--git-dir|--work-tree|--namespace|--super-prefix) skip=1; continue ;;
+        -*) continue ;;
+        *) sub="$t"; break ;;
+      esac
+    fi
+    case "$t" in
+      git) seen=1 ;;
+    esac
+  done
+  set +f
+  printf '%s' "$sub"
+}
+
+# git_stash_subarg <cmd>: the first bare argument after `stash` in the first
+# git invocation, empty when the command has no `git stash ...`. Bare `git
+# stash` pushes, so only list/show keep the command read-only.
+git_stash_subarg() {
+  local cmd="$1" t seen=0 skip=0 in_stash=0 arg=""
+  set -f
+  for t in $cmd; do
+    if [ "$skip" = 1 ]; then skip=0; continue; fi
+    case "$t" in
+      ';'*) seen=0; skip=0; in_stash=0; case "$t" in *git) [ "${t#*;}" = "git" ] && seen=1 ;; esac; continue ;;
+    esac
+    if [ "$in_stash" = 1 ]; then
+      case "$t" in
+        -*) continue ;;
+        *) arg="$t"; break ;;
+      esac
+    fi
+    if [ "$seen" = 1 ]; then
+      case "$t" in
+        -C|-c|--git-dir|--work-tree|--namespace|--super-prefix) skip=1; continue ;;
+        -*) continue ;;
+        stash) in_stash=1 ;;
+      esac
+    fi
+    case "$t" in
+      git) seen=1 ;;
+    esac
+  done
+  set +f
+  printf '%s' "$arg"
+}
+
+# in_word_list <word> <list>: the word equals one of the list's words. A case
+# pattern would read the unquoted list as a single space-joined pattern, so
+# membership is a word loop over the list's words.
+in_word_list() {
+  local w="$1" e
+  shift
+  for e in "$@"; do
+    [ "$e" = "$w" ] && return 0
+  done
+  return 1
+}
+
+# cmd_readonly <cmd>: every program the command runs is read-only, so a path
+# it names is being read, not written. git counts by subcommand; a program
+# missing from the lists fails the check and the naming arm stays alive. The
+# walk is bash =~, not grep: the boundary class carries a literal newline,
+# which grep's ERE reads as backslash-n and the extraction would mis-parse.
+cmd_readonly() {
+  local cmd="$1" rest="$1" pat pat_mid prog sub m invocation first=1 matched=0
+  [ -n "$cmd" ] || return 1
+  pat="${SESSION_EDITS_CMD_START_RE}([A-Za-z_/][A-Za-z0-9_/+.-]*)"
+  # The ^ alternative is only a boundary at the true start of the text; after
+  # the first match it would read a consumed command's first argument as a new
+  # program (git diff -> diff), so later passes use the boundary-class form.
+  pat_mid="((${SESSION_EDITS_CMD_START_RE:4}([A-Za-z_/][A-Za-z0-9_/+.-]*)"
+  while :; do
+    if [ "$first" = 1 ]; then
+      [[ "$rest" =~ $pat ]] || break
+      first=0
+    else
+      [[ "$rest" =~ $pat_mid ]] || break
+    fi
+    matched=1
+    m="${BASH_REMATCH[0]}"
+    invocation="${rest#*"$m"}"
+    prog="${BASH_REMATCH[7]##*/}"
+    rest="${rest/"$m"/ }"
+    case "$prog" in
+      git)
+        sub=$(git_subcommand "git $invocation")
+        case "$sub" in
+          '') return 1 ;;
+          stash) [ "$(git_stash_subarg "git $invocation")" = list ] || [ "$(git_stash_subarg "git $invocation")" = show ] || return 1 ;;
+          *) in_word_list "$sub" $SESSION_EDITS_GIT_READONLY_SUBCMDS || return 1 ;;
+        esac
+        ;;
+      *) in_word_list "$prog" $SESSION_EDITS_READONLY_PROGRAMS || return 1 ;;
+    esac
+  done
+  [ "$matched" = 1 ]
+}
+
 # cmd_names_path <cmd> <root> <subdir-prefix> <root-relative-path>: the command
-# text names this path. Three spellings are tried, since a session working in a
-# subdirectory writes `a.txt` for the ledger's `sub/a.txt`, and an absolute
-# path has the root in front of it.
+# text names this path as a whole token. Three spellings are tried, since a
+# session working in a subdirectory writes `a.txt` for the ledger's
+# `sub/a.txt`, and an absolute path has the root in front of it. A read-only
+# command names its paths to read them, so the naming arm is withheld for it
+# and a peer's concurrent write to a named path lands in the suspect log.
 cmd_names_path() {
-  local cmd="$1" root="$2" prefix="${3:-}" p="${4:-}" rel
+  local cmd="$1" root="$2" prefix="${3:-}" p="${4:-}" rel target
   [ -n "$p" ] || return 1
+  while IFS= read -r target; do
+    cmd_mentions "$target" "$p" && return 0
+    [ -n "$root" ] && cmd_mentions "$target" "$root/$p" && return 0
+    if [ -n "$prefix" ]; then
+      case "$p" in "$prefix"*)
+        rel="${p#"$prefix"}"
+        [ -n "$rel" ] && cmd_mentions "$target" "$rel" && return 0
+        ;;
+      esac
+    fi
+  done < <(cmd_write_targets "$cmd")
+  cmd_readonly "$cmd" && return 1
   cmd_mentions "$cmd" "$p" && return 0
   [ -n "$root" ] && cmd_mentions "$cmd" "$root/$p" && return 0
   [ -n "$prefix" ] || return 1
@@ -381,4 +578,55 @@ cmd_is_writer_form() {
     return 0
   done < <(cmd_write_targets "$cmd")
   return 1
+}
+
+# cmd_writer_plausible <cmd> <cwd> <root> <root-relative-path>: for a command
+# whose shape is a writer form, is THIS path inside the tool's plausible file
+# set? The blanket licence is withheld for the shapes that carry no file
+# operand: cargo fmt/fix can only touch tracked *.rs under the workspace, and
+# rmcm only the operands it was pointed at (a directory operand reaches into
+# its tree). Every other writer form names its operands, so the naming arm and
+# the blanket backstop stay as they are.
+cmd_writer_plausible() {
+  local cmd="$1" cwd="$2" root="$3" p="${4:-}"
+  [ -n "$p" ] || return 1
+  if [[ "$cmd" =~ $SESSION_EDITS_CARGO_FMT_RE ]]; then
+    case "$p" in
+      *.rs) git -C "$root" ls-files --error-unmatch -- "$p" >/dev/null 2>&1 ;;
+      *) return 1 ;;
+    esac
+    return $?
+  fi
+  if [[ "$cmd" =~ ${SESSION_EDITS_CMD_START_RE}rmcm([[:space:]]|$) ]]; then
+    local t abs prefix
+    set -f
+    # shellcheck disable=SC2086
+    for t in $cmd; do
+      t="${t%\'}"; t="${t#\'}"
+      t="${t%\"}"; t="${t#\"}"
+      t="${t%;}"; t="${t%,}"
+      case "$t" in ''|-*) continue ;; esac
+      case "$t" in
+        /*) abs="$t" ;;
+        *) abs="$cwd/${t#./}" ;;
+      esac
+      [ -e "$abs" ] || continue
+      if [ -d "$abs" ]; then
+        abs=$(cd "$abs" && pwd -P) || continue
+      else
+        abs="$(cd "$(dirname "$abs")" && pwd -P)/$(basename "$abs")"
+      fi
+      case "$abs" in "$root"|"$root"/*) ;; *) continue ;; esac
+      if [ -d "$abs" ]; then
+        [ "$abs" = "$root" ] && return 0
+        prefix="${abs#"$root"/}"
+        case "$p" in "$prefix"/*) return 0 ;; esac
+      elif [ "$abs" = "$root/$p" ]; then
+        return 0
+      fi
+    done
+    set +f
+    return 1
+  fi
+  [[ "$cmd" =~ $SESSION_EDITS_WRITER_RE ]]
 }

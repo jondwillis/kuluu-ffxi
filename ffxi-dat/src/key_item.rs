@@ -214,9 +214,8 @@ mod tests {
     use super::*;
     use crate::chunk::CHUNK_KIND_MASK;
 
-    // Retail chunk walker (crate::chunk::ChunkWalker): a 16-byte header whose
-    // size field counts 16-byte units; only the name word and the kind/size
-    // word are used.
+    /// The retail chunk header (`crate::chunk::ChunkWalker`): 16 bytes, the size field in
+    /// 16-byte units; the fixture uses only the name word and the kind/size word.
     const CHUNK_HEADER_BYTES: usize = 16;
     const CHUNK_HEADER_USED_BYTES: usize = KEY_ITEM_CHUNK_NAME.len() + size_of::<u32>();
 

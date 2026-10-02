@@ -16,15 +16,15 @@ const D3M_EXTRA_COUNT_OFFSET: usize = 0x05;
 const D3M_TRI_COUNT_OFFSET: usize = 0x06;
 const D3M_COUNT_TABLE_OFFSET: usize = 0x08;
 
-// The one-material layout every shipped effect mesh but two uses: vertices follow the single
-// 16-byte material at `material_table_offset(1, 0)`.
+/// The one-material layout every shipped effect mesh but two uses: vertices follow the
+/// single 16-byte material at `material_table_offset(1, 0)`.
 pub const D3M_VERTEX_OFFSET: usize = 0x1E;
 
-// CMoD3m::Open GetShortPointer — the per-entry triangle-count table is padded by rounding the
-// ENTRY count down to a multiple of four and adding three, not by aligning the byte offset:
-// n = 1..=3 all put the material table at byte 14, n = 4 at 16, n = 5..=7 at 22. A byte-aligned
-// reader agrees for the shipped one-material meshes and reads two bytes into every vertex
-// past that.
+// research/XIClient/src/XIClient/source/Resource/Derived/CMoD3m.cpp CMoD3m::Open
+// GetShortPointer — the per-entry triangle-count table is padded by rounding the ENTRY count
+// down to a multiple of four and adding three, not by aligning the byte offset: n = 1..=3 all
+// put the material table at byte 14, n = 4 at 16, n = 5..=7 at 22. A byte-aligned reader
+// agrees for the shipped one-material meshes and reads two bytes into every vertex past that.
 pub fn material_table_offset(mat_count: usize, extra_count: usize) -> usize {
     let n = mat_count + extra_count;
     let shorts = if n.is_multiple_of(4) {
@@ -270,7 +270,6 @@ mod tests {
         assert!(D3m::parse(*b"trun", &body).is_err());
     }
 
-    // The table is padded by entry count, so n = 1..=3 share byte 14 and n = 4 moves to 16.
     #[test]
     fn material_table_follows_the_entry_count_padding_rule() {
         assert_eq!(material_table_offset(0, 0), 8);
@@ -284,7 +283,7 @@ mod tests {
         assert_eq!(vertex_offset(2, 3), 22 + 32);
     }
 
-    // ROM/0/0's `coll` and `hi14` ship matCount 0 / extraCount 1: no material, vertices at 14.
+    /// ROM/0/0's `coll` and `hi14` ship matCount 0 / extraCount 1: no material, vertices at 14.
     #[test]
     fn material_less_mesh_reads_vertices_at_the_table_end() {
         let mut body = build_body_with_counts(1, 0, 1, &[0u8; 16]);

@@ -1,10 +1,10 @@
 //! Enumerates the "font    usgaiji " UI-element group (retail weather icons,
 //! research/xim Compass.kt drawWeather) across the four static menu UI DATs.
 
-use ffxi_dat::ui_element::{find_ui_element_group, ui_sprite};
+use ffxi_dat::ui_element::{find_ui_element_group, ui_sprite, UI_SHEET_FILE_ID};
 
 // kuluu-render::ui_element_atlas::UI_DAT_FILE_IDS
-const UI_DAT_FILE_IDS: [u32; 4] = [13, 39542, 39551, 39560];
+const UI_DAT_FILE_IDS: [u32; 4] = [13, UI_SHEET_FILE_ID, 39551, 39560];
 const GROUPS: [&str; 2] = ["font    usgaiji ", "font    gaiji   "];
 
 fn main() {

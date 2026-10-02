@@ -71,6 +71,12 @@ impl ResyncTracker {
 /// this window and nothing else changed; otherwise a full snapshot (resync,
 /// non-entity state, or a watch change no batch explains — e.g. a self-look
 /// latch that mutated no record). Every watch change still yields a frame.
+///
+/// The watch read guard is taken before draining: the folder sends each
+/// batch under the watch write lock, so the drained batches and the
+/// observed version share a boundary. A full snapshot is authoritative for
+/// everything its drained batches covered, so those ids are not emitted
+/// separately.
 fn translate_frame(
     state_rx: &mut watch::Receiver<SessionState>,
     changes_rx: &mut mpsc::UnboundedReceiver<EntityChanges>,
@@ -78,8 +84,6 @@ fn translate_frame(
 ) -> ReadyFrame {
     let started = std::time::Instant::now();
 
-    // The folder sends each batch under the watch write lock. Hold its read
-    // guard before draining so batches and the observed version share a boundary.
     let guard = state_rx.borrow_and_update();
     let mut upserts: HashSet<u32> = HashSet::new();
     let mut removals: HashSet<u32> = HashSet::new();
@@ -98,16 +102,10 @@ fn translate_frame(
 
     let (frame, entity_count) = {
         let entity_count = guard.entities.len();
-        if resync.needs_full_snapshot(&guard) || other_changed {
-            // A full snapshot is authoritative for everything the drained
-            // batches covered, so those ids need no separate emission.
-            (
-                TranslatedFrame::Snapshot(Box::new(state_to_snapshot(&guard))),
-                entity_count,
-            )
-        } else if upserts.is_empty() && removals.is_empty() {
-            // The watch changed but no batch explains it: emit a full snapshot
-            // rather than risk dropping the change. Rare in practice.
+        let full_snapshot = resync.needs_full_snapshot(&guard)
+            || other_changed
+            || (upserts.is_empty() && removals.is_empty());
+        if full_snapshot {
             (
                 TranslatedFrame::Snapshot(Box::new(state_to_snapshot(&guard))),
                 entity_count,
@@ -212,6 +210,8 @@ impl SceneSource for NativeSource {
     /// Takes the newest mailbox frame. A full snapshot is returned here; an
     /// entity delta is stashed in `pending_delta` and served by
     /// [`Self::drain_deltas`] so ingest applies it after the snapshot slot.
+    /// At most one frame is emitted per cycle, so a new stashed delta
+    /// replaces the last one instead of queueing behind it.
     fn poll_snapshot(&mut self) -> Option<Box<wire::SceneSnapshot>> {
         let ready = self
             .mailbox
@@ -237,8 +237,6 @@ impl SceneSource for NativeSource {
                 Some(snap)
             }
             TranslatedFrame::Delta(delta) => {
-                // The translator emits at most one frame per cycle, so a
-                // stashed delta can only be replaced by the next frame.
                 self.pending_delta = Some(delta);
                 None
             }
@@ -482,6 +480,8 @@ mod tests {
         assert_eq!(normalized(snap), normalized(expected));
     }
 
+    /// The final send_modify bypasses the folder, so no batch explains the
+    /// watch change: the defensive full-snapshot path must deliver it.
     #[test]
     fn final_state_is_delivered_after_sender_drops() {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -507,8 +507,6 @@ mod tests {
             .unwrap_or_else(PoisonError::into_inner)
             .take()
             .expect("final snapshot published");
-        // The direct send_modify bypasses the folder, so no batch explains the
-        // watch change: the defensive full-snapshot path must deliver it.
         let snap = match last.frame {
             TranslatedFrame::Snapshot(snap) => *snap,
             TranslatedFrame::Delta(_) => panic!("unexplained watch change must be a full snapshot"),
@@ -574,6 +572,8 @@ mod tests {
         });
     }
 
+    /// A stamped upsert emits a one-id delta; a second upsert of the same
+    /// entity stays a one-id delta.
     #[test]
     fn translate_frame_emits_entity_delta_for_stamped_changes() {
         let mut s = SessionState::default();
@@ -587,7 +587,6 @@ mod tests {
         let (changes_tx, mut changes_rx) = mpsc::unbounded_channel();
         let mut resync = ResyncTracker::default();
 
-        // First cycle is always a full snapshot.
         let first = translate_frame(&mut state_rx, &mut changes_rx, &mut resync);
         assert!(matches!(first.frame, TranslatedFrame::Snapshot(_)));
 
@@ -609,7 +608,6 @@ mod tests {
             TranslatedFrame::Snapshot(_) => panic!("steady-state change must be a delta"),
         }
 
-        // A second upsert of the same entity stays a one-id delta.
         let mut moved = mob_entity(42);
         moved.pos.z += 5.0;
         fold_and_drain(
@@ -626,6 +624,8 @@ mod tests {
         }
     }
 
+    /// The first cycle primes the resync tracker, so the window under test
+    /// starts steady-state.
     #[test]
     fn translate_frame_removal_wins_over_same_window_upsert() {
         let mut s = SessionState::default();
@@ -638,7 +638,7 @@ mod tests {
         let (state_tx, mut state_rx) = watch::channel(s);
         let (changes_tx, mut changes_rx) = mpsc::unbounded_channel();
         let mut resync = ResyncTracker::default();
-        translate_frame(&mut state_rx, &mut changes_rx, &mut resync); // prime
+        translate_frame(&mut state_rx, &mut changes_rx, &mut resync);
 
         fold_and_drain(
             &state_tx,
@@ -693,6 +693,8 @@ mod tests {
         assert!(changes_rx.try_recv().is_err());
     }
 
+    /// The first cycle primes the resync tracker. A chat line is not an
+    /// entity change: the batch flags other_changed, forcing a full snapshot.
     #[test]
     fn translate_frame_other_changed_forces_full_snapshot() {
         let mut s = SessionState::default();
@@ -705,9 +707,8 @@ mod tests {
         let (state_tx, mut state_rx) = watch::channel(s);
         let (changes_tx, mut changes_rx) = mpsc::unbounded_channel();
         let mut resync = ResyncTracker::default();
-        translate_frame(&mut state_rx, &mut changes_rx, &mut resync); // prime
+        translate_frame(&mut state_rx, &mut changes_rx, &mut resync);
 
-        // A chat line is not an entity change: the batch flags other_changed.
         state_tx.send_if_modified(|s| {
             s.apply_event(&AgentEvent::ChatLine {
                 line: ChatLine {
@@ -735,6 +736,12 @@ mod tests {
         }
     }
 
+    /// The first cycle primes the resync tracker. The self record is seeded
+    /// so PositionChanged has an index entry to mutate: a server position
+    /// echo mutates it in place, and the delta must carry the new scalar or
+    /// snap.self_pos freezes at zone entry and the walker rubber-bands back
+    /// to spawn (PREDICTION_RESYNC_YALMS). An NPC-only upsert leaves the
+    /// scalar untouched (None = no change).
     #[test]
     fn translate_frame_delta_carries_self_pos_when_self_record_changes() {
         let mut s = SessionState::default();
@@ -747,9 +754,8 @@ mod tests {
         let (state_tx, mut state_rx) = watch::channel(s);
         let (changes_tx, mut changes_rx) = mpsc::unbounded_channel();
         let mut resync = ResyncTracker::default();
-        translate_frame(&mut state_rx, &mut changes_rx, &mut resync); // prime
+        translate_frame(&mut state_rx, &mut changes_rx, &mut resync);
 
-        // Seed the self record so PositionChanged has an index entry to mutate.
         fold_and_drain(
             &state_tx,
             &changes_tx,
@@ -759,9 +765,6 @@ mod tests {
             },
         );
 
-        // A server position echo mutates the self record in place; the delta
-        // must carry the new scalar or snap.self_pos freezes at zone entry and
-        // the walker rubber-bands back to spawn (PREDICTION_RESYNC_YALMS).
         fold_and_drain(
             &state_tx,
             &changes_tx,
@@ -790,7 +793,6 @@ mod tests {
             TranslatedFrame::Snapshot(_) => panic!("steady-state change must be a delta"),
         }
 
-        // An NPC-only upsert leaves the scalar untouched (None = no change).
         fold_and_drain(
             &state_tx,
             &changes_tx,

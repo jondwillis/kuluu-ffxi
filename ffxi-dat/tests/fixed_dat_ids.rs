@@ -1,7 +1,7 @@
 //! Pins the file ids this crate reads by id — item, spell, emote, system
 //! message and UI sheet — to the install-relative path each resolves to, so a
-//! patch that re-homes one fails here instead of silently reading the stale
-//! file left at the old path. Self-skips without an install.
+//! patch that re-homes one fails here instead of silently reading a stale copy.
+//! Self-skips without an install.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

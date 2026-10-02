@@ -134,31 +134,17 @@ pub struct SpecialPoseStep {
 pub fn next_special_pose(prev: &SpecialPose, status: u8, animationsub: u8) -> SpecialPoseStep {
     let hidden = status == INVISIBLE_STATUS;
     let (active_routine, slot_held, triggered) = if hidden {
-        // Buried: nothing triggers; the resurface decides what plays.
         (prev.active_routine, prev.slot_held, None)
     } else if prev.hidden {
-        // Resurfaced: retail constructs a fresh actor (no slot) and runs its load routine. The
-        // pose is held by the routine's lock, not the wire sub, so it falls to idle when the
-        // lock lapses even if the server keeps the sub set. This wins over any sub change in the
-        // same frame: the create path is what retail runs.
         (Some(LOAD_ROUTINE), false, Some(LOAD_ROUTINE))
     } else if animationsub != prev.sub {
         match special_routine(animationsub) {
-            Some(routine) => {
-                // Sub changed to a named routine while visible: the slot is active.
-                (Some(routine), true, Some(routine))
-            }
-            None => {
-                // Sub changed to zero: the slot clears, but the last-triggered routine stays
-                // selected so the pose pass can hold it for the duration of its lock.
-                (prev.active_routine, false, None)
-            }
+            Some(routine) => (Some(routine), true, Some(routine)),
+            None => (prev.active_routine, false, None),
         }
     } else if special_routine(animationsub).is_none() {
-        // Sub already zero and still zero: nothing changes; the slot stays clear.
         (prev.active_routine, false, None)
     } else {
-        // Sub unchanged and named: the slot holds as before.
         (prev.active_routine, prev.slot_held, None)
     };
     SpecialPoseStep {
@@ -684,16 +670,16 @@ mod tests {
 
     #[test]
     fn wire_gait_table_is_speed_vs_speed_base() {
-        // (speed, animationSpeed) pairs straight off the 0x0E block. UpdateSpeed(run) writes a
-        // higher `speed` and leaves animationSpeed alone, so the comparison is the whole rule:
-        // no kind, no base-speed constant.
+        // Both bytes ride the POS head of the 0x0E position update
+        // (research/XIClient/src/XIClient/source/Game/Net/Packets/s2c/0x00E.cpp);
+        // UpdateSpeed(run) lifts `speed` only, so speed-vs-base is the whole rule.
         let cases = [
-            ((40u8, 40), true), // roam: speed at base walks
-            ((39, 40), true),   // slower than base still walks
-            ((50, 40), false),  // chase: the run factor lifted speed above base
-            ((255, 1), false),  // extreme bytes keep the ordering sane
-            ((0, 0), true),     // idle bytes: not running
-            ((1, 0), false),    // any lift of speed over base is a run
+            ((40u8, 40), true),
+            ((39, 40), true),
+            ((50, 40), false),
+            ((255, 1), false),
+            ((0, 0), true),
+            ((1, 0), false),
         ];
         for ((speed, speed_base), walking) in cases {
             assert_eq!(
@@ -769,9 +755,8 @@ mod tests {
         assert!(rest_animation_id_phase(RestKind::None, In).is_none());
     }
 
-    // Routine timings dumped from the retail PC skeleton DATs
-    // (`dat-routine-stages 7072 dead`): `ded?` for 116 half-frames = 58 real
-    // frames, then `cor?`.
+    // The HumeM `dead` routine: `ded?` for 116 half-frames (58 real frames), then `cor?`;
+    // timings from the retail PC skeleton DATs via ffxi-dat/examples/dat-routine-stages.rs.
     const HUME_M_COLLAPSE_FRAMES: f32 = 58.0;
 
     #[test]
@@ -924,7 +909,6 @@ mod tests {
 
     #[test]
     fn special_pose_idle_stays_plain() {
-        // Idle on the surface: no sub, visible -> nothing active, nothing triggered.
         let s = step(&SpecialPose::default(), 0, 0);
         assert_eq!(s.pose.active_routine, None);
         assert_eq!(s.triggered, None);
@@ -932,13 +916,11 @@ mod tests {
 
     #[test]
     fn special_pose_sub_change_triggers_the_named_routine() {
-        // A sub change while visible plays table[sub] on the model (change detector).
         for (sub, name) in [(1u8, *b"ini1"), (2, *b"ini2"), (3, *b"ini3")] {
             let s = step(&SpecialPose::default(), 0, sub);
             assert_eq!(s.pose.active_routine, Some(name));
             assert_eq!(s.triggered, Some(name));
         }
-        // Spawn-flagged selector: the raw byte indexes the table; no masking.
         let s = step(&SpecialPose::default(), 0, 5);
         assert_eq!(s.pose.active_routine, Some(*b"ini1"));
         assert_eq!(s.triggered, Some(*b"ini1"));
@@ -955,12 +937,10 @@ mod tests {
 
     #[test]
     fn special_pose_hidden_never_triggers() {
-        // First observed already hidden: no live actor in retail, nothing runs.
         let s = step(&SpecialPose::default(), INVISIBLE_STATUS, 0);
         assert!(s.pose.hidden);
         assert_eq!(s.triggered, None);
 
-        // A sub change while hidden also triggers nothing; the resurface decides what plays.
         let buried = SpecialPose {
             sub: 1,
             hidden: true,
@@ -974,8 +954,6 @@ mod tests {
 
     #[test]
     fn special_pose_resurface_runs_init() {
-        // Hidden -> visible is an actor create in retail: the load routine 'init' runs,
-        // whether or not the sub byte changed in the same frame.
         let buried = SpecialPose {
             sub: 1,
             hidden: true,
@@ -991,8 +969,6 @@ mod tests {
             "the resurface's fresh actor has no slot; the lock holds the pose"
         );
 
-        // Re-hidden mid-settle and resurfaced again: 'init' replays (retail rebuilds the
-        // actor every time).
         let s2 = step(&s.pose, INVISIBLE_STATUS, 1);
         assert_eq!(s2.triggered, None);
         let s3 = step(&s2.pose, 0, 1);
@@ -1001,9 +977,6 @@ mod tests {
 
     #[test]
     fn special_pose_settles_on_sub_clear() {
-        // The server cleared animationsub while visible (engaged mid-dig): the slot releases,
-        // but the last-triggered routine stays selected so the pose pass can hold it for the
-        // duration of its lock; no routine fires on a clear.
         let digging = SpecialPose {
             sub: 1,
             hidden: false,
@@ -1015,9 +988,6 @@ mod tests {
         assert!(!s.pose.slot_held);
         assert_eq!(s.triggered, None);
 
-        // Same settle after a resurface's 'init': the settle window holds while the sub is
-        // still set (no re-fire), then the slot clears when the sub drops - the routine stays
-        // selected for the lock.
         let settled = SpecialPose {
             sub: 1,
             hidden: false,
@@ -1043,38 +1013,30 @@ mod tests {
         // settle ~2s with the sub still set; sub clears.
         let mut pose = SpecialPose::default();
 
-        // Idle on the surface.
         let s = step(&pose, 0, 0);
         assert_eq!(s.triggered, None);
         pose = s.pose;
 
-        // Server starts the dig: sub set while still visible -> ini1 fires once.
         let s = step(&pose, 0, 1);
         assert_eq!(s.triggered, Some(*b"ini1"));
         pose = s.pose;
 
-        // Visible dig window: hold the override, no re-fire.
         let s = step(&pose, 1, 1);
         assert_eq!(s.pose.active_routine, Some(*b"ini1"));
         assert_eq!(s.triggered, None);
         pose = s.pose;
 
-        // ~3s later the model is hidden underground: nothing triggers while buried.
         let s = step(&pose, INVISIBLE_STATUS, 1);
         assert!(s.pose.hidden);
         assert_eq!(s.triggered, None);
         pose = s.pose;
 
-        // It surfaces: visible again with the sub still set -> 'init' (the create path),
-        // not a re-fire of ini1. The fresh actor has no slot: the lock holds the pose.
         let s = step(&pose, 0, 1);
         assert!(!s.pose.hidden);
         assert_eq!(s.triggered, Some(*b"init"));
         assert!(!s.pose.slot_held);
         pose = s.pose;
 
-        // ~2s later the sub clears: the slot releases, but the routine stays selected so the
-        // pose can hold for the lock before falling to idle.
         let s = step(&pose, 0, 0);
         assert_eq!(s.pose.active_routine, Some(*b"init"));
         assert!(!s.pose.slot_held);

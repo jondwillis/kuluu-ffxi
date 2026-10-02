@@ -19,11 +19,11 @@ fn is_symlink(p: &Path) -> bool {
 
 /// Search `start` (and descendants up to `depth`) for an FFXI DAT root.
 /// Returns the first match, preferring a dir literally named "FINAL FANTASY XI".
+/// BFS so shallow matches win; the visited-dir cap keeps big trees snappy.
 pub fn find_ffxi_root(start: &Path, depth: usize) -> Option<PathBuf> {
     if is_ffxi_root(start) {
         return Some(start.to_path_buf());
     }
-    // BFS so shallow matches win; cap visited dirs to stay snappy on big trees.
     let mut queue: Vec<(PathBuf, usize)> = vec![(start.to_path_buf(), 0)];
     let mut visited = 0usize;
     while let Some((dir, d)) = queue.pop() {
@@ -92,7 +92,6 @@ pub fn detect() -> Vec<PathBuf> {
             roots.push(PathBuf::from(p).join("Games"));
         }
     } else if let Some(home) = home {
-        // macOS CrossOver, Linux Lutris/Wine prefixes.
         roots.push(home.join("Library/Application Support/CrossOver/Bottles"));
         roots.push(home.join("Games"));
         roots.push(home.join(".wine"));

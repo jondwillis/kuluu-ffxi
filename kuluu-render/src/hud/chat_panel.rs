@@ -87,7 +87,7 @@ pub struct ChatArea {
 const CHAT_SPLIT_MIN_WIDTH_PX: f32 = 960.0;
 const CHAT_WINDOW_GAP_PX: f32 = 4.0;
 const CHAT_TAB_HEIGHT_PX: f32 = 20.0;
-// Leave breathing room above the log controls at large text scales.
+/// Leave breathing room above the log controls at large text scales.
 const CHAT_TOP_CLEARANCE_PX: f32 = 16.0;
 
 #[derive(Component, Debug, Clone, Copy)]

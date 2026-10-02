@@ -39,7 +39,7 @@ pub enum SampleStatus {
     Valid,
     /// Above both neighbors by less than LIP_MAX: replaced by their maximum.
     LipFiltered,
-    /// Dropped more than STEP_MAX below the previous sample (ledge / hole
+    /// Dropped more than STEP_MAX below the toward-feet sample (ledge / hole
     /// edge): truncates its arm.
     RejectDrop,
     /// No floor under the chain ceiling: truncates its arm.
@@ -141,6 +141,26 @@ pub fn support_probe<S: Sampler>(sampler: &S, feet_xz: Vec2, feet_y: f32) -> Sup
 }
 
 /// Sample the ramp field at `feet_xz` / `feet_y` facing unit direction `m`.
+///
+/// Sample positions: the move arm is a zero-aligned grid (k=0 sits under the
+/// feet, so the envelope includes d = 0), plus two lateral pairs off the
+/// line at along 0 and along +LATERAL_OFFSET. The forward arm chains outward
+/// from the feet; the backward arm chains in reverse, seeding from the feet
+/// column (the first forward sample) when it exists; a truncated arm stops
+/// the chain. Lateral pairs are independent single queries (no chain across
+/// the line), ceiling from the nearest on-line sample at that along
+/// distance. Isolated nosings are filtered so they do not tilt the stair
+/// envelope.
+///
+/// Riser count + range run over the surviving on-line samples (post-filter);
+/// a walkable slope rises less than LIP_MAX between the four sub-samples of
+/// each pair.
+///
+/// Envelope: a staircase (>= 2 risers) rides the upper envelope of a
+/// least-squares plane over the surviving samples; everything else targets
+/// h0 directly (single step / slope / flat / poof all ride h0 at speed).
+/// Monotonic only: a window mixing up- and down-risers straddles a crest or
+/// a trench — fitting the plane there hovers, so target h0 direct.
 pub fn sample_field<S: Sampler>(sampler: &S, feet_xz: Vec2, feet_y: f32, m: Vec2) -> Field {
     let m = if m.length_squared() < 1e-8 {
         Vec2::X
@@ -148,15 +168,11 @@ pub fn sample_field<S: Sampler>(sampler: &S, feet_xz: Vec2, feet_y: f32, m: Vec2
         m.normalize()
     };
 
-    // Sample positions: the move arm is a zero-aligned grid (k=0 sits under
-    // the feet, so the envelope always includes d = 0), plus two lateral pairs
-    // off the line at along 0 and along +LATERAL_OFFSET.
     let k_behind = (LOOKBEHIND / SAMPLE_SPACING).floor() as usize;
     let k_ahead = (LOOKAHEAD / SAMPLE_SPACING).round() as usize;
 
     let mut samples: Vec<FieldSample> = Vec::with_capacity(2 * k_behind + 1 + k_ahead + 4);
 
-    // Forward arm, chained outward from the feet.
     let mut prev_h: Option<f32> = None;
     for k in 0..=k_ahead {
         let d = (k as f32) * SAMPLE_SPACING;
@@ -177,12 +193,10 @@ pub fn sample_field<S: Sampler>(sampler: &S, feet_xz: Vec2, feet_y: f32, m: Vec2
         });
         match status {
             SampleStatus::Valid | SampleStatus::LipFiltered => prev_h = hit,
-            _ => break, // arm truncated
+            _ => break,
         }
     }
 
-    // Backward arm, chained outward from the feet in reverse. The chain seeds
-    // from the feet column (the first forward sample) when it exists.
     let seed = samples.first().and_then(|s| s.raw);
     let mut prev_h: Option<f32> = None;
     for k in 1..=k_behind {
@@ -204,12 +218,10 @@ pub fn sample_field<S: Sampler>(sampler: &S, feet_xz: Vec2, feet_y: f32, m: Vec2
         });
         match status {
             SampleStatus::Valid | SampleStatus::LipFiltered => prev_h = hit,
-            _ => break, // arm truncated
+            _ => break,
         }
     }
 
-    // Lateral pairs: independent single queries (no chain across the line),
-    // ceiling from the nearest on-line sample at that along distance.
     for &along in &[0.0_f32, LATERAL_OFFSET] {
         let base = samples
             .iter()
@@ -238,7 +250,6 @@ pub fn sample_field<S: Sampler>(sampler: &S, feet_xz: Vec2, feet_y: f32, m: Vec2
         }
     }
 
-    // Keep isolated nosings from tilting the stair envelope.
     let mut on_line: Vec<usize> = samples
         .iter()
         .enumerate()
@@ -295,14 +306,12 @@ pub fn sample_field<S: Sampler>(sampler: &S, feet_xz: Vec2, feet_y: f32, m: Vec2
         }
     }
 
-    // Riser count + range over the surviving on-line run (post-filter).
     let heights: Vec<f32> = on_line
         .iter()
         .filter_map(|&i| samples[i].filtered)
         .collect();
     let mut risers = 0u32;
     let mut signed_risers = 0_i32;
-    // A walkable slope rises less than LIP_MAX between these sub-samples.
     const RISER_SUBDIVISIONS: usize = 4;
     let max_floor_slope = (1.0 - FLOOR_COS * FLOOR_COS).sqrt() / FLOOR_COS;
     for pair in on_line.windows(2) {
@@ -344,11 +353,6 @@ pub fn sample_field<S: Sampler>(sampler: &S, feet_xz: Vec2, feet_y: f32, m: Vec2
 
     let poof = !heights.is_empty() && range < POOF_MAX;
 
-    // Envelope: a staircase (>= 2 risers) rides the upper envelope of a
-    // least-squares plane over the surviving samples; everything else targets
-    // h0 directly (single step / slope / flat / poof all ride h0 at speed).
-    // Monotonic only: a window mixing up- and down-risers straddles a crest
-    // or a trench — fitting the plane there hovers, so target h0 direct.
     let (g, target) = if risers >= 2 && signed_risers.unsigned_abs() == risers && !poof {
         fit_envelope(&samples, &on_line)
     } else {
@@ -372,7 +376,12 @@ pub fn sample_field<S: Sampler>(sampler: &S, feet_xz: Vec2, feet_y: f32, m: Vec2
     }
 }
 
-/// Forward-arm classification against the previous (toward-feet) sample.
+/// Forward-arm classification against the toward-feet sample. A miss under
+/// the chain ceiling is a wall face ahead when a second query with reach
+/// finds a ledge above it, otherwise open ground / a hole. A drop beyond one
+/// step is a ledge / hole edge, not a walkable run. A floor at the chain
+/// ceiling gets the same check: a face ahead caps the rise, or the sample
+/// simply found the next tread.
 fn classify_forward(
     hit: Option<f32>,
     prev_h: Option<f32>,
@@ -380,9 +389,6 @@ fn classify_forward(
     xz: Vec2,
 ) -> SampleStatus {
     let Some(h) = hit else {
-        // No floor under the chain ceiling. A wall face ahead caps the rise:
-        // a second query with reach finds the ledge above it; otherwise this
-        // is just open ground / a hole (Miss).
         if let Some(prev) = prev_h {
             let ceiling = prev + STEP_MAX + CHAIN_CEILING_EPS;
             if sampler
@@ -395,12 +401,9 @@ fn classify_forward(
         return SampleStatus::Miss;
     };
     if let Some(prev) = prev_h {
-        // A drop beyond one step is a ledge / hole edge, not a walkable run.
         if prev - h > STEP_MAX + CHAIN_CEILING_EPS {
             return SampleStatus::RejectDrop;
         }
-        // The chain ceiling capped a rise: check whether a floor sits above it
-        // (a wall face ahead) or the sample simply found the next tread.
         let ceiling = prev + STEP_MAX + CHAIN_CEILING_EPS;
         if h >= ceiling - 1e-4 {
             if let Some(higher) = sampler.floor(xz, prev + WALL_AHEAD_REACH) {
@@ -414,8 +417,8 @@ fn classify_forward(
 }
 
 /// Backward-arm classification (mirror of the forward rule). The WallAhead
-/// second query is skipped backwards: a wall behind the feet never gates the
-/// walk target.
+/// second query is skipped backwards: a wall behind the feet does not gate
+/// the walk target.
 fn classify_backward(hit: Option<f32>, prev_h: Option<f32>) -> SampleStatus {
     let Some(h) = hit else {
         return SampleStatus::Miss;
@@ -432,9 +435,16 @@ fn classify_backward(hit: Option<f32>, prev_h: Option<f32>) -> SampleStatus {
 /// and lateral samples, then the upper envelope at the feet:
 /// `max_k (h_k - g . d_k)` — the plane of gradient g touching the highest
 /// sample. k=0 (d = 0) is in the set, so the result is >= h0 whenever both
-/// exist: never inside a tread.
+/// exist: not inside a tread.
+///
+/// Samples enter as (d along m, l left of m, h); the normal equations are
+/// X^T X [a b c]^T = X^T h with design rows [d l 1]. With no lateral spread
+/// — the usual case, since only on-line samples carry filtered heights — b
+/// and c are confounded and the plane is singular; the along-m gradient is
+/// still estimable as a plain least-squares slope of h over d, fit with
+/// g.y = 0. The envelope result carries the same no-hover cap as the
+/// full-plane path: not above the highest surviving sample.
 fn fit_envelope(samples: &[FieldSample], on_line: &[usize]) -> (Vec2, Option<f32>) {
-    // Surviving samples as (d along m, l left of m, h).
     let mut pts: Vec<(f32, f32, f32)> = Vec::new();
     for &i in on_line {
         if let Some(h) = samples[i].filtered {
@@ -451,8 +461,6 @@ fn fit_envelope(samples: &[FieldSample], on_line: &[usize]) -> (Vec2, Option<f32
         return (Vec2::ZERO, None);
     }
 
-    // Normal equations for h = a*d + b*l + c: X^T X [a b c]^T = X^T h with
-    // design rows [d l 1].
     let n = pts.len() as f32;
     let (mut sdd, mut sdl, mut sdh, mut sll, mut slh, mut sch, mut sum_d, mut sum_l) =
         (0.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
@@ -478,10 +486,6 @@ fn fit_envelope(samples: &[FieldSample], on_line: &[usize]) -> (Vec2, Option<f32
     let det = a11 * (a22 * a33 - a23 * a32) - a12 * (a21 * a33 - a23 * a31)
         + a13 * (a21 * a32 - a22 * a31);
     if det.abs() < 1e-9 {
-        // No lateral spread in the surviving set — the usual case, since only
-        // on-line samples carry filtered heights: b and c are confounded and
-        // the plane is singular. The along-m gradient is still estimable as a
-        // plain least-squares slope of h over d; fit that with g.y = 0.
         let det1d = sdd * n - sum_d * sum_d;
         if det1d.abs() < 1e-9 {
             return (Vec2::ZERO, None);
@@ -493,8 +497,6 @@ fn fit_envelope(samples: &[FieldSample], on_line: &[usize]) -> (Vec2, Option<f32
             best = best.max(h - g.x * d);
         }
         return if best.is_finite() {
-            // Same no-hover cap as the full-plane path: never above the
-            // highest surviving sample.
             (
                 g,
                 Some(best.min(pts.iter().map(|p| p.2).reduce(f32::max).unwrap())),
@@ -512,7 +514,6 @@ fn fit_envelope(samples: &[FieldSample], on_line: &[usize]) -> (Vec2, Option<f32
         a11 * (b2 * a33 - a23 * b3) - b1 * (a21 * a33 - a23 * a31) + a13 * (a21 * b3 - b2 * a31);
     let g = Vec2::new(da / det, db / det);
 
-    // Upper envelope at the feet: max over surviving samples of h_k - g . d_k.
     let mut best = f32::NEG_INFINITY;
     for &(d, l, h) in &pts {
         best = best.max(h - (g.x * d + g.y * l));
@@ -584,28 +585,28 @@ mod tests {
         assert!(p.accepted.iter().all(|&a| a));
     }
 
+    /// Floor 1 m below the feet: beyond the step band on every probe.
     #[test]
     fn support_probe_airborne_over_deep_hole() {
-        // Floor 1 m below the feet: beyond the step band on every probe.
         let s = sampler(flat());
         let p = support_probe(&s, Vec2::ZERO, 1.0);
         assert!(!p.grounded);
         assert_eq!(p.h0, None);
     }
 
+    /// A 0.3 riser at along +0.45 on otherwise flat ground: one jump in the
+    /// window => single step, no envelope.
     #[test]
     fn single_riser_is_one_not_a_staircase() {
-        // A 0.3 riser at along +0.45 on otherwise flat ground: one jump in the
-        // window => single step, no envelope.
         let s = sampler(|xz, _| Some(if xz.x >= 0.45 { 0.3 } else { 0.0 }));
         let f = sample_field(&s, Vec2::ZERO, 0.0, Vec2::X);
         assert_eq!(f.riser_count, 1);
         assert!(f.target.is_none());
     }
 
+    /// Ascending flight: tread width 0.45, riser 0.3, starting at along 0.3.
     #[test]
     fn staircase_envelope_never_below_h0() {
-        // Ascending flight: tread width 0.45, riser 0.3, starting at along 0.3.
         let s = sampler(|xz, _| {
             Some(if xz.x < 0.3 {
                 0.0
@@ -623,17 +624,16 @@ mod tests {
         assert!(t >= f.h0.unwrap() - 1e-6, "envelope {t} below h0");
     }
 
+    /// A 0.05 nosing on every tread edge of an otherwise clean flight must
+    /// not count as a riser and must not tilt the gradient.
     #[test]
     fn lip_filter_removes_nosings() {
-        // A 0.05 nosing on every tread edge of an otherwise clean flight must
-        // not count as a riser and must not tilt the gradient.
         let s = sampler(|xz, _| {
             let base = if xz.x < 0.3 {
                 0.0
             } else {
                 (1.0 + ((xz.x - 0.3) / 0.45).floor()) * 0.3
             };
-            // Nosing: a bump in the first 0.06 of each tread.
             let into_tread = if xz.x < 0.3 {
                 xz.x
             } else {
@@ -642,15 +642,13 @@ mod tests {
             Some(if into_tread < 0.06 { base + 0.05 } else { base })
         });
         let f = sample_field(&s, Vec2::ZERO, 0.0, Vec2::X);
-        // The nosings are filtered; the flight still reads as a staircase with
-        // the same gradient as the clean case (within noise).
         assert!(f.riser_count >= 2);
     }
 
+    /// Flat, then a 1.5 drop at along +0.6: RejectDrop truncates the arm;
+    /// no staircase, target stays h0 — no dip toward the edge.
     #[test]
     fn ledge_ahead_rejects_and_holds_target_at_h0() {
-        // Flat, then a 1.5 drop at along +0.6: RejectDrop truncates the arm;
-        // no staircase, target stays h0 — no dip toward the edge.
         let s = sampler(|xz, _| Some(if xz.x < 0.6 { 0.0 } else { -1.5 }));
         let f = sample_field(&s, Vec2::ZERO, 0.0, Vec2::X);
         assert!(f
@@ -660,18 +658,18 @@ mod tests {
         assert_eq!(field_target(&f), Some(0.0));
     }
 
+    /// No floor past along +0.3: the arm misses and stops.
     #[test]
     fn hole_truncates_arm() {
-        // No floor past along +0.3: the arm misses and stops.
         let s = sampler(|xz, _| (xz.x < 0.3).then_some(0.0));
         let f = sample_field(&s, Vec2::ZERO, 0.0, Vec2::X);
         assert!(f.samples.iter().any(|s| s.status == SampleStatus::Miss));
     }
 
+    /// Descending flight: the envelope must stay >= h0 (does not enter a
+    /// tread) even though forward samples are lower.
     #[test]
     fn descending_staircase_envelope_rides_treads() {
-        // Descending flight: the envelope must stay >= h0 (never inside a
-        // tread) even though forward samples are lower.
         let s = sampler(|xz, _| {
             Some(if xz.x < 0.3 {
                 0.9
@@ -685,18 +683,15 @@ mod tests {
         assert!(t >= f.h0.unwrap() - 1e-6);
     }
 
+    /// A vertical face at along +0.5 rising to a ledge at +1.5: the chain
+    /// ceiling caps at feet+STEP_MAX and the second query finds the floor
+    /// above it.
     #[test]
     fn wall_ahead_caps_the_chain() {
-        // A vertical face at along +0.5 rising to a ledge at +1.5: the chain
-        // ceiling caps at feet+STEP_MAX and the second query finds the floor
-        // above it.
         let s = sampler(|xz, ceiling| {
             if xz.x < 0.5 {
                 Some(0.0f32).filter(|h| *h <= ceiling)
             } else {
-                // The wall's top ledge: a floor at +1.5 only "under" ceilings
-                // that reach it; the face itself is not a floor (the normal
-                // test lives in the geometry, here we model its top).
                 Some(1.5f32).filter(|h| *h <= ceiling)
             }
         });
@@ -713,10 +708,10 @@ mod tests {
         );
     }
 
+    /// Walk an ascending flight sample by sample: the target must move in
+    /// small steps (no zig) — max tick-to-tick change stays under a riser.
     #[test]
     fn envelope_is_continuous_along_a_walk() {
-        // Walk an ascending flight sample by sample: the target must move in
-        // small steps (no zig) — max tick-to-tick change stays under a riser.
         let h = |xz: Vec2, _ceiling: f32| {
             Some(if xz.x < 0.3 {
                 0.0
@@ -740,10 +735,10 @@ mod tests {
         assert!(max_step < 0.35, "target zig of {max_step}");
     }
 
+    /// Steps on both sides ahead of the feet (a cross-aisle): the plane fit
+    /// must pick up a non-zero gradient and stay finite.
     #[test]
     fn lateral_step_gives_lateral_gradient() {
-        // Steps on both sides ahead of the feet (a cross-aisle): the plane fit
-        // must pick up a non-zero gradient and stay finite.
         let s = sampler(|xz, _| {
             Some(if xz.x > 0.3 && xz.y.abs() > 0.15 {
                 0.3
@@ -755,19 +750,19 @@ mod tests {
         assert!(f.g.is_finite());
     }
 
+    /// A 0.1 sill (under POOF_MAX) in the window: no ramp, target == h0.
     #[test]
     fn dead_band_sill_is_poof() {
-        // A 0.1 sill (under POOF_MAX) in the window: no ramp, target == h0.
         let s = sampler(|xz, _| Some(if xz.x > 0.3 { 0.1 } else { 0.0 }));
         let f = sample_field(&s, Vec2::ZERO, 0.0, Vec2::X);
         assert!(f.poof || f.riser_count < 2, "sill must not ramp");
         assert_eq!(field_target(&f), Some(0.0));
     }
 
+    /// Facing -x on an ascending flight that rises toward +x: the backward
+    /// arm (toward +x) must see the risers, so the window still counts them.
     #[test]
     fn reverse_direction_samples_behind() {
-        // Facing -x on an ascending flight that rises toward +x: the backward
-        // arm (toward +x) must see the risers, so the window still counts them.
         let s = sampler(|xz, _| {
             Some(if xz.x < 0.3 {
                 0.0
@@ -779,27 +774,27 @@ mod tests {
         assert!(f.samples.iter().any(|s| s.along < 0.0 && s.raw.is_some()));
     }
 
+    /// A hole wider than one probe spacing but narrower than the footprint:
+    /// the center misses, a ring probe still accepts => grounded.
     #[test]
     fn support_probe_bridges_narrow_hole() {
-        // A hole wider than one probe spacing but narrower than the footprint:
-        // the center misses, a ring probe still accepts => grounded.
         let s = sampler(|xz, _| (xz.x.abs() > 0.1).then_some(0.0));
         let p = support_probe(&s, Vec2::ZERO, 0.0);
         assert!(p.grounded, "narrower-than-footprint hole is bridged");
     }
 
+    /// A hole wider than the footprint: no probe accepts => airborne.
     #[test]
     fn support_probe_misses_wide_hole() {
-        // A hole wider than the footprint: no probe accepts => airborne.
         let s = sampler(|xz, _| (xz.x.abs() > 0.4).then_some(0.0));
         let p = support_probe(&s, Vec2::ZERO, 0.0);
         assert!(!p.grounded);
     }
 
+    /// Floating 0.3 above the floor (mid stop-settle): still grounded, h0
+    /// is the floor below.
     #[test]
     fn field_h0_matches_support_rule() {
-        // Floating 0.3 above the floor (mid stop-settle): still grounded, h0
-        // is the floor below.
         let s = sampler(flat());
         let f = sample_field(&s, Vec2::ZERO, 0.3, Vec2::X);
         assert_eq!(f.h0, Some(0.0));
@@ -824,10 +819,10 @@ mod tests {
         }
     }
 
-    /// Property: on random staircases the envelope never dips below h0.
+    /// Property: on random staircases the envelope does not dip below h0.
+    /// A deterministic LCG keeps a failure reproducible.
     #[test]
     fn envelope_never_below_h0_on_random_staircases() {
-        // Deterministic LCG so a failure is reproducible.
         let mut seed = 0x9E37_79B9u32;
         let next_f = |s: &mut u32| -> f32 {
             *s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
@@ -835,8 +830,8 @@ mod tests {
         };
         for _ in 0..200 {
             let steps = 2 + (next_f(&mut seed) * 14.0) as u32;
-            let d = 0.2 + next_f(&mut seed) * 0.8; // tread 0.2..1.0
-            let r = 0.1 + next_f(&mut seed) * 0.3; // riser 0.1..0.4 (climbable)
+            let d = 0.2 + next_f(&mut seed) * 0.8;
+            let r = 0.1 + next_f(&mut seed) * 0.3;
             for _ in 0..8 {
                 let x = 0.3 + next_f(&mut seed) * ((steps as f32 * d - 0.6).max(0.5));
                 let h = flight(0.3, d, r, steps);
@@ -912,14 +907,12 @@ mod tests {
     /// staircase, wide ones as single steps.
     #[test]
     fn riser_count_by_tread_width() {
-        let flat_f = flight(0.3, 1.0, 0.0, 1); // no risers at all
+        let flat_f = flight(0.3, 1.0, 0.0, 1);
         let s = sampler(flat_f);
         assert_eq!(sample_field(&s, Vec2::ZERO, 0.0, Vec2::X).riser_count, 0);
 
         for (d, min_risers) in [(0.25, 2u32), (0.3, 2), (0.4, 2)] {
             let h = flight(0.3, d, 0.3, 10);
-            // Stand on the tread under x=1.5: its height depends on d, so
-            // derive it from the sampler instead of hardcoding one flight's.
             let feet = Vec2::new(1.5, 0.0);
             let feet_y = h(feet, f32::INFINITY).unwrap();
             let s = sampler(h);
@@ -930,7 +923,6 @@ mod tests {
                 f.riser_count
             );
         }
-        // Wide tread (0.9): one riser in the window = single step.
         let h = flight(0.3, 0.9, 0.3, 10);
         let s = sampler(h);
         let f = sample_field(&s, Vec2::new(1.0, 0.0), 0.3, Vec2::X);
@@ -945,7 +937,6 @@ mod tests {
         let feet_y = clean(Vec2::new(2.0, 0.0), 0.0).unwrap();
         let with_nosings = |xz: Vec2, _c: f32| -> Option<f32> {
             let base = flight(0.3, 0.45, 0.3, 12)(xz, 0.0)?;
-            // Into-tread distance on the current tread (0 before the first riser).
             let into = if xz.x < 0.3 {
                 xz.x
             } else {
@@ -975,7 +966,6 @@ mod tests {
     /// and support under the feet is still grounded.
     #[test]
     fn hole_ahead_truncates_without_losing_support() {
-        // Floor everywhere except a 0.8 gap centered at x = 0.45 + 0.4 = 0.85...
         let h = |xz: Vec2, _c: f32| -> Option<f32> {
             if (0.45..1.25).contains(&xz.x) {
                 None
@@ -989,7 +979,6 @@ mod tests {
             .samples
             .iter()
             .any(|s| matches!(s.status, SampleStatus::Miss | SampleStatus::RejectDrop)));
-        // No staircase out of a truncated arm: target is h0 direct.
         assert_eq!(field_target(&f), Some(0.0));
         let p = support_probe(&s, Vec2::ZERO, 0.0);
         assert!(p.grounded, "feet are on solid floor");
@@ -1003,7 +992,6 @@ mod tests {
             if xz.x < 0.5 {
                 Some(0.0f32).filter(|h| *h <= ceiling)
             } else {
-                // The ledge on top of the wall: only visible to high ceilings.
                 Some(1.5f32).filter(|h| *h <= ceiling)
             }
         });
@@ -1035,7 +1023,7 @@ mod tests {
     }
 
     /// Diagonal 30/45/60 to the flight: the plane fit stays finite and
-    /// the envelope never dips below h0.
+    /// the envelope does not dip below h0.
     #[test]
     fn diagonal_to_flight_stays_sane() {
         for deg in [30.0f32, 45.0, 60.0] {
@@ -1057,9 +1045,10 @@ mod tests {
     /// by the FLOOR_COS angle cutoff: a jump pair counts as a riser only when
     /// its subdivided samples rise faster than that cutoff, so any continuous
     /// ramp below retail's 45 degrees reads 0 risers regardless of LIP_MAX.
+    /// The 65 degree face keeps the whole rise inside one sample pair, so it
+    /// is one riser rather than two.
     #[test]
     fn slanted_riser_40_is_slope_65_is_step() {
-        // Continuous floors below the normal cutoff do not count as risers.
         let h40 = |xz: Vec2, _c: f32| -> Option<f32> {
             Some(if xz.x < 0.45 {
                 0.0
@@ -1071,9 +1060,6 @@ mod tests {
         let f = sample_field(&s, Vec2::ZERO, 0.0, Vec2::X);
         assert_eq!(f.riser_count, 0, "40 degree face must be a slope: {f:?}");
 
-        // The same rise above the floor-angle cutoff counts as a step (65
-        // degrees keeps the whole rise inside one sample pair, so it is one
-        // riser rather than two).
         let h65 = |xz: Vec2, _c: f32| -> Option<f32> {
             Some(if xz.x < 0.45 {
                 0.0
@@ -1088,10 +1074,11 @@ mod tests {
 
     /// A gentle ramp reads as a SLOPE (0 risers); a steep face of the same
     /// height is a single step — the LIP_MAX-scale variant of the angle test.
+    /// The steep face's whole rise sits in one window jump and no sample
+    /// position falls inside the ramp band, so it reads exactly one riser
+    /// regardless of f32 boundary flips.
     #[test]
     fn gentle_ramp_reads_zero_risers_steep_face_reads_one() {
-        // Gentle ramp: rise 0.3 over run 1.0 (~17 deg) — per-step 0.045,
-        // endpoint jump 0.09 < LIP_MAX.
         let h_gentle = |xz: Vec2, _c: f32| -> Option<f32> {
             Some(if xz.x < 0.45 {
                 0.0
@@ -1103,9 +1090,6 @@ mod tests {
         let f = sample_field(&s, Vec2::ZERO, 0.0, Vec2::X);
         assert_eq!(f.riser_count, 0, "gentle ramp must be a slope: {f:?}");
 
-        // Steep face (~65 deg): rise 0.3 over run 0.143 — one jump in the
-        // window; no sample position falls inside the ramp band [0.45, 0.593),
-        // so exactly one riser regardless of f32 boundary flips.
         let h_steep = |xz: Vec2, _c: f32| -> Option<f32> {
             Some(if xz.x < 0.45 {
                 0.0

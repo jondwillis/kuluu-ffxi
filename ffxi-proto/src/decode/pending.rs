@@ -9,7 +9,8 @@ pub struct PendingNum {
 }
 
 impl PendingNum {
-    /// Body size after the 4-byte sub-header (the packet is 0x24 on the wire).
+    /// Body size after the 4-byte sub-header (the packet is 36 bytes on the
+    /// wire, research/XiPackets/world/server/0x005C).
     pub(crate) const SIZE: usize = 8 * std::mem::size_of::<i32>();
 
     pub fn decode(body: &[u8]) -> Result<Self, DecodeError> {

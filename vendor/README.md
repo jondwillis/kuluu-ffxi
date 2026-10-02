@@ -35,9 +35,9 @@ in `ffxi-dat/src/client_profile.rs`; `kuluu install list` shows each install's
 row. Read a pin's date with `git -C vendor/<name> log -1 --format=%cs`.
 
 - **server.** The pin's `settings/default/login.lua` declares `CLIENT_VER`
-  and `VER_LOCK`. A stock server at that pin admits exactly that client
-  version while locked, so an install from another generation needs the lock
-  off. The zone text ids under `scripts/zones/*/IDs.lua` are synced to the same
+  and `VER_LOCK`. Strict mode (`1`) requires an exact version match; the
+  default mode (`2`) allows matching or newer versions, and `0` disables the
+  version check. Read the pinned settings before choosing a client. The zone text ids under `scripts/zones/*/IDs.lua` are synced to the same
   client: the matching retail generation reads them as identity DAT indexes,
   and older clients go through the landmark reconciliation in `kuluu-session`.
 - **POLUtils.** `ROMFileMappings.xml` was last edited in 2018 for the Unity

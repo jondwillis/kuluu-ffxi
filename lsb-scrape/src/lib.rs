@@ -819,7 +819,7 @@ mod tests {
 
     #[test]
     fn cpp_u32_str_map_decodes_c_escapes_and_keeps_the_first_duplicate() {
-        let src = "// f.write(\"const std::map<unsigned int, const char*> values =\\n{\\n\")\nconst std::map<unsigned int, const char*> values =\n{\n    { 66050, \"Greetings\" },\n    { 0x01010202, \"Nice to meet you.\" },\n    { 3489989127, \"\\\" A \\\" Egg\" },\n    { 7, \"tab\\there\\\\\\x41\\101\" },\n    { 66050, \"shadowed\" },\n};\n";
+        let src = "/* f.write(\"const std::map<unsigned int, const char*> values =\\n{\\n\") */\nconst std::map<unsigned int, const char*> values =\n{\n    { 66050, \"Greetings\" },\n    { 0x01010202, \"Nice to meet you.\" },\n    { 3489989127, \"\\\" A \\\" Egg\" },\n    { 7, \"tab\\there\\\\\\x41\\101\" },\n    { 66050, \"shadowed\" },\n};\n";
         let rows = parse_cpp_u32_str_map(src, "const std::map<unsigned int, const char*> values =")
             .unwrap();
         assert_eq!(

@@ -293,11 +293,12 @@ mod tests {
         }
     }
 
-    // The two links kuluu-d9wv adds, driven through the production entry point: the celestial
-    // set has to ask for the undither, and `spawn_zone_particle_generator` has to carry that
-    // request through mesh resolution into the sheet it binds on the material. A synthetic
-    // nibble 7/8 sheet - the pattern `weat/<type>/kasa` ships end to end - makes a celestial
-    // spawn distinguishable from every other generator set by alpha alone.
+    /// The two links this test drives through the production entry point: the
+    /// celestial set asks for the undither, and `spawn_zone_particle_generator`
+    /// carries that request through mesh resolution into the sheet it binds on
+    /// the material. A synthetic nibble 7/8 sheet - the pattern
+    /// `weat/<type>/kasa` ships end to end - makes a celestial spawn
+    /// distinguishable from every other generator set by alpha alone.
     #[test]
     fn the_celestial_spawn_binds_an_undithered_sheet() {
         use crate::ffxi_particle_material::FfxiParticleMaterial;
@@ -312,8 +313,9 @@ mod tests {
         const DITHER_LO: u8 = 0x77;
         const DITHER_HI: u8 = 0x88;
         const SIDE: u32 = 8;
-        // 0x80's recovered mean is 127.5, which no 8-bit alpha holds; the remap doubles that to
-        // a 254/255 split. One step is the floor, not a slack tolerance.
+        /// 0x80's recovered mean is 127.5, which no 8-bit alpha holds; the remap doubles that to
+        /// a 254/255 split. One step is the floor, not a slack tolerance.
+        /// texture.rs
         const RESOLVED_RESIDUAL_MAX: u8 = 1;
 
         let mut rgba = Vec::with_capacity((SIDE * SIDE * 4) as usize);

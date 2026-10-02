@@ -15,11 +15,11 @@ pub mod event_locate;
 pub mod footstep;
 pub mod ftable;
 pub mod generator;
-// Sourced directly from ffxi-install rather than a crate dependency: an
-// ffxi-install crate dependency would drag its unconditional native deps
-// (unrar in particular, a C++ build via cc-rs) into every ffxi-dat consumer,
-// including the wasm32 target (kuluu-viewer-wasm -> kuluu-render ->
-// ffxi-actor/ffxi-dat), which has no C++ stdlib to link against.
+/// Sourced directly from ffxi-install rather than a crate dependency: an
+/// ffxi-install crate dependency would drag its unconditional native deps
+/// (unrar in particular, a C++ build via cc-rs) into every ffxi-dat consumer,
+/// including the wasm32 target (kuluu-viewer-wasm -> kuluu-render ->
+/// ffxi-actor/ffxi-dat), which has no C++ stdlib to link against.
 pub mod install;
 #[path = "../../ffxi-install/src/install_detect.rs"]
 pub mod install_detect;

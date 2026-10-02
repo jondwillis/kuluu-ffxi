@@ -2,8 +2,10 @@ use serde::{Deserialize, Serialize};
 
 use super::DecodeError;
 
-/// The extra action offered by s2c 0x0F9. `None` is the ordinary home-point
-/// menu; the server only sends `Raise` or `Tractor` while that offer is active.
+/// The extra action offered by s2c 0x0F9
+/// (vendor/server/src/map/packets/s2c/0x0f9_res.h GP_SERV_COMMAND_RES). `None`
+/// is the ordinary home-point menu; the server only sends `Raise` or `Tractor`
+/// while that offer is active.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeathMenuOffer {

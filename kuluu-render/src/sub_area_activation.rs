@@ -368,6 +368,9 @@ mod doorway_tests {
         /// off the one ordering declaration production registers
         /// ([`crate::dat_mmb::zone_load_dispatch_systems`]), and with the main
         /// block reduced to the shell placeholder the interior stands in for.
+        /// The declaration orders the segment, not merely contains it: an
+        /// unordered write-then-read of `LoadMzbRequest` is the deferred spawn
+        /// this pins against, and the executor may run it either way.
         fn streaming() -> Option<Self> {
             let root = std::sync::Arc::new(ffxi_dat::archive::open_test_install()?);
             AsyncComputeTaskPool::get_or_init(TaskPool::default);
@@ -386,10 +389,6 @@ mod doorway_tests {
                 .init_asset::<Mesh>()
                 .init_asset::<StandardMaterial>()
                 .add_systems(Update, crate::dat_mmb::zone_load_dispatch_systems());
-            // The declaration has to *order* the segment, not merely contain it:
-            // an unordered write-then-read of `LoadMzbRequest` is exactly the
-            // deferred spawn this pins against, and the executor is free to run
-            // it either way.
             d.app.edit_schedule(Update, |schedule| {
                 schedule.set_build_settings(ScheduleBuildSettings {
                     ambiguity_detection: LogLevel::Error,

@@ -72,9 +72,10 @@ pub fn equipment_dat_id(dll: &MainDll, slot_index: u8, model_id: u16, race: u8) 
 }
 
 /// [`equipment_dat_id`] for a wire slot id: the slot number in the high nibble
-/// over a 12-bit model id (the shape s2c 0x00D / 0x051 carry per slot). A bare
-/// model id with no slot nibble is slot 0 and resolves to nothing, which is how
-/// an empty slot reads.
+/// over a 12-bit model id (the shape s2c 0x00D / 0x051 carry per slot, the wire
+/// half of vendor/server/src/map/packets/s2c/0x051_grap_list.cpp). A bare model
+/// id with no slot nibble is slot 0 and resolves to nothing, which is how an
+/// empty slot reads.
 pub fn equipment_slot_dat_id(dll: &MainDll, slot_id: u16, race: u8) -> Option<u32> {
     let slot = ((slot_id >> EQUIP_SLOT_ID_SHIFT) & EQUIP_SLOT_ID_SLOT_MASK) as u8;
     equipment_dat_id(dll, slot, slot_id & EQUIP_SLOT_ID_MODEL_MASK, race)
@@ -190,6 +191,13 @@ fn mount_dat_id(mount_id: u8) -> Option<u32> {
     Some(MOUNT_BLOCK_BASE + u32::from(mount_id.checked_sub(FIRST_MODELLED_MOUNT)?))
 }
 
+/// Dispatches look-driven model loads. Every PC part is named by the wired
+/// install's equipment table, so until `ActionMainDll` lands (it loads
+/// off-thread after the root is wired) the look is left unsigned and comes
+/// back on the next dirty frame; NPCs need no table and are not held up.
+/// A face that cannot resolve is only reachable for a race outside 1..=8;
+/// the face DAT carries the head and hair, so the failure is a loud warn —
+/// a user's stderr should explain a decapitated screenshot.
 pub fn dispatch_look_driven_models(
     state: Res<SceneState>,
     tracked: Res<TrackedEntities>,
@@ -254,10 +262,6 @@ pub fn dispatch_look_driven_models(
             ranged,
         } = look.0
         {
-            // Every PC part is named by the wired install's equipment table, so
-            // until `ActionMainDll` lands (it loads off-thread after the root is
-            // wired) the look is left unsigned and comes back on the next dirty
-            // frame; NPCs below need no table and are not held up.
             let Some(dll) = dll else {
                 warn_once!(
                     "pc dispatch deferred: the wired install's FFXiMain.dll has not loaded (entity {})",
@@ -269,9 +273,6 @@ pub fn dispatch_look_driven_models(
             if let Some(file_id) = face_dat_id(dll, face, race) {
                 equipment.push(file_id);
             } else {
-                // Only reachable for a race outside 1..=8; the face DAT carries
-                // the head and hair, so it must be loud enough for a user's
-                // stderr to explain a decapitated screenshot.
                 warn!(
                     "pc face unresolved (entity {}): race {} is not a PC race (face {}) -- head/hair will not render",
                     we.id, race, face
@@ -480,9 +481,16 @@ mod tests {
 
     #[test]
     fn mount_dat_id_maps_the_block_and_rejects_the_chocobo_ids() {
-        // Verified against the retail DAT 2026-08-04 by dumping each file's
-        // skeleton chunk: the block is MOUNTTYPE-ordered from QUEST_RAPTOR.
-        assert_eq!(mount_dat_id(1), Some(0x0001_9131)); // MOUNT_QUEST_RAPTOR, "wyve"
+        /// Verified against the retail DAT 2026-08-04 by dumping each file's
+        /// skeleton chunk: the block is MOUNTTYPE-ordered from QUEST_RAPTOR.
+        /// The base stays literal here: it is the dump's second source, not
+        /// the resolver's own const.
+        const MOUNT_BLOCK_BASE_PINNED: u32 = 0x0001_9131;
+        assert_eq!(
+            mount_dat_id(1),
+            Some(MOUNT_BLOCK_BASE_PINNED),
+            "MOUNT_QUEST_RAPTOR (wyve)"
+        );
         assert_eq!(mount_dat_id(3), Some(0x0001_9133)); // MOUNT_TIGER, "tige"
         assert_eq!(mount_dat_id(17), Some(0x0001_9141)); // MOUNT_HIPPOGRYPH, "kiri"
 
@@ -521,8 +529,8 @@ mod tests {
         assert_eq!(npc_dat_id(3500), 3500 + 98239);
     }
 
-    // The 3000-range base applies all the way to 3499: the split is at 3500,
-    // not wherever the install's registered files happen to thin out.
+    /// The 3000-range base applies all the way to 3499: the split is at 3500,
+    /// not wherever the install's registered files happen to thin out.
     #[test]
     fn npc_dat_id_keeps_the_3000_range_base_through_3499() {
         for m in [3193u16, 3194, 3300, 3499] {
@@ -543,8 +551,11 @@ mod tests {
         let f = fixture("retag");
         assert_eq!(equipment_dat_id(&f.dll, 2, 4, 3), Some(13724));
 
-        // A bare model id is slot 0: an empty slot, never a face.
-        assert_eq!(equipment_slot_dat_id(&f.dll, 4, 3), None);
+        assert_eq!(
+            equipment_slot_dat_id(&f.dll, 4, 3),
+            None,
+            "a bare model id is slot 0: an empty slot, not a face"
+        );
 
         assert_eq!(equipment_dat_id(&f.dll, 2, 0x2004, 3), Some(13724));
 
@@ -559,8 +570,11 @@ mod tests {
         assert_eq!(equipment_slot_dat_id(&f.dll, 0x2004, 0), None);
         assert_eq!(equipment_slot_dat_id(&f.dll, 0x2004, 9), None);
         assert_eq!(equipment_slot_dat_id(&f.dll, 0x2000, 3), Some(13720));
-        // A slot the race's row leaves empty resolves to nothing, not to a clamp.
-        assert_eq!(equipment_dat_id(&f.dll, EQUIP_SLOT_RANGED, 0, 1), None);
+        assert_eq!(
+            equipment_dat_id(&f.dll, EQUIP_SLOT_RANGED, 0, 1),
+            None,
+            "a slot the race's row leaves empty resolves to nothing, not to a clamp"
+        );
     }
 
     #[test]
@@ -604,8 +618,11 @@ mod tests {
         assert_eq!(face_dat_id(&f.dll, 17, 1), Some(7097));
         // Face 8B == 15 is LSB's creation maximum.
         assert_eq!(face_dat_id(&f.dll, 15, 1), Some(7095));
-        // Tarutaru F: the row the dll places at 22952.
-        assert_eq!(face_dat_id(&f.dll, 0, 6), Some(22952));
+        assert_eq!(
+            face_dat_id(&f.dll, 0, 6),
+            Some(22952),
+            "Tarutaru F: the row the dll places at 22952"
+        );
         assert_eq!(face_dat_id(&f.dll, 31, 6), Some(22983));
     }
 
@@ -619,8 +636,11 @@ mod tests {
         assert_eq!(face_dat_id(&f.dll, 31, 1), Some(7111));
         assert_eq!(face_dat_id(&f.dll, 32, 1), Some(7080));
         assert_eq!(face_dat_id(&f.dll, 255, 6), Some(22952));
-        // Invalid races reject; a race with no face row is nothing, not a clamp.
-        assert_eq!(face_dat_id(&f.dll, 0, 0), None);
+        assert_eq!(
+            face_dat_id(&f.dll, 0, 0),
+            None,
+            "invalid races reject; a race with no face row is nothing, not a clamp"
+        );
         assert_eq!(face_dat_id(&f.dll, 0, 9), None);
         assert_eq!(face_dat_id(&f.dll, 0, 3), None);
     }

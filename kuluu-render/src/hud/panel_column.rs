@@ -26,6 +26,14 @@ fn logical_height(computed: &ComputedNode) -> f32 {
     computed.size().y * computed.inverse_scale_factor()
 }
 
+/// One-frame height confirm: with the render-scale composite active,
+/// `ComputedNode` can transiently mismeasure while camera targets re-resolve
+/// (physical size and inverse_scale_factor land a frame apart), and trusting
+/// each frame's reading restacked the whole column every frame — the
+/// "bouncing bottoms" at any non-default UI scale. A height must repeat
+/// (within half a pixel) on two consecutive frames before the column accepts
+/// it; a genuine content change lands one frame late, which is invisible,
+/// and a flip-flopping reading does not move anything.
 pub fn layout_panel_column_system(
     mut panels: Query<(Entity, &ColumnPanel, &mut Node, &ComputedNode)>,
     mut last_seen: Local<std::collections::HashMap<Entity, f32>>,
@@ -33,14 +41,6 @@ pub fn layout_panel_column_system(
     let mut stack: Vec<_> = panels.iter_mut().collect();
     stack.sort_by_key(|(_, slot, _, _)| **slot);
 
-    // ONE-FRAME HEIGHT CONFIRM. With the render-scale composite active,
-    // `ComputedNode` can transiently mismeasure while camera targets
-    // re-resolve (physical size and inverse_scale_factor land a frame apart),
-    // and trusting each frame's reading restacked the whole column every
-    // frame -- the "bouncing bottoms" at any non-default UI scale. A height
-    // must repeat (within half a pixel) on two consecutive frames before the
-    // column accepts it; a genuine content change lands one frame late,
-    // which is invisible, and a flip-flopping reading never moves anything.
     let mut heights: Vec<f32> = Vec::with_capacity(stack.len());
     for (e, _, node, computed) in stack.iter() {
         if node.display == Display::None {
@@ -55,9 +55,9 @@ pub fn layout_panel_column_system(
         }
         let prev = last_seen.insert(*e, h);
         match prev {
-            None => heights.push(h), // first sighting
+            None => heights.push(h),
             Some(p) if (p - h).abs() <= 0.5 => heights.push(h),
-            Some(_) => return, // unconfirmed: hold
+            Some(_) => return,
         }
     }
 

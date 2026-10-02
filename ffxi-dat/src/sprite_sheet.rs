@@ -293,17 +293,17 @@ pub struct CelestialColorTables {
     pub moon_phase: Option<[[f32; 4]; MOON_PHASES]>,
 }
 
-// Scoped to the generator that also carries MoonPhaseSpriteSheetUpdater (0x45) -- the moon
-// sprite itself. In 164 of the 181 shipped DATs that carry these tables a generator without
-// 0x45 precedes the moon's, and none of the 164 repeats the moon's values: file 201's lunar
-// halo f_ro/weat/fine/moon/kasa has dow[6]=(0.50,0.50,0.50) against the moon's
-// (0.70,0.70,0.70), so a first-match scrape tints the disc with the halo's dimmer table.
-// The walk is flat and weather-blind, unlike the weather-scoped
-// kuluu-render::celestial_particles::collect_celestial_defs: of the 143 DATs shipping more
-// than one weather's moon generator, none varies its 0x4E/0x4F tables across weathers (survey
-// of all resolvable ids 1..4000, kuluu-xxqy; pinned by
-// real_dat_moon_tables_do_not_vary_by_weather), so the first 0x45 generator in file order
-// carries the active weather's tables too.
+/// research/xim ParticleUpdaters.kt MoonPhaseSpriteSheetUpdater (0x45): scoped to the
+/// generator that also carries it -- the moon sprite itself. In 164 of the 181 shipped DATs
+/// that carry these tables a generator without 0x45 precedes the moon's, and none of the 164
+/// repeats the moon's values: file 201's lunar halo f_ro/weat/fine/moon/kasa has
+/// dow[6]=(0.50,0.50,0.50) against the moon's (0.70,0.70,0.70), so a first-match scrape
+/// tints the disc with the halo's dimmer table. The walk is flat and weather-blind, unlike
+/// the weather-scoped kuluu-render::celestial_particles::collect_celestial_defs: of the 143
+/// DATs shipping more than one weather's moon generator, none varies its 0x4E/0x4F tables
+/// across weathers (survey of all resolvable ids 1..4000; pinned by
+/// real_dat_moon_tables_do_not_vary_by_weather), so the first 0x45 generator in file order
+/// carries the active weather's tables too.
 pub fn extract_celestial_color_tables(dat_bytes: &[u8]) -> Option<CelestialColorTables> {
     for c in walk(dat_bytes).filter_map(Result::ok) {
         if ChunkKind::from_u8(c.kind) != Some(ChunkKind::Generator) {
@@ -562,8 +562,9 @@ mod tests {
         out
     }
 
-    // The halo `kasa` is the earlier Moon-attached generator in every environment DAT and carries
-    // its own 0x4E/0x4F pair; only the moon sprite's own (0x45-carrying) generator tints the disc.
+    /// research/xim ParticleUpdaters.kt: the halo `kasa` is the earlier Moon-attached generator
+    /// in every environment DAT and carries its own 0x4E/0x4F pair; only the moon sprite's own
+    /// (0x45-carrying) generator tints the disc.
     #[test]
     fn celestial_tables_come_from_the_moon_sprite_generator_not_the_earlier_halo() {
         const HALO_DOW: [[u8; 4]; DAYS_OF_WEEK] = [[128, 128, 51, 41]; DAYS_OF_WEEK];
@@ -601,8 +602,8 @@ mod tests {
         );
     }
 
-    // Without a moon sprite generator there is no disc tint to scrape: the halo's tables must not
-    // stand in for it (sun_moon falls back to its own constants on None).
+    /// Without a moon sprite generator there is no disc tint to scrape: the halo's tables must
+    /// not stand in for it (sun_moon falls back to its own constants on None).
     #[test]
     fn celestial_tables_absent_when_only_the_halo_carries_them() {
         const HALO_DOW: [[u8; 4]; DAYS_OF_WEEK] = [[128, 128, 51, 41]; DAYS_OF_WEEK];
@@ -621,7 +622,7 @@ mod tests {
         assert!(extract_celestial_color_tables(&dat).is_none());
     }
 
-    // West Ronfaure's environment DAT, or None on a machine without the retail install.
+    /// West Ronfaure's environment DAT, or None on a machine without the retail install.
     fn west_ronfaure_env_dat() -> Option<Vec<u8>> {
         const WEST_RONFAURE_ENV_DAT: u32 = 201;
         let root = crate::archive::open_test_install()?;
@@ -638,12 +639,12 @@ mod tests {
         }
     }
 
-    // Real-DAT pin: West Ronfaure's fine-weather moon (f_ro/weat/fine/moon/moon) carries
-    // dow[6]=(0.70,0.70,0.70) at alpha 0.50 where the halo (f_ro/weat/fine/moon/kasa) that
-    // precedes it in chunk order carries (0.50,0.50,0.50) at alpha 0.16. Only the RGB reaches
-    // the drawn disc -- kuluu-render::sun_moon::celestial_moon_tint returns RGB and
-    // MoonMaterial's tint.w carries the sprite-vs-procedural mode flag -- so the halo's table
-    // shows up as a washed-out weekday hue, not as a transparency change.
+    /// Real-DAT pin: West Ronfaure's fine-weather moon (f_ro/weat/fine/moon/moon) carries
+    /// dow[6]=(0.70,0.70,0.70) at alpha 0.50 where the halo (f_ro/weat/fine/moon/kasa) that
+    /// precedes it in chunk order carries (0.50,0.50,0.50) at alpha 0.16. Only the RGB reaches
+    /// the drawn disc -- kuluu-render::sun_moon::celestial_moon_tint returns RGB and
+    /// MoonMaterial's tint.w carries the sprite-vs-procedural mode flag -- so the halo's table
+    /// shows up as a washed-out weekday hue, not as a transparency change.
     #[test]
     fn real_dat_west_ronfaure_scrapes_the_moon_tables_not_the_halos() {
         const MOON_DOW_LIGHT_RED: f32 = 0.70;
@@ -680,8 +681,9 @@ mod tests {
         );
     }
 
-    // The scrape takes the first 0x45 generator in file order rather than the active weather's;
-    // this pins the shipped-data invariant that makes the two the same tables.
+    /// research/xim ParticleUpdaters.kt: the scrape takes the first 0x45 generator in file
+    /// order rather than the active weather's; this pins the shipped-data property that makes
+    /// the two the same tables.
     #[test]
     fn real_dat_moon_tables_do_not_vary_by_weather() {
         let Some(bytes) = west_ronfaure_env_dat() else {

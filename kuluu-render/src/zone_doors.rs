@@ -45,15 +45,9 @@ const ROUTINE_CLOSE: [u8; 4] = *b"clos";
 const ROUTINE_OPEN_ON_ARRIVAL: [u8; 4] = *b"into";
 const ROUTINE_CLOSE_ON_ARRIVAL: [u8; 4] = *b"intc";
 
-/// A leaf's routine-driven displacement from its authored MZB placement pose —
-/// what a 0x0C/0x0D stage's `final_value` targets. Zero is the authored pose,
-/// which is why retail keeps a per-slot copy of the placement's TRS to rebuild
-/// from (research/XIClient `UnderscoreAtStruct::InitMatrix`).
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct DoorPose {
-    /// Radians per FFXI axis, added to the placement's authored Euler triple.
     pub rotation: Vec3,
-    /// Yalms per FFXI axis, added to the placement's authored translation.
     pub translation: Vec3,
 }
 
@@ -73,6 +67,20 @@ pub struct ZoneDoorLeaf {
     base_rot: Vec3,
     base_trans: Vec3,
     world_offset: Vec3,
+}
+
+#[derive(Component, Debug, Clone, Copy)]
+pub struct ZoneDoorMesh(pub ZoneDoorLeaf);
+
+impl DoorPose {
+    fn local_transform(self) -> Transform {
+        Transform::from_translation(self.translation).with_rotation(Quat::from_euler(
+            EulerRot::XYZEx,
+            self.rotation.x,
+            self.rotation.y,
+            self.rotation.z,
+        ))
+    }
 }
 
 pub type DoorLeafKey = (u32, u32);
@@ -102,15 +110,19 @@ impl ZoneDoorLeaf {
         (self.four_cc, self.subchunk)
     }
 
+    /// The placement's authored translation, FFXI axes.
+    pub fn authored_translation(&self) -> Vec3 {
+        self.base_trans
+    }
+
     /// The leaf's world matrix under `pose`. [`DoorPose::default`] reproduces the
     /// matrix the placement spawned with, bit for bit.
     pub fn posed_transform(&self, pose: DoorPose) -> Mat4 {
+        // retail-2026-09 FFXiMain.dll RVA 0xACF90 composes the animated
+        // local matrix with the cached initial leaf matrix through RVA 0x27D10.
         Mat4::from_translation(self.world_offset)
-            * placement_bevy_transform(
-                self.base_scale,
-                self.base_rot + pose.rotation,
-                self.base_trans + pose.translation,
-            )
+            * placement_bevy_transform(self.base_scale, self.base_rot, self.base_trans)
+            * pose.local_transform().to_matrix()
     }
 }
 
@@ -133,6 +145,11 @@ pub struct ZoneDoorNpc {
     /// Last animation byte acted on. The server repeats the byte on every 0x0E,
     /// so only a change is an event.
     pub animation: u8,
+
+    /// Last StatusEvent the running event wrote for this door (the 0x4C/0x4D/0x4F
+    /// cues). Kept off `animation` because the wire byte keeps reporting the
+    /// server's own state and would clobber the event's dedup.
+    pub event_animation: Option<u8>,
 }
 
 /// One zone-DAT door directory: every Scheduler it holds (so a routine's 0x03
@@ -253,6 +270,9 @@ pub struct ZoneDoors {
     source_file_id: Option<u32>,
     dirs: HashMap<u32, DoorDir>,
     leaves: HashMap<DoorLeafKey, LeafMotion>,
+    /// Absolute FFXI-space height a lift's `@` group currently sits at, keyed by
+    /// FourCC; `crate::elevators` owns the value, the leaf pass applies it.
+    platform_heights: HashMap<u32, f32>,
     collision_rects: Vec<ZoneInteraction>,
     load: Option<Task<DoorZoneData>>,
 }
@@ -294,6 +314,30 @@ impl ZoneDoors {
         self.leaves.get(&key).map(|m| m.pose).unwrap_or_default()
     }
 
+    pub fn set_platform_height(&mut self, four_cc: u32, y: f32) {
+        self.platform_heights.insert(four_cc, y);
+    }
+
+    pub fn clear_platform_height(&mut self, four_cc: u32) {
+        self.platform_heights.remove(&four_cc);
+    }
+
+    /// Whether `four_cc` is a lift platform group with a known height.
+    pub fn is_platform(&self, four_cc: u32) -> bool {
+        self.platform_heights.contains_key(&four_cc)
+    }
+
+    pub fn leaf_pose(&self, leaf: &ZoneDoorLeaf) -> DoorPose {
+        let mut pose = self.pose(leaf.key());
+        if let Some(&y) = self.platform_heights.get(&leaf.four_cc) {
+            let base = leaf.posed_transform(DoorPose::default());
+            let mut translated = base.transform_point3(pose.translation);
+            translated.y = leaf.world_offset.y - y;
+            pose.translation = base.inverse().transform_point3(translated);
+        }
+        pose
+    }
+
     pub fn dir(&self, four_cc: u32) -> Option<&DoorDir> {
         self.dirs.get(&four_cc)
     }
@@ -306,6 +350,7 @@ impl ZoneDoors {
     fn clear_zone_state(&mut self) {
         self.dirs.clear();
         self.leaves.clear();
+        self.platform_heights.clear();
         self.collision_rects.clear();
         self.load = None;
     }
@@ -414,6 +459,10 @@ pub fn sync_zone_door_dirs(
 /// The first sighting is not a change: the byte is the door's *state*, so a door
 /// that is already open when it comes into view takes the on-arrival pose
 /// directly rather than swinging (and without its 0x0B sound).
+///
+/// The enqueue is insert-or-push like the other dispatchers: a door swing
+/// alongside another running routine on the same entity runs concurrently, and
+/// the push path leaves the first writer's ActionAssets alone.
 pub fn trigger_zone_doors(
     scene_state: Res<SceneState>,
     tracked: Res<TrackedEntities>,
@@ -439,12 +488,14 @@ pub fn trigger_zone_doors(
                     continue;
                 }
                 npc.animation = wire.animation;
+                npc.event_animation = None;
                 false
             }
             Err(_) => {
                 commands.entity(entity).try_insert(ZoneDoorNpc {
                     four_cc,
                     animation: wire.animation,
+                    event_animation: None,
                 });
                 true
             }
@@ -486,20 +537,117 @@ pub fn trigger_zone_doors(
             );
             continue;
         }
-        let Some(active) = ActiveScheduler::from_main(&dir.routines, &routine) else {
-            continue;
-        };
-        // Insert-or-push like the other dispatchers: a door swing alongside another running
-        // routine on the same entity runs concurrently; the push path leaves the first writer's
-        // ActionAssets alone.
-        crate::scheduler_runtime::enqueue_routine(&mut commands, entity, active);
-        commands.entity(entity).try_insert_if_new(ActionAssets {
-            seps: dir.seps.clone(),
-            ..Default::default()
-        });
+        swing_door(dir, &routine, entity, &mut commands);
         info!(
             "zone_doors: {label} runs {}",
             String::from_utf8_lossy(&routine)
+        );
+    }
+    flush_active_scheduler_inserts(&mut pending_inserts, &mut q_scheds, &mut commands);
+}
+
+/// Enqueue `routine` on `entity` with the Sep assets its sound stages resolve
+/// against; a routine the directory does not hold enqueues nothing.
+fn swing_door(dir: &DoorDir, routine: &[u8; 4], entity: Entity, commands: &mut Commands) {
+    let Some(active) = ActiveScheduler::from_main(&dir.routines, routine) else {
+        return;
+    };
+    crate::scheduler_runtime::enqueue_routine(commands, entity, active.with_target(Some(entity)));
+    commands.entity(entity).try_insert_if_new(ActionAssets {
+        seps: dir.seps.clone(),
+        ..Default::default()
+    });
+}
+
+/// Applies authored event door state (research/XiEvents/OpCodes/0x004C.md).
+pub fn trigger_event_doors(
+    events: Res<crate::snapshot::EventLog>,
+    scene_state: Res<SceneState>,
+    table: Res<crate::entity_table::EntityTable>,
+    tracked: Res<TrackedEntities>,
+    mut pending_inserts: Local<std::collections::HashMap<Entity, Vec<ActiveScheduler>>>,
+    doors: Res<ZoneDoors>,
+    mut q_npc: Query<&mut ZoneDoorNpc>,
+    mut q_scheds: Query<&mut ActiveSchedulers>,
+    mut commands: Commands,
+    mut last_seen: Local<u64>,
+) {
+    let new_count =
+        (events.pushed_total.saturating_sub(*last_seen)).min(events.recent.len() as u64) as usize;
+    *last_seen = events.pushed_total;
+    if new_count == 0 {
+        return;
+    }
+    for ev in events.recent.iter().rev().take(new_count).rev() {
+        if matches!(
+            ev,
+            kuluu_snapshot::ViewerEvent::CutsceneEnded
+                | kuluu_snapshot::ViewerEvent::ZoneChanged { .. }
+                | kuluu_snapshot::ViewerEvent::Disconnected { .. }
+        ) {
+            for mut npc in &mut q_npc {
+                npc.event_animation = None;
+            }
+            continue;
+        }
+        let kuluu_snapshot::ViewerEvent::Cutscene { cue } = *ev else {
+            continue;
+        };
+        let kuluu_snapshot::CutsceneCue::Mount {
+            target,
+            status_event,
+            mount_id,
+        } = cue
+        else {
+            continue;
+        };
+        // A mount id names a mount, not a door state.
+        if mount_id.is_some() {
+            continue;
+        }
+        let Some(routine) = (match status_event {
+            animation::OPEN_DOOR => Some(ROUTINE_OPEN),
+            animation::CLOSE_DOOR => Some(ROUTINE_CLOSE),
+            _ => None,
+        }) else {
+            continue;
+        };
+        let Some(id) = crate::scheduler_runtime::cutscene_actor_server_id(table.self_id(), target)
+        else {
+            continue;
+        };
+        let Some(wire) = scene_state.snapshot.entities.iter().find(|e| e.id == id) else {
+            continue;
+        };
+        let Some(four_cc) = door_four_cc(wire.look.as_ref()) else {
+            continue;
+        };
+        let Some(&entity) = tracked.by_id.get(&id) else {
+            continue;
+        };
+        match q_npc.get_mut(entity) {
+            Ok(mut npc) => {
+                if npc.event_animation.unwrap_or(npc.animation) == status_event {
+                    continue;
+                }
+                npc.event_animation = Some(status_event);
+            }
+            Err(_) => {
+                commands.entity(entity).try_insert(ZoneDoorNpc {
+                    four_cc,
+                    animation: wire.animation,
+                    event_animation: Some(status_event),
+                });
+            }
+        }
+        let Some(dir) = doors.dirs.get(&four_cc) else {
+            continue;
+        };
+        swing_door(dir, &routine, entity, &mut commands);
+        info!(
+            door = door_label(four_cc),
+            animation = status_event,
+            "zone_doors: event door state"
         );
     }
     flush_active_scheduler_inserts(&mut pending_inserts, &mut q_scheds, &mut commands);
@@ -573,7 +721,7 @@ pub fn apply_zone_door_stages(
 pub fn animate_zone_door_leaves(
     time: Res<Time>,
     mut doors: ResMut<ZoneDoors>,
-    mut q: Query<(&ZoneDoorLeaf, &mut Transform)>,
+    mut q: Query<(&ZoneDoorMesh, &mut Transform)>,
 ) {
     if doors.leaves.values().any(LeafMotion::animating) {
         let frames = time.delta_secs() * ROUTINE_FPS;
@@ -581,8 +729,8 @@ pub fn animate_zone_door_leaves(
             motion.advance(frames);
         }
     }
-    for (leaf, mut transform) in &mut q {
-        let posed = Transform::from_matrix(leaf.posed_transform(doors.pose(leaf.key())));
+    for (mesh, mut transform) in &mut q {
+        let posed = doors.leaf_pose(&mesh.0).local_transform();
         if *transform != posed {
             *transform = posed;
         }
@@ -597,6 +745,7 @@ impl Plugin for ZoneDoorsPlugin {
             Update,
             (
                 sync_zone_door_dirs,
+                trigger_event_doors,
                 trigger_zone_doors.before(crate::scheduler_runtime::tick_active_schedulers),
                 apply_zone_door_stages.after(crate::scheduler_runtime::tick_active_schedulers),
                 animate_zone_door_leaves,
@@ -658,6 +807,8 @@ mod tests {
                 actor_fade: None,
                 idle_transition_time: None,
                 flinch_duration: None,
+                model_visibility: None,
+                spell_effect: None,
                 random_group: None,
                 local_dir: ffxi_dat::scheduler::NO_LOCAL_DIR,
             },
@@ -741,7 +892,7 @@ mod tests {
         let m = app
             .world()
             .entity(leaf)
-            .get::<Transform>()
+            .get::<GlobalTransform>()
             .unwrap()
             .to_matrix();
         m.transform_point3(Vec3::X)
@@ -755,7 +906,8 @@ mod tests {
     fn an_animation_byte_change_swings_the_tagged_leaves() {
         let swing = SSANDY_STABLES_SWING_DEG.to_radians();
         let mut app = App::new();
-        app.init_resource::<Time>()
+        app.add_plugins(bevy::transform::TransformPlugin)
+            .init_resource::<Time>()
             .init_resource::<SceneState>()
             .init_resource::<TrackedEntities>()
             .init_resource::<ZoneDoors>()
@@ -797,8 +949,12 @@ mod tests {
         let leaves: Vec<Entity> = (0..2)
             .map(|slot| {
                 let leaf = ZoneDoorLeaf::new(slot, &placement(&SSANDY_STABLES_DOOR, 0.0, 1.0));
-                app.world_mut()
+                let parent = app
+                    .world_mut()
                     .spawn((leaf, Transform::from_matrix(shut[slot as usize])))
+                    .id();
+                app.world_mut()
+                    .spawn((ZoneDoorMesh(leaf), Transform::default(), ChildOf(parent)))
                     .id()
             })
             .collect();
@@ -836,6 +992,217 @@ mod tests {
                 "closing returns leaf {slot} to the authored placement pose"
             );
         }
+    }
+
+    /// The 0x4C/0x4D/0x4F StatusEvent writes on the Mount cue swing the door
+    /// the target's look names, with the server's byte still shut: the event is
+    /// the only trigger. A repeated cue and a non-door status swing nothing.
+    #[test]
+    fn an_event_cue_swings_the_door_and_dedups_on_the_same_state() {
+        let swing = SSANDY_STABLES_SWING_DEG.to_radians();
+        let mut app = App::new();
+        app.add_plugins(bevy::transform::TransformPlugin)
+            .init_resource::<Time>()
+            .init_resource::<SceneState>()
+            .init_resource::<TrackedEntities>()
+            .init_resource::<ZoneDoors>()
+            .init_resource::<crate::entity_table::EntityTable>()
+            .init_resource::<crate::snapshot::EventLog>()
+            .add_message::<SchedulerStageEvent>()
+            .add_message::<crate::scheduler_runtime::CutsceneMotionDone>()
+            .add_systems(
+                Update,
+                (
+                    trigger_event_doors,
+                    trigger_zone_doors,
+                    crate::scheduler_runtime::tick_active_schedulers,
+                    apply_zone_door_stages,
+                    animate_zone_door_leaves,
+                )
+                    .chain(),
+            );
+        app.world_mut()
+            .resource_mut::<ZoneDoors>()
+            .dirs
+            .insert(u32::from_le_bytes(SSANDY_STABLES_DOOR), swing_dir(swing));
+
+        let npc = app.world_mut().spawn_empty().id();
+        app.world_mut()
+            .resource_mut::<TrackedEntities>()
+            .by_id
+            .insert(DOOR_ENTITY_ID, npc);
+        let shut: Vec<Mat4> = (0..2)
+            .map(|slot| {
+                ZoneDoorLeaf::new(slot, &placement(&SSANDY_STABLES_DOOR, 0.0, 1.0))
+                    .posed_transform(DoorPose::default())
+            })
+            .collect();
+        let leaves: Vec<Entity> = (0..2)
+            .map(|slot| {
+                let leaf = ZoneDoorLeaf::new(slot, &placement(&SSANDY_STABLES_DOOR, 0.0, 1.0));
+                let parent = app
+                    .world_mut()
+                    .spawn((leaf, Transform::from_matrix(shut[slot as usize])))
+                    .id();
+                app.world_mut()
+                    .spawn((ZoneDoorMesh(leaf), Transform::default(), ChildOf(parent)))
+                    .id()
+            })
+            .collect();
+        app.world_mut()
+            .resource_mut::<SceneState>()
+            .snapshot
+            .entities = vec![door_entity(DOOR_ENTITY_ID, animation::CLOSE_DOOR)];
+
+        let push_cue = |app: &mut App, cue: kuluu_snapshot::CutsceneCue| {
+            app.world_mut()
+                .resource_mut::<crate::snapshot::EventLog>()
+                .push(kuluu_snapshot::ViewerEvent::Cutscene { cue });
+        };
+        let open_cue = kuluu_snapshot::CutsceneCue::Mount {
+            target: kuluu_snapshot::CutsceneActor::Entity {
+                server_id: DOOR_ENTITY_ID,
+            },
+            status_event: animation::OPEN_DOOR,
+            mount_id: None,
+        };
+
+        push_cue(&mut app, open_cue);
+        step(&mut app, SWING_FRAMES as f32 / 2.0);
+        for (slot, leaf) in leaves.iter().enumerate() {
+            assert!(
+                swept(&app, *leaf, shut[slot]) > 0.0,
+                "leaf {slot} swings on the event cue, the server byte still shut"
+            );
+        }
+        step(&mut app, SWING_FRAMES as f32 / 2.0);
+
+        // The same state again: no second swing.
+        let at = (0..2)
+            .map(|slot| swept(&app, leaves[slot], shut[slot]))
+            .collect::<Vec<_>>();
+        push_cue(&mut app, open_cue);
+        step(&mut app, 1.0);
+        for (slot, leaf) in leaves.iter().enumerate() {
+            assert_eq!(
+                swept(&app, *leaf, shut[slot]),
+                at[slot],
+                "leaf {slot} does not re-swing on the same state"
+            );
+        }
+
+        // A status no routine names swings nothing; the current door state
+        // again dedups.
+        for status in [animation::CHOCOBO, animation::OPEN_DOOR] {
+            let before = (0..2)
+                .map(|slot| swept(&app, leaves[slot], shut[slot]))
+                .collect::<Vec<_>>();
+            push_cue(
+                &mut app,
+                kuluu_snapshot::CutsceneCue::Mount {
+                    target: kuluu_snapshot::CutsceneActor::Entity {
+                        server_id: DOOR_ENTITY_ID,
+                    },
+                    status_event: status,
+                    mount_id: (status == animation::CHOCOBO).then_some(1),
+                },
+            );
+            step(&mut app, 1.0);
+            for (slot, leaf) in leaves.iter().enumerate() {
+                assert_eq!(
+                    swept(&app, *leaf, shut[slot]),
+                    before[slot],
+                    "status {status} swings nothing"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn event_door_override_releases_on_server_change_and_event_end() {
+        let mut app = App::new();
+        app.init_resource::<SceneState>()
+            .init_resource::<TrackedEntities>()
+            .init_resource::<ZoneDoors>()
+            .init_resource::<crate::entity_table::EntityTable>()
+            .init_resource::<crate::snapshot::EventLog>()
+            .add_systems(Update, (trigger_event_doors, trigger_zone_doors).chain());
+        app.world_mut().resource_mut::<ZoneDoors>().dirs.insert(
+            u32::from_le_bytes(SSANDY_STABLES_DOOR),
+            swing_dir(SSANDY_STABLES_SWING_DEG.to_radians()),
+        );
+        let npc = app.world_mut().spawn_empty().id();
+        app.world_mut()
+            .resource_mut::<TrackedEntities>()
+            .by_id
+            .insert(DOOR_ENTITY_ID, npc);
+        app.world_mut()
+            .resource_mut::<SceneState>()
+            .snapshot
+            .entities = vec![door_entity(DOOR_ENTITY_ID, animation::CLOSE_DOOR)];
+        let open = kuluu_snapshot::ViewerEvent::Cutscene {
+            cue: kuluu_snapshot::CutsceneCue::Mount {
+                target: kuluu_snapshot::CutsceneActor::Entity {
+                    server_id: DOOR_ENTITY_ID,
+                },
+                status_event: animation::OPEN_DOOR,
+                mount_id: None,
+            },
+        };
+        app.world_mut()
+            .resource_mut::<crate::snapshot::EventLog>()
+            .push(open.clone());
+        app.update();
+        app.world_mut()
+            .resource_mut::<SceneState>()
+            .snapshot
+            .entities[0]
+            .animation = animation::OPEN_DOOR;
+        app.update();
+        app.world_mut()
+            .resource_mut::<SceneState>()
+            .snapshot
+            .entities[0]
+            .animation = animation::CLOSE_DOOR;
+        app.update();
+        let before = app
+            .world()
+            .get::<ActiveSchedulers>(npc)
+            .unwrap()
+            .routine_names()
+            .count();
+        app.world_mut()
+            .resource_mut::<crate::snapshot::EventLog>()
+            .push(open.clone());
+        app.update();
+        assert_eq!(
+            app.world()
+                .get::<ActiveSchedulers>(npc)
+                .unwrap()
+                .routine_names()
+                .count(),
+            before + 1
+        );
+        app.world_mut()
+            .resource_mut::<crate::snapshot::EventLog>()
+            .push(kuluu_snapshot::ViewerEvent::CutsceneEnded);
+        app.update();
+        assert_eq!(
+            app.world().get::<ZoneDoorNpc>(npc).unwrap().event_animation,
+            None
+        );
+        app.world_mut()
+            .resource_mut::<crate::snapshot::EventLog>()
+            .push(open);
+        app.update();
+        assert_eq!(
+            app.world()
+                .get::<ActiveSchedulers>(npc)
+                .unwrap()
+                .routine_names()
+                .count(),
+            before + 2
+        );
     }
 
     #[test]
@@ -897,23 +1264,109 @@ mod tests {
     }
 
     #[test]
-    fn mirrored_leaf_keeps_the_stage_sign() {
+    fn mirrored_pair_free_edges_open_to_the_same_side() {
         let swing = SSANDY_STABLES_SWING_DEG.to_radians();
-        let pose = DoorPose {
-            rotation: Vec3::new(0.0, swing, 0.0),
-            ..Default::default()
-        };
-        // The second Southern San d'Oria leaf is the first mirrored through
-        // scale.z; one positive stage value swings both outward, so the renderer
-        // must not negate it per leaf.
-        let mirrored = ZoneDoorLeaf::new(1, &placement(&SSANDY_STABLES_DOOR, 0.0, -1.0));
-        let plain = ZoneDoorLeaf::new(0, &placement(&SSANDY_STABLES_DOOR, 0.0, 1.0));
-        let mirrored_yaw = mirrored.posed_transform(pose) * Vec3::X.extend(0.0);
-        let plain_yaw = plain.posed_transform(pose) * Vec3::X.extend(0.0);
-        assert!(
-            (mirrored_yaw - plain_yaw).length() < 1e-5,
-            "the mirror lives in the placement's scale, not in the stage value"
-        );
+        for mirror in [Vec3::new(-1.0, 1.0, 1.0), Vec3::new(1.0, 1.0, -1.0)] {
+            for angle in [swing, -swing] {
+                let pose = DoorPose {
+                    rotation: Vec3::Y * angle,
+                    ..Default::default()
+                };
+                let plain = ZoneDoorLeaf::new(0, &placement(&SSANDY_STABLES_DOOR, 0.0, 1.0));
+                let mut mirrored_placement = placement(&SSANDY_STABLES_DOOR, 0.0, 1.0);
+                mirrored_placement.scale = mirror.to_array();
+                let mirrored = ZoneDoorLeaf::new(1, &mirrored_placement);
+                let plain_edge = plain
+                    .posed_transform(DoorPose::default())
+                    .inverse()
+                    .transform_vector3(Vec3::X);
+                let mirrored_edge = mirrored
+                    .posed_transform(DoorPose::default())
+                    .inverse()
+                    .transform_vector3(-Vec3::X);
+                let plain_push = plain.posed_transform(pose).transform_vector3(plain_edge).z;
+                let mirrored_push = mirrored
+                    .posed_transform(pose)
+                    .transform_vector3(mirrored_edge)
+                    .z;
+                assert!(
+                    plain_push * mirrored_push > 0.0,
+                    "mirror={mirror:?}, angle={angle}, pushes={plain_push},{mirrored_push}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mesh_hierarchy_preserves_nonuniform_mirrored_affine_and_cleanup() {
+        const NONUNIFORM_SCALE: Vec3 = Vec3::new(-0.89, 0.82, 1.0);
+        const MATRIX_TOLERANCE: f32 = 1e-5;
+        let mut p = placement(&SSANDY_STABLES_DOOR, std::f32::consts::FRAC_PI_4, 1.0);
+        p.scale = NONUNIFORM_SCALE.to_array();
+        let leaf = ZoneDoorLeaf::new(0, &p);
+        let mut app = App::new();
+        app.add_plugins(bevy::transform::TransformPlugin)
+            .init_resource::<Time>()
+            .init_resource::<ZoneDoors>()
+            .add_systems(Update, animate_zone_door_leaves);
+        app.world_mut()
+            .resource_mut::<ZoneDoors>()
+            .leaves
+            .entry(leaf.key())
+            .or_default()
+            .snap(
+                StageKind::ModelRotation,
+                Vec3::Y * std::f32::consts::FRAC_PI_4,
+            );
+        let parent = app
+            .world_mut()
+            .spawn((
+                leaf,
+                Transform::from_matrix(leaf.posed_transform(DoorPose::default())),
+            ))
+            .id();
+        let mesh = app
+            .world_mut()
+            .spawn((ZoneDoorMesh(leaf), Transform::default(), ChildOf(parent)))
+            .id();
+        app.update();
+        let actual = app
+            .world()
+            .get::<GlobalTransform>(mesh)
+            .unwrap()
+            .to_matrix();
+        let pose = app.world().resource::<ZoneDoors>().leaf_pose(&leaf);
+        let expected = leaf.posed_transform(pose);
+        assert!((actual - expected)
+            .to_cols_array()
+            .iter()
+            .all(|v| v.abs() < MATRIX_TOLERANCE));
+        let flattened = Transform::from_matrix(expected).to_matrix();
+        assert!((flattened - expected)
+            .to_cols_array()
+            .iter()
+            .any(|v| v.abs() > MATRIX_TOLERANCE));
+        app.world_mut().entity_mut(parent).despawn();
+        assert!(app.world().get_entity(mesh).is_err());
+    }
+
+    #[test]
+    fn platform_world_height_survives_local_translation_composition() {
+        const PLATFORM_HEIGHT: f32 = 7.0;
+        const WORLD_OFFSET: Vec3 = Vec3::new(3.0, 4.0, 5.0);
+        const HEIGHT_TOLERANCE: f32 = 1e-5;
+        let mut p = placement(&SSANDY_STABLES_DOOR, std::f32::consts::FRAC_PI_4, -1.0);
+        p.scale[1] = 2.0;
+        p.rot[0] = std::f32::consts::FRAC_PI_4;
+        let leaf = ZoneDoorLeaf::new(0, &p).with_world_offset(WORLD_OFFSET);
+        let mut doors = ZoneDoors::default();
+        doors.set_platform_height(leaf.four_cc, PLATFORM_HEIGHT);
+        let actual = leaf
+            .posed_transform(doors.leaf_pose(&leaf))
+            .transform_point3(Vec3::ZERO);
+        assert!((actual.y - (WORLD_OFFSET.y - PLATFORM_HEIGHT)).abs() < HEIGHT_TOLERANCE);
+        doors.clear_platform_height(leaf.four_cc);
+        assert_eq!(doors.leaf_pose(&leaf), DoorPose::default());
     }
 
     #[test]
@@ -1100,7 +1553,8 @@ mod tests {
             door_four_cc(Some(&EntityLook::Transport {
                 size: 3,
                 model_id: None,
-                animation_start: None
+                animation_start: None,
+                travel_secs: None,
             })),
             None
         );

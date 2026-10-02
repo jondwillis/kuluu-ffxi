@@ -13,9 +13,12 @@ use kuluu_render::hud::shop::{
 /// - a zone change takes the vendor with it (the retail shop table lives in
 ///   GC_ZONE — research/XIClient GC_ZONE::gcShop), and a zone change is not an
 ///   `AppPhase` transition, so no state-exit cleanup fires for us (kuluu-oe8y);
-/// - walking out of the vendor's trigger range ends the conversation, the same
-///   distance LSB requires to start one
+/// - walking out of the vendor's trigger range ends the conversation, at the
+///   same distance LSB requires to start one
 ///   (vendor/server/src/map/packets/c2s/0x01a_action.cpp Trigger).
+///
+/// A shop that opens while another window owns the cursor waits behind it;
+/// the window takes focus only from the world.
 pub fn shop_mode_sync_system(
     state: Res<SceneState>,
     cmd_tx: Res<CommandTx>,
@@ -39,8 +42,6 @@ pub fn shop_mode_sync_system(
         return;
     };
 
-    // Closed on this side already; the snapshot just has not caught up. Do not
-    // reopen the window on top of the player.
     if screen.dismissed {
         if matches!(*mode, InputMode::Shop) {
             *mode = InputMode::World;
@@ -54,8 +55,6 @@ pub fn shop_mode_sync_system(
     }
 
     if !matches!(*mode, InputMode::Shop) {
-        // A shop that opened while another window owned the cursor still waits
-        // behind it; taking focus is only right from the world.
         if matches!(*mode, InputMode::World) {
             screen.reset();
             *mode = InputMode::Shop;
@@ -80,14 +79,14 @@ fn close_shop(cmd_tx: &CommandTx, mode: &mut InputMode, screen: &mut ShopScreenS
 
 /// Whether the vendor has left the player's reach. A shop with no resolved
 /// vendor (`vendor_id == 0`, e.g. one opened by a server-driven menu rather
-/// than a Talk) has no anchor to measure against and stays open.
+/// than a Talk) has no anchor to measure against and stays open; a vendor
+/// that despawned or fell out of the entity table counts as out of reach.
 fn vendor_out_of_range(snap: &kuluu_snapshot::SceneSnapshot, vendor_id: u32) -> bool {
     if vendor_id == 0 {
         return false;
     }
     match snap.entities.iter().find(|e| e.id == vendor_id) {
         Some(vendor) => out_of_reach(snap.self_pos.pos, vendor.pos),
-        // The vendor despawned or fell out of the entity table.
         None => true,
     }
 }
@@ -218,7 +217,9 @@ fn handle_list_key(
 }
 
 /// Answer the row the cursor is on: size the stack, or move a lone item
-/// outright.
+/// outright. A sell row carries no price of its own, so the first confirm
+/// buys the quote: appraise a single unit and let the picker show what each
+/// one is worth before the player commits to a count.
 fn activate_row(
     screen: &mut ShopScreenState,
     scene_state: &mut SceneState,
@@ -230,9 +231,6 @@ fn activate_row(
     };
     match begin_quantity(screen.mode, &row) {
         Some(spinner) => {
-            // A sell row carries no price of its own, so the first confirm buys
-            // the quote: appraise a single unit and let the picker show what
-            // each one is worth before the player commits to a count.
             if matches!(screen.mode, ShopMode::Sell) {
                 clear_appraisal(scene_state);
                 request_appraisal(cmd_tx, &row, 1);
@@ -292,6 +290,8 @@ fn handle_quantity_key(
     spinner_nav(spinner, key, bindings);
 }
 
+/// Walk the confirm box. It is two rows, so either axis walks them — retail's
+/// Log Out prompt answers to Left, the stacked Yes/No boxes to Up/Down.
 fn handle_confirm_key(
     key: &Key,
     bindings: &Bindings,
@@ -303,8 +303,6 @@ fn handle_confirm_key(
         decline(screen, cmd_tx);
         return;
     }
-    // Two rows, so either axis walks them — retail's Log Out prompt answers to
-    // Left, the stacked Yes/No boxes to Up/Down.
     for action in [
         Action::NavUp,
         Action::NavDown,
@@ -322,7 +320,8 @@ fn handle_confirm_key(
 }
 
 /// Send the confirm box's answer. Confirming with the cursor on No is the same
-/// answer as cancelling.
+/// answer as cancelling. In Sell mode the appraisal is what the player is
+/// answering; until it lands there is no price to say yes to.
 fn answer_confirm(
     screen: &mut ShopScreenState,
     scene_state: &mut SceneState,
@@ -346,8 +345,6 @@ fn answer_confirm(
             screen.focus = ShopFocus::List;
         }
         ShopMode::Sell => {
-            // The appraisal is what the player is answering; until it lands
-            // there is no price to say yes to.
             if shop::confirmed_sale(screen, &scene_state.snapshot).is_none() {
                 return;
             }
@@ -382,7 +379,11 @@ fn begin_quantity(mode: ShopMode, row: &ShopRow) -> Option<DigitSpinner> {
 
 /// Take the sized amount into the priced step. A buy prices itself from the
 /// listed unit price; a sell has to ask the server, so it sends the 0x084
-/// appraisal and waits for the 0x03D answer to fill the prompt in.
+/// appraisal (vendor/server/src/map/packets/c2s/0x084_shop_sell_req.cpp) and
+/// waits for the 0x03D answer
+/// (vendor/server/src/map/packets/s2c/0x03d_shop_sell.cpp) to fill the prompt
+/// in. A sell re-prices at the chosen count: the quote shown while sizing was
+/// for one unit, and the confirm prompt states the whole sale.
 fn commit_quantity(
     screen: &mut ShopScreenState,
     scene_state: &mut SceneState,
@@ -403,8 +404,6 @@ fn commit_quantity(
             screen.quantity = None;
             screen.pending_sell = Some((row.index, row.item_no, quantity));
             screen.enter_confirm();
-            // Re-price at the chosen count: the quote shown while sizing was
-            // for one unit, and the confirm prompt states the whole sale.
             clear_appraisal(scene_state);
             request_appraisal(cmd_tx, row, quantity);
         }
@@ -557,7 +556,6 @@ mod tests {
             );
         }
 
-        // The session finally clears the stock: the latch lifts.
         app.world_mut().resource_mut::<SceneState>().snapshot.shop = None;
         app.update();
         assert!(!app.world().resource::<ShopScreenState>().dismissed);

@@ -56,14 +56,14 @@ const WORM_FILE: u32 = 1724;
 /// kil0/bom0/kil1/efon). The S6c/S6d victim: a crit on it must fall back to damg, and only
 /// when the global dir's ldam is out of reach.
 const NOLDA_FILE: u32 = 52087;
-/// ROM/4/106.DAT - flying bat; its 0x45 Info chunk carries movement byte 3 (Flying) and scale
-/// byte 85, so the live pipeline must load it at 85 percent with no wire stride scale.
+/// ROM/4/106.DAT - flying bat; its Info chunk carries movement byte 3 (Flying) and
+/// scale byte 85, so the live pipeline must load it at 85 percent with no wire stride scale.
 const BAT_FILE: u32 = 1564;
 /// ROM/3/60.DAT - walking mob whose Info chunk carries scale byte 100: the unchanged control
 /// for S8's model-scale assertion.
 const WALKER_FILE: u32 = 1386;
 
-// World ids used by the hand-packed packets. Rarab carries its real zone-115 entity id.
+/// World ids used by the hand-packed packets. Rarab carries its real zone-115 entity id.
 const RARAB_W: u32 = 17_248_272;
 const HUMEM_W: u32 = 9_000_001;
 const RARAB2_W: u32 = 9_000_002;
@@ -98,7 +98,8 @@ fn install() -> Option<ffxi_dat::DatRoot> {
 
 struct Bits {
     bytes: Vec<u8>,
-    pos: u32, // absolute bit index; the packet header occupies bits 0..7
+    /// Absolute bit index; the packet header occupies bits 0..7.
+    pos: u32,
 }
 
 impl Bits {
@@ -140,17 +141,17 @@ fn pack_battle2(
 ) -> Vec<u8> {
     let mut b = Bits::new();
     b.write(actor_id, 32);
-    b.write(u32::from(target.is_some()), 6); // trg_sum
-    b.write(0, 4); // res_sum (unused by the client reader)
+    b.write(u32::from(target.is_some()), 6);
+    b.write(0, 4);
     b.write(action_kind as u32, 4);
-    b.write(0, 32); // action_id - BATTLE2 cmd_arg is FourCC::BasicAttack for every swing
-    b.write(0, 32); // info
+    b.write(0, 32);
+    b.write(0, 32);
     if let Some(t) = target {
         b.write(t, 32);
-        b.write(u32::from(result.is_some()), 4); // nres
+        b.write(u32::from(result.is_some()), 4);
         if let Some((resolution, animation, info, distortion, knockback)) = result {
             b.write(resolution, 3);
-            b.write(0, 2); // kind (uninterpreted)
+            b.write(0, 2);
             b.write(animation, 12);
             b.write(info, 5);
             b.write(distortion, 2);
@@ -178,32 +179,29 @@ fn action_event(bytes: &[u8]) -> ViewerEvent {
     }
 }
 
-// ---------------------------------------------------------------------------
-// App + entity rig
-// ---------------------------------------------------------------------------
-
 /// Deterministic app: real scheduler plugin + pose path, no GPU. dt = 1/60 s per update, so the
-/// routine clock (ROUTINE_FPS=60) advances exactly one frame per `step`.
+/// routine clock (ROUTINE_FPS=60) advances exactly one frame per `step`. The rig mirrors the
+/// production ownership notes below each resource init.
 fn build_app() -> App {
     // A bare `App::new()` skips bevy's TaskPoolPlugin, but the scheduler plugin spawns its
     // global-effect-dir load on the async compute pool - initialize it exactly like the
-    // dat_mzb/zone_doors tests do.
+    // dat_mzb.rs/zone_doors.rs tests do.
     bevy::tasks::AsyncComputeTaskPool::get_or_init(Default::default);
     let mut app = App::new();
     // Every action-DAT read (ROM/0/0.DAT's global effect dir included) resolves through the
-    // shared root the host wires; without one here Bevy auto-inserts the default None and the
-    // global dir lands empty, so S6c/S6d's ldam precondition can never hold. Wire it from the
-    // same test install load_npc/load_pc use.
+    // shared root the host wires (view_native/mod.rs); without one here Bevy auto-inserts the
+    // default None and the global dir lands empty, so S6c/S6d's ldam precondition cannot be
+    // met. Wire it from the same test install load_npc/load_pc use.
     let root = install().map(Arc::new);
     app.insert_resource(ActionDatRoot(root.clone()));
     app.insert_resource(kuluu_render::ffxi_actor_render::ActorDatRoot(root));
     app.init_resource::<Time>();
-    // The plugin's particle systems take asset stores as ResMut; a bare app has none of them.
     app.init_resource::<bevy::asset::Assets<bevy::prelude::Mesh>>();
     app.init_resource::<bevy::asset::Assets<kuluu_render::ffxi_particle_material::FfxiParticleMaterial>>();
     app.init_resource::<bevy::asset::Assets<bevy::image::Image>>();
-    // The plugin's Update chain includes poll_action_dat_tasks, which takes a bare
-    // Res<CameraMode>; a bare app has no such resource, so the first update panics.
+    // The plugin's Update chain includes poll_action_dat_tasks (scheduler_runtime.rs),
+    // which takes a bare Res<CameraMode>; a bare app has no such resource, so the first
+    // update panics.
     app.init_resource::<kuluu_render::camera::CameraMode>();
     app.add_plugins(SchedulerRuntimePlugin);
     // The plugin's chain is .after(dispatch_action_overlay), and
@@ -217,14 +215,11 @@ fn build_app() -> App {
         (
             dispatch_action_overlay.before(tick_live_ffxi_actors),
             apply_invis_flag_system.before(tick_live_ffxi_actors),
-            // One subject use for the pose pass (Bevy 0.19: each subject registration is a
-            // distinct instance; ordering against an ambiguous name panics at schedule init).
             tick_live_ffxi_actors
                 .after(kuluu_render::scheduler_runtime::dispatch_melee_action_started)
                 .before(kuluu_render::scheduler_runtime::tick_active_schedulers),
         ),
     );
-    // The plugin's sound stages write SfxEvent; an unregistered message would panic.
     app.add_message::<SfxEvent>();
     app.init_resource::<EventLog>();
     app.init_resource::<TrackedEntities>();
@@ -239,7 +234,8 @@ fn build_app() -> App {
     // Production visibility ownership (lib.rs): apply_invis_flag_system resets every skinned model
     // root's Visibility from the wire invis flag each frame, and tick_live_ffxi_actors runs after it
     // so a status-INVISIBLE entity's Hidden write wins for that frame. The rig must mirror both: with
-    // no reset system in place, a once-set Hidden would latch forever here (s12's resurface).
+    // no reset system in place, a once-set Hidden would latch for the rest of the scenario here
+    // (s12's resurface).
     app.init_resource::<EntityTable>();
     app.insert_resource(EntityMaterials {
         pc: Default::default(),
@@ -267,7 +263,7 @@ fn spawn_actor(
     let actor = make_render_actor(loaded, 0, Vec::new(), world_id, 0.0, 1.0);
     // The pose path's query requires GlobalTransform + Visibility on the model root; a bare
     // spawn in this rig gets neither (Bevy does not auto-insert them here), so insert both -
-    // matching what scene::spawn_live_actor gives every production actor.
+    // matching what ffxi_actor_render.rs's spawn_live_actor gives every production actor.
     let child = app
         .world_mut()
         .spawn((
@@ -285,7 +281,6 @@ fn spawn_actor(
             kind,
         })
         .id();
-    // Bevy maintains the parent's Children immediately via the ChildOf component hook.
     app.world_mut().entity_mut(child).insert(ChildOf(parent));
     // Production shape (scene.rs): the wire entity carries FfxiRenderRoot pointing at its model
     // root; that link is how apply_invis_flag_system finds each frame's visibility reset target.
@@ -389,8 +384,8 @@ fn step_n(app: &mut App, n: u32) -> u32 {
     n
 }
 
-// The probes read through a `&World` handed in by [`watch`] so the closure never borrows
-// the `App` that `step` mutably drives.
+/// Reads through a `&World` handed in by [`watch`] so the closure does not borrow
+/// the `App` that `step` mutably drives.
 fn active_clip(world: &bevy::prelude::World, child: Entity) -> Option<String> {
     world
         .entity(child)
@@ -430,8 +425,8 @@ fn push_battle2(
 }
 
 /// Wait for the async global effect dir load (ROM/0/0.DAT) to land, then remove it so no lookup
-/// can rescue a routine from there. The poll system inserts exactly once and never re-inserts,
-/// so the removal holds for the rest of the scenario. Asserting ldam is present first keeps the
+/// can rescue a routine from there. The poll system inserts exactly once and does not
+/// re-insert, so the removal holds for the rest of the scenario. Asserting ldam is present first keeps the
 /// S6c/S6d fallback honest: without this step the global dir's own ldam would satisfy the guard.
 fn drop_global_effect_dir(app: &mut App) {
     for _ in 0..600 {
@@ -469,11 +464,8 @@ fn watch(
     (first, samples)
 }
 
-// ---------------------------------------------------------------------------
-// S1/S2 - spawn + idle baseline
-// ---------------------------------------------------------------------------
-
-/// S1: spawn Rarab, no events. No panic; the pose settles on an idl? clip and stays there.
+/// S1/S2 - spawn + idle baseline. S1: spawn Rarab, no events. No panic; the pose settles
+/// on an idl? clip and stays there.
 #[test]
 fn s1_spawn_settles_on_idle() {
     let Some(loaded) = load_rarab() else { return };
@@ -487,25 +479,27 @@ fn s1_spawn_settles_on_idle() {
         "fresh Rarab idles on {clip}, not a battle/death clip"
     );
 
-    // S2: three more seconds of idle - still the same family, no panic.
     step_n(&mut app, 180);
     let clip = pose_clip(app.world(), child).expect("pose pass ran");
     assert!(clip.starts_with("idl"), "idle held for 3 s, now {clip}");
 }
 
-// ---------------------------------------------------------------------------
-// S3/S4 - gait selection from the motion sample
-// ---------------------------------------------------------------------------
-
+/// S3/S4 - gait selection from the motion sample.
 fn moving_sample(speed: f32) -> MotionSample {
-    // Only `moving` drives the pose pass in this rig (track_entity_motion_system is not
-    // registered); gait selection reads speed > speed_base, not this value.
+    // Only `moving` drives the pose pass in this rig (combat_stance.rs's
+    // track_entity_motion_system is not registered); gait selection reads
+    // speed > speed_base, not this value.
     MotionSample {
         speed,
         moving: true,
         ..Default::default()
     }
 }
+
+/// Wire speed bytes the S3/S4 gait tests drive: at the base the gait rule
+/// (speed > speed_base) selects walk, above it run.
+const GAIT_BASE_SPEED: u8 = 40;
+const GAIT_RUN_SPEED: u8 = 50;
 
 /// Set the wire speed bytes on an entity's snapshot entry; the next pose pass rebuilds the
 /// index from them and applies the gait rule (run = speed > speed_base).
@@ -531,7 +525,7 @@ fn s3_walk_gait_selects_wlk_clip() {
         .resource_mut::<EntityMotion>()
         .by_id
         .insert(RARAB_W, moving_sample(1.0));
-    set_wire_gait(&mut app, RARAB_W, 40, 40); // speed at base = walk
+    set_wire_gait(&mut app, RARAB_W, GAIT_BASE_SPEED, GAIT_BASE_SPEED);
 
     let (first, _) = watch(&mut app, 60, |i, w| {
         i >= 2 && pose_clip(w, child).is_some_and(|c| c.starts_with("wlk"))
@@ -554,7 +548,7 @@ fn s4_run_gait_selects_run_clip() {
         .resource_mut::<EntityMotion>()
         .by_id
         .insert(RARAB_W, moving_sample(4.0));
-    set_wire_gait(&mut app, RARAB_W, 50, 40); // run factor lifted speed above base = run
+    set_wire_gait(&mut app, RARAB_W, GAIT_RUN_SPEED, GAIT_BASE_SPEED);
 
     let (first, _) = watch(&mut app, 60, |i, w| {
         i >= 2 && pose_clip(w, child).is_some_and(|c| c.starts_with("run"))
@@ -562,11 +556,8 @@ fn s4_run_gait_selects_run_clip() {
     assert!(first.is_some(), "run gait selected run? within 1 s");
 }
 
-// ---------------------------------------------------------------------------
-// S5/S5b - swing impact hands off to the victim reaction AT the inlined DamageCallback frame
-// ---------------------------------------------------------------------------
-
-/// Rarab swings RightAttack at HumeM (Hit, dist=0, kb=0). Expect: at0? on the attacker from
+/// S5/S5b - swing impact hands off to the victim reaction AT the inlined DamageCallback
+/// frame. Rarab swings RightAttack at HumeM (Hit, dist=0, kb=0). Expect: at0? on the attacker from
 /// ~frame 1; at the inlined DamageCallback impact (~36 for ati0) HumeM runs `damg` (it ships no sdam of
 /// its own - the reaction table falls through to damg) and its flinch stage starts dfm? on the PC host.
 #[test]
@@ -579,17 +570,13 @@ fn s5_swing_impact_runs_damg_and_flinches_the_pc() {
     let (vic_parent, vic_child) = spawn_actor(&mut app, HUMEM_W, EntityKind::Pc, &humem);
     step_n(&mut app, 10);
 
-    // res=Hit(0), anim=RightAttack(0), info=0, dist=0, kb=0.
     push_battle2(&mut app, RARAB_W, 1, Some(HUMEM_W), Some((0, 0, 0, 0, 0)));
 
-    // The overlay/pose path picks the swing clip from BATTLE2's animation field (D6).
     let (swing_at, _) = watch(&mut app, 5, |i, w| {
         i >= 1 && active_clip(w, atk_child).is_some_and(|c| c.starts_with("at0"))
     });
     assert!(swing_at.is_some(), "attacker plays the at0? swing clip");
 
-    // Impact: damg queued on the victim AND its flinch stage started dfm?. The inlined DamageCallback
-    // fires at routine frame 36 (ati0 calls dada @32, +4 delay); allow dispatch slack.
     let (impact_at, _) = watch(&mut app, 45, |_i, w| {
         routines(w, vic_parent).contains(b"damg")
             && active_clip(w, vic_child).is_some_and(|c| c.starts_with("dfm"))
@@ -602,10 +589,10 @@ fn s5_swing_impact_runs_damg_and_flinches_the_pc() {
 }
 
 /// S5b: same swing, victim = a second Rarab. Retail's dam0 branch table routes every non-crit
-/// Hit to damg/damh - both carry the 0x21 flinch stage (ROM/0/0.DAT), so the mob victim runs
-/// its own `damg` and flinches with dfi? on a normal hit. This is the "animations not playing"
-/// case: sdam-shipping models like Rarab must get a visible flinch on normal hits (sdam is
-/// sound-only).
+/// Hit to damg/damh - both carry the 0x21 flinch stage (research/xim
+/// EffectRoutineInterpolatedEffects.kt), so the mob victim runs its own `damg` and flinches
+/// with dfi? on a normal hit. This is the "animations not playing" case: sdam-shipping models
+/// like Rarab must get a visible flinch on normal hits (sdam is sound-only).
 #[test]
 fn s5b_mob_victim_normal_hit_runs_damg_and_flinches() {
     let Some(rarab) = load_rarab() else { return };
@@ -624,16 +611,11 @@ fn s5b_mob_victim_normal_hit_runs_damg_and_flinches() {
         impact_at.is_some_and(|f| f >= IMPACT_FRAME_MIN),
         "normal hit runs damg + dfi? flinch on the mob victim"
     );
-    // The attacker still swung (sanity: the chain armed from this swing's DamageCallback).
     assert!(active_clip(app.world(), atk_child).is_some());
 }
 
-// ---------------------------------------------------------------------------
-// S6/S6b - crits: ldam + flinch, no sway at kb=0
-// ---------------------------------------------------------------------------
-
-/// S6: Hit with info=CriticalHit runs `ldam` on HumeM and its
-/// flinch stage starts dfm?; kb=0 adds no sway.
+/// S6/S6b - crits: ldam + flinch, no sway at kb=0. S6: Hit with info=CriticalHit runs `ldam`
+/// on HumeM and its flinch stage starts dfm?; kb=0 adds no sway.
 #[test]
 fn s6_crit_runs_ldam_and_flinches_the_pc() {
     let (Some(rarab), Some(humem)) = (load_rarab(), load_humem()) else {
@@ -644,7 +626,6 @@ fn s6_crit_runs_ldam_and_flinches_the_pc() {
     let (vic_parent, vic_child) = spawn_actor(&mut app, HUMEM_W, EntityKind::Pc, &humem);
     step_n(&mut app, 10);
 
-    // res=Hit(0), anim=RightAttack(0), info=0, dist=3 (Heavy/crit), kb=0.
     push_battle2(&mut app, RARAB_W, 1, Some(HUMEM_W), Some((0, 0, 2, 3, 0)));
 
     let (impact_at, _) = watch(&mut app, 45, |_i, w| {
@@ -658,7 +639,6 @@ fn s6_crit_runs_ldam_and_flinches_the_pc() {
 
     let sway = routines(app.world(), vic_parent).contains(b"sway");
     assert!(!sway, "kb=0 adds no sway alongside the crit reaction");
-    // The attacker still swung (sanity: the chain armed from this swing's DamageCallback).
     assert!(active_clip(app.world(), atk_child).is_some());
 }
 
@@ -682,7 +662,6 @@ fn s6b_crit_flinches_the_mob_with_dfi() {
         impact_at.is_some_and(|f| f >= IMPACT_FRAME_MIN),
         "crit flinches the mob victim with dfi?"
     );
-    // The attacker still swung (sanity: the chain armed from this swing's DamageCallback).
     assert!(active_clip(app.world(), atk_child).is_some());
 }
 
@@ -703,7 +682,6 @@ fn s6c_crit_without_ldam_falls_back_to_damg() {
     step_n(&mut app, 10);
     drop_global_effect_dir(&mut app);
 
-    // res=Hit(0), anim=RightAttack(0), info=0, dist=3 (Heavy/crit), kb=0.
     push_battle2(&mut app, RARAB_W, 1, Some(NOLDA_W), Some((0, 0, 2, 3, 0)));
 
     let (impact_at, _) = watch(&mut app, 45, |_i, w| {
@@ -714,7 +692,6 @@ fn s6c_crit_without_ldam_falls_back_to_damg() {
         "crit on a no-ldam victim runs the damg fallback at the impact frame, not an \
          unresolvable ldam"
     );
-    // The attacker still swung (sanity: the chain armed from this swing's DamageCallback).
     assert!(active_clip(app.world(), atk_child).is_some());
 }
 
@@ -731,7 +708,6 @@ fn s6d_medium_hit_without_ldam_still_runs_damg() {
     step_n(&mut app, 10);
     drop_global_effect_dir(&mut app);
 
-    // res=Hit(0), dist=2 (Medium), kb=0.
     push_battle2(&mut app, RARAB_W, 1, Some(NOLDA_W), Some((0, 0, 0, 2, 0)));
 
     let (impact_at, _) = watch(&mut app, 45, |_i, w| {
@@ -744,10 +720,7 @@ fn s6d_medium_hit_without_ldam_still_runs_damg() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// S8 - the Cib Info chunk through the live load pipeline: model scale and movement type
-// ---------------------------------------------------------------------------
-
+/// S8 - the Cib Info chunk through the live load pipeline: model scale and movement type.
 /// The (scale, movement_type) of an entity's LIVE render root, or None while the placeholder
 /// (empty instance slots) still stands in. poll_load_actor_tasks despawns the placeholder and
 /// spawns the real actor with the PreparedActor's resolved scale; FfxiRenderActor.scale is the
@@ -835,8 +808,6 @@ fn s8_info_chunk_scale_and_movement_reach_the_live_actor() {
             });
     }
 
-    // Poll spawns at most two actors per frame and the loads are async; 900 frames (15 s of
-    // sim time) is far past both DATs' load times.
     let mut bat_live = None;
     let mut walker_live = None;
     watch(&mut app, 900, |_i, w| {
@@ -868,11 +839,8 @@ fn s8_info_chunk_scale_and_movement_reach_the_live_actor() {
     assert_eq!(walker_move, ffxi_dat::cib::MovementType::Walking);
 }
 
-// ---------------------------------------------------------------------------
-// S7 - miss / guard / parry / knockback
-// ---------------------------------------------------------------------------
-
-/// S7a: Miss runs `sway` on the victim (sound-only for Rarab - assert the routine, not a clip).
+/// S7 - miss / guard / parry / knockback. S7a: Miss runs `sway` on the victim (sound-only for
+/// Rarab - assert the routine, not a clip).
 #[test]
 fn s7a_miss_runs_sway() {
     let Some(rarab) = load_rarab() else { return };
@@ -881,7 +849,6 @@ fn s7a_miss_runs_sway() {
     let (vic_parent, _) = spawn_actor(&mut app, RARAB2_W, EntityKind::Mob, &rarab);
     step_n(&mut app, 10);
 
-    // res=Miss(1).
     push_battle2(&mut app, RARAB_W, 1, Some(RARAB2_W), Some((1, 0, 0, 0, 0)));
 
     let (impact_at, _) = watch(&mut app, 45, |_i, w| {
@@ -902,7 +869,6 @@ fn s7b_guard_plays_gud_clip() {
     let (vic_parent, vic_child) = spawn_actor(&mut app, RARAB2_W, EntityKind::Mob, &rarab);
     step_n(&mut app, 10);
 
-    // res=Guard(2).
     push_battle2(&mut app, RARAB_W, 1, Some(RARAB2_W), Some((2, 0, 0, 0, 0)));
 
     let (impact_at, _) = watch(&mut app, 45, |_i, w| {
@@ -924,7 +890,6 @@ fn s7c_parry_plays_gud_clip() {
     let (vic_parent, vic_child) = spawn_actor(&mut app, RARAB2_W, EntityKind::Mob, &rarab);
     step_n(&mut app, 10);
 
-    // res=Parry(3).
     push_battle2(&mut app, RARAB_W, 1, Some(RARAB2_W), Some((3, 0, 0, 0, 0)));
 
     let (impact_at, _) = watch(&mut app, 45, |_i, w| {
@@ -948,7 +913,6 @@ fn s7d_knockback_adds_sway_alongside_the_damage_reaction() {
     let (vic_parent, _) = spawn_actor(&mut app, RARAB2_W, EntityKind::Mob, &rarab);
     step_n(&mut app, 10);
 
-    // res=Hit(0), dist=0, kb=2.
     push_battle2(&mut app, RARAB_W, 1, Some(RARAB2_W), Some((0, 0, 0, 0, 2)));
 
     let (impact_at, _) = watch(&mut app, 45, |_i, w| {
@@ -960,11 +924,8 @@ fn s7d_knockback_adds_sway_alongside_the_damage_reaction() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// S8b - stun: observation only
-// ---------------------------------------------------------------------------
-
-/// S8b: BATTLE2 carries no stun payload - the status byte path is untraced in LSB, so this
+/// S8b - stun: observation only. BATTLE2 carries no stun payload - the status byte path is
+/// untraced in LSB, so this
 /// scenario documents what the snapshot carries instead of asserting a DAT-driven stun clip.
 /// A result-less body must not arm any reaction and must not panic.
 #[test]
@@ -975,14 +936,9 @@ fn s8b_resultless_body_arms_nothing() {
     let (vic_parent, _) = spawn_actor(&mut app, RARAB2_W, EntityKind::Mob, &rarab);
     step_n(&mut app, 10);
 
-    // Target present but nres=0: no result block at all.
     push_battle2(&mut app, RARAB_W, 1, Some(RARAB2_W), None);
     step_n(&mut app, 60);
 
-    // The only routine the victim may carry is `init`, the create-time load routine: first
-    // observation takes the hidden->visible resurface path and every model that ships an
-    // init runs it on spawn, Rarab's degenerate one included. That is not a reaction to this
-    // BATTLE2; anything else would be.
     let got = routines(app.world(), vic_parent);
     assert!(
         got.iter().all(|r| *r == *b"init"),
@@ -993,13 +949,10 @@ fn s8b_resultless_body_arms_nothing() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// S9 - Defeated: the dead routine falls over instead of popping to a corpse
-// ---------------------------------------------------------------------------
-
-/// S9: Hit with info=Defeated on a Rarab victim. The `dead` routine runs immediately:
+/// S9 - Defeated: the dead routine falls over instead of popping to a corpse. Hit with
+/// info=Defeated on a Rarab victim. The `dead` routine runs immediately:
 /// ded? fall-over at its first Motion stage, and the pose pass holds idle across the gap -
-/// never flashing cor? before ded? owns the pose (D5). build_app pins the pose pass between
+/// without flashing cor? before ded? owns the pose (D5). build_app pins the pose pass between
 /// dispatch_melee_action_started and tick_active_schedulers so the D5 hold path runs on the
 /// event frame itself; dead_fall_over_pending() closes intra-update when the tick fires the
 /// fall-over, so it is asserted through its observable effects (queued + ded? start + no cor?
@@ -1012,10 +965,8 @@ fn s9_defeated_runs_dead_routine_and_holds_idle_across_the_gap() {
     let (vic_parent, vic_child) = spawn_actor(&mut app, RARAB2_W, EntityKind::Mob, &rarab);
     step_n(&mut app, 10);
 
-    // res=Hit(0), info bit1 = Defeated.
     push_battle2(&mut app, RARAB_W, 1, Some(RARAB2_W), Some((0, 0, 1, 0, 0)));
 
-    // The dead routine is queued on the event's frame (same-frame death path).
     let (queued_at, _) = watch(&mut app, 3, |i, w| {
         i >= 1 && routines(w, vic_parent).contains(b"dead")
     });
@@ -1024,8 +975,6 @@ fn s9_defeated_runs_dead_routine_and_holds_idle_across_the_gap() {
         "Defeated latches the death path on this frame (F49)"
     );
 
-    // No cor? flash across the gap: from the event through the fall-over start the pose stays
-    // off the corpse clip, and the ded? fall-over starts within a few frames.
     let mut cor_flashed = false;
     let (ded_at, _) = watch(&mut app, 12, |_i, w| {
         cor_flashed |= pose_clip(w, vic_child).is_some_and(|c| c.starts_with("cor"));
@@ -1041,11 +990,8 @@ fn s9_defeated_runs_dead_routine_and_holds_idle_across_the_gap() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// S10 - limb selection from BATTLE2's animation field (D6)
-// ---------------------------------------------------------------------------
-
-/// S10: HumeM swings LeftAttack (anim=1). Its motion DAT ships no bti0, so the overlay/pose
+/// S10 - limb selection from BATTLE2's animation field (D6). HumeM swings LeftAttack (anim=1).
+/// Its motion DAT ships no bti0, so the overlay/pose
 /// path must fall back to ati0 and play at0? - a model that lacks the limb still swings.
 #[test]
 fn s10_left_attack_without_bti0_falls_back_to_ati0() {
@@ -1057,7 +1003,6 @@ fn s10_left_attack_without_bti0_falls_back_to_ati0() {
     let (_, atk_child) = spawn_actor(&mut app, HUMEM_W, EntityKind::Pc, &humem);
     step_n(&mut app, 10);
 
-    // res=Hit(0), anim=LeftAttack(1).
     push_battle2(&mut app, HUMEM_W, 1, Some(RARAB_W), Some((0, 1, 0, 0, 0)));
 
     let (swing_at, _) = watch(&mut app, 5, |i, w| {
@@ -1079,7 +1024,6 @@ fn s10b_left_attack_with_bti0_plays_the_limb_clip() {
     let Some(loaded) = load_model(LIMB_MODEL_FILE) else {
         return;
     };
-    // The limb model must actually carry bti0 with a Motion clip, or the scenario is void.
     use ffxi_dat::datid::DatId;
     let routines = loaded.all_routines();
     let Some(bti) = routines.get(&DatId::from_str("bti0")) else {
@@ -1109,12 +1053,9 @@ fn s10b_left_attack_with_bti0_plays_the_limb_clip() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// S11 - missing-routine fall-through: an active animationsub on a model without the named
-// routine must not freeze
-// ---------------------------------------------------------------------------
-
-/// S11: the frozen-mob regression. A nonzero animationsub names a special routine on the wire
+/// S11 - missing-routine fall-through: an active animationsub on a model without the named
+/// routine must not freeze. A nonzero animationsub names a special
+/// routine on the wire
 /// (sub 1 -> `ini1`, FFXiMain.dll); retail plays that name on the model and no-ops when the
 /// model does not ship it. Rarab's DAT ships no `ini1` routine, so the special tier must
 /// fall through to locomotion instead of pinning current_clip: a not-moving mob idles on idl?
@@ -1123,7 +1064,6 @@ fn s10b_left_attack_with_bti0_plays_the_limb_clip() {
 #[test]
 fn s11_missing_routine_falls_through_on_a_model_without_ini1() {
     let Some(loaded) = load_rarab() else { return };
-    // The model genuinely ships no ini1 routine: the fall-through is what has to save us.
     use ffxi_dat::datid::DatId;
     assert!(
         !loaded.all_routines().contains_key(&DatId::from_str("ini1")),
@@ -1132,14 +1072,14 @@ fn s11_missing_routine_falls_through_on_a_model_without_ini1() {
     let mut app = build_app();
     let (_, child) = spawn_actor(&mut app, RARAB_W, EntityKind::Mob, &loaded);
 
-    // First observation at sub 0: retail's create path runs 'init' on the new actor.
-    // Rarab ships no usable init motion, so the pose stays on idle; stepping also establishes
-    // the prev state that makes the sub change below a genuine table trigger instead of another
-    // create.
+    // First observation at sub 0: retail's create path (FFXiMain) runs 'init' on the new
+    // actor. Rarab ships no usable init motion, so the pose stays on idle; stepping also
+    // establishes the prev state that makes the sub change below a genuine table trigger
+    // instead of another create.
     step_n(&mut app, 2);
 
-    // Active animationsub while visible: next_special_pose triggers `ini1` on the next index
-    // rebuild; the pose pass must resolve that name against this model and fall through.
+    // Active animationsub while visible: the sub names a special routine (FFXiMain); the pose
+    // pass must resolve that name against this model and fall through.
     {
         let mut state = app.world_mut().resource_mut::<SceneState>();
         for e in &mut state.snapshot.entities {
@@ -1156,8 +1096,6 @@ fn s11_missing_routine_falls_through_on_a_model_without_ini1() {
         "an active sub on a model without an ini1 routine falls through to idle: got {clip}"
     );
 
-    // And it is not frozen: the idle loop keeps advancing its frame. Prime sampling gaps keep
-    // this from aliasing with any plausible loop length.
     let mut frames = Vec::new();
     for _ in 0..5 {
         step_n(&mut app, 7);
@@ -1175,22 +1113,16 @@ fn s11_missing_routine_falls_through_on_a_model_without_ini1() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// S12 - worm special-pose cycle: create fires init; hiding follows status only, never clip
-// completion
-// ---------------------------------------------------------------------------
-
-/// S12: the full special-pose lifecycle on a model that ships both routines (ROM/5/64.DAT).
+/// S12 - worm special-pose cycle: create fires init; hiding follows status only, not clip
+/// completion. The full special-pose lifecycle on a model that ships both routines (ROM/5/64.DAT).
 /// First observation is a retail actor create and runs 'init': the pop-up sp0? plays once
 /// and holds its end frame while the wire state stays up, with the model root visible throughout.
-/// Retail hides only on status INVISIBLE, never on clip completion. A sub change then fires ini1
+/// Retail hides only on status INVISIBLE, not on clip completion. A sub change then fires ini1
 /// (dig-down sp1?), the buried window hides on status, resurface replays init instead of re-firing
 /// ini1, and a sub clear settles back to locomotion.
 #[test]
 fn s12_worm_special_cycle_hides_only_on_status() {
     let Some(loaded) = load_worm() else { return };
-    // Ground truth: both routines ship in this model's DAT (the pose pass takes each one's first
-    // Motion stage).
     use ffxi_dat::datid::DatId;
     assert!(
         loaded.all_routines().contains_key(&DatId::from_str("init")),
@@ -1204,7 +1136,6 @@ fn s12_worm_special_cycle_hides_only_on_status() {
     let mut app = build_app();
     let (parent, child) = spawn_actor(&mut app, WORM_W, EntityKind::Mob, &loaded);
 
-    // Create path: the first visible observation runs 'init' -> sp0? pop-up.
     step_n(&mut app, 2);
     assert!(
         routines(app.world(), parent).contains(b"init"),
@@ -1216,9 +1147,6 @@ fn s12_worm_special_cycle_hides_only_on_status() {
         "worm spawn plays the init pop-up, got {clip}"
     );
 
-    // sp0? completes and pins its end frame while the state stays up; the model root must stay
-    // visible throughout - no hide on clip completion. The window far exceeds any plausible one-
-    // shot length at this rig's 1 frame per step.
     for _ in 0..4 {
         step_n(&mut app, 300);
         assert_eq!(
@@ -1228,7 +1156,6 @@ fn s12_worm_special_cycle_hides_only_on_status() {
         );
     }
 
-    // Dig start: sub set while visible fires ini1 -> sp1?.
     {
         let mut state = app.world_mut().resource_mut::<SceneState>();
         for e in &mut state.snapshot.entities {
@@ -1244,7 +1171,6 @@ fn s12_worm_special_cycle_hides_only_on_status() {
         "dig start plays the ini1 dig-down, got {clip}"
     );
 
-    // Buried: status INVISIBLE hides the model root outright.
     {
         let mut state = app.world_mut().resource_mut::<SceneState>();
         for e in &mut state.snapshot.entities {
@@ -1260,8 +1186,6 @@ fn s12_worm_special_cycle_hides_only_on_status() {
         "status INVISIBLE hides the model"
     );
 
-    // Resurface: visible again with the sub still set -> 'init' replays (the create path), not a
-    // re-fire of ini1.
     {
         let mut state = app.world_mut().resource_mut::<SceneState>();
         for e in &mut state.snapshot.entities {
@@ -1281,7 +1205,6 @@ fn s12_worm_special_cycle_hides_only_on_status() {
         "resurface replays the init pop-up, got {clip}"
     );
 
-    // Settle: sub clears -> back to locomotion.
     {
         let mut state = app.world_mut().resource_mut::<SceneState>();
         for e in &mut state.snapshot.entities {
@@ -1290,10 +1213,6 @@ fn s12_worm_special_cycle_hides_only_on_status() {
             }
         }
     }
-    // The resurface 'init' holds its pop-up for the routine's own AnimationLock (~3s on this rig),
-    // so settling back to locomotion is a wait for that lock to lapse, not an immediate flip on the
-    // sub clear. Step until the pose drops to the idle family; the cap runs well past the lock so a
-    // regression that pins the pose forever still fails instead of hanging.
     let mut settled = false;
     for _ in 0..600 {
         step_n(&mut app, 1);

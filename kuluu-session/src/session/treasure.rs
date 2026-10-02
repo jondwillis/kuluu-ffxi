@@ -352,6 +352,12 @@ mod tests {
 
     #[test]
     fn an_unknown_item_id_still_names_something() {
-        assert_eq!(item_name(0xFFFE), "item #65534");
+        /// The value coincides with the event-id wildcard const; the point is
+        /// the display fallback for an id with no name.
+        const UNKNOWN_ITEM_NO_PINNED: u16 = 0xFFFE;
+        assert_eq!(
+            item_name(UNKNOWN_ITEM_NO_PINNED),
+            format!("item #{UNKNOWN_ITEM_NO_PINNED}")
+        );
     }
 }

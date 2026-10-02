@@ -241,6 +241,12 @@ fn lcg_next(state: &mut u64) -> f32 {
     ((*state >> 33) as f32) / (u32::MAX as f32)
 }
 
+/// Debug-menu weather gate: a flip re-seeds the modifier alone (no
+/// base-ambient recapture — that value is only meaningful on real weather
+/// changes), so toggling Weather back on restores the live weather's effects
+/// without waiting for the next server update. While the Weather row is off,
+/// every consumer (ambient tint/brightness, sun mul, lightning, weather fog)
+/// sees clear-sky values.
 pub fn update_weather_modifier_system(
     current: Res<CurrentWeather>,
     panels: Res<crate::hud::HudPanels>,
@@ -260,7 +266,7 @@ pub fn update_weather_modifier_system(
 
         if let Some((lo, hi)) = active.modifier.lightning {
             if lightning.rng == 0 {
-                lightning.rng = 0x9E3779B97F4A7C15;
+                lightning.rng = crate::scheduler_runtime::SPLITMIX64_GOLDEN_RATIO;
             }
             let r = lcg_next(&mut lightning.rng);
             lightning.time_to_next = lo + r * (hi - lo);
@@ -271,16 +277,10 @@ pub fn update_weather_modifier_system(
         }
     }
 
-    // Debug-menu weather gate: a flip re-seeds the modifier alone (no base-
-    // ambient recapture — that value is only meaningful on real weather
-    // changes), so toggling Weather back on restores the live weather's
-    // effects without waiting for the next server update.
     if panels.weather_off != active.gated_last {
         active.gated_last = panels.weather_off;
         active.modifier = weather_modifier_for(new_weather.unwrap_or_default());
     }
-    // While the Weather row is off, every consumer (ambient tint/brightness,
-    // sun mul, lightning, weather fog) sees clear-sky values.
     if panels.weather_off {
         active.modifier = WeatherModifier::default();
     }
@@ -335,6 +335,9 @@ fn distance_fog_eq(a: &DistanceFog, b: &DistanceFog) -> bool {
         && fog_falloff_eq(&a.falloff, &b.falloff)
 }
 
+/// When the debug gate is off, drops any weather fog the last frame left on
+/// the camera; the DAT distance fog is unaffected — when present it is
+/// re-written by apply_zone_weather after this system.
 pub fn apply_weather_to_ambient_and_fog_system(
     active: Res<ActiveWeatherModifier>,
     panels: Res<crate::hud::HudPanels>,
@@ -360,9 +363,6 @@ pub fn apply_weather_to_ambient_and_fog_system(
 
     if let Ok(cam_entity) = cam.single() {
         if panels.weather_off {
-            // Debug gate: drop any weather fog the previous frame left on the
-            // camera. The DAT distance fog is unaffected — when present it is
-            // re-written by apply_zone_weather after this system.
             commands.entity(cam_entity).remove::<DistanceFog>();
         } else if let Ok(fog_slot) = q_cam.single_mut() {
             match (active.modifier.fog.clone(), fog_slot) {

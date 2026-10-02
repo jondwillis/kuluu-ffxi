@@ -127,6 +127,8 @@ const STICK_NAV_RELEASE: f32 = 0.33;
 const NAV_REPEAT_DELAY_SECS: f32 = 0.42;
 const NAV_REPEAT_INTERVAL_SECS: f32 = 0.11;
 
+/// Maps a stick deflection past its deadzone to a nav direction. A pad
+/// stick's +y is up; screen space's is down.
 pub(super) fn stick_nav_dir(stick: Vec2, deadzone: f32, currently_held: bool) -> Option<NavDir> {
     let v = apply_stick_deadzone(stick, deadzone);
     let threshold = if currently_held {
@@ -144,7 +146,6 @@ pub(super) fn stick_nav_dir(stick: Vec2, deadzone: f32, currently_held: bool) ->
             NavDir::Left
         })
     } else {
-        // A pad stick's +y is up; screen space's is down.
         Some(if v.y > 0.0 { NavDir::Up } else { NavDir::Down })
     }
 }
@@ -160,6 +161,9 @@ pub(super) struct LauncherNavRepeat {
 }
 
 impl LauncherNavRepeat {
+    /// Advances the held direction and returns a step on the repeat timer.
+    /// The timer resets rather than subtracts: a frame spike longer than
+    /// several intervals is still one step, not a burst of banked ones.
     pub(super) fn update(&mut self, dir: Option<NavDir>, dt: f32) -> Option<NavDir> {
         let Some(dir) = dir else {
             self.held = None;
@@ -182,8 +186,6 @@ impl LauncherNavRepeat {
         if self.elapsed < threshold {
             return None;
         }
-        // Reset rather than subtract: a frame spike longer than several
-        // intervals must still be one step, not a burst of banked ones.
         self.elapsed = 0.0;
         self.repeating = true;
         Some(dir)
@@ -198,7 +200,9 @@ fn pad_button(bindings: &PadBindings, action: PadAction) -> Option<GamepadButton
 
 /// Turns the pad into [`LauncherNav`] intent for every launcher screen. Pure
 /// producer: the focus ring, activation and paging all live in
-/// `launcher_ui::common`, so no screen needs its own pad code.
+/// `launcher_ui::common`, so no screen needs its own pad code. Paging uses
+/// the shoulder bumpers, not the analog triggers (`*Trigger2`); their
+/// in-game `PadAction` roles do not apply on launcher screens.
 pub(super) fn gamepad_launcher_nav_system(
     gamepads: Query<&Gamepad>,
     primary: Res<PrimaryGamepad>,
@@ -242,8 +246,6 @@ pub(super) fn gamepad_launcher_nav_system(
         }
     }
 
-    // The shoulder bumpers, not the analog triggers (`*Trigger2`); their
-    // in-game `PadAction` roles do not apply on launcher screens.
     for (button, page) in [
         (GamepadButton::LeftTrigger, PageDir::Prev),
         (GamepadButton::RightTrigger, PageDir::Next),
@@ -540,11 +542,11 @@ mod tests {
         }
     }
 
+    /// The raw stick value undoes the deadzone renormalization so the
+    /// processed magnitude lands between the two thresholds.
     #[test]
     fn stick_hysteresis_needs_activate_then_holds_until_release() {
         let between = (STICK_NAV_ACTIVATE + STICK_NAV_RELEASE) * 0.5;
-        // Undo the deadzone renormalization so the processed magnitude lands
-        // between the two thresholds.
         let raw = between * (1.0 - STICK_DEADZONE_DEFAULT) + STICK_DEADZONE_DEFAULT;
         let stick = full_up() * raw;
         assert_eq!(stick_nav_dir(stick, STICK_DEADZONE_DEFAULT, false), None);
@@ -554,6 +556,8 @@ mod tests {
         );
     }
 
+    /// A pad's +y is up; screen space's is down, so the Up step vector
+    /// matches the arrow-key convention the focus picker scores in.
     #[test]
     fn stick_reports_the_dominant_axis_direction() {
         assert_eq!(
@@ -564,8 +568,6 @@ mod tests {
             stick_nav_dir(Vec2::new(-0.9, 0.1), STICK_DEADZONE_DEFAULT, false),
             Some(NavDir::Left)
         );
-        // A pad's +y is up; screen space's is down, so the Up step vector
-        // matches the arrow-key convention the focus picker scores in.
         assert_eq!(
             stick_nav_dir(Vec2::new(0.1, 0.9), STICK_DEADZONE_DEFAULT, false),
             Some(NavDir::Up)

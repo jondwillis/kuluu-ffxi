@@ -805,7 +805,7 @@ mod tests {
     #[test]
     fn time_name_rejects_bad_input() {
         assert!(parse_time_name(b"abcd").is_err());
-        assert!(parse_time_name(b"2500").is_err());
+        assert!(parse_time_name(b"2400").is_err());
         assert!(parse_time_name(b"1260").is_err());
     }
 

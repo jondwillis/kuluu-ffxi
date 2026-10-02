@@ -13,7 +13,6 @@ pub mod combat_stance;
 pub mod components;
 pub mod cursor;
 pub mod cutscene;
-// The kind 0x06 camera routes a cutscene scheduler routine drives the operator camera along.
 #[cfg(not(target_arch = "wasm32"))]
 pub mod cutscene_camera;
 #[cfg(not(target_arch = "wasm32"))]
@@ -40,6 +39,7 @@ pub mod fishing_spot;
 pub mod gpu_assets;
 pub mod graphics;
 pub use graphics::settings as graphics_settings;
+pub mod elevators;
 pub mod hud;
 pub mod hud_hide;
 pub mod input_mode;
@@ -225,7 +225,6 @@ impl<S: SceneSource + Resource + Component<Mutability = bevy::ecs::component::Mu
 
         app.add_plugins(lens_flare::LensFlarePlugin);
 
-        // Nameplates: final in-view pass (replaces the retired overlay camera).
         app.add_plugins(nameplate_final_pass::NameplateFinalPassPlugin);
 
         #[cfg(not(target_arch = "wasm32"))]
@@ -235,7 +234,7 @@ impl<S: SceneSource + Resource + Component<Mutability = bevy::ecs::component::Mu
         app.add_plugins(zone_particles::ZoneParticlesPlugin);
 
         #[cfg(not(target_arch = "wasm32"))]
-        app.add_plugins(zone_doors::ZoneDoorsPlugin);
+        app.add_plugins((zone_doors::ZoneDoorsPlugin, elevators::ElevatorsPlugin));
 
         #[cfg(not(target_arch = "wasm32"))]
         app.add_plugins(zone_sfx::ZoneSfxPlugin);
@@ -300,9 +299,6 @@ impl<S: SceneSource + Resource + Component<Mutability = bevy::ecs::component::Mu
             .add_systems(Update, ui_font::apply_ui_font)
             .add_systems(PreUpdate, ingest_system::<S>.run_if(resource_exists::<S>))
             .add_systems(PostUpdate, drain_toast_events)
-            // (The nameplate overlay camera used to need a PostUpdate mirror system
-            // here; the final pass in nameplate_final_pass reads each plate's
-            // GlobalTransform from extraction instead.)
             .add_systems(
                 PreUpdate,
                 vana_time::ingest_vana_time.after(ingest_system::<S>),
@@ -345,12 +341,6 @@ impl<S: SceneSource + Resource + Component<Mutability = bevy::ecs::component::Mu
                     .chain()
                     .run_if(resource_exists::<EntityMesh>),
             )
-            // Runs every rendered frame in the fixed-loop tail, after any
-            // fixed tick may have fired, before Update systems that read
-            // Transform (chase camera, nameplates). Lerps the visual position
-            // between the last two authoritative render Ys so a display frame
-            // rate faster than the 60Hz fixed step doesn't quantize the
-            // chase-camera anchor into visible stair-shake.
             .add_systems(
                 bevy::prelude::RunFixedMainLoop,
                 scene::interpolate_self_transform_system
@@ -466,9 +456,6 @@ impl<S: SceneSource + Resource + Component<Mutability = bevy::ecs::component::Mu
                 .before(ffxi_actor_render::tick_live_ffxi_actors),
         );
 
-        // After apply_invis_flag_system: it resets every skinned model root's Visibility from
-        // the invis flag each frame, and tick_live_ffxi_actors must win that write for entities
-        // the server has hidden via status INVISIBLE (buried mobs).
         #[cfg(not(target_arch = "wasm32"))]
         app.add_systems(
             Update,
@@ -527,17 +514,8 @@ impl<S: SceneSource + Resource + Component<Mutability = bevy::ecs::component::Mu
                 .run_if(resource_changed::<GraphicsSettings>),
         );
 
-        // UNGATED: reacts to window resizes frame-over-frame, so it cannot
-        // live inside the resource_changed tuple above (that only runs when
-        // the settings menu writes -- the "HUD only rescales when I open the
-        // menu" bug).
         app.add_systems(Update, graphics_settings::apply_ui_scale_system);
 
-        // UNGATED for the same reason: the capability probe writes the
-        // settings resource itself (once, on the frame the renderer's
-        // DlssSuperResolutionSupported marker is seen), which then makes the
-        // resource_changed apply chain run. Ordered before it so the AA
-        // respawn key sees the capability the same frame.
         #[cfg(all(not(target_arch = "wasm32"), feature = "dlss"))]
         app.add_systems(
             Update,

@@ -118,7 +118,6 @@ fn main() -> ExitCode {
             a.key_frame_duration,
             a.length_in_frames()
         );
-        // Compare frame 0 vs last frame per joint; report the movers.
         let mut movers: Vec<(u32, f32)> = Vec::new();
         for (&joint, frames) in &a.key_frame_sets {
             if frames.len() < 2 {

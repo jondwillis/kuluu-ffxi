@@ -19,7 +19,7 @@ pub mod overlay_store;
 #[cfg(feature = "native-window")]
 pub mod padbinds_store;
 
-// The windowed viewer lives in the library (not the binary) so examples and
-// integration tests can drive it headless, e.g. the walker's zz-field-walk.
+/// The windowed viewer lives in the library (not the binary) so examples and
+/// integration tests can drive it headless, e.g. the walker's zz-field-walk.
 #[cfg(feature = "native-window")]
 pub mod view_native;

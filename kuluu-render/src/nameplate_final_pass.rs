@@ -77,10 +77,6 @@ use bevy::render::{
 use crate::camera::OperatorCamera;
 use crate::nameplate_billboard::NameplateBillboard;
 
-// ---------------------------------------------------------------------------
-// GPU data
-// ---------------------------------------------------------------------------
-
 /// Per-plate uniform. Byte layout must match nameplate_final.wgsl `PlateUniform`:
 /// model mat4 @ 0 (64 B), fade alpha f32 @ 64, padded to [`PLATE_UNIFORM_SIZE`].
 #[derive(ShaderType, Clone, Copy)]
@@ -90,7 +86,7 @@ pub struct PlateUniform {
 }
 
 /// Per-view uniform for this frame's pass run: the clip matrix of the view
-/// currently being drawn (always the operator camera — see the gate in the draw system),
+/// currently being drawn (the operator camera — see the gate in the draw system),
 /// that projection's near plane, and the render-res/full-res scale the fragment stage
 /// uses to map a full-res fragment onto the depth sub-rect under an upscaler.
 #[derive(ShaderType, Clone, Copy)]
@@ -101,10 +97,15 @@ pub struct ViewUniform {
     pub subrect_scale: Vec2,
 }
 
+/// Shader asset path. The file is embedded by the `embedded_asset!` call in
+/// `NameplateFinalPassPlugin::build` (nameplate_final_pass.rs), so the path is
+/// fixed to that embedded copy.
+const NAMEPLATE_SHADER_PATH: &str = "embedded://kuluu_render/nameplate_final.wgsl";
+
 const PLATE_UNIFORM_SIZE: u32 = 80;
 /// Byte layout of the view uniform (see nameplate_final.wgsl `ViewUniform`):
-/// clip matrix @ 0, near f32 @ 64, subrect_scale vec2 @ 72. The buffer must be at
-/// least encase's `min_size()` for ViewUniform — Mat4(64) + f32 + vec2 (align 8,
+/// clip matrix @ 0, near f32 @ 64, subrect_scale vec2 @ 72. The buffer has to be
+/// at least encase's `min_size()` for ViewUniform — Mat4(64) + f32 + vec2 (align 8,
 /// padded to offset 72) rounded up to the 16-byte struct alignment = 80; binding a
 /// shorter slice fails wgpu validation with "Binding size ... less than minimum".
 /// Same padding rule as PlateUniform.
@@ -123,7 +124,12 @@ const PLATE_VERTEX_DATA: [[f32; 5]; 4] = [
 const PLATE_INDEX_DATA: [u32; 6] = [0, 1, 2, 0, 2, 3];
 
 /// One bind-group entry set per plate: uniform @0 (this plate), view uniform @1
-/// (shared buffer), texture @2 + sampler @3 — matches nameplate_final.wgsl.
+/// (shared buffer), texture @2 + sampler @3 — matches nameplate_final.wgsl. The
+/// view uniform is VERTEX_FRAGMENT: the vertex stage reads clip_from_world and
+/// the MSAA manual-depth-test path in the fragment stage reads .near to turn
+/// stored reversed-Z depth into a view distance — the layout has to cover every
+/// stage that touches the binding or wgpu rejects the pipeline ("group 0
+/// binding 1 not available … visibility flags don't include the shader stage").
 fn plate_bgl_descriptor() -> BindGroupLayoutDescriptor {
     BindGroupLayoutDescriptor::new(
         "nameplate_final_pass_bgl",
@@ -131,13 +137,6 @@ fn plate_bgl_descriptor() -> BindGroupLayoutDescriptor {
             ShaderStages::FRAGMENT,
             (
                 uniform_buffer::<PlateUniform>(false).visibility(ShaderStages::VERTEX),
-                // VERTEX_FRAGMENT: vs reads clip_from_world, and the MSAA
-                // manual-depth-test path in fs reads .near to turn stored
-                // reversed-Z depth into a view distance. Was VERTEX-only until
-                // the fragment gained that read — the layout must cover every
-                // stage that touches the binding or wgpu rejects the pipeline
-                // ("group 0 binding 1 not available … visibility flags don't
-                // include the shader stage").
                 uniform_buffer::<ViewUniform>(false).visibility(ShaderStages::VERTEX_FRAGMENT),
                 texture_2d(TextureSampleType::Float { filterable: true }),
                 smp_entry(SamplerBindingType::Filtering),
@@ -146,20 +145,19 @@ fn plate_bgl_descriptor() -> BindGroupLayoutDescriptor {
     )
 }
 
-// Bind-group entry for group 1 — the view's scene depth, shared by every plate of a
-// tick (one bind group, rebuilt per frame while MSAA is on). The single-sample variant
-// leaves this slot unbound and tests the attached depth buffer in hardware instead.
+/// Bind-group entry for group 1 — the view's scene depth, shared by every plate of a
+/// tick (one bind group, rebuilt per frame while MSAA is on). The single-sample variant
+/// leaves this slot unbound and tests the attached depth buffer in hardware instead.
+/// The entry is multi-sample scene depth, read with per-sample textureLoad in the
+/// fragment shader (see nameplate_final.wgsl). textureLoad needs no sampler, so this
+/// group is a lone texture binding, paired with bevy's own prepass BGL entry for the
+/// same buffer. (One-element tuple keeps the same `sequential` constructor the rest
+/// of the file uses.)
 fn depth_bgl_descriptor() -> BindGroupLayoutDescriptor {
     BindGroupLayoutDescriptor::new(
         "nameplate_final_pass_depth_bgl",
         &BindGroupLayoutEntries::sequential(
             ShaderStages::FRAGMENT,
-            // Multi-sample scene depth, read with per-sample textureLoad in the
-            // fragment shader (see nameplate_final.wgsl). textureLoad needs no
-            // sampler, so this group is a lone texture binding. Pairs with
-            // bevy's own prepass BGL entry for the same buffer. (One-element
-            // tuple keeps the same `sequential` constructor the rest of the
-            // file uses.)
             (texture_depth_2d_multisampled(),),
         ),
     )
@@ -228,7 +226,7 @@ impl NameplatePassGpu {
             mapped_at_creation: false,
         });
 
-        let shader = asset_server.load::<Shader>("embedded://kuluu_render/nameplate_final.wgsl");
+        let shader = asset_server.load::<Shader>(NAMEPLATE_SHADER_PATH);
 
         Self {
             shader,
@@ -243,7 +241,7 @@ impl NameplatePassGpu {
 }
 
 /// Pipeline descriptor. Keyed on (target format, depth mode, MSAA sample count):
-/// this pass always draws single-sample AFTER all effects (the current main side
+/// this pass draws single-sample after all effects (the current main side
 /// holds the resolved, processed image) and depth is Bevy's fixed 3D format
 /// everywhere. `Hardware` attaches the scene depth for a hardware GreaterEqual test;
 /// `Gather` (MSAA on — the multi-sample buffer cannot sit beside a 1× color attachment
@@ -267,6 +265,34 @@ enum PlateDepthMode {
     Subrect,
 }
 
+/// The MSAA sample count feeds the manual variants: they read exactly that many
+/// sub-samples per pixel via textureLoad when > 1 (WGSL forbids textureGather on
+/// multisampled depth); Subrect with samples == 1 takes the single-load path
+/// instead. Bevy's Msaa is 1/2/4/8; the shader falls back to a 4-sample loop if
+/// no MSAA_SAMPLES_N def is set.
+///
+/// Shader defs: the manual-occlusion variants compile MANUAL_DEPTH_TEST; Hardware
+/// does not reference group 1. A bare def name is a Bool(name, true) — exactly
+/// what #ifdef in the shader expects. Subrect adds SUBRECT_SCALE (map fragment
+/// coords into the render-res sub-rect) and SINGLE_SAMPLE_DEPTH when the view is
+/// single-sample (the upscaler case today: DLSS forces MSAA off). The sample-
+/// count def matches the view: Bevy reports 1/2/4/8; 2 and 8 need a def, 4 is
+/// the shader's fallback so no def is emitted, and any other value silently uses
+/// the 4-sample fallback rather than panicking.
+///
+/// Blend is premultiplied (ONE / ONE_MINUS_SRC_ALPHA) over the processed scene —
+/// identical to what AlphaMode::Premultiplied produced in core_3d. Group 1 (the
+/// scene depth) is bound for Gather and Subrect only: Hardware leaves slot 1
+/// unbound at draw time, so declaring a depth BGL in its layout makes wgpu
+/// reject the draw with "the current set RenderPipeline expects a BindGroup to
+/// be set at index 1". The layout has to match the actual bindings, not the
+/// union across modes; Subrect picks the single-sample BGL unless a future
+/// upscaler runs multisampled, and Gather runs with samples > 1.
+///
+/// Depth: Bevy's depth is reversed-Z (closer = LARGER), so nearer-geometry-
+/// occludes tests GreaterEqual — the same convention the skybox and zone
+/// materials use. No depth write: plate-vs-plate order comes from the CPU sort,
+/// not the buffer.
 fn plate_pipeline_descriptor(
     shader: &Handle<Shader>,
     bgl: &BindGroupLayoutDescriptor,
@@ -274,18 +300,8 @@ fn plate_pipeline_descriptor(
     ss_depth_bgl: &BindGroupLayoutDescriptor,
     target_format: TextureFormat,
     mode: PlateDepthMode,
-    // MSAA sample count — the manual variants read exactly this many sub-samples
-    // per pixel via textureLoad when > 1 (WGSL forbids textureGather on
-    // multisampled depth); Subrect with samples == 1 takes the single-load path
-    // instead. Bevy's Msaa is 1/2/4/8; the shader falls back to a 4-sample loop
-    // if no MSAA_SAMPLES_N def is set.
     samples: u32,
 ) -> RenderPipelineDescriptor {
-    // Compiled into the manual-occlusion variants only; Hardware never references
-    // group 1. A bare def name is a Bool(name, true) — exactly what #ifdef in the
-    // shader expects. Subrect adds SUBRECT_SCALE (map fragment coords into the
-    // render-res sub-rect) and SINGLE_SAMPLE_DEPTH when the view is single-sample
-    // (the upscaler case today: DLSS forces MSAA off).
     let mut shader_defs: Vec<bevy::shader::ShaderDefVal> = match mode {
         PlateDepthMode::Hardware => Vec::new(),
         PlateDepthMode::Gather | PlateDepthMode::Subrect => vec!["MANUAL_DEPTH_TEST".into()],
@@ -299,10 +315,6 @@ fn plate_pipeline_descriptor(
     let manual_loop = !matches!(mode, PlateDepthMode::Hardware)
         && !(matches!(mode, PlateDepthMode::Subrect) && samples == 1);
     if manual_loop {
-        // Pick the sample-count def that matches this view. Bevy only ever
-        // reports 1/2/4/8; 2 and 8 need a def, 4 is the shader's fallback so
-        // no def emitted. Any other value silently uses the 4-sample fallback
-        // rather than panicking.
         match samples {
             2 => shader_defs.push("MSAA_SAMPLES_2".into()),
             8 => shader_defs.push("MSAA_SAMPLES_8".into()),
@@ -314,8 +326,6 @@ fn plate_pipeline_descriptor(
         [VertexFormat::Float32x3, VertexFormat::Float32x2],
     );
 
-    // Premultiplied blend (ONE / ONE_MINUS_SRC_ALPHA) over the processed scene —
-    // identical to what AlphaMode::Premultiplied produced in core_3d.
     let premult = BlendComponent {
         operation: BlendOperation::Add,
         src_factor: BlendFactor::One,
@@ -324,16 +334,9 @@ fn plate_pipeline_descriptor(
 
     RenderPipelineDescriptor {
         label: Some("nameplate_final_pass".into()),
-        // Only Gather and Subrect bind group 1 (the scene depth). Hardware leaves
-        // slot 1 unbound at draw time, so declaring a depth BGL in its layout makes
-        // wgpu reject the draw with "the current set RenderPipeline expects a
-        // BindGroup to be set at index 1". Layout must match actual bindings, not
-        // the union across modes; Subrect picks the single-sample BGL unless a
-        // future upscaler runs multisampled.
         layout: {
             let depth_layout = match mode {
                 PlateDepthMode::Hardware => None,
-                // Gather only ever runs with samples > 1 (mode selection below).
                 PlateDepthMode::Gather => Some(depth_bgl.clone()),
                 PlateDepthMode::Subrect if samples > 1 => Some(depth_bgl.clone()),
                 PlateDepthMode::Subrect => Some(ss_depth_bgl.clone()),
@@ -357,12 +360,6 @@ fn plate_pipeline_descriptor(
             polygon_mode: PolygonMode::Fill,
             ..Default::default()
         },
-        // Bevy's depth is reversed-Z (closer = LARGER), so nearer-geometry-occludes
-        // tests GreaterEqual — the same convention the skybox and zone materials use.
-        // No depth WRITE: plate-vs-plate order comes from the CPU sort, not the buffer.
-        // (The old material carried a huge depth_bias for TRANSPARENT-phase sorting;
-        // nothing equivalent is needed here — first frame of A/B will confirm no
-        // co-planar z-fight against zone geometry.)
         depth_stencil: if matches!(mode, PlateDepthMode::Hardware) {
             Some(DepthStencilState {
                 format: CORE_3D_DEPTH_FORMAT,
@@ -405,13 +402,9 @@ fn plate_pipeline_descriptor(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Per-frame per-plate state (render world)
-// ---------------------------------------------------------------------------
-
 /// CPU description of one drawable plate for the current frame. `matrix` is the
 /// billboard's GlobalTransform — the unit quad scaled to world size and rotated
-/// camera-facing, exactly what core_3d used to draw through the overlay camera.
+/// camera-facing, the same quad core_3d drew through the overlay camera.
 pub struct PlateDraw {
     entity: Entity,
     matrix: Mat4,
@@ -428,7 +421,7 @@ pub struct PlateDraw {
 /// `texture_view` is the id of the GpuImage view the bind group was built
 /// against. A billboard re-raster re-inserts its Image under the SAME asset
 /// handle, and bevy's render-asset prepare answers that with a NEW GpuImage
-/// (new wgpu texture + view) — the old one stays alive only because this bind
+/// (new wgpu texture + view); the prior one stays alive only because this bind
 /// group holds it. Keying the cache on entity alone therefore pinned every
 /// plate to its very first bake (the white spawn fallback) until the entity
 /// despawned; `prepare_nameplate_bindings` compares this id against the
@@ -450,10 +443,6 @@ pub struct NameplateFinalPassData {
     pub plates: Vec<PlateDraw>,
 }
 
-// ---------------------------------------------------------------------------
-// Debug menu mirror (render thread -> main-world HUD panel)
-// ---------------------------------------------------------------------------
-
 /// One render tick's worth of pass state, for the Debug menu "Nameplate
 /// Debug" panel. Counters cover every stage between a billboard existing in
 /// the scene and its quad actually drawn: extract skips, GPU texture cache
@@ -462,7 +451,7 @@ pub struct NameplateFinalPassData {
 #[derive(Clone, Copy)]
 pub struct NameplateFrameSnap {
     pub plates_total: u32,
-    /// Culled upstream (depth ramp / self-plate first-person) — never GPU-bound.
+    /// Culled upstream (depth ramp / self-plate first-person) — not GPU-bound.
     pub hidden: u32,
     /// Plate texture not in the render world's GpuImage cache yet.
     pub no_gpu_image: u32,
@@ -480,7 +469,7 @@ pub struct NameplateFrameSnap {
     pub draws: u32,
     /// Pipeline was ready when the draw system ran this tick.
     pub pipeline_ready: bool,
-    /// Operator view color attachment format (None = the draw stage never ran).
+    /// Operator view color attachment format (None = the draw stage did not run).
     pub target_fmt: Option<TextureFormat>,
     /// Operator view sample count (>1 means MSAA on — shader-side gather test
     /// instead of the hardware depth attachment).
@@ -496,8 +485,8 @@ pub struct NameplateFrameSnap {
     pub far_w: f32,
     /// That plate's fade alpha (0 = fully faded out).
     pub far_alpha: f32,
-    // Billboard visibility breakdown mirrored from the main-world update
-    // system (NameplateBillboardDebug) — answers "why is `hidden` what it is".
+    /// Billboard visibility breakdown mirrored from the main-world update
+    /// system (NameplateBillboardDebug) — answers "why is `hidden` what it is".
     /// Billboard entities present in the main world this frame.
     pub bb_total: u32,
     /// Self-plate camera-mode cull.
@@ -580,7 +569,7 @@ const NAMEPLATE_SNAP_ZERO: NameplateFrameSnap = NameplateFrameSnap {
 };
 
 /// Render-thread owned; read by the main-world HUD update — a Mutex, not
-/// atomics, so the snapshot stays one readable struct. Never held across a
+/// atomics, so the snapshot stays one readable struct. Not held across a
 /// system boundary.
 pub static NAMEPLATE_PASS_DEBUG: Mutex<NameplatePassDebug> = Mutex::new(NameplatePassDebug {
     frame: 0,
@@ -588,14 +577,12 @@ pub static NAMEPLATE_PASS_DEBUG: Mutex<NameplatePassDebug> = Mutex::new(Nameplat
     prev: NAMEPLATE_SNAP_ZERO,
 });
 
-// ---------------------------------------------------------------------------
-// Systems
-// ---------------------------------------------------------------------------
-
 /// ExtractSchedule (render sub-app): snapshot the main-world billboards — pose,
 /// fade, texture id, visibility — into render-side draw data. Runs after the
 /// whole main schedule, so GlobalTransforms already include this frame's
-/// billboard update and the fixed-loop interpolation tail.
+/// billboard update and the fixed-loop interpolation tail. Hidden billboards
+/// (culled by the depth-ramp legibility check upstream) are skipped before any
+/// GPU work.
 fn extract_nameplates(
     mut data: ResMut<NameplateFinalPassData>,
     operator_cameras: Extract<Query<Entity, With<OperatorCamera>>>,
@@ -613,7 +600,6 @@ fn extract_nameplates(
 ) {
     data.operator_cam = operator_cameras.iter().next();
 
-    // Rotate last completed tick into prev; this tick builds a fresh cur.
     let mut hidden = 0u32;
     {
         let mut dbg = NAMEPLATE_PASS_DEBUG
@@ -628,8 +614,6 @@ fn extract_nameplates(
     let mut plates = std::mem::take(&mut data.plates);
     plates.clear();
     for (entity, gt, np, mat_ref, vis) in &plate_q {
-        // Hidden plates were culled by the depth-ramp legibility check upstream;
-        // skip them before any GPU work.
         if matches!(vis, Visibility::Hidden) {
             hidden += 1;
             continue;
@@ -667,6 +651,18 @@ fn extract_nameplates(
 
 /// Render schedule (Prepare set): resolve each plate's GpuImage and build/reuse
 /// its bind group, then push this frame's matrix+alpha into its uniform buffer.
+///
+/// The handle's CURRENT GpuImage is resolved every tick, not just on a cache
+/// miss: a re-raster (colour fix, hp move, marker change) swaps the GpuImage
+/// behind the same handle, and a bind group built against the prior one keeps
+/// drawing the prior bake. While the replacement is still uploading
+/// (None / !had_data) the existing binding stays in use, so the plate does not
+/// blink during the swap. A texture/sampler swap rebuilds only the bind group;
+/// the uniform buffer is texture-independent. Bindings of plates that left the
+/// data are dropped (the GPU objects die with the wrappers), and this frame's
+/// uniforms are rewritten for every plate that has a binding. The GpuImage
+/// cache count stands in for a RenderAssets length, which bevy 0.19 does not
+/// expose.
 fn prepare_nameplate_bindings(
     mut data: ResMut<NameplateFinalPassData>,
     gpu: Res<NameplatePassGpu>,
@@ -682,12 +678,6 @@ fn prepare_nameplate_bindings(
     let mut not_had_data = 0u32;
     let mut rebound = 0u32;
     for plate in &mut data.plates {
-        // Resolve the handle's CURRENT GpuImage every tick, not just on a cache
-        // miss: a re-raster (colour fix, hp move, marker change) swaps the
-        // GpuImage behind the same handle, and a bind group built against the
-        // previous one keeps drawing the previous bake. While the replacement
-        // is still uploading (None / !had_data) the existing binding stays in
-        // use, so the plate never blinks during the swap.
         let current = match gpu_images.get(plate.texture_handle.id()) {
             Some(img) if img.had_data => Some(img),
             Some(_) => {
@@ -707,8 +697,6 @@ fn prepare_nameplate_bindings(
                 Some(existing)
                     if existing.texture_view == view_id && existing.sampler == sampler_id => {}
                 Some(existing) => {
-                    // Same plate, new texture/sampler: rebuild only the bind
-                    // group. The uniform buffer is texture-independent, keep it.
                     existing.bind_group = plate_bind_group(
                         &device,
                         &bind_group_layout,
@@ -752,12 +740,9 @@ fn prepare_nameplate_bindings(
         }
     }
 
-    // Drop bindings for plates that no longer exist (the GPU objects die with
-    // the wrappers).
     let live: HashSet<Entity> = data.plates.iter().map(|p| p.entity).collect();
     cache.retain(|e, _| live.contains(e));
 
-    // Rewrite this frame's uniforms for every plate that has a binding.
     let mut bound = 0u32;
     for plate in &data.plates {
         if let Some(b) = &plate.binding {
@@ -779,7 +764,6 @@ fn prepare_nameplate_bindings(
         dbg.cur.not_had_data = not_had_data;
         dbg.cur.bound = bound;
         dbg.cur.rebound = rebound;
-        // RenderAssets has no len in bevy 0.19 — count the GpuImage cache.
         dbg.cur.gpu_images_total = gpu_images.iter().count() as u32;
     }
 }
@@ -843,8 +827,8 @@ fn view_uniform_bytes(
 }
 
 /// wgpu-queue write through Bevy's wrapped queue/buffer types. The tracked
-/// encoder used by the pass is flushed to this same queue LATER (submit phase),
-/// so a direct write here always lands before the draws that reference it.
+/// encoder used by the pass is flushed to this same queue later (submit phase),
+/// so a direct write here lands before the draws that reference it.
 fn queue_write(queue: &RenderQueue, buffer: &Buffer, offset: u64, data: &[u8]) {
     queue.write_buffer(buffer, offset, data);
 }
@@ -853,6 +837,85 @@ fn queue_write(queue: &RenderQueue, buffer: &Buffer, offset: u64, data: &[u8]) {
 /// processed main texture — after all post effects, before upscaling writes the
 /// window. Gated to the operator camera; every other 3D camera (launcher,
 /// minimap bake, ...) runs its own Core3d schedule and skips.
+///
+/// The gate: only the operator camera's PRIMARY view carries plates. Note that
+/// `view.entity()` (CurrentView) is a RENDER-world view entity and does not
+/// equal a main-world camera Entity — match via retained_view_entity instead.
+/// subview_index 0 keeps this same camera's shadow-cascade subviews out of the
+/// pass (they share the main entity but draw into depth targets, not the
+/// scene).
+///
+/// The unsampled main texture is single-sample (MSAA resolves into it), so the
+/// color attachment here is count 1 in every mode. Scene depth can only be
+/// ATTACHED when the view itself is single-sample — with MSAA on, the
+/// multi-sample depth buffer cannot sit beside a 1-sample color attachment in
+/// one pass; that variant instead compiles the fragment's per-sample
+/// textureLoad test against the same buffer (see nameplate_final.wgsl). Under
+/// an upscaler (DLSS sets MainPassResolutionOverride) neither of those is
+/// sound: this pass runs post-upscale at full res while the depth buffer only
+/// holds valid geometry in its render-res sub-rect (bevy sizes the TEXTURE
+/// from physical_target_size, so no size mismatch — just stale content past
+/// the sub-rect). Subrect mode instead maps every fragment down into that
+/// sub-rect and loads it, so walls still occlude plates. Deliberately NO
+/// viewport in any mode: this pass positions plates in the CURRENT
+/// (post-upscale) target's clip space, so under DLSS a
+/// MainPassResolutionOverride viewport would squish every plate into the
+/// render-res corner of the full-res image. The mode check comes first because
+/// it decides both pipeline and attachments; MSAA is forced off under DLSS
+/// anyway, but override-first keeps this correct for any future upscaler that
+/// runs multisampled. Non-upscaled views did not have an override, so the
+/// viewport absence is a no-op for them.
+///
+/// Blend order: far-to-near in current view space — with premultiplied
+/// blending the NEAREST plate must draw LAST, over everything behind it.
+/// `center` is already WORLD space (GlobalTransform::translation at extract),
+/// so the VIEW matrix projects it to view-space z; feeding it through
+/// world_from_view double-transforms it. View-space z is negative in front of
+/// the camera: most-negative = farthest, drawn first. ExtractedView only
+/// carries world_from_view (a GlobalTransform), so invert once and reuse for
+/// every comparison.
+///
+/// The clip matrix: written before the pass is recorded (same queue, earlier
+/// position) so GPU order holds even though the tracked encoder's buffer is
+/// submitted at the Submit phase. `ExtractedView.world_from_view` is the
+/// camera frame's LOCAL-TO-WORLD matrix — Bevy inverts it before building its
+/// own clip matrix (see `prepare_view_uniforms`, bevy_render 0.19:
+/// `view_from_world = world_from_view.inverse(); clip = P * view_from_world`).
+/// Feeding the non-inverted form projects every plate through the camera's own
+/// frame instead of through the camera: plates land ~an order of magnitude off
+/// NDC in every MSAA/scale/TAA configuration while still issuing green draw
+/// counters. Reuse the same `view_from_world` the sort above already derives.
+///
+/// The near plane (manual-depth paths: fragment distances are `near /
+/// depth_value`): Bevy's perspective-infinite-reverse projection stores `near`
+/// at column 3, row z (bevy_render's own doc on
+/// ExtractedView.clip_from_view). The sub-rect scale is render resolution over
+/// the full target extent; the depth texture is sized from physical_target_size,
+/// so its size is the full-res denominator, with (1, 1) when no override is
+/// active.
+///
+/// The pipeline key includes `samples` so cycling MSAA 2x -> 4x -> 8x compiles
+/// a fresh pipeline per level (each variant's sample loop is a compile-time
+/// constant). Hardware ignores the sample count on the shader side, but keying
+/// on it costs nothing and avoids any special-casing. While the pipeline is
+/// still compiling (first frame or two) the pass returns early — plates
+/// reappear next tick, and a compile failure surfaces as a RenderError and
+/// quits the app.
+///
+/// Color: the CURRENT main side after all effects. `get_unsampled_color_attachment`
+/// is the plain single-sample view with Load semantics from here on (the first
+/// pass of the frame cleared it) — no MSAA resolve interference when MSAA is
+/// on, and exactly the processed image when it is off. Depth: LOAD what
+/// geometry wrote; storing it back keeps later passes seeing the same "already
+/// used" state (no re-clear). The farthest plate's clip position is mirrored to
+/// the debug snapshot: ndc xy inside [-1, 1] with w > 0 means on screen; glam
+/// has no Mat4*Vec3, so project with a w=1 Vec4. Manual-depth runs (Gather,
+/// Subrect) share one bind group for this view's scene depth, rebuilt each
+/// tick — a single handle that tracks target/MSAA changes without cache
+/// bookkeeping, living to the end of the function because the tracked pass
+/// retains every binding set on it until its scope. Only Hardware attaches the
+/// depth buffer; Gather and Subrect read it as a texture in the fragment stage
+/// (see `PlateDepthMode`).
 #[allow(clippy::type_complexity)]
 fn draw_nameplate_final_pass(
     view: ViewQuery<(
@@ -872,11 +935,6 @@ fn draw_nameplate_final_pass(
 ) {
     let (ev, resolution_override, target, depth, msaa) = view.into_inner();
 
-    // The gate: only the operator camera's PRIMARY view carries plates. Note that
-    // `view.entity()` (CurrentView) is a RENDER-world view entity and can never
-    // equal a main-world camera Entity — match via retained_view_entity instead.
-    // subview_index 0 keeps this same camera's shadow-cascade subviews out of the
-    // pass (they share the main entity but draw into depth targets, not the scene).
     let Some(operator_cam) = data.operator_cam else {
         return;
     };
@@ -886,24 +944,6 @@ fn draw_nameplate_final_pass(
         return;
     }
 
-    // The unsampled main texture is ALWAYS single-sample (MSAA resolves into it), so the color
-    // attachment here is count 1 in every mode. Scene depth can only be ATTACHED when the view
-    // itself is single-sample — with MSAA on, the multi-sample depth buffer cannot sit beside a
-    // 1-sample color attachment in one pass; that variant instead compiles the fragment's
-    // per-sample textureLoad test against the same buffer (see nameplate_final.wgsl).
-    //
-    // Under an upscaler (DLSS sets MainPassResolutionOverride) neither of those is sound:
-    // this pass runs post-upscale at full res while the depth buffer only holds valid
-    // geometry in its render-res sub-rect (bevy sizes the TEXTURE from
-    // physical_target_size, so no size mismatch — just stale content past the sub-rect).
-    // Subrect mode instead maps every fragment down into that sub-rect and loads it,
-    // so walls still occlude plates. Deliberately NO viewport in any mode: this pass
-    // positions plates in the CURRENT (post-upscale) target's clip space, so under
-    // DLSS a MainPassResolutionOverride viewport would squish every plate into the
-    // render-res corner of the full-res image. The mode check comes first because it
-    // decides both pipeline and attachments; MSAA is forced off under DLSS anyway,
-    // but override-first keeps this correct for any future upscaler that runs
-    // multisampled.
     let samples = msaa.map_or(1, Msaa::samples);
     let mode = if resolution_override.is_some() {
         PlateDepthMode::Subrect
@@ -913,19 +953,10 @@ fn draw_nameplate_final_pass(
         PlateDepthMode::Hardware
     };
 
-    // Far-to-near in current view space: with premultiplied blending the NEAREST
-    // plate must draw LAST, over everything behind it. View-space z is negative
-    // in front of the camera — most-negative (farthest) sorts first.
     let mut draws: Vec<&PlateDraw> = data.plates.iter().filter(|p| p.binding.is_some()).collect();
     if draws.is_empty() {
         return;
     }
-    // `center` is already WORLD space (GlobalTransform::translation at extract),
-    // so the VIEW matrix projects it to view-space z — feeding it through
-    // world_from_view was a double transform that produced garbage ordering.
-    // View-space z is negative in front of the camera: most-negative = farthest,
-    // drawn first. ExtractedView only carries world_from_view (a GlobalTransform),
-    // so invert once and reuse for every comparison.
     let view_from_world = ev.world_from_view.to_matrix().inverse();
     draws.sort_by(|a, b| {
         let za = (view_from_world * a.center.extend(1.0)).z;
@@ -933,28 +964,10 @@ fn draw_nameplate_final_pass(
         FloatOrd(za).cmp(&FloatOrd(zb))
     });
 
-    // This frame's clip matrix for this view. Written before the pass is
-    // recorded (same queue, earlier position) so GPU order holds even though
-    // the tracked encoder's buffer is submitted at the Submit phase.
-    //
-    // NOTE: `ExtractedView.world_from_view` is the camera frame's LOCAL-TO-WORLD
-    // matrix — Bevy inverts it before building its own clip matrix (see
-    // `prepare_view_uniforms`, bevy_render 0.19 view/mod.rs ~L1052:
-    // `view_from_world = world_from_view.inverse(); clip = P * view_from_world`).
-    // Feeding the non-inverted form projects every plate through the camera's own
-    // frame instead of through the camera: plates land ~an order of magnitude off
-    // NDC in every MSAA/scale/TAA configuration while still issuing green draw
-    // counters. Reuse the same `view_from_world` the sort above already derives.
     let clip = ev
         .clip_from_world
         .unwrap_or_else(|| ev.clip_from_view * view_from_world);
-    // Projection near plane (manual-depth paths: fragment distances are `near / depth_value`).
-    // Bevy's perspective-infinite-reverse projection stores `near` at column 3, row z
-    // (bevy_render's own doc on ExtractedView.clip_from_view).
     let near = ev.clip_from_view.col(3).z;
-    // Sub-rect mapping for the upscaler case: render resolution over the full target
-    // extent. The depth texture is sized from physical_target_size, so its size IS the
-    // full-res denominator; (1, 1) when no override is active.
     let subrect_scale = match resolution_override {
         Some(ovr) => {
             let ext = depth.texture.size();
@@ -972,9 +985,6 @@ fn draw_nameplate_final_pass(
         &view_uniform_bytes(clip, near, subrect_scale),
     );
 
-    // Lazily specialize the pipeline for (target format, depth mode) — one in
-    // practice each: Rgba16Float with Hdr; the render-scale image path reuses them.
-    // Debug mirror: the draw stage reached the operator view this tick.
     {
         let mut dbg = NAMEPLATE_PASS_DEBUG
             .lock()
@@ -983,10 +993,6 @@ fn draw_nameplate_final_pass(
         dbg.cur.samples = samples;
     }
 
-    // Key includes `samples` so cycling MSAA 2x -> 4x -> 8x compiles a fresh
-    // pipeline per level (each variant's sample loop is a compile-time
-    // constant). Hardware ignores the sample count on the shader side, but keying
-    // on it costs nothing and avoids any special-casing here.
     let key = (target.main_texture_format(), mode, samples);
     if pipe_state.as_ref().is_none_or(|(k, _)| *k != key) {
         let id = pipeline_cache.queue_render_pipeline(plate_pipeline_descriptor(
@@ -1011,16 +1017,9 @@ fn draw_nameplate_final_pass(
             dbg.cur.pipeline_ready = false;
             dbg.cur.target_fmt = Some(key.0);
         }
-        return; // still compiling (first frame or two) — plates reappear next tick;
-                // a compile failure surfaces as a RenderError and quits the app.
+        return;
     };
 
-    // Color: the CURRENT main side after all effects. `get_unsampled_color_attachment`
-    // is the plain single-sample view with Load semantics from here on (the first
-    // pass of the frame cleared it) — no MSAA resolve interference when MSAA is
-    // on, and exactly the processed image when it is off.
-    // Depth: LOAD what geometry wrote; storing it back keeps later passes seeing
-    // the same "already used" state (no re-clear).
     {
         let mut dbg = NAMEPLATE_PASS_DEBUG
             .lock()
@@ -1029,9 +1028,6 @@ fn draw_nameplate_final_pass(
         dbg.cur.pipeline_ready = true;
         dbg.cur.target_fmt = Some(key.0);
         if let Some(far) = draws.first() {
-            // Farthest plate (head of the blend order): where it lands in clip
-            // space — ndc xy inside [-1, 1] with w > 0 means on screen.
-            // glam has no Mat4*Vec3 — project with a w=1 Vec4.
             let c = clip * far.center.extend(1.0);
             dbg.cur.far_alpha = far.alpha;
             dbg.cur.far_w = c.w;
@@ -1042,10 +1038,6 @@ fn draw_nameplate_final_pass(
         }
     }
 
-    // Manual-depth runs (Gather, Subrect): one shared bind group for this view's scene
-    // depth. Rebuilt each tick — a single handle, and it tracks target/MSAA changes
-    // without any cache bookkeeping. It lives to the end of the function because the
-    // tracked pass retains every binding set on it until its scope.
     let depth_bg = match mode {
         PlateDepthMode::Hardware => None,
         _ => {
@@ -1066,8 +1058,6 @@ fn draw_nameplate_final_pass(
     let mut pass = ctx.begin_tracked_render_pass(RenderPassDescriptor {
         label: Some("nameplate_final_pass"),
         color_attachments: &[Some(target.get_unsampled_color_attachment())],
-        // Only Hardware attaches this buffer; Gather and Subrect read it as a texture
-        // in the fragment stage instead (see `PlateDepthMode`).
         depth_stencil_attachment: if matches!(mode, PlateDepthMode::Hardware) {
             Some(depth.get_attachment(StoreOp::Store))
         } else {
@@ -1078,11 +1068,6 @@ fn draw_nameplate_final_pass(
         multiview_mask: None,
     });
 
-    // Deliberately NO viewport here in any mode: this pass positions plates in
-    // the CURRENT (post-upscale) target's clip space, so under DLSS the old
-    // MainPassResolutionOverride viewport squished every plate into the
-    // render-res corner of the full-res image. Non-upscaled views never had an
-    // override, making the removed block a no-op for them.
     pass.set_render_pipeline(pipeline);
 
     if let Some(bg) = &depth_bg {
@@ -1109,19 +1094,25 @@ fn init_nameplate_pass_gpu(
     commands.insert_resource(NameplatePassGpu::new(&device, &asset_server));
 }
 
-// ---------------------------------------------------------------------------
-// Plugin
-// ---------------------------------------------------------------------------
-
+/// No RenderErrorHandler override in build: any render error (validation,
+/// pipeline compile failure, ...) hits bevy's default handler and quits the
+/// app with full detail — failures have to crash loudly, not get swallowed.
+///
+/// The draw system orders after every post effect (bloom/DOF/fog/TAA/tonemapping
+/// all live in or before the PostProcess set — verified against bevy 0.19
+/// sources) and before upscaling writes the window, per-camera (once per
+/// Camera3d, gated to the operator inside). It also orders before `ui_pass`:
+/// bevy's UI composite is scheduled `.after(Core3dSystems::PostProcess).before(upscaling)`
+/// — the exact same bounds as the draw system (bevy_ui_render 0.19,
+/// render_pass::ui_pass). With no explicit edge between them the two ran in
+/// arbitrary order and plates could land on top of the HUD. Ordering before
+/// ui_pass composites the UI over the plates, so nameplates do not overwrite
+/// menus/HUD.
 pub struct NameplateFinalPassPlugin;
 
 impl Plugin for NameplateFinalPassPlugin {
     fn build(&self, app: &mut App) {
         embedded_asset!(app, "nameplate_final.wgsl");
-
-        // No RenderErrorHandler override here: any render error (validation,
-        // pipeline compile failure, ...) hits bevy's default handler and quits
-        // the app with full detail — failures must crash loudly, not get swallowed.
 
         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
             render_app
@@ -1132,18 +1123,6 @@ impl Plugin for NameplateFinalPassPlugin {
                     Render,
                     prepare_nameplate_bindings.in_set(RenderSystems::PrepareBindGroups),
                 )
-                // AFTER every post effect (bloom/DOF/fog/TAA/tonemapping all live in or
-                // before the PostProcess set — verified against bevy 0.19 sources),
-                // BEFORE upscaling writes the window. Per-camera sub-schedule: runs
-                // once per Camera3d, gated to the operator inside.
-                //
-                // ALSO before `ui_pass`: bevy's UI composite is scheduled
-                // `.after(Core3dSystems::PostProcess).before(upscaling)` — the
-                // exact same bounds as this pass (bevy_ui_render 0.19,
-                // render_pass::ui_pass). With no explicit edge between them the
-                // two ran in arbitrary order and plates could land on TOP of the
-                // HUD. Ordering before ui_pass makes the UI composite over the
-                // plates, so nameplates never overwrite menus/HUD.
                 .add_systems(
                     Core3d,
                     draw_nameplate_final_pass
@@ -1154,10 +1133,6 @@ impl Plugin for NameplateFinalPassPlugin {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -1193,7 +1168,6 @@ mod tests {
             !layers.intersects(&crate::nameplate_overlay::nameplate_render_layers()),
             "the plate layer must stay excluded from the operator view"
         );
-        // ...and still sees world + gizmo (unchanged contract).
         assert!(layers.intersects(&RenderLayers::layer(0)));
         assert!(layers.intersects(&RenderLayers::layer(WORLD_GIZMO_LAYER)));
     }
@@ -1211,8 +1185,6 @@ mod tests {
         assert_eq!(PLATE_VERTEX_DATA, expected);
         assert_eq!(PLATE_INDEX_DATA, [0u32, 1, 2, 0, 2, 3]);
 
-        // The interleaved stride is what from_vertex_formats derives — pin it so a
-        // format swap cannot silently desync the shader.
         let layout = VertexBufferLayout::from_vertex_formats(
             VertexStepMode::Vertex,
             [VertexFormat::Float32x3, VertexFormat::Float32x2],
@@ -1234,12 +1206,10 @@ mod tests {
     fn draw_order_is_farthest_first() {
         let view_from_world = Mat4::from_rotation_y(std::f32::consts::FRAC_PI_2);
         struct P(usize, Vec3);
-        // World-space plate centers; under this view each maps to z_view = −x,
-        // so x=50 is farthest (most-negative), x=1 nearest.
         let mut plates = [
-            P(0, Vec3::new(1.0, 0.0, 0.0)),  // view z -1   (nearest)
-            P(1, Vec3::new(50.0, 0.0, 0.0)), // view z -50  (farthest)
-            P(2, Vec3::new(20.0, 0.0, 0.0)), // view z -20
+            P(0, Vec3::new(1.0, 0.0, 0.0)),
+            P(1, Vec3::new(50.0, 0.0, 0.0)),
+            P(2, Vec3::new(20.0, 0.0, 0.0)),
         ];
         plates.sort_by(|a, b| {
             let za = view_from_world * a.1.extend(1.0);
@@ -1278,7 +1248,6 @@ mod tests {
         );
         let bytes = plate_uniform_bytes(&m, 0.5);
 
-        // mat4 occupies the first 64 bytes: compare against a manual pack.
         let mut expected_head = [0u8; 64];
         for (i, c) in m.to_cols_array().iter().enumerate() {
             expected_head[i * 4..i * 4 + 4].copy_from_slice(&c.to_le_bytes());

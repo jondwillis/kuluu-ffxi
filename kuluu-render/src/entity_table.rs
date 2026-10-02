@@ -164,7 +164,10 @@ impl EntityTable {
         }
     }
 
-    /// Stamped at zone entry; until then `is_self` is false.
+    /// Stamped at zone entry; until then `is_self` is false. The char id only
+    /// changes on connect/zone entry and full snapshots carry it; `0` is not a
+    /// valid character id, so the caller filters it out to keep `is_self`
+    /// false for an unstamped slot.
     pub fn set_self_id(&mut self, id: Option<u32>) {
         self.self_id = id;
     }
@@ -227,18 +230,21 @@ mod tests {
         let rec = t.get(1).expect("id=1 live");
         assert_eq!(rec.entity.pos.x, 99.0);
 
-        // Insertion order is stable for full-table iteration.
         let ids: Vec<u32> = t.iter().map(|r| r.entity.id).collect();
-        assert_eq!(ids, vec![1, 2]);
+        assert_eq!(
+            ids,
+            vec![1, 2],
+            "insertion order is stable for full-table iteration"
+        );
     }
 
     #[test]
     fn changed_ids_reports_upserts_once_and_clears() {
         let mut t = EntityTable::default();
         t.upsert(&ent(1, 0.0));
-        t.upsert(&ent(1, 1.0)); // same window: still one report
+        t.upsert(&ent(1, 1.0));
 
-        assert_eq!(t.changed_ids(), vec![1]);
+        assert_eq!(t.changed_ids(), vec![1], "same window: still one report");
         assert!(t.changed_ids().is_empty(), "drain clears the dirty flags");
 
         t.upsert(&ent(2, 0.0));
@@ -294,8 +300,11 @@ mod tests {
 
         t.apply_snapshot(&snap_of(&[2, 3]));
         let changed = t.changed_ids();
-        // All snapshot records are dirty; id=1 was live but is gone.
-        assert_eq!(changed.len(), 3);
+        assert_eq!(
+            changed.len(),
+            3,
+            "all snapshot records are dirty; id=1 was live but is gone"
+        );
         for id in [1u32, 2, 3] {
             assert!(changed.contains(&id), "missing {id} from drain");
         }
@@ -303,7 +312,6 @@ mod tests {
         assert!(t.get(2).is_some());
         assert!(t.get(3).is_some());
 
-        // A second identical snapshot reports nothing new.
         t.apply_snapshot(&snap_of(&[2, 3]));
         let changed = t.changed_ids();
         assert_eq!(changed.len(), 2, "full replace marks every record dirty");
@@ -317,12 +325,14 @@ mod tests {
         let mut t = EntityTable::default();
         t.upsert(&ent(1, 0.0));
         assert_eq!(t.changed_ids(), vec![1]);
-        t.remove(1); // pending removal, not yet drained
-
-        // The snapshot brings id=1 back: it must report as an upsert only.
+        t.remove(1);
         t.apply_snapshot(&snap_of(&[1]));
         let changed = t.changed_ids();
-        assert_eq!(changed, vec![1]);
+        assert_eq!(
+            changed,
+            vec![1],
+            "pending removal drains; the returned id=1 reports as an upsert only"
+        );
         assert!(t.get(1).is_some());
     }
 

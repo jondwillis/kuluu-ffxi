@@ -345,6 +345,7 @@ mod tests {
                 name: "hxi".into(),
                 client: "horizonxi-2023".into(),
                 patch_version: Some("30230905_0".into()),
+                known_retail: false,
             }),
             ..Default::default()
         };

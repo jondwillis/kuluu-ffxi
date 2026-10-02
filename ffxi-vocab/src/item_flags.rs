@@ -108,13 +108,12 @@ mod tests {
         // @FLAG_NODELIVERY | @FLAG_EX (item_basic.sql).
         assert_eq!(lookup(7) & NOSALE, NOSALE);
         assert!(!sellable(7));
-        // item 2 (simple_bed) carries neither flag.
         assert!(sellable(2));
     }
 
+    /// item 4096 (fire crystal) stacks to 12; item 7 (gold_bed) does not stack.
     #[test]
     fn stack_size_comes_from_item_basic() {
-        // item 4096 (fire crystal) stacks to 12; item 7 (gold_bed) does not stack.
         assert_eq!(stack_size(4096), 12);
         assert_eq!(stack_size(7), 1);
         assert_eq!(stack_size(u16::MAX), 1, "unknown ids do not stack");

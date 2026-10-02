@@ -38,18 +38,27 @@ const PLAYER_POSITION_BASE: u32 = 0x7F80;
 const REQSET_PRIORITY_OFS: usize = 1; // 0x0027 / 0x0028 / 0x0029
 const REQSET_ACTOR_OFS: usize = 2;
 const REQSET_TAG_OFS: usize = 6;
-const REQWAIT_PRIORITY_OFS: usize = 1; // 0x002A
-const MOVE_GOAL_OFS: usize = 2; // 0x001F case 0 (x @2, z @4, y @6)
-const SET_EVENT_POS_X_OFS: usize = 1; // 0x0037 (z @3, y @5, heading @7)
-const SET_FACING_OFS: usize = 1; // 0x0039
-const DTURA_ACTOR_OFS: usize = 1; // 0x004A (target @5)
+/// Priority operand (research/XiEvents/OpCodes/0x002A.md).
+const REQWAIT_PRIORITY_OFS: usize = 1;
+/// Case 0 goal: x @2, z @4, y @6 (research/XiEvents/OpCodes/0x001F.md).
+const MOVE_GOAL_OFS: usize = 2;
+/// x @1, z @3, y @5, heading @7 (research/XiEvents/OpCodes/0x0037.md).
+const SET_EVENT_POS_X_OFS: usize = 1;
+/// Facing operand (research/XiEvents/OpCodes/0x0039.md).
+const SET_FACING_OFS: usize = 1;
+/// Actor operand; target @5 (research/XiEvents/OpCodes/0x004A.md).
+const DTURA_ACTOR_OFS: usize = 1;
 const DTURA_TARGET_OFS: usize = 5;
-const STOP_ACTION_KEY_OFS: usize = 1; // 0x005E / 0x006B
-const STOP_NAMED_ACTOR_OFS: usize = 5; // 0x006B
-const LOOKAT_CASE_OFS: usize = 1; // 0x0079
+/// Action key operand (research/XiEvents/OpCodes/0x005E.md, 0x006B.md).
+const STOP_ACTION_KEY_OFS: usize = 1;
+/// Named actor operand (research/XiEvents/OpCodes/0x006B.md).
+const STOP_NAMED_ACTOR_OFS: usize = 5;
+/// Case operand (research/XiEvents/OpCodes/0x0079.md).
+const LOOKAT_CASE_OFS: usize = 1;
 const LOOKAT_ACTOR_OFS: usize = 2;
 const LOOKAT_TARGET_OFS: usize = 6;
-const LOOK_AND_TALK_TARGET_OFS: usize = 1; // 0x001E
+/// Target operand (research/XiEvents/OpCodes/0x001E.md).
+const LOOK_AND_TALK_TARGET_OFS: usize = 1;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct EventPosition {
@@ -96,7 +105,7 @@ pub(super) struct Scene {
     dat: Arc<EventDat>,
     pub(super) actor: u32,
     player: EventPosition,
-    /// Raw 0x32 MainSpeed work-slot operand; yalms/sec is
+    /// The MainSpeed work-slot operand as authored; yalms/sec is
     /// `speed as f32 * EVENT_SPEED_SCALE`.
     speed: i32,
     motion: Option<EventPosition>,
@@ -205,11 +214,14 @@ impl EventVm {
     /// surfaces it to the host via [`Scene::dialog_child`] instead of being
     /// dropped, because retail's single global CliEventMessOpenFlag
     /// (research/XiEvents/OpCodes/0x001D.md) keeps the whole event parked
-    /// until the player answers that child; requests that stop on an
-    /// unrunnable opcode are still dropped.
+    /// until the player answers that child; a second parker while a frame is
+    /// open is dropped rather than stalling the stack behind it, since
+    /// authored events sequence around the flag with REQWAIT/MESWAIT. Requests
+    /// that stop on an unrunnable opcode are still dropped, and the drop is
+    /// real: a zombie left on the stack would keep REQWAIT/REQEW parked on it
+    /// forever. The active (actor, request index) pairs are collected under
+    /// one immutable borrow, since each step below needs &mut self.
     pub(super) fn step_stacks(&mut self) -> Option<StepResult> {
-        // Collect the active (actor, request index) pairs under one immutable
-        // borrow; each step below needs &mut self.
         let Some(scene) = &self.scene else {
             return None;
         };
@@ -231,11 +243,6 @@ impl EventVm {
             match result {
                 StepResult::Done => self.remove_request(actor, index),
                 StepResult::AwaitMessage(_) | StepResult::AwaitChoice(_) => {
-                    // A frame is already open: the master's own, or one another
-                    // child surfaced this pass. Retail's single global flag holds
-                    // one frame at a time and authored events sequence around it
-                    // with REQWAIT/MESWAIT, so a second parker is dropped rather
-                    // than stalling the stack behind it.
                     if self.pending_message.is_some()
                         || self.pending_choice.is_some()
                         || surfaced.is_some()
@@ -270,8 +277,6 @@ impl EventVm {
                         "dropping a child request that stopped on an opcode \
                          this VM does not run"
                     );
-                    // The drop must be real: a zombie left on the stack keeps
-                    // REQWAIT/REQEW parked on it forever.
                     self.remove_request(actor, index);
                 }
                 StepResult::Waiting | StepResult::Cancelled => {}
@@ -318,9 +323,11 @@ impl EventVm {
     }
 
     /// Step one child once and bubble its cues, scene actions and zone writes.
+    /// The child is reached through the `scene` field alone so the cue and
+    /// zone bubbling can borrow the sibling fields while it lives. Host-armed
+    /// holds live on the VM that published the cue (the master); a child's
+    /// WAIT* and MOVE case 1 park against them too.
     fn child_step(&mut self, actor: u32, index: usize) -> StepResult {
-        // The child is reached through the `scene` field alone so the cue and
-        // zone bubbling below can borrow the sibling fields while it lives.
         let vm = &mut self
             .scene
             .as_mut()
@@ -331,8 +338,6 @@ impl EventVm {
             .unwrap()
             .requests[index]
             .vm;
-        // Host-armed holds live on the VM that published the cue (the master);
-        // a child's WAIT* and MOVE case 1 park against them too.
         vm.action_holds = self.action_holds.clone();
         vm.move_holds = self.move_holds.clone();
         let result = vm.step();
@@ -461,7 +466,10 @@ impl EventVm {
     /// Push `tag` onto the actor's stack, starting a child at that tag index of
     /// the actor's own block. Returns false when nothing was pushed: the tag is
     /// already queued there (ReqSet returns 0), or the actor has no block or no
-    /// entry at that index.
+    /// entry at that index. A child for the local player starts from the
+    /// master's tracked position; NPC children start at zero and their
+    /// ActorMove cues carry the goal only, so the renderer walks from where
+    /// the entity stands.
     fn push_request(&mut self, actor: u32, priority: u8, tag: u8) -> bool {
         if self.request_queued(actor, tag) {
             return false;
@@ -488,9 +496,6 @@ impl EventVm {
             }
         };
         let dat = scene.dat.clone();
-        // A child for the local player starts from the master's tracked
-        // position; NPC children start at zero and their ActorMove cues carry
-        // the goal only, so the renderer walks from where the entity stands.
         let player = if actor == ZONE_PLAYER_ACTOR {
             scene.player
         } else {
@@ -580,8 +585,9 @@ impl EventVm {
     }
 
     /// The entity/player position accessor a `getworkofs` value selects, when a
-    /// scene is attached: 0x7F00..0x7F03 on the zone block and 0x7F80..0x7F83
-    /// anywhere read x, y, z, heading of the tracked player position.
+    /// scene is attached: the entity-position base on the zone block and the
+    /// player-position base anywhere read x, y, z, heading of the tracked
+    /// player position (research/XiEvents/Event VM Functions.md).
     pub(super) fn scene_operand(&self, operand: u32) -> Option<i32> {
         let scene = self.scene.as_ref()?;
         let index = if scene.actor == ZONE_PLAYER_ACTOR
@@ -647,8 +653,6 @@ impl EventVm {
                 let actor = self.reqset_actor(ActorLookup(self.eventgetcode2(REQSET_ACTOR_OFS)));
                 let tag = self.byte_at(REQSET_TAG_OFS);
                 if self.req_wait == Some((actor, tag)) {
-                    // The parked re-run of this opcode: hold until the original
-                    // request leaves the target's stack, then advance.
                     if !self.request_queued(actor, tag) {
                         self.req_wait = None;
                     }
@@ -737,7 +741,8 @@ impl EventVm {
                     return Some(StepResult::Unimplemented(op));
                 }
             }
-            // 0x37 on a non-player actor: set the event entity's position. The
+            // `OP_SET_EVENT_POS` on a non-player actor: set the event entity's
+            // position (research/XiEvents/OpCodes/0x0037.md). The
             // player-actor version keeps its width skip (the server round trip
             // owns that path).
             OP_SET_EVENT_POS if self.scene.as_ref().unwrap().actor != ZONE_PLAYER_ACTOR => {
@@ -748,7 +753,8 @@ impl EventVm {
                 });
                 self.advance(op);
             }
-            // 0x39 on a non-player actor: set the event entity's facing.
+            // `OP_SET_FACING` on a non-player actor: set the event entity's
+            // facing (research/XiEvents/OpCodes/0x0039.md).
             OP_SET_FACING if self.scene.as_ref().unwrap().actor != ZONE_PLAYER_ACTOR => {
                 let heading = self.getworkofs(SET_FACING_OFS, 0);
                 self.cues.push(EventCue::ActorFace {
@@ -757,14 +763,16 @@ impl EventVm {
                 });
                 self.advance(op);
             }
-            // 0x4A DTURA: turn the first named actor toward the second.
+            // `OP_DTURA`: turn the first named actor toward the second
+            // (research/XiEvents/OpCodes/0x004A.md).
             OP_DTURA => {
                 let actor = ActorLookup(self.eventgetcode2(DTURA_ACTOR_OFS));
                 let target = ActorLookup(self.eventgetcode2(DTURA_TARGET_OFS));
                 self.cues.push(EventCue::ActorLookAt { actor, target });
                 self.advance(op);
             }
-            // 0x5E: stop the event entity's current action and return it to idle.
+            // `OP_STOP_ACTION`: stop the event entity's current action and
+            // return it to idle (research/XiEvents/OpCodes/0x005E.md).
             OP_STOP_ACTION => {
                 let key = (self.eventgetcode2(STOP_ACTION_KEY_OFS) != 0)
                     .then(|| self.fourcc_at(STOP_ACTION_KEY_OFS));
@@ -774,7 +782,8 @@ impl EventVm {
                 });
                 self.advance(op);
             }
-            // 0x6B: stop the named action on the second named actor.
+            // `OP_STOP_NAMED_ACTION`: stop the named action on the second
+            // named actor (research/XiEvents/OpCodes/0x006B.md).
             OP_STOP_NAMED_ACTION => {
                 let actor = ActorLookup(self.eventgetcode2(STOP_NAMED_ACTOR_OFS));
                 let key = (self.eventgetcode2(STOP_ACTION_KEY_OFS) != 0)
@@ -782,15 +791,17 @@ impl EventVm {
                 self.cues.push(EventCue::ActorStopAction { actor, key });
                 self.advance(op);
             }
-            // 0x79 lookat case 0: turn the first named actor toward the second.
+            // `OP_LOOKAT` case 0: turn the first named actor toward the second
+            // (research/XiEvents/OpCodes/0x0079.md).
             OP_LOOKAT if self.byte_at(LOOKAT_CASE_OFS) == 0 => {
                 let actor = ActorLookup(self.eventgetcode2(LOOKAT_ACTOR_OFS));
                 let target = ActorLookup(self.eventgetcode2(LOOKAT_TARGET_OFS));
                 self.cues.push(EventCue::ActorLookAt { actor, target });
                 self.advance(op);
             }
-            // 0x1E look-and-talk: the motion half turns the event entity toward
-            // the named actor; the talk half is a separate message path.
+            // `OP_LOOK_AND_TALK`: the motion half turns the event entity
+            // toward the named actor (research/XiEvents/OpCodes/0x001E.md); the
+            // talk half is a separate message path.
             OP_LOOK_AND_TALK => {
                 let target = ActorLookup(self.eventgetcode2(LOOK_AND_TALK_TARGET_OFS));
                 self.cues.push(EventCue::ActorLookAt {
@@ -830,7 +841,7 @@ impl EventVm {
         None
     }
 
-    fn position_operands(&self, start: usize, heading: bool) -> EventPosition {
+    pub(super) fn position_operands(&self, start: usize, heading: bool) -> EventPosition {
         EventPosition {
             x: self.getworkofs(start, 0),
             z: self.getworkofs(start + 2, 0),

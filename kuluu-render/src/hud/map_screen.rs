@@ -867,7 +867,8 @@ pub(crate) fn spawn_map_screen(mut commands: Commands, mut images: ResMut<Assets
         .spawn((
             InGameEntity,
             // Same exemption as the map surface: the command panel belongs to the
-            // event-opened window, not the HUD that 0x67 hides.
+            // event-opened window, not the HUD that 0x67 hides
+            // (research/XiEvents/OpCodes/0x0067.md).
             MapPanelRoot,
             HudHideExempt,
             n,
@@ -1764,18 +1765,18 @@ mod tests {
         assert!(!rows[0].is_cursor);
     }
 
-    // Headless draw-level proof for event 503 (Southern San d'Oria new-character
-    // CS): the MAPSCHEDULOR beat opens the full-screen Map with Ailevia's marker
-    // while HIDE_HUD is live — assert the map roots actually flip visible and the
-    // placed-marker dot lands at the recorded position: a drawn map, not just an
-    // emitted event (recorded beat: map_open{map_id 230} + marker "Ailevia" @
-    // x_milli -10264 / y_milli -363).
+    /// Headless draw-level proof for event 503 (Southern San d'Oria new-character
+    /// CS): the MAPSCHEDULOR beat opens the full-screen Map with Ailevia's marker
+    /// while HIDE_HUD is live — assert the map roots actually flip visible and the
+    /// placed-marker dot lands at the recorded position: a drawn map, not just an
+    /// emitted event (recorded beat: map_open{map_id 230} + marker "Ailevia" @
+    /// x_milli -10264 / y_milli -363).
     mod event503_draw {
         use super::*;
-        // The outer tests module globs in kuluu_snapshot::{Entity, Vec3}; the
-        // explicit imports below shadow them for Bevy's query types.
         use crate::input_mode::MenuStack;
         use crate::minimap::MinimapAabb;
+        /// The outer tests module globs in kuluu_snapshot::{Entity, Vec3}; these
+        /// explicit imports shadow those for Bevy's query types.
         use bevy::ecs::entity::Entity;
         use bevy::ecs::system::RunSystemOnce;
 
@@ -1893,8 +1894,6 @@ mod tests {
                 let mut state = app.world_mut().resource_mut::<SceneState>();
                 state.snapshot.zone_id = Some(230);
             }
-            // The recorded beat: the session pushed MenuKind::Map and placed
-            // Ailevia's marker in zone 230.
             app.world_mut().insert_resource(map_mode());
             let mut markers = app.world_mut().resource_mut::<MapMarkers>();
             markers.by_zone.insert(
@@ -1924,17 +1923,23 @@ mod tests {
 
             let dot = placed_dot_node(app.world_mut());
             assert_eq!(dot.display, Display::Flex, "Ailevia's dot must draw");
-            // (-10.264 + 50) / 100 and (-0.363 + 50) / 100 in the test window.
             let left = val_percent(&dot.left).expect("percent-placed dot");
             let top = val_percent(&dot.top).expect("percent-placed dot");
-            assert!((left - 39.736).abs() < 1e-3, "dot left {left}");
-            assert!((top - 49.637).abs() < 1e-3, "dot top {top}");
+            assert!(
+                (left - 39.736).abs() < 1e-3,
+                "dot left: (-10.264 + 50) / 100 in the test window, got {left}"
+            );
+            assert!(
+                (top - 49.637).abs() < 1e-3,
+                "dot top: (-0.363 + 50) / 100 in the test window, got {top}"
+            );
             assert_eq!(placed_label(app.world_mut()), "Ailevia");
         }
 
         /// Event 503's A6 HIDE_HUD is live through the map beat; retail's 0x67 only
-        /// repositions the event-message boxes and sets CompassDraw, so both map
-        /// roots must survive `apply_hud_hidden` while a plain HUD root hides.
+        /// repositions the event-message boxes and sets CompassDraw
+        /// (research/XiEvents/OpCodes/0x0067.md), so both map roots must survive
+        /// `apply_hud_hidden` while a plain HUD root hides.
         #[test]
         fn cutscene_hud_hide_keeps_the_map_roots_visible() {
             use crate::hud_hide::{apply_hud_hidden, HudHidden, HudHideStash};
@@ -2010,7 +2015,6 @@ mod tests {
             run_draw(&mut app);
             assert_eq!(root_display(app.world_mut()), Display::Flex);
 
-            // map_closed pops MenuKind::Map back to the root menu level.
             app.world_mut()
                 .insert_resource(InputMode::Menu(MenuStack::root()));
             run_draw(&mut app);
@@ -2018,7 +2022,7 @@ mod tests {
             assert_eq!(
                 root_display(app.world_mut()),
                 Display::None,
-                "map must hide on close"
+                "map must hide on close (map_closed pops to the root menu level)"
             );
             assert_eq!(panel_display(app.world_mut()), Display::None);
             let dot = placed_dot_node(app.world_mut());

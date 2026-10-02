@@ -49,7 +49,7 @@ const MSI_TABLE_MEDIA: &str = "Media";
 /// Which of this crate's concurrent workers a [`Progress`] came from. The
 /// downloader and the cabinet decoder run at the same time (`download_and_unpack`
 /// overlaps the LZX decode with the next volume's transfer), so a UI that
-/// renders one line per lane must be told which one spoke rather than
+/// renders one line per lane needs to know which one spoke rather than
 /// re-deriving it from the variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Lane {
@@ -236,13 +236,12 @@ pub fn volume_name(tag: &str, index: usize) -> String {
     }
 }
 
-// --- RAR5 header scan (std only): which members each volume completes ---
-// Format: rarlab.com/technote.htm "RAR 5.0 archive format". Every header is
-// `crc32 u32, size vint, type vint, flags vint, [extra vint], [data vint], ...`;
-// file headers (type 2) carry `file_flags, unpacked, attrs, [mtime], [crc],
-// compression, host, name_len, name`. Header flag 0x10 = continues in the
-// next volume.
-
+/// RAR5 header layout, std-only: which members each volume completes.
+/// Format per rarlab.com/technote.htm "RAR 5.0 archive format": every header is
+/// `crc32 u32, size vint, type vint, flags vint, [extra vint], [data vint], ...`;
+/// file headers (type 2) carry `file_flags, unpacked, attrs, [mtime], [crc],
+/// compression, host, name_len, name`. The split-after header flag marks a
+/// member that continues in the next volume.
 const RAR5_SIGNATURE: &[u8] = b"Rar!\x1a\x07\x01\x00";
 const RAR5_HEADER_FILE: u64 = 2;
 const RAR5_HEADER_END: u64 = 5;
@@ -260,15 +259,20 @@ pub struct Member {
     pub continues: bool,
 }
 
+/// RAR5 vint: seven payload bits per byte, the high bit marks more bytes to
+/// come (rarlab.com/technote.htm).
+const VINT_PAYLOAD_BITS: u8 = 127;
+const VINT_MORE: u8 = 128;
+
 fn vint(b: &[u8], i: &mut usize) -> Option<u64> {
     let mut v = 0u64;
     let mut shift = 0;
     loop {
         let c = *b.get(*i)?;
         *i += 1;
-        v |= u64::from(c & 0x7f) << shift;
+        v |= u64::from(c & VINT_PAYLOAD_BITS) << shift;
         shift += 7;
-        if c & 0x80 == 0 {
+        if c & VINT_MORE == 0 {
             return Some(v);
         }
     }
@@ -346,8 +350,6 @@ pub fn scan_volume(path: &Path) -> Result<Vec<Member>, String> {
     Ok(members)
 }
 
-// --- download ---
-
 /// Transfer size from a HEAD, following redirects. `None` whenever the CDN
 /// declines to say, which downgrades the download bar to indeterminate rather
 /// than inventing a denominator.
@@ -408,8 +410,6 @@ fn curl(url: &str, dest: &Path, cancel: &Cancel, on_bytes: &dyn Fn(u64)) -> Resu
     }
 }
 
-// --- RAR member extraction ---
-
 fn extract_members(
     part1: &Path,
     wanted: &[String],
@@ -447,17 +447,17 @@ fn extract_members(
     Ok(())
 }
 
-// --- CAB decode into the staging area, keyed by member name ---
-
 /// How many progress events a cabinet decode emits, spread over its members.
 const CAB_PROGRESS_STEPS: usize = 20;
 
+/// Decode a cabinet into the staging area, keyed by member name. Members are
+/// tracked as (folder index, folder-relative offset, size, name) in decode
+/// order: a folder is one compression stream, so its members are read front
+/// to back.
 fn unpack_cab(cab_path: &Path, staging: &Path, report: &Reporter) -> Result<usize, String> {
     let f = fs::File::open(cab_path).map_err(|e| format!("{}: {e}", cab_path.display()))?;
     let mut cabinet = cab::Cabinet::new(f)
         .map_err(|e| format!("{} is not a cabinet: {e}", cab_path.display()))?;
-    // (folder index, folder-relative offset, size, name), in decode order: a
-    // folder is one compression stream, so its members are read front to back.
     let mut entries: Vec<(usize, u64, u64, String)> = cabinet
         .folder_entries()
         .enumerate()
@@ -532,8 +532,6 @@ fn unpack_cab(cab_path: &Path, staging: &Path, report: &Reporter) -> Result<usiz
     }
     Ok(written)
 }
-
-// --- MSI-driven placement ---
 
 struct MsiLayout {
     /// File key -> destination relative to the target root (`SquareEnix/...`).
@@ -668,8 +666,6 @@ fn file_name(p: &Path) -> String {
         .into_owned()
 }
 
-// --- the pipeline ---
-
 enum Event {
     VolumeReady(usize),
     DownloadFailed(String),
@@ -705,6 +701,10 @@ pub fn refuse_patched_target(target_root: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Download the base volumes and unpack them into `target_root`. The download
+/// bar's denominator is the sum of the known transfer sizes; one volume whose
+/// length the CDN withholds zeroes it, since a partial denominator would make
+/// the bar jump when that volume starts.
 pub fn download_and_unpack(plan: &Plan, cancel: &Cancel, report: &Reporter) -> Result<(), String> {
     let Plan {
         region,
@@ -733,8 +733,6 @@ pub fn download_and_unpack(plan: &Plan, cancel: &Cancel, report: &Reporter) -> R
             scope.spawn(move || {
                 let lens: Vec<Option<u64>> =
                     volumes.iter().map(|(url, _)| remote_len(url)).collect();
-                // A partial denominator would make the bar jump when the
-                // volume of unknown length starts, so one unknown zeroes it.
                 let total = lens.iter().copied().sum::<Option<u64>>().unwrap_or(0);
                 let mut base = 0u64;
                 for (i, (url, dest)) in volumes.iter().enumerate() {
@@ -952,7 +950,7 @@ mod tests {
     #[test]
     fn vint_decodes_multi_byte_values() {
         let mut i = 0;
-        assert_eq!(vint(&[0x80 | 0x05, 0x01], &mut i), Some(0x85));
+        assert_eq!(vint(&[VINT_MORE | 5, 1], &mut i), Some(133));
         assert_eq!(i, 2);
         let mut i = 0;
         assert_eq!(vint(&[0x7f], &mut i), Some(0x7f));

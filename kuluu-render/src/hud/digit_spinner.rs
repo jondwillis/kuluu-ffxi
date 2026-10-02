@@ -238,7 +238,9 @@ impl DigitSpinner {
     }
 }
 
-/// Text, tint and background for one node of the drawn row.
+/// Text, tint and background for one node of the drawn row. The `All` slot is
+/// a readout, not a control: it lights when the digits beside it already add
+/// up to the whole cap.
 pub fn slot_style(
     spinner: &DigitSpinner,
     slot: SpinnerSlot,
@@ -246,8 +248,6 @@ pub fn slot_style(
 ) -> (String, Color, Color) {
     use crate::hud::item_ui::theme;
     match slot {
-        // A readout, not a control: it lights when the digits beside it already
-        // add up to the whole cap.
         SpinnerSlot::All => (
             "All".to_string(),
             if spinner.is_all() {

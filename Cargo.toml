@@ -1,9 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["ffxi-proto", "kuluu", "kuluu-mcp", "kuluu-nav", "ffxi-nav-recast", "kuluu-snapshot", "kuluu-render", "kuluu-dlss-nr", "kuluu-ngx-fwd", "kuluu-viewer-wasm", "ffxi-dat", "ffxi-actor", "ffxi-audio", "ffxi-event", "kuluu-session", "ffxi-vocab", "lsb-scrape", "ffxi-install", "xtask"]
+members = ["ffxi-proto", "kuluu", "kuluu-mcp", "kuluu-nav", "ffxi-nav-recast", "kuluu-snapshot", "kuluu-render", "kuluu-dlss-nr", "kuluu-ngx-fwd", "kuluu-viewer-wasm", "ffxi-dat", "ffxi-actor", "ffxi-audio", "ffxi-event", "kuluu-session", "ffxi-vocab", "lsb-scrape", "ffxi-install", "ffxi-pol", "xtask"]
 # `xtask` is project automation run on demand via `cargo xtask` — exclude it
 # from the default set so plain `cargo build`/`test` don't compile it.
-default-members = ["ffxi-proto", "kuluu", "kuluu-mcp", "kuluu-nav", "ffxi-nav-recast", "kuluu-snapshot", "kuluu-render", "kuluu-dlss-nr", "kuluu-ngx-fwd", "kuluu-viewer-wasm", "ffxi-dat", "ffxi-actor", "ffxi-audio", "ffxi-event", "kuluu-session", "ffxi-vocab", "lsb-scrape", "ffxi-install"]
+default-members = ["ffxi-proto", "kuluu", "kuluu-mcp", "kuluu-nav", "ffxi-nav-recast", "kuluu-snapshot", "kuluu-render", "kuluu-dlss-nr", "kuluu-ngx-fwd", "kuluu-viewer-wasm", "ffxi-dat", "ffxi-actor", "ffxi-audio", "ffxi-event", "kuluu-session", "ffxi-vocab", "lsb-scrape", "ffxi-install", "ffxi-pol"]
 
 # Vendored fork of recastnavigation-rs 0.1.0 with a one-line `#include
 # <cstddef>` in Deterministic.h. Without it, `cargo test` fails with
@@ -72,9 +72,13 @@ clap = { version = "4", features = ["derive"] }
 flate2 = "1.1"
 hex = "0.4"
 md-5 = "0.11"
+num-bigint = { version = "0.4", default-features = false }
+num-integer = { version = "0.1", default-features = false }
+rand = { version = "0.10", default-features = false }
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
 rustls-pki-types = "1"
 serde = { version = "1", features = ["derive"] }
+sha1 = "0.10"
 serde_json = "1"
 sha2 = "0.11"
 thiserror = "2"

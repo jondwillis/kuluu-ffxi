@@ -48,11 +48,12 @@ FFXI, please support the official service. See [LEGAL.md](LEGAL.md).
 Grab the archive for your platform from
 [Releases](https://github.com/jondwillis/kuluu-ffxi/releases) and unpack it.
 
-| Platform | Archive | Then |
+| Platform | Build | First launch |
 | --- | --- | --- |
-| Windows | `kuluu-<version>-x86_64-windows.zip` | Run `kuluu.exe` |
-| macOS | `kuluu-<version>-aarch64-macos.tar.gz` | Move `Kuluu.app` to Applications, or run the `kuluu` binary |
-| Linux, Steam Deck | `kuluu-<version>-x86_64-linux.tar.gz` | Run `./install-local.sh` to install the binary and desktop icon under `~/.local` (needs Python 3) |
+| Windows | x86_64 or ARM64 | Run `kuluu.exe` |
+| macOS | Apple Silicon | Move `Kuluu.app` to Applications |
+| Linux | x86_64 or ARM64 | Run `./install-local.sh` (needs Python 3) |
+| Steam Deck | x86_64 Linux | See the Steam Deck steps below |
 
 Starting Kuluu with no arguments opens the launcher, which asks for a server,
 account and character and lists the account's characters by name. Stuck?
@@ -68,7 +69,7 @@ step. The same from a terminal:
 
 ```bash
 kuluu install get            # download, patch and make it the default
-kuluu install link hxi       # or register an install you already have (auto-detects HorizonXI, Lutris, Wine, CrossOver, PlayOnline)
+kuluu install link hxi       # detect and register an existing install
 kuluu install list           # every install Kuluu can see, with its client version
 kuluu install use hxi        # pick the default
 kuluu install which          # what will load, and why
@@ -84,34 +85,23 @@ them. Installs live under your user data directory
 default for one run.
 
 Retail keeps changing its DAT formats and private servers pin older clients.
-The latest retail client is the primary target. Kuluu identifies each install
-at startup and picks the matching decoders, so older generations stay usable
-through the same code, and `install list` shows which generation each one is.
+The latest retail client is the primary target. Kuluu identifies known client
+builds at startup; `install list` shows the version it recognizes. Support for
+older builds depends on the formats they use.
 
 <details>
 <summary>Steam Deck</summary>
 
-The Deck runs the plain x86_64 Linux binary. Launch it from Game Mode, not
-Desktop mode: Steam keeps its desktop controller layout active for anything
-started outside Game Mode, so the d-pad and left stick arrive as arrow keys
-on top of the gamepad. `kuluu steam-shortcut` registers the binary as a
-non-Steam shortcut named Kuluu, with `play` as its launch options, so Game
-Mode can start it under its own controller layout. Run it once from Desktop
-mode with Steam fully quit; rerun it after moving the binary.
+The Deck uses the x86_64 Linux build. With Steam fully closed, run this once
+from Desktop mode, then launch Kuluu from Game Mode:
 
 ```bash
-./kuluu steam-shortcut install                    # add or update the Kuluu shortcut (Steam must be closed)
-./kuluu steam-shortcut install --layout deck.vdf  # also install a Steam Input layout for it
-./kuluu steam-shortcut install --live             # hand the path to a running Steam instead (no rename/layout)
-./kuluu steam-shortcut status                     # which Steam install and account, and whether the entry matches
-./kuluu steam-shortcut remove
+./kuluu steam-shortcut install
 ```
 
-Without a layout file, pick the Gamepad template in the shortcut's
-controller settings the first time you launch. In-game the pad follows
-retail's Pattern E: A confirm, B cancel, X main menu, Y active window, LB
-autorun, L3 heal/lock, R3 first person, d-pad targets in the field and moves
-the cursor in menus, left stick moves, right stick is the camera.
+Pick the Gamepad template in Steam's controller settings. Desktop mode can
+send keyboard inputs alongside gamepad inputs, so use Game Mode to play.
+Rerun the command if you move the binary.
 
 </details>
 
@@ -122,7 +112,7 @@ the cursor in menus, left stick moves, right stick is the camera.
   Anything with no retail equivalent is an **Enhanced** feature, opt-in and
   never on by default.
 - **Modernization layers on top.** Bevy and wgpu replace the legacy D3D8
-  stack; a planned plugin API aims to make Windower and Ashita unnecessary.
+  stack; the aim is to support extensions without patching the game client.
 - **No asset redistribution.** Kuluu requires a user-provided retail install.
   Tables translated from LandSandBoat, POLUtils and similar sources are baked
   in as derived compile-time constants under the upstream license, never as
@@ -135,19 +125,11 @@ Nightly Rust is required; `rust-toolchain.toml` pins it.
 ```bash
 git clone https://github.com/jondwillis/kuluu-ffxi && cd kuluu-ffxi
 git submodule update --init --depth 1 vendor/server vendor/POLUtils vendor/AltanaListener
-cargo run -p kuluu -- play                                    # native window
-cargo run -p kuluu --no-default-features -- play --headless   # JSON event stream, no Bevy
+cargo run -p kuluu -- play
 ```
 
-The submodules are build-time only: build scripts translate their data into
-compile-time constants, and nothing under [`vendor/`](vendor/README.md) is
-needed at runtime. Credentials come from `FFXI_USER`, `FFXI_PASS`,
-`FFXI_CHAR` and `FFXI_SERVER`; the launcher prompts for any that are unset.
-Headless mode is the loop for protocol work and for driving the client from
-an automation harness through the MCP bridge.
-
-Git hooks, the check stages, the backlog, the reference-only
-[`research/`](research/README.md) policy and the optional DLSS build are in
+The submodules supply build-time data; they are not needed to run a release.
+For hooks, checks, architecture and optional DLSS builds, see
 [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Roadmap
@@ -155,11 +137,11 @@ Git hooks, the check stages, the backlog, the reference-only
 [![open issues](https://img.shields.io/github/issues/jondwillis/kuluu-ffxi)](https://github.com/jondwillis/kuluu-ffxi/issues)
 [![good first issues](https://img.shields.io/github/issues/jondwillis/kuluu-ffxi/good%20first%20issue?label=good%20first%20issue&color=7057ff)](https://github.com/jondwillis/kuluu-ffxi/issues?q=is%3Aopen+label%3A%22good+first+issue%22)
 
-Progress is tracked against retail in [beads](.beads/), a git-backed issue
-tracker checked into the repo. Parity work carries the `roadmap` label plus
-`vanilla` or `enhanced` and an area label, and issue status is the source of
-truth for what's done. The GitHub issues above are a generated projection of
-that backlog, so the live counts are not a hand-kept promise.
+Follow the [roadmap issues](https://github.com/jondwillis/kuluu-ffxi/issues?q=is%3Aopen+label%3Aroadmap)
+for remaining parity work. This is a work in progress; the goal of matching
+retail is not a claim that every feature works today. Bug reports and pull
+requests are welcome. See [Contributing](CONTRIBUTING.md) or
+[Support](SUPPORT.md) to get involved.
 
 ## AI-generated code
 
@@ -172,10 +154,10 @@ infer it.
 - **Review it like any unfamiliar code.** AI-written code can be confidently
   wrong, and FFXI's wire protocol and coordinate math are easy to get subtly
   wrong even by hand.
-- **Guardrails, not guarantees.** The FFXI / LandSandBoat protocol boundary
+- **Checks have limits.** The FFXI / LandSandBoat protocol boundary
   is audited against the upstream source by dedicated review agents and
-  pinned with tests, and every push runs the same gate as CI. That catches a
-  lot; it does not make the code independently audited.
+  pinned with tests. Local hooks and CI check different parts of the build;
+  they do not make the code independently audited.
 - **No warranty.** Per the GPL-3.0 license, this software comes with none.
 
 Contributions are welcome on the same terms, human-written or AI-assisted.

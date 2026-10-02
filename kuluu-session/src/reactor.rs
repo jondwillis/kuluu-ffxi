@@ -99,6 +99,15 @@ pub enum Goal {
         attack_issued: bool,
     },
 
+    /// Attack sent (or about to be, on the next tick), server not yet
+    /// answered. Promoted to `Engaged` by the accept in `observe_event`,
+    /// dropped by the refusal there or by `ENGAGE_ACCEPT_TIMEOUT` in
+    /// `tick_goal`.
+    Engaging {
+        target_id: u32,
+        attack_issued: bool,
+    },
+
     Pathing {
         waypoints: Vec<Vec3>,
         idx: usize,
@@ -138,6 +147,13 @@ fn snapshot_goal(goal: &Goal) -> ReactorGoalSnapshot {
             target_id: *target_id,
             attack_issued: *attack_issued,
         },
+        Goal::Engaging {
+            target_id,
+            attack_issued,
+        } => ReactorGoalSnapshot::Engaging {
+            target_id: *target_id,
+            attack_issued: *attack_issued,
+        },
         Goal::Pathing { waypoints, idx, .. } => {
             let dest = waypoints.last().copied().unwrap_or(Vec3 {
                 x: 0.0,
@@ -161,6 +177,17 @@ fn snapshot_goal(goal: &Goal) -> ReactorGoalSnapshot {
         },
     }
 }
+
+/// How long a sent Attack waits for the server's answer before the pending
+/// engage is dropped. Both answers leave inside one logic update
+/// (vendor/server/src/map/map_constants.h kLogicUpdateInterval): the accept
+/// as 0x058 from ai/controllers/player_controller.cpp
+/// CPlayerController::Engage, then 0x037 from entities/char_entity.cpp
+/// CCharEntity::PostTick behind m_nextUpdateTimer; the refusal as the 0x029
+/// from the same Engage. The packet validator
+/// (packets/c2s/0x01a_action.cpp, the Attack blockedBy set) drops a blocked
+/// Attack with no reply at all, which is the case this bounds.
+const ENGAGE_ACCEPT_TIMEOUT: Duration = Duration::from_secs(2);
 
 const FIELD_BAG_CONTAINERS: [u8; 4] = [0, 5, 6, 7];
 
@@ -222,6 +249,10 @@ pub struct Reactor {
 
     target_locked: bool,
 
+    /// Time spent in `Goal::Engaging` with the Attack issued, against
+    /// `ENGAGE_ACCEPT_TIMEOUT`.
+    engage_wait: Duration,
+
     fishing: FishingMachine,
     fishing_phase_pub: Option<u8>,
     fishing_pending: Vec<AgentCommand>,
@@ -253,6 +284,7 @@ impl Reactor {
             needs_zone_seed: false,
             reactor_override: None,
             target_locked: automates_player_input,
+            engage_wait: Duration::ZERO,
             fishing: FishingMachine::new(automates_player_input),
             fishing_phase_pub: None,
             fishing_pending: Vec::new(),
@@ -384,33 +416,73 @@ impl Reactor {
         }
         self.state.apply_event(ev);
 
-        // vendor/server/src/map/ai/ai_container.cpp CAIContainer::Internal_ChangeTarget:
-        // while engaged the server re-aims the battle target at the new target
-        // (SetBattleTargetID) and clears it for a zero target, so the goal must
-        // follow the 0x058 push or it keeps facing the abandoned target. The
-        // re-aimed target is already being attacked by the server's continuing
-        // attack state, so no fresh Attack action is issued.
+        // The accept: vendor/server/src/map/ai/controllers/player_controller.cpp
+        // CPlayerController::Engage pushes 0x058 only after its checks and
+        // CController::Engage pass, so the pending goal becomes Engaged on it.
+        // While engaged the server re-aims the battle target at the new target
+        // (ai_container.cpp CAIContainer::Internal_ChangeTarget,
+        // SetBattleTargetID) and clears it for a zero target, so the goal must
+        // follow the push or it keeps facing the abandoned target. The re-aimed
+        // target is already being attacked by the server's continuing attack
+        // state, so no fresh Attack action is issued.
         if let AgentEvent::TargetChanged { target_id } = ev {
-            if let Goal::Engaged { target_id: old, .. } = self.goal {
-                match target_id {
-                    Some(new) if *new != old => {
-                        self.goal = Goal::Engaged {
-                            target_id: *new,
-                            attack_issued: true,
-                        };
-                        out.push(AgentEvent::ReactorGoalChanged {
-                            goal: snapshot_goal(&self.goal),
-                        });
-                    }
-                    None => {
-                        self.goal = Goal::Idle;
-                        out.push(AgentEvent::ReactorGoalChanged {
-                            goal: snapshot_goal(&self.goal),
-                        });
-                    }
-                    _ => {}
+            let goal = self.goal.clone();
+            match (&goal, target_id) {
+                (Goal::Engaging { .. }, Some(new)) => {
+                    self.goal = Goal::Engaged {
+                        target_id: *new,
+                        attack_issued: true,
+                    };
+                    out.push(AgentEvent::ReactorGoalChanged {
+                        goal: snapshot_goal(&self.goal),
+                    });
+                }
+                (Goal::Engaged { target_id: old, .. }, Some(new)) if *new != *old => {
+                    self.goal = Goal::Engaged {
+                        target_id: *new,
+                        attack_issued: true,
+                    };
+                    out.push(AgentEvent::ReactorGoalChanged {
+                        goal: snapshot_goal(&self.goal),
+                    });
+                }
+                (Goal::Engaging { .. } | Goal::Engaged { .. }, None) => {
+                    self.goal = Goal::Idle;
+                    out.push(AgentEvent::ReactorGoalChanged {
+                        goal: snapshot_goal(&self.goal),
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        // 0x037 is the byte's authority (state.rs SelfServerStatus); should the
+        // 0x058 be missed, the ATTACK byte still promotes the pending engage.
+        if let AgentEvent::SelfServerStatus { status, .. } = ev {
+            if let Goal::Engaging { target_id, .. } = self.goal {
+                if *status == ffxi_proto::decode::animation::ATTACK {
+                    self.goal = Goal::Engaged {
+                        target_id,
+                        attack_issued: true,
+                    };
+                    out.push(AgentEvent::ReactorGoalChanged {
+                        goal: snapshot_goal(&self.goal),
+                    });
                 }
             }
+        }
+
+        // The refusal (the 0x029 MsgBasic from CPlayerController::Engage or
+        // entities/char_entity.cpp CCharEntity::applyTargetRestrictions)
+        // changes no server state, so the pending goal is dropped; nothing on
+        // the client ever read as engaged.
+        if matches!(ev, AgentEvent::EngageRefused { .. })
+            && matches!(self.goal, Goal::Engaging { .. })
+        {
+            self.goal = Goal::Idle;
+            out.push(AgentEvent::ReactorGoalChanged {
+                goal: snapshot_goal(&self.goal),
+            });
         }
 
         // Feed the fishing machine its server-side inputs and publish any resulting phase
@@ -555,9 +627,23 @@ impl Reactor {
                 CommandRouting::absorbed_with_goal(snapshot_goal(&self.goal))
             }
             AgentCommand::Engage { target_id } => {
-                self.goal = Goal::Engaged {
-                    target_id,
-                    attack_issued: false,
+                // Already engaged, the server treats the Attack as a
+                // ChangeTarget (vendor/server/src/map/ai/ai_container.cpp
+                // CAIContainer::Internal_Engage, the IsEngaged branch): the
+                // weapon is out, the goal re-aims at once and the 0x058
+                // re-aim confirms it. From any other goal the engage is a
+                // request until the server answers.
+                self.goal = if matches!(self.goal, Goal::Engaged { .. }) {
+                    Goal::Engaged {
+                        target_id,
+                        attack_issued: false,
+                    }
+                } else {
+                    self.engage_wait = Duration::ZERO;
+                    Goal::Engaging {
+                        target_id,
+                        attack_issued: false,
+                    }
                 };
                 CommandRouting::absorbed_with_goal(snapshot_goal(&self.goal))
             }
@@ -603,7 +689,12 @@ impl Reactor {
                 // 0x01a_action.cpp GP_CLI_COMMAND_ACTION_ACTIONID::AttackOff routes to
                 // CPlayerController::Disengage); a goal-only cancel would leave the
                 // server auto-swinging on the abandoned target.
-                if let Goal::Engaged { target_id, .. } = self.goal {
+                // AttackOff on a pending engage is dropped by the validator
+                // (packets/c2s/0x01a_action.cpp AttackOff .isEngaged()) if
+                // the accept never came, and disengages if it raced in.
+                if let Goal::Engaged { target_id, .. } | Goal::Engaging { target_id, .. } =
+                    self.goal
+                {
                     if let Some((act_index, _, _)) = self.entity_target_info(target_id) {
                         self.goal = Goal::Idle;
                         return CommandRouting::forward_with_goal(
@@ -654,7 +745,7 @@ impl Reactor {
                     return CommandRouting::default();
                 }
 
-                if matches!(self.goal, Goal::Engaged { .. }) {
+                if matches!(self.goal, Goal::Engaged { .. } | Goal::Engaging { .. }) {
                     return CommandRouting::forward(cmd);
                 }
 
@@ -780,6 +871,7 @@ impl Reactor {
         // position to this frame's; a zone-in has no such predecessor (the old
         // zone's coords would sweep across the whole map), so it degenerates to
         // a point test for one tick.
+        // research/XiClient/src/XiClient/source/World/Actor/ActorTelemetry.cpp
         let prev = if self.needs_zone_seed {
             player
         } else {
@@ -852,6 +944,50 @@ impl Reactor {
             .unwrap_or(&[])
     }
 
+    /// The shared engage tick: drop a dead target, issue the Attack once,
+    /// square up while locked.
+    fn tick_engage(&mut self, target_id: u32, attack_issued: bool) -> TickOutput {
+        let target_alive = self
+            .state
+            .entities
+            .iter()
+            .find(|e| e.id == target_id)
+            .is_some_and(|e| e.hp_pct != Some(0));
+        if !target_alive {
+            self.goal = Goal::Idle;
+            return TickOutput {
+                commands: Vec::new(),
+                derived_events: vec![AgentEvent::ReactorGoalChanged {
+                    goal: snapshot_goal(&self.goal),
+                }],
+            };
+        }
+        let mut commands = Vec::new();
+        if !attack_issued {
+            if let Some((act_index, _, _)) = self.entity_target_info(target_id) {
+                commands.push(AgentCommand::Action {
+                    target_id,
+                    target_index: act_index,
+                    kind: ActionKind::Attack,
+                });
+                if let Goal::Engaged { attack_issued, .. } | Goal::Engaging { attack_issued, .. } =
+                    &mut self.goal
+                {
+                    *attack_issued = true;
+                }
+            }
+        }
+        if self.target_locked {
+            if let Some(m) = self.face_entity(target_id) {
+                commands.push(m);
+            }
+        }
+        TickOutput {
+            commands,
+            derived_events: Vec::new(),
+        }
+    }
+
     fn tick_goal(&mut self) -> TickOutput {
         match self.goal.clone() {
             Goal::Idle => TickOutput::default(),
@@ -865,48 +1001,28 @@ impl Reactor {
                     .unwrap_or_default(),
                 derived_events: Vec::new(),
             },
-            Goal::Engaged {
+            Goal::Engaging {
                 target_id,
                 attack_issued,
             } => {
-                let target_alive = self
-                    .state
-                    .entities
-                    .iter()
-                    .find(|e| e.id == target_id)
-                    .is_some_and(|e| e.hp_pct != Some(0));
-                if !target_alive {
-                    self.goal = Goal::Idle;
-                    return TickOutput {
-                        commands: Vec::new(),
-                        derived_events: vec![AgentEvent::ReactorGoalChanged {
-                            goal: snapshot_goal(&self.goal),
-                        }],
-                    };
-                }
-                let mut commands = Vec::new();
-                if !attack_issued {
-                    if let Some((act_index, _, _)) = self.entity_target_info(target_id) {
-                        commands.push(AgentCommand::Action {
-                            target_id,
-                            target_index: act_index,
-                            kind: ActionKind::Attack,
-                        });
-                        if let Goal::Engaged { attack_issued, .. } = &mut self.goal {
-                            *attack_issued = true;
-                        }
+                if attack_issued {
+                    self.engage_wait += self.cfg.tick;
+                    if self.engage_wait >= ENGAGE_ACCEPT_TIMEOUT {
+                        self.goal = Goal::Idle;
+                        return TickOutput {
+                            commands: Vec::new(),
+                            derived_events: vec![AgentEvent::ReactorGoalChanged {
+                                goal: snapshot_goal(&self.goal),
+                            }],
+                        };
                     }
                 }
-                if self.target_locked {
-                    if let Some(m) = self.face_entity(target_id) {
-                        commands.push(m);
-                    }
-                }
-                TickOutput {
-                    commands,
-                    derived_events: Vec::new(),
-                }
+                self.tick_engage(target_id, attack_issued)
             }
+            Goal::Engaged {
+                target_id,
+                attack_issued,
+            } => self.tick_engage(target_id, attack_issued),
             Goal::Pathing {
                 waypoints,
                 idx,

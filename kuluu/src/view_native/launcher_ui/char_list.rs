@@ -30,7 +30,9 @@ fn title_case(name: &str) -> String {
         .join(" ")
 }
 
-/// The lobby's 0x05 expansion mask, worded for the character screen.
+/// The lobby's 0x05 expansion mask
+/// (vendor/server/src/login/view_session.cpp), worded for the character
+/// screen.
 fn expansions_line(names: &[&str]) -> Option<String> {
     let listed: Vec<String> = names
         .iter()
@@ -53,6 +55,9 @@ pub(crate) struct CharCursor(pub usize);
 #[derive(Component)]
 pub(super) struct CharRowButton(pub usize);
 
+/// Spawns the character list screen. Hover sets the cursor but leaves
+/// `InputFocusVisible` alone: hover shares the selection model without
+/// painting a focus ring.
 pub(super) fn spawn_char_list_ui(
     mut commands: Commands,
     chars: Res<CharListData>,
@@ -155,9 +160,6 @@ pub(super) fn spawn_char_list_ui(
                                     if cursor.0 != idx {
                                         cursor.0 = idx;
                                     }
-                                    // `InputFocusVisible` is deliberately left
-                                    // alone: hover shares the selection model
-                                    // without painting a focus ring.
                                     focus.set(ev.entity, FocusCause::Pressed);
                                 },
                             );
@@ -238,6 +240,9 @@ pub(super) fn handle_keyboard_system(
 /// [`sync_cursor_to_focus_system`], so the focus ring, the Primary-variant row
 /// and the 3D preview cannot disagree whether the keyboard, the pad or the
 /// mouse drove the move.
+/// Keyboard navigation for the character list. Enter activates only when
+/// focus rests outside the rows: a focused row already activates itself
+/// through its own `Activate` observer, and this arm is the fallback.
 pub(super) fn keyboard_nav_system(
     mut events: MessageReader<KeyboardInput>,
     chars: Res<CharListData>,
@@ -267,8 +272,6 @@ pub(super) fn keyboard_nav_system(
                 step(count - 1, &mut focus, &mut visible)
             }
             Key::Character(s) if s.eq_ignore_ascii_case("s") => step(1, &mut focus, &mut visible),
-            // A focused row already activates itself through its own `Activate`
-            // observer; this arm is the fallback for focus resting elsewhere.
             Key::Enter if !focus.get().is_some_and(|e| q_rows.contains(e)) => {
                 if cursor.0 == chars.0.len() {
                     next.set(LauncherState::CharCreate);
@@ -335,6 +338,9 @@ pub(super) fn handle_click_system() {}
 #[derive(Component)]
 pub(super) struct DeleteConfirmRoot;
 
+/// Spawns the delete-character confirm screen. The focus ring starts on
+/// Cancel, not on the destructive action: a stray pad Confirm must not
+/// delete a character.
 pub(super) fn spawn_delete_confirm_ui(mut commands: Commands, sel: Res<SelectedChar>) {
     let name = sel
         .0
@@ -373,8 +379,6 @@ pub(super) fn spawn_delete_confirm_ui(mut commands: Commands, sel: Res<SelectedC
                         },
                     );
 
-                    // The ring starts on Cancel, not on the destructive
-                    // action: a stray pad Confirm must not delete a character.
                     r.spawn(button_bundle(
                         ButtonBundleProps::default(),
                         DefaultFocusTarget,
@@ -419,6 +423,8 @@ mod tests {
     use super::*;
     use bevy::input_focus::FocusCause;
 
+    /// A mouse hover that moved the cursor must not be undone by an
+    /// unchanged focus.
     #[test]
     fn focused_char_row_moves_the_cursor() {
         let mut app = App::new();
@@ -441,7 +447,6 @@ mod tests {
         app.update();
         assert_eq!(app.world().resource::<CharCursor>().0, 1);
 
-        // A mouse hover moved the cursor; an unchanged focus must not undo it.
         app.world_mut().resource_mut::<CharCursor>().0 = 0;
         app.update();
         assert_eq!(app.world().resource::<CharCursor>().0, 0);

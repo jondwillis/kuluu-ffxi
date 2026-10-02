@@ -65,6 +65,7 @@ pub enum SubTargetAction {
     },
     /// "Switch Target": pick a different mob; confirm asks the server to move
     /// the battle target and it becomes the main target when the 0x058 lands.
+    /// research/XiPackets/world/server/0x0058/README.md
     PickSub,
 }
 
@@ -74,6 +75,7 @@ pub struct SubTargetState {
 
     /// TARGETTYPE bitmask for the pending action (ffxi-proto valid_target).
     pub flags: u16,
+    pub candidate_filter: Option<u16>,
 
     /// Entity currently under the sub-target cursor. None when no valid
     /// candidate exists in range (cursor parks on self only if SELF is valid).
@@ -86,9 +88,11 @@ pub struct SubTargetState {
     /// picker holds until the server's 0x058 commits it into the main target
     /// (or the wait lapses), so the target frame only swaps on the server's
     /// word. Cycling to another candidate cancels the wait.
+    /// research/XiPackets/world/server/0x0058/README.md
     pub pending_switch: Option<u32>,
 
     /// When `pending_switch` was armed; the wait lapses if no 0x058 lands.
+    /// research/XiPackets/world/server/0x0058/README.md
     pub pending_since: Option<std::time::Instant>,
 }
 
@@ -97,6 +101,7 @@ impl SubTargetState {
         Self {
             action,
             flags,
+            candidate_filter: None,
             candidate: None,
             return_to: Box::new(return_to),
             pending_switch: None,
@@ -256,6 +261,7 @@ pub enum MenuKind {
 
     /// Yes/No step under the Item submenu's Drop row, cursor defaulting to No.
     /// Confirming sends c2s 0x028 ITEM_DUMP for the whole stack.
+    /// vendor/server/src/map/packets/c2s/0x028_item_dump.cpp
     ItemDropConfirm {
         container: u8,
         index: u8,
@@ -441,9 +447,19 @@ pub struct TargetActionState {
     pub chat_mode_idx: usize,
 
     pub abilities_group_idx: usize,
+
+    pub dismount_confirm: bool,
 }
 
 impl TargetActionState {
+    // FFXiMain.dll retail-2026-09 VA 0x10210ECB selects row 2; VA 0x10211398 accepts only row 1.
+    pub const DISMOUNT_NO_ROW: usize = 1;
+
+    pub fn confirm_dismount(&mut self) {
+        self.dismount_confirm = true;
+        self.cursor = Self::DISMOUNT_NO_ROW;
+    }
+
     pub fn open(ctx: crate::hud::action_model::TargetActionContext) -> Self {
         Self {
             cursor: 0,
@@ -451,6 +467,7 @@ impl TargetActionState {
             sub: None,
             chat_mode_idx: 0,
             abilities_group_idx: 0,
+            dismount_confirm: false,
         }
     }
 }

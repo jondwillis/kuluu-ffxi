@@ -12,6 +12,7 @@ pub(super) fn handle_world_key(
     engaged: bool,
     usable_items_available: bool,
     can_fish: bool,
+    modern_mount: bool,
     cmd_tx: &Sender<AgentCommand>,
     scene_state: &mut SceneState,
     check_target: &mut kuluu_render::hud::check_view::CheckTarget,
@@ -52,6 +53,7 @@ pub(super) fn handle_world_key(
                         engaged,
                         usable_items_available,
                         can_fish,
+                        modern_mount,
                         cmd_tx,
                         scene_state,
                         check_target,
@@ -72,6 +74,7 @@ pub(super) fn handle_world_key(
                 engaged,
                 usable_items_available,
                 can_fish,
+                modern_mount,
                 cmd_tx,
                 scene_state,
                 check_target,
@@ -95,6 +98,7 @@ fn open_target_action_menu(
     engaged: bool,
     usable_items_available: bool,
     can_fish: bool,
+    modern_mount: bool,
     cmd_tx: &Sender<AgentCommand>,
     scene_state: &mut SceneState,
     check_target: &mut kuluu_render::hud::check_view::CheckTarget,
@@ -110,6 +114,7 @@ fn open_target_action_menu(
         engaged,
         usable_items_available,
         can_fish,
+        modern_mount,
     );
     let entries = kuluu_render::hud::overlay::RETAIL.resolve_target_actions(&ctx);
     if entries.is_empty() {
@@ -171,6 +176,31 @@ pub(super) fn handle_target_action_key(
     if count == 0 {
         return Some(InputMode::World);
     }
+
+    // A pending Dismount confirm owns the pane: Yes/No instead of the rows.
+    if state.dismount_confirm {
+        if bindings.matches_logical(Action::NavUp, key)
+            || bindings.matches_logical(Action::NavDown, key)
+        {
+            state.cursor = 1 - state.cursor % 2;
+            return None;
+        }
+        if bindings.matches_logical(Action::NavConfirm, key)
+            || bindings.matches_logical(Action::NavCancel, key)
+        {
+            // Confirm takes the row under the cursor (0 = Yes); Cancel is No.
+            return answer_dismount_confirm(
+                state,
+                &entries,
+                bindings.matches_logical(Action::NavConfirm, key) && state.cursor == 0,
+                scene_state,
+                entities,
+                cmd_tx,
+            );
+        }
+        return None;
+    }
+
     if state.cursor >= count {
         state.cursor = count - 1;
     }
@@ -226,6 +256,8 @@ pub(super) fn handle_target_action_key(
     None
 }
 
+/// Confirm the target-action entry under the cursor. Disengage releases the
+/// camera lock like the H toggle.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn confirm_target_action_at_cursor(
     state: &mut kuluu_render::input_mode::TargetActionState,
@@ -256,8 +288,9 @@ pub(super) fn confirm_target_action_at_cursor(
             match target_ent {
                 Some(e) => {
                     // The server's engage rejections, answered locally before the
-                    // command goes out (the server's own 0x029 lines still land
-                    // in the main log; these save the round trip).
+                    // command goes out (the server's own 0x029 lines still land in
+                    // the main log, vendor/server/src/map/packets/s2c/0x029_battle_message.cpp;
+                    // these save the round trip).
                     if let Some(line) = crate::view_native::engage::rejection_line(
                         e,
                         scene_state.snapshot.self_pos.pos,
@@ -280,14 +313,14 @@ pub(super) fn confirm_target_action_at_cursor(
         }
         TargetActionId::SwitchTarget => {
             // Retail's "Switch Target" opens the sub-target picker over the
-            // other mobs; confirming asks the server to move the battle
-            // target, and it becomes the main target when the 0x058 lands.
+            // other mobs; confirming asks the server to move the battle target,
+            // and it becomes the main target when the 0x058 lands
+            // (vendor/server/src/map/packets/s2c/0x058_assist.cpp).
             let sub_action = kuluu_render::input_mode::SubTargetAction::PickSub;
             let return_to = InputMode::TargetAction(state.clone());
             open_sub_target(sub_action, current_target, scene_state, return_to)
         }
         TargetActionId::Disengage => {
-            // Disengage releases the camera lock like the H toggle.
             lock_on.target_id = None;
             if let Err(err) = cmd_tx.try_send(AgentCommand::Cancel) {
                 push_system_chat_line(
@@ -393,7 +426,73 @@ pub(super) fn confirm_target_action_at_cursor(
             }
             Some(InputMode::World)
         }
+        TargetActionId::Dismount => {
+            state.confirm_dismount();
+            None
+        }
     }
+}
+
+/// The self-targeted 0x01A dismount: the vendor acts on the
+/// sender and ignores the target fields
+/// (vendor/server/src/map/packets/c2s/0x01a_action.cpp
+/// GP_CLI_COMMAND_ACTION::process).
+fn send_self_action(
+    kind: ActionKind,
+    label: &str,
+    scene_state: &mut SceneState,
+    entities: &[kuluu_snapshot::Entity],
+    cmd_tx: &Sender<AgentCommand>,
+) {
+    let self_id = scene_state.snapshot.self_char_id.unwrap_or(0);
+    let self_index = entities
+        .iter()
+        .find(|e| e.id == self_id)
+        .map(|e| e.act_index)
+        .unwrap_or(0);
+    if let Err(err) = cmd_tx.try_send(AgentCommand::Action {
+        target_id: self_id,
+        target_index: self_index,
+        kind,
+    }) {
+        push_system_chat_line(
+            scene_state,
+            format!("[menu] {label} dispatch dropped: {err}"),
+        );
+    }
+}
+
+/// The Dismount confirm's answer: Yes sends the self-targeted 0x01A and closes
+/// the menu; No (or a cancel) returns to the rows with the cursor back on
+/// Dismount.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn answer_dismount_confirm(
+    state: &mut kuluu_render::input_mode::TargetActionState,
+    entries: &[kuluu_render::hud::action_model::ActionEntry],
+    yes: bool,
+    scene_state: &mut SceneState,
+    entities: &[kuluu_snapshot::Entity],
+    cmd_tx: &Sender<AgentCommand>,
+) -> Option<InputMode> {
+    use kuluu_render::hud::action_model::TargetActionId;
+    state.dismount_confirm = false;
+    if !yes {
+        if let Some(row) = entries
+            .iter()
+            .position(|e| e.id == TargetActionId::Dismount)
+        {
+            state.cursor = row;
+        }
+        return None;
+    }
+    send_self_action(
+        ActionKind::Dismount,
+        "dismount",
+        scene_state,
+        entities,
+        cmd_tx,
+    );
+    Some(InputMode::World)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -472,4 +571,77 @@ fn open_submenu(kind: MenuKind) -> InputMode {
     let mut stack = MenuStack::root();
     stack.push(kind);
     InputMode::Menu(stack)
+}
+
+#[cfg(test)]
+mod mounted_tests {
+    use super::*;
+    use kuluu_render::hud::action_model::{TargetActionContext, TargetActionId};
+    use kuluu_render::input_mode::TargetActionState;
+
+    #[test]
+    fn dismount_menu_confirmation_starts_on_no() {
+        let ctx = TargetActionContext {
+            modern_mount: true,
+            ..Default::default()
+        };
+        let entries = kuluu_render::hud::overlay::RETAIL.resolve_target_actions(&ctx);
+        let mut state = TargetActionState::open(ctx);
+        state.cursor = entries
+            .iter()
+            .position(|e| e.id == TargetActionId::Dismount)
+            .unwrap();
+        let mut scene = SceneState::default();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        assert!(confirm_target_action_at_cursor(
+            &mut state,
+            &entries,
+            &mut scene,
+            None,
+            &[],
+            &tx,
+            &mut Default::default(),
+            &mut Default::default(),
+            &mut Default::default(),
+        )
+        .is_none());
+        assert!(state.dismount_confirm);
+        assert_eq!(state.cursor, TargetActionState::DISMOUNT_NO_ROW);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn dismount_confirmation_cancel_sends_nothing_and_yes_targets_self() {
+        const SELF_ID: u32 = 1234;
+        let ctx = TargetActionContext {
+            modern_mount: true,
+            ..Default::default()
+        };
+        let entries = kuluu_render::hud::overlay::RETAIL.resolve_target_actions(&ctx);
+        let mut state = TargetActionState::open(ctx);
+        let mut scene = SceneState::default();
+        scene.snapshot.self_char_id = Some(SELF_ID);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        state.dismount_confirm = true;
+        assert!(
+            answer_dismount_confirm(&mut state, &entries, false, &mut scene, &[], &tx).is_none()
+        );
+        assert!(!state.dismount_confirm);
+        assert_eq!(entries[state.cursor].id, TargetActionId::Dismount);
+        assert!(rx.try_recv().is_err());
+        state.dismount_confirm = true;
+        assert!(matches!(
+            answer_dismount_confirm(&mut state, &entries, true, &mut scene, &[], &tx),
+            Some(InputMode::World)
+        ));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            AgentCommand::Action {
+                target_id: SELF_ID,
+                target_index: 0,
+                kind: ActionKind::Dismount,
+            }
+        ));
+        assert!(rx.try_recv().is_err());
+    }
 }

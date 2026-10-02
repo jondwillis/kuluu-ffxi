@@ -12,10 +12,11 @@ use lsb_scrape::check_scrape_count;
 // research/xim/src/jsMain/kotlin/xim/resource/table/ZoneTables.kt
 // getMainAreaResourcePath (0x64 + zoneId below 0x100, 0x147B3 + (zoneId - 0x100)
 // above, i.e. zoneId + 83635).
+const ZONE_DAT_HI_OFFSET: u32 = 83635;
 const ZONE_DAT_FORMULA: Formula = Formula {
     threshold: 256,
     lo_offset: 100,
-    hi_offset: 83635,
+    hi_offset: ZONE_DAT_HI_OFFSET,
 };
 
 const ZONE_SETTINGS_SQL: &str = "../vendor/server/sql/zone_settings.sql";

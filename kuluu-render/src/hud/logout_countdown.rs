@@ -1,10 +1,11 @@
 #![cfg(feature = "enhanced-shutdown-counter")]
 
-// Enhanced (non-retail) on-screen shutdown/logout countdown banner. Retail's
-// client shows only the 0x053 system chat lines for these ticks; this whole
-// module (banner node, anchor/pending state machines, update system) exists
-// only with `enhanced-shutdown-counter`. The chat lines themselves come from
-// kuluu-session and are unaffected.
+//! Enhanced (non-retail) on-screen shutdown/logout countdown banner. Retail's
+//! client shows only the 0x053 system chat lines for these ticks
+//! (vendor/server/src/map/packets/s2c/0x053_systemmes.cpp); this whole module
+//! (banner node, anchor/pending state machines, update system) exists only with
+//! `enhanced-shutdown-counter`. The chat lines themselves come from kuluu-session
+//! and are unaffected.
 use bevy::prelude::*;
 use kuluu_snapshot::{LogoutCountdown, SceneSnapshot, Stage};
 
@@ -65,7 +66,7 @@ pub struct LogoutRequested {
 }
 
 /// Lifecycle of a locally-sent /logout or /shutdown request until (and unless)
-/// the server confirms it with a 0x053 tick.
+/// the server confirms it with a 0x053 tick (leavegame.lua onEffectTick).
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum LogoutRequestState {
     #[default]
@@ -76,7 +77,8 @@ pub enum LogoutRequestState {
     /// server-confirmed, not local guesswork.
     AwaitingTick { requested_at: f64, shutdown: bool },
     /// No tick within REQUEST_ACK_TIMEOUT_SECS of the request: the 0x0e7
-    /// validator silently rejected it (no packet exists for that case).
+    /// validator silently rejected it (0x0e7_reqlogout.cpp; no packet exists
+    /// for that case).
     Blocked { entered_at: f64, shutdown: bool },
 }
 
@@ -91,9 +93,10 @@ pub struct LogoutCountdownAnchor {
     pub shutdown: bool,
     pub anchor_secs: f64,
     /// The snapshot value last folded in. The snapshot holds a tick until the
-    /// next 0x053 replaces or clears it, so only a changed value is a new
-    /// server observation; folding the held value again would re-anchor every
-    /// RESYNC_TOLERANCE_SECS as the implied remaining drifts past it.
+    /// next 0x053 tick replaces or clears it (leavegame.lua onEffectTick), so
+    /// only a changed value is a new server observation; folding the held value
+    /// again would re-anchor every RESYNC_TOLERANCE_SECS as the implied
+    /// remaining drifts past it.
     pub consumed: Option<LogoutCountdown>,
 }
 
@@ -185,9 +188,9 @@ pub enum DisplayMode {
     Blocked { shutdown: bool },
 }
 
-/// The banner is driven ONLY by the server anchor. AwaitingTick shows nothing:
-/// the countdown starts when the first 0x053 tick (para=30) lands, never on
-/// the local request.
+/// The banner is driven only by the server anchor. AwaitingTick shows
+/// nothing: the countdown starts when the first 0x053 tick with para 30 lands,
+/// not on the local request (leavegame.lua onEffectGain).
 fn compute_display(
     now: f64,
     server: Option<(u16, bool, f64)>,
@@ -222,6 +225,18 @@ fn compute_display(
     }
 }
 
+/// Per-frame driver for the banner: folds the snapshot's logout countdown
+/// into the anchor, tracks the pending /logout or /shutdown request, and writes
+/// the display mode to the banner node. A zoning or disconnect invalidates the
+/// pending request: /logout inside a Mog House is accepted with an immediate
+/// leaveGame() and no countdown ticks, so the ack timeout would otherwise fire
+/// "blocked" after we are already disconnected, and the snapshot's own
+/// logout_countdown clears on both transitions, dropping the anchor. Stand-up
+/// (heal to walk) is local knowledge — the server drops leavegame with no
+/// cancel packet — so the pending request is cleared and the held snapshot
+/// value is marked consumed so it does not re-anchor; that check runs before
+/// request handling so a /shutdown on the same frame as stand-up still arms
+/// fresh.
 #[allow(clippy::too_many_arguments)]
 pub fn update_logout_countdown(
     mut requests: MessageReader<LogoutRequested>,
@@ -253,12 +268,6 @@ pub fn update_logout_countdown(
         pending.state = LogoutRequestState::None;
     }
 
-    // Stand-up is LOCAL knowledge (Sit key, heal toggle, movement exit, /sit).
-    // The server drops leavegame on stand-up with no cancel packet; the
-    // session reports the heal->walk transition as LogoutCountdownCancelled
-    // once CHAR_PC confirms it, and until then the held snapshot value is
-    // already marked consumed, so it cannot re-anchor. Checked BEFORE request
-    // handling so a /shutdown on the same frame as stand-up still arms fresh.
     let stood_up = rest.kind == RestKind::None && *prev_rest != RestKind::None;
     *prev_rest = rest.kind;
     if stood_up {
@@ -398,8 +407,11 @@ mod tests {
             shutdown: false,
         };
 
-        // 10s after the request with no tick: still hidden.
-        assert_eq!(compute_display(10.0, None, pending), DisplayMode::Hidden);
+        assert_eq!(
+            compute_display(10.0, None, pending),
+            DisplayMode::Hidden,
+            "10s after the request with no tick: still hidden"
+        );
 
         // The first tick (para=30, leavegame.lua onEffectGain) starts it:
         // anchored at t=10.2 carrying 30, so at t=10.5 remaining = 29.7 -> 30.
@@ -465,8 +477,6 @@ mod tests {
     /// running anchor (no visible jump), even when it arrives off-cadence.
     #[test]
     fn tick_within_tolerance_keeps_the_running_anchor() {
-        // Anchor 30 @ t=0. The next server tick carries 25 but arrives late at
-        // t=6: implied = 24, |24 - 25| = 1 <= 2 -> keep the anchor.
         let mut a = anchored(30, false, 0.0);
         assert_eq!(
             fold_tick(&mut a, Some(tick(25, false)), 6.0),
@@ -474,29 +484,27 @@ mod tests {
         );
         assert_eq!((a.server_seconds, a.anchor_secs), (Some(30), 0.0));
 
-        // And the one after: carries 20 at t=11 (implied = 19, diff 1) -> keep.
         assert_eq!(
             fold_tick(&mut a, Some(tick(20, false)), 11.0),
             TickFold::Held
         );
         assert_eq!((a.server_seconds, a.anchor_secs), (Some(30), 0.0));
 
-        // Display consequence: at t=6 the counter reads off the original anchor
-        // (24) instead of jumping back up to 25 on the late tick.
         let mode = compute_display(6.0, Some((30u16, false, 0.0)), LogoutRequestState::None);
         assert_eq!(
             mode,
             DisplayMode::Counting {
                 seconds: 24,
                 shutdown: false
-            }
+            },
+            "the late tick keeps the original anchor: reads 24, not 25"
         );
     }
 
-    /// The snapshot holds a tick until the next 0x053 replaces it. Folding that
-    /// held value frame after frame must never re-anchor, or the display would
-    /// read 30, 29, 28, 30, 29, 28 as the implied remaining drifts past the
-    /// tolerance.
+    /// The snapshot holds a tick until the next 0x053 replaces it
+    /// (leavegame.lua onEffectTick). Folding that held value frame after frame
+    /// does not re-anchor, or the display would read 30, 29, 28, 30, 29, 28 as
+    /// the implied remaining drifts past the tolerance.
     #[test]
     fn held_snapshot_value_never_reanchors() {
         let mut a = LogoutCountdownAnchor::default();
@@ -540,8 +548,6 @@ mod tests {
     /// (para=30 only ever comes from onEffectGain) and re-anchors.
     #[test]
     fn tick_beyond_tolerance_reanchors() {
-        // Anchor 15 @ t=0; at t=2 a brand-new countdown's first tick arrives:
-        // implied = 13, |13 - 30| = 17 > 2 -> re-anchor to 30 @ now.
         let mut a = anchored(15, false, 0.0);
         assert_eq!(
             fold_tick(&mut a, Some(tick(30, false)), 2.0),
@@ -554,7 +560,6 @@ mod tests {
     /// "within +-2 seconds").
     #[test]
     fn tick_exactly_at_tolerance_keeps_the_anchor() {
-        // Anchor 30 @ t=0; at t=4.0 implied = 26, incoming 24 -> diff exactly 2: keep.
         let mut a = anchored(30, false, 0.0);
         assert_eq!(
             fold_tick(&mut a, Some(tick(24, false)), 4.0),
@@ -562,7 +567,6 @@ mod tests {
         );
         assert_eq!((a.server_seconds, a.anchor_secs), (Some(30), 0.0));
 
-        // At t=4.5 implied = 25.5, incoming 23 -> diff 2.5 > 2: re-anchor.
         let mut a = anchored(30, false, 0.0);
         assert_eq!(
             fold_tick(&mut a, Some(tick(23, false)), 4.5),
@@ -576,14 +580,11 @@ mod tests {
     /// flag flips.
     #[test]
     fn kind_switch_within_tolerance_refreshes_flag_without_reanchor() {
-        // Anchor 30/logout @ t=0; at t=5 a shutdown-kind tick carries 25
-        // (implied = 25, diff 0) -> same anchor, flag flips to shutdown.
         let mut a = anchored(30, false, 0.0);
         assert_eq!(fold_tick(&mut a, Some(tick(25, true)), 5.0), TickFold::Held);
         assert!(a.shutdown);
         assert_eq!(a.anchor_secs, 0.0);
 
-        // And the display carries the new label off the unchanged anchor.
         let mode = compute_display(5.0, Some((30u16, true, 0.0)), LogoutRequestState::None);
         assert_eq!(
             mode,
@@ -594,7 +595,7 @@ mod tests {
         );
     }
 
-    /// The first tick after a request always anchors, whatever it carries.
+    /// The first tick after a request anchors whatever it carries.
     #[test]
     fn first_tick_always_anchors() {
         let mut a = LogoutCountdownAnchor::default();

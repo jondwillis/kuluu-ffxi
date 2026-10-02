@@ -69,6 +69,22 @@ Two things to get right before blaming the client:
 - **Ports.** Non-default auth/lobby/data ports on the server need the matching
   `--authport`/`--serverport`/`--dataport` here. The repository's own constants
   are the source for those values; do not re-type a port literal you can import.
+- **Loader era, separately from client era.** LSB's login server checks the
+  loader's own version before it checks anything else, and refuses an older one
+  outright (`SupportedXiloaderVersion` in `vendor/server/src/login/auth_session.h`;
+  the client sees "Expected xiloader version mismatch"). The loader shipped with
+  a private server's bootloader bundle can be years behind that. Take the
+  matching release from LandSandBoat/xiloader rather than assuming the one
+  already in the install will do.
+- **The loader also has to match `polcore.dll`.** `xiloader` boots the client by
+  byte-pattern-scanning the PlayOnline viewer's `polcore.dll` and writing the
+  profile server port into it. Those patterns track a particular polcore
+  vintage, so a *newer* client can fail where an older one works: against the
+  2026-09 retail viewer, xiloader 2.1.2 finds its first pattern and not the
+  second, and stops at "Failed to locate profileServerPortAddress2!" -- while
+  the same loader patches a 2024-era polcore cleanly. Check a candidate before
+  launching by scanning the viewer's `polcore.dll` for the patterns in that
+  release's `SetProfileServerPort`; pattern absence is the whole diagnosis.
 - **Client era.** A server expects a client of a particular vintage, and the
   installed build is a fact you can check: `kuluu install list` names each
   install's `KNOWN_CLIENTS` row (see `KNOWN_CLIENTS` in

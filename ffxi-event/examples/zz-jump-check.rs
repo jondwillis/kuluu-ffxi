@@ -17,11 +17,20 @@ use ffxi_event::opcode_meta::{sub_size, OPCODE_META};
 
 type DecodedBlock = (Vec<usize>, Vec<(usize, u8, usize, usize)>);
 
+/// research/XiEvents/OpCodes/0x0001.md: the unconditional jump.
+const OP_GOTO: u8 = 0x01;
+/// research/XiEvents/OpCodes/0x0002.md: the conditional jump.
+const OP_IF: u8 = 0x02;
+/// research/XiEvents/OpCodes/0x001A.md: the long jump.
+const OP_JUMP: u8 = 0x1A;
+
+/// ffxi-dat/src/event_dat.rs: walk every entry offset directly and collect
+/// instruction start positions (absolute into event_data), including the
+/// EVENT_ID_PLACEHOLDER-owned shared code regions that event_entry_exact
+/// refuses to hand out; also record jump opcodes with their absolute position.
+/// The walk stops at an opcode byte past the table or one the table marks
+/// undefined.
 fn decode_block(block: &EventBlock) -> DecodedBlock {
-    // Walk every entry offset directly and collect instruction start
-    // positions (absolute into event_data), including 0xFFFF placeholder-owned
-    // shared code regions that event_entry_exact refuses to hand out. Also
-    // record jump opcodes with their absolute position.
     let mut boundaries: std::collections::BTreeSet<usize> = Default::default();
     let mut jumps: Vec<(usize, u8, usize, usize)> = vec![];
 
@@ -34,10 +43,10 @@ fn decode_block(block: &EventBlock) -> DecodedBlock {
             boundaries.insert(abs);
             let op = data[pos];
             let Some(meta) = OPCODE_META.get(op as usize) else {
-                break; // opcode byte past the table: stop walking this event
+                break;
             };
             if !meta.valid {
-                break; // undefined opcode byte: stop walking this event
+                break;
             }
             let sub = *data.get(pos + 1).unwrap_or(&0);
             let width = sub_size(op, sub).unwrap_or(meta.size) as usize;
@@ -45,11 +54,11 @@ fn decode_block(block: &EventBlock) -> DecodedBlock {
                 break;
             }
             match op {
-                0x01 | 0x1A => {
+                OP_GOTO | OP_JUMP => {
                     let target = u16::from_le_bytes([data[pos + 1], data[pos + 2]]) as usize;
                     jumps.push((abs, op, target, target));
                 }
-                0x02 => {
+                OP_IF => {
                     let val3 = u16::from_le_bytes([data[pos + 6], data[pos + 7]]);
                     let abs_target = val3 as usize;
                     let rel_target = (abs as u16).wrapping_add(val3) as usize;
@@ -94,14 +103,14 @@ fn main() {
                     "  MISS-ABS {kind} @abs {abs}: target {abs_target} is not an instruction boundary"
                 );
             }
-            if *op == 0x02 && !boundaries.contains(rel_target) {
+            if *op == OP_IF && !boundaries.contains(rel_target) {
                 rel_miss += 1;
                 println!(
                     "  MISS-REL IF   @abs {abs}: abs+val3 = {rel_target} is not an instruction boundary"
                 );
             }
         }
-        let n_ifs = jumps.iter().filter(|(_, op, _, _)| *op == 0x02).count();
+        let n_ifs = jumps.iter().filter(|(_, op, _, _)| *op == OP_IF).count();
         println!(
             "block 0x{:08X}: {} boundaries, {} jump opcodes ({} IFs): ABS misses {abs_miss}, REL misses {rel_miss}",
             block.actor,

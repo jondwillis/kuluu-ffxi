@@ -41,7 +41,9 @@ const RADAR_FLATTENING: f32 = 0.5;
 const CARDINAL_RADIUS_PX: f32 = 56.0;
 const CARDINAL_SIZE_PX: f32 = 16.0;
 const DOT_DIAMETER_PX: f32 = 4.0;
-// Provisional distance calibration; the supplied screenshot does not establish range.
+/// Provisional distance calibration; the supplied screenshot does not
+/// establish range.
+/// .agents/skills/retail-observe/references/2026-09-09-compass-radar.md
 const RADAR_RANGE_YALMS: f32 = 20.0;
 const ROSE_FALLBACK_COLOR: Color = Color::srgba(0.65, 0.70, 0.80, 0.25);
 const NORTH_FALLBACK_COLOR: Color = Color::srgb(0.95, 0.30, 0.30);

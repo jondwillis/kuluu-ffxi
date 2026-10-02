@@ -40,17 +40,18 @@ use common::EphemeralChar;
 // cutscene trigger (vendor/server/scripts/quests/hiddenQuests/
 // New_Character_Cutscenes.lua WINDURST_WATERS onZoneIn).
 const WINDURST_WATERS_ZONE: u32 = 238;
-// The 531 event id, low 16 bits of the agent event id.
+/// The 531 event id, low 16 bits of the agent event id.
 const EVENT_531: u16 = 531;
-// The char_vars row that arms the trigger (quest var 'notSeen' of hidden quest
-// newCharacterCS).
+/// The char_vars row that arms the trigger (quest var 'notSeen' of hidden
+/// quest newCharacterCS,
+/// vendor/server/scripts/quests/hiddenQuests/New_Character_Cutscenes.lua).
 const NOT_SEEN_VAR: &str = "HQuest[newCharacterCS]notSeen";
 
 const LOGIN_DEADLINE: Duration = Duration::from_secs(90);
-// The 531 cutscene plays for a while; two minutes from CutsceneStarted is
-// generous.
+/// The 531 cutscene plays for a while; two minutes from CutsceneStarted is
+/// generous.
 const PLAYBACK_DEADLINE: Duration = Duration::from_secs(120);
-// Grace for the event to start after zone-in.
+/// Grace for the event to start after zone-in.
 const NO_EVENT_GRACE: Duration = Duration::from_secs(60);
 
 fn open_dat_root() -> Option<ffxi_dat::DatRoot> {
@@ -74,12 +75,16 @@ struct Tally {
     inzone_at: Option<Instant>,
     cutscene_started_at: Option<Instant>,
     event_ended_at: Option<Instant>,
-    // Staging frames the running 531 script emitted (CutsceneCue).
+    /// Staging frames the running 531 script emitted (CutsceneCue).
     cues_total: u32,
     auto_skipped_line: Option<String>,
     disconnected_reason: Option<String>,
 }
 
+/// Tallys the 531 run. Staging frames count only after the cutscene has
+/// started, so unrelated cues around zone-in do not inflate the tally; the
+/// end is gated the same way — `EventEnded` is a unit variant carrying no
+/// event id, so the first end after start is the one tallied.
 fn handle_event(tally: &mut Tally, ev: &AgentEvent, now: Instant) {
     match ev {
         AgentEvent::StageChanged { stage } => {
@@ -92,7 +97,7 @@ fn handle_event(tally: &mut Tally, ev: &AgentEvent, now: Instant) {
             }
         }
         AgentEvent::CutsceneStarted { event_id } => {
-            if *event_id & 0xFFFF == u32::from(EVENT_531) && tally.cutscene_started_at.is_none() {
+            if *event_id & 65535 == u32::from(EVENT_531) && tally.cutscene_started_at.is_none() {
                 tally.cutscene_started_at = Some(now);
                 eprintln!(
                     "[live] CutsceneStarted (agent id 0x{event_id:08X}) at t+{:.1}s",
@@ -101,16 +106,11 @@ fn handle_event(tally: &mut Tally, ev: &AgentEvent, now: Instant) {
             }
         }
         AgentEvent::CutsceneCue { .. } => {
-            // Count staging frames only after the 531 cutscene has started, so
-            // unrelated cues around zone-in do not inflate the tally.
             if tally.cutscene_started_at.is_some() {
                 tally.cues_total += 1;
             }
         }
         AgentEvent::EventEnded => {
-            // EventEnded is a unit variant carrying no event id, so gate on the
-            // 531 cutscene having started to ignore any unrelated event that
-            // ends around zone-in. First end after start is the one we tally.
             if tally.event_ended_at.is_none() && tally.cutscene_started_at.is_some() {
                 tally.event_ended_at = Some(now);
                 eprintln!("[live] EventEnded at t+{:.1}s", now.elapsed().as_secs_f32());
@@ -232,8 +232,6 @@ async fn event_531_full_playback_against_live_lsb() {
                     break Some("session disconnected".into());
                 }
 
-                // Success: the 531 cutscene played end to end — it started,
-                // emitted at least one staging frame, and ended.
                 if tally.event_ended_at.is_some() && tally.cues_total >= 1 {
                     break Some("event 531 played (CutsceneStarted, frame, EventEnded)".into());
                 }

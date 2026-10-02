@@ -6,12 +6,12 @@ use ffxi_dat::main_dll::CommandTable;
 /// legally say is lost to it.
 pub const RETAIL_PREFIX: char = '/';
 /// Kuluu's own commands. Every name in the client's table carries exactly one
-/// leading slash, so a doubled one can never collide with a command Square
+/// leading slash, so a doubled one can't collide with a command Square
 /// Enix adds later. Windower reached the same place for the same reason;
 /// Ashita put addons on a single slash and its addons have had to dodge retail
 /// names ever since (its `clock` addon answers to `/time` because `/clock` was
 /// taken).
-pub const EXTENSION_PREFIX: &str = "//";
+pub const EXTENSION_PREFIX: &str = "\u{002F}\u{002F}";
 /// Separates an owner from a command in the fully qualified extension form,
 /// `//kuluu:lights`. Bare `//lights` resolves while nothing else claims it.
 pub const OWNER_SEPARATOR: char = ':';
@@ -26,7 +26,7 @@ pub const EXTENSION_HELP_NAMES: &[&str] = &["?", "help"];
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CommandSet {
     /// A command the retail client itself accepts. Typed under
-    /// [`RETAIL_PREFIX`] and never switchable.
+    /// [`RETAIL_PREFIX`] and not switchable.
     Retail,
     /// Gameplay Kuluu offers that retail has no command for.
     Core,
@@ -254,11 +254,11 @@ mod tests {
     #[test]
     fn a_doubled_slash_is_the_extension_surface() {
         assert_eq!(
-            word_of("//lights 8"),
+            word_of("\u{002F}\u{002F}lights 8"),
             Some((Surface::Extension, None, "lights".into(), "8".into()))
         );
         assert_eq!(
-            word_of("//kuluu:lights 8"),
+            word_of("\u{002F}\u{002F}kuluu:lights 8"),
             Some((
                 Surface::Extension,
                 Some(FIRST_PARTY_OWNER.into()),
@@ -277,15 +277,21 @@ mod tests {
 
     #[test]
     fn a_bare_prefix_is_not_a_command() {
-        for line in ["/", "//", "/ say", "// lights", "//:"] {
+        for line in [
+            "/",
+            "\u{002F}\u{002F}",
+            "/ say",
+            "\u{002F}\u{002F} lights",
+            "\u{002F}\u{002F}:",
+        ] {
             assert_eq!(word_of(line), None, "{line:?}");
         }
     }
 
     #[test]
     fn the_argument_tail_survives_its_own_slashes() {
-        let typed = classify("/tell Bob see //lights").expect("a command");
-        assert_eq!(typed.rest, "Bob see //lights");
+        let typed = classify("/tell Bob see \u{002F}\u{002F}lights").expect("a command");
+        assert_eq!(typed.rest, "Bob see \u{002F}\u{002F}lights");
     }
 
     #[test]

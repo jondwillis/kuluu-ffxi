@@ -5,7 +5,7 @@ const KIND_TYPE_USE_BONE_TABLE: u16 = 0x80;
 pub(crate) const BONE_INDEX_MASK: u16 = 0x7F;
 pub(crate) const MIRROR_AXIS_MASK: u16 = 0x03;
 const POLY_BLOCK_CLASS_MASK: u16 = 0x80F0;
-const POLY_BLOCK_SPECULAR: u16 = 0x8010;
+pub(crate) const POLY_BLOCK_SPECULAR: u16 = 0x8010;
 const POLY_BLOCK_TEXTURE_NAME: u16 = 0x8000;
 
 #[derive(Debug, thiserror::Error)]

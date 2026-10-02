@@ -30,7 +30,9 @@ pub enum KeyMsg {
 }
 
 impl KeyMsg {
-    /// Decode one driver line into a message (see module docs for the protocol).
+    /// Decode one driver line into a message (see module docs for the
+    /// protocol). A lone key name is a tap; explicit down/up give hold
+    /// control.
     pub fn from_json_line(line: &str) -> Option<Self> {
         let v = serde_json::from_str::<serde_json::Value>(line.trim()).ok()?;
         if let Some(text) = v.get("text").and_then(|x| x.as_str()) {
@@ -40,7 +42,6 @@ impl KeyMsg {
         let down = v.get("down").and_then(|x| x.as_bool()).unwrap_or(false);
         let up = v.get("up").and_then(|x| x.as_bool()).unwrap_or(false);
         match (down, up) {
-            // A lone "key" is a tap; explicit down/up give hold control.
             (_, true) => Some(KeyMsg::Release(key.to_ascii_lowercase())),
             (true, false) => Some(KeyMsg::Press(key.to_ascii_lowercase())),
             _ => Some(KeyMsg::Tap(key.to_ascii_lowercase())),
@@ -80,6 +81,13 @@ impl KeyMsg {
             "down" => (KeyCode::ArrowDown, Key::ArrowDown),
             "left" => (KeyCode::ArrowLeft, Key::ArrowLeft),
             "right" => (KeyCode::ArrowRight, Key::ArrowRight),
+            "f1" => (KeyCode::F1, Key::F1),
+            "f2" => (KeyCode::F2, Key::F2),
+            "f3" => (KeyCode::F3, Key::F3),
+            "f4" => (KeyCode::F4, Key::F4),
+            "f5" => (KeyCode::F5, Key::F5),
+            "f6" => (KeyCode::F6, Key::F6),
+            "printscreen" | "prtsc" | "prtscn" => (KeyCode::PrintScreen, Key::PrintScreen),
             _ => return None,
         };
         Some((kc, lk))
@@ -146,7 +154,7 @@ impl Default for KeyDriveQueue {
 
 /// Bind and serve the `FFXI_STAIR_DRIVE`-style TCP listener. One JSON line per
 /// connection; each valid line enqueues one [KeyMsg]. Malformed lines are
-/// skipped (never drop the connection over a typo).
+/// skipped (the connection stays open over a typo).
 pub async fn serve_key_drive(addr: SocketAddr, queue: Arc<Mutex<Vec<KeyMsg>>>) {
     let Ok(listener) = tokio::net::TcpListener::bind(addr).await else {
         tracing::warn!(%addr, "FFXI_KEY_DRIVE bind failed");
@@ -175,14 +183,15 @@ pub async fn serve_key_drive(addr: SocketAddr, queue: Arc<Mutex<Vec<KeyMsg>>>) {
 /// PreUpdate: drain the queue into global `KeyboardInput` events so every
 /// Update-phase consumer (launcher screens, in-game input, text buffers) sees
 /// the same frame's synthetic presses. A tap is a press+release pair queued
-/// back-to-back; holds are explicit down/up messages from the driver.
+/// back-to-back; holds are explicit down/up messages from the driver. On the
+/// first frame the window may not exist yet; the queue is left in place.
 pub fn key_drive_system(
     mut events: MessageWriter<KeyboardInput>,
     queue: Res<KeyDriveQueue>,
     windows: Query<Entity, With<PrimaryWindow>>,
 ) {
     let Ok(window) = windows.single() else {
-        return; // no window yet (first frame) — keep the queued messages
+        return;
     };
     let mut batch = std::mem::take(&mut *match queue.0.lock() {
         Ok(mut q) => q,
@@ -269,6 +278,105 @@ mod tests {
     use super::*;
 
     #[test]
+    fn injected_keys_reach_existing_control_handlers() {
+        use super::super::input::{handle_input_system, AutoRun, CommandTx, TabCycleStack};
+        use super::super::screenshot::ScreenshotRequest;
+        use kuluu_render::keybinds::Preset;
+        use kuluu_render::{
+            CameraMode, CameraTransition, ChaseCamera, CursorLockRequest, InputMode, LockOn,
+            SceneState, Target,
+        };
+
+        const SELF_ID: u32 = 0xE111_0001;
+        let cases = [
+            ("F1", Some(SELF_ID)),
+            ("F2", Some(SELF_ID + 1)),
+            ("F3", Some(SELF_ID + 2)),
+            ("F4", Some(SELF_ID + 3)),
+            ("F5", Some(SELF_ID + 4)),
+            ("F6", Some(SELF_ID + 5)),
+            ("PrintScreen", None),
+            ("prtsc", None),
+            ("prtscn", None),
+        ];
+        for preset in [Preset::Standard, Preset::Compact1, Preset::Compact2] {
+            for (name, expected_target) in cases {
+                let queue = Arc::new(Mutex::new(vec![KeyMsg::Press(name.to_owned())]));
+                let (tx, _rx) = tokio::sync::mpsc::channel(1);
+                let mut app = App::new();
+                app.add_plugins((MinimalPlugins, bevy::input::InputPlugin))
+                    .insert_resource(KeyDriveQueue(queue.clone()))
+                    .insert_resource(preset.bindings())
+                    .insert_resource(CommandTx(tx))
+                    .init_resource::<super::super::gamepad_input::PadPressed>()
+                    .init_resource::<SceneState>()
+                    .init_resource::<Target>()
+                    .init_resource::<InputMode>()
+                    .init_resource::<AutoRun>()
+                    .init_resource::<CameraMode>()
+                    .init_resource::<ChaseCamera>()
+                    .init_resource::<CursorLockRequest>()
+                    .init_resource::<LockOn>()
+                    .init_resource::<CameraTransition>()
+                    .init_resource::<TabCycleStack>()
+                    .init_resource::<kuluu_render::combat_stance::RestStance>()
+                    .init_resource::<kuluu_render::combat_stance::WalkMode>()
+                    .init_resource::<kuluu_render::hud_hide::HudHidden>()
+                    .add_message::<bevy::window::WindowCloseRequested>()
+                    .add_message::<ScreenshotRequest>()
+                    .add_systems(PreUpdate, key_drive_system)
+                    .add_systems(Update, handle_input_system);
+                app.world_mut().spawn(PrimaryWindow);
+                {
+                    let mut scene = app.world_mut().resource_mut::<SceneState>();
+                    scene.snapshot.self_char_id = Some(SELF_ID);
+                    scene.snapshot.party = (0..6)
+                        .map(|slot| kuluu_snapshot::PartyMember {
+                            id: SELF_ID + slot,
+                            act_index: 0,
+                            name: None,
+                            hp: 0,
+                            mp: 0,
+                            tp: 0,
+                            hp_pct: 0,
+                            mp_pct: 0,
+                            zone_no: 0,
+                            main_job: 0,
+                            main_job_lv: 0,
+                            sub_job: 0,
+                            sub_job_lv: 0,
+                            is_party_leader: false,
+                            is_alliance_leader: false,
+                            party_no: 0,
+                            in_mog_house: false,
+                        })
+                        .collect();
+                }
+                app.update();
+                app.update();
+                assert_eq!(app.world().resource::<Target>().id, expected_target);
+                assert_eq!(
+                    app.world().resource::<Messages<ScreenshotRequest>>().len(),
+                    usize::from(expected_target.is_none()),
+                );
+                app.world_mut()
+                    .resource_mut::<Messages<ScreenshotRequest>>()
+                    .clear();
+                queue.lock().unwrap().push(KeyMsg::Release(name.to_owned()));
+                app.update();
+                app.update();
+                let keys = app.world().resource::<ButtonInput<KeyCode>>();
+                assert!(!keys.pressed(KeyMsg::resolve(name).unwrap().0));
+                assert_eq!(app.world().resource::<Target>().id, expected_target);
+                assert!(app
+                    .world()
+                    .resource::<Messages<ScreenshotRequest>>()
+                    .is_empty());
+            }
+        }
+    }
+
+    #[test]
     fn tap_line_parses() {
         assert!(matches!(
             KeyMsg::from_json_line(r#"{"key":"Enter"}"#),
@@ -296,12 +404,34 @@ mod tests {
         ));
     }
 
+    /// .is_none() rather than assert_eq!(.., None): rkyv's cross-type
+    /// PartialEq impls (via ffxi-nav-recast) break bare-None inference in
+    /// assert_eq!.
     #[test]
     fn unknown_lines_rejected() {
-        // .is_none() (not assert_eq!(.., None)): rkyv's cross-type PartialEq
-        // impls (via ffxi-nav-recast) break bare-None inference in assert_eq!
         assert!(KeyMsg::from_json_line("not json").is_none());
         assert!(KeyMsg::from_json_line(r#"{"foo":1}"#).is_none());
+    }
+
+    #[test]
+    fn resolve_function_and_screenshot_keys() {
+        let function_keys = [
+            ("F1", KeyCode::F1, Key::F1),
+            ("F2", KeyCode::F2, Key::F2),
+            ("F3", KeyCode::F3, Key::F3),
+            ("F4", KeyCode::F4, Key::F4),
+            ("F5", KeyCode::F5, Key::F5),
+            ("F6", KeyCode::F6, Key::F6),
+        ];
+        for (name, physical, logical) in function_keys {
+            assert_eq!(KeyMsg::resolve(name), Some((physical, logical)));
+        }
+        for name in ["PrintScreen", "prtsc", "prtscn"] {
+            assert_eq!(
+                KeyMsg::resolve(name),
+                Some((KeyCode::PrintScreen, Key::PrintScreen))
+            );
+        }
     }
 
     #[test]

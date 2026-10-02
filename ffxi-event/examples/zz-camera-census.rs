@@ -27,6 +27,11 @@ const CENSUS_FILES: [&str; 7] = [
 
 const KIND_CAMERA: u8 = 0x06;
 
+/// xim's 20-bit size mask: bit 26 is is_shadow, not size.
+const XIM_SIZE_UNITS_MASK: u32 = 0xFFFFF;
+/// Attachment.cpp GetAttachMode: the attach mode's low nibble.
+const ATTACH_MODE_NIBBLE: u32 = 0xF;
+
 #[derive(Default)]
 struct WalkCensus {
     chunks: usize,
@@ -89,8 +94,8 @@ fn census_xim20(bytes: &[u8]) -> WalkCensus {
     let mut cursor = 0;
     while cursor + 16 <= bytes.len() {
         let value = u32::from_le_bytes(bytes[cursor + 4..cursor + 8].try_into().unwrap());
-        let kind = (value & 0x7F) as u8;
-        let size_units = (value >> 7) & 0xFFFFF;
+        let kind = (value & ffxi_dat::chunk::CHUNK_KIND_MASK) as u8;
+        let size_units = (value >> 7) & XIM_SIZE_UNITS_MASK;
         let total = (size_units as usize).saturating_mul(16);
         if total < 16 {
             break;
@@ -296,7 +301,7 @@ fn main() {
                 total_attached += n;
             }
             // Attachment.cpp GetAttachMode: low nibble plus bit 16.
-            let mode = (info & 0xF) + 16 * ((info >> 16) & 1);
+            let mode = (info & ATTACH_MODE_NIBBLE) + 16 * ((info >> 16) & 1);
             *mode_dist.entry(mode).or_default() += n;
         }
     }
@@ -321,7 +326,6 @@ fn main() {
         push(&format!("  {rel}: {n}"));
     }
 
-    // Land the report in the gitignored per-machine artifacts dir, for the record.
     let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
     let artifacts = workspace_root.join("artifacts").join("verify");
     std::fs::create_dir_all(&artifacts).ok();

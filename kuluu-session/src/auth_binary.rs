@@ -21,8 +21,8 @@ pub const RESULT_VERSION_MISMATCH: u8 = 0x0B;
 pub const DEFAULT_VERSION: [u8; 5] = *b"1.0.0";
 pub const VERSION_FIELD_LEN: usize = 5;
 
-/// The loader version as the fixed-width field at 0x61 carries it: a dotted
-/// triple whose text is exactly [`VERSION_FIELD_LEN`] bytes, so every
+/// The loader version as the fixed-width field at offset 97 carries it: a
+/// dotted triple whose text is exactly [`VERSION_FIELD_LEN`] bytes, so every
 /// component is a single digit.
 pub fn version_field(s: &str) -> Option<[u8; VERSION_FIELD_LEN]> {
     let trimmed = s.trim();

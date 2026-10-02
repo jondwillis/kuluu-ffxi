@@ -46,6 +46,17 @@ fn body_contact(src: &impl WallSource, xz: Vec2, feet_y: f32, r: f32) -> Option<
 /// Sweep the body from `xz` along horizontal `d`. Returns the clear fraction
 /// of `d` and the blocking contact at the stop (None when the whole sweep is
 /// clear). Coarse march by 1/8 radius then bisect.
+///
+/// A face the body is not moving into cannot block: the walker rests at
+/// standoff ~R beside a wall, and a parallel slide re-detecting that same
+/// wall at t≈0 every iteration (triangle-seam distance dips) is the
+/// stuck-on-walls / walking-in-place bug — only an opposing face stops the
+/// sweep; grazes and partings pass through. Two faces pinching a gap narrower
+/// than the body still stop it (PINCH slop).
+///
+/// The march cap of ~1/8 radius per probe keeps the check dense: one check
+/// at the segment end per in-game tick let the body embed before "blocked"
+/// registered.
 fn body_sweep(src: &impl WallSource, xz: Vec2, feet_y: f32, d: Vec2) -> (f32, Option<(f32, Vec3)>) {
     let len = d.length();
     if len < 1e-6 {
@@ -54,12 +65,6 @@ fn body_sweep(src: &impl WallSource, xz: Vec2, feet_y: f32, d: Vec2) -> (f32, Op
     let r_eff = BODY_RADIUS - 1e-4;
     let blocked = |t: f32| -> Option<(f32, Vec3)> {
         let c = body_contact(src, xz + d * t, feet_y, r_eff)?;
-        // A face we are NOT moving into cannot block. The walker rests at
-        // standoff ~R beside a wall; sliding parallel used to re-detect the
-        // same wall at t≈0 every iteration (triangle-seam distance dips), which
-        // is the stuck-on-walls / walking-in-place bug: only an opposing face
-        // stops the sweep now — grazes and partings pass through. Two faces
-        // pinching a gap narrower than the body still stop it (PINCH slop).
         let n2 = Vec2::new(c.1.x, c.1.z);
         let into_face = d.dot(n2) < 0.0;
         let pinched = r_eff - c.0.sqrt() > PINCH_PENETRATION_SLOP;
@@ -68,9 +73,6 @@ fn body_sweep(src: &impl WallSource, xz: Vec2, feet_y: f32, d: Vec2) -> (f32, Op
         }
         Some(c)
     };
-    // March no more than ~1/8 radius per probe: the old half-radius cap meant a
-    // normal in-game tick got ONE check at the segment end — by the time
-    // "blocked" registered the body was already embedded.
     let step = ((BODY_RADIUS * 0.125) / len).min(1.0);
     let mut t_clear = 0.0f32;
     let mut t_hit: Option<f32> = None;
@@ -151,31 +153,40 @@ pub enum SweepExit {
 /// displacement in bevy xz and which exit of the slide loop produced it;
 /// `feet_y` is the pre-move height (the body's vertical position does not
 /// change inside the loop — `step.rs` owns that after the sweep).
+///
+/// The wanted direction is the original input; a slide that ends up pointing
+/// more than 90° away from it means the body is boxed in — stop rather than
+/// crab backwards. Clip planes accumulate across slide iterations: each wall
+/// touched adds its normal, and the remaining velocity is clipped so it does
+/// not point into any plane hit. On a single flat wall this is a plain slide;
+/// at an inside corner it rides the crease; only a true reversal stops the
+/// body. A grazed wall already in the set is skipped, with a small angular
+/// tolerance keeping numerical twins on a flat wall from filling the set and
+/// confusing the crease logic. Clipping against a later plane that
+/// re-introduces motion into an earlier one follows the crease — the
+/// direction perpendicular to both, oriented downstream; a crease still
+/// pointing into the second plane is a dead-end pocket (Reversal), otherwise
+/// the body rides it. A zero-length velocity exits with the exit the clip
+/// that produced it already decided; a stop exactly at the face and a
+/// degenerate face normal end the loop at the held position. A head-on hit
+/// leaves no slide direction after the clip (Hold).
 pub fn sweep(src: &impl WallSource, xz: Vec2, feet_y: f32, d_in: Vec2) -> (Vec2, SweepExit) {
     let mut p = depenetrate(src, xz, feet_y);
     let mut d = d_in;
     let want_len = d.length();
-    // The original desired direction. A slide that ends up pointing more than
-    // 90° away from this means we're boxed in — stop rather than crab
-    // backwards.
     let want_dir = if want_len > 1e-6 {
         d / want_len
     } else {
         Vec2::ZERO
     };
 
-    // Clip planes accumulated across slide iterations (PM_SlideMove /
-    // PM_ClipVelocity). Each wall we touch adds its normal; the remaining
-    // velocity is clipped so it never points into any plane we've hit. On a
-    // single flat wall this is a plain slide; at an inside corner it rides the
-    // crease; only a true reversal stops us.
     let mut normals: [Vec2; 4] = [Vec2::ZERO; 4];
     let mut n_count: usize = 0;
     let mut exit = SweepExit::Clean;
 
     for _ in 0..SLIDE_ITERATIONS {
         if d.length() < 1e-6 {
-            break; // the clip that produced d already decided the exit
+            break;
         }
         let (t, hit) = body_sweep(src, p, feet_y, d);
         p += d * t;
@@ -185,55 +196,40 @@ pub fn sweep(src: &impl WallSource, xz: Vec2, feet_y: f32, d_in: Vec2) -> (Vec2,
         let rem = d * (1.0 - t);
         let rem_len = rem.length();
         if rem_len < 1e-6 {
-            break; // stopped exactly at the face
+            break;
         }
 
         let n2_raw = Vec2::new(hit.1.x, hit.1.z);
         let n2l = n2_raw.length();
         if n2l < 1e-4 {
-            break; // no usable slide direction — hold this tick's position
+            break;
         }
         let n2 = n2_raw / n2l;
 
-        // Skip a plane we already have (same wall grazed again). A tiny angular
-        // tolerance keeps numerical twins on a flat wall from filling the clip
-        // set and confusing the crease logic below.
         let is_duplicate = normals[..n_count].iter().any(|prev| prev.dot(n2) > 0.98);
         if !is_duplicate && n_count < normals.len() {
             normals[n_count] = n2;
             n_count += 1;
         }
 
-        // Clip `rem` against each plane: remove the component pointing into the
-        // plane. Do it for every accumulated plane; if clipping against a later
-        // plane re-introduces motion into an earlier one, clip to the CREASE
-        // (slide along the shared edge).
         let rem_len2 = rem.length();
         let mut vel = rem;
         'planes: for i in 0..n_count {
-            // Only clip if we're actually heading into this plane.
             if vel.dot(normals[i]) >= 0.0 {
                 continue;
             }
-            // Slide along this plane.
             let mut v = vel - normals[i] * vel.dot(normals[i]);
-            // Does the new velocity dig into any OTHER plane?
             for j in 0..n_count {
                 if j == i {
                     continue;
                 }
                 if v.dot(normals[j]) < 0.0 {
-                    // Two planes at once — slide along their crease (the
-                    // direction perpendicular to both). In 2D that's the
-                    // perpendicular of one normal, oriented downstream.
                     let crease = Vec2::new(-normals[i].y, normals[i].x);
                     let crease = if crease.dot(rem) < 0.0 {
                         -crease
                     } else {
                         crease
                     };
-                    // If the crease still points into plane j, it's a real
-                    // dead-end pocket. Otherwise ride it.
                     if crease.dot(normals[j]) < -1e-3 {
                         vel = Vec2::ZERO;
                         exit = SweepExit::Reversal;
@@ -245,9 +241,6 @@ pub fn sweep(src: &impl WallSource, xz: Vec2, feet_y: f32, d_in: Vec2) -> (Vec2,
             vel = v;
         }
 
-        // Stop only on a genuine reversal: the slide points back more than 90°
-        // from where we wanted to go. A flat wall hit at any oblique angle stays
-        // forward and keeps sliding; a true box-in reverses.
         if want_dir != Vec2::ZERO && vel.length() > 1e-6 {
             let vd = vel / vel.length();
             if vd.dot(want_dir) < -0.01 {
@@ -256,8 +249,6 @@ pub fn sweep(src: &impl WallSource, xz: Vec2, feet_y: f32, d_in: Vec2) -> (Vec2,
             }
         }
         if vel.length() < 1e-6 {
-            // Head-on hit: the clip consumed the whole remaining velocity, so
-            // there is no slide direction left to ride.
             exit = SweepExit::Hold;
             break;
         }
@@ -270,7 +261,7 @@ pub fn sweep(src: &impl WallSource, xz: Vec2, feet_y: f32, d_in: Vec2) -> (Vec2,
 /// Ceiling hold: before applying a rise from `feet_old` to
 /// `feet_new`, reject it when any triangle (any face class) sits in the slab
 /// `(feet_old + BODY_HEIGHT, feet_new + BODY_HEIGHT]` at the feet column —
-/// the body top would push into geometry. A descent never trips this.
+/// the body top would push into geometry. A descent does not trip this.
 pub fn ceiling_holds(geom: &MzbCollisionGeometry, xz: Vec2, feet_old: f32, feet_new: f32) -> bool {
     if feet_new <= feet_old + 1e-6 {
         return false;

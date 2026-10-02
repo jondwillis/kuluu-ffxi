@@ -92,13 +92,13 @@ fn nameplate_hit_distance(ray: Ray3d, transform: &GlobalTransform) -> Option<f32
         .then_some(distance)
 }
 
+/// The final pass draws plates outside the operator camera's render layers.
 fn pick_nameplates(
     rays: Res<RayMap>,
     cameras: Query<&Camera, With<crate::camera::OperatorCamera>>,
     plates: Query<(Entity, &GlobalTransform, &Visibility, &Pickable), With<Nameplate>>,
     mut hits: MessageWriter<PointerHits>,
 ) {
-    // The final pass draws plates outside the operator camera's render layers.
     for (id, ray) in rays.iter() {
         let Ok(camera) = cameras.get(id.camera) else {
             continue;
@@ -288,6 +288,11 @@ pub fn update_hovered_entity_system(
 /// one pointer; gather every resolved (id, depth) and let [`choose_hovered_id`]
 /// rank them. Hits from the mouse and the render-scale bridge pointer count
 /// alike; id 0 is the self entity before its char id arrives.
+/// Untargetable entities (invisible "[obj]" event points, hidden NPCs) do not
+/// hover: the mouse behaves exactly like the click path, which already refuses
+/// to select them — no hover card, no cursor swap, and they do not mask a real
+/// entity behind them. Unknown ids (snapshot mid-sync) stay hoverable. Doors
+/// pass: is_targetable carves them out for the retail Talk flow.
 fn priority_hover_id(
     hover_map: &HoverMap,
     bridge: &PickBridgePointer,
@@ -305,12 +310,6 @@ fn priority_hover_id(
             let id = resolve_hit_entity_id(*entity, world_q, parent_q, nameplate_q)?;
             (id != 0).then_some((id, hit.depth))
         })
-        // Untargetable entities (invisible "[obj]" event points, hidden NPCs)
-        // never hover: the mouse behaves exactly like the click path, which
-        // already refuses to select them -- no hover card, no cursor swap,
-        // and they can't mask a real entity behind them. Unknown ids
-        // (snapshot mid-sync) stay hoverable. Doors pass: is_targetable
-        // carves them out for the retail Talk flow.
         .filter(|(id, _)| {
             snap.entities
                 .iter()
@@ -411,6 +410,8 @@ pub enum ClickResolution {
     Ignored,
 }
 
+/// Self identity comes from the table's self slot, not a per-entity
+/// comparison against a snapshot field.
 pub fn click_to_target_system(
     mut clicks: MessageReader<Pointer<Click>>,
     q_world: Query<&WorldEntity>,
@@ -494,8 +495,6 @@ pub fn click_to_target_system(
                 scene.snapshot.current_goal,
                 Some(kuluu_snapshot::ReactorGoal::Engaged { .. })
             );
-            // Self identity comes from the table's self slot, not a
-            // per-entity comparison against a snapshot field.
             let ctx = action_model::context_for_target(
                 target.id,
                 &scene.snapshot.entities,
@@ -504,6 +503,7 @@ pub fn click_to_target_system(
                 engaged,
                 crate::hud::menu::any_usable_item(&scene.snapshot),
                 fishing_spot.0.is_ready(),
+                scene.snapshot.self_mount.is_some(),
             );
             if !action_model::build_target_action_entries(&ctx, &crate::hud::overlay::RETAIL)
                 .is_empty()
@@ -585,6 +585,8 @@ mod tests {
             .is_none());
     }
 
+    /// click_to_target_system reads self from the table, so it is stamped to
+    /// match the snapshot's self_char_id.
     fn click_world() -> World {
         let mut world = World::new();
         world.insert_resource(Messages::<Pointer<Click>>::default());
@@ -592,8 +594,6 @@ mod tests {
         let mut scene = crate::snapshot::SceneState::default();
         scene.snapshot.self_char_id = Some(7);
         world.insert_resource(scene);
-        // click_to_target_system reads self from the table; stamp it to match
-        // the snapshot field above.
         let mut table = crate::entity_table::EntityTable::default();
         table.set_self_id(Some(7));
         world.insert_resource(table);

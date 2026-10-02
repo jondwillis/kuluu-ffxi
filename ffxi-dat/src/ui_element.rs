@@ -265,9 +265,9 @@ mod tests {
     const FRAMES_JP: &str = "menu    frames  ";
     const FRAMES_US: &str = "menu    framesus";
 
-    // Read the bare install file rather than resolving through overlays: the
-    // xiview Pivot overlay ships an hxi-era sheet, which would mask the
-    // install's own.
+    /// Read the bare install file rather than resolving through overlays: the
+    /// xiview Pivot overlay ships an hxi-era sheet, which would mask the
+    /// install's own.
     fn read_icon_sheet_unoverlaid(root: &crate::archive::DatRoot) -> Option<Vec<u8>> {
         let path = match root.resolve(UI_SHEET_FILE_ID) {
             Ok(loc) => loc.join_under(root.root()),
@@ -524,9 +524,9 @@ mod tests {
         }
     }
 
-    // Gated on a retail install (self-skips without one). The US sheet names
-    // the frames group "menu    framesus" and has no JP "menu    frames  "
-    // (measured on KNOWN_CLIENTS horizonxi-2023 and retail-2026-09).
+    /// Gated on a retail install (self-skips without one). The US sheet names
+    /// the frames group "menu    framesus" and has no JP "menu    frames  "
+    /// (measured on KNOWN_CLIENTS horizonxi-2023 and retail-2026-09).
     #[test]
     fn real_dat_51_names_the_frames_group_framesus() {
         let Some(root) = crate::archive::open_test_install() else {
@@ -547,10 +547,10 @@ mod tests {
         );
     }
 
-    // Gated on a retail install (self-skips without one). Pins the +42 byte as
-    // MenuShapeFormat.h's SourceBlendFactor: every quad in the icon sheet decodes
-    // to a valid 0..2 factor, and the counts are the ones measured per
-    // KNOWN_CLIENTS row.
+    /// Gated on a retail install (self-skips without one). Pins the +42 byte as
+    /// MenuShapeFormat.h's SourceBlendFactor: every quad in the icon sheet decodes
+    /// to a valid 0..2 factor, and the counts are the ones measured per
+    /// KNOWN_CLIENTS row.
     #[test]
     fn real_dat_framesus_blend_factor_counts() {
         const FRAMESUS_QUADS_BY_CLIENT: &[(&str, usize)] =

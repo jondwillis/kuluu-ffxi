@@ -198,7 +198,7 @@ mod tests {
         );
     }
 
-    /// A `NaN` master means a corrupt/failed write (our own save() can never
+    /// A `NaN` master means a corrupt/failed write (our own save() can't
     /// emit one; serde_json rejects non-finite f32 on serialize), so the whole
     /// document is rejected: load returns Err, callers fall back to defaults.
     #[test]

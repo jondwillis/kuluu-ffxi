@@ -634,7 +634,10 @@ fn fishing_blocks_sit_within_the_era_skew_of_the_lsb_pin() {
 /// what lets a zone message name its own line when the server numbers the
 /// dialog table from a different client era, so it has to hold on the real DAT
 /// — the decoder has to see through the `{Auto:N}` terminators and inline tags
-/// these entries carry.
+/// these entries carry. The server's own stack message for a sairui-ran
+/// landed on the parameterless neighbour on both installs in hand, so feeding
+/// one back in has to resolve to the obtained line rather than print the
+/// neighbour.
 #[test]
 fn the_item_obtained_line_is_the_only_shape_its_neighbours_are_not() {
     let Some(root) = install() else {
@@ -662,9 +665,6 @@ fn the_item_obtained_line_is_the_only_shape_its_neighbours_are_not() {
             dat.text(obtain)
         );
 
-        // The message the server sent for a stack of sairui-ran landed on a
-        // parameterless neighbour on both installs in hand; feeding one back in
-        // has to resolve to the obtained line rather than print the neighbour.
         let wire = (obtain + 1..obtain + 1 + usize::from(MAX_ERA_SKEW))
             .find(|&i| dat.param_slots(i) == Some(0) && dat.menu(i).is_none())
             .unwrap_or_else(|| panic!("zone {zone}: no parameterless line after {obtain}"));

@@ -386,9 +386,9 @@ pub mod timers {
         crate::ui_font::line_height_px(TIMER_FONT_PX)
     }
 
+    /// The label is centred on the chip pitch, not on the icon, so it
+    /// overhangs evenly into the gap either side.
     pub(super) fn spawn_chip_timer(chip: &mut ChildSpawnerCommands, pitch: f32) {
-        // The label is centred on the chip pitch, not on the icon, so it
-        // overhangs evenly into the gap either side.
         let overhang = (pitch - ICON_SIZE_PX) / 2.0;
         chip.spawn((
             StatusChipTimer,
@@ -441,8 +441,8 @@ pub mod timers {
         use super::*;
         use bevy::ecs::system::RunSystemOnce;
 
-        // Every countdown the pipeline can deliver has to fit the width the chip
-        // pitch reserves, or neighbouring labels run together (kuluu-nxmi).
+        /// Every countdown the pipeline can deliver has to fit the width the
+        /// chip pitch reserves, or neighbouring labels run together.
         #[test]
         fn ribbon_timer_never_exceeds_reserved_width() {
             let reserved = WIDEST_RIBBON_TIMER.chars().count();
@@ -475,16 +475,15 @@ pub mod timers {
                 "pitch {pitch} leaves no gap between {label}px labels"
             );
             assert!(pitch >= ICON_SIZE_PX + MIN_ICON_GAP_PX, "pitch {pitch}");
-            // Centring the label on the pitch must not push it off its own icon.
             assert!(
                 pitch < ICON_SIZE_PX * 2.0,
-                "pitch {pitch} orphans the label"
+                "pitch {pitch} orphans the label (centring on the pitch must not push it off its own icon)"
             );
         }
 
-        // `update_status_timers` reads the clock again after this test does, so
-        // the expiry sits mid-bucket: every remaining time in 2h00..2h01 renders
-        // identically, leaving 30s of slack for wall clock passing in between.
+        /// `update_status_timers` reads the clock again after this test does, so
+        /// the expiry sits mid-bucket: every remaining time in 2h00..2h01 renders
+        /// identically, leaving 30s of slack for wall clock passing in between.
         const MID_BUCKET_REMAINING_SECS: u32 = 2 * 3600 + 30;
         const MID_BUCKET_LABEL: &str = "2h00";
 
@@ -644,9 +643,9 @@ mod tests {
         }
     }
 
-    // Retail draws no countdown on the ribbon, so a build without
-    // `enhanced-buff-timers` must spawn no label under a chip and must not
-    // reserve the pitch/row space one would need (kuluu-m9hj).
+    /// Retail draws no countdown on the ribbon, so a build without
+    /// `enhanced-buff-timers` spawns no label under a chip and does not
+    /// reserve the pitch/row space one would need.
     #[cfg(not(feature = "enhanced-buff-timers"))]
     #[test]
     fn default_build_packs_the_ribbon_tight_with_no_countdown() {

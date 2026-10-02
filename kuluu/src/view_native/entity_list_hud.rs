@@ -27,7 +27,7 @@ const VISIBLE_ROWS: usize = 16;
 /// Refresh cadence for the text content.
 const REFRESH_INTERVAL: f32 = 0.2;
 const ROW_FONT: f32 = 12.0;
-/// Approximate rendered row height in px, used to convert pixel-unit wheel
+/// Approximate rendered row height in px, converting pixel-unit wheel
 /// deltas into rows.
 const ROW_H_PX: f32 = 15.0;
 const NAME_WIDTH: usize = 12;
@@ -48,6 +48,13 @@ pub struct EntityListScroll {
     pub rows: i32,
 }
 
+/// Spawn the panel node tree. The panel is 750px wide so the claim and
+/// status-name columns fit at FiraMono 12px without clipping FLAGS; the
+/// scroll window clips a fixed set of row slots, which the update system
+/// pages by offset instead of spawning/despawning per entity. The column
+/// header is static text aligned with the row format. Each row's resting
+/// border is 0-width and `Color::NONE` (not a transparent srgba), so no
+/// border draws until the target rectangle claims the row.
 pub fn spawn_entity_list_hud(mut commands: Commands) {
     commands
         .spawn((
@@ -57,8 +64,6 @@ pub fn spawn_entity_list_hud(mut commands: Commands) {
                 position_type: PositionType::Absolute,
                 top: Val::Px(300.0),
                 left: Val::Px(8.0),
-                // Wide enough for the claim + status-name columns at FiraMono
-                // 12px without clipping FLAGS (the old 600px clipped it).
                 width: Val::Px(750.0),
                 padding: UiRect::axes(Val::Px(8.0), Val::Px(6.0)),
                 border: UiRect::all(Val::Px(1.0)),
@@ -83,8 +88,6 @@ pub fn spawn_entity_list_hud(mut commands: Commands) {
                 TextLayout::no_wrap(),
             ));
 
-            // Clipped scroll window: fixed row slots inside; the update system
-            // pages them by offset instead of spawning/despawning per entity.
             p.spawn(Node {
                 width: Val::Percent(100.0),
                 height: Val::Px(VISIBLE_ROWS as f32 * ROW_H_PX + 4.0),
@@ -93,7 +96,6 @@ pub fn spawn_entity_list_hud(mut commands: Commands) {
                 ..default()
             })
             .with_children(|box_| {
-                // Column header (static; aligned with the row format below).
                 box_.spawn((
                     Text::new(column_header()),
                     TextFont {
@@ -113,15 +115,11 @@ pub fn spawn_entity_list_hud(mut commands: Commands) {
                         },
                         TextColor(theme::TEXT),
                         TextLayout::no_wrap(),
-                        // The target rectangle toggles border width per row;
-                        // a 0-width transparent border is the resting state.
                         Node {
                             display: Display::None,
                             border: UiRect::all(Val::Px(0.0)),
                             ..default()
                         },
-                        // Color::NONE (not a transparent srgba): the resting
-                        // state draws no border at all.
                         BorderColor::all(Color::NONE),
                     ));
                 }
@@ -129,6 +127,8 @@ pub fn spawn_entity_list_hud(mut commands: Commands) {
         });
 }
 
+/// Toggle the panel; a fresh open starts at the top of the list, so the
+/// scroll offset resets when the panel turns on.
 pub fn apply_entity_list_visibility(
     panels: Res<HudPanels>,
     mut scroll: ResMut<EntityListScroll>,
@@ -142,7 +142,6 @@ pub fn apply_entity_list_visibility(
     } else {
         Visibility::Hidden
     };
-    // A fresh open starts at the top of the list.
     if panels.entity_list && scroll.rows != 0 {
         scroll.rows = 0;
     }
@@ -178,6 +177,16 @@ pub fn entity_list_wheel_system(
     scroll.rows = (scroll.rows - delta_rows.round() as i32).max(0);
 }
 
+/// Refresh the panel text at 5 Hz. Rows are id-sorted so a given entity
+/// stays on the same row while it is alive, which makes watching its status
+/// byte flip readable. The header query's Without filter keeps the two
+/// `&mut Text` queries disjoint (B0001): the header row does not carry
+/// EntityListRow. The target rectangle is the row slot holding the targeted
+/// entity, if it is on the visible page; a stale id (target despawned)
+/// matches nothing. Claim state is read live off the table record: it flips
+/// on every UPDATE_STATUS update (s2c 0x0E,
+/// research/XiPackets/world/server/0x000E) and this panel re-reads at 5 Hz,
+/// so a flip shows up within one refresh.
 pub fn update_entity_list_hud(
     panels: Res<HudPanels>,
     time: Res<Time>,
@@ -185,8 +194,6 @@ pub fn update_entity_list_hud(
     target: Res<Target>,
     mut scroll: ResMut<EntityListScroll>,
     mut refresh: Local<f32>,
-    // Without keeps the two `&mut Text` queries provably disjoint (B0001):
-    // the header row never carries EntityListRow.
     mut header_q: Query<&mut Text, (With<EntityListHeader>, Without<EntityListRow>)>,
     mut row_q: Query<(
         &EntityListRow,
@@ -205,8 +212,6 @@ pub fn update_entity_list_hud(
     }
     *refresh = 0.0;
 
-    // Id-sorted: deterministic order so a given entity stays on the same row
-    // while it is alive, which makes watching its status byte flip readable.
     let mut ents: Vec<_> = table.iter().collect();
     ents.sort_by_key(|r| r.entity.id);
     let n = ents.len();
@@ -229,8 +234,6 @@ pub fn update_entity_list_hud(
     }
 
     let self_id = table.self_id();
-    // The target rectangle: the row slot holding the targeted entity, if it is
-    // on the visible page. A stale id (target despawned) matches nothing.
     let target_row = target
         .id
         .and_then(|id| ents.iter().position(|r| r.entity.id == id));
@@ -240,9 +243,6 @@ pub fn update_entity_list_hud(
                 let e = &rec.entity;
                 let is_self = self_id == Some(e.id);
                 let markers = marker_labels(e);
-                // Claim state, live off the table record: it flips on every
-                // UPDATE_STATUS 0x0E and this panel re-reads at 5 Hz, so a flip
-                // shows up within one refresh — no extra tracking needed.
                 let claim_label = if e.claim_id == 0 {
                     "-"
                 } else if self_id.is_some_and(|s| s == e.claim_id) {
@@ -291,9 +291,9 @@ pub fn update_entity_list_hud(
     }
 }
 
+/// Static column header: plain padding (no `08X`) because the row format's
+/// hex spec is integer-only and this header carries labels, not values.
 fn column_header() -> String {
-    // Plain padding (no `08X`): the row format's hex spec is integer-only, and
-    // this header carries labels, not values.
     format!(
         "  {id:>8}  {name:<12} {kind:<4} {pos:<12}  {st_name:<13} {hp:>3}  {claim:<13} {status:<7} FLAGS",
         id = "ID",
@@ -325,6 +325,10 @@ fn status_name(status: u8) -> String {
     }
 }
 
+/// One row of text: X,Y,Z flattened into one column to leave room for
+/// ST/HP/STATUS/FLAGS on the right (three separate columns clipped FLAGS at
+/// 500px panel width). Whole yalms: this is a where-is-it readout, not a
+/// survey.
 fn format_row(
     is_self: bool,
     id: u32,
@@ -350,9 +354,6 @@ fn format_row(
     .flatten()
     .collect::<Vec<_>>()
     .join(" ");
-    // X,Y,Z flattened into one column to leave room for ST/HP/STATUS/FLAGS on
-    // the right (the three separate columns clipped FLAGS at 500px panel
-    // width). Whole yalms: this is a where-is-it readout, not a survey.
     let pos = format!("{x:.0},{y:.0},{z:.0}");
     let st_name = status_name(status);
     format!(
@@ -367,8 +368,8 @@ fn format_row(
 
 /// The nameplate status markers this entity's plate would draw, as short
 /// labels — the same priority-resolved list `nameplate_markers` feeds the
-/// billboard raster. Empty for kinds that never carry icons (mobs/pets) and
-/// for flag-less players; a `-` there means "no marker-driving state arrived",
+/// billboard raster. Empty for kinds that carry no icons (mobs/pets) and for
+/// flag-less players; a `-` there means "no marker-driving state arrived",
 /// which is exactly what the icon debugging needs to see.
 fn marker_labels(e: &kuluu_snapshot::Entity) -> String {
     let labels = nameplate_marker::nameplate_markers(e)
@@ -383,6 +384,8 @@ fn marker_labels(e: &kuluu_snapshot::Entity) -> String {
     }
 }
 
+/// The short label for a nameplate glyph code; None draws nothing. JOB_MASTER_TAIL
+/// is the half-scale companion of JOB_MASTER and carries no label of its own.
 fn label_for_glyph(code: u8) -> Option<&'static str> {
     use nameplate_marker::glyph as g;
     match code {
@@ -403,7 +406,6 @@ fn label_for_glyph(code: u8) -> Option<&'static str> {
         g::BESIEGED_EVEN | g::BESIEGED_ODD => Some("BSG"),
         g::MONSTROSITY => Some("MON"),
         g::JOB_MASTER => Some("JM"),
-        // The half-scale companion of JOB_MASTER: no label of its own.
         g::JOB_MASTER_TAIL => None,
         _ => None,
     }
@@ -438,9 +440,10 @@ fn kind_label(kind: EntityKind) -> &'static str {
     }
 }
 
+/// Truncate to `width` with an ASCII ellipsis: the rows rasterize with
+/// Bevy's bundled FiraMono subset, which turns any non-ASCII glyph into a
+/// tofu box.
 fn truncate_pad(s: &str, width: usize) -> String {
-    // ASCII ellipsis: the rows rasterize with Bevy's bundled FiraMono subset,
-    // which turns any non-ASCII glyph into a tofu box.
     let count = s.chars().count();
     if count > width {
         let mut out: String = s.chars().take(width.saturating_sub(3)).collect();

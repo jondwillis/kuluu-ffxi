@@ -5,9 +5,9 @@ use keyring::Entry;
 
 pub const FALLBACK_FILE: &str = "secrets.json";
 
-// Steam Deck Game Mode (and any session without an org.freedesktop.secrets
-// provider) has no keyring daemon, so the platform store is best-effort and a
-// mode-0600 file under the config dir catches what it rejects.
+/// Steam Deck Game Mode (and any session without an org.freedesktop.secrets
+/// provider) has no keyring daemon, so the platform store is best-effort and
+/// a mode-0600 file under the config dir catches what it rejects.
 pub struct SecretStore;
 
 impl SecretStore {

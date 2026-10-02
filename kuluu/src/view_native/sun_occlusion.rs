@@ -199,10 +199,10 @@ mod tests {
     // reported in.
     const TEST_FOG_VISIBILITY: f32 = 1200.0;
 
-    // A zone authored to draw past its own fog, as Lower Jeuno is at noon.
+    /// A zone authored to draw past its own fog, as Lower Jeuno is at noon.
     const TEST_ZONE_DRAW_DISTANCE: f32 = 1000.0;
 
-    // What update_sun_occlusion_system passes in that zone at the vanilla multiplier.
+    /// What update_sun_occlusion_system passes in that zone at the vanilla multiplier.
     fn default_reach() -> f32 {
         occlusion_reach(TEST_ZONE_DRAW_DISTANCE, Some(TEST_FOG_VISIBILITY))
     }

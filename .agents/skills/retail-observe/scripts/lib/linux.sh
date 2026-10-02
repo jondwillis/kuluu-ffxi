@@ -155,7 +155,13 @@ host_launch() {
   args="$LOADER_ARGS"
   [ -n "${SERVER:-}" ] && args="$args --server $SERVER"
   printf 'observe: %s %s %s\n' "${RUNNER:-}" "$loader" "$args"
-  ( cd "$(dirname "$loader")" && exec ${RUNNER:-} "$loader" $args )
+  # One executable whose path may contain spaces, or a command line to
+  # word-split (`umu-run --some-flag`); only the second may be split.
+  if [ -x "${RUNNER:-}" ]; then
+    ( cd "$(dirname "$loader")" && exec "$RUNNER" "$loader" $args )
+  else
+    ( cd "$(dirname "$loader")" && exec ${RUNNER:-} "$loader" $args )
+  fi
 }
 
 host_doctor() {

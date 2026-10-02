@@ -37,8 +37,8 @@ const READ_TIME_PER_CHAR: f32 = 0.025;
 const READ_TIME_MIN: f32 = 1.5;
 /// Long monologues do not drag the scene.
 const READ_TIME_MAX: f32 = 12.0;
-/// A frame outliving this after its advance command means the command never
-/// landed (the session round-trips in milliseconds); re-arm the clock.
+/// A frame outliving this after its advance command means the advance did
+/// not land (the session round-trips in milliseconds); re-arm the clock.
 const ADVANCE_GRACE: f32 = 0.5;
 /// How long the player's own advance holds auto-enter's fire: the session
 /// round-trip is milliseconds, so this only needs to cover the few frames
@@ -90,7 +90,11 @@ pub struct Clock {
 
 impl Clock {
     /// Advance by `dt` seconds with `frame` up (`None` = box down). Returns
-    /// the frame to advance when its read time has elapsed.
+    /// the frame to advance when its read time has elapsed. A new frame
+    /// starts its read clock; a frame change also clears any in-flight
+    /// advance, since the session has moved on. When the advance outlives
+    /// ADVANCE_GRACE it has not landed, and the clock re-arms with a fresh
+    /// read time.
     pub fn tick(&mut self, frame: Option<&DialogState>, dt: f32) -> Option<DialogState> {
         let frame = frame.filter(|d| eligible(d));
         let Some(d) = frame else {
@@ -98,8 +102,6 @@ impl Clock {
             return None;
         };
         if self.frame.as_ref() != Some(d) {
-            // A new frame (or the first one): start its read clock; a frame
-            // change also clears any in-flight advance — the session moved on.
             self.frame = Some(d.clone());
             self.elapsed = 0.0;
             self.pending_since = None;
@@ -107,7 +109,6 @@ impl Clock {
         if let Some(since) = self.pending_since.as_mut() {
             *since += dt;
             if *since > ADVANCE_GRACE {
-                // The command never landed: re-arm with a fresh read time.
                 self.pending_since = None;
                 self.elapsed = 0.0;
             } else {
@@ -140,10 +141,6 @@ pub fn auto_enter_cs_system(
         return;
     };
     if manual_advance_guard(scene_state.last_manual_dialog_advance, MANUAL_GUARD) {
-        // The player's own Enter just advanced this frame; the snapshot still
-        // shows the pre-advance frame, and sending now would make the session
-        // dismiss the frame that advance just opened. The clock is pending,
-        // so it re-arms only after the frame actually changes.
         return;
     }
     let _ = cmd_tx.0.try_send(AgentCommand::EndEventChoice {
@@ -216,17 +213,15 @@ mod tests {
 
     #[test]
     fn clock_fires_once_per_frame_after_read_time() {
-        let f = frame(&"x".repeat(100)); // read time 2.5 s
+        let f = frame(&"x".repeat(100));
         let mut c = Clock::default();
         for _ in 0..12 {
             assert!(c.tick(Some(&f), 0.2).is_none());
         }
         assert_eq!(c.tick(Some(&f), 0.2), Some(f.clone()));
-        // The advance is in flight: the same frame stays up, no re-fire.
         for _ in 0..2 {
             assert!(c.tick(Some(&f), 0.2).is_none());
         }
-        // A new frame starts its own clock; the box going down clears all.
         let g = frame("next line");
         assert!(c.tick(Some(&g), 0.2).is_none());
         assert!(c.tick(None, 0.2).is_none());
@@ -235,14 +230,12 @@ mod tests {
 
     #[test]
     fn clock_rearms_when_the_advance_never_lands() {
-        let f = frame("hi"); // read time 1.5 s
+        let f = frame("hi");
         let mut c = Clock::default();
         for _ in 0..7 {
             assert!(c.tick(Some(&f), 0.2).is_none());
         }
         assert_eq!(c.tick(Some(&f), 0.2), Some(f.clone()));
-        // The 0.5 s grace (two 0.2 s ticks) keeps the fire in flight, then a
-        // fresh read time runs to the next fire.
         for _ in 0..2 {
             assert!(c.tick(Some(&f), 0.2).is_none());
         }

@@ -59,6 +59,12 @@ enhanced-job-display = []
 # are unaffected - they come from kuluu-session).
 enhanced-shutdown-counter = []
 
+# Enhanced (non-retail): the movement hold retail applies while the weapon is
+# drawn or sheathed is off by default, with a Debug-menu row (Engage_anim_lock)
+# that forces it back on. Without this feature the hold always applies and the
+# row does not exist.
+enhanced-engage-move-lock-off = []
+
 # DEV-ONLY: renders the "Debug" entry (and its Retail+ section) on page 2 of
 # the Command menu. Shipped release builds never enable this, so retail parity
 # holds by construction; dev/test builds pass `--features debug-menu` explicitly.
@@ -123,7 +129,7 @@ ffxi-audio = { path = "../ffxi-audio" }
 # Same pinned copy as bevy's wgpu (29.x in the lockfile — zero new compile):
 # graphics/dlss_nr.rs names a few raw wgpu types that bevy does not re-export
 # (TextureTransition/TextureUses). Native-only; wasm never sees it.
-wgpu = { version = "29", default-features = false, features = ["std"] }
+wgpu = { version = "30", default-features = false, features = ["std"] }
 # Stable id for the synthetic picking pointer that bridges window-space mouse
 # input onto the off-screen render-scale target (graphics::render_scale, which
 # is itself native-only). from_u128 only — no getrandom needed.

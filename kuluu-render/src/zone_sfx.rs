@@ -138,6 +138,11 @@ fn collect_placed_sounds(
     }
 }
 
+/// Seeded per emitter so a row of identical bird calls does not fire in
+/// lockstep. The countdown is drawn from the same window as the re-emission
+/// period rather than started at zero, or every in-range emitter in the zone
+/// fires together on the first tick after zone-in (West Ronfaure ships 30+
+/// bird calls) and only de-syncs afterwards.
 fn emitter(
     def: &SoundGeneratorDef,
     sep: &Sep,
@@ -145,11 +150,7 @@ fn emitter(
     attached: bool,
     index: usize,
 ) -> ZonePlacedSfx {
-    // Seeded per emitter so a row of identical bird calls does not fire in lockstep.
     let mut rng = SFX_RNG_SEED ^ (index as u64).wrapping_mul(SFX_RNG_STRIDE);
-    // Drawn from the same window as the re-emission period rather than started at zero,
-    // or every in-range emitter in the zone fires together on the first tick after
-    // zone-in (West Ronfaure ships 30+ bird calls) and only de-syncs afterwards.
     let countdown_frames = next_unit(&mut rng) * (def.frames_per_emission + def.emission_variance);
     ZonePlacedSfx {
         se_id: sep.se_id,
@@ -208,14 +209,14 @@ pub fn actor_auto_run_sounds(assets: &ActionAssets) -> Vec<(SoundGeneratorDef, S
     out
 }
 
+/// The base position is in the actor's DAT-local frame; the root's transform
+/// carries the FFXI->Bevy basis, as it does for the actor's particle meshes.
 fn spawn_actor_auto_run_sounds(
     q_added: Query<(Entity, &ActorAutoRunEffects), Added<ActorAutoRunEffects>>,
     mut commands: Commands,
 ) {
     for (actor_root, fx) in &q_added {
         for (index, (def, sep)) in actor_auto_run_sounds(&fx.assets).iter().enumerate() {
-            // The base position is in the actor's DAT-local frame; the root's transform
-            // carries the FFXI->Bevy basis, as it does for the actor's particle meshes.
             let local = Vec3::from_array(def.base_position);
             commands.spawn((
                 InGameEntity,
@@ -227,7 +228,7 @@ fn spawn_actor_auto_run_sounds(
     }
 }
 
-const SFX_RNG_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
+const SFX_RNG_SEED: u64 = crate::scheduler_runtime::SPLITMIX64_GOLDEN_RATIO;
 const SFX_RNG_STRIDE: u64 = 0x0000_0100_0000_01B3;
 
 // The draw is the high word, so it spans the whole unit interval rather than the lower half.
@@ -482,8 +483,8 @@ mod tests {
         assets
     }
 
-    // Only an auto-run, source-attached Sep generator rides the actor; a zone placement or a
-    // routine-driven cue is someone else's.
+    /// Only an auto-run, source-attached Sep generator rides the actor; a zone
+    /// placement or a routine-driven cue is someone else's.
     #[test]
     fn actor_auto_run_sounds_take_the_attached_auto_run_generators() {
         let attached = SoundGeneratorDef {
@@ -521,7 +522,7 @@ mod tests {
         assert_eq!(out[0].1.se_id, HOME_POINT_AMBIENT_SE);
     }
 
-    // ROM/3/25.DAT: `snd0` links Sep `9013` (loop flag set), auto-run, attached to the actor.
+    /// ROM/3/25.DAT: `snd0` links Sep `9013` (loop flag set), auto-run, attached to the actor.
     #[test]
     fn home_point_model_carries_its_ambient_loop() {
         let Some(bytes) = zone_dat(HOME_POINT_MODEL_DAT) else {

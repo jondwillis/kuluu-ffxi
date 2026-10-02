@@ -1,5 +1,6 @@
 //! B6: distribution of the 0x5B/0x66 actor operands across the retail event
-//! DAT corpus. The entity Type gate the two motion resource readers apply
+//! DAT corpus (research/XiEvents/OpCodes/0x005B.md, 0x0066.md). The entity Type
+//! gate the two motion resource readers apply
 //! runs on the entity the opcode names, so the host must know which kind of
 //! lookup the corpus
 //! actually authors: the event-entity selector, a local-player selector, a
@@ -24,6 +25,13 @@ use std::path::Path;
 use ffxi_dat::{event_dat, event_locate, DatRoot};
 use ffxi_event::cue::ActorLookup;
 use ffxi_event::opcode_meta::{sub_size, OPCODE_META};
+
+/// research/XiEvents/OpCodes/0x0000.md: the walk's stop opcode.
+const OP_END: u8 = 0x00;
+/// research/XiEvents/OpCodes/0x005B.md, 0x0066.md: the two event motion
+/// resource loaders this probe counts.
+const OP_LOADEXTSCHEDULER: u8 = 0x5B;
+const OP_LOADEXTSCHEDULER2: u8 = 0x66;
 
 fn categorize(v: u32) -> &'static str {
     let lookup = ActorLookup(v);
@@ -53,7 +61,7 @@ fn u16_at(data: &[u8], pos: usize) -> Option<u16> {
 }
 
 /// One worklist walk: record the 0x5B/0x66 instruction sites reachable from
-/// `start` and return them.
+/// `start` and return them (research/XiEvents/OpCodes/0x005B.md, 0x0066.md).
 fn walk_block(data: &[u8], start: usize) -> BTreeSet<usize> {
     let mut sites = BTreeSet::new();
     let mut seen: BTreeSet<usize> = BTreeSet::new();
@@ -64,14 +72,14 @@ fn walk_block(data: &[u8], start: usize) -> BTreeSet<usize> {
             continue;
         }
         let op = data[pos];
-        if op == 0x00 {
+        if op == OP_END {
             continue;
         }
-        if op == 0x5B || op == 0x66 {
+        if op == OP_LOADEXTSCHEDULER || op == OP_LOADEXTSCHEDULER2 {
             sites.insert(pos);
         }
-        // Opcodes above 0xD9 are undefined in the meta table; stop the walk
-        // there rather than index past the end.
+        // research/XiEvents/OpCodes: opcodes above 0xD9 are undefined in the meta table;
+        // stop the walk there rather than index past the end.
         let Some(meta) = OPCODE_META.get(op as usize) else {
             continue;
         };

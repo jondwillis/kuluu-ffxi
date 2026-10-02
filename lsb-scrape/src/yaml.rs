@@ -155,6 +155,9 @@ fn parse_block(lines: &mut Vec<Line>, cursor: &mut usize, indent: usize) -> Resu
     }
 }
 
+/// Parse a block sequence at `indent`. A map item carries its first key on
+/// the dash line and the rest two columns deeper; re-homing the dash line at
+/// that depth makes the whole item one contiguous map.
 fn parse_seq(lines: &mut Vec<Line>, cursor: &mut usize, indent: usize) -> Result<Yaml> {
     let mut items = Vec::new();
     while *cursor < lines.len()
@@ -170,9 +173,6 @@ fn parse_seq(lines: &mut Vec<Line>, cursor: &mut usize, indent: usize) -> Result
             let child_indent = lines[*cursor].indent;
             items.push(parse_block(lines, cursor, child_indent)?);
         } else if split_key(&rest).is_some() {
-            // A map item carries its first key on the dash line and the rest
-            // two columns deeper; re-homing the dash line at that depth makes
-            // the whole item one contiguous map.
             lines[*cursor].indent = indent + 2;
             lines[*cursor].text = rest;
             items.push(parse_map(lines, cursor, indent + 2)?);

@@ -98,6 +98,9 @@ impl WeatherParticles {
     }
 }
 
+/// Debug gate (Debug menu Weather row): while off, despawn any live
+/// precipitation generators and drop the load key so re-enabling rebuilds
+/// the set for whatever weather is active then.
 fn sync_weather_particles(
     scene_state: Res<SceneState>,
     zone_weather: Res<crate::weather::ZoneWeather>,
@@ -111,9 +114,6 @@ fn sync_weather_particles(
     mut commands: Commands,
     dat_root: Res<crate::dat_root::SharedDatRoot>,
 ) {
-    // Debug gate (Debug menu Weather row): while off, despawn any live
-    // precipitation generators and drop the load key so re-enabling rebuilds
-    // the set for whatever weather is active then.
     if panels.weather_off {
         for e in store.entities.drain(..) {
             commands.entity(e).try_despawn();

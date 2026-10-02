@@ -9,7 +9,7 @@ use bevy::prelude::*;
 use bevy::ui::{Checked, ComputedNode, Overflow, ScrollPosition, UiGlobalTransform};
 use bevy::ui_widgets::{Activate, ValueChange};
 
-use crate::launcher_store::{self, keyring_account_key, KEYRING_SERVICE};
+use crate::launcher_store::{self, keyring_account_key, keyring_square_enix_key, KEYRING_SERVICE};
 use crate::secret_store::SecretStore;
 
 use super::brand::{spawn_brand_mark, BrandMark};
@@ -21,25 +21,33 @@ use super::common::{
 use super::server_edit::ver_lock_label;
 use super::server_version_check::{ServerVersionStatus, VersionViolation};
 use super::{
-    Credentials, DatSetupReturn, LauncherState, LoginErrorMsg, LoginErrorReturn, LoginField,
-    LoginForm, ServerEditForm, ServerInfo, ServerSelectForm,
+    Credentials, DatSetupReturn, LauncherClients, LauncherState, LoginErrorMsg, LoginErrorReturn,
+    LoginField, LoginForm, ServerEditForm, ServerInfo, ServerSelectForm,
 };
 use crate::view_native::widgets::text_field::{text_field, TextField, TextFieldSubmitted};
 use crate::view_native::widgets::{TextFieldDisplay, TextFieldProps};
+use kuluu_session::auth_client::AuthFlavor;
 
 #[derive(Component)]
 pub(super) struct LoginUiRoot;
 
+#[derive(Component)]
+pub(super) struct LoginCredentialField;
+
 #[derive(Resource, Default)]
 pub(super) struct LoginUiDirty(pub bool);
 
-fn saved_accounts_for(form: &ServerSelectForm, info: &ServerInfo) -> (String, Vec<(String, bool)>) {
+/// A saved account as the sign-in form needs it: the identity it is keyed on,
+/// whether a password was kept, and the Square Enix id that rides with it.
+type SavedEntry = (String, bool, String);
+
+fn saved_accounts_for(form: &ServerSelectForm, info: &ServerInfo) -> (String, Vec<SavedEntry>) {
     let server_key = form.selected.clone().unwrap_or_else(|| info.server.clone());
     let accts = launcher_store::load()
         .accounts
         .into_iter()
         .filter(|a| a.server_name == server_key)
-        .map(|a| (a.username, a.remember_password))
+        .map(|a| (a.username, a.remember_password, a.square_enix_id))
         .collect();
     (server_key, accts)
 }
@@ -52,6 +60,7 @@ pub(super) fn spawn_login_ui(
     version: Res<ServerVersionStatus>,
     era: Res<ClientEraStatus>,
     mark: Res<BrandMark>,
+    clients: Res<LauncherClients>,
 ) {
     build_login_ui(
         &mut commands,
@@ -61,6 +70,7 @@ pub(super) fn spawn_login_ui(
         &version,
         &era,
         &mark,
+        clients.auth.flavor,
     );
 }
 
@@ -74,6 +84,7 @@ pub(super) fn rebuild_login_ui_system(
     version: Res<ServerVersionStatus>,
     era: Res<ClientEraStatus>,
     mark: Res<BrandMark>,
+    clients: Res<LauncherClients>,
 ) {
     if !dirty.0 {
         return;
@@ -90,6 +101,7 @@ pub(super) fn rebuild_login_ui_system(
         &version,
         &era,
         &mark,
+        clients.auth.flavor,
     );
 }
 
@@ -115,12 +127,18 @@ fn build_login_ui(
     version: &ServerVersionStatus,
     era: &ClientEraStatus,
     mark: &BrandMark,
+    flavor: AuthFlavor,
 ) {
     let user_initial = form.user.clone();
     let pass_initial = form.pass.clone();
+    let pol_id_initial = form.pol_id.clone();
+    let pol_pass_initial = form.pol_pass.clone();
     let remember = form.remember_password;
-    let active_user = form.user.clone();
+    let active_user = form
+        .account_key(flavor == AuthFlavor::PlayOnline)
+        .to_string();
     let (server_key, accts) = saved_accounts_for(server_form, server);
+    let playonline = flavor == AuthFlavor::PlayOnline;
 
     commands
         .spawn((LoginUiRoot, screen_root()))
@@ -136,36 +154,90 @@ fn build_login_ui(
                 spawn_version_banner(panel, version);
                 spawn_client_era_banner(panel, era);
 
-                spawn_saved_accounts_row(panel, &server_key, &active_user, &accts);
-
-                spawn_field(panel, "Username", false, &user_initial, LoginField::User);
-                spawn_field(panel, "Password", true, &pass_initial, LoginField::Password);
-
-                let mut cb = panel.spawn(checkbox_bundle(
-                    (),
-                    Spawn((Text::new("Remember password"), ThemedText)),
-                ));
-                if remember {
-                    cb.insert(Checked);
+                if playonline && !terms_acknowledged(server.profile_name.as_deref()) {
+                    spawn_terms_gate(panel, server.profile_name.as_deref());
+                    return;
                 }
-                cb.observe(
-                    |ev: On<ValueChange<bool>>,
-                     mut form: ResMut<LoginForm>,
-                     mut commands: Commands| {
-                        form.remember_password = ev.value;
-                        if ev.value {
-                            commands.entity(ev.source).insert(Checked);
-                        } else {
-                            commands.entity(ev.source).remove::<Checked>();
+
+                {
+                    spawn_saved_accounts_row(panel, &server_key, &active_user, &accts, playonline);
+
+                    if playonline {
+                        for line in POL_CREDENTIAL_HINTS {
+                            panel.spawn((Text::new(line), ThemedText));
                         }
-                    },
-                );
+                        spawn_field(
+                            panel,
+                            "PlayOnline ID",
+                            false,
+                            &pol_id_initial,
+                            LoginField::PolId,
+                            playonline,
+                        );
+                        spawn_field(
+                            panel,
+                            "PlayOnline password",
+                            true,
+                            &pol_pass_initial,
+                            LoginField::PolPassword,
+                            playonline,
+                        );
+                    }
 
-                let blocked = login_blocked(version, era);
+                    let user_label = if playonline {
+                        "Square Enix ID"
+                    } else {
+                        "Username"
+                    };
+                    let pass_label = if playonline {
+                        "Square Enix password"
+                    } else {
+                        "Password"
+                    };
+                    spawn_field(
+                        panel,
+                        user_label,
+                        false,
+                        &user_initial,
+                        LoginField::User,
+                        playonline,
+                    );
+                    spawn_field(
+                        panel,
+                        pass_label,
+                        true,
+                        &pass_initial,
+                        LoginField::Password,
+                        playonline,
+                    );
 
-                panel.spawn(row()).with_children(|r| {
-                    if !blocked {
-                        r.spawn(button_bundle(
+                    {
+                        let mut cb = panel.spawn(checkbox_bundle(
+                            (),
+                            Spawn((Text::new("Remember password"), ThemedText)),
+                        ));
+                        if remember {
+                            cb.insert(Checked);
+                        }
+                        cb.observe(
+                            |ev: On<ValueChange<bool>>,
+                             mut form: ResMut<LoginForm>,
+                             mut commands: Commands| {
+                                form.remember_password = ev.value;
+                                if ev.value {
+                                    commands.entity(ev.source).insert(Checked);
+                                } else {
+                                    commands.entity(ev.source).remove::<Checked>();
+                                }
+                            },
+                        );
+                    }
+
+                    let blocked = login_blocked(version, era);
+
+                    panel.spawn(row()).with_children(|r| {
+                        if !blocked {
+                            r.spawn(button_bundle(
                             ButtonBundleProps {
                                 variant: ButtonVariant::Primary,
                                 ..default()
@@ -175,48 +247,118 @@ fn build_login_ui(
                         ))
                         .insert(DefaultFocusTarget)
                         .observe(
-                            |_ev: On<Activate>,
-                             form: Res<LoginForm>,
-                             mut next: ResMut<NextState<LauncherState>>| {
-                                if !form.user.is_empty() && !form.pass.is_empty() {
+                            move |_ev: On<Activate>,
+                                  form: Res<LoginForm>,
+                                  mut next: ResMut<NextState<LauncherState>>| {
+                                if form.is_complete(playonline) {
                                     next.set(LauncherState::AuthInFlight);
                                 }
                             },
                         );
-                    }
+                        }
+                        if playonline {
+                            return;
+                        }
 
-                    r.spawn(button_bundle(
-                        ButtonBundleProps::default(),
-                        (),
-                        Spawn((Text::new("Create account"), ThemedText)),
-                    ))
-                    .insert_if(DefaultFocusTarget, || blocked)
-                    .observe(
-                        |_ev: On<Activate>, mut next: ResMut<NextState<LauncherState>>| {
-                            next.set(LauncherState::CreateAccount);
-                        },
-                    );
+                        r.spawn(button_bundle(
+                            ButtonBundleProps::default(),
+                            (),
+                            Spawn((Text::new("Create account"), ThemedText)),
+                        ))
+                        .insert_if(DefaultFocusTarget, || blocked)
+                        .observe(
+                            |_ev: On<Activate>, mut next: ResMut<NextState<LauncherState>>| {
+                                next.set(LauncherState::CreateAccount);
+                            },
+                        );
 
-                    r.spawn(button_bundle(
-                        ButtonBundleProps::default(),
-                        (),
-                        Spawn((Text::new("Change password"), ThemedText)),
-                    ))
-                    .observe(
-                        |_ev: On<Activate>, mut next: ResMut<NextState<LauncherState>>| {
-                            next.set(LauncherState::ChangePassword);
-                        },
-                    );
-                });
+                        r.spawn(button_bundle(
+                            ButtonBundleProps::default(),
+                            (),
+                            Spawn((Text::new("Change password"), ThemedText)),
+                        ))
+                        .observe(
+                            |_ev: On<Activate>, mut next: ResMut<NextState<LauncherState>>| {
+                                next.set(LauncherState::ChangePassword);
+                            },
+                        );
+                    });
+                }
             });
         });
+}
+
+/// The label column has to hold the longest of the PlayOnline field names.
+const FIELD_LABEL_WIDTH: f32 = 160.0;
+
+/// A PlayOnline account carries both identities and the handshake uses both,
+/// so the form says which is which in the Viewer's own words.
+const POL_CREDENTIAL_HINTS: [&str; 3] = [
+    "Sign in with both of the account's identities, as the PlayOnline Viewer",
+    "asks for them. A PlayOnline ID is four capitals then four digits. The",
+    "Square Enix ID is the login name you chose, not your email address.",
+];
+
+/// LEGAL.md section 7, said once per profile where the player signs in.
+const POL_TERMS_NOTICE: [&str; 3] = [
+    "Connecting with a third-party client may breach the terms of service of",
+    "the server you connect to. Kuluu does not patch or inject into any Square",
+    "Enix program; any consequence to your account is yours alone.",
+];
+
+fn terms_acknowledged(profile_name: Option<&str>) -> bool {
+    let Some(name) = profile_name else {
+        return false;
+    };
+    launcher_store::load()
+        .servers
+        .iter()
+        .any(|p| p.name == name && p.terms_acknowledged)
+}
+
+fn acknowledge_terms(profile_name: Option<&str>) {
+    let Some(name) = profile_name else {
+        return;
+    };
+    let mut store = launcher_store::load();
+    for profile in store.servers.iter_mut().filter(|p| p.name == name) {
+        profile.terms_acknowledged = true;
+    }
+    if let Err(e) = launcher_store::save(&store) {
+        tracing::warn!(error = %e, "launcher_store: save failed");
+    }
+}
+
+/// A profile that signs in to the official service shows the notice once;
+/// the sign-in form appears after the player has read it.
+fn spawn_terms_gate(panel: &mut ChildSpawnerCommands, profile_name: Option<&str>) {
+    for line in POL_TERMS_NOTICE {
+        panel.spawn(hint(line));
+    }
+    let name = profile_name.map(str::to_string);
+    panel.spawn(row()).with_children(|r| {
+        r.spawn(button_bundle(
+            ButtonBundleProps {
+                variant: ButtonVariant::Primary,
+                ..default()
+            },
+            (),
+            Spawn((Text::new("I understand"), ThemedText)),
+        ))
+        .insert(DefaultFocusTarget)
+        .observe(move |_ev: On<Activate>, mut dirty: ResMut<LoginUiDirty>| {
+            acknowledge_terms(name.as_deref());
+            dirty.0 = true;
+        });
+    });
 }
 
 fn spawn_saved_accounts_row(
     panel: &mut ChildSpawnerCommands,
     server_key: &str,
     active_user: &str,
-    accts: &[(String, bool)],
+    accts: &[SavedEntry],
+    playonline: bool,
 ) {
     if accts.is_empty() {
         return;
@@ -245,7 +387,7 @@ fn spawn_saved_accounts_row(
             ScrollRegion,
         ))
         .with_children(|r| {
-            for (u, remember) in accts.iter() {
+            for (u, remember, square_enix_id) in accts.iter() {
                 let label = if *remember {
                     format!("{u}  [saved]")
                 } else {
@@ -260,9 +402,12 @@ fn spawn_saved_accounts_row(
                 let pick_user = u.clone();
                 let pick_server = server_key.to_string();
                 let pick_remember = *remember;
+                let pick_playonline = playonline;
+                let pick_square_enix_id = square_enix_id.clone();
 
                 let forget_user = u.clone();
                 let forget_server = server_key.to_string();
+                let forget_playonline = playonline;
 
                 r.spawn(chip_group()).with_children(|chip| {
                     chip.spawn(button_bundle(
@@ -277,15 +422,32 @@ fn spawn_saved_accounts_row(
                         move |_ev: On<Activate>,
                               mut login: ResMut<LoginForm>,
                               mut dirty: ResMut<LoginUiDirty>| {
-                            login.user = pick_user.clone();
+                            // The saved account is keyed on whichever identity
+                            // the flavor always has, so a PlayOnline chip names
+                            // the PlayOnline id and carries the other beside it.
+                            if pick_playonline {
+                                login.pol_id = pick_user.clone();
+                                login.user = pick_square_enix_id.clone();
+                            } else {
+                                login.user = pick_user.clone();
+                            }
                             login.pass.clear();
+                            login.pol_pass.clear();
                             login.remember_password = pick_remember;
                             if pick_remember {
-                                if let Some(pw) = SecretStore::get(
+                                let primary = SecretStore::get(
                                     KEYRING_SERVICE,
                                     &keyring_account_key(&pick_server, &pick_user),
-                                ) {
-                                    login.pass = pw;
+                                );
+                                let secondary = SecretStore::get(
+                                    KEYRING_SERVICE,
+                                    &keyring_square_enix_key(&pick_server, &pick_user),
+                                );
+                                if pick_playonline {
+                                    login.pol_pass = primary.unwrap_or_default();
+                                    login.pass = secondary.unwrap_or_default();
+                                } else {
+                                    login.pass = primary.unwrap_or_default();
                                 }
                             }
                             login.focus = if login.pass.is_empty() {
@@ -323,10 +485,16 @@ fn spawn_saved_accounts_row(
                                 KEYRING_SERVICE,
                                 &keyring_account_key(&forget_server, &forget_user),
                             );
+                            SecretStore::delete(
+                                KEYRING_SERVICE,
+                                &keyring_square_enix_key(&forget_server, &forget_user),
+                            );
 
-                            if login.user == forget_user {
+                            if login.account_key(forget_playonline) == forget_user {
                                 login.user.clear();
                                 login.pass.clear();
+                                login.pol_id.clear();
+                                login.pol_pass.clear();
                                 login.remember_password = false;
                                 login.focus = LoginField::User;
                             }
@@ -348,6 +516,8 @@ fn spawn_saved_accounts_row(
                      mut dirty: ResMut<LoginUiDirty>| {
                         login.user.clear();
                         login.pass.clear();
+                        login.pol_id.clear();
+                        login.pol_pass.clear();
                         login.remember_password = false;
                         login.focus = LoginField::User;
                         dirty.0 = true;
@@ -544,6 +714,7 @@ fn spawn_field(
     mask: bool,
     initial: &str,
     binding: LoginField,
+    playonline: bool,
 ) {
     parent
         .spawn(Node {
@@ -557,7 +728,7 @@ fn spawn_field(
         .with_children(|row| {
             row.spawn((
                 Node {
-                    width: Val::Px(110.0),
+                    width: Val::Px(FIELD_LABEL_WIDTH),
                     ..default()
                 },
                 Text::new(label.to_string()),
@@ -569,6 +740,7 @@ fn spawn_field(
                 submit_on_enter: true,
                 ..default()
             }))
+            .insert(LoginCredentialField)
             .with_children(|tf| {
                 tf.spawn((
                     Node {
@@ -587,6 +759,8 @@ fn spawn_field(
                 move |ev: On<ValueChange<String>>, mut form: ResMut<LoginForm>| match binding {
                     LoginField::User => form.user = ev.value.clone(),
                     LoginField::Password => form.pass = ev.value.clone(),
+                    LoginField::PolId => form.pol_id = ev.value.clone(),
+                    LoginField::PolPassword => form.pol_pass = ev.value.clone(),
                 },
             )
             .observe(
@@ -598,7 +772,7 @@ fn spawn_field(
                     if login_blocked(&version, &era) {
                         return;
                     }
-                    if !form.user.is_empty() && !form.pass.is_empty() {
+                    if form.is_complete(playonline) {
                         next.set(LauncherState::AuthInFlight);
                     }
                 },
@@ -612,30 +786,37 @@ pub(super) fn despawn_login_ui(mut commands: Commands, q: Query<Entity, With<Log
     }
 }
 
+/// Login is the root of the launcher's back tree - the default startup state
+/// and the back target of every other screen - so Escape has nowhere to back
+/// out to. The pad's Cancel lands here too; at the root it cancels the form.
+/// A back hop to ServerSelect would loop: its Escape returns to Login.
+///
+/// Real keyboard Enter submits whenever BOTH fields are filled, regardless of
+/// which widget (if any) holds UI focus. The per-field TextFieldSubmitted path
+/// only fires for a FOCUSED field and stays silent when the other side is
+/// still empty - that was the "pressing enter does nothing" dead end.
 pub(super) fn keyboard_input_system(
     mut events: MessageReader<KeyboardInput>,
-    form: Res<LoginForm>,
+    mut form: ResMut<LoginForm>,
     version: Res<ServerVersionStatus>,
     era: Res<ClientEraStatus>,
     mut next: ResMut<NextState<LauncherState>>,
+    mut fields: Query<&mut TextField, With<LoginCredentialField>>,
 ) {
     for ev in events.read() {
         if ev.state != ButtonState::Pressed {
             continue;
         }
         match ev.logical_key {
-            // Back, not a credential wipe: the pad's Cancel lands here too and
-            // needs a back action. `LoginForm` survives the transition, so
-            // nothing typed is lost.
             Key::Escape => {
-                next.set(LauncherState::ServerSelect);
+                form.user.clear();
+                form.pass.clear();
+                for mut field in &mut fields {
+                    field.value.clear();
+                    field.cursor = 0;
+                }
                 return;
             }
-            // Real keyboard Enter: submits whenever BOTH fields are filled,
-            // regardless of which widget (if any) holds UI focus. The
-            // per-field TextFieldSubmitted path only fires for a FOCUSED field
-            // and stays silent when the other side is still empty - that was
-            // the "pressing enter does nothing" dead end.
             Key::Enter
                 if !login_blocked(&version, &era)
                     && !form.user.is_empty()
@@ -652,7 +833,9 @@ pub(super) fn keyboard_input_system(
 /// Arrow-key navigation for the login form: move the blue focus outline between
 /// tabbable widgets (saved-account chips, fields, remember checkbox, buttons)
 /// in visual order, wrapping at the edges. While a text field holds focus,
-/// Left/Right stay with the caret; Up/Down still navigate.
+/// Left/Right stay with the caret, not the selection; Up/Down still navigate.
+/// The per-widget center estimate uses a uniform convention across all nodes;
+/// only relative positions matter for scoring.
 pub(super) fn arrow_nav_system(
     mut events: MessageReader<KeyboardInput>,
     mut input_focus: ResMut<InputFocus>,
@@ -673,13 +856,10 @@ pub(super) fn arrow_nav_system(
         };
 
         let cur = input_focus.get();
-        // Left/Right inside a focused field moves the caret, not the selection.
         if dir.x != 0.0 && cur.is_some_and(|e| q_fields.contains(e)) {
             continue;
         }
 
-        // Center estimate per tabbable widget (uniform convention across all
-        // nodes; only relative positions matter for scoring).
         let cands: Vec<(Vec2, Entity)> = q_tabs
             .iter()
             .map(|(e, cn, gt)| (gt.affine().translation + cn.size * 0.5, e))
@@ -800,5 +980,75 @@ pub(super) fn error_keyboard_system(
             back_from_error(*ret, &mut err, &mut form, &mut creds, &mut next_state);
             return;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy::window::PrimaryWindow;
+
+    fn escape_app() -> App {
+        let mut app = App::new();
+        app.add_message::<KeyboardInput>()
+            .init_resource::<NextState<LauncherState>>()
+            .insert_resource(LoginForm {
+                user: "cow".into(),
+                pass: "moo".into(),
+                ..Default::default()
+            })
+            .insert_resource(ServerVersionStatus::default())
+            .insert_resource(ClientEraStatus::default())
+            .add_systems(Update, keyboard_input_system);
+        app
+    }
+
+    fn press_escape(app: &mut App, window: Entity) {
+        app.world_mut().write_message(KeyboardInput {
+            key_code: KeyCode::Escape,
+            logical_key: Key::Escape,
+            state: ButtonState::Pressed,
+            text: None,
+            repeat: false,
+            window,
+        });
+    }
+
+    #[test]
+    fn escape_at_login_wipes_credentials_without_leaving_the_screen() {
+        let mut app = escape_app();
+        let window = app.world_mut().spawn(PrimaryWindow).id();
+        let fields: Vec<_> = ["cow", "moo"]
+            .into_iter()
+            .map(|value| {
+                app.world_mut()
+                    .spawn((
+                        LoginCredentialField,
+                        TextField {
+                            value: value.into(),
+                            cursor: value.len(),
+                            ..Default::default()
+                        },
+                    ))
+                    .id()
+            })
+            .collect();
+        press_escape(&mut app, window);
+        app.update();
+        let form = app.world().resource::<LoginForm>();
+        assert!(form.user.is_empty(), "Escape must clear the user field");
+        assert!(form.pass.is_empty(), "Escape must clear the password field");
+        for field in fields {
+            let editor = app.world().get::<TextField>(field).unwrap();
+            assert!(editor.value.is_empty());
+            assert_eq!(editor.cursor, 0);
+        }
+        assert!(
+            matches!(
+                *app.world().resource::<NextState<LauncherState>>(),
+                NextState::Unchanged
+            ),
+            "Login is the back-tree root: Escape must not request a screen change"
+        );
     }
 }

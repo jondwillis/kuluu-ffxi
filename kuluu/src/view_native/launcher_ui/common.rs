@@ -321,7 +321,8 @@ fn node_max_scroll_y(node: &ComputedNode) -> f32 {
     )
 }
 
-/// Overlap a page keeps from the previous view, so the reader keeps an anchor row.
+/// The fraction of the incoming page that repeats the outgoing view, so the
+/// reader keeps an anchor row.
 const PAGE_SCROLL_OVERLAP_FRACTION: f32 = 0.15;
 
 fn paged_scroll_y(current: f32, viewport_y: f32, page: PageDir, max: f32) -> f32 {

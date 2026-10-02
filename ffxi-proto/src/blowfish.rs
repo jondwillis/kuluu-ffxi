@@ -1,4 +1,5 @@
-const SUBKEY: &[u8; 4168] = include_bytes!(concat!(env!("OUT_DIR"), "/blowfish_subkey.bin"));
+const SUBKEY_LEN: usize = 4168;
+const SUBKEY: &[u8; SUBKEY_LEN] = include_bytes!(concat!(env!("OUT_DIR"), "/blowfish_subkey.bin"));
 
 const N: usize = 16;
 
@@ -145,6 +146,6 @@ mod tests {
 
     #[test]
     fn p_init_matches_subkey_when_keyed_with_zero_pad() {
-        assert_eq!(SUBKEY.len(), 4168);
+        assert_eq!(SUBKEY.len(), SUBKEY_LEN);
     }
 }

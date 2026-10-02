@@ -43,7 +43,7 @@ use common::EphemeralChar;
 // area 1: 569 for a rank-2+ nation-0 char, a nation-5-mission char, or any
 // rank-3+ char; 568 otherwise — the fixture char is nation 0 rank 0).
 const EVENT_568: u16 = 568;
-// Northern San d'Oria zone id.
+/// Northern San d'Oria zone id.
 const NORTHERN_SAN_DORIA_ZONE: u32 = 231;
 
 // The trigger cuboid (Zone.lua registerCuboidTriggerArea(1, -7, -3, 110, 7,
@@ -64,11 +64,13 @@ const LOGIN_DEADLINE: Duration = Duration::from_secs(90);
 // kTriggerAreaInterval); the 0x47 round trip and the single frame then take
 // well under a second. A minute from InZone is generous.
 const NO_EVENT_GRACE: Duration = Duration::from_secs(60);
-// From CutsceneStarted to EventEnded: the 0x47 round trip plus one frame.
+/// From CutsceneStarted to EventEnded: the 0x47 round trip
+/// (research/XiEvents/OpCodes/0x0047.md) plus one frame.
 const PLAYBACK_DEADLINE: Duration = Duration::from_secs(2 * 60);
-// The 568 script carries exactly one message frame (0x2B + 0x23). The frame
-// only appears after the 0x05C ack releases the case-1 hold, so at least one
-// frame is part of the round-trip proof.
+/// The 568 script carries exactly one message frame (0x2B + 0x23,
+/// research/XiEvents/OpCodes/0x002B.md). The frame only appears after the
+/// 0x05C ack (research/XiEvents/OpCodes/0x005C.md) releases the case-1 hold,
+/// so at least one frame is part of the round-trip proof.
 const MIN_DIALOG_FRAMES: u32 = 1;
 
 fn open_dat_root() -> Option<ffxi_dat::DatRoot> {
@@ -99,6 +101,10 @@ struct Tally {
     disconnected_reason: Option<String>,
 }
 
+/// Tallys the 568 run. The end is gated on the cutscene having started:
+/// `EventEnded` is a unit variant carrying no event id, so this ignores any
+/// unrelated event that ends around zone-in; the first end after start is the
+/// one tallied.
 fn handle_event(tally: &mut Tally, ev: &AgentEvent, now: Instant) {
     match ev {
         AgentEvent::StageChanged { stage } => {
@@ -111,7 +117,7 @@ fn handle_event(tally: &mut Tally, ev: &AgentEvent, now: Instant) {
             }
         }
         AgentEvent::CutsceneStarted { event_id } => {
-            if *event_id & 0xFFFF == u32::from(EVENT_568) && tally.cutscene_started_at.is_none() {
+            if *event_id & 65535 == u32::from(EVENT_568) && tally.cutscene_started_at.is_none() {
                 tally.cutscene_started_at = Some(now);
                 eprintln!(
                     "[live] CutsceneStarted (agent id 0x{event_id:08X}) at t+{:.1}s",
@@ -120,9 +126,6 @@ fn handle_event(tally: &mut Tally, ev: &AgentEvent, now: Instant) {
             }
         }
         AgentEvent::EventEnded => {
-            // EventEnded is a unit variant carrying no event id, so gate on the 568
-            // cutscene having started to ignore any unrelated event that ends around
-            // zone-in. First end after start is the one we tally.
             if tally.event_ended_at.is_none() && tally.cutscene_started_at.is_some() {
                 tally.event_ended_at = Some(now);
                 eprintln!("[live] EventEnded at t+{:.1}s", now.elapsed().as_secs_f32());
@@ -247,8 +250,9 @@ async fn event_568_full_playback_against_live_lsb() {
                 });
                 writeln!(events_log, "{line}").expect("writing event_568_events.jsonl");
 
-                // The trigger only checks once the ZoningIn window has passed, so
-                // the walk-in can go out as soon as the zone is up; the POS lands
+                // The trigger only checks once the ZoningIn window has passed
+                // (vendor/server/scripts/globals/player.lua onGameIn), so the
+                // walk-in can go out as soon as the zone is up; the POS lands
                 // and the 200 ms interval picks it up after that.
                 if !move_sent && tally.inzone_at.is_some() {
                     move_sent = true;
@@ -270,7 +274,8 @@ async fn event_568_full_playback_against_live_lsb() {
 
                 if let AgentEvent::EventDialog { dialog } = &ev {
                     if dialog.event_para == EVENT_568 {
-                        // The 568 script carries no 0x24 QUERY frames; choice 0
+                        // The 568 script carries no 0x24 QUERY frames
+                        // (research/XiEvents/OpCodes/0x0024.md); choice 0
                         // dismisses the single message frame.
                         eprintln!("[live] frame {}: dismissing", tally.frames_total);
                         let _ = cmd_tx

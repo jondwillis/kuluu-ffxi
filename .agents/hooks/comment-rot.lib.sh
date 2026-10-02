@@ -28,7 +28,13 @@
 # clippy::undocumented_unsafe_blocks), citations to the vendored
 # authoritative sources (the LSB-boundary convention), and SPDX /
 # copyright headers. Doc comments are deliberately absent — see above.
-CR_RE_ALLOWED='(SAFETY|#[[:space:]]*Safety|SPDX-|[Cc]opyright|\bvendor/|\bresearch/|\bLSB\b|Phoenix|POLUtils|XiEvents|XiPackets|atom0s|FFXiMain|\bxim\b|\bRFC[ -]?[0-9])'
+CR_RE_ALLOWED='(SAFETY|#[[:space:]]*Safety|SPDX-|[Cc]opyright|\bvendor/|\bresearch/|\bLSB\b|Phoenix|POLUtils|XiEvents|XiPackets|atom0s|FFXiMain|\bxim\b|\bRFC[ -]?[0-9]|[A-Za-z][A-Za-z0-9_]*\.(cpp|hpp|c|cc|cs|lua|sql|py|rs|xml|json|kt|js|md)\b)'
+
+# The source-file alternative above matches a bare decompile/vendor filename
+# (CYyGenerator.cpp, ParticleUpdaters.kt): the tree cites retail decompiles by
+# basename + symbol, and a filename reference is a citation. Line-pinned
+# variants stay flagged — CR_RE_CITE_LINE judges the full comment set before
+# the carve-out is applied.
 
 # Doc-comment lines (/// //!). Scanned by the rot families above, but
 # excluded from the blanket catch-all so a clean one-line API doc isn't
@@ -193,16 +199,48 @@ CR_RE_MAGIC='0x[0-9A-Fa-f]+'
 # in this protocol-heavy tree.
 CR_RE_CODE_MAGIC='(==|!=|<=|>=|[[:space:]][&|^<>][[:space:]])[[:space:]]*0x[0-9A-Fa-f]+'
 
+# cr_allowed_block_strip: read source lines on stdin, print the comment
+# lines that survive the allowed carve-out, judged per comment BLOCK instead
+# of per line: a citation on one line (SAFETY, vendor/research path, bare
+# decompile filename) scopes the whole contiguous run it sits in, so a block
+# that cites on its header line is not re-flagged line by line. A block is a
+# maximal run of adjacent lines containing `//`; a URL line keeps the block
+# open but is never printed; non-comment lines break blocks.
+cr_allowed_block_strip() {
+  local text marked
+  text=$(cat)
+  [ -z "$text" ] && return 0
+  # grep owns the carve-out regex (its \b word boundaries are GNU-grep
+  # extensions the awk below cannot see); awk owns the block logic.
+  marked=$(printf '%s\n' "$text" | grep -nE "$CR_RE_ALLOWED" | cut -d: -f1 | paste -sd, - || true)
+  printf '%s\n' "$text" | awk -v marked="$marked" '
+    BEGIN { n = split(marked, m, ","); for (i = 1; i <= n; i++) ismarked[m[i] + 0] = 1 }
+    {
+      if (index($0, "//") > 0) {
+        if ($0 !~ /https?:\/\//) buf[++nb] = $0
+        if (NR in ismarked) blockmarked = 1
+      } else if (nb > 0) {
+        if (!blockmarked) for (i = 1; i <= nb; i++) print buf[i]
+        nb = 0; blockmarked = 0
+      }
+    }
+    END { if (nb > 0 && !blockmarked) for (i = 1; i <= nb; i++) print buf[i] }
+  '
+}
+
 # scan_comment_rot: read plain source text on stdin, print labeled
 # findings to stdout (one per line, capped per category), and return 0
 # if anything matched, 1 if clean. URLs and the allowed carve-out are
-# excluded up front; the worst families get a sharp label and everything
-# else remaining falls through to a generic [comment] flag.
+# excluded up front (per comment block — see cr_allowed_block_strip); the
+# worst families get a sharp label and everything else remaining falls
+# through to a generic [comment] flag.
 scan_comment_rot() {
-  local comments flaggable found=1 hits matched rest
+  local text comments flaggable found=1 hits matched rest
 
   # Every line comment, minus URLs (so prose links don't trip).
-  comments=$(grep -E '//' | grep -vE 'https?://' || true)
+  text=$(cat)
+  [ -z "$text" ] && return 1
+  comments=$(printf '%s\n' "$text" | grep -E '//' | grep -vE 'https?://' || true)
   [ -z "$comments" ] && return 1
 
   # Line-pinned vendor citations are flagged from the FULL comment set: the
@@ -221,8 +259,8 @@ scan_comment_rot() {
     found=0
   fi
 
-  # Drop the allowed carve-out before flagging anything.
-  flaggable=$(printf '%s\n' "$comments" | grep -vE "$CR_RE_ALLOWED" || true)
+  # Drop the allowed carve-out before flagging anything, per comment block.
+  flaggable=$(printf '%s\n' "$text" | cr_allowed_block_strip || true)
   [ -z "$flaggable" ] && return $found
 
   matched=''

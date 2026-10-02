@@ -17,8 +17,9 @@ const CONTROL_POINT_COUNT_OFFSET: usize = CAMERA_HEADER_OFFSET;
 const INTERP_FACTOR_OFFSET: usize = CAMERA_HEADER_OFFSET + 1;
 const FLAGS_OFFSET: usize = CAMERA_HEADER_OFFSET + 2;
 const SMOOTHING_TYPE_OFFSET: usize = CAMERA_HEADER_OFFSET + 4;
-// After SmoothingType the header carries a KeyframeResource pointer and an int the client
-// fills at load; both are zero in every shipped byte.
+// research/XIClient include/World/Camera/CameraFormat.h CameraHeader - after SmoothingType
+// the header carries a KeyframeResource pointer and an int the client fills at load; both
+// are zero in every shipped byte.
 pub const POINTS_OFFSET: usize = CAMERA_HEADER_OFFSET + 16;
 
 // research/XIClient include/World/Camera/CameraFormat.h SplineControlPoint - packed, 48 bytes.
@@ -144,7 +145,7 @@ pub struct CameraControlPoint {
     pub param: [f32; 3],
 }
 
-/// A parsed kind 0x06 chunk.
+/// A parsed `ChunkKind::Camera` chunk.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CameraResource {
     pub name: [u8; 4],
@@ -366,10 +367,10 @@ mod tests {
         assert_eq!(p1.focal_length, 682.0);
     }
 
+    /// One authored point: locked with no flags, straight once a flag adds the virtual
+    /// endpoint, spline when both do. Two authored points are straight, three a spline.
     #[test]
     fn path_mode_follows_the_effective_point_count() {
-        // One authored point: locked with no flags, straight once a flag adds the virtual
-        // endpoint, spline when both do.
         let one = [point_bytes([0.0; 3], 280.0, [0.0; 3], 0.0, [0.0; 3])];
         let two = [
             point_bytes([0.0; 3], 280.0, [0.0; 3], 0.0, [0.0; 3]),
@@ -390,8 +391,6 @@ mod tests {
         let spline = CameraResource::parse(*b"sp01", &chunk_body(0, 0, 0, 0, &three)).unwrap();
         assert_eq!(spline.path_mode(), CameraPathMode::Spline);
 
-        // Flags add virtual endpoints: one authored point plus START_AT_CURRENT_POS is a
-        // straight path from the camera's current state to it.
         let flagged = CameraResource::parse(
             *b"fl01",
             &chunk_body(
@@ -445,7 +444,6 @@ mod tests {
                 "mode 0 ignores the locator bits: {raw:#x}"
             );
         }
-        // The extension bits: bit 16 lifts the mode into the high group, bit 18 the locator.
         assert_eq!(decode(0x10151), (17, 21));
         assert_eq!(decode(0x40151), (ATTACH_MODE_CASTER, 64 + 21));
     }
@@ -463,12 +461,11 @@ mod tests {
         assert_eq!(cam.smoothing, CameraSmoothType::Keyframe(808_464_491));
     }
 
+    /// A body shorter than the header and a point count that outruns the bytes both error.
     #[test]
     fn truncated_bodies_error() {
-        // Shorter than the header.
         let short = vec![0u8; POINTS_OFFSET - 1];
         assert!(CameraResource::parse(*b"tr01", &short).is_err());
-        // A count that outruns the bytes: two points declared, one present.
         let mut lying = chunk_body(
             0,
             0,
@@ -480,12 +477,16 @@ mod tests {
         assert!(CameraResource::parse(*b"tr02", &lying).is_err());
     }
 
-    // Retail-byte guard (skips without an install): the Southern San d'Oria opening scene's two
-    // scheduler DATs and the fade file, walked end to end. Every 0x04 stage in them is a plain
-    // id stage naming a kind 0x06 chunk that parses in the same file.
-    const SANDY_SCHEDULER_FILE_ID: u32 = 30834; // ROM/62/82.DAT
-    const SANDY_VARIATION_FILE_ID: u32 = 30912; // ROM/94/123.DAT
-    const FADE_FILE_ID: u32 = 30904; // ROM/62/110.DAT
+    // research/XIClient source/Game/Scheduler/Tags/0x04.cpp HandleTag0x04 - retail-byte guard
+    // (skips without an install): the Southern San d'Oria opening scene's two scheduler DATs
+    // and the fade file, walked end to end. Every camera-route stage in them names a
+    // ChunkKind::Camera chunk that parses in the same file.
+    /// ROM/62/82.DAT
+    const SANDY_SCHEDULER_FILE_ID: u32 = 30834;
+    /// ROM/94/123.DAT
+    const SANDY_VARIATION_FILE_ID: u32 = 30912;
+    /// ROM/62/110.DAT
+    const FADE_FILE_ID: u32 = 30904;
 
     fn file_bytes(file_id: u32) -> Option<Vec<u8>> {
         let root = crate::archive::open_test_install()?;
@@ -555,14 +556,12 @@ mod tests {
         assert!(!c043.flags.starts_at_current_pos());
         assert!(!c043.flags.ends_at_current_pos());
         assert_eq!(c043.smoothing, CameraSmoothType::Linear);
-        // The authored focal ramps a tenth of a unit across the dolly; pin it loosely.
         assert!((c043.points[0].focal_length - 500.14).abs() < 0.5);
         assert!((c043.points[1].focal_length - 500.16).abs() < 0.5);
 
         let c077 = cam(*b"c077");
         assert_eq!(c077.path_mode(), CameraPathMode::Spline);
         assert_eq!(c077.points.len(), 3);
-        // Param.x is the normalized time of each point along the path.
         let times: Vec<f32> = c077.points.iter().map(|p| p.param[0]).collect();
         assert!((times[0] - 0.0).abs() < 1e-4);
         assert!(
@@ -570,7 +569,6 @@ mod tests {
             "middle point {times:?}"
         );
         assert!((times[2] - 1.0).abs() < 1e-4);
-        // One authored focal across the whole route.
         let first = c077.points[0].focal_length;
         for p in &c077.points {
             assert_eq!(p.focal_length, first);

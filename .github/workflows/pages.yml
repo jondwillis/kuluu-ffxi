@@ -25,7 +25,7 @@ jobs:
       name: github-pages
       url: ${{ steps.deploy.outputs.page_url }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Stage the site with the branding assets it references
         run: |
           mkdir -p _site/assets
@@ -33,8 +33,6 @@ jobs:
           cp kuluu/assets/branding/png/kuluu-32.png kuluu/assets/branding/png/kuluu-256.png \
              kuluu/assets/branding/social/github-preview.png _site/assets/
       - uses: actions/configure-pages@v5
-        with:
-          enablement: true
       - uses: actions/upload-pages-artifact@v3
         with:
           path: _site

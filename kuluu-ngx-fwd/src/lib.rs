@@ -1,7 +1,6 @@
 //! kuluu-ngx-fwd: the "nvngx.dll" calling-module forwarder.
 //!
 //! WHY THIS EXISTS
-//! ---------------
 //! `nvngx_dlssnr.dll` v310.8 gates most exported entry points on the identity of the
 //! CALLING module: Init_Ext/Init_Ext2, CreateFeature/CreateFeature1, ReleaseFeature,
 //! Shutdown/Shutdown1 (each carries its own copy of the same prologue — verified in
@@ -9,7 +8,7 @@
 //! resolves that address to a module (GetModuleHandleExW with
 //! GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | UNCHANGED_REFCOUNT), reads the module's file
 //! name, and does a case-insensitive substring test for "nvngx.dll". Anything else returns
-//! NVSDK_NGX_Result_FAIL_PlatformError (0xBAD00002) before a single Vulkan argument is
+//! NVSDK_NGX_Result_FAIL_PlatformError before a single Vulkan argument is
 //! looked at.
 //!
 //! So the only thing that matters is: the instruction AFTER each gated `call` must live
@@ -22,7 +21,7 @@
 //! * The forwarder does NOT LoadLibrary anything. kuluu-dlss-nr keeps sole ownership of
 //!   the nvngx_dlssnr.dll module handle and passes the resolved Init_Ext pointer in.
 //!   That keeps one loader, one error path, and no second copy of the 166 MB DLL logic.
-//! * The call MUST be a real `call`, never a tail `jmp`. A jmp would leave kuluu.exe's
+//! * The call has to be a real `call`, not a tail `jmp`. A jmp would leave kuluu.exe's
 //!   return address on the stack and the gate would see kuluu.exe again. `black_box` on
 //!   the result keeps the call out of tail position at every opt level.
 //! * No allocation, no panics, no unwinding across the FFI boundary: every function is a
@@ -84,7 +83,7 @@ pub type PfnVulkanCreateFeature = unsafe extern "C" fn(
 pub type PfnVulkanReleaseFeature = unsafe extern "C" fn(handle: *mut std::ffi::c_void) -> NgxResult;
 
 /// Returned when `target` is null so the caller can tell "forwarder got a bad pointer"
-/// apart from anything NGX itself would say. Chosen outside NGX's 0xBAD0_xxxx range.
+/// apart from anything NGX itself would say. Chosen outside the NGX FAIL_* error range.
 pub const KULUU_FWD_NULL_TARGET: NgxResult = 0xF0F0_0001;
 
 /// Forward one call to `NVSDK_NGX_VULKAN_Init_Ext`.
@@ -106,7 +105,6 @@ pub unsafe extern "C" fn kuluu_ngx_fwd_vulkan_init_ext(
     let Some(f) = target else {
         return KULUU_FWD_NULL_TARGET;
     };
-    // The `call` instruction generated here is the whole point of this crate.
     let r = f(
         app_id,
         app_data_path,
@@ -116,7 +114,6 @@ pub unsafe extern "C" fn kuluu_ngx_fwd_vulkan_init_ext(
         sdk_version,
         params,
     );
-    // Keep the call out of tail position so it can never become a `jmp`.
     black_box(r)
 }
 
@@ -191,7 +188,9 @@ pub unsafe extern "C" fn kuluu_ngx_fwd_vulkan_release_feature(
 
 /// Cheap presence/version probe so kuluu can log "forwarder vX loaded" and refuse to run
 /// against a stale staged copy after the ABI of these exports changes.
+/// Version 1 exposed only the Init_Ext trampoline; version 2 adds the gated
+/// CreateFeature/ReleaseFeature trampolines.
 #[no_mangle]
 pub extern "C" fn kuluu_ngx_fwd_abi_version() -> u32 {
-    2 // v1: init_ext only; v2: + create_feature, release_feature (both are gated too)
+    2
 }

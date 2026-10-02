@@ -37,6 +37,7 @@ fn format_mmss(secs: u32) -> String {
 /// The server only re-sends 0x037 char_status on status changes, not every
 /// second, so the KO countdown is anchored to the last server value and ticked
 /// down locally.
+/// vendor/server/src/map/packets/char_status.cpp
 #[derive(Default)]
 pub struct DeathCountdownAnchor {
     server_secs: Option<u32>,

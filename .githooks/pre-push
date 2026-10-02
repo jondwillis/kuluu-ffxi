@@ -22,6 +22,28 @@ fi
 
 cd "$(git rev-parse --show-toplevel)"
 
+# A cargo stage can die for reasons that have nothing to do with the diff, because
+# several agent sessions, rust-analyzer and this gate share one target/: EAGAIN
+# (os error 35) when the machine runs out of thread/process headroom, or the
+# jobserver stall cargo-guard.sh kills. Every per-stage message below names a code
+# cause, so retry serially before blaming the diff for the environment.
+checks_retry_contention() {
+  local stage="$1" log
+  log=$(mktemp)
+  if scripts/checks.sh "$stage" 2>&1 | tee "$log"; then
+    rm -f "$log"
+    return 0
+  fi
+  if grep -qE 'os error 35|WEDGE DETECTED' "$log"; then
+    rm -f "$log"
+    echo "pre-push: $stage lost to build contention, not your diff; retrying with one job" >&2
+    CARGO_BUILD_JOBS=1 scripts/checks.sh "$stage"
+    return $?
+  fi
+  rm -f "$log"
+  return 1
+}
+
 if command -v bd >/dev/null 2>&1; then
   bd hooks run pre-push "$@"
 fi
@@ -34,6 +56,8 @@ if ! scripts/checks.sh harness; then
   echo "pre-push: ✗ harness config — see .agents/AGENTS.md (or 'git push --no-verify' to bypass)" >&2
   exit 1
 fi
+
+scripts/checks.sh readme
 
 if ! scripts/checks.sh comments; then
   echo "pre-push: ✗ comments — line-pinned or dangling citations; see .agents/skills/comment-discipline/SKILL.md (or 'git push --no-verify' to bypass)" >&2
@@ -50,7 +74,7 @@ if ! scripts/checks.sh fmt; then
   exit 1
 fi
 
-if ! scripts/checks.sh contracts; then
+if ! checks_retry_contention contracts; then
   echo "pre-push: state contracts failed" >&2
   exit 1
 fi
@@ -76,7 +100,7 @@ fi
 wasm_paths=$(git diff --name-only @{push}.. -- kuluu-render kuluu-snapshot \
   kuluu-viewer-wasm 2>/dev/null) || wasm_paths='(no @{push} to diff against)'
 if [[ -n "$wasm_paths" ]]; then
-  if ! scripts/checks.sh wasm; then
+  if ! checks_retry_contention wasm; then
     echo "pre-push: ✗ wasm — the browser viewer does not build; an item is likely gated out of wasm32 but referenced from ungated code (or 'git push --no-verify' to bypass)" >&2
     exit 1
   fi
@@ -88,13 +112,13 @@ install_paths=$(git diff --name-only @{push}.. -- ffxi-dat ffxi-proto/build.rs \
   kuluu-session/src/event_dialog.rs kuluu-render/src/look_resolver.rs \
   kuluu-render/src/ffxi_actor_render.rs vendor/server 2>/dev/null) || install_paths='(no @{push} to diff against)'
 if [[ -n "$install_paths" ]]; then
-  if ! scripts/checks.sh install; then
+  if ! checks_retry_contention install; then
     echo "pre-push: ✗ install conformance — a client install on disk disagrees with the DAT-facing code (or 'git push --no-verify' to bypass)" >&2
     exit 1
   fi
 fi
 
-if ! scripts/checks.sh clippy; then
+if ! checks_retry_contention clippy; then
   echo "pre-push: ✗ clippy — fix the warnings above (or 'git push --no-verify' to bypass)" >&2
   exit 1
 fi

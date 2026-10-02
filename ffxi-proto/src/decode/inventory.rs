@@ -326,6 +326,10 @@ mod item_tests {
         assert_eq!(n.lock_flg, 1);
     }
 
+    /// The lock byte is the only field an item use rewrites, and it sits right
+    /// after the slot index - reading either a byte off swaps two small numbers
+    /// with no other symptom. (The flag's value is pinned by the ItemLockFlg
+    /// citation, not by this test.)
     #[test]
     fn item_list_decodes() {
         let mut buf = vec![0u8; ItemList::SIZE];
@@ -341,9 +345,6 @@ mod item_tests {
         assert_eq!(l.index, 12);
         assert_eq!(l.lock_flg, 0);
 
-        // The lock byte is the only field an item use rewrites, and it sits right after the
-        // slot index - reading either a byte off swaps two small numbers with no other symptom.
-        // (The flag's value is pinned by the ItemLockFlg citation, not by this test.)
         buf[8] = lock_flg::NO_SELECT;
         let locked = ItemList::decode(&buf).unwrap();
         assert_eq!(locked.lock_flg, lock_flg::NO_SELECT);

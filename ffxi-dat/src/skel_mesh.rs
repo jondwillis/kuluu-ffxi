@@ -328,7 +328,9 @@ pub fn parse(id: DatId, data: &[u8]) -> SkelMesh {
         let opcode = c.next16();
         match opcode {
             0xFFFF => break,
-            0x8010 => render_properties = read_render_properties(&mut c),
+            crate::vos2::POLY_BLOCK_SPECULAR => {
+                render_properties = read_render_properties(&mut c);
+            }
             0x8000 => texture_name = c.next_string(0x10),
             0x5453 => {
                 let mv = parse_tri_strip(&mut c);

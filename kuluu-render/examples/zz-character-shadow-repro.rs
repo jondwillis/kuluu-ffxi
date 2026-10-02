@@ -30,13 +30,13 @@ const SHADOW_NORMAL_BIAS: f32 = 0.1;
 const SHADOW_DISTANCE: f32 = 20.0;
 const AMBIENT: f32 = 0.08;
 const DIFFUSE: f32 = 0.25;
-// The point modes light the plate from a single lamp on the camera side of the blocker.
+/// The point modes light the plate from a single lamp on the camera side of the blocker.
 const POINT_LIGHT_DISTANCE: f32 = 2.5;
 const POINT_LIGHT_RANGE: f32 = 10.0;
 // FAITHFUL_LIGHT_INTENSITY (zone_point_lights.rs) x DIFFUSE, so the --zone plate's
 // clustered feed lands at the same brightness as the skinned plate's uniform slot.
 const POINT_LIGHT_INTENSITY: f32 = 6250.0;
-// Flat falloff (const term only) keeps the lit/shadowed contrast a single step.
+/// Flat falloff (const term only) keeps the lit/shadowed contrast a single step.
 const POINT_LIGHT_CONST_ATTEN: f32 = 1.0;
 const ALBEDO: f32 = 0.6;
 const CAPTURE_FRAME: u32 = 80;
@@ -54,6 +54,7 @@ struct Run {
     target: Handle<Image>,
 }
 
+/// The fixture owns its entities and GPU buffers until this bounded process exits.
 fn main() {
     let mut args = std::env::args().skip(1);
     let mode = args
@@ -62,7 +63,6 @@ fn main() {
     let out = args.next().expect("output PNG path");
     let flags: Vec<String> = args.collect();
     let mut app = App::new();
-    // The fixture owns its entities and GPU buffers until this bounded process exits.
     app.insert_resource(Run {
         mode,
         out,

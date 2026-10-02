@@ -1,5 +1,5 @@
 //! Probe for the `zone_scene_file_id` memo: times the first
-//! 0x2D lookup against the install (one full DAT read + parse per candidate
+//! MAPSCHEDULOR lookup against the install (one full DAT read + parse per candidate
 //! file) and the repeat (served from the process-local memo). Needs an install
 //! via FFXI_DAT_PATH or the default location.
 fn main() {

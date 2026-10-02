@@ -438,7 +438,7 @@ fn set_target_lock_is_not_forwarded_to_server() {
 fn cancel_clears_goal() {
     let mut r = Reactor::new(ReactorConfig::default());
     r.handle_command(AgentCommand::Engage { target_id: 99 });
-    assert!(matches!(r.current_goal(), Goal::Engaged { .. }));
+    assert!(matches!(r.current_goal(), Goal::Engaging { .. }));
     r.handle_command(AgentCommand::Cancel);
     assert!(matches!(r.current_goal(), Goal::Idle));
     assert!(r.tick().commands.is_empty());
@@ -540,7 +540,7 @@ fn death_timer_disengages_and_emits_goal_change() {
     let mut r = Reactor::new(step_test_cfg());
     r.observe_event(&connected(1));
     r.handle_command(AgentCommand::Engage { target_id: 99 });
-    assert!(matches!(r.current_goal(), Goal::Engaged { .. }));
+    assert!(matches!(r.current_goal(), Goal::Engaging { .. }));
 
     let derived = r.observe_event(&AgentEvent::DeathTimerUpdated {
         seconds_until_homepoint: Some(60),
@@ -560,7 +560,7 @@ fn zone_change_while_engaged_emits_idle_goal_change() {
     let mut r = Reactor::new(step_test_cfg());
     r.observe_event(&connected(1));
     r.handle_command(AgentCommand::Engage { target_id: 99 });
-    assert!(matches!(r.current_goal(), Goal::Engaged { .. }));
+    assert!(matches!(r.current_goal(), Goal::Engaging { .. }));
 
     let derived = r.observe_event(&AgentEvent::ZoneChanged {
         from: Some(116),
@@ -599,7 +599,7 @@ fn revive_event_does_not_disengage() {
         seconds_until_homepoint: None,
     });
     assert!(
-        matches!(r.current_goal(), Goal::Engaged { .. }),
+        matches!(r.current_goal(), Goal::Engaging { .. }),
         "an alive CHAR_STATUS (None) must not disengage"
     );
     assert!(!emits_idle_goal(&derived));
@@ -732,7 +732,7 @@ fn engage_emits_reactor_goal_changed() {
     match routing.derived_events.as_slice() {
         [AgentEvent::ReactorGoalChanged {
             goal:
-                ReactorGoalSnapshot::Engaged {
+                ReactorGoalSnapshot::Engaging {
                     target_id,
                     attack_issued,
                 },
@@ -741,7 +741,7 @@ fn engage_emits_reactor_goal_changed() {
 
             assert!(!*attack_issued, "attack_issued is false until first tick");
         }
-        other => panic!("expected ReactorGoalChanged(Engaged), got {other:?}"),
+        other => panic!("expected ReactorGoalChanged(Engaging), got {other:?}"),
     }
 }
 
@@ -1669,12 +1669,12 @@ fn dat_rect_wide_axis_in_short_axis_out() {
     assert!(!rect.contains(to_native(far_above)));
 }
 
+/// The 200ms reactor tick is 40x retail's frame period, so a run-speed step
+/// can clear a 2-unit-deep trigger entirely. Retail sweeps the segment
+/// instead of sampling the endpoint, which is why this has to hit.
 #[test]
 fn dat_rect_sweep_catches_a_tick_that_steps_over_the_door() {
     let rect = zmr0_rect();
-    // The 200ms reactor tick is 40x retail's frame period, so a run-speed step
-    // can clear a 2-unit-deep trigger entirely. Retail sweeps the segment
-    // instead of sampling the endpoint, which is why this has to hit.
     let center = Vec3 {
         x: 164.933,
         y: 164.792,
@@ -2186,4 +2186,197 @@ fn self_heading_byte_matches_world_angle() {
             );
         }
     }
+}
+
+fn engaged_goal_event(events: &[AgentEvent], target: u32) -> bool {
+    events.iter().any(|e| {
+        matches!(
+            e,
+            AgentEvent::ReactorGoalChanged {
+                goal: ReactorGoalSnapshot::Engaged { target_id, .. }
+            } if *target_id == target
+        )
+    })
+}
+
+fn attack_issued(commands: &[AgentCommand]) -> bool {
+    commands.iter().any(|c| {
+        matches!(
+            c,
+            AgentCommand::Action {
+                kind: ActionKind::Attack,
+                ..
+            }
+        )
+    })
+}
+
+fn reactor_with_mob_99() -> Reactor {
+    let mut r = Reactor::new(ReactorConfig::default());
+    r.observe_event(&connected(1));
+    r.observe_event(&upsert(1, Vec3::default(), 100, EntityKind::Pc, 1));
+    r.observe_event(&upsert(99, Vec3::default(), 100, EntityKind::Mob, 7));
+    r
+}
+
+/// The goal is a request until the server's 0x058: nothing reads as Engaged
+/// at send time, and the accept promotes it with the Attack already issued.
+#[test]
+fn engage_is_pending_until_the_server_accepts() {
+    let mut r = reactor_with_mob_99();
+    r.handle_command(AgentCommand::Engage { target_id: 99 });
+    assert!(matches!(
+        r.current_goal(),
+        Goal::Engaging {
+            target_id: 99,
+            attack_issued: false
+        }
+    ));
+
+    assert!(attack_issued(&r.tick().commands));
+    assert!(
+        matches!(r.current_goal(), Goal::Engaging { .. }),
+        "sending the Attack is not the accept"
+    );
+
+    let derived = r.observe_event(&AgentEvent::TargetChanged {
+        target_id: Some(99),
+    });
+    assert!(matches!(
+        r.current_goal(),
+        Goal::Engaged {
+            target_id: 99,
+            attack_issued: true
+        }
+    ));
+    assert!(engaged_goal_event(&derived, 99));
+}
+
+/// The 0x037 ATTACK byte is the fallback accept.
+#[test]
+fn char_status_attack_promotes_the_pending_engage() {
+    let mut r = Reactor::new(ReactorConfig::default());
+    r.observe_event(&connected(1));
+    r.handle_command(AgentCommand::Engage { target_id: 99 });
+    let derived = r.observe_event(&AgentEvent::SelfServerStatus {
+        status: ffxi_proto::decode::animation::ATTACK,
+        mount_id: 0,
+    });
+    assert!(matches!(
+        r.current_goal(),
+        Goal::Engaged { target_id: 99, .. }
+    ));
+    assert!(engaged_goal_event(&derived, 99));
+}
+
+/// "You must wait longer to perform that action." and the rest of the
+/// CPlayerController::Engage refusals leave the server unengaged, so the
+/// pending goal goes back to Idle, is emitted, and is not retried.
+#[test]
+fn engage_refused_by_the_server_drops_the_pending_goal() {
+    for message_num in [
+        crate::session::MSG_BASIC_WAIT_LONGER,
+        crate::session::MSG_BASIC_TOO_FAR_AWAY,
+        crate::session::MSG_BASIC_ALREADY_CLAIMED,
+        crate::session::MSG_BASIC_CANNOT_ON_THAT_TARGET,
+        crate::session::MSG_BASIC_CANNOT_ATTACK_TARGET,
+    ] {
+        let mut r = reactor_with_mob_99();
+        r.handle_command(AgentCommand::Engage { target_id: 99 });
+        r.tick();
+        let derived = r.observe_event(&AgentEvent::EngageRefused { message_num });
+        assert!(
+            matches!(r.current_goal(), Goal::Idle),
+            "refusal {message_num} must drop the pending engage"
+        );
+        assert!(emits_idle_goal(&derived));
+        assert!(
+            !attack_issued(&r.tick().commands),
+            "a dropped engage is not retried"
+        );
+    }
+}
+
+/// A refusal after the accept is some other action's; the standing engage
+/// is untouched.
+#[test]
+fn refusal_after_the_accept_leaves_the_engage_standing() {
+    let mut r = Reactor::new(ReactorConfig::default());
+    r.observe_event(&connected(1));
+    r.handle_command(AgentCommand::Engage { target_id: 99 });
+    r.observe_event(&AgentEvent::TargetChanged {
+        target_id: Some(99),
+    });
+    let derived = r.observe_event(&AgentEvent::EngageRefused {
+        message_num: crate::session::MSG_BASIC_WAIT_LONGER,
+    });
+    assert!(matches!(
+        r.current_goal(),
+        Goal::Engaged { target_id: 99, .. }
+    ));
+    assert!(derived.is_empty());
+}
+
+/// A validator-dropped Attack gets no answer at all; the pending goal is
+/// dropped after ENGAGE_ACCEPT_TIMEOUT and not before.
+#[test]
+fn unanswered_engage_times_out_to_idle() {
+    let mut r = reactor_with_mob_99();
+    r.handle_command(AgentCommand::Engage { target_id: 99 });
+    let tick = ReactorConfig::default().tick;
+    let ticks_to_timeout = ENGAGE_ACCEPT_TIMEOUT.as_nanos().div_ceil(tick.as_nanos()) as usize;
+
+    assert!(attack_issued(&r.tick().commands));
+    for _ in 0..ticks_to_timeout - 1 {
+        let out = r.tick();
+        assert!(
+            matches!(r.current_goal(), Goal::Engaging { .. }),
+            "the wait must run the full timeout"
+        );
+        assert!(!emits_idle_goal(&out.derived_events));
+    }
+    let out = r.tick();
+    assert!(matches!(r.current_goal(), Goal::Idle));
+    assert!(emits_idle_goal(&out.derived_events));
+}
+
+/// The timeout is for the pending goal only; once accepted, the engage
+/// stands for as long as the server keeps it.
+#[test]
+fn accept_before_the_timeout_keeps_the_engage() {
+    let mut r = reactor_with_mob_99();
+    r.handle_command(AgentCommand::Engage { target_id: 99 });
+    for _ in 0..10 {
+        r.tick();
+    }
+    r.observe_event(&AgentEvent::TargetChanged {
+        target_id: Some(99),
+    });
+    for _ in 0..200 {
+        r.tick();
+    }
+    assert!(matches!(
+        r.current_goal(),
+        Goal::Engaged { target_id: 99, .. }
+    ));
+}
+
+/// An Attack while already engaged is the server's ChangeTarget; the goal
+/// re-aims at once because the weapon is already out.
+#[test]
+fn engage_while_engaged_reaims_without_going_pending() {
+    let mut r = Reactor::new(ReactorConfig::default());
+    r.observe_event(&connected(1));
+    r.handle_command(AgentCommand::Engage { target_id: 99 });
+    r.observe_event(&AgentEvent::TargetChanged {
+        target_id: Some(99),
+    });
+    r.handle_command(AgentCommand::Engage { target_id: 77 });
+    assert!(matches!(
+        r.current_goal(),
+        Goal::Engaged {
+            target_id: 77,
+            attack_issued: false
+        }
+    ));
 }

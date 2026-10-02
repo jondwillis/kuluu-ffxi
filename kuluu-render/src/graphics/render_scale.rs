@@ -43,7 +43,7 @@ const BRIDGE_POINTER_UUID: u128 = 0x6b756c75_72656e64_72736361_6c655f30;
 
 /// Order slot of the render-scale composite camera: one past the retired
 /// nameplate-overlay slot. The operator Camera3d writes the scene at order 0 and —
-/// since Phase 1 removed the second overlay Camera3d that shared this target — is
+/// since the second overlay Camera3d that shared this target is gone — is
 /// the ONLY other window writer on this path; anything spawned between them (or a
 /// second Camera3d) would double-draw the frame. The slot values are pinned by
 /// `scaled_mode_composite_is_one_slot_past_the_retired_overlay` below and by
@@ -70,7 +70,7 @@ pub struct RenderScaleState {
     /// Image render-target scale factor (kept equal to the window's, so the
     /// image's logical size is `window_logical * render_scale`).
     scale_factor: f32,
-    /// Kept alive one rebuild cycle so in-flight render passes never draw into
+    /// Kept alive one rebuild cycle so in-flight render passes do not draw into
     /// a freed texture during a live window resize (the resize crash).
     prev_image: Option<Handle<Image>>,
     /// Live-drag debounce: a new size must hold for two frames before the
@@ -147,6 +147,25 @@ fn create_render_scale_image(images: &mut Assets<Image>, width: u32, height: u32
     images.add(image)
 }
 
+/// Reconciles the render-scale state with the settings and window size. Native
+/// mode tears the composite down and points the operator straight at the window;
+/// scaled mode keeps an off-screen image at `window * scale` and a window-targeted
+/// composite that shows it. `assert_hud_camera_ownership` (same stage, later this
+/// frame) marks exactly one default UI camera per configuration — the operator at
+/// native scale, the composite while scaled — so bevy_ui's
+/// `propagate_ui_target_cameras` binds every HUD node to it instead of falling
+/// back to its "highest order window camera" rule (the double-rendered-UI path).
+/// The image size is even-floored: an odd window times a scale can round to an
+/// odd image, and odd attachment dimensions feed the same half-pixel class of
+/// problems the window even-snap exists for. New sizes debounce for two frames so
+/// a live drag does not rebuild per pixel. The rebuild is an atomic switchover —
+/// new handle, RenderTarget insert, and prev_image retention in one command flush
+/// — because a frame where the color image is new while the camera still targets
+/// the prior handle leaves depth (allocated by prepare_core_3d_depth_textures
+/// against the camera's target size) matching neither, and that mismatch is a wgpu
+/// validation crash. The operator's RenderTarget is re-applied every frame: the
+/// AA-driven camera respawn drops it, and the insert is a no-op when it already
+/// points at the live image.
 #[allow(clippy::type_complexity)]
 fn reconcile_render_scale_system(
     settings: Res<GraphicsSettings>,
@@ -167,10 +186,6 @@ fn reconcile_render_scale_system(
     };
 
     if !settings.wants_render_scale() {
-        // Native configuration: `assert_hud_camera_ownership` (same stage,
-        // later this frame) marks the operator as THE default UI camera so
-        // bevy_ui's propagate_ui_target_cameras binds every HUD node to it.
-        // Tear back down to the native single-camera path.
         if state.image.is_some() {
             commands
                 .entity(op_entity)
@@ -196,18 +211,11 @@ fn reconcile_render_scale_system(
     }
     let scale_factor = window.scale_factor();
     let s = settings.render_scale();
-    // Even-floored: an odd window (e.g. maximized 2560x1369) times a scale
-    // can round to an odd image; odd attachment dimensions feed the same
-    // half-pixel class of problems the window even-snap exists for.
     let want = UVec2::new(
         (((phys.x as f32 * s).round() as u32).max(2)) & !1,
         (((phys.y as f32 * s).round() as u32).max(2)) & !1,
     );
 
-    // Scaled configuration: `assert_hud_camera_ownership` marks the composite
-    // (spawned below) as THE default UI camera and removes the operator's —
-    // exactly one marker at all times keeps bevy_ui's propagate off its
-    // "highest order window camera" fallback (the double-rendered-UI path).
     dbg_snap.img = (want.x, want.y);
     let need_rebuild = state.image.is_none()
         || state.built_size != want
@@ -215,28 +223,11 @@ fn reconcile_render_scale_system(
     if need_rebuild {
         let first = state.image.is_none();
         if !first && state.pending_size != want {
-            // New size this frame: start the debounce, keep serving the OLD
-            // image (and its OLD RenderTarget pointer -- see below) so a live
-            // drag doesn't rebuild per pixel.
             state.pending_size = want;
             state.pending_streak = 0;
         } else if !first && state.pending_streak < 1 {
             state.pending_streak += 1;
         } else {
-            // ATOMIC SWITCHOVER. Create the new image AND rewrite the
-            // camera's RenderTarget to point at it in the SAME command flush.
-            // The bug this fixes: previously `state.image` was reassigned
-            // here while the RenderTarget update happened later in the
-            // function, so for a frame the color image was new (720p) while
-            // the camera still targeted the old handle -- and depth,
-            // which is allocated by prepare_core_3d_depth_textures against
-            // the camera's target size, matched neither. The result was
-            // depth (old_size) + color (new_size) in one pass = wgpu
-            // validation crash.
-            //
-            // Now: new handle, RenderTarget insert, and prev_image retention
-            // all happen atomically. Depth will be reallocated to match the
-            // new target size on the same frame the color image switches.
             state.prev_image = state.image.take();
             let handle = create_render_scale_image(&mut images, want.x, want.y);
             commands
@@ -253,13 +244,10 @@ fn reconcile_render_scale_system(
         }
     }
     let Some(_) = state.image else {
-        return; // mid-debounce with no image yet (first frames only)
+        return;
     };
     let handle = state.image.clone().expect("image set above");
 
-    // Self-heal: the AA-driven camera respawn drops RenderTarget. Re-apply
-    // it every frame when a live image exists and the camera isn't already
-    // pointed at it. Safe outside a size change: same handle, no-op insert.
     if op_target.and_then(|t| t.as_image()) != Some(&handle) {
         commands
             .entity(op_entity)
@@ -278,9 +266,6 @@ fn reconcile_render_scale_system(
                 RenderScaleCompositeCamera,
                 Camera2d,
                 Camera {
-                    // One slot past the operator camera (0): with the nameplate
-                    // overlay camera gone, nothing else writes this window path,
-                    // so the composite is unambiguously last.
                     order: RENDER_SCALE_COMPOSITE_ORDER,
                     ..default()
                 },
@@ -413,9 +398,20 @@ fn mirror_pointer_to_render_target_system(
 /// unstably under relayout -- with the debug text churning every frame, glyphs
 /// and borders flip a pixel in different directions and the panel "spreads"
 /// (the arbitrary-window-size jitter; default size and fullscreen are even, so
-/// they never showed it). Snap windowed-mode size DOWN to even physical
+/// they stayed free of it). Snap windowed-mode size DOWN to even physical
 /// dimensions; a 1px shrink is invisible. Fullscreen modes are left alone.
 /// Self-quiescing: once even, nothing is written, so no resize-event loop.
+///
+/// Maximized windows are letterboxed instead of resized: Bevy 0.19 has no
+/// public read of the OS maximize bit, so a physical size matching any
+/// monitor's full extent on either axis is treated as OS-driven maximum, and
+/// resizing there is what Windows reads as a manual resize, which un-maximizes
+/// (the "click Max, it snaps back" bug). The cameras get the even-floored
+/// viewport rect; the window keeps its OS geometry and the 1px dead row is
+/// invisible. A camera whose render target is an off-screen image skips the
+/// letterbox: a window-derived viewport can exceed that image, and wgpu
+/// rejects the scissor at submit time ("scissor rect not contained in render
+/// target", which quits the app via the default RenderErrorHandler).
 #[allow(dead_code)]
 fn snap_window_to_even_system(
     mut windows: Query<&mut Window, With<PrimaryWindow>>,
@@ -429,41 +425,23 @@ fn snap_window_to_even_system(
         return;
     };
     if !matches!(window.mode, bevy::window::WindowMode::Windowed) {
-        return; // fullscreen/borderless: OS owns the size
+        return;
     }
     let p = window.physical_size();
     if p.x < 2 || p.y < 2 {
         return;
     }
     let even = UVec2::new(p.x & !1, p.y & !1);
-    // MAXIMIZE detection (Bevy 0.19 has no public read of the OS bit): the
-    // current physical size matching any monitor's full extent on either
-    // axis means OS-driven maximum. Resizing there is what Windows treats
-    // as a manual resize, which un-maximizes -- the "click Max, it snaps
-    // back" bug. So: two strategies, one goal (even effective dimensions
-    // everywhere).
     let maximized = monitors
         .iter()
         .any(|m| m.physical_size().x == p.x || m.physical_size().y == p.y);
     if maximized {
-        // Maximized + odd: LETTERBOX instead of resize. Camera viewports get
-        // the even-floored rect; the window keeps its OS geometry (Max stays
-        // Max), rendering and UI layout see 2560x1368 instead of 2560x1369,
-        // and the 1px dead row is invisible. Cleared when dimensions are
-        // already even.
         let want_viewport = (even != p).then_some(bevy::camera::Viewport {
             physical_position: UVec2::ZERO,
             physical_size: even,
             depth: 0.0..1.0,
         });
         for (mut cam, target) in &mut cameras {
-            // Letterboxing only makes sense on a camera whose render target IS
-            // the window. When render scale is active the operator camera targets
-            // an off-screen IMAGE sized window*scale — a window-derived viewport
-            // can exceed that image and wgpu rejects the scissor at submit time
-            // ("scissor rect not contained in render target", app quits via the
-            // default RenderErrorHandler). Image-targeted cameras keep their own
-            // full-image viewport.
             if target.and_then(|t| t.as_image()).is_some() {
                 continue;
             }
@@ -478,8 +456,6 @@ fn snap_window_to_even_system(
         }
         return;
     }
-    // Plain windowed sizes: snap the window itself down to even, and make
-    // sure no stale letterbox viewport survives from a maximized phase.
     for (mut cam, _target) in &mut cameras {
         if cam.viewport.is_some() {
             cam.viewport = None;
@@ -492,13 +468,11 @@ fn snap_window_to_even_system(
 
 #[cfg(test)]
 mod tests {
-    /// Phase 2 invariant: exactly one camera writes the game-window path per
-    /// mode. The operator Camera3d renders the scene (order 0); with the second
-    /// nameplate-overlay Camera3d gone (Phase 1), the ONLY other writer is this
-    /// composite in scaled mode, and it must sit exactly one slot past the retired
-    /// overlay's order constant — a second window writer between them is the whole-frame
-    /// ghost regression. The spawn site reads [`RENDER_SCALE_COMPOSITE_ORDER`], so this
-    /// test fails if that slot ever moves without updating the invariant.
+    /// Exactly one camera writes the game-window path per mode: the operator
+    /// Camera3d renders the scene at order 0, and in scaled mode the only other
+    /// writer is this composite, which sits exactly one slot past the retired
+    /// overlay's order constant. A second window writer between them would
+    /// double-draw the frame, so the test fails if that slot moves.
     #[test]
     fn scaled_mode_composite_is_one_slot_past_the_retired_overlay() {
         assert_eq!(crate::nameplate_overlay::NAMEPLATE_OVERLAY_CAMERA_ORDER, 1);
@@ -507,7 +481,6 @@ mod tests {
             composite,
             crate::nameplate_overlay::NAMEPLATE_OVERLAY_CAMERA_ORDER + 1,
         );
-        // Operator is at the default 0 and nothing may share its slot.
         assert_eq!(composite, 2);
     }
 }

@@ -5,7 +5,10 @@
 //!
 //! Usage: zz-field-walk <zone_id> <x0> <y0> <z0> <x1> <y1> [stride]
 //! (ffxi coordinates; z grows down, like the wire frame. `stride` prints every
-//! Nth tick, default 1.)
+//! Nth tick, default 1.) The walk is horizontal: the direction is computed in
+//! wire x/y (z is not part of the walk), at the production run speed dispatch
+//! feeds the walker on foot, and `step` gets geometry_ready = true because
+//! the real zone geometry is loaded above.
 
 use bevy::tasks::AsyncComputeTaskPool;
 use kuluu::view_native::walker::{obstacles::ObstacleSet, step, WalkMode, Walker};
@@ -47,7 +50,6 @@ fn main() {
         Some(file_id),
     ));
 
-    // Horizontal direction in wire units (z is not part of the walk).
     let dx01 = x1 - x0;
     let dy01 = y1 - y0;
     let len = (dx01 * dx01 + dy01 * dy01).sqrt();
@@ -57,7 +59,6 @@ fn main() {
     }
     let dir = (dx01 / len, dy01 / len);
 
-    // The production run speed: what dispatch feeds the walker on foot.
     let speed =
         kuluu_session::state::move_speed_yps(kuluu_session::state::BASE_PACKET_SPEED, false);
     let dt = 1.0 / HZ;
@@ -85,7 +86,7 @@ fn main() {
             speed,
             dt,
             false,
-            true, // real zone geometry loaded above: floor source is ready
+            true,
         );
         x += res.dx;
         y += res.dy;

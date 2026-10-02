@@ -1,5 +1,10 @@
 # Compass radar evidence, 2026-09-09
 
+Method: captures of the player's own client sessions on HorizonXI (a
+community-run private server) using ordinary client-side addons, plus
+inspection of DAT files from the player's own retail install. No Square Enix
+production hosts were contacted.
+
 ## Contents
 - Primary sources and visible output
 - Installed DAT evidence
@@ -58,8 +63,9 @@ rectangle `(780,1490)-(920,1577)` and is enlarged fivefold for inspection. It ha
 S/W above the dial and E/N below. The different absolute size from the user
 reference does not establish a different game rule: HUD scale/configuration was
 not recorded for either capture. Both support an approximately 2:1 dial aspect.
-The older session runs through Ashita/HorizonXI; injected UI modifications have
-not been exhaustively excluded.
+The older session runs through Ashita/HorizonXI; client-side addon UI
+modifications (Ashita addons load into the player's own client) have not been
+exhaustively excluded.
 
 ## Installed DAT evidence
 

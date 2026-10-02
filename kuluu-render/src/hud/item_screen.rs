@@ -453,6 +453,8 @@ fn spawn_bag_tabs(col: &mut ChildSpawnerCommands) {
     });
 }
 
+/// The list box; retail overlays each row's stack count on the icon's top-left
+/// corner rather than suffixing the name, so the count is a child of the icon.
 fn spawn_list_box(col: &mut ChildSpawnerCommands, placeholder: Handle<Image>) {
     let (mut n, bg, bd) = framed_box();
     n.width = Val::Px(LIST_WIDTH_PX);
@@ -489,24 +491,18 @@ fn spawn_list_box(col: &mut ChildSpawnerCommands, placeholder: Handle<Image>) {
                         ImageNode::new(placeholder.clone()),
                     ))
                     .with_children(|icon| {
-                        // Retail overlays the stack count on the icon's
-                        // top-left corner rather than suffixing the name.
-                        let (badge, badge_bg, badge_edge) = item_grid::stack_badge_chip(Node {
+                        let placement = Node {
                             position_type: PositionType::Absolute,
                             left: Val::Px(0.0),
                             top: Val::Px(-2.0),
                             display: Display::None,
                             ..default()
-                        });
-                        icon.spawn((
+                        };
+                        item_grid::spawn_stack_count(
+                            icon,
                             ItemText(ItemRole::ListBadge(i)),
-                            Text::new(""),
-                            text_font(item_grid::BADGE_FONT_PX),
-                            TextColor(theme::TEXT),
-                            badge,
-                            badge_bg,
-                            badge_edge,
-                        ));
+                            placement,
+                        );
                     });
                     row.spawn(list_view::row_label_clip()).with_children(|col| {
                         col.spawn((
@@ -585,6 +581,8 @@ pub fn option_label(id: SortOptionId) -> &'static str {
 
 /// Shows/hides the window's three surfaces (list, Options box, item card) and
 /// swaps the compass/clock cluster out for the card while the list is up.
+/// The Options box belongs to the full inventory browser only; the per-item
+/// submenu takes its screen slot while open.
 pub(crate) fn update_item_screen_layout(
     mode: Res<InputMode>,
     mut focus: ResMut<ItemMenuFocus>,
@@ -627,8 +625,6 @@ pub(crate) fn update_item_screen_layout(
     if let Ok(mut node) = cluster_q.single_mut() {
         set_display(&mut node, !open);
     }
-    // The Options box belongs to the full inventory browser only, and the
-    // per-item submenu takes its screen slot while open.
     let options_visible = screen_mode == Some(ItemScreenMode::Inventory) && !submenu_open(&mode);
     if let Ok(mut node) = options_q.single_mut() {
         set_display(&mut node, options_visible);
@@ -638,6 +634,8 @@ pub(crate) fn update_item_screen_layout(
     }
 }
 
+/// Retail prints the window-change key's glyph before "Sort" ("+ :Sort"); ours
+/// follows whatever SelectActiveWindow is bound to.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn update_item_screen(
     mode: Res<InputMode>,
@@ -702,8 +700,6 @@ pub(crate) fn update_item_screen(
     let focused_slot = rows.get(cursor).and_then(|r| r.action.item_slot());
     let (detail_name, detail_rows) =
         item_ui::focus_detail(focused_item, focused_slot, snap, &dat_root, &mut icon_cache);
-    // Retail prints the window-change key's glyph before "Sort" ("+ :Sort");
-    // ours follows whatever SelectActiveWindow is bound to.
     let sort_label = match bindings.key_label(crate::keybinds::Action::SelectActiveWindow) {
         Some(label) => format!("{label} :{OPTIONS_SORT_LABEL}"),
         None => OPTIONS_SORT_LABEL.to_string(),
@@ -878,6 +874,8 @@ fn role_value(
     }
 }
 
+/// Hovering the list returns focus to it, mirroring the options box grabbing
+/// focus on hover, so neither pane traps the keyboard.
 pub(crate) fn item_row_mouse_hover_system(
     mut mode: ResMut<InputMode>,
     viewport: Res<ItemListViewport>,
@@ -907,8 +905,6 @@ pub(crate) fn item_row_mouse_hover_system(
         }
         let list_idx = start + row.0;
         if list_idx < total {
-            // Hovering the list returns focus here, mirroring the options box
-            // grabbing it on hover — so neither pane traps the keyboard.
             if focus.sort_focused() {
                 focus.exit_sort();
             }

@@ -68,7 +68,7 @@ const ALLEGIANCE_COLORED_MAX: u8 = 99;
 /// tests pinning that behaviour.
 #[allow(dead_code)] // test fixture + wire documentation; see doc comment
 const BELLIGERENT_MOB_ALLEGIANCE: u8 = 0b1_000;
-#[allow(dead_code)] // ditto
+#[allow(dead_code)]
 const BELLIGERENT_PLAYER_ALLEGIANCE: u8 = 0b1_001;
 
 /// The nameplate's diffuse colour is drawn through `D3DTOP_MODULATE2X`
@@ -108,7 +108,7 @@ impl NameColorTable {
     /// The drawn colour for an `ncol` row, already doubled for MODULATE2X.
     /// Until the retail table has been read, the built-in [`DEFAULT_ROW`] stands
     /// in: a plate's colour is a fact about the entity (kind/status from the
-    /// live table), not about whether a DAT read has finished — it must be
+    /// live table), not about whether a DAT read has finished, so it is
     /// drawable on the first frame. The real table overrides these on load; any
     /// plate whose row moved re-rasters via its key comparison.
     pub fn color(&self, index: usize) -> Color {
@@ -221,12 +221,15 @@ impl NameColorChoice {
 
 /// Built-in stand-ins for every `ncol` row, drawn until (and unless) the
 /// retail table loads from the install's UI DAT. Kind and status come from the
-/// live entity table, so a plate's colour is known on its first frame — it must
-/// never hold a white placeholder waiting on a DAT read. The rows that matter at
+/// live entity table, so a plate's colour is known on its first frame — it does
+/// not hold a white placeholder waiting on a DAT read. The rows that matter at
 /// a glance follow the per-kind stand-ins the minimap already uses (PC white /
-/// NPC green / MOB yellow); the claim and dead rows match the real table's
-/// pinned values (`real_dat_table_loads_with_retail_claim_colors`).
+/// NPC green / MOB yellow); the row numbers are the `ncol` indices
+/// `NameColorSet` uses (ActorTelemetry.cpp), and the claim and dead rows match
+/// the real table's pinned values
+/// (`real_dat_table_loads_with_retail_claim_colors`).
 const DEFAULT_ROW: [Color; NAME_COLOR_COUNT] = [
+    // row indices are the `ncol` rows `NameColorSet` uses (ActorTelemetry.cpp)
     Color::srgb(1.00, 1.00, 1.00), // 0 PC — plain white
     Color::srgb(0.45, 0.75, 1.00), // 1 PARTY — pale blue (minimap party stand-in)
     Color::srgb(1.00, 0.85, 0.35), // 2 SEEKING — gold
@@ -473,8 +476,6 @@ pub fn load_name_colors_system(
         return;
     }
     let Some(root) = dat_root.0.as_ref() else {
-        // No retail install yet (headless/relay paths): the fallback colour
-        // is the documented behaviour, nothing to warn about.
         return;
     };
     for (id, bytes) in crate::ui_element_atlas::read_ui_dats(root) {
@@ -487,10 +488,6 @@ pub fn load_name_colors_system(
             return;
         }
     }
-    // A retail install is present but none of its UI DATs carries the ncol
-    // group (locale mismatch, partial install). Plates then draw the built-in
-    // stand-ins for the whole session — surface it once instead of failing
-    // silently.
     if !*scanned_without_group {
         *scanned_without_group = true;
         warn!(
@@ -907,9 +904,10 @@ mod tests {
         }
     }
 
-    /// Belligerence (base | 0x08 outside the Ferretory) takes no nation row:
-    /// retail maps 8/9 to the PC row without returning, so a belligerent player
-    /// draws plain white and a belligerent mob keeps its kind colour.
+    /// Belligerence (base | 0x08 outside the Ferretory; char_update.cpp) takes
+    /// no nation row: retail maps 8/9 to the PC row without returning, so a
+    /// belligerent player draws plain white and a belligerent mob keeps its
+    /// kind colour.
     #[test]
     fn belligerent_allegiances_fall_through_to_the_kind_colour() {
         for allegiance in [BELLIGERENT_MOB_ALLEGIANCE, BELLIGERENT_PLAYER_ALLEGIANCE] {
@@ -996,9 +994,6 @@ mod tests {
     fn an_unloaded_table_resolves_to_the_builtin_rows() {
         let table = NameColorTable::default();
         assert!(!table.is_loaded());
-        // A plate's colour is a fact about the entity (kind/status from the
-        // live table), not about whether a DAT read has finished: it must
-        // resolve on frame one.
         assert_eq!(
             NameColorChoice::Row(ncol::PC).resolve(&table),
             DEFAULT_ROW[ncol::PC]

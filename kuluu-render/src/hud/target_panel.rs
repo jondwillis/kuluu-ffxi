@@ -125,6 +125,8 @@ pub fn spawn_target_panel(mut commands: Commands) {
         });
 }
 
+/// While the sub-target picker is up the frame tracks the live cursor
+/// candidate, so the swap shows before the commit.
 pub fn update_target_panel_system(
     target: Res<Target>,
     mode: Res<crate::InputMode>,
@@ -194,8 +196,6 @@ pub fn update_target_panel_system(
         return;
     };
 
-    // While the sub-target picker is up the frame tracks the live cursor
-    // candidate, so the swap shows before the commit.
     let target_id = match &*mode {
         crate::InputMode::SubTarget(st) => st.candidate.or(target.id),
         _ => target.id,

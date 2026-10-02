@@ -40,7 +40,7 @@ pub enum ItemBlockLayout {
 }
 
 /// Decoded value of the last byte of every real block on both measured
-/// layouts; a stride that lands elsewhere reads a 0x00 pad or icon byte.
+/// layouts; a stride that lands elsewhere reads a zero pad or icon byte.
 pub const ITEM_BLOCK_TRAILER: u8 = 0xFF;
 
 impl ItemBlockLayout {
@@ -79,7 +79,7 @@ impl ItemBlockLayout {
     /// Which stride ends the first block on [`ITEM_BLOCK_TRAILER`] and starts
     /// the second on the consecutive id, or on an all-zero id when the file
     /// holds a single real block (the currency DAT). Works on a file prefix,
-    /// so callers only need the first `0x1400 + 4` bytes.
+    /// so callers only need the first `ItemBlockLayout::Retail2026.stride() + 4` bytes.
     pub fn detect(head: &[u8]) -> Option<ItemBlockLayout> {
         let id_at = |off: usize| -> Option<u32> {
             let b = head.get(off..off + 4)?;
@@ -160,8 +160,8 @@ pub const KNOWN_CLIENTS: &[KnownClient] = &[
         retail: false,
     },
     // FFXIFullSetup_US from gdl.square-enix.com (CDN Last-Modified 2019-05-10),
-    // unpacked by ffxi-install; the unpatched starting point of every retail
-    // install.
+    // unpacked by ffxi-install (ffxi-install/src/lib.rs unpack_cab); the
+    // unpatched starting point of every retail install.
     KnownClient {
         name: "retail-2019-base",
         ffximain_sha256: "3da0a1e0dc897294880c0a4bf9ea0e9c580786b2d05698290e588c761a802835",
@@ -170,8 +170,9 @@ pub const KNOWN_CLIENTS: &[KnownClient] = &[
         item_layout: ItemBlockLayout::Legacy,
         retail: true,
     },
-    // retail-2019-base patched by `cargo xtask ffxi-client update` (ffxi-install's
-    // PlayOnline patch client) to the server's 2026-09-04 release.
+    // retail-2019-base patched to the server's 2026-09-04 release by the
+    // PlayOnline patch client (ffxi-install/src/patch_client.rs), driven by
+    // `cargo run -p kuluu -- install update`.
     KnownClient {
         name: "retail-2026-09",
         ffximain_sha256: "f2245d1c9d06e02c36624942483913f5120c0d40777fc1bb8703c6f4bda823e4",

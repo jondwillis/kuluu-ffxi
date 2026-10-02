@@ -92,8 +92,10 @@ mod tests {
         // CTargetFind::getValidTarget TARGET_PET).
         let flags = ability(72).expect("Sic present");
         assert!(flags.contains(TargetFlags::PET));
-        // Blood Rage (267) is self-only: its 0x13F column is message1, not
-        // validTarget — pin the column mapping against a re-scrape drift.
+        // Blood Rage (267) is self-only: its message1 value (319) carries the
+        // PET bit, so a scrape drifting onto the wrong column would light it —
+        // pin the column mapping against re-scrape drift
+        // (vendor/server/sql/abilities.sql).
         assert!(!ability(267)
             .expect("Blood Rage present")
             .contains(TargetFlags::PET));

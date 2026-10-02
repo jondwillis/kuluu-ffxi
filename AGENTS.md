@@ -11,8 +11,8 @@ Kuluu is a faithful, open-source FINAL FANTASY XI **client** rebuilt in Rust + B
 `scripts/checks.sh` is the **single source of truth** for check *commands* — the `pre-push` hook and CI both call it, so a given stage runs byte-identical flags in each. They select **different stages**, though, so a green hook is not a green CI: `test` and `enhanced` are CI-only, and `wasm` runs in the hook only when the push touches its build graph. Prefer it over spelling out cargo flags:
 
 ```bash
-scripts/checks.sh harness comments literals fmt contracts wasm install clippy # what the pre-push hook runs
-scripts/checks.sh harness comments literals fmt clippy test enhanced wasm # the full CI gate
+scripts/checks.sh harness readme comments literals fmt contracts wasm install clippy # what the pre-push hook runs
+scripts/checks.sh harness readme comments literals fmt clippy test enhanced wasm # the full CI gate
 COMMENTS_DIFF=staged scripts/checks.sh comments # what pre-commit runs on the staged hunks
 LITERALS_DIFF=staged scripts/checks.sh literals # pre-commit: no re-typed const values, tests included
 cargo fmt --all                         # autofix formatting
@@ -30,6 +30,10 @@ cargo test -p ffxi-proto framing::tests::roundtrip --features native-window
 - **Integration tests that need a live LSB server self-skip** when it's unreachable, so the test stage is safe on a network-isolated machine. Fixtures using `mysql_async` stamp out isolated accounts against a real MariaDB and only run when one is reachable.
 - **Enable the hooks once per clone:** `cargo xtask install-hooks` (sets `core.hooksPath=.githooks`). Bypass a push with `git push --no-verify`; `PREPUSH_FAST=1 git push` runs fmt and state contracts.
 - `xtask` is excluded from `default-members`, so plain `cargo build`/`test` skip it; run it via the `cargo xtask` alias.
+
+## PR review and evidence
+
+PRs must justify why the change belongs in Kuluu beyond linking an issue. Prefer verified GitHub issue links in contributor-facing material; Beads remains the tracking source. Vanilla/Retail is the default; modest FPS or UX improvements need a clear benefit without material gameplay or convenience drift; Enhanced behavior requires explicit opt-in. Use the [Kuluu review skill](.agents/skills/kuluu-review/SKILL.md) for project-fit assessment, focused correction stacks and evidence requirements. Graphical or visible interaction changes need reviewer-accessible screenshots/video; use [verify](.agents/skills/verify/SKILL.md) to capture them.
 
 ## Running
 
@@ -51,7 +55,7 @@ cargo run -p kuluu --no-default-features -- play --headless  # JSON event-stream
 
 There is no `docs/` tree — it was removed as a redundant hand-kept projection of beads (a scoreboard plus three plan/status notes that had all gone stale). The grounded parity backlog is the `roadmap`-labelled beads, each citing `file:line` evidence and carrying `vanilla`/`enhanced` plus an area label (`hud`, `combat-action`, …). Durable project memory belongs in Beads (`bd remember` / `bd memories`) so it follows the repository across coding-agent harnesses; ephemeral execution notes stay in the active session.
 
-**Don't reintroduce free-floating `.md` notes.** Every kind of prose has a home that keeps it honest, so route by audience rather than starting a new file: *what work is open* → a bead (`--design`/`--notes` hold the plan; a plan that isn't a bead has no one to close it); *how retail behaves* → `.agents/skills/retail-observe/references/` as a dated observation record; *how to do a recurring task* → a skill under `.agents/skills/`; *what we already fixed* → the commit message, which git keeps accurate for free; *contributor-facing orientation* → `README.md`. Anything that survives none of those tests is a session note and belongs in the bead you're working, not the tree.
+**Don't reintroduce free-floating `.md` notes.** Every kind of prose has a home that keeps it honest, so route by audience rather than starting a new file: *what work is open* → a bead (`--design`/`--notes` hold the plan; a plan that isn't a bead has no one to close it); *how retail behaves* → `.agents/skills/retail-observe/references/` as a dated observation record; *how to do a recurring task* → a skill under `.agents/skills/`; *what we already fixed* → the commit message, which git keeps accurate for free; *first-visit orientation* → `README.md`; *contributor workflows* → `CONTRIBUTING.md`; *player support* → `SUPPORT.md`; *directory-specific reference* → a local `README.md`. Anything that survives none of those tests is a session note and belongs in the bead you're working, not the tree.
 
 **Commit authority (repository-profile grant).** The beads `bd prime` session protocol defaults to *conservative* — no commits without granted authority. This repository **grants standing authority to commit liberally**: group finished, uncontroversial work into clear, coherent commits as you go, without stopping to ask. This is the sanctioned override of the conservative default. Still **confirm before `git push`** (outward-facing) and before `bd dolt push` / remote sync, and never force-push or rewrite shared history. In a tree that mixes another session's edits, stage only your own hunks (`git add -p`), never `-A`.
 
@@ -138,9 +142,34 @@ Unavailable retail access should narrow the claim, not silently turn a community
 approximation into vanilla truth or block unrelated work. Product-only tooling
 and explicitly requested enhancements do not acquire a retail-parity gate.
 
+**Rendered evidence is part of completing UI work.** Before changing rendering,
+HUD, menus, camera, animation, or input behavior, use the `verify` skill to
+choose the runtime surface and the visible result to inspect. Build the changed
+client, drive the affected view, capture it, and open the capture for pixel
+inspection before closing the bead or claiming completion. Include the evidence
+path and observation in the final report. Prefer evidence captured directly
+from the game or derived from its production rendering pipeline. When direct
+evidence cannot be gathered, state the reason and the limits of any secondary
+evidence. Unit tests and source inspection do not satisfy this requirement.
+A commit does not clear it, and work in another worktree still belongs to this
+session. If a concrete build, launch, capture,
+or access failure prevents verification, capture the diagnostic, keep the bead
+open, and report verification as blocked. Build duration or effort already spent
+is not a reason to skip the drive. Waiving visual verification requires the
+user's explicit opt-out for that change.
+
 ### Build-time vendor scrape (no hand-maintained tables)
 
 `build.rs` in `ffxi-proto`/`ffxi-vocab`/`ffxi-dat`/`kuluu-nav`/`ffxi-audio` (sharing the `lsb-scrape` helper crate) reads LSB SQL/headers/lua and POLUtils XML out of `vendor/` and emits **compile-time Rust constants** (blowfish subkeys, zlib tables, msg/effect/job/spell/item names, zone-DAT id formulas, ROM file mappings). Never hand-copy these values — update the upstream pin and let the build regenerate them (see the `vendor-scrape` skill). The vendor submodules are **build-only**; nothing under `vendor/` is needed at runtime.
+
+## README changes
+
+Follow [the README editorial policy](CONTRIBUTING.md#readme-editorial-policy)
+before editing the root README. It serves first-time players and prospective
+contributors, not as a feature ledger or implementation manual. State which
+reader question an addition answers, use friendly, direct technical prose,
+and move specialist detail to its maintained home. Run `scripts/checks.sh readme`;
+the length and link checks do not replace editorial review.
 
 ## Conventions
 

@@ -1,6 +1,20 @@
 ---
 name: retail-grounding
-description: Ground FFXI vanilla client behavior in available retail observation, binaries and DATs before implementing or reviewing parity changes. Use this whenever the correct behavior depends on the original client -- rendering, animation, camera, UI, input, collision, or client file-format semantics -- including when the request sounds like ordinary implementation work and never mentions retail or parity. Works from whatever retail client is reachable on this machine (native, Wine or a VM) and from the installed binaries and DATs when none is running. Skip it for product-only tooling and for purely server-side protocol work.
+description: >
+  Use BEFORE writing or reviewing any change to code that decides how the
+  game looks, moves or responds -- rendering, animation, camera, collision,
+  input, HUD, menus, or a constant standing in for one of those rules -- to
+  ground the target behavior in retail evidence instead of a plausible
+  guess. Most requests that need this never say "retail" or "parity": they
+  arrive as ordinary bug reports ("it clips through the wall", "that plays
+  too fast", "the nameplate sits too high", "ours looks denser than the real
+  thing"), as a request to add a menu or HUD behavior, or as a review of a
+  diff that changes such a value. The skill ranks the evidence available
+  here -- live client observation on any host, the installed client
+  binaries, the DATs, LSB -- says which one actually settles the question,
+  and what the resulting citation has to pin down. Skip it for product-only
+  tooling, for deliberately enhanced non-vanilla features, and for purely
+  server-side protocol work.
 ---
 
 # Retail grounding

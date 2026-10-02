@@ -158,8 +158,8 @@ impl DatLocation {
     /// First existing spelling of this file under `dir`. Retail runs on
     /// Windows, whose fopen is case-insensitive, so an install (or a
     /// hand-assembled overlay) can mix `.DAT` with `.dat` and the real client
-    /// never notices; only a case-sensitive filesystem — a Linux user's
-    /// wine/launcher-managed install — can tell them apart.
+    /// reads both the same; only a case-sensitive filesystem — a Linux user's
+    /// wine/launcher-managed install — distinguishes the spellings.
     fn find_under(&self, dir: &Path) -> Option<PathBuf> {
         ["DAT", "dat"]
             .into_iter()
@@ -298,8 +298,9 @@ impl DatRoot {
         }
 
         let overlays = RwLock::new(discover_overlays(&root));
-        // The profile's item-layout probe resolves a file id, so it needs the
-        // assembled tables and overlay search path: build the root, then fill it in.
+        // probe_in resolves a file id, which needs the assembled tables and the
+        // overlay search path (ffxi-dat/src/client_profile.rs probe_in): build the
+        // root first, then fill the profile in.
         let mut root = Self {
             root,
             profile: ClientProfile::default(),
@@ -421,9 +422,9 @@ impl DatRoot {
 
 /// Test-support entry point, `pub` only so real-DAT guards in sibling crates can
 /// share it. Opens the install [`crate::install::resolve`] names; `None` with a
-/// printed reason, so a vacuous pass is never mistaken for a real one, when
+/// printed reason, so a vacuous pass is not mistaken for a real one, when
 /// nothing resolves or the install does not open. A set but unusable
-/// `FFXI_DAT_PATH` is a skip that says so, never a fallthrough to another
+/// `FFXI_DAT_PATH` is a skip that says so, not a fallthrough to another
 /// install.
 #[doc(hidden)]
 pub fn open_test_install() -> Option<DatRoot> {
@@ -836,8 +837,9 @@ mod tests {
     }
 
     // Ids 1 and 2 are claimed by the base ROM; ROM2 re-claims id 1 and ROM3
-    // re-claims both, each with its own FTABLE entry. The merge order in
-    // LoadFileTables makes the highest claimant the owner.
+    // re-claims both, each with its own FTABLE entry. The merge in
+    // research/XIClient/src/XIClient/source/System/FileIO/FileIOVirtualFileSystem.cpp
+    // LoadFileTables walks ROMs ascending, so the highest claimant owns the id.
     #[test]
     fn resolve_picks_highest_appid_that_claims_file_id() {
         let (_tmp, root) = synth_root(&[
@@ -945,8 +947,9 @@ mod tests {
 
     // Real-install guard: every ROM's tables fit the base id space (no ROM
     // skipped), and wherever more than one ROM claims an id the highest wins.
-    // The horizonxi-2023 target ships a ROM10 that re-claims base-ROM ids;
-    // retail-2026-09 has no multi-claims, where this passes vacuously.
+    // The horizonxi-2023 target ships a ROM10
+    // that re-claims base-ROM ids; retail-2026-09 has no multi-claims, where
+    // this passes vacuously.
     #[test]
     fn installed_tables_all_fit_and_highest_claim_wins() {
         let Some(root) = open_test_install() else {
@@ -1073,8 +1076,9 @@ mod tests {
         );
     }
 
-    // HorizonXI's XI-Pivot overlays (horizonoverrides, xiview) mix both
-    // spellings, which only matters where the filesystem is case-sensitive.
+    // The XI-Pivot overlays of the horizonxi-2023 target
+    // mix both spellings, which only matters
+    // where the filesystem is case-sensitive.
     #[test]
     fn overlay_matches_a_lowercase_extension() {
         let (_tmp, root) = overlay_root();
@@ -1085,11 +1089,6 @@ mod tests {
         assert_eq!(served_bytes(&root), b"lower");
     }
 
-    // The base install mixes spellings too: retail's Windows fopen is
-    // case-insensitive, so an install assembled by wine or a third-party
-    // launcher can carry `127.dat` and the real client never notices. A
-    // case-sensitive filesystem (a Linux user's install) must not turn that
-    // file into a missing body part.
     #[test]
     fn base_install_matches_a_lowercase_extension() {
         let (tmp, root) = overlay_root();
@@ -1097,9 +1096,8 @@ mod tests {
         assert_eq!(served_bytes(&root), b"base-lower");
     }
 
-    /// The shape XI-Pivot actually ships, from the horizonxi-2023 target
-    /// (vendor/game-files/targets/hxi) — including the Windows `root_path` that
-    /// cannot resolve off Windows.
+    /// The shape XI-Pivot actually ships for the horizonxi-2023 client profile
+    /// — including the Windows `root_path` that cannot resolve off Windows.
     const REAL_PIVOT_INI: &str = "\
 [settings]
 root_path=C:\\Program Files (x86)\\HorizonXI\\HorizonXI\\Game\\polplugins\\DATs

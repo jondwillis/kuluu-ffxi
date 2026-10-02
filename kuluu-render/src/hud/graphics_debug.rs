@@ -1,6 +1,6 @@
 //! Graphics-debug panel: window/image/panel metrics split out of the stair
 //! HUD, plus the rolling panel-position capture (panelpositions.txt) behind
-//! its own Debug-menu toggle so the game never spams a log unasked.
+//! its own Debug-menu toggle so the game does not spam a log unasked.
 
 use bevy::prelude::*;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -27,7 +27,7 @@ pub fn record_surface_size(windows: Res<bevy::render::view::ExtractedWindows>) {
 pub struct GraphicsDebugState {
     /// Window physical size + scale factor.
     pub win: (u32, u32, f32),
-    /// Render-scale off-screen image size (0x0 when the path is inactive).
+    /// Render-scale off-screen image size ((0, 0) when the path is inactive).
     pub img: (u32, u32),
     /// The measured panel's laid-out rect: center (physical px) + size.
     pub panel: (f32, f32, f32, f32),
@@ -82,8 +82,6 @@ pub fn update_graphics_debug_hud(
     let Ok(mut text) = q_text.single_mut() else {
         return;
     };
-    // img: "off" when render-scale isn't producing an off-screen image
-    // (Render Scale = 100%), otherwise the target size.
     let img = if state.img.0 == 0 && state.img.1 == 0 {
         "off (Render Scale = 100%)".to_string()
     } else {
@@ -123,12 +121,12 @@ pub fn update_graphics_debug_hud(
 /// actually writes (plain GlobalTransform on UI stays identity). Duplicate
 /// tolerant: takes the largest laid-out match. The file capture only runs
 /// while the Debug-menu "Position Log" toggle is on; turning it off clears
-/// the buffer so a later session starts fresh.
+/// the buffer so a later session starts fresh. The panel is the party/self
+/// frame (HP/MP/TP/job/Solo): PartyFrameRoot marks each party window's
+/// Absolute root node, and the query picks the largest laid-out match, i.e.
+/// the populated Party A frame.
 pub fn graphics_debug_metrics_system(
     windows: Query<&Window, With<bevy::window::PrimaryWindow>>,
-    // Party/self frame (HP/MP/TP/job/Solo). PartyFrameRoot marks each party
-    // window's Absolute root node; .iter() below picks the largest, i.e. the
-    // populated Party A frame.
     panel: Query<
         (&bevy::ui::ComputedNode, &bevy::ui::UiGlobalTransform),
         With<crate::hud::party_frame::PartyFrameRoot>,
@@ -169,13 +167,10 @@ pub fn graphics_debug_metrics_system(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Nameplate Debug panel: last two render ticks of the final in-view pass.
-// Splits "names don't show" into stages: nothing extracted / hidden culled /
-// texture-not-in-GpuImage-cache / bound-but-no-draws / pipeline-compiling /
-// drawn-but-off-screen (far_ndc answers that one).
-// ---------------------------------------------------------------------------
-
+/// Nameplate Debug panel: last two render ticks of the final in-view pass.
+/// Splits "names don't show" into stages: nothing extracted / hidden culled /
+/// texture-not-in-GpuImage-cache / bound-but-no-draws / pipeline-compiling /
+/// drawn-but-off-screen (far_ndc answers that one).
 #[derive(Component)]
 pub struct NameplateDebugHud;
 
@@ -186,13 +181,22 @@ pub struct NameplateDebugText;
 /// right: plates extracted -> hidden culled upstream -> GPU texture cache
 /// misses (nogpuimg) / data-not-uploaded (nodata) -> bound this tick ->
 /// drawn into the operator view (pipeline + farthest-plate clip position).
+/// The all-zero plus no-draw case reads "in flight": Prepare writes
+/// bound/gputex unconditionally when it runs, so zeros at HUD-read time mean
+/// the render thread had not finished P/D for that tick (extract ran ahead of
+/// its own pass). The main line stays short (panel width) — draws + pipeline
+/// state only; the farthest plate (head of the blend order) reports on screen
+/// as ndc xy inside [-1, 1] with w > 0, and alpha near 0 means fully faded
+/// even if in view. The billboard gate breakdown (main-world mirror of
+/// Visibility::Hidden) answers why `hidden` is what it is, and only when
+/// there is something to explain. `{tag}` captures the tag parameter from
+/// scope; the bare specifiers take the eight counters in order, and `rebound`
+/// counts the bind groups rebuilt this tick because a plate's texture changed
+/// under its handle.
 fn nameplate_snap_line(tag: &str, s: NameplateFrameSnap) -> String {
     let draw = if !s.operator_cam {
         "NO OPERATOR CAMERA".to_string()
     } else if !s.reached_draw {
-        // Prepare writes bound/gputex unconditionally when it runs; all-zero
-        // plus no draw means the render thread simply hadn't finished P/D for
-        // this tick at HUD-read time (extract ran ahead of its own pass).
         if s.bound == 0 && s.gpu_images_total == 0 {
             "in flight (P/D not done at read time)".to_string()
         } else {
@@ -214,7 +218,6 @@ fn nameplate_snap_line(tag: &str, s: NameplateFrameSnap) -> String {
             None => format!("draws=0 pipe=ok samples={}", s.samples),
         }
     } else {
-        // Main line stays short (panel width): draws + pipeline state only.
         let main = match s.target_fmt {
             Some(f) => format!(
                 "draws={} pipe=ok fmt={:?} samples={}",
@@ -222,15 +225,10 @@ fn nameplate_snap_line(tag: &str, s: NameplateFrameSnap) -> String {
             ),
             None => format!("draws={} pipe=ok samples={}", s.draws, s.samples),
         };
-        // Farthest plate (head of the blend order): on screen = ndc xy inside
-        // [-1, 1] AND w > 0; alpha near 0 means fully faded even if in view.
         let mut tail = format!(
             "far_ndc=({:+.2},{:+.2}) w={:.3} alpha={:.2}",
             s.far_ndc_x, s.far_ndc_y, s.far_w, s.far_alpha
         );
-        // Billboard gate breakdown (main-world mirror of Visibility::Hidden):
-        // answers "why is `hidden` what it is". Only when there's something to
-        // explain.
         if s.bb_total > 0 || s.hidden > 0 {
             tail.push_str(&format!(
                 " bb {} visible of {} | self={} status={} depth-gate={} gone={}",
@@ -245,9 +243,6 @@ fn nameplate_snap_line(tag: &str, s: NameplateFrameSnap) -> String {
         format!("{}\n      {}", main, tail)
     };
     format!(
-        // {tag} captures the `tag` parameter from scope; the bare specifiers
-        // take the eight counters in order. `rebound` = bind groups rebuilt
-        // this tick because a plate's texture changed under its handle.
         "{tag}: plates={} hidden={} nogpuimg={} nodata={} bound={} rebound={} gputex={} | {}",
         s.plates_total,
         s.hidden,
@@ -282,6 +277,9 @@ pub fn spawn_nameplate_debug_hud(mut commands: Commands) {
         });
 }
 
+/// Renders the Nameplate Debug panel from the pass's last two ticks. The ring
+/// is render-thread-owned; the lock is held only for this brief format read,
+/// not across a system boundary.
 pub fn update_nameplate_debug_hud(
     panels: Res<crate::hud::HudPanels>,
     mut q_root: Query<&mut Visibility, With<NameplateDebugHud>>,
@@ -302,8 +300,6 @@ pub fn update_nameplate_debug_hud(
     let Ok(mut text) = q_text.single_mut() else {
         return;
     };
-    // Render-thread-owned ring of the last two ticks; held only for this brief
-    // read, never across a system boundary.
     let s = {
         let dbg = NAMEPLATE_PASS_DEBUG
             .lock()

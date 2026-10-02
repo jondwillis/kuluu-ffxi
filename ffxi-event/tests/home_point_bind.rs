@@ -33,9 +33,9 @@ fn load() -> Option<(EventDat, StringDat)> {
 }
 
 /// Drives the event choosing `first` on the "What will you do?" menu and `later` on
-/// every menu after it, returning the cues in order. The event's own 0x43
-/// send-tag and WAIT parks are answered the way a live host would, so they do
-/// not stop the drive.
+/// every menu after it, returning the cues in order. The event's own SENDTAG
+/// and WAIT parks are answered the way a live host would, so they do not stop
+/// the drive.
 fn drive(
     dat: &EventDat,
     strings: &StringDat,
@@ -67,9 +67,9 @@ fn drive(
 }
 
 /// Runs to the next dialog frame, answering the parks the event's own
-/// choreography sets: the 0x43 send-tag is acked the way the server would
-/// (a unit test has no c2s/s2c round-trip) and a timed wait is run to
-/// expiry, the pattern the runner's own tests use.
+/// choreography sets: the SENDTAG is acked the way the server would (a unit
+/// test has no c2s/s2c round-trip) and a timed wait is run to expiry, the
+/// pattern the runner's own tests use.
 fn advance_past_parks(
     runner: &mut DialogRunner,
     choice: Option<u32>,

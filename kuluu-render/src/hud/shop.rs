@@ -78,13 +78,15 @@ pub struct ShopRow {
     pub index: u8,
     pub item_no: u16,
     /// Unit price for a buy row; 0 on a sell row, whose price the server only
-    /// reveals in the 0x03D appraisal.
+    /// reveals in the 0x03D appraisal
+    /// (vendor/server/src/map/packets/s2c/0x03d_shop_sell.cpp).
     pub price: u32,
     /// Held quantity for a sell row; 0 on a buy row, where stock is unlimited.
     pub quantity: u32,
 }
 
-/// A price the server has quoted for one of the player's stacks (s2c 0x03D).
+/// A price the server has quoted for one of the player's stacks (s2c 0x03D,
+/// vendor/server/src/map/packets/s2c/0x03d_shop_sell.cpp).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Appraisal {
     pub item_index: u8,
@@ -443,12 +445,23 @@ pub struct ShopPanel;
 enum ShopTextRole {
     RowName(usize),
     RowPrice(usize),
+    /// Marks exactly one row: the one the cursor is on while the picker has
+    /// focus, and the side being browsed once the list takes over.
     MenuRow(usize),
     MenuTitle,
+    /// Retail swaps the Current Gil box for the quantity picker while a stack
+    /// is being sized; the priced step labels what the figure under it is, so
+    /// it is not misread as the player's purse. The picker under the label
+    /// carries the cap, so the label does not repeat it.
     GilLabel,
+    /// A sell total exists only once the server answers; until then the label
+    /// above already promises a figure for this sale, so the purse under it
+    /// would read as that figure.
     GilValue,
     ConfirmChoice(bool),
     QuantityColumn(SpinnerSlot),
+    /// The per-unit price is not repeated here: it is on the row, where retail
+    /// leaves it once the appraisal lands.
     DetailName,
     DetailBody,
 }
@@ -571,7 +584,6 @@ pub(crate) fn spawn_shop_panel(mut commands: Commands, mut images: ResMut<Assets
                         list_view::spawn_scrollbar(p, ShopScrollTrack, ShopScrollThumb);
                     });
 
-                // The Buy/Sell picker (retail's `shopmain`).
                 let (mut n, bg, bd) = framed_box();
                 n.width = Val::Px(DOCK_WIDTH_PX);
                 top.spawn((n, bg, bd)).with_children(|dock| {
@@ -756,8 +768,6 @@ pub(crate) fn update_shop_panel_system(
                 None => (String::new(), theme::TEXT),
             },
             ShopTextRole::MenuTitle => (SHOP_TITLE.to_string(), theme::TITLE),
-            // The picker always marks one row: the one the cursor is on while
-            // it has focus, and the side being browsed once the list takes over.
             ShopTextRole::MenuRow(i) => {
                 let mode = ShopMode::ROWS[i];
                 let marked = if list_active {
@@ -774,12 +784,7 @@ pub(crate) fn update_shop_panel_system(
                     },
                 )
             }
-            // Retail swaps the Current Gil box for the quantity picker while a
-            // stack is being sized. The priced step then labels what the figure
-            // under it is, so it cannot be misread as the player's purse.
             ShopTextRole::GilLabel => match (screen.quantity.as_ref(), screen.focus) {
-                // The picker under this label carries the cap, so the label does
-                // not repeat it.
                 (Some(_), _) => ("Quantity".to_string(), theme::TITLE),
                 (None, ShopFocus::Confirm) => (confirm_total_label(screen.mode), theme::MUTED),
                 (None, _) => ("Current Gil".to_string(), theme::MUTED),
@@ -793,9 +798,6 @@ pub(crate) fn update_shop_panel_system(
                         theme::DANGER
                     },
                 ),
-                // A sell total only exists once the server answers, and the
-                // label above already promises a figure for this sale — the
-                // purse under it would read as that figure.
                 None if !matches!(screen.focus, ShopFocus::List | ShopFocus::Menu) => {
                     (APPRAISING.to_string(), theme::MUTED)
                 }
@@ -826,8 +828,6 @@ pub(crate) fn update_shop_panel_system(
                 }
                 (label, tint)
             }
-            // The per-unit price is not repeated here: it is on the row, where
-            // retail leaves it once the appraisal lands.
             ShopTextRole::DetailName => match (screen.focus, focused) {
                 (ShopFocus::Confirm, _) => match confirm_line(&screen, snap) {
                     Some(line) => (line, theme::CURSOR),
@@ -966,7 +966,9 @@ pub(crate) fn shop_mouse_click_system(
 
 /// The wheel walks the ware list under the pointer a row at a time. It moves the
 /// cursor rather than the page on its own: the page follows the cursor every
-/// frame, so a page scrolled away from it would snap straight back.
+/// frame, so a page scrolled away from it would snap straight back. Wheel away
+/// from the player walks toward the top of the list, where the row index is
+/// lowest.
 pub(crate) fn shop_wheel_scroll_system(
     mut wheel: MessageReader<MouseWheel>,
     state: Res<SceneState>,
@@ -985,8 +987,6 @@ pub(crate) fn shop_wheel_scroll_system(
         return;
     }
     let len = rows_for(screen.mode, &state.snapshot).len();
-    // Wheel away from the player walks toward the top of the list, where the
-    // row index is lowest.
     let (cursor, frac) = list_view::apply_wheel_delta(screen.cursor, *accum, -delta, len);
     *accum = frac;
     screen.set_cursor(cursor, len);
@@ -1050,18 +1050,19 @@ fn empty_list_prompt(mode: ShopMode) -> &'static str {
     }
 }
 
+/// The sell side shows how many the player is holding, as the bag list does.
 fn row_label(row: &ShopRow, mode: ShopMode) -> String {
     let name = item_name(row.item_no, None);
     match mode {
         ShopMode::Buy => name,
-        // A stack shows how many the player is holding, as the bag list does.
         ShopMode::Sell if row.quantity > 1 => format!("{name} ({})", row.quantity),
         ShopMode::Sell => name,
     }
 }
 
 /// A sell row starts blank — the server only reveals a price in the 0x03D
-/// appraisal a confirm asks for — and keeps the quote once it lands.
+/// appraisal a confirm asks for (vendor/server/src/map/packets/s2c/0x03d_shop_sell.cpp) —
+/// and keeps the quote once it lands.
 fn row_price(row: &ShopRow, screen: &ShopScreenState) -> String {
     match screen.mode {
         ShopMode::Buy => format!("{} G", group_digits(row.price)),
@@ -1374,16 +1375,22 @@ mod tests {
         sell.record_appraisal(quote(&snap));
         assert_eq!(sell_unit_price(&sell, Some(&row)), Some(10));
 
-        // A quote for a different slot must not price this row.
         let other = ShopRow { index: 9, ..row };
-        assert_eq!(sell_unit_price(&sell, Some(&other)), None);
+        assert_eq!(
+            sell_unit_price(&sell, Some(&other)),
+            None,
+            "a quote for a different slot does not price this row"
+        );
 
-        // The buy side prices itself off the listed price, never the quote.
         let buy = ShopScreenState {
             mode: ShopMode::Buy,
             ..sell.clone()
         };
-        assert_eq!(sell_unit_price(&buy, Some(&row)), None);
+        assert_eq!(
+            sell_unit_price(&buy, Some(&row)),
+            None,
+            "the buy side prices off the listed price, not the quote"
+        );
     }
 
     #[test]
@@ -1467,8 +1474,6 @@ mod tests {
         );
         assert_eq!(row_price(&ore, &s), "40 G");
 
-        // Re-pricing the same stack at a different count replaces its quote
-        // rather than stacking a second one behind it.
         s.record_appraisal(&ShopSale {
             item_index: crystals.index,
             item_no: crystals.item_no,
@@ -1476,7 +1481,11 @@ mod tests {
             count: 12,
         });
         assert_eq!(s.appraised.len(), 2);
-        assert_eq!(row_price(&crystals, &s), "1,300 G");
+        assert_eq!(
+            row_price(&crystals, &s),
+            "1,300 G",
+            "re-pricing the same stack replaces its quote"
+        );
 
         s.move_menu_cursor(1);
         s.enter_list();

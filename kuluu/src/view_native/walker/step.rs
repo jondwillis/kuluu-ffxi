@@ -48,8 +48,11 @@ impl Sampler for FloorSampler<'_> {
 
 /// Wall source for the body sweep: MZB zone geometry plus closed-door
 /// triangles: a door is a wall for the sweep AND a floor for the column
-/// probe. Door normals are winding-derived and oriented toward the
-/// query point at contact time, so either mesh authoring side blocks.
+/// probe. Up-facing door faces (a drawbridge deck) are floors, not walls —
+/// the column probe owns them (the 45 degree rule). Door normals are
+/// winding-derived and oriented toward the body at contact time, so either
+/// mesh authoring side blocks: slide re-projection and depenetration both
+/// need "from face to free space".
 struct Walls<'a> {
     geom: &'a MzbCollisionGeometry,
     doors: &'a [DoorObstacle],
@@ -64,15 +67,11 @@ impl WallSource for Walls<'_> {
                 continue;
             }
             for (v, n) in &d.tris {
-                // The 45 degree rule: an up-facing door face (a drawbridge deck)
-                // is a floor, not a wall — the column probe owns it.
                 if n.y >= FLOOR_COS {
                     continue;
                 }
                 let d2 = point_tri_dist_sq(center, v[0], v[1], v[2]);
                 if d2 < r2 && best.is_none_or(|(bd, _)| d2 < bd) {
-                    // Orient the face normal toward the body: slide re-projection
-                    // and depenetration both need "from face to free space".
                     let closest = closest_point_on_tri(center, v[0], v[1], v[2]);
                     let mut n = *n;
                     if n.dot(center - closest) < 0.0 {
@@ -114,8 +113,8 @@ fn door_floor_at(d: &DoorObstacle, xz: Vec2, ceiling_y: f32) -> Option<f32> {
 
 /// True when any closed-door triangle crosses the vertical slab `(lo_y, hi_y]`
 /// at `xz` — the door half of the ceiling hold: any triangle crossing the slab
-/// blocks the rise, whatever its face class. A descent never trips it; callers
-/// gate on a rise first.
+/// blocks the rise, whatever its face class. A descent does not trip it;
+/// callers gate on a rise first.
 fn doors_in_column_slab(doors: &[DoorObstacle], xz: Vec2, lo_y: f32, hi_y: f32) -> bool {
     for d in doors {
         if !column_in_box(d.min.x, d.max.x, d.min.z, d.max.z, xz) {
@@ -136,7 +135,7 @@ fn doors_in_column_slab(doors: &[DoorObstacle], xz: Vec2, lo_y: f32, hi_y: f32) 
 }
 
 /// Downward vertical ray at `xz` against triangle `v`: the hit height, or None
-/// when the face is parallel to the column (vertical faces never cross it).
+/// when the face is parallel to the column (vertical faces do not cross it).
 fn tri_hits_column(v: [Vec3; 3], xz: Vec2) -> Option<f32> {
     let (a, b, c) = (v[0], v[1], v[2]);
     let e1 = b - a;
@@ -159,7 +158,8 @@ fn tri_hits_column(v: [Vec3; 3], xz: Vec2) -> Option<f32> {
 }
 
 /// Closest point on triangle (a, b, c) to `p` — Ericson §5.1.3, the same
-/// region walk as `point_tri_dist_sq` without the final distance.
+/// region walk as `point_tri_dist_sq` without the final distance. A
+/// degenerate triangle (zero area) falls back to vertex `a`.
 fn closest_point_on_tri(p: Vec3, a: Vec3, b: Vec3, c: Vec3) -> Vec3 {
     let ab = b - a;
     let ac = c - a;
@@ -198,7 +198,6 @@ fn closest_point_on_tri(p: Vec3, a: Vec3, b: Vec3, c: Vec3) -> Vec3 {
     }
     let denom = va + vb + vc;
     if denom.abs() <= f32::EPSILON {
-        // p is in the vertex region of a degenerate triangle.
         return a;
     }
     let v = vb / denom;
@@ -261,6 +260,43 @@ fn contact_blocks(
 /// One fixed tick of the walker. Wire coordinates throughout at the boundary:
 /// x/y horizontal, z grows DOWN (the frame `AgentCommand::Move` carries).
 /// Pure over its inputs — no ECS — so the test matrices can drive it headless.
+///
+/// Horizontal: the wall sweep runs at the PRE-move height — nothing below
+/// feet + STEP_MAX is a horizontal obstacle, and vertical authority lands
+/// after it. No input this tick means nothing to sweep; only the idle
+/// contact test still runs against the standing position. Boxed-in and
+/// no-slide stops leave the body at the contact position. Noclip bypasses
+/// walls AND mobs (free-fly for debugging); grounding stays on either way.
+///
+/// Actor contact is all-or-nothing against the single nearest actor to the
+/// projected position, and drops the tick's movement instead of
+/// depenetrating: overlap is legal, a standing player is not shoved, and the
+/// expiring budget turns sustained input into a walk-through.
+///
+/// Vertical: airborne persists until a landing (steering stays live in the
+/// air); otherwise input decides — want_len == 0 is Stopped this tick. With
+/// no floor source for the zone yet (main MZB block not landed) the
+/// server-seeded height holds instead of gravity integrating against an
+/// empty column set — the same hold from rest, since a zone whose floor has
+/// not landed is not a ledge. A landing sets y to the floor that entered the
+/// swept band [y_new, feet_y]: a bank too steep to stand on still stops the
+/// fall at the feet column, retail's sphere query colliding with every
+/// polygon, so nothing falls through. A missed support from rest (a ledge,
+/// a hole wider than the footprint) enters Airborne holding height this
+/// tick; the fall starts next. Grounded merges toward the target at
+/// speed_yps * dt per tick — the whole blend model — sampling the field
+/// only when it can matter: a moving walker on a staircase window rides the
+/// envelope, everything else targets h0 direct.
+///
+/// Target + decision: the dead band snaps to h0 instantly; a staircase
+/// window rides the slewed envelope (the gradient slews toward this tick's
+/// fit, so a wobbly estimate or a fast 180 does not spike it); a wall face
+/// ahead caps the chain — hold h0, no rise, the sweep slides on it. The
+/// merge is rate-limited to speed_yps * dt per tick; outside Airborne a |dy|
+/// above STEP_MAX means the field is lying — hold and log. A rise is
+/// rejected for the tick when any triangle sits in (feet + BODY_HEIGHT,
+/// y_new + BODY_HEIGHT] at the new column (MZB or a closed door above us).
+/// Idle ticks run the same settle, named Stopped for the panel.
 pub fn step(
     geom: &MzbCollisionGeometry,
     obstacles: &ObstacleSet,
@@ -289,16 +325,9 @@ pub fn step(
         doors: &obstacles.doors,
     };
 
-    // ---- 1. Horizontal -----------------------------------------------------
-    // The wall sweep runs at the PRE-move height: nothing below
-    // feet + STEP_MAX is a horizontal obstacle, and vertical authority lands
-    // after it. Noclip bypasses walls AND mobs — free-fly for debugging;
-    // grounding stays on either way.
     let mut outcome;
     let mut d;
     if want_len <= 1e-6 {
-        // No input this tick: nothing to sweep; only the idle contact test
-        // below still runs against the standing position.
         outcome = HorizontalOutcome::NoInput;
         d = d_in;
     } else if noclip {
@@ -307,7 +336,6 @@ pub fn step(
     } else {
         let (swept, exit) = sweep::sweep(&walls, feet_xz, feet_y, d_in);
         outcome = match exit {
-            // Boxed-in and no-slide stops: the body is at the contact position.
             sweep::SweepExit::Hold => HorizontalOutcome::WallHold {
                 contact: Some(feet_xz + swept),
             },
@@ -326,10 +354,6 @@ pub fn step(
         d = swept;
     }
 
-    // Actor contact is all-or-nothing against the single nearest actor to the
-    // projected position, and drops the tick's movement instead of
-    // depenetrating: overlap is legal, a standing player is never shoved, and
-    // the expiring budget turns sustained input into a walk-through.
     if !noclip && contact_blocks(&obstacles.mobs, feet_xz + d, dt, &mut state.contact) {
         d = Vec2::ZERO;
         outcome = HorizontalOutcome::ActorContact {
@@ -340,21 +364,14 @@ pub fn step(
 
     let new_xz = feet_xz + d;
 
-    // ---- 2. Support at the NEW xz ------------------------------------------
     let probe = field::support_probe(&sampler, new_xz, feet_y);
 
-    // Mode: airborne persists until a landing (steering stays live in the air);
-    // otherwise input decides — want_len == 0 is Stopped this tick.
     let was_airborne = matches!(state.mode, WalkMode::Airborne { .. });
     let grounded_now = probe.grounded;
 
-    // ---- 3. Vertical --------------------------------------------------------
     let mut y_new = feet_y;
     let decision = if was_airborne {
         if !geometry_ready {
-            // No floor source for this zone yet (main MZB block not landed):
-            // nothing to fall through — hold the server-seeded height instead of
-            // integrating gravity against an empty column set. y_new stays feet_y.
             state.mode = if want_len > 1e-6 {
                 WalkMode::Walking
             } else {
@@ -369,10 +386,6 @@ pub fn step(
             let vy = (prev_vy - state.fall.g * dt).max(-state.fall.v_max);
             y_new = feet_y + vy * dt;
 
-            // Landing: a floor entered the swept band [y_new, feet_y] under the
-            // footprint. Set y to it, mode by input, vy = 0. A bank too steep to
-            // stand on still stops the fall at the feet column: retail's sphere
-            // query collides with every polygon, so nothing is ever fallen through.
             match landing_floor(&sampler, new_xz, y_new, feet_y)
                 .or_else(|| geom.highest_up_facing_hit_in_slab(new_xz, y_new, feet_y))
             {
@@ -393,8 +406,6 @@ pub fn step(
         }
     } else if !grounded_now {
         if !geometry_ready {
-            // Same hold from rest: a zone whose floor has not landed is not a
-            // ledge — there is simply no geometry to be off of yet.
             state.mode = if want_len > 1e-6 {
                 WalkMode::Walking
             } else {
@@ -402,17 +413,10 @@ pub fn step(
             };
             VerticalDecision::NoGeometry
         } else {
-            // Support missed: no floor within the step band under the footprint —
-            // a ledge, a hole wider than the footprint. Enter Airborne from rest;
-            // this tick holds height (the fall starts next tick).
             state.mode = WalkMode::Airborne { vy: 0.0 };
             VerticalDecision::Airborne { vy: 0.0 }
         }
     } else {
-        // Grounded: merge toward the target at speed_yps * dt per tick — that's
-        // the whole blend model. The field is only sampled when it
-        // can matter: a moving walker on a staircase window rides the envelope;
-        // everything else targets h0 direct.
         let v = speed_yps * dt;
         let h0 = probe.h0.expect("grounded implies an accepted support hit");
 
@@ -423,13 +427,9 @@ pub fn step(
 
         let h0 = field_opt.as_ref().and_then(|f| f.h0).unwrap_or(h0);
 
-        // Target + decision: dead band snaps to h0 instantly; a staircase
-        // window rides the slewed envelope; everything else targets h0 direct.
         let (target, mut decision) = match &field_opt {
             Some(f) if f.poof => (h0, VerticalDecision::Poof { delta: h0 - feet_y }),
             Some(f) if f.target.is_some() => {
-                // Slew the gradient toward this tick's fit: a
-                // wobbly estimate or a fast 180 can't spike g.
                 let g_new = f.g;
                 state.grad.x += (g_new.x - state.grad.x).clamp(-GRAD_SLEW, GRAD_SLEW);
                 state.grad.y += (g_new.y - state.grad.y).clamp(-GRAD_SLEW, GRAD_SLEW);
@@ -453,8 +453,6 @@ pub fn step(
                     .iter()
                     .any(|s| s.status == field::SampleStatus::WallAhead) =>
             {
-                // A wall face ahead capped the chain: hold h0, no rise — the
-                // sweep slides on it.
                 (h0, VerticalDecision::WallAhead)
             }
             _ => {
@@ -469,7 +467,6 @@ pub fn step(
             }
         };
 
-        // Rate-limit the merge to speed_yps * dt per tick.
         let target = if want_len > 1e-6 && state.grad.x > CHAIN_CEILING_EPS {
             let forward_floor = field_opt.as_ref().and_then(|field| {
                 field
@@ -489,8 +486,6 @@ pub fn step(
         let delta = (target - feet_y).clamp(-v, v);
         y_new = feet_y + delta;
 
-        // Sanity cap outside Airborne: |dy| <= STEP_MAX per tick — if the field
-        // ever asks for more it's lying; hold and log.
         if y_new - feet_y > STEP_MAX + 1e-6 || feet_y - y_new > STEP_MAX + 1e-6 {
             eprintln!(
                 "walker: vertical delta {} exceeds STEP_MAX, holding",
@@ -499,9 +494,6 @@ pub fn step(
             y_new = feet_y;
         }
 
-        // Ceiling hold: a rise is rejected for the tick when any
-        // triangle sits in (feet + BODY_HEIGHT, y_new + BODY_HEIGHT] at the new
-        // column — MZB or a closed door above us.
         if y_new > feet_y + 1e-6 {
             let held = sweep::ceiling_holds(geom, new_xz, feet_y, y_new)
                 || doors_in_column_slab(
@@ -528,7 +520,6 @@ pub fn step(
         } else {
             WalkMode::Stopped
         };
-        // Idle ticks: the same settle, named for the panel.
         if !matches!(decision, VerticalDecision::Poof { .. }) && want_len <= 1e-6 {
             decision = VerticalDecision::Stopped {
                 settling: (y_new - feet_y).abs() > 1e-9,
@@ -549,23 +540,23 @@ pub fn step(
 
 #[cfg(test)]
 mod tests {
+    //! The rate/fall math below is exercised directly rather than through
+    //! `step` over a synthetic geometry: the MZB side of a default geometry
+    //! has no blocks, so driving `step` would couple these tests to door
+    //! plumbing.
     use super::*;
     use crate::view_native::walker::ActorContact;
 
-    // The rate/fall math below is exercised directly rather than through
-    // `step` over a synthetic geometry: the MZB side of a default geometry has
-    // no blocks, so driving `step` would couple these tests to door plumbing.
-
+    /// y(t), vy(t) for a drop from rest under FallModel{g, v_max}.
     fn fall_closed_form(g: f32, v_max: f32, t: f32) -> (f32, f32) {
-        // y(t), vy(t) for a drop from rest under FallModel{g, v_max}.
         let t_term = (v_max / g).min(t);
         let dist = 0.5 * g * t_term * t_term + v_max * (t - t_term);
         let vy = -(g * t_term).min(v_max);
         (-dist, vy)
     }
 
+    /// Inverse of fall_closed_form: time to fall `dist` from rest.
     fn fall_time(g: f32, v_max: f32, dist: f32) -> f32 {
-        // Inverse of fall_closed_form: time to fall `dist` from rest.
         let t_term = v_max / g;
         let d_term = 0.5 * g * t_term * t_term;
         if dist <= d_term {
@@ -575,24 +566,24 @@ mod tests {
         }
     }
 
+    /// The retail derivation in walker::consts, pinned so a change to either
+    /// factor has to be deliberate: a per-frame step growing 0.040833335 per
+    /// tick over 60 ticks and 30 frames a second is 73.5 yalms/s^2, and the
+    /// 1 yalm step ceiling at 30 frames a second is 30 yalms/s. Terminal
+    /// speed arrives after 6.12 yalms of drop. The closed form itself: past
+    /// the terminal time (0.408 s) it runs at v_max (at t=1.0: 6.1224 yalms
+    /// of parabola + 30 * 0.5918, vy -30). Euler integration of the same
+    /// model must land within one tick of the closed-form time at production
+    /// dt.
     #[test]
     fn fall_model_matches_closed_form() {
-        // The retail derivation in walker::consts, pinned so a change to either
-        // factor has to be deliberate: a per-frame step growing 0.040833335 per
-        // tick over 60 ticks and 30 frames a second is 73.5 yalms/s^2, and the
-        // 1 yalm step ceiling at 30 frames a second is 30 yalms/s. Terminal
-        // speed arrives after 6.12 yalms of drop.
         let fall = FallModel::default();
         assert!((fall.g - 73.5).abs() < 1e-4);
         assert!((fall.v_max - 30.0).abs() < 1e-6);
 
-        // The closed form itself: past the terminal time (0.408 s) it runs at
-        // v_max (at t=1.0: 6.1224 yalms of parabola + 30 * 0.5918, vy -30).
         let (d, v) = fall_closed_form(fall.g, fall.v_max, 1.0);
         assert!((d - (-23.8776)).abs() < 1e-3 && (v - -30.0).abs() < 1e-6);
 
-        // Euler integration of the same model must land within one tick of the
-        // closed-form time at production dt.
         let dt = 1.0 / 60.0;
         for dist in [1.0f32, 3.0, 10.0] {
             let mut y = 0.0f32;
@@ -616,15 +607,15 @@ mod tests {
         }
     }
 
+    /// From a stop on a 0.3 float at run speed (5 y/s, 60 Hz): y reaches h0
+    /// in ceil(0.3 / (speed*dt)) ticks, monotonically.
     #[test]
     fn rate_limit_reaches_h0_in_expected_ticks() {
-        // From a stop on a 0.3 float at run speed (5 y/s, 60 Hz): y reaches h0
-        // in ceil(0.3 / (speed*dt)) ticks, monotonically.
         let speed = 5.0;
         let dt = 1.0 / 60.0;
         let v = speed * dt;
         let gap = 0.3f32;
-        let mut y = -gap; // floating above the floor at 0
+        let mut y = -gap;
         let mut ticks = 0u32;
         let mut monotone = true;
         while y < -1e-9 {
@@ -639,37 +630,37 @@ mod tests {
         assert!(monotone);
     }
 
+    /// Tap and release: y moves at most 2 * speed * dt total, then settles
+    /// back — the rate limit is symmetric in both directions.
     #[test]
     fn tap_forward_two_ticks_moves_at_most_two_steps() {
-        // Tap and release: y moves at most 2 * speed * dt total, then settles
-        // back — the rate limit is symmetric in both directions.
         let speed = 5.0;
         let dt = 1.0 / 60.0;
         let v = speed * dt;
         let mut y = 0.0f32;
         for _ in 0..2 {
-            y += (0.3 - y).clamp(-v, v); // rising toward a 0.3 target
+            y += (0.3 - y).clamp(-v, v);
         }
         assert!(y <= 2.0 * v + 1e-9, "moved {y}");
         let mut settle = y;
         for _ in 0..60 {
-            settle += (0.0 - settle).clamp(-v, v); // back to the floor
+            settle += (0.0 - settle).clamp(-v, v);
         }
         assert!(settle.abs() < 1e-9, "settled at {settle}");
     }
 
+    /// 0.41 ledge: beyond the step band on every probe => Airborne (a fall);
+    /// 0.39: inside it => a step-down at speed, not a fall (support probe
+    /// acceptance: hit >= feet_y - STEP_MAX). The fall itself: off a 3.0
+    /// ledge, y(t) matches FallModel and lands within one tick of the
+    /// analytic time — solve 0.5 g t^2 = 3 for the pre-terminal phase.
     #[test]
     fn just_past_step_band_is_a_fall_just_under_is_a_step() {
-        // 0.41 ledge: beyond the step band on every probe => Airborne (a fall).
-        // 0.39: inside it => a step-down at speed, not a fall.
         let dt = 1.0 / 60.0;
         for (drop, is_fall) in [(0.41f32, true), (0.39f32, false)] {
-            // Support probe acceptance: hit >= feet_y - STEP_MAX.
             let accepted = drop <= STEP_MAX + 1e-6;
             assert_eq!(accepted, !is_fall, "drop {drop}");
         }
-        // And the fall itself: off a 3.0 ledge, y(t) matches FallModel and it
-        // lands within one tick of the analytic time (closed form below).
         let fall = FallModel::default();
         let mut y = 3.0f32;
         let mut vy = 0.0f32;
@@ -679,7 +670,6 @@ mod tests {
             y += vy * dt;
             t += dt;
         }
-        // Analytic: solve 0.5 g t^2 = 3 for the pre-terminal phase.
         let t_analytic = (2.0 * 3.0 / fall.g).sqrt();
         assert!(
             (t - t_analytic).abs() <= dt + 1e-6,
@@ -687,12 +677,13 @@ mod tests {
         );
     }
 
+    /// A floor inside [y_new, y_old] lands; one below the band does not. The
+    /// step runs at terminal speed (~0.5 yalm per tick).
     #[test]
     fn landing_band_catches_the_floor_it_sweeps_over() {
-        // A floor inside [y_new, y_old] lands; one below the band does not.
         let fall = FallModel::default();
         let dt = 1.0 / 60.0;
-        let vy = -fall.v_max; // terminal speed: ~0.5 yalm per tick
+        let vy = -fall.v_max;
         for (floor_drop, should_land) in [(0.4f32, true), (0.9f32, false)] {
             let y_old = 10.0f32;
             let y_new = y_old + vy * dt;
@@ -702,11 +693,11 @@ mod tests {
         }
     }
 
+    /// field_5AC = 30 decremented by CheckTick() (60 / EffectiveFramerate)
+    /// is 30 sixtieths of a second regardless of our tick rate: the same
+    /// wall-clock window at 60 Hz and at 30 Hz.
     #[test]
     fn contact_budget_expires_after_retail_window() {
-        // field_5AC = 30 decremented by CheckTick() (60 / EffectiveFramerate)
-        // is 30 sixtieths of a second regardless of our tick rate: the same
-        // wall-clock window at 60 Hz and at 30 Hz.
         for hz in [60.0f32, 30.0] {
             let dt = 1.0 / hz;
             let mut c = ActorContact::default();
@@ -723,26 +714,27 @@ mod tests {
         }
     }
 
+    /// Exhaust the budget against actor 1; a different nearest actor re-arms
+    /// it (what makes a crowd stutter rather than open up); separating
+    /// clears all three fields, so the next approach blocks again.
     #[test]
     fn contact_budget_rearms_on_target_change_and_clear() {
         let dt = 1.0 / 60.0;
-        // Exhaust the budget against actor 1.
         let mut c = ActorContact::default();
         while c.contact(1, dt) {}
         assert!(
             !c.contact(1, dt),
             "expired budget must keep passing through"
         );
-        // A different nearest actor re-arms the budget: this is what makes a
-        // crowd stutter rather than open up.
         assert!(c.contact(2, dt), "target switch must re-arm");
-        // Separating clears all three fields, so the next approach blocks again.
         while c.contact(2, dt) {}
         c.clear();
         assert_eq!(c.target(), None);
         assert!(c.contact(2, dt), "clear must re-arm the same actor");
     }
 
+    /// Beyond the 8 yalm scan seed nothing is a candidate, however close the
+    /// circles would otherwise be.
     #[test]
     fn contact_takes_the_nearest_actor_only() {
         let dt = 1.0 / 60.0;
@@ -762,8 +754,6 @@ mod tests {
         assert!(contact_blocks(&mobs, Vec2::ZERO, dt, &mut c));
         assert_eq!(c.target(), Some(2), "nearest actor owns the contact");
 
-        // Beyond the 8 yalm scan seed nothing is a candidate, however close the
-        // circles would otherwise be.
         let far = [MobObstacle {
             id: 3,
             center: Vec2::new(CONTACT_SEARCH_RADIUS + 1.0, 0.0),
@@ -773,11 +763,11 @@ mod tests {
         assert!(!contact_blocks(&far, Vec2::ZERO, dt, &mut c));
     }
 
+    /// Retail withholds movement; it does not push the player out. Standing
+    /// still overlapping an actor must therefore produce zero displacement,
+    /// not a shove to the circle boundary.
     #[test]
     fn contact_never_depenetrates() {
-        // Retail withholds movement; it never pushes the player out. Standing
-        // still overlapping an actor must therefore produce zero displacement,
-        // not a shove to the circle boundary.
         let dt = 1.0 / 60.0;
         let mobs = [MobObstacle {
             id: 1,
@@ -792,9 +782,9 @@ mod tests {
         assert_eq!(d, Vec2::ZERO, "overlap must not generate a push-out");
     }
 
+    /// A floor quad at y=0.5 under the ray: hit; a vertical wall face: miss.
     #[test]
     fn tri_hits_column_finds_horizontal_faces_only() {
-        // A floor quad at y=0.5 under the ray: hit; a vertical wall face: miss.
         let floor = [
             Vec3::new(0.0, 0.5, 0.0),
             Vec3::new(1.0, 0.5, 0.0),
@@ -827,23 +817,23 @@ mod tests {
         assert_eq!(tri_hits_column(triangle, Vec2::new(6.0, 8.0)), None);
     }
 
+    /// First-load race: self enters the snapshot before
+    /// this zone's main MZB block lands. With an empty column set every
+    /// support probe misses — without the hold, that reads as "no floor in
+    /// reach" and gravity integrates from the server seed forever (each
+    /// fallen z reported via Move is mirrored into self_pos by the session,
+    /// so no resync fires). geometry_ready=false must hold wire z at the
+    /// seed; once ready flips true with still no floor underfoot, the fall
+    /// starts again (a ledge over a hole is not a load race). The idle tick
+    /// run is a full second — far past the first tick where a missing hold
+    /// would have entered Airborne and started integrating gravity.
     #[test]
     fn missing_geometry_holds_z_instead_of_falling() {
-        // First-load race (kuluu-mo4q class): self enters the snapshot before
-        // this zone's main MZB block lands. With an empty column set every
-        // support probe misses — without the hold, that reads as "no floor in
-        // reach" and gravity integrates from the server seed forever (each
-        // fallen z reported via Move is mirrored into self_pos by the session,
-        // so no resync ever fires). geometry_ready=false must hold wire z at
-        // the seed; once ready flips true with still no floor underfoot, the
-        // fall starts again (a ledge over a hole is not a load race).
         let dt = 1.0 / 60.0;
-        let geom = MzbCollisionGeometry::default(); // no blocks: empty column set
+        let geom = MzbCollisionGeometry::default();
         let obstacles = ObstacleSet::default();
         let mut state = Walker::default();
 
-        // A full second of idle ticks — far past the first tick where the old
-        // code entered Airborne and started integrating gravity.
         for _ in 0..60 {
             let res = step(
                 &geom, &obstacles, &mut state, 0.0, 0.0, 12.5, 0.0, 0.0, 5.0, dt, false, false,
@@ -858,14 +848,14 @@ mod tests {
         assert!(matches!(res.decision, VerticalDecision::Airborne { .. }));
     }
 
+    /// A slab crossing (feet+BODY_HEIGHT, y_new+BODY_HEIGHT] holds; one
+    /// above the band or a descent does not. The positive case is a door leaf
+    /// with a horizontal lintel at y=2.0 over the column.
     #[test]
     fn ceiling_slab_rejects_only_rises_into_geometry() {
-        // A slab crossing (feet+BODY_HEIGHT, y_new+BODY_HEIGHT] holds; one
-        // above the band or a descent does not.
         let doors: &[DoorObstacle] = &[];
         assert!(!doors_in_column_slab(doors, Vec2::ZERO, 1.8, 2.1));
 
-        // A door leaf with a horizontal lintel at y=2.0 over the column.
         let lintel = [
             Vec3::new(-1.0, 2.0, -1.0),
             Vec3::new(1.0, 2.0, -1.0),

@@ -5,16 +5,16 @@ use std::path::Path;
 use crate::pol1::{self, SECTION_NAME_LEN};
 use crate::{DatError, Result};
 
-// research/xim MainDll.kt — table offsets are located by scanning FFXiMain.dll for a known
-// big-endian marker word. The marker bytes ARE the first entries of the table, so the
-// matched position is used directly as the table base; per-race entries are little-endian
-// u16 at base + race_index * 2.
+// research/xim MainDll.kt — table offsets are located by scanning FFXiMain.dll for a
+// known big-endian marker word. The marker bytes ARE the first entries of the
+// table, so the matched position is used directly as the table base; per-race
+// entries are little-endian u16 at base + race_index * 2.
 //
-// Every table lives in the `.data` section: `.text` ships packed (its raw size is 0 in
-// both KNOWN_CLIENTS horizonxi-2023 and retail-2026-09) and is only unpacked at load,
-// so the file bytes of the code section hold no marker. The scan window is
-// therefore the `.data` raw span from the PE section table; the fixed window below is
-// the fallback for a file whose header does not parse.
+// Every table lives in the `.data` section: `.text` ships packed (its raw size
+// is 0 in both KNOWN_CLIENTS horizonxi-2023 and retail-2026-09) and is only
+// unpacked at load, so the file bytes of the code section hold no marker. The
+// scan window is therefore the `.data` raw span from the PE section table; the
+// fixed window below is the fallback for a file whose header does not parse.
 pub const SCAN_START: usize = 0x30000;
 pub const SCAN_WORDS: usize = 0xC000;
 /// Every marker is 4-byte aligned in both builds, so the scan steps by a word.
@@ -191,8 +191,9 @@ const ZONE_MAP_FILE_TABLE_BASES: [u32; 3] = [0x14C0, 0xD02F, 0xD417];
 /// What that switch answers for a nibble without an arm: a whole file id,
 /// `file_table_offset` not added. The map loader pre-seeds the same id as its
 /// no-record default (KNOWN_CLIENTS retail-2026-09 RVA 0x1f838a, horizonxi-2023
-/// RVA 0x1f4aba). No row of either build takes this arm; the id resolves to
-/// ROM/18/105.DAT on both installs.
+/// RVA 0x1f4aba; research/xim ZoneMapTable.kt getFileTableOffset). No row of
+/// either build takes this arm; the id resolves to ROM/18/105.DAT on both
+/// installs.
 const ZONE_MAP_FALLBACK_FILE_ID: u32 = 0x1592;
 const ZONE_MAP_FILE_TABLE_BASE_MASK: u8 = 0x0F;
 /// Byte 4's high nibble picks which key-item base signed byte 6 counts from,
@@ -1394,10 +1395,10 @@ mod tests {
     }
 
     /// Gated on an install (self-skips). Every record's file id, zone-keyed or
-    /// client-only, is a DAT the install's VTABLE knows and ships, across all
-    /// three file-table bases. The 148 client-only rows on base index 2 are
-    /// what separate 0xD417 from the transposed 0xD147, under which only 84
-    /// of them resolved, onto index-1 maps.
+    /// client-only, is a DAT the install's VTABLE knows and ships; the tally
+    /// pins the per-base split, including the 148 client-only rows on base
+    /// index 2 — the set that separates the index-2 base from its digit
+    /// transposition (see `ZONE_MAP_FILE_TABLE_BASES`).
     #[test]
     fn real_dll_every_zone_map_resolves_through_the_install() {
         let Some((root, dll)) = open_test_dll() else {

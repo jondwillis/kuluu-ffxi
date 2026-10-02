@@ -124,9 +124,10 @@ mod tests {
         assert_eq!(rejection_line(&t, HERE, Some(SELF), &[]), None);
     }
 
+    /// The server takes the target only while distance < 30; just inside
+    /// (29.9) passes.
     #[test]
     fn at_or_beyond_the_engage_range_is_too_far() {
-        // The server takes the target only while distance < 30.
         for (x, z) in [(30.0, 0.0), (35.0, 0.0), (0.0, -30.0), (20.0, 22.4)] {
             let t = mob(1, x, 0.0, z, 0);
             assert_eq!(
@@ -135,7 +136,6 @@ mod tests {
                 "dist {x}/{z}"
             );
         }
-        // Just inside passes.
         let t = mob(1, 29.9, 0.0, 0.0, 0);
         assert_eq!(rejection_line(&t, HERE, Some(SELF), &[]), None);
     }

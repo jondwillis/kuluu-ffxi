@@ -32,6 +32,8 @@ pub(crate) struct ActiveInstall {
     /// ffxi_dat::client_profile::KNOWN_CLIENTS row name, or "unknown".
     pub client: String,
     pub patch_version: Option<String>,
+    /// A hash-matched KNOWN_CLIENTS row with retail: true.
+    pub known_retail: bool,
 }
 
 impl ActiveInstall {
@@ -104,6 +106,11 @@ pub(crate) fn classify(profile: &ServerProfile, install: Option<ActiveInstall>) 
         return status;
     };
     status.verdict = match install.patch_version.as_deref() {
+        // A hash-recognized retail client with no readable patch.cfg (SE base
+        // image / a POL install without the stamp, e.g. the phoenix-bundle row):
+        // the DLL is a measured retail build, and the lobby's own 0x26 check is
+        // the authority. Do not pre-warn on a stamp the launcher cannot read.
+        None if install.known_retail => EraVerdict::Ok,
         None => EraVerdict::Warn,
         Some(stamp) if !lobby_accepts_client_ver(stamp, &status.expected, lock) => {
             if configured {
@@ -148,6 +155,7 @@ pub(super) fn active_install(
         name,
         client: profile.name().to_string(),
         patch_version: profile.patch_version.clone(),
+        known_retail: profile.known.is_some_and(|k| k.retail),
     })
 }
 
@@ -207,6 +215,7 @@ mod tests {
             name: name.into(),
             client: "horizonxi-2023".into(),
             patch_version: stamp.map(str::to_string),
+            known_retail: false,
         })
     }
 
@@ -292,6 +301,19 @@ mod tests {
         let s = classify(&profile(None, None), install("odd", None));
         assert_eq!(s.verdict, EraVerdict::Warn);
         assert_eq!(s.install_stamp(), "unknown");
+    }
+
+    #[test]
+    fn known_retail_without_a_stamp_is_ok() {
+        let install = ActiveInstall {
+            name: "phoenix".into(),
+            client: "phoenix-bundle".into(),
+            patch_version: None,
+            known_retail: true,
+        };
+        let s = classify(&profile(Some("30260904_1"), Some(2)), Some(install));
+        assert_eq!(s.verdict, EraVerdict::Ok);
+        assert!(!s.blocks_login());
     }
 
     #[test]

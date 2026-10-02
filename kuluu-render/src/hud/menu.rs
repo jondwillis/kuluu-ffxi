@@ -18,13 +18,16 @@ pub const ROOT_CURRENT_TIME: &str = "Current Time";
 pub const ROOT_COMMUNICATION: &str = "Communication";
 pub const COMM_EMOTE_LIST: &str = "Emote List";
 
-// Retail's Command menu is a single pane with two pages, flipped with "-" (or
-// the Left/Right arrows). ROOT_ENTRIES is page 1 followed by page 2; the page a
-// cursor is on is derived from its index (root_page_bounds), so no separate page
-// state is needed. Order mirrors retail HorizonXI for the commands we implement
-// (Synthesis/Trade/Linkshell/Region Info/Missions/Quests/View House/Bazaar/Help
-// Desk are dropped; Graphics/Debug are ours, grouped with the page-2 config-like
-// commands).
+/// Retail's Command menu is a single pane with two pages, flipped with "-" (or
+/// the Left/Right arrows). ROOT_ENTRIES is page 1 followed by page 2; the page a
+/// cursor is on is derived from its index (root_page_bounds), so no separate page
+/// state is needed. Order mirrors retail HorizonXI for the commands we implement
+/// (Synthesis/Trade/Linkshell/Region Info/Missions/Quests/View House/Bazaar/Help
+/// Desk are dropped; Graphics/Debug are ours, grouped with the page-2 config-like
+/// commands). The Debug entry renders only when built with `--features
+/// debug-menu` — opt-in and off by default, so retail parity holds as long as
+/// shipped builds do not enable the flag; local test batches (build_cowland.bat)
+/// pass it on RELEASE builds on purpose.
 const ROOT_ENTRIES: &[&str] = &[
     // Page 1
     "Status",
@@ -42,10 +45,6 @@ const ROOT_ENTRIES: &[&str] = &[
     ROOT_CURRENT_TIME,
     ROOT_COMMUNICATION,
     "Graphics",
-    // DEV-ONLY: the Debug menu (incl. its Retail+ section) renders only when
-    // built with `--features debug-menu` — opt-in and off by default, so retail
-    // parity holds as long as shipped builds never enable the flag. Local test
-    // batches (build_cowland.bat) pass it on RELEASE builds on purpose.
     #[cfg(feature = "debug-menu")]
     "Debug",
     ROOT_SHUT_DOWN,
@@ -156,7 +155,8 @@ pub enum DynamicMenuAction {
     },
 
     /// Item submenu "Drop": opens the Yes/No confirm for the whole stack
-    /// (c2s 0x028 ITEM_DUMP on Yes).
+    /// (c2s 0x028 ITEM_DUMP on Yes;
+    /// vendor/server/src/map/packets/c2s/0x028_item_dump.cpp).
     DropItem {
         container: u8,
         index: u8,
@@ -290,6 +290,10 @@ pub const DEBUG_TARGET_CYCLE: &str = "Target Cycle";
 pub const DEBUG_MESH: &str = "Mesh Debug";
 pub const DEBUG_NET_STATUS: &str = "Net Status";
 pub const DEBUG_NOCLIP: &str = "NoClip";
+/// Enhanced build only: forces the retail weapon draw/sheathe movement hold
+/// back on (the gated build lifts it by default). Default off.
+#[cfg(feature = "enhanced-engage-move-lock-off")]
+pub const DEBUG_ENGAGE_ANIM_LOCK: &str = "Engage_anim_lock";
 /// Debug auto-enter row (enternity-style): [on] = event-dialog message frames
 /// advance themselves after their read time instead of parking on Enter;
 /// choice frames, item lines, text-entry frames, server custom menus, and the
@@ -317,10 +321,10 @@ pub const DEBUG_POSITION_LOG: &str = "Panel Pos Log";
 pub const DEBUG_NAMEPLATES: &str = "Nameplate Debug";
 pub const DEBUG_UI_SETTINGS: &str = "UI Settings";
 
-// Retail+ section (dev-only Debug menu): a separator row, the section label,
-// then the DLSS On/Off toggle plus — in enhanced builds only — Mob HP Under /
-// Job Display. All persist in GraphicsSettings, so each choice survives
-// restarts.
+/// Retail+ section (dev-only Debug menu): a separator row, the section label,
+/// then the DLSS On/Off toggle plus — in enhanced builds only — Mob HP Under /
+/// Job Display. All persist in GraphicsSettings, so each choice survives
+/// restarts.
 pub const DEBUG_RETAIL_SEPARATOR: &str = "────────────────────────────";
 pub const DEBUG_RETAIL_LABEL: &str = "Retail+";
 /// Makes DLSS selectable in the Graphics menu. Does NOT turn DLSS on — with
@@ -339,6 +343,8 @@ const DEBUG_ENTRIES: &[&str] = &[
     DEBUG_MESH,
     DEBUG_NET_STATUS,
     DEBUG_NOCLIP,
+    #[cfg(feature = "enhanced-engage-move-lock-off")]
+    DEBUG_ENGAGE_ANIM_LOCK,
     DEBUG_AUTO_ENTER_CS,
     DEBUG_WEATHER,
     DEBUG_FOG,
@@ -386,7 +392,7 @@ pub fn settings_field_at(
 }
 
 /// Nudge a cursor off a header row in the direction it was already moving,
-/// wrapping. Headers are chrome, so the cursor never rests on one.
+/// wrapping. Headers are chrome, so the cursor does not rest on one.
 pub fn settle_cursor(kind: MenuKind, dlss_supported: bool, cursor: usize, down: bool) -> usize {
     let Some(rows) = settings_rows(kind, dlss_supported) else {
         return cursor;
@@ -486,6 +492,10 @@ pub fn page_cursor(cursor: usize, entry_count: usize, rows: usize, forward: bool
     }
 }
 
+/// The label at a cursor slot. Dynamic menus read the live row; every other
+/// menu reads `static_entries`, which is empty for the section-derived pages
+/// (Config/Graphics/GraphicsDlss) — callers that need those rows use
+/// `entries_for`, which resolves them through `settings_rows`.
 pub fn entry_label(kind: MenuKind, idx: usize, dynamic: &DynamicMenu) -> &str {
     if is_dynamic(kind) {
         if dynamic.rows.is_empty() {
@@ -497,8 +507,6 @@ pub fn entry_label(kind: MenuKind, idx: usize, dynamic: &DynamicMenu) -> &str {
             .map(|r| r.label.as_str())
             .unwrap_or("<unknown>");
     }
-    // Section-derived pages need the build's DLSS support to resolve a row;
-    // callers that have it use entries_for directly.
     static_entries(kind)
         .get(idx)
         .copied()
@@ -566,7 +574,6 @@ pub fn entries_for(kind: MenuKind, dlss_supported: bool) -> Vec<&'static str> {
 fn static_entries(kind: MenuKind) -> &'static [&'static str] {
     match kind {
         MenuKind::Root => ROOT_ENTRIES,
-        // Config/Graphics/GraphicsDlss are section-derived; see settings_rows.
         MenuKind::Config => &[],
         MenuKind::Controls => CONTROLS_ENTRIES,
         MenuKind::Debug => DEBUG_ENTRIES,
@@ -1077,7 +1084,8 @@ pub fn item_action_rows(
 
     // Locked = equipped / linkshell / bazaar-reserved: the server rejects the
     // move (and the drop) silently, so don't offer them. The recycle bin is
-    // the one container 0x028 never dumps from.
+    // the one container the 0x028 ITEM_DUMP handler does not accept as a
+    // source (vendor/server/src/map/packets/c2s/0x028_item_dump.cpp).
     let droppable =
         item_no != ffxi_proto::map::GIL_ITEM_NO && !slot.locked && container != c::LOC_RECYCLEBIN;
     if droppable {
@@ -1100,8 +1108,9 @@ pub fn item_action_rows(
             {
                 continue;
             }
-            // 0x029 isValidMovement: recycle-bin items only come back out to
-            // the inventory or the locker.
+            // 0x029 item-move: recycle-bin items only come back out to the
+            // inventory or the locker
+            // (vendor/server/src/map/packets/c2s/0x029_item_move.cpp).
             if container == c::LOC_RECYCLEBIN
                 && dest != c::LOC_INVENTORY
                 && dest != c::LOC_MOGLOCKER
@@ -1463,8 +1472,6 @@ fn format_row_body(
     snapshot: &kuluu_snapshot::SceneSnapshot,
 ) -> String {
     match kind {
-        // Header and action rows render their label alone; only field rows
-        // carry a value column.
         MenuKind::Config | MenuKind::Graphics | MenuKind::GraphicsDlss => {
             match settings_field_at(kind, slot, settings.dlss_supported) {
                 Some(field) => format!(
@@ -1476,21 +1483,13 @@ fn format_row_body(
             }
         }
         MenuKind::Debug => {
-            // Volume is a 0..=100 number row, not an on/off toggle.
             if label == DEBUG_VOLUME {
                 format!("{label:<14}[{master_pct:>3}]")
             } else if label == DEBUG_PRINT_POS {
-                // A button, not a toggle: Enter fires it (prints self coords
-                // to system chat), so the value column says what Enter does
-                // instead of a stateless [off].
                 format!("{label:<14}[enter]")
             } else if label == DEBUG_RETAIL_SEPARATOR || label == DEBUG_RETAIL_LABEL {
-                // Section chrome: no value column.
                 label.to_string()
             } else if label == RETAIL_DLSS_MENU {
-                // Menu gate, not the DLSS on/off itself (that lives in the
-                // Graphics menu): [on] means "DLSS is selectable there". When this
-                // build can't run DLSS at all it reads N/A instead of a live toggle.
                 format!(
                     "{label:<14}[{}]",
                     if !settings.dlss_supported {
@@ -1502,9 +1501,6 @@ fn format_row_body(
                     }
                 )
             } else {
-                // The Retail+ toggles only exist in enhanced builds —
-                // DEBUG_ENTRIES omits their rows without the feature, so these
-                // labels are unreachable there.
                 #[cfg(feature = "enhanced-mob-hp-under")]
                 if label == RETAIL_MOB_HP_UNDER {
                     return format!(
@@ -1548,9 +1544,9 @@ pub fn debug_panel_state(
         DEBUG_TARGET_CYCLE => panels.target_cycle,
         DEBUG_MESH => panels.mesh_debug,
         DEBUG_NOCLIP => panels.noclip,
+        #[cfg(feature = "enhanced-engage-move-lock-off")]
+        DEBUG_ENGAGE_ANIM_LOCK => panels.engage_anim_lock,
         DEBUG_AUTO_ENTER_CS => panels.auto_enter_cs,
-        // The rows read as the feature's live state, so they invert the
-        // "off" flags: Weather [on] = weather effects applied.
         DEBUG_WEATHER => !panels.weather_off,
         DEBUG_FOG => !panels.fog_off,
         DEBUG_ENTITY_LIST => panels.entity_list,
@@ -1562,9 +1558,6 @@ pub fn debug_panel_state(
         DEBUG_POSITION_LOG => panels.position_log,
         DEBUG_NAMEPLATES => panels.nameplate_debug,
         DEBUG_UI_SETTINGS => panels.ui_settings,
-        // Print POS is a button, not a toggle — it never reads on/off (the
-        // row formatter shows [enter] for it); false here is just the
-        // don't-care default for any label without panel state.
         _ => false,
     }
 }
@@ -2103,7 +2096,6 @@ mod tests {
             "test presumes Graphics outgrows the viewport"
         );
         let dynamic = DynamicMenu::default();
-        // Cursor on the last row (Reset to Minimum) must land inside the window.
         let last = total - 1;
         let (t, start) = resolve_viewport(MenuKind::Graphics, last, &dynamic, true);
         let window = visible_window(MenuKind::Graphics, t);
@@ -2256,7 +2248,6 @@ mod tests {
             Some(&MenuRow::Action(MenuAction::Controls)),
             "Controls must stay the last row of Config"
         );
-        // Every field row is preceded, somewhere above it, by a header.
         assert!(matches!(rows.first(), Some(MenuRow::Header(_))));
         assert_eq!(root_child_kind("Config"), Some(MenuKind::Config));
         assert!(static_entries(MenuKind::Controls).contains(&"Standard"));
@@ -2346,7 +2337,6 @@ mod tests {
                         );
                     }
                 }
-                // Opening a page puts the cursor at 0, which is a header.
                 assert!(rows[settle_cursor(kind, dlss, 0, true)].is_selectable());
             }
         }

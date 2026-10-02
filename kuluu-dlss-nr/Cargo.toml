@@ -26,7 +26,7 @@ repository.workspace = true
 # Only the Vulkan HAL surface is needed: `as_hal::<Vulkan>()` raw-handle
 # extraction. Feature set is a subset of what bevy_render already enables, so
 # no extra backend code gets compiled into the final binary.
-wgpu = { version = "29", default-features = false, features = ["std", "vulkan"] }
+wgpu = { version = "30", default-features = false, features = ["std", "vulkan"] }
 # Same copy wgpu-hal already builds (0.38 in the lockfile) — only used for the
 # public `Handle` trait: ash handle tuple fields are private, so raw u64
 # extraction goes through `as_raw()`.

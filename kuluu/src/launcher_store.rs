@@ -9,15 +9,23 @@ pub const KEYRING_SERVICE: &str = "kuluu";
 pub enum AuthFlavorKind {
     Json,
     Binary,
-    /// No auth server: the lobby is opened with a session the PlayOnline
-    /// Viewer produced (kuluu_session::playonline). Not offered by the
-    /// server editor until the viewer handoff exists.
+    /// No auth server: Kuluu signs in to the PlayOnline account itself
+    /// (kuluu_session::pol_inhouse) and opens the lobby with the session
+    /// Square Enix issues.
     PlayOnline,
 }
 
 impl AuthFlavorKind {
     pub fn uses_auth_server(self) -> bool {
         !matches!(self, AuthFlavorKind::PlayOnline)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            AuthFlavorKind::Json => "JSON",
+            AuthFlavorKind::Binary => "Binary",
+            AuthFlavorKind::PlayOnline => "PlayOnline",
+        }
     }
 }
 
@@ -49,6 +57,10 @@ pub struct ServerProfile {
     /// An ffxi_client::Install name this server should be played from.
     #[serde(default)]
     pub preferred_client: Option<String>,
+
+    /// The player has read this profile's third-party-client terms notice.
+    #[serde(default)]
+    pub terms_acknowledged: bool,
 }
 
 pub const HORIZONXI_HOST: &str = "play.horizonxi.com";
@@ -82,6 +94,10 @@ pub fn server_templates() -> Vec<ServerTemplate> {
             label: "Local LandSandBoat",
             profile: ServerProfile::lsb_defaults("local", LOCALHOST),
         },
+        ServerTemplate {
+            label: "PlayOnline",
+            profile: ServerProfile::playonline_defaults("PlayOnline", ffxi_pol::hosts::LOBBY_HOST),
+        },
     ]
 }
 
@@ -99,7 +115,22 @@ impl ServerProfile {
             client_ver: None,
             ver_lock: None,
             preferred_client: None,
+            terms_acknowledged: false,
         }
+    }
+
+    /// A lobby reached through a PlayOnline session: `host` is the FFXI lobby
+    /// server, on retail's port map, which LSB mirrors; the auth port is
+    /// unused because the PlayOnline account services replace the auth server.
+    pub fn playonline_defaults(name: &str, host: &str) -> Self {
+        Self {
+            flavor: AuthFlavorKind::PlayOnline,
+            ..Self::lsb_defaults(name, host)
+        }
+    }
+
+    pub fn is_playonline(&self) -> bool {
+        self.flavor == AuthFlavorKind::PlayOnline
     }
 
     pub fn expected_client_ver(&self) -> &str {
@@ -123,6 +154,13 @@ pub struct SavedAccount {
     pub server_name: String,
     pub username: String,
     pub remember_password: bool,
+    /// The Square Enix id this account signs in with, for the flavor that
+    /// authenticates two identities. The account is keyed on its PlayOnline
+    /// id, which is the one that always exists, so this holds the other.
+    /// Empty for every other flavor, for an account with no Square Enix id,
+    /// and for a profile saved before the flavor existed.
+    #[serde(default)]
+    pub square_enix_id: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
@@ -213,6 +251,18 @@ pub struct LoginPrefill<'a> {
 pub fn keyring_account_key(server_name: &str, username: &str) -> String {
     format!("{server_name}:{username}")
 }
+
+/// The secret-store key the Square Enix password lives under. A PlayOnline
+/// sign-in holds two passwords: the account key carries the PlayOnline one,
+/// which every flavor has an equivalent of, and this carries the other.
+pub fn keyring_square_enix_key(server_name: &str, username: &str) -> String {
+    format!(
+        "{}{SQUARE_ENIX_KEY_SUFFIX}",
+        keyring_account_key(server_name, username)
+    )
+}
+
+const SQUARE_ENIX_KEY_SUFFIX: &str = ":square-enix";
 
 fn default_path() -> Option<PathBuf> {
     kuluu_session::config_dir::config_file("launcher.json").ok()
@@ -357,7 +407,25 @@ mod tests {
             server_name: server.into(),
             username: user.into(),
             remember_password: false,
+            square_enix_id: String::new(),
         }
+    }
+
+    #[test]
+    fn the_two_secret_keys_of_one_account_are_distinct() {
+        let account = keyring_account_key("Retail", "XAAA0000");
+        let sqex = keyring_square_enix_key("Retail", "XAAA0000");
+        assert_ne!(account, sqex);
+        assert!(sqex.starts_with(&account));
+    }
+
+    #[test]
+    fn an_account_saved_before_the_playonline_flavor_still_loads() {
+        let json = r#"{"server_name":"Retail","username":"someone","remember_password":true}"#;
+        let acct: SavedAccount = serde_json::from_str(json).unwrap();
+        assert_eq!(acct.username, "someone");
+        assert!(acct.remember_password);
+        assert!(acct.square_enix_id.is_empty());
     }
 
     #[test]
@@ -424,6 +492,43 @@ mod tests {
             local.profile.expected_client_ver(),
             ffxi_proto::login::LSB_CLIENT_VER
         );
+        let pol = templates
+            .iter()
+            .find(|t| t.label == "PlayOnline")
+            .expect("PlayOnline template");
+        assert!(pol.profile.is_playonline());
+        assert!(!pol.profile.flavor.uses_auth_server());
+        assert_eq!(pol.profile.host, ffxi_pol::hosts::LOBBY_HOST);
+        assert_eq!(pol.profile.view_port, ffxi_proto::login::LOGIN_VIEW_PORT);
+        assert_eq!(pol.profile.data_port, ffxi_proto::login::LOGIN_DATA_PORT);
+        assert!(!pol.profile.terms_acknowledged);
+    }
+
+    #[test]
+    fn a_playonline_profile_round_trips_its_terms_flag() {
+        let profile = ServerProfile {
+            terms_acknowledged: true,
+            ..ServerProfile::playonline_defaults("retail", "lobby.example")
+        };
+        let text = serde_json::to_string(&profile).unwrap();
+        assert!(text.contains("\"playonline\""), "{text}");
+        let back: ServerProfile = serde_json::from_str(&text).unwrap();
+        assert!(back.terms_acknowledged);
+        assert_eq!(back.flavor.label(), "PlayOnline");
+    }
+
+    #[test]
+    fn a_profile_saved_with_the_retired_session_file_field_still_loads() {
+        let text = format!(
+            r#"{{"name":"retail","host":"lobby.example","auth_port":{},"data_port":{},
+            "view_port":{},"flavor":"playonline","pol_session_file":"C:/sessions/pol.json"}}"#,
+            ffxi_proto::login::LOGIN_AUTH_PORT,
+            ffxi_proto::login::LOGIN_DATA_PORT,
+            ffxi_proto::login::LOGIN_VIEW_PORT
+        );
+        let back: ServerProfile = serde_json::from_str(&text).unwrap();
+        assert!(back.is_playonline());
+        assert_eq!(back.host, "lobby.example");
     }
 
     #[test]

@@ -12,9 +12,9 @@ const TAG_LEN: usize = 6;
 // English dictionary, so lookups drop it.
 const LANGUAGE_AGNOSTIC_KEY_MASK: u32 = 0xFFFF_00FF;
 
-// `decode` wraps a resolved phrase in these; kuluu-render's chat panel colours
-// spans delimited by them and must import rather than re-type them (no
-// magic numbers: a wire/format contract lives with its emitter).
+/// `decode` wraps a resolved phrase in these; kuluu-render's chat panel colours
+/// spans delimited by them and must import rather than re-type them (no
+/// magic numbers: a wire/format contract lives with its emitter).
 pub const PHRASE_OPEN: char = '{';
 pub const PHRASE_CLOSE: char = '}';
 
@@ -129,8 +129,8 @@ pub struct PhraseSpan {
 }
 
 /// Splits a `decode`-produced (or otherwise `PHRASE_OPEN`/`PHRASE_CLOSE`
-/// delimited) string into plain-text and phrase spans, so a UI consumer never
-/// re-matches the delimiter chars itself. An unterminated `PHRASE_OPEN` runs
+/// delimited) string into plain-text and phrase spans, so a UI consumer does
+/// not re-match the delimiter chars itself. An unterminated `PHRASE_OPEN` runs
 /// to the end of the line, mirroring `decode`'s own tolerance for a lone
 /// marker.
 pub fn split_phrases(line: &str) -> Vec<PhraseSpan> {
@@ -352,9 +352,9 @@ mod tests {
         );
     }
 
-    // Guard: pins decode()'s PHRASE_OPEN/PHRASE_CLOSE contract against
-    // split_phrases so a consumer (kuluu-render's chat panel) never has to
-    // re-type the delimiter chars itself.
+    /// Guard: pins decode()'s PHRASE_OPEN/PHRASE_CLOSE contract against
+    /// split_phrases so a consumer (kuluu-render's chat panel) does not have
+    /// to re-type the delimiter chars itself.
     #[test]
     fn split_phrases_finds_exactly_the_decoded_phrase() {
         let bytes = [b'h', b'i', b' ', 0xFD, 0x02, 0x02, 0x01, 0x01, 0xFD, b'!'];

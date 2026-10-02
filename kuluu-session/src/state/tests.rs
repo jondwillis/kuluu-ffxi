@@ -61,9 +61,10 @@ fn zone_in_weather_survives_the_zone_change_clear() {
     assert_eq!(s.current_weather, Some(4));
 }
 
-// Stand-up cancels leavegame server-side with no 0x053 cancel packet; the
-// heal→walk transition folds in as LogoutCountdownCancelled and must drop a
-// live countdown. A cancel with nothing active is a no-op fold (no churn).
+/// Stand-up cancels leavegame server-side with no 0x053 cancel packet
+/// (vendor/server/src/map/packets/s2c/0x053_systemmes.cpp); the heal→walk
+/// transition folds in as LogoutCountdownCancelled and must drop a live
+/// countdown. A cancel with nothing active is a no-op fold (no churn).
 #[test]
 fn logout_countdown_cancelled_clears_the_live_countdown() {
     let mut s = SessionState::default();
@@ -736,7 +737,6 @@ fn merge_kind_specialized_wins_over_other() {
 fn job_master_flag_refreshes_on_pos_only_updates() {
     let mut s = SessionState::default();
 
-    // A General-block update establishes the flags with the star off...
     let mut e = make_test_entity(9, Some("Star"), EntityKind::Pc);
     e.char_flags = Some(ffxi_proto::decode::CharFlags::default());
     e.job_master_display = Some(false);
@@ -745,7 +745,6 @@ fn job_master_flag_refreshes_on_pos_only_updates() {
         pos_present: true,
     });
 
-    // ...and a later pos-only tick (no General words) turns it on.
     let mut e = make_test_entity(9, None, EntityKind::Pc);
     e.char_flags = None;
     e.job_master_display = Some(true);
@@ -762,7 +761,6 @@ fn job_master_flag_refreshes_on_pos_only_updates() {
         "a pos-only tick must carry the fresh star"
     );
 
-    // ...and a later pos-only 'off' clears it again.
     let mut e = make_test_entity(9, None, EntityKind::Pc);
     e.char_flags = None;
     e.job_master_display = Some(false);
@@ -952,14 +950,14 @@ fn entity_upserted_name_vis_survives_pos_only_tick() {
     // un-hide a hidden entity the moment it moved.
     let mut s = SessionState::default();
     let mut ent = make_test_entity(42, Some("Survival Guide"), EntityKind::Npc);
-    ent.name_vis = Some(0x08); // FLAG_HIDE_NAME
+    ent.name_vis = Some(8);
     s.apply_event(&AgentEvent::EntityUpserted {
         entity: ent,
         pos_present: true,
     });
-    assert_eq!(s.entities[0].name_vis, Some(0x08));
+    assert_eq!(s.entities[0].name_vis, Some(8));
 
-    let mut moved = make_test_entity(42, None, EntityKind::Npc); // POS-only: no namevis byte
+    let mut moved = make_test_entity(42, None, EntityKind::Npc);
     moved.pos = Vec3 {
         x: 50.0,
         y: 1.0,
@@ -976,10 +974,11 @@ fn entity_upserted_name_vis_survives_pos_only_tick() {
     );
 }
 
+/// #512-4: HideName(true) sets UPDATE_HP, not UPDATE_POS. Merging off
+/// pos_present kept the stale visible value for a static NPC the server
+/// just hid.
 #[test]
 fn entity_upserted_name_vis_applies_on_hp_only_tick() {
-    // #512-4: HideName(true) sets UPDATE_HP, not UPDATE_POS. Merging off pos_present
-    // kept the stale visible value for a static NPC the server just hid.
     let mut s = SessionState::default();
     let ent = make_test_entity(42, Some("Unity Master"), EntityKind::Npc);
     s.apply_event(&AgentEvent::EntityUpserted {
@@ -989,14 +988,14 @@ fn entity_upserted_name_vis_applies_on_hp_only_tick() {
     assert_eq!(s.entities[0].name_vis, None);
 
     let mut hidden = make_test_entity(42, None, EntityKind::Npc);
-    hidden.name_vis = Some(0x08); // HideName(true) -> updatemask |= UPDATE_HP only
+    hidden.name_vis = Some(8);
     s.apply_event(&AgentEvent::EntityUpserted {
         entity: hidden,
         pos_present: false,
     });
     assert_eq!(
         s.entities[0].name_vis,
-        Some(0x08),
+        Some(8),
         "an HP-only tick must apply the new namevis even without UPDATE_POS"
     );
 }
@@ -1204,11 +1203,12 @@ fn entity_patched_by_act_index_resolves_when_id_unknown() {
     assert_eq!(s.entities[0].hp_pct, Some(75));
 }
 
+/// Self's entity carries no flags until its first 0x037
+/// (vendor/server/src/map/packets/char_status.cpp) — the patch must
+/// materialize rather than skip.
 #[test]
 fn entity_patched_allegiance_materializes_flags_and_preserves_the_rest() {
     let mut s = SessionState::default();
-    // Self's entity carries no flags until its first 0x037 — the patch must
-    // materialize rather than skip.
     s.apply_event(&AgentEvent::EntityUpserted {
         entity: make_test_entity(1, None, EntityKind::Pc),
         pos_present: true,
@@ -1227,17 +1227,18 @@ fn entity_patched_allegiance_materializes_flags_and_preserves_the_rest() {
     let flags = s.entities[0].char_flags.expect("materialized by the patch");
     assert_eq!(flags.allegiance, 9);
 
-    // A repeat of the same value is a no-op (0x037 arrives every non-pos tick).
-    assert!(!s.apply_event(&AgentEvent::EntityPatched {
-        id: Some(1),
-        act_index: None,
-        name: None,
-        kind: None,
-        hp_pct: None,
-        allegiance: Some(9),
-    }));
+    assert!(
+        !s.apply_event(&AgentEvent::EntityPatched {
+            id: Some(1),
+            act_index: None,
+            name: None,
+            kind: None,
+            hp_pct: None,
+            allegiance: Some(9),
+        }),
+        "a repeat of the same value is a no-op fold"
+    );
 
-    // A later value updates in place without zeroing the other flags.
     s.apply_event(&AgentEvent::EntityPatched {
         id: Some(1),
         act_index: None,
@@ -1247,7 +1248,10 @@ fn entity_patched_allegiance_materializes_flags_and_preserves_the_rest() {
         allegiance: Some(3),
     });
     let flags = s.entities[0].char_flags.expect("still materialized");
-    assert_eq!(flags.allegiance, 3);
+    assert_eq!(
+        flags.allegiance, 3,
+        "a later value updates in place without zeroing the other flags"
+    );
 }
 
 #[test]
@@ -1685,7 +1689,6 @@ fn inventory_fold_no_select_covers_a_use_until_its_recast_lands() {
         "a lock-only update restates no charge info and must not erase it"
     );
 
-    // The use resolves: the slot is selectable again, and the recast is what keeps it greyed.
     fold(&mut s, bare(false));
     fold(
         &mut s,
@@ -1696,7 +1699,10 @@ fn inventory_fold_no_select_covers_a_use_until_its_recast_lands() {
         },
     );
     let slot = &s.inventory.containers[&0].slots[0];
-    assert!(!slot.unselectable);
+    assert!(
+        !slot.unselectable,
+        "the use resolves: the slot is selectable again, and the recast is what keeps it greyed"
+    );
     assert_eq!(slot.next_use_vana_ts, Some(86_400));
 }
 
@@ -2096,27 +2102,107 @@ fn apply_event_reports_real_mutations_only() {
     }));
 }
 
-/// The 0x058 battle-target push is the server's engage truth for self: it flips
-/// the animation byte to ATTACK on an accepted engage and back to NONE on a
-/// disengage. A rejection sends no 0x058, so the byte stays put.
+/// A 0x058 target push with no engage goal of our own (an /assist push, a
+/// stray commit) never arms the weapon: the byte stays NONE.
 #[test]
-fn apply_event_target_changed_sets_self_engage_byte() {
-    use ffxi_proto::decode::animation::{ATTACK, NONE};
+fn target_push_without_an_engage_goal_never_draws() {
+    use ffxi_proto::decode::animation::NONE;
     let mut s = SessionState::default();
-    assert_eq!(s.self_server_status, NONE);
-
-    // Accepted engage: the byte flips to ATTACK.
-    assert!(s.apply_event(&AgentEvent::TargetChanged {
-        target_id: Some(99)
-    }));
-    assert_eq!(s.self_server_status, ATTACK);
-    // A repeat for the same target is a no-op fold.
     assert!(!s.apply_event(&AgentEvent::TargetChanged {
         target_id: Some(99)
     }));
+    assert_eq!(s.self_server_status, NONE);
+}
 
-    // Disengage: the byte returns to NONE.
+/// With our engage pending, the server's 0x058 is the accept: the byte flips
+/// to ATTACK on it, before any 0x037 arrives. The standing Engaged goal
+/// (a re-aim while fighting) passes the same gate.
+#[test]
+fn target_push_with_the_engage_goal_draws_on_the_accept() {
+    use ffxi_proto::decode::animation::{ATTACK, NONE};
+    for goal in [
+        ReactorGoalSnapshot::Engaging {
+            target_id: 99,
+            attack_issued: true,
+        },
+        ReactorGoalSnapshot::Engaged {
+            target_id: 99,
+            attack_issued: true,
+        },
+    ] {
+        let mut s = SessionState::default();
+        s.apply_event(&AgentEvent::ReactorGoalChanged { goal });
+        assert_eq!(
+            s.self_server_status, NONE,
+            "sending the engage draws nothing"
+        );
+        assert!(s.apply_event(&AgentEvent::TargetChanged {
+            target_id: Some(99)
+        }));
+        assert_eq!(s.self_server_status, ATTACK);
+    }
+}
+
+/// The refusal event is inert in the fold: the reactor owns the goal change,
+/// and the byte never moved.
+#[test]
+fn engage_refused_changes_nothing_in_the_fold() {
+    use ffxi_proto::decode::animation::NONE;
+    let mut s = SessionState::default();
+    s.apply_event(&AgentEvent::ReactorGoalChanged {
+        goal: ReactorGoalSnapshot::Engaging {
+            target_id: 99,
+            attack_issued: true,
+        },
+    });
+    assert!(!s.apply_event(&AgentEvent::EngageRefused {
+        message_num: crate::session::MSG_BASIC_WAIT_LONGER
+    }));
+    assert_eq!(s.self_server_status, NONE);
+}
+
+#[test]
+fn engaging_goal_event_roundtrip() {
+    let ev = AgentEvent::ReactorGoalChanged {
+        goal: ReactorGoalSnapshot::Engaging {
+            target_id: 99,
+            attack_issued: false,
+        },
+    };
+    let s = serde_json::to_string(&ev).unwrap();
+    let back: AgentEvent = serde_json::from_str(&s).unwrap();
+    assert!(matches!(
+        back,
+        AgentEvent::ReactorGoalChanged {
+            goal: ReactorGoalSnapshot::Engaging {
+                target_id: 99,
+                attack_issued: false,
+            },
+        }
+    ));
+}
+
+/// 0x037 remains the authority in both directions: it can flip the byte to
+/// ATTACK on its own and back to NONE, and a 0x058 clear also sheathes.
+#[test]
+fn char_status_and_target_clear_both_move_the_byte() {
+    use ffxi_proto::decode::animation::{ATTACK, NONE};
+    let mut s = SessionState::default();
+    assert!(s.apply_event(&AgentEvent::SelfServerStatus {
+        status: ATTACK,
+        mount_id: 0
+    }));
+    assert_eq!(s.self_server_status, ATTACK);
     assert!(s.apply_event(&AgentEvent::TargetChanged { target_id: None }));
+    assert_eq!(s.self_server_status, NONE);
+    assert!(s.apply_event(&AgentEvent::SelfServerStatus {
+        status: ATTACK,
+        mount_id: 0
+    }));
+    assert!(s.apply_event(&AgentEvent::SelfServerStatus {
+        status: NONE,
+        mount_id: 0
+    }));
     assert_eq!(s.self_server_status, NONE);
 }
 
@@ -2141,7 +2227,6 @@ fn apply_event_dialog_dismissed_clears_the_frame() {
     }));
     assert!(s.dialog.is_some());
 
-    // The dismissal clears the frame — and reports a mutation only because it did.
     assert!(s.apply_event(&AgentEvent::DialogDismissed));
     assert!(s.dialog.is_none());
     assert!(
@@ -2149,7 +2234,6 @@ fn apply_event_dialog_dismissed_clears_the_frame() {
         "already clear"
     );
 
-    // Reopening after dismissal still mutates (the next message opcode).
     assert!(s.apply_event(&AgentEvent::EventDialog { dialog }));
 }
 
@@ -2494,6 +2578,8 @@ fn _agentevent_is_additive_only(x: &AgentEvent) {
         AgentEvent::MusicVolumeChanged { .. } => (),
         AgentEvent::LevelUp { .. } => (),
         AgentEvent::SkillLevelUp { .. } => (),
+        AgentEvent::EngageRefused { .. } => (),
+        AgentEvent::Knockbacks { .. } => (),
         AgentEvent::FishingCast { .. } => (),
         AgentEvent::FishHooked { .. } => (),
         AgentEvent::FishHookedSize { .. } => (),
@@ -2532,10 +2618,8 @@ fn _agentevent_is_additive_only(x: &AgentEvent) {
     }
 }
 
-// The wire-id index must stay in lockstep with the entities Vec across every
-// mutation path, and the pending sets must carry exactly the ids that changed
-// since the last drain.
-
+/// The wire-id index stays in lockstep with the entities Vec across every
+/// mutation path.
 #[test]
 fn entity_index_stays_in_lockstep_with_the_vec() {
     let mut s = SessionState::default();
@@ -2549,14 +2633,12 @@ fn entity_index_stays_in_lockstep_with_the_vec() {
         assert_eq!(s.entity_index.get(&e.id), Some(&i));
     }
 
-    // Removing the middle one shifts every later slot; the index must follow.
     assert!(s.apply_event(&AgentEvent::EntityRemoved { id: 20 }));
     for (i, e) in s.entities.iter().enumerate() {
         assert_eq!(s.entity_index.get(&e.id), Some(&i));
     }
     assert!(!s.entity_index.contains_key(&20));
 
-    // A fresh insert lands at the tail.
     assert!(s.apply_event(&AgentEvent::EntityUpserted {
         entity: make_test_entity(40, None, EntityKind::Npc),
         pos_present: true,
@@ -2565,7 +2647,6 @@ fn entity_index_stays_in_lockstep_with_the_vec() {
         assert_eq!(s.entity_index.get(&e.id), Some(&i));
     }
 
-    // A zone change wipes the Vec and the index together.
     s.apply_event(&AgentEvent::ZoneChanged {
         from: None,
         to: 103,
@@ -2576,11 +2657,11 @@ fn entity_index_stays_in_lockstep_with_the_vec() {
     assert!(s.entity_index.is_empty());
 }
 
+/// The pending sets carry exactly the ids that changed since the last drain.
 #[test]
 fn pending_entity_sets_carry_exactly_the_changed_ids() {
     let mut s = SessionState::default();
 
-    // Insert stamps; an identical re-upsert is a no-op fold and stamps nothing.
     assert!(s.apply_event(&AgentEvent::EntityUpserted {
         entity: make_test_entity(1, Some("a"), EntityKind::Mob),
         pos_present: true,
@@ -2598,7 +2679,6 @@ fn pending_entity_sets_carry_exactly_the_changed_ids() {
     assert!(up.is_empty(), "no-op upsert must not stamp");
     assert!(rem.is_empty());
 
-    // A real change stamps again; removing an absent id stamps nothing.
     let mut moved = make_test_entity(1, Some("a"), EntityKind::Mob);
     moved.pos.z += 5.0;
     assert!(s.apply_event(&AgentEvent::EntityUpserted {
@@ -2610,7 +2690,6 @@ fn pending_entity_sets_carry_exactly_the_changed_ids() {
     assert_eq!(up, std::collections::HashSet::from([1u32]));
     assert!(rem.is_empty());
 
-    // Upsert-then-remove in one batch nets to a removal.
     assert!(s.apply_event(&AgentEvent::EntityUpserted {
         entity: make_test_entity(2, None, EntityKind::Npc),
         pos_present: true,
@@ -2620,7 +2699,6 @@ fn pending_entity_sets_carry_exactly_the_changed_ids() {
     assert!(up.is_empty(), "voided upsert must not survive the drain");
     assert_eq!(rem, std::collections::HashSet::from([2u32]));
 
-    // A zone change marks every live id removed and clears pending upserts.
     assert!(s.apply_event(&AgentEvent::EntityUpserted {
         entity: make_test_entity(3, None, EntityKind::Mob),
         pos_present: true,
@@ -2633,10 +2711,12 @@ fn pending_entity_sets_carry_exactly_the_changed_ids() {
     });
     let (up, rem) = s.take_pending_entities();
     assert!(up.is_empty());
-    // Entity 1 is still live at the wipe, so both ids are marked removed.
-    assert_eq!(rem, std::collections::HashSet::from([1u32, 3]));
+    assert_eq!(
+        rem,
+        std::collections::HashSet::from([1u32, 3]),
+        "entity 1 is still live at the wipe, so both ids are marked removed"
+    );
 
-    // Repopulating upserts after the wipe stamp back in.
     assert!(s.apply_event(&AgentEvent::EntityUpserted {
         entity: make_test_entity(4, None, EntityKind::Mob),
         pos_present: true,
@@ -2661,7 +2741,6 @@ fn self_position_events_stamp_the_self_id() {
     }));
     s.take_pending_entities();
 
-    // A moved self position stamps the self id; an identical one does not.
     let p1 = Position {
         pos: Vec3 {
             x: 1.0,
@@ -2705,4 +2784,24 @@ fn respawn_cancels_pending_removal_before_batch_drain() {
         state.entities[state.entity_index[&9]].name.as_deref(),
         Some("new")
     );
+}
+
+#[test]
+fn legacy_clock_hold_event_uses_hour_only_defaults() {
+    let event: AgentEvent = serde_json::from_value(serde_json::json!({
+        "type": "cutscene_cue",
+        "cue": {"ClockHold": {"stop": true, "hour": null}}
+    }))
+    .unwrap();
+    assert!(matches!(
+        event,
+        AgentEvent::CutsceneCue {
+            cue: CutsceneCue::ClockHold {
+                stop: true,
+                hour: None,
+                minute: 0,
+                day_from_epoch: None
+            }
+        }
+    ));
 }

@@ -80,7 +80,7 @@ pub struct EntityMaterials {
 
     /// Fully transparent stand-in for a placeholder orb whose owner must not be
     /// drawn (Flags1.InvisFlag). Shared, so blanking an orb is a handle swap,
-    /// never a per-entity asset.
+    /// not a per-entity asset.
     pub invis_orb: Handle<StandardMaterial>,
 }
 
@@ -125,10 +125,10 @@ pub fn auto_clear_target_system(
 }
 
 /// Snapshot frames a server retarget waits for its entity to appear. The 0x058
-/// reaches the viewer on the event channel while the entity reaches it in the
-/// snapshot, so a retarget onto a mob spawning into view can beat its own
-/// entity by a frame; expiring keeps a retarget whose entity never arrives from
-/// firing much later.
+/// (0x058_assist.cpp) reaches the viewer on the event channel while the entity
+/// reaches it in the snapshot, so a retarget onto a mob spawning into view can
+/// beat its own entity by a frame; expiring keeps a retarget whose entity does
+/// not arrive from firing much later.
 const RETARGET_ENTITY_WAIT_FRAMES: u8 = 3;
 
 #[derive(Clone, Copy)]
@@ -373,6 +373,15 @@ impl ZoneFloorGate<'_> {
     }
 }
 
+/// Spawns, moves and re-skins the wire entities from the snapshot. Self's
+/// position is owned by the native fixed-tick prediction, so the wire position
+/// is applied only on a zone change or on the relay viewer, which consumes
+/// snapshots. The Other kind is not server-moved — doors are static (their
+/// open/close is client-side MMB/DAT rotation) and transports play their
+/// authored FollowPoints path in pose_transports, which owns the whole
+/// transform — so the wire position applies directly, with Y left to its own
+/// owner. Nameplate billboards are spawned by
+/// update_nameplate_billboards_system's ensure pass, not here.
 pub fn sync_entities_system(
     state: Res<SceneState>,
     table: Res<EntityTable>,
@@ -405,8 +414,6 @@ pub fn sync_entities_system(
         std::collections::HashSet::with_capacity(snap.entities.len() + 1);
     let mut hp_by_id: HashMap<u32, Option<u8>> = HashMap::new();
 
-    // Identity comes from the table's self slot (stamped by ingest from the
-    // same snapshot field), not a per-entity comparison.
     let self_char_id = table.self_id().unwrap_or(0);
     for wire in &snap.entities {
         seen.insert(wire.id);
@@ -444,16 +451,10 @@ pub fn sync_entities_system(
             Some(existing) => {
                 if let Ok(mut t) = queries.xform.get_mut(existing) {
                     if is_self {
-                        // Native fixed-tick prediction owns self; the relay viewer consumes snapshots.
                         if zone_changed || cfg!(target_arch = "wasm32") {
                             t.translation = world_pos;
                         }
                     } else if matches!(wire.kind, EntityKind::Other) {
-                        // The Other kind is not server-moved: doors are static (their open/close
-                        // is client-side MMB/DAT rotation) and transports play their authored
-                        // FollowPoints path in pose_transports (PostUpdate), which owns the whole
-                        // transform. So the wire position applies directly here; there is no
-                        // motion to pace between updates, and Y stays with its own owner.
                         t.translation = Vec3::new(world_pos.x, t.translation.y, world_pos.z);
                         t.rotation = heading_to_quat(wire.heading);
                     }
@@ -501,8 +502,6 @@ pub fn sync_entities_system(
                     wire.look,
                     Some(EntityLook::Door { .. } | EntityLook::Transport { .. })
                 );
-                // A worm can be underground (INVISIBLE) when we zone in; hide it
-                // from the first frame instead of flashing orb/model for a beat.
                 let spawn_vis = if !is_self && wire.is_invisible() {
                     Visibility::Hidden
                 } else {
@@ -542,10 +541,6 @@ pub fn sync_entities_system(
                 }
             }
         }
-
-        // Nameplate billboards are spawned by
-        // update_nameplate_billboards_system's ensure pass (every frame, from
-        // the live entity table) — sync no longer owns plate existence.
     }
 
     // A mount is a second actor standing exactly where its rider stands; the
@@ -641,8 +636,6 @@ pub fn apply_invis_flag_system(
     for (_bevy_entity, ent, orb_mat) in &mut q_roots {
         let hide = table.get(ent.id).is_some_and(|r| r.invis_flag());
 
-        // The skinned model is a separate root synced by world_id; hiding it never
-        // touches the wire entity or its hitbox.
         #[cfg(not(target_arch = "wasm32"))]
         if let Ok(rr) = model_roots.get(_bevy_entity) {
             if let Ok(mut v) = other_vis.get_mut(rr.0) {
@@ -657,9 +650,6 @@ pub fn apply_invis_flag_system(
             }
         }
 
-        // The placeholder orb, present until model load removes Mesh3d. While hidden it is
-        // blanked to the shared transparent handle; sync_entities_system restores the kind
-        // handle on the dirty frame that clears the flag.
         if let Some(mut mm) = orb_mat {
             if hide && mm.0 != materials.invis_orb {
                 mm.0 = materials.invis_orb.clone();
@@ -867,7 +857,7 @@ pub fn ensure_self_render_pos_system(
 /// positions (produced by `apply_self_prediction_system` at 60Hz) using the
 /// fixed-timestep overstep fraction. This decouples the visible character
 /// motion from the fixed-tick cadence so the chase camera, which reads
-/// Transform every render frame, no longer sees stair-step Y jitter as the
+/// Transform every render frame, does not see stair-step Y jitter as the
 /// display frame rate races ahead of FixedUpdate.
 pub fn interpolate_self_transform_system(
     fixed_time: Res<Time<Fixed>>,
@@ -1238,7 +1228,6 @@ mod tests {
             .spawn((Visibility::Visible, ChildOf(root)))
             .id();
 
-        // The skinned model is a separate root (ffxi_actor_render's shape).
         let actor_root = app.world_mut().spawn(Visibility::default()).id();
         app.world_mut()
             .entity_mut(root)
@@ -1306,9 +1295,6 @@ mod tests {
             "a stray InvisFlag bit on a mob must not hide it (PCs only)"
         );
 
-        // Clearing the flag restores the actor root. The orb material restore is owned by
-        // sync_entities_system's dirty frame, so it stays blanked here — that split is the
-        // design, not an oversight.
         app.world_mut()
             .resource_mut::<EntityTable>()
             .upsert(&pc_entity(7, false));
@@ -1353,8 +1339,8 @@ mod tests {
         }
     }
 
-    /// The server-pushed retarget (s2c 0x058 ASSIST) is what makes `/assist`
-    /// and auto-target-after-kill move the cursor.
+    /// The server-pushed retarget (s2c 0x058 ASSIST, 0x058_assist.cpp) is what
+    /// makes `/assist` and auto-target-after-kill move the cursor.
     #[test]
     fn server_retarget_moves_the_target() {
         let mut app = retarget_app();
@@ -1467,8 +1453,9 @@ mod tests {
         );
     }
 
-    /// The 0x058 rides the event channel while the entity rides the snapshot,
-    /// so the retarget can arrive first. Applying it straight away would hand
+    /// The 0x058 (0x058_assist.cpp) rides the event channel while the entity
+    /// rides the snapshot, so the retarget can arrive first. Applying it
+    /// straight away would hand
     /// `auto_clear_target_system` a target with no entity, which drops it for
     /// good.
     #[test]

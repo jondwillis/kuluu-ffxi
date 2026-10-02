@@ -1,5 +1,6 @@
 //! NVIDIA DLSS 5 Neural Rendering ("Neural Uplift", a.k.a. DLSSNR) — kuluu's
-//! own pipeline hook, driving `nvngx_dlssnr.dll`'s Vulkan NGX API directly.
+//! own pipeline hook, driving `nvngx_dlssnr.dll`'s (vendor/DLSS/nvngx_dlssnr.dll)
+//! Vulkan NGX API directly.
 //!
 //! All unsafe FFI lives in the [`kuluu_dlss_nr`] crate; this module is safe
 //! Bevy wiring around it:
@@ -19,6 +20,12 @@
 
 use std::sync::Mutex;
 
+/// Raw wgpu types that bevy does not re-export (TextureTransition/TextureUses)
+/// plus the ones we name directly. Same pinned copy as bevy's wgpu — no new
+/// crate gets built; this only adds a direct edge to it.
+use bevy::camera::{CameraMainTextureUsages, MainPassResolutionOverride};
+use bevy::core_pipeline::prepass::ViewPrepassTextures;
+use bevy::core_pipeline::schedule::{Core3d, Core3dSystems};
 use bevy::{
     ecs::query::QueryItem,
     prelude::*,
@@ -30,12 +37,6 @@ use bevy::{
         Render, RenderApp, RenderSystems,
     },
 };
-// Raw wgpu types that bevy does not re-export (TextureTransition/TextureUses)
-// plus the ones we name directly. Same pinned copy as bevy's wgpu — no new
-// crate gets built; this only adds a direct edge to it.
-use bevy::camera::{CameraMainTextureUsages, MainPassResolutionOverride};
-use bevy::core_pipeline::prepass::ViewPrepassTextures;
-use bevy::core_pipeline::schedule::{Core3d, Core3dSystems};
 use kuluu_dlss_nr::{
     raw_command_buffer, result_name, wait_device_idle, NrParams, NrRuntime, NvngxHandle,
     NvngxResourceVk, VulkanHandles,
@@ -48,7 +49,7 @@ use wgpu::{
 
 use super::dlss::KULUU_DLSS_PROJECT_ID;
 
-const NGX_FAIL_PLATFORM_ERROR: u32 = 0xBAD0_0002;
+const NGX_FAIL_PLATFORM_ERROR: u32 = kuluu_dlss_nr::FAIL_PLATFORM_ERROR;
 use super::settings::GraphicsSettings;
 use crate::camera::OperatorCamera;
 
@@ -81,7 +82,7 @@ impl ExtractComponent for NrEnabled {
 /// Process-wide NR runtime state (render world). One DLL load + one Init_Ext
 /// per process, created lazily on the first frame where a camera carries
 /// [`NrEnabled`]. A missing `nvngx_dlssnr.dll` or failed init is logged and
-/// retried at most once per second — never per frame.
+/// retried at most once per second, not per frame.
 #[derive(Resource, Default)]
 pub struct NrState {
     runtime: Option<NrRuntime>,
@@ -96,13 +97,24 @@ pub struct NrState {
 impl NrState {
     /// Loads the DLL + extracts raw Vulkan handles + runs Init_Ext exactly
     /// once. Returns true when the runtime is ready for CreateFeature /
-    /// EvaluateFeature.
+    /// EvaluateFeature. Retries are throttled to at most once per second
+    /// (missing DLL / failed init). load() also resolved the forwarder
+    /// (nvngx.dll_kuluu.dll) and checked its ABI version: without it every
+    /// gated entry point (Init_Ext, CreateFeature, ReleaseFeature) fails.
+    /// LoadLibraryW returns NULL for any load failure (missing dependency,
+    /// DllMain refusal, policy block), not just a missing file — the win32
+    /// code says which. RenderDevice is a bevy wrapper, not wgpu::Device —
+    /// unwrap it first. The data path follows the same convention as
+    /// dlss_wgpu's SR init: the OS temp dir. The app id is the lower 64 bits
+    /// of KULUU_DLSS_PROJECT_ID (the u128 UUID); the NGX API takes a u64 app
+    /// id. A FWD_NULL_TARGET result means the forwarder got a null target — a
+    /// kuluu load-order bug, not NGX; NGX_FAIL_PLATFORM_ERROR means the call
+    /// is still module-gated and did not land inside nvngx.dll_kuluu.dll.
     fn ensure_initialized(&mut self, device: &RenderDevice) -> bool {
         if self.initialized {
             return true;
         }
 
-        // Throttle retries (missing DLL / failed init): at most once per second.
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
@@ -115,16 +127,10 @@ impl NrState {
         if self.runtime.is_none() {
             match NrRuntime::load() {
                 Ok(rt) => {
-                    // load() also resolved the forwarder (nvngx.dll_kuluu.dll)
-                    // and checked its ABI version — without it every gated entry
-                    // point (Init_Ext, CreateFeature, ReleaseFeature) fails.
                     info!("dlss-nr: loaded nvngx_dlssnr.dll + forwarder (nvngx.dll_kuluu.dll)");
                     self.runtime = Some(rt);
                 }
                 Err(e) => {
-                    // LoadLibraryW returns NULL for ANY load failure (missing
-                    // dependency, DllMain refusal, policy block), not just a
-                    // missing file — the win32 code says which.
                     warn!(
                         "dlss-nr: failed to load nvngx_dlssnr.dll ({e}) — Neural Uplift unavailable (DLSS SR unaffected)"
                     );
@@ -134,7 +140,6 @@ impl NrState {
         }
 
         if self.handles.is_none() {
-            // RenderDevice is a bevy wrapper, not wgpu::Device — unwrap it first.
             match VulkanHandles::from_wgpu(device.wgpu_device()) {
                 Some(h) => self.handles = Some(h),
                 None => {
@@ -146,10 +151,7 @@ impl NrState {
 
         let runtime = self.runtime.as_ref().unwrap();
         let handles = self.handles.unwrap();
-        // Same data-path convention as dlss_wgpu's SR init: the OS temp dir.
         let data_path = std::env::temp_dir().to_string_lossy().into_owned();
-        // Lower 64 bits of KULUU_DLSS_PROJECT_ID (the u128 UUID) — the NGX API
-        // takes a u64 app id.
         let app_id = KULUU_DLSS_PROJECT_ID as u64;
 
         match runtime.init(app_id, &data_path, &handles, None) {
@@ -164,10 +166,8 @@ impl NrState {
             r => {
                 error!("dlss-nr: Init_Ext failed: {}", result_name(r));
                 if r == kuluu_dlss_nr::FWD_NULL_TARGET {
-                    // Forwarder got a null target — our load-order bug, not NGX.
                     error!("dlss-nr: forwarder received a null Init_Ext pointer (kuluu-dlss-nr load-order bug)");
                 } else if r as u32 == NGX_FAIL_PLATFORM_ERROR {
-                    // Still gated: the call did not land inside nvngx.dll_kuluu.dll.
                     warn!("dlss-nr: still module-gated — confirm nvngx.dll_kuluu.dll sits next to this exe (staging in CONTRIBUTING.md#optional-dlss-and-neural-uplift-builds)");
                 }
                 false
@@ -203,16 +203,16 @@ struct NrInner {
     last_depth_sig: Option<(bool, u32, u32)>,
 }
 
+/// Best-effort release when the context goes away without a recreate
+/// (camera despawn); the runtime may already be gone, results ignored. Waits
+/// for in-flight evaluate work before releasing: freeing the feature while it
+/// is still on the GPU lets the runtime drop internal resources those
+/// commands reference (UAF -> device loss). Same ordering as dlss_wgpu's
+/// Drop; a lost device just makes the wait report an error, which is logged
+/// and proceeded past.
 impl Drop for NrInner {
     fn drop(&mut self) {
-        // Best-effort release when the context goes away without a recreate
-        // (camera despawn). The runtime may already be gone; ignore results.
         if !self.handle.is_empty() {
-            // Wait for in-flight evaluate work before releasing: freeing the
-            // feature while it is still on the GPU lets the runtime drop
-            // internal resources those commands reference (UAF -> device loss).
-            // Same ordering as dlss_wgpu's Drop; a lost device just makes the
-            // wait report an error, which we log and proceed past.
             if let Err(code) = wait_device_idle(&self.device) {
                 warn!("dlss-nr: device not idle before feature release (vk result {code})");
             }
@@ -225,7 +225,10 @@ impl Drop for NrInner {
 /// Mirrors the Neural Uplift settings onto the operator camera. Runs every
 /// frame (ungated) so it self-heals across the AA/DLSS camera respawn — same
 /// pattern as `apply_camera_prepass_system`. Steady state is a single-entity
-/// query with no writes.
+/// query with no writes. Disabled and no marker present is the steady state,
+/// nothing to do. A knob change while enabled re-inserts with fresh values;
+/// the extraction system picks the new copy up next frame, so one frame of
+/// stale knobs is invisible in practice.
 pub fn apply_neural_uplift_system(
     settings: Res<GraphicsSettings>,
     mut commands: Commands,
@@ -246,11 +249,7 @@ pub fn apply_neural_uplift_system(
         (false, Some(_)) => {
             commands.entity(entity).try_remove::<NrEnabled>();
         }
-        // Disabled and no marker present: steady state, nothing to do.
         (false, None) => {}
-        // Knob changed while enabled: re-insert with fresh values. The
-        // extraction system picks the new copy up next frame; one frame of
-        // stale knobs is invisible in practice.
         (true, Some(existing)) => {
             let fresh = NrEnabled {
                 intensity: settings.nr_intensity,
@@ -265,10 +264,34 @@ pub fn apply_neural_uplift_system(
 }
 
 /// Render-schedule prepare (PrepareViews set, before view targets are built):
-/// lazily inits the runtime and keeps one 0x12 feature per NR camera at the
-/// current full-window resolution. Also ORs STORAGE_BINDING into the main
-/// texture usages — NGX writes its output through storage ops, exactly like
-/// bevy's own DLSS prepare does for SR.
+/// lazily inits the runtime and keeps one feature per NR camera (feature type
+/// 0x12, vendor/DLSS/nvngx_dlssnr.dll) at the current full-window resolution.
+/// Also ORs STORAGE_BINDING into the main texture usages — NGX writes its
+/// output through storage ops, exactly like bevy's own DLSS prepare does for
+/// SR.
+///
+/// Recreate attempts after a failed CreateFeature are throttled to 1/s: while
+/// the gate or forwarder is broken this would otherwise log once per frame.
+/// The prior feature is released first: Release is not command-buffer encoded
+/// in this ABI — it takes only the handle; wait for idle before releasing,
+/// because last frame's evaluate may still be on the GPU, and releasing under
+/// it lets the runtime free resources those commands reference (UAF -> device
+/// loss). Same ordering as dlss_wgpu's Drop.
+///
+/// The new feature is created on its own command buffer, submitted now — same
+/// pattern as dlss_wgpu's DlssSuperResolution::new; native-res enhancement
+/// pass: input and output are both the full window size. The zero-filled
+/// motion-vector stand-in is created alongside the feature so it matches this
+/// window resolution and is cleared exactly once (the pass ends, storing the
+/// clear, when its RenderPass drops); the inner wgpu::Device is used, not
+/// RenderDevice's own create_texture (which returns bevy's Texture wrapper —
+/// the raw wgpu texture/view is needed). The one-time clear runs on its OWN
+/// encoder: wgpu-core 29 forbids mixing the high-level and raw encoding APIs
+/// on one CommandEncoder (the first use locks the EncodingApi); the create
+/// path encodes through raw Vulkan, so it keeps a separate raw-only encoder,
+/// and submitting the clear first guarantees it completes before any frame
+/// samples MVec. NrInner keeps the inner wgpu::Device: RenderDevice derives
+/// Clone, so .clone() alone would keep the wrapper.
 pub fn prepare_nr(
     mut query: Query<
         (
@@ -289,14 +312,12 @@ pub fn prepare_nr(
             usages.0 |= TextureUsages::STORAGE_BINDING;
         }
 
-        // Lazy one-time init: load DLL + extract handles + Init_Ext.
         if !nr_state.ensure_initialized(&render_device) {
             continue;
         }
         let runtime = nr_state.runtime.as_ref().unwrap();
 
         let out_size = view.viewport.zw();
-        // Borrow, don't move — `context` is used again below for the release path.
         let needs_recreate = match context {
             Some(ref ctx) => {
                 let inner = ctx.inner.lock().unwrap();
@@ -308,8 +329,6 @@ pub fn prepare_nr(
             continue;
         }
 
-        // Throttle recreate attempts after a failed CreateFeature: while the gate
-        // or forwarder is broken this would otherwise log once per frame.
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
@@ -320,11 +339,6 @@ pub fn prepare_nr(
             continue;
         }
 
-        // Drop the old feature first. Release is not command-buffer encoded in
-        // this ABI — it takes only the handle. Wait for idle before releasing:
-        // last frame's evaluate may still be on the GPU, and releasing under it
-        // lets the runtime free resources those commands reference (UAF ->
-        // device loss). Same ordering as dlss_wgpu's Drop.
         if let Some(ctx) = context {
             let mut inner = ctx.inner.lock().unwrap();
             if !inner.handle.is_empty() {
@@ -343,18 +357,10 @@ pub fn prepare_nr(
             continue;
         };
 
-        // Create the new feature on its own command buffer, submitted now —
-        // same pattern as dlss_wgpu's DlssSuperResolution::new. Native-res
-        // enhancement pass: input and output are both the full window size.
         let mut encoder = render_device.create_command_encoder(&CommandEncoderDescriptor {
             label: Some("kuluu_dlss_nr_create"),
         });
 
-        // Zero-filled motion-vector stand-in, created alongside the feature so
-        // it matches this window resolution and is cleared exactly once. The
-        // pass ends (storing the clear) when its RenderPass drops.
-        // The inner wgpu::Device, not RenderDevice's own create_texture (which
-        // returns bevy's Texture wrapper — we need the raw wgpu texture/view).
         let mvec_texture = render_device
             .wgpu_device()
             .create_texture(&TextureDescriptor {
@@ -373,7 +379,6 @@ pub fn prepare_nr(
             });
         let mvec_view = mvec_texture.create_view(&TextureViewDescriptor::default());
 
-        // The one-time clear runs on its OWN encoder: wgpu-core 29 forbids mixing the high-level and raw encoding APIs on one CommandEncoder (the first use locks the EncodingApi — build-12 panic). The create path below encodes through raw Vulkan, so it keeps a separate raw-only encoder; submitting this clear first guarantees it completes before any frame samples MVec.
         let mut mvec_encoder = render_device.create_command_encoder(&CommandEncoderDescriptor {
             label: Some("kuluu_dlss_nr_mvec_clear"),
         });
@@ -412,8 +417,6 @@ pub fn prepare_nr(
                         handle,
                         params,
                         runtime: *runtime,
-                        // NrInner needs the inner wgpu::Device (RenderDevice
-                        // derives Clone — .clone() alone would keep the wrapper).
                         device: render_device.wgpu_device().clone(),
                         out_w: out_size.x,
                         out_h: out_size.y,
@@ -448,6 +451,44 @@ pub fn prepare_nr(
 /// lives, so NR enhances whatever SR produced). One EvaluateFeature per frame:
 /// Color = current main texture, Depth = prepass depth when sampleable,
 /// Output = the ping-pong destination.
+///
+/// Depth is only usable when the prepass exists and is single-sampled: under
+/// MSAA the prepass depth texture is multisampled and unsampleable by NGX, so
+/// NR runs color-only (the parser tolerates a missing depth). `pre.depth` is
+/// an Option<ColorAttachment>; its `.texture` is a CachedTexture, so
+/// sample_count() lives on the inner wgpu::Texture. The color resource is
+/// built from the CURRENT main texture view (no flip yet), so a failed
+/// extraction skips the frame without losing the ping-pong state; the MVec
+/// stand-in resource is built from the same view every frame. The flip is
+/// committed only once the runtime + output resource work; a miss falls back
+/// to preserve_main_after_flip.
+///
+/// Barriers run on the shared encoder (source -> shader-readable, output ->
+/// storage-writable), then the NGX evaluate is encoded into our own command
+/// buffer — exactly dlss_wgpu's per-frame pattern; the separate buffer is
+/// submitted immediately after the main one via add_command_buffer. The
+/// MVec stand-in was last written as a render attachment (its one-time clear
+/// in prepare_nr), so sampling it from the evaluate command buffer needs the
+/// shader-read transition too. PostProcessWrite hands out &bevy Texture,
+/// which deref-coerces to &wgpu::Texture only when the target type is known
+/// (no coercion into a generic), so the barriers are annotated explicitly;
+/// dv.texture() already yields &wgpu::Texture. A raw-command-buffer miss after
+/// the color extraction would still leave the flipped main texture unwritten,
+/// so it falls back the same way.
+///
+/// When SR is active the prepass depth only has valid data in its top-left
+/// subrect (the render resolution); the runtime is told so. Without SR the
+/// whole depth texture is valid — its full size is passed explicitly rather
+/// than relying on the parser default, since the params map persists across
+/// frames and would otherwise keep a stale SR subrect. The runtime's temporal
+/// history is flushed when the input geometry changes (SR on/off or tier
+/// change moves the depth subrect; MSAA toggles depth availability) and on
+/// the first frame after create, whose internal buffers are not yet
+/// meaningful; steady-state frames keep accumulating. Bevy's
+/// PerspectiveProjection::get_clip_from_view uses reverse-Z, hence the
+/// reverse-Z flag. After an evaluate failure the flip has already moved the
+/// main texture to `destination`; without a write into it, next frame would
+/// read undefined contents.
 pub fn nr_node(
     view: ViewQuery<(
         &NrEnabled,
@@ -462,19 +503,12 @@ pub fn nr_node(
     let (nr_enabled, nr_context, resolution_override, view_target, prepass_textures) =
         view.into_inner();
 
-    // Depth is only usable when the prepass exists and is single-sampled.
-    // Under MSAA the prepass depth texture is multisampled and unsampleable by
-    // NGX — NR then runs color-only (the parser tolerates a missing depth).
-    // `pre.depth` is an Option<ColorAttachment>; its `.texture` is a
-    // CachedTexture, so sample_count() lives on the inner wgpu::Texture.
     let depth_view = prepass_textures
         .as_ref()
         .and_then(|pre| pre.depth.as_ref())
         .filter(|depth| depth.texture.texture.sample_count() == 1)
         .map(|depth| &depth.texture.default_view);
 
-    // Build the color resource from the CURRENT main texture view (no flip yet),
-    // so a failed extraction skips the frame without losing the ping-pong state.
     let Some(color_res) =
         NvngxResourceVk::from_texture_view(view_target.main_texture_view(), &adapter)
     else {
@@ -482,14 +516,11 @@ pub fn nr_node(
     };
 
     let mut inner = nr_context.inner.lock().unwrap();
-    // Zero-filled stand-in sized to the input (created in prepare_nr); its
-    // resource is built from the same view every frame.
     let Some(mvec_res) = NvngxResourceVk::from_texture_view(&inner.mvec_view, &adapter) else {
         return;
     };
     let out_extent = [color_res.width, color_res.height, 1];
 
-    // Commit to the flip only once we know the runtime + output resource work.
     let view_target = view_target.post_process_write();
     let Some(output_res) = NvngxResourceVk::from_texture_view(view_target.destination, &adapter)
     else {
@@ -505,13 +536,6 @@ pub fn nr_node(
 
     let depth_res = depth_view.and_then(|dv| NvngxResourceVk::from_texture_view(dv, &adapter));
 
-    // Barriers on the shared encoder (source -> shader-readable, output ->
-    // storage-writable), then encode the NGX evaluate into our own command
-    // buffer — exactly dlss_wgpu's per-frame pattern. The separate buffer is
-    // submitted immediately after the main one via add_command_buffer below.
-    // Annotate explicitly: PostProcessWrite hands out &bevy Texture, which
-    // deref-coerces to &wgpu::Texture only when the target type is known (no
-    // coercion into a generic). dv.texture() already yields &wgpu::Texture.
     let mut barriers: Vec<TextureTransition<&wgpu::Texture>> = Vec::with_capacity(3);
     barriers.push(TextureTransition {
         texture: view_target.source_texture,
@@ -525,9 +549,6 @@ pub fn nr_node(
             state: TextureUses::RESOURCE,
         });
     }
-    // The MVec stand-in was last written as a render attachment (its one-time
-    // clear in prepare_nr); sampling it from the evaluate command buffer needs
-    // the shader-read transition too.
     barriers.push(TextureTransition {
         texture: inner.mvec_view.texture(),
         selector: None,
@@ -546,8 +567,6 @@ pub fn nr_node(
         .create_command_encoder(&CommandEncoderDescriptor {
             label: Some("kuluu_dlss_nr_evaluate"),
         });
-    // Unreachable after the color extraction above (both need Vulkan), but a
-    // miss here would still leave the flipped main texture unwritten.
     let Some(raw_cmd) = raw_command_buffer(&mut encoder) else {
         preserve_main_after_flip(
             ctx.command_encoder(),
@@ -558,21 +577,12 @@ pub fn nr_node(
         return;
     };
 
-    // When SR is active the prepass depth only has valid data in its top-left
-    // subrect (the render resolution); tell the runtime so. Without SR the
-    // whole depth texture is valid — pass its full size explicitly rather than
-    // relying on the parser default, since the params map persists across
-    // frames and would otherwise keep a stale SR subrect.
     let has_depth = depth_res.is_some();
     let (sub_w, sub_h) = match resolution_override {
         Some(ovr) => (ovr.0.x, ovr.0.y),
         None => (color_res.width, color_res.height),
     };
 
-    // Flush the runtime's temporal history when the input geometry changes
-    // (SR on/off or tier change moves the depth subrect; MSAA toggles depth
-    // availability) — and on the first frame after create, whose internal
-    // buffers are not yet meaningful. Steady-state frames keep accumulating.
     let sig = (has_depth, sub_w, sub_h);
     let reset = inner.last_depth_sig != Some(sig);
     inner.last_depth_sig = Some(sig);
@@ -588,7 +598,7 @@ pub fn nr_node(
         nr_enabled.intensity,
         nr_enabled.local_tone_strength,
         nr_enabled.structure_strength,
-        true, // Bevy PerspectiveProjection::get_clip_from_view uses reverse-Z.
+        true,
         sub_w,
         sub_h,
         reset,
@@ -596,8 +606,6 @@ pub fn nr_node(
 
     if r != kuluu_dlss_nr::NGX_SUCCESS {
         warn!("dlss-nr: EvaluateFeature failed: {}", result_name(r));
-        // The flip above already moved the main texture to `destination`;
-        // without a write into it, next frame would read undefined contents.
         preserve_main_after_flip(
             ctx.command_encoder(),
             view_target.source_texture,
@@ -625,7 +633,7 @@ pub fn preserve_main_after_flip(
         texture,
         mip_level: 0,
         origin: Default::default(),
-        aspect: TextureAspect::All, // default; the main texture is color-only anyway
+        aspect: TextureAspect::All,
     };
     encoder.copy_texture_to_texture(
         copy(source),
@@ -640,15 +648,17 @@ pub fn preserve_main_after_flip(
 
 /// Registers the NR systems on a Bevy app. Called from ViewerCorePlugin under
 /// the `dlss` feature:
-/// - main world: the apply system + component extraction plugin;
+/// - main world: the apply system (mirrors settings onto the operator camera,
+///   every frame) + component extraction plugin (adds its own ExtractSchedule
+///   system to the RenderApp sub-app and wires removal propagation);
 /// - render world: prepare (PrepareViews, before view targets) and the node
-///   (Core3d PostProcess — after EarlyPostProcess where DLSS SR lives).
+///   (Core3d PostProcess — after EarlyPostProcess where DLSS SR lives, so NR
+///   enhances whatever SR produced when both are on). `.before(tonemapping)`
+///   pins it ahead of the LDR conversion: without it the scheduler may run NR
+///   last, enhancing already-tonemapped data instead of the HDR scene.
 pub fn register(app: &mut App) {
-    // Main world: mirror settings onto the operator camera, every frame.
     app.add_systems(Update, apply_neural_uplift_system);
 
-    // Extraction into the render world (adds its own ExtractSchedule system to
-    // the RenderApp sub-app and wires removal propagation).
     app.add_plugins(bevy::render::extract_component::ExtractComponentPlugin::<
         NrEnabled,
     >::default());
@@ -661,10 +671,6 @@ pub fn register(app: &mut App) {
             .in_set(RenderSystems::PrepareViews)
             .before(prepare_view_targets),
     );
-    // PostProcess runs after EarlyPostProcess (where DLSS SR lives), so NR
-    // enhances whatever SR produced when both are on. `.before(tonemapping)`
-    // pins it ahead of the LDR conversion: without it the scheduler may run NR
-    // last, enhancing already-tonemapped data instead of the HDR scene.
     render_app.add_systems(
         Core3d,
         nr_node

@@ -1,6 +1,9 @@
 //! Runs every event in every zone through the VM and reports what stops it, so a
 //! change to opcode coverage can be measured against the whole retail corpus
-//! rather than the one cutscene that prompted it.
+//! rather than the one cutscene that prompted it. Server tags are answered
+//! immediately: with no server offline, an event whose loop condition moves only
+//! on a PENDINGNUM side effect reaches the step limit instead of burning one
+//! step's opcode budget.
 //!
 //! `cargo run -p ffxi-event --example zz-event-sweep [-- <zone>...]`
 
@@ -109,10 +112,6 @@ fn main() {
                             last = "wait";
                             vm.tick(OFFLINE_WAIT_SKIP_SECS)
                         }
-                        // No server offline: answer the tag immediately. Events
-                        // whose loop condition only a PENDINGNUM side effect
-                        // would move reach the step limit here rather than
-                        // burning one step's opcode budget.
                         StepResult::AwaitServerAck(_) => {
                             last = "pending";
                             vm.ack_server()

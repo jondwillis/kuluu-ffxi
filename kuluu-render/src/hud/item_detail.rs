@@ -92,9 +92,9 @@ pub(crate) fn detail_rows(detail: &ItemDetail) -> Vec<String> {
     rows
 }
 
+/// A mask covering every job the scraped table knows reads "All Jobs" (retail
+/// prints it for bait and level-1 gear whose DAT lists all 22).
 fn format_jobs(jobs_mask: u32) -> String {
-    // A mask covering every job the scraped table knows reads "All Jobs"
-    // (retail prints it for bait and level-1 gear whose DAT lists all 22).
     let every_job = (1..32u32)
         .filter(|bit| ffxi_vocab::job_names::abbrev(*bit as u16).is_some())
         .all(|bit| jobs_mask & (1 << bit) != 0);
@@ -348,6 +348,8 @@ fn consolidates(items: &[kuluu_snapshot::InventoryItem]) -> bool {
 /// Unverified against retail: the observation record has the Options box and
 /// its help strings but never confirmed a sort
 /// (.agents/skills/retail-observe/references/2026-09-11-items-window.md).
+/// The InZone/dialog gate: an ITEM_STACK mid-event is refused by the transport,
+/// and a container read before the bootstrap finishes is not the real inventory.
 pub fn auto_consolidate_inventory_system(
     sort: Res<SortOptions>,
     scene: Res<crate::snapshot::SceneState>,
@@ -359,8 +361,6 @@ pub fn auto_consolidate_inventory_system(
         return;
     }
     let snap = &scene.snapshot;
-    // An ITEM_STACK mid-event is refused by the transport, and a container read
-    // before the bootstrap finishes is not the real inventory yet.
     if !sort.auto || snap.stage != kuluu_snapshot::Stage::InZone || snap.dialog.is_some() {
         return;
     }
@@ -470,9 +470,9 @@ mod tests {
         assert!(!consolidates(&[locked, slot(1, id, stack / 2)]));
     }
 
+    /// Two of the same non-stacking item occupy two slots however they sort.
     #[test]
     fn unstackable_duplicates_are_not_worth_consolidating() {
-        // Two of the same non-stacking item occupy two slots however they sort.
         let id = unstacking();
         assert!(!consolidates(&[slot(0, id, 1), slot(1, id, 1)]));
     }
@@ -570,8 +570,11 @@ mod tests {
     #[test]
     fn races_collapse_per_gender_bits() {
         assert_eq!(format_races(0), "All Races");
-        assert_eq!(format_races(0x01FE), "All Races"); // all 8 race bits set
-                                                       // 1-indexed race ids: Hume M = bit 1, Mithra = bit 7, Galka = bit 8.
+        assert_eq!(
+            format_races(0x01FE),
+            "All Races",
+            "all 8 race bits set; 1-indexed race ids: Hume M = bit 1, Mithra = bit 7, Galka = bit 8"
+        );
         assert_eq!(format_races(0x0002), "Hume");
         assert_eq!(format_races(0x0080), "Mithra"); // Mithran Gaiters, not Galka
         assert_eq!(format_races(0x0100), "Galka");

@@ -8,7 +8,8 @@ use bevy::render::render_asset::RenderAssets;
 use bevy::render::texture::GpuImage;
 use bevy::render::{Render, RenderApp, RenderSystems};
 
-// Asset IDs carry no ownership; this process-wide mirror follows the render world's residency.
+/// Asset IDs carry no ownership; this process-wide mirror follows the render
+/// world's residency.
 #[derive(Resource, Default, Clone, ExtractResource)]
 pub struct GpuAssetResidency(Arc<Mutex<HashSet<AssetId<Image>>>>);
 

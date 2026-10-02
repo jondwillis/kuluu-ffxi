@@ -445,6 +445,9 @@ fn decoded_texture_to_image(t: &DecodedTexture) -> Image {
     )
 }
 
+/// Later mesh files for the same entity merge into the cumulative `cpu_extent`
+/// range, so the BakedActor insert is a replace: each arrival rewrites the range
+/// instead of freezing at the first file's extent.
 pub fn process_load_vos2_requests(
     mut events: MessageReader<LoadVos2Request>,
     mut commands: Commands,
@@ -686,9 +689,6 @@ pub fn process_load_vos2_requests(
                 let merged_min = prev_min.min(slot_min);
                 let merged_max = prev_max.max(slot_max);
                 cpu_extent.insert(req.entity_id, (merged_min, merged_max));
-
-                // Replace, same as the skinned path above: later mesh files for this
-                // entity merge into `cpu_extent`/this range and must be able to move it.
                 commands.entity(bevy_e).insert(crate::scene::BakedActor {
                     min_mesh_y: merged_min,
                     actor_height: (merged_max - merged_min).max(0.1),
@@ -1428,6 +1428,9 @@ fn spawn_ffxi_actor(
     (pivot, skin_slot, out_slots)
 }
 
+/// An outfit's files can land on different frames, and each arrival rewrites the full
+/// cumulative range read back from the actor state, so the FfxiActor/BakedActor inserts
+/// are replaces: a try_insert would freeze both components at the first file's extent.
 #[allow(clippy::too_many_arguments)]
 pub fn process_load_vos2_requests_ffxi(
     mut events: MessageReader<LoadVos2Request>,
@@ -1540,10 +1543,6 @@ pub fn process_load_vos2_requests_ffxi(
         );
 
         let actor_height = (actor_max - actor_min).max(0.1);
-        // Replace, same as the non-FFXI path above: an outfit's files can land
-        // on different frames, and each arrival rewrites the full cumulative
-        // range read back from q_actor — try_insert would freeze both components
-        // at the FIRST file's extent (its insert wins, later ones silently no-op).
         commands.entity(bevy_e).insert(FfxiActor {
             skeleton: skeleton.clone(),
 
@@ -2361,6 +2360,9 @@ pub fn prepare_equipped(
     }
 }
 
+/// Re-equipping and re-spawning rebuild the actor's mesh range, so the BakedActor insert
+/// is a replace: the anchor height tracks the freshly assembled range instead of keeping
+/// a stale one.
 pub fn spawn_prepared_equipped(
     root: &DatRoot,
     commands: &mut Commands,
@@ -2405,8 +2407,6 @@ pub fn spawn_prepared_equipped(
             "equipped actor spawn: parent={:?} race={} mesh=[{:.2}..{:.2}] actor_height={:.2}",
             parent, prepared.race, prepared.min_mesh_y, prepared.max_mesh_y, actor_height,
         );
-        // Replace, not try-insert: re-equipping/re-spawning must move the anchor
-        // height to the freshly assembled range instead of keeping a stale one.
         commands.entity(parent).insert(BakedActor {
             min_mesh_y: prepared.min_mesh_y,
             actor_height,

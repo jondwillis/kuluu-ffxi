@@ -101,9 +101,9 @@ impl EmoteList {
         Self::job_bit_set(self.job_bits, job_id)
     }
 
-    /// jobemotes_t spans 22 job bits (vendor/server/src/map/packets/s2c/
-    /// 0x11a_emote_list.h jobemotes_t); `checked_shr` bounds a wire-supplied job id
-    /// so out-of-range values read as locked instead of overflowing the shift.
+    /// jobemotes_t spans 22 job bits (vendor/server/src/map/packets/s2c/0x11a_emote_list.h
+    /// jobemotes_t); `checked_shr` bounds a wire-supplied job id so out-of-range
+    /// values read as locked instead of overflowing the shift.
     pub fn job_bit_set(job_bits: u32, job_id: u8) -> bool {
         job_id >= 1
             && job_bits
@@ -214,9 +214,9 @@ mod emote_list_tests {
         ));
     }
 
-    /// jobemotes_t is 22 bits wide (vendor/server/src/map/packets/s2c/
-    /// 0x11a_emote_list.h jobemotes_t); wire-supplied ids past the u32 width must
-    /// read as locked, never overflow the shift.
+    /// jobemotes_t is 22 bits wide (vendor/server/src/map/packets/s2c/0x11a_emote_list.h
+    /// jobemotes_t); wire-supplied ids past the u32 width must read as locked,
+    /// not overflow the shift.
     #[test]
     fn job_unlocked_bounds_out_of_range_job_id() {
         let e = EmoteList {

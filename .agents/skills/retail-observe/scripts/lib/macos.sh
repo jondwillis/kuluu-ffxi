@@ -76,6 +76,30 @@ host_raise_hint() {
   return 1
 }
 
+# A locked Mac is the cruellest state this backend can be in: screencapture
+# still returns the client's window off the window-server list, so discovery,
+# captures and OCR all keep working and look healthy, while the login window
+# swallows every synthesized click and keystroke and host_show reports some
+# other app frontmost. Without this check a drive loop reads that as broken
+# input delivery and goes hunting through focus, coordinates and scale.
+# `ioreg | grep -q` would SIGPIPE ioreg the moment grep matches, and under
+# `set -o pipefail` that reports the pipeline as failed on exactly the runs
+# where the screen IS locked. Read the whole listing, then match it.
+host_screen_locked() {
+  local reg
+  reg=$(ioreg -l -w0 2>/dev/null) || return 1
+  case $reg in
+    *'"CGSSessionScreenIsLocked"=Yes'*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+host_input_or_die() {
+  host_screen_locked || return 0
+  die "the Mac's screen is locked, so synthesized input goes nowhere (captures and OCR still work).
+Unlock the machine and re-run; no drive loop can deliver keys or clicks past the login window."
+}
+
 host_no_window_help() {
   cat <<'EOF'
 On macOS the client window is either a Wine window (its owner is the Wine
@@ -202,7 +226,15 @@ host_launch() {
   printf 'observe: %s %s %s\n' "${RUNNER:-}" "$loader" "$args"
   # cd into the install: loaders resolve DATs, Ashita config and their own
   # DLLs relative to the working directory, not to argv[0].
-  ( cd "$(dirname "$loader")" && exec ${RUNNER:-} "$loader" $args )
+  # A runner is either one executable -- possibly an absolute path with spaces
+  # in it, which is where a purpose-built wine build lands on macOS -- or a
+  # command line to word-split (`umu-run --some-flag`). Only the second may be
+  # split, so decide by asking whether the whole string names a file.
+  if [ -x "${RUNNER:-}" ]; then
+    ( cd "$(dirname "$loader")" && exec "$RUNNER" "$loader" $args )
+  else
+    ( cd "$(dirname "$loader")" && exec ${RUNNER:-} "$loader" $args )
+  fi
 }
 
 host_doctor() {
@@ -224,6 +256,12 @@ host_doctor() {
     "false true") printf '  [FAIL] Screen Recording NOT granted -> captures come back black (System Settings > Privacy & Security > Screen Recording)\n'; ok=1 ;;
     *) printf '  [warn] could not read permission state (%s)\n' "${perms:-no output}" ;;
   esac
+  if host_screen_locked; then
+    printf '  [FAIL] the screen is locked: captures and OCR still work, input does not\n'
+    ok=1
+  else
+    printf '  [ok]   screen unlocked (input can reach the client)\n'
+  fi
   if [ -n "${VM_NAME:-}" ]; then
     command -v prlctl >/dev/null 2>&1 && printf '  [ok]   prlctl present; VM %s: %s\n' "$VM_NAME" "$(prlctl list "$VM_NAME" 2>&1 | tail -1)" \
       || printf '  [warn] no prlctl; start the VM from its GUI\n'

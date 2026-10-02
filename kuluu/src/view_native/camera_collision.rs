@@ -12,7 +12,7 @@ use super::collision_bvh::{CollisionBvh, ZoneCollisionBvh};
 
 /// Gap-proportional pull rate (1/sec) for the position spring, HORIZONTAL only.
 /// At run speed ~6 yalms/sec the settled horizontal gap is speed / PULL_RATE
-/// = ~3 yalms: the character leads, the camera trails. Rotation is never
+/// = ~3 yalms: the character leads, the camera trails. Rotation is not
 /// lagged (this engine has no lean); only position.
 const CAM_PULL_RATE: f32 = 2.0;
 
@@ -55,6 +55,46 @@ const OUTWARD_LERP: f32 = 0.18;
 
 const INWARD_LERP: f32 = 0.45;
 
+/// The single chase-camera authority: position spring, orbit, and the wall
+/// pull-in against the zone MZB BVH, with one transform write at the end.
+///
+/// Init sync aligns yaw behind the player on the first frame. Pass 1 is the
+/// position spring (horizontal only): rate-limited follow moves the anchor
+/// toward the player at min(gap*rate, max_speed), travel capped at the gap so
+/// it does not overshoot, no easing so it does not wobble; Y is taken direct
+/// from the (already render-smoothed) player Transform, so the camera does
+/// not float above the player on stairs. snap_to_anchor (zone/warp) resets to
+/// the exact position. The spring-smoothed value is the boom origin (where
+/// the camera rig sits), not the orbit/look-at pivot: using it as the pivot
+/// made rotation swing around the trailing anchor while the player sat off to
+/// one side — the "dizzy, off-center rotation" bug. The pivot is the
+/// player's true position; the spring only softens how the rig glides toward
+/// that pivot horizontally.
+///
+/// Pass 2 is the orbit: instant rotation, not lagged. The pivot is the
+/// player, spring or not, so rotation orbits the player and the look-at keeps
+/// the player centered in frame; the spring-smoothed follow only shifts the
+/// boom origin, so the rig can glide while the subject stays put under
+/// rotation. Both share the same anchor height (direct-Y off the player) so
+/// the boom stays level.
+///
+/// Pass 3 is the collision pull-in: a ray from the pivot along the boom,
+/// where walls block and mobs do not — the same solid world the walker
+/// sweeps (the door triangles join this ray when the obstacle set lands).
+/// The nearest hit shortens the boom so the camera does not clip through
+/// geometry; cast from the pivot (the player), not the glide origin, so wall
+/// pull-in is measured from where the camera is actually looking. The BVH
+/// rebuilds ~1 s after zone geometry goes quiet; until then there is no ray
+/// and the boom runs unclipped.
+///
+/// Boom-length easing (not position) snaps in fast when a wall appears and
+/// eases out slow when it clears, so the camera does not jitter at wall
+/// edges; the position spring is pass 1, this only smooths the pull-in
+/// distance. The single write places the eye along the boom from the glide
+/// origin while the camera looks at the player pivot, so however the rig
+/// glides the player stays centered and rotation orbits the player; with the
+/// spring off, boom_origin equals the pivot and this reduces to the plain
+/// centered behavior.
 pub fn resolve_camera(
     mode: Res<CameraMode>,
     settings: Res<kuluu_render::GraphicsSettings>,
@@ -80,26 +120,11 @@ pub fn resolve_camera(
         return;
     };
 
-    // Init sync: align yaw behind the player on the first frame (moved here
-    // from the retired chase_camera_system).
     if !chase.synced_initial {
         chase.yaw = yaw_for_heading(scene_state.snapshot.self_pos.heading);
         chase.synced_initial = true;
     }
 
-    // --- Pass 1: position spring (HORIZONTAL only) ---
-    // Rate-limited follow: move the anchor toward the player at
-    // min(gap*rate, max_speed), travel capped at the gap so it can't overshoot,
-    // no easing so it can't wobble. Y is taken direct from the (already
-    // render-smoothed) player Transform, so the camera never floats above the
-    // player on stairs. snap_to_anchor (zone/warp) resets to exact position.
-    //
-    // IMPORTANT: this smoothed value is the boom ORIGIN (where the camera rig
-    // sits), NOT the orbit/look-at pivot. Using it as the pivot made rotation
-    // swing around the trailing anchor while the player sat off to one side —
-    // the "dizzy, off-center rotation" bug. The pivot is always the player's
-    // true position (see `pivot` below); the spring only softens how the rig
-    // glides toward that pivot horizontally.
     let player_pos = self_t.translation;
     let follow_pos = match follow.pos {
         Some(prev) if settings.camera_spring && !chase.snap_to_anchor => {
@@ -119,12 +144,6 @@ pub fn resolve_camera(
     };
     follow.pos = Some(follow_pos);
 
-    // --- Pass 2: orbit (instant rotation, never lagged) ---
-    // Pivot is ALWAYS the player, spring or not: rotation orbits the player and
-    // the look-at keeps the player centered in frame. The spring-smoothed
-    // follow_pos only shifts the boom origin, so the rig can glide while the
-    // subject stays put under rotation. Both share the same anchor height
-    // (direct-Y off the player) so the boom stays level.
     let anchor_y = Vec3::Y * (third_person_anchor_y(baked) - step.offset);
     let pivot = player_pos + anchor_y;
     let boom_origin = follow_pos + anchor_y;
@@ -133,14 +152,6 @@ pub fn resolve_camera(
     let dir = Vec3::new(chase.yaw.sin() * cos_p, sin_p, chase.yaw.cos() * cos_p);
     let wanted = chase.orbit_radius();
 
-    // --- Pass 3: collision pull-in against the zone MZB BVH ---
-    // Ray from the pivot along the boom; walls block, mobs never do. Same
-    // solid world the walker sweeps (the door triangles join this ray when the
-    // obstacle set lands). Nearest hit shortens the boom so the camera never
-    // clips through geometry. Cast from the pivot (the player), not the glide
-    // origin, so wall pull-in is measured from where the camera is actually
-    // looking. The BVH rebuilds ~1 s after zone geometry goes quiet; until
-    // then there is no ray and the boom runs unclipped.
     let mut hit_t = wanted;
     if let Some(bvh) = zone_bvh.0.as_ref() {
         if let Some(t) = bvh.ray_cast(pivot, dir, wanted) {
@@ -150,9 +161,6 @@ pub fn resolve_camera(
 
     let target = clamped_camera_distance(hit_t, wanted);
 
-    // Boom-LENGTH easing (not position): snap in fast when a wall appears, ease
-    // out slow when it clears, so the camera doesn't jitter at wall edges. The
-    // position spring is pass 1; this only smooths the pull-in distance.
     let effective = if !settings.camera_spring || chase.snap_to_anchor {
         target
     } else {
@@ -164,11 +172,6 @@ pub fn resolve_camera(
     };
     *smoothed_effective = Some(effective);
 
-    // --- Single write: this system is the sole camera authority ---
-    // Eye sits along the boom from the glide origin, but the camera LOOKS AT the
-    // player pivot — so however the rig glides, the player stays centered and
-    // rotation orbits the player. When the spring is off, boom_origin == pivot
-    // and this reduces to the exact old centered behavior.
     cam_t.translation = boom_origin + dir * effective;
     cam_t.look_at(pivot, Vec3::Y);
     chase.snap_to_anchor = false;
@@ -311,12 +314,11 @@ mod tests {
         assert!(camera_collides_with_mmb(CameraCollisionSource::Both, false));
     }
 
+    /// Zone-in snap must land on frame one — no lerp from wherever the last
+    /// zone left the eye. The empty zone BVH is resolve_camera's hard
+    /// requirement: it raycasts the boom against zone MZB.
     #[test]
     fn snap_to_anchor_places_eye_behind_player_without_smoothing() {
-        // Migrated from kuluu-render::camera after the WIP camera work retired its
-        // chase authority: resolve_camera is now the single eye owner (this crate,
-        // which can reach the zone collision BVH). Zone-in snap must land on frame
-        // one — no lerp from wherever the previous zone left the eye.
         let mut app = App::new();
         app.add_plugins(MinimalPlugins)
             .insert_resource(CameraMode::Chase)
@@ -328,8 +330,6 @@ mod tests {
             .init_resource::<ZoneCollisionBvh>()
             .insert_resource(kuluu_render::camera::CameraStepSmoothing::default())
             .insert_resource(AnchorFollow::default())
-            // Empty zone BVH — no walls in this test world; resolve_camera's
-            // hard requirement since it raycasts the boom against zone MZB.
             .init_resource::<ZoneCollisionBvh>()
             .insert_resource(ChaseCamera {
                 snap_to_anchor: true,
@@ -361,8 +361,6 @@ mod tests {
             "zone-in yaw follows player heading"
         );
 
-        // No wall in this empty world: the effective distance is the wanted orbit
-        // padded off by WALL_PAD (retail's fixed clip-plane padding), never lerp'd.
         let anchor = player_pos + Vec3::Y * third_person_anchor_y(None);
         let expected_dist = clamped_camera_distance(chase.orbit_radius(), chase.orbit_radius());
         let cos_p = chase.pitch.cos();
@@ -387,16 +385,17 @@ mod tests {
         );
     }
 
+    /// However the boom origin glides, the camera looks at the player pivot,
+    /// so the player stays centered and rotation orbits the player — the
+    /// "dizzy, off-center rotation" guard. The mid-glide case is approximated
+    /// by seeding the follow anchor well behind the player (the worst case for
+    /// off-center rotation), running one frame with the spring on, and
+    /// checking the camera's forward ray points at the player anchor (not the
+    /// lagged follow position). The empty zone BVH is resolve_camera's hard
+    /// requirement: it raycasts the boom against zone MZB. The snap flag is
+    /// off so the spring path runs, not the snap path.
     #[test]
     fn spring_on_keeps_player_centered_under_rotation() {
-        // The "dizzy" bug: with the spring on, the orbit/look-at used the
-        // lagged follow anchor, so rotating swung the view around a point
-        // behind the player. Regression guard: however the boom origin glides,
-        // the camera must always LOOK AT the player pivot, so the player stays
-        // centered and rotation orbits the player. We approximate "mid-glide"
-        // by seeding AnchorFollow behind the player, running one frame with the
-        // spring on, and checking the camera's forward ray points at the
-        // player anchor (not the lagged follow position).
         let mut app = App::new();
         app.add_plugins(MinimalPlugins)
             .insert_resource(CameraMode::Chase)
@@ -407,16 +406,11 @@ mod tests {
             .insert_resource(SceneState::default())
             .init_resource::<ZoneCollisionBvh>()
             .insert_resource(kuluu_render::camera::CameraStepSmoothing::default())
-            // Seed the follow anchor well behind the player so the glide gap is
-            // large this frame — the worst case for off-center rotation.
             .insert_resource(AnchorFollow {
                 pos: Some(Vec3::new(0.0, 1.0, -6.0)),
             })
-            // Empty zone BVH — no walls in this test world; resolve_camera's
-            // hard requirement since it raycasts the boom against zone MZB.
             .init_resource::<ZoneCollisionBvh>()
             .insert_resource(ChaseCamera {
-                // Not a warp: we want the spring path, not the snap path.
                 snap_to_anchor: false,
                 synced_initial: true,
                 ..Default::default()

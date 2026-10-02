@@ -15,9 +15,9 @@ const EQUIP_SLOT_NAMES: [&str; 8] = [
     "head", "body", "hands", "legs", "feet", "main", "sub", "ranged",
 ];
 
-// The actor path feeds decoded alpha to the shader unremapped
-// (`decoded_texture_to_image`), so the discard threshold compares against the
-// raw decoded byte.
+/// The actor path feeds decoded alpha to the shader unremapped
+/// (`decoded_texture_to_image`), so the discard threshold compares against the
+/// raw decoded byte.
 const ALPHA_DISCARD_RAW: u8 = (SKINNED_ALPHA_DISCARD * 255.0) as u8;
 
 struct FileProbe {
@@ -193,9 +193,9 @@ pub fn report(root: &DatRoot, entity_id: u32, name: &str, look: &EntityLook) -> 
 mod tests {
     use super::*;
 
-    // The renderer discards at SKINNED_ALPHA_DISCARD without remapping actor
-    // alpha; the diag verdict must sit on the same raw threshold or it will
-    // clear textures the shader actually discards.
+    /// The renderer discards at SKINNED_ALPHA_DISCARD without remapping actor
+    /// alpha; the diag verdict sits on the same raw threshold or it would
+    /// clear textures the shader actually discards.
     #[test]
     fn alpha_verdict_threshold_matches_the_shader_discard() {
         assert_eq!(ALPHA_DISCARD_RAW, 69);

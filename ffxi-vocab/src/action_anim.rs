@@ -6,7 +6,7 @@ include!(concat!(env!("OUT_DIR"), "/mob_skill_animation_table.rs"));
 // research/xim SpellTables.kt / AbilityTable.kt: a skill's completion animation
 // is a global file-table entry at base_offset + per-skill animation index, where
 // the per-skill index is the `animation` column of spell_list.sql / abilities.sql.
-const SPELL_FILE_TABLE_OFFSET: u32 = 0xAF0;
+pub const SPELL_FILE_TABLE_OFFSET: u32 = 0xAF0;
 const ABILITY_FILE_TABLE_OFFSET: u32 = 0x113C;
 const TRUST_FILE_ID: u32 = 0xE9B;
 const TRUST_SPELL_ID_MIN: u16 = 896;

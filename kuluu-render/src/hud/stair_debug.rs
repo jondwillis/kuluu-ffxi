@@ -72,6 +72,8 @@ pub fn update_stair_debug_hud(
 
 /// Build the multi-line status string. ASCII only:
 /// this text renders with Bevy's bundled default font, which covers U+0020-7E.
+/// The 120-tick strip chart shows h0 / target / y: a staircase should show h0 as
+/// steps and target + y as one straight line; any zig in y is the bug.
 fn build_status_text(snap: &StairDebugSnapshot) -> String {
     let mut out = String::with_capacity(1024);
     out.push_str("=== STAIR DEBUG ===\n");
@@ -106,8 +108,6 @@ fn build_status_text(snap: &StairDebugSnapshot) -> String {
         return out;
     };
 
-    // Header: support + mode/vy + the three heights + gradient/risers/window/
-    // speed + the last two ticks' decisions.
     out.push_str(&format!(
         "grounded: {}  speed={:.2}\n",
         if f.grounded { "yes" } else { "no (airborne)" },
@@ -142,7 +142,6 @@ fn build_status_text(snap: &StairDebugSnapshot) -> String {
         if f.poof { "yes" } else { "no" }
     ));
 
-    // Sample table: along | lateral | raw | filtered | status.
     out.push_str("along   lat     raw      filt   status\n");
     for s in &f.samples {
         out.push_str(&format!(
@@ -155,8 +154,6 @@ fn build_status_text(snap: &StairDebugSnapshot) -> String {
         ));
     }
 
-    // 120-tick strip chart of h0 / target / y: a staircase should show h0 as
-    // steps and target + y as one straight line; any zig in y is the bug.
     out.push_str(&format!(
         "last {} ticks ({} cols, .:-=+*#% low->high, o = none):\n",
         f.history.len(),
@@ -169,7 +166,6 @@ fn build_status_text(snap: &StairDebugSnapshot) -> String {
     out.push_str(&format!("h0     : {}\n", strip_line(&h0s)));
     out.push_str(&format!("target : {}\n", strip_line(&ts)));
 
-    // Counters: the two numbers the walker's `live_tests` matrices assert on.
     out.push_str(&format!(
         "reversals(120)={}  max|d2y|(120)={:.4}\n",
         f.reversals_120, f.max_d2y_120
@@ -206,7 +202,6 @@ fn strip_line(values: &[Option<f32>]) -> String {
     let span = (hi - lo).max(1e-6);
     let mut out = String::with_capacity(STRIP_COLS);
     for c in 0..STRIP_COLS {
-        // Nearest tick of the ring for this column.
         let idx =
             ((c as f32 * values.len() as f32 / STRIP_COLS as f32) as usize).min(values.len() - 1);
         match values[idx] {

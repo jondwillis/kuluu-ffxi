@@ -90,6 +90,20 @@ impl ParticleSimulator {
         self.stop_where(|o| o.owner == owner && o.gen_id == gen_id);
     }
 
+    // research/xim EffectRoutineInstance.kt handleParticleEffectDampen — 0x1E ParticleDampen:
+    // unlike StopParticle the already-live particles are force-expired at once (their audio
+    // fades out there; this engine's particle generators carry no audio).
+    pub fn dampen_generator(&mut self, owner: Entity, gen_id: [u8; 4]) {
+        for g in &mut self.generators {
+            if g.origin_routine
+                .is_some_and(|o| o.owner == owner && o.gen_id == gen_id)
+            {
+                g.stopped = true;
+                g.particles.clear();
+            }
+        }
+    }
+
     pub fn stop_routine(&mut self, owner: Entity, routine: [u8; 4]) {
         self.stop_where(|o| o.owner == owner && o.routine == routine);
     }
@@ -242,7 +256,9 @@ fn d3m_stage_chain(
     )
 }
 
+#[derive(Clone)]
 struct LiveGenerator {
+    immediate_parent: Option<Entity>,
     def: ParticleGeneratorDef,
     template: SpriteTemplate,
     draw_path: D3mDrawPath,
@@ -297,11 +313,24 @@ struct LiveGenerator {
     // See weather_particles::WEATHER_EMIT_SCALE for why it is applied to batched generators too.
     emit_scale: f32,
     emit_rng: u64,
+    // CYyGenerator.cpp CYyGenerator::ElemGenerate case 0x1F — retail's stepped azimuth indexes
+    // the generator's element counter (field_9C), advanced once per emitted element; it resets
+    // with the generator (field_9C = 0 at resource load and routine start).
+    elements_emitted: u32,
+    /// The camera rotation at the last sync, for the 0x1F camera-oriented ring: the ring is
+    /// authored in the camera's frame, so the offset is mapped camera->local before it lands
+    /// in the generator's local space (retail multiplies the offset chain by the inverse of
+    /// attach x view). One sync behind like `emit_culled`
+    /// (research/xim ParticleGeneratorParser.kt SphericalPositionVarianceFull).
+    cam_view: Quat,
+    /// The mesh entity's world rotation — the actor root's for actor-local generators, whose
+    /// local frame is the actor's FFXI frame; identity otherwise.
+    actor_rot: Quat,
     // Key of the last BUILT mesh (spawn writes `empty_mesh`, hence `MeshKey::Empty`), so
     // quantization error is bounded by one quantum and never accumulates across skipped frames.
     built_key: MeshKey,
-    // `template_bound_radius`, resolved once at spawn: the unscaled radius of the widest
-    // template/flipbook frame, which `generator_bounds` scales per particle.
+    /// `template_bound_radius`, resolved once at spawn: the unscaled radius of the widest
+    /// template/flipbook frame, which `generator_bounds` scales per particle.
     bound_radius: f32,
 }
 
@@ -320,8 +349,8 @@ pub struct ZoneGeneratorOptions {
     // The generator chunk's byte offset in the zone DAT (element_sort.rs tie-break).
     pub dat_offset: usize,
     pub emit_scale: f32,
-    // Set only by the weat/<type>/ celestial set, whose sheets carry FFXI's stored 4-bit alpha
-    // dither at a fixed on-screen size: see `dat_d3m::decoded_sky_texture_to_image`.
+    /// Set only by the weat/<type>/ celestial set, whose sheets carry FFXI's stored 4-bit alpha
+    /// dither at a fixed on-screen size: see `dat_d3m.rs` decoded_sky_texture_to_image.
     pub resolve_alpha_dither: bool,
 }
 
@@ -344,6 +373,7 @@ pub struct ActorAutoRunEffects {
     pub assets: std::sync::Arc<ActionAssets>,
 }
 
+#[derive(Clone)]
 struct Particle {
     pos: Vec3,
     // research/xim Particle.kt updateAssociatedPosition — cameraAttachedBasePosition resolves the offset from the
@@ -356,9 +386,43 @@ struct Particle {
     life_frames: f32,
     rgb: Vec3,
     scale: Vec2,
+    // The spawn-time scale: the scale keyframe track seeds its opening segment from the
+    // particle's initial value, captured once (research/xim ParticleUpdaters.kt
+    // ProgressValueUpdater — initialValueOverride is set only while null), so it must not
+    // drift with the 0x12 growth.
+    scale_seed: Vec2,
+    // The 0x12 scale rate (x/y); zero while the generator's sec3 0x08 scale updater is off
+    // (research/xim ParticleUpdaters.kt ScaleUpdater is the only integrator).
+    scale_vel: Vec2,
     // Euler radians, seeded from the generator's 0x09 rotation and turned by its spin
     // (CYyGenerator.cpp CYyGenerator::ElemIdle case 0x05 integrates the 0x0B rate per frame).
     rotation: Vec3,
+    // The 0x0B spin rate plus this particle's 0x0C variance draw; zero when the generator's
+    // rotation updater is off (research/xim ParticleUpdaters.kt RotationUpdater — the
+    // rotation transform's velocity, which holds the 0x0B + 0x0C sum, is what it integrates).
+    spin: Vec3,
+    // Armed by the sec2 0x3B block: the orientation step flips the rotation y
+    // (research/xim Particle.kt — negateRotationY multiplies rotation.y by −1 in the
+    // particle transform, set by IncrementalRotationApplier even for an all-zero payload).
+    negate_rotation_y: bool,
+    // The 0x08/0x41 relative-velocity portion in the integration frame, negated by 0x67: the
+    // oscillation applier's direction source (research/xim ParticleUpdaters.kt
+    // getOscillationDirection reads ParticleTransform.relativeVelocity, not the total
+    // velocity; Particle.kt getTotalVelocity keeps the two transforms separate).
+    rel_vel: Vec3,
+    // Some while the generator carries the sec2 0x3D marker (research/xim
+    // ParticleGeneratorSettings.kt OscillationParams): the per-axis acceleration (0x3E/0x3F/
+    // 0x40 base plus one variance draw) and the applier's last-amplitude memory.
+    osc: Option<Oscillation>,
+}
+
+// research/xim ParticleGeneratorSettings.kt OscillationParams — the per-particle oscillation
+// state the sec3 appliers integrate: per-axis acceleration and the applier's previous-amplitude
+// memory. [0]/[1]/[2] are the X/Y/Z axes.
+#[derive(Clone)]
+struct Oscillation {
+    accel: [f32; 3],
+    prev_amplitude: [f32; 3],
 }
 
 // research/xim ParticleGeneratorAttachment.kt resolveExtendedJoints — a source joint naming
@@ -401,25 +465,26 @@ fn attach_joint_reference(def: &ParticleGeneratorDef) -> Option<usize> {
     }
 }
 
-// The pose an attach actor was last drawn in, plus the transform carrying its pose frame (FFXI
-// axes, -Y up) into Bevy world space.
+/// The pose an attach actor was last drawn in, plus the transform carrying its pose frame (FFXI
+/// axes, -Y up) into Bevy world space.
 struct AttachPose<'a> {
     pose: &'a [Mat4],
     skeleton: &'a ffxi_dat::skel::Skeleton,
     root: bevy::math::Affine3A,
 }
 
-// The entity a routine runs on and the actor root holding the posed skeleton are not the same
-// entity on the live path — ffxi_actor_render::spawn_live_actor parents the root under the wire
-// entity — while the offline harnesses run the routine on the root itself. Doors and any actor
-// whose model has not loaded have no pose at all.
-//
-// `Transform`, not `GlobalTransform`, for the same reason spawn_particle_generators reads it for
-// the origin (see scheduler_runtime::dispatch_sound_stages): the wire entity is a world root and a
-// frame-0 stage fires on the frame spawn_live_actor inserts the actor root, before PostUpdate has
-// propagated anything — a `GlobalTransform` read there is Ok-but-identity, which would strip the
-// FFXI->Bevy basis off the pose-frame offset and bury the effect under the actor's feet, mirrored.
-// The two local transforms are composed instead, so the basis comes from the root the pose is in.
+/// The entity a routine runs on and the actor root holding the posed skeleton are not the same
+/// entity on the live path — ffxi_actor_render.rs spawn_live_actor parents the root under the
+/// wire entity — while the offline harnesses run the routine on the root itself. Doors and any
+/// actor whose model has not loaded have no pose at all.
+///
+/// `Transform`, not `GlobalTransform`, for the same reason spawn_particle_generators reads it for
+/// the origin (see scheduler_runtime.rs dispatch_sound_stages): the wire entity is a world root
+/// and a frame-0 stage fires on the frame spawn_live_actor inserts the actor root, before
+/// PostUpdate has propagated anything — a `GlobalTransform` read there is Ok-but-identity, which
+/// would strip the FFXI->Bevy basis off the pose-frame offset and bury the effect under the
+/// actor's feet, mirrored. The two local transforms are composed instead, so the basis comes
+/// from the root the pose is in.
 fn attach_pose<'a>(
     entity: Entity,
     q_children: &Query<&Children>,
@@ -471,6 +536,51 @@ fn attach_joint_offset(
     .unwrap_or(Vec3::ZERO)
 }
 
+// The world origin a generator emits from: the attach actor's root plus the joint the def
+// hangs off (research/xim ParticleGeneratorAttachment.kt updateAssociatedPosition). The spawn
+// path computes it once; `track_attached_origins` recomputes it every frame for the defs that
+// carry the 0x11 follow.
+fn attached_origin(
+    def: &ParticleGeneratorDef,
+    owner: Entity,
+    target: Option<Entity>,
+    q_xf: &Query<&Transform>,
+    q_children: &Query<&Children>,
+    q_render: &Query<&FfxiRenderActor>,
+) -> Option<Vec3> {
+    let origin_entity =
+        crate::scheduler_runtime::particle_origin_entity(def.attach_type, owner, target);
+    let origin_xf = q_xf.get(origin_entity).ok()?;
+    // research/xim SkeletonInstance.kt getStandardJointExtended has no source-vs-target
+    // guard: it always walks the ring and keeps the reference nearest the other actor. On a
+    // self-targeted action both sides ARE the same actor, and the winner is the ring point
+    // nearest the actor's own origin — torso height, which is the whole point of this bead.
+    // Only an attachment with no second actor at all falls back to the root.
+    let other_world = if origin_entity == owner {
+        target
+    } else {
+        Some(owner)
+    }
+    .and_then(|e| q_xf.get(e).ok())
+    .map(|xf| xf.translation);
+    let joint_offset = attach_joint_offset(
+        def,
+        attach_pose(origin_entity, q_children, q_xf, q_render),
+        other_world,
+    );
+    Some(origin_xf.translation + joint_offset + Vec3::Y * def.base_position[1])
+}
+
+/// Spawns the live generator entities for the scheduler's particle stages.
+///
+/// A cast routine's generators ship in the global effect dir, not the caster's own
+/// ActionAssets, and an actor-routine's (a model's `bind`) in the model DAT, so the def
+/// resolves against whichever tier actually holds it.
+///
+/// Spawned mesh entities opt out of frustum culling: the mesh is rebuilt in place every
+/// frame, but Bevy computes the frustum-culling Aabb once from the initially-empty mesh and
+/// does not recompute it, so the entity would be culled permanently. `sync_particle_meshes`
+/// owns the draw gate instead.
 pub fn spawn_particle_generators(
     mut events: MessageReader<SchedulerStageEvent>,
     q_actors: Query<(&Transform, Option<&ActionAssets>)>,
@@ -492,9 +602,6 @@ pub fn spawn_particle_generators(
         let Ok((actor_xf, local_assets)) = q_actors.get(ev.actor) else {
             continue;
         };
-        // A cast routine's generators ship in the global effect dir, never in the caster's own
-        // ActionAssets, and an actor-routine's (a model's `bind`) in the model DAT, so the def
-        // resolves against whichever tier actually holds it.
         let actor_assets = q_children
             .get(ev.actor)
             .ok()
@@ -521,30 +628,8 @@ pub fn spawn_particle_generators(
             continue;
         };
         let target = q_action_target.get(ev.actor).ok().and_then(|t| t.0);
-        let origin_entity =
-            crate::scheduler_runtime::particle_origin_entity(def.attach_type, ev.actor, target);
-        let origin_xf = if origin_entity == ev.actor {
-            actor_xf
-        } else {
-            q_xf.get(origin_entity).unwrap_or(actor_xf)
-        };
-        // research/xim SkeletonInstance.kt getStandardJointExtended has no source-vs-target
-        // guard: it always walks the ring and keeps the reference nearest the other actor. On a
-        // self-targeted action both sides ARE the same actor, and the winner is the ring point
-        // nearest the actor's own origin — torso height, which is the whole point of this bead.
-        // Only an attachment with no second actor at all falls back to the root.
-        let other_world = if origin_entity == ev.actor {
-            target
-        } else {
-            Some(ev.actor)
-        }
-        .and_then(|e| q_xf.get(e).ok())
-        .map(|xf| xf.translation);
-        let joint_offset = attach_joint_offset(
-            &def,
-            attach_pose(origin_entity, &q_children, &q_xf, &q_render),
-            other_world,
-        );
+        let origin = attached_origin(&def, ev.actor, target, &q_xf, &q_children, &q_render)
+            .unwrap_or(actor_xf.translation + Vec3::Y * def.base_position[1]);
         let mat = mats.add(FfxiParticleMaterial::for_def(&def, tex, NO_DAT_ORDER));
         let mesh = meshes.add(empty_mesh());
 
@@ -555,9 +640,6 @@ pub fn spawn_particle_generators(
                 MeshMaterial3d(mat),
                 Transform::IDENTITY,
                 Visibility::default(),
-                // The mesh is rebuilt in place every frame; Bevy computes a frustum-culling Aabb
-                // once from the initially-empty mesh and never recomputes it, so the entity would
-                // be culled forever. Opt out, and let `sync_particle_meshes` own the draw gate.
                 bevy::camera::visibility::NoFrustumCulling,
                 bevy::light::NotShadowCaster,
                 bevy::light::NotShadowReceiver,
@@ -577,6 +659,7 @@ pub fn spawn_particle_generators(
 
         let emit_window_frames = ev.stage.stage.duration_frames as f32;
         sim.generators.push(LiveGenerator {
+            immediate_parent: None,
             scale_x: resolve(def.scale_x_track),
             scale_y: resolve(def.scale_y_track),
             alpha: resolve(def.alpha_track),
@@ -587,7 +670,7 @@ pub fn spawn_particle_generators(
             draw_path: D3mDrawPath::D3m,
             sprite_frames,
             def,
-            origin: origin_xf.translation + joint_offset + Vec3::Y * def.base_position[1],
+            origin,
             particles: Vec::new(),
             emit_accum: 0.0,
             age_frames: 0.0,
@@ -598,7 +681,11 @@ pub fn spawn_particle_generators(
             orientation: None,
             actor_local: false,
             tex_translate: Vec2::ZERO,
-            vel_basis: Vec3::ONE,
+            vel_basis: crate::scene::mzb_to_bevy(kuluu_snapshot::Vec3 {
+                x: Vec3::ONE.x,
+                y: Vec3::ONE.y,
+                z: Vec3::ONE.z,
+            }),
             origin_routine: Some(RoutineOrigin {
                 owner: ev.actor,
                 gen_id: ev.stage.stage.id,
@@ -609,8 +696,66 @@ pub fn spawn_particle_generators(
             emit_culled: false,
             emit_scale: UNSCALED_EMISSION,
             emit_rng: emit_seed(entity),
+            elements_emitted: 0,
+            cam_view: Quat::IDENTITY,
+            actor_rot: Quat::IDENTITY,
             built_key: MeshKey::Empty,
         });
+
+        let mut chain = vec![(def_dir, ev.stage.stage.id)];
+        let mut linked_dir = def_dir;
+        while let Some(parent) = sim.generators.last() {
+            let Some(id) = parent.def.immediate_generator else {
+                break;
+            };
+            let Some((dir, linked_def)) = assets.particle_def_scoped(linked_dir, &id) else {
+                break;
+            };
+            if chain.contains(&(dir, id)) {
+                break;
+            }
+            chain.push((dir, id));
+            linked_dir = dir;
+            let linked_def = *linked_def;
+            let Some((template, sprite_frames, texture)) =
+                resolve_mesh(assets, dir, &linked_def, &mut images, false)
+            else {
+                break;
+            };
+            let mut linked = parent.clone();
+            linked.immediate_parent = Some(parent.entity);
+            linked.def = linked_def;
+            linked.origin = parent.origin;
+            linked.scale_x = resolve(linked_def.scale_x_track);
+            linked.scale_y = resolve(linked_def.scale_y_track);
+            linked.alpha = resolve(linked_def.alpha_track);
+            linked.tod_color = resolve_tod_tracks(&linked_def, assets);
+            linked.solid_mesh = is_solid_mesh(&template);
+            linked.bound_radius = template_bound_radius(&template, &sprite_frames);
+            linked.template = template;
+            linked.sprite_frames = sprite_frames;
+            linked.stopped = true;
+            linked.mesh = meshes.add(empty_mesh());
+            let material = mats.add(FfxiParticleMaterial::for_def(
+                &linked_def,
+                texture,
+                NO_DAT_ORDER,
+            ));
+            linked.entity = commands
+                .spawn((
+                    InGameEntity,
+                    Mesh3d(linked.mesh.clone()),
+                    MeshMaterial3d(material),
+                    Transform::IDENTITY,
+                    Visibility::default(),
+                    bevy::camera::visibility::NoFrustumCulling,
+                    bevy::light::NotShadowCaster,
+                    bevy::light::NotShadowReceiver,
+                ))
+                .id();
+            linked.emit_rng = emit_seed(linked.entity);
+            sim.generators.push(linked);
+        }
     }
 }
 
@@ -671,6 +816,7 @@ pub fn spawn_actor_auto_run_particles(
                 id.and_then(|i| fx.assets.keyframes.get(&i).cloned())
             };
             sim.generators.push(LiveGenerator {
+                immediate_parent: None,
                 scale_x: resolve(def.scale_x_track),
                 scale_y: resolve(def.scale_y_track),
                 alpha: resolve(def.alpha_track),
@@ -698,6 +844,9 @@ pub fn spawn_actor_auto_run_particles(
                 emit_culled: false,
                 emit_scale: UNSCALED_EMISSION,
                 emit_rng: emit_seed(entity),
+                elements_emitted: 0,
+                cam_view: Quat::IDENTITY,
+                actor_rot: Quat::IDENTITY,
                 built_key: MeshKey::Empty,
                 def,
             });
@@ -709,6 +858,11 @@ pub fn spawn_actor_auto_run_particles(
 // generator embedded in the zone MZB DAT (Bastok Mines pump spray), placed in
 // world space rather than parented to an actor. `origin` is already mzb->bevy;
 // velocity/accel take the same basis so the spray arcs in Bevy space.
+//
+// `emit_culled` starts true when the def carries a camera-distance band
+// (research/xim EnvironmentManager zone-static Generator), so a zone-in does not
+// burst every out-of-band emitter once; the first sync settles the in-band ones
+// a frame later.
 pub fn spawn_zone_particle_generator(
     def: ParticleGeneratorDef,
     assets: &ActionAssets,
@@ -743,6 +897,7 @@ pub fn spawn_zone_particle_generator(
 
     let resolve = |id: Option<[u8; 4]>| keyframe(assets, global, id);
     sim.generators.push(LiveGenerator {
+        immediate_parent: None,
         scale_x: resolve(def.scale_x_track),
         scale_y: resolve(def.scale_y_track),
         alpha: resolve(def.alpha_track),
@@ -767,11 +922,12 @@ pub fn spawn_zone_particle_generator(
         origin_routine: None,
         stopped: false,
         camera_relative: opts.camera_relative,
-        // Starts culled so a zone-in does not burst every out-of-band emitter once; the first
-        // sync settles the in-band ones a frame later.
         emit_culled: def.emit_cull.is_some(),
         emit_scale: opts.emit_scale,
         emit_rng: emit_seed(entity),
+        elements_emitted: 0,
+        cam_view: Quat::IDENTITY,
+        actor_rot: Quat::IDENTITY,
         built_key: MeshKey::Empty,
         def,
     });
@@ -796,14 +952,19 @@ fn particle_orientation(def: &ParticleGeneratorDef) -> Option<Quat> {
 // The live orientation of a fixed-orientation particle: its 0x09 seed plus whatever the spin
 // has added, in the same Euler order `particle_orientation` seeds with.
 fn particle_rotation(p: &Particle) -> Quat {
-    Quat::from_euler(EulerRot::XYZ, p.rotation.x, p.rotation.y, p.rotation.z)
+    let y = if p.negate_rotation_y {
+        -p.rotation.y
+    } else {
+        p.rotation.y
+    };
+    Quat::from_euler(EulerRot::XYZ, p.rotation.x, y, p.rotation.z)
 }
 
 // Distinct per generator so two emitters sharing a def do not spawn identical particle clouds;
 // deterministic so a rebuilt zone/weather set replays the same spread.
 fn emit_seed(entity: Entity) -> u64 {
-    const SEED: u64 = 0x9E37_79B9_7F4A_7C15;
-    SEED ^ entity.to_bits().wrapping_mul(SEED)
+    let seed = crate::scheduler_runtime::SPLITMIX64_GOLDEN_RATIO;
+    seed ^ entity.to_bits().wrapping_mul(seed)
 }
 
 fn next_unit(state: &mut u64) -> f32 {
@@ -818,10 +979,127 @@ pub fn stop_generators_for_despawned_owners(
     sim.stop_generators_of_dead_owners(|e| q_alive.get(e).is_ok());
 }
 
+// 0x11 AssociationUpdater: retail re-snaps the associated position to the attach actor's
+// position plus joint every frame (research/xim ParticleGeneratorAttachment.kt
+// updateAssociatedPosition - a hard copy; the follow-rate factor is parsed but unused
+// there). The spawn path computes the origin once, so without this a cast aura or hit
+// flash keeps emitting from where the actor stood when the stage fired.
+//
+// Only scheduled generators track: auto-run zone generators are parented to their
+// actor root and ride along, and the camera/celestial origins have their own
+// per-frame setters.
+pub fn track_attached_origins(
+    q_xf: Query<&Transform>,
+    q_children: Query<&Children>,
+    q_render: Query<&FfxiRenderActor>,
+    q_action_target: Query<&crate::scheduler_runtime::ActionTarget>,
+    mut sim: ResMut<ParticleSimulator>,
+) {
+    use ffxi_dat::particle_gen::AttachType;
+    for g in &mut sim.generators {
+        let Some(origin_routine) = g.origin_routine else {
+            continue;
+        };
+        if !g
+            .def
+            .association
+            .as_ref()
+            .is_some_and(|a| a.follow_position)
+        {
+            continue;
+        }
+        // xim's AttachType.None branch updates nothing; Sun/Moon ride
+        // `set_celestial_origins` instead.
+        match g.def.attach_type {
+            AttachType::None | AttachType::Sun | AttachType::Moon => continue,
+            _ => {}
+        }
+        let target = q_action_target
+            .get(origin_routine.owner)
+            .ok()
+            .and_then(|t| t.0);
+        if let Some(origin) = attached_origin(
+            &g.def,
+            origin_routine.owner,
+            target,
+            &q_xf,
+            &q_children,
+            &q_render,
+        ) {
+            g.origin = origin;
+        }
+    }
+}
+
 pub fn tick_particle_simulator(time: Res<Time>, mut sim: ResMut<ParticleSimulator>) {
     let frames = time.delta_secs() * ROUTINE_FPS;
-    for g in &mut sim.generators {
+    advance_simulator(&mut sim, frames);
+}
+
+// .agents/skills/retail-observe/references/2026-10-02-level-up-linked-sparkle.md immediate emission and parent position addition.
+fn advance_simulator(sim: &mut ParticleSimulator, frames: f32) {
+    let parents: std::collections::HashSet<_> = sim
+        .generators
+        .iter()
+        .filter_map(|g| g.immediate_parent)
+        .collect();
+    if parents.is_empty() {
+        for g in &mut sim.generators {
+            advance_generator(g, frames);
+        }
+        return;
+    }
+    let mut births = std::collections::HashMap::<Entity, Vec<Vec3>>::new();
+    let mut pending = Vec::new();
+    for (index, g) in sim.generators.iter_mut().enumerate() {
+        let before = g.elements_emitted;
         advance_generator(g, frames);
+        if g.immediate_parent.is_some() {
+            pending.push(index);
+        } else if parents.contains(&g.entity) {
+            births.insert(
+                g.entity,
+                g.particles
+                    .iter()
+                    .skip(
+                        g.particles
+                            .len()
+                            .saturating_sub((g.elements_emitted - before) as usize),
+                    )
+                    .map(|p| p.pos)
+                    .collect(),
+            );
+        }
+    }
+    let entities: std::collections::HashSet<_> = sim.generators.iter().map(|g| g.entity).collect();
+    while !pending.is_empty() {
+        let before = pending.len();
+        pending.retain(|index| {
+            let g = &mut sim.generators[*index];
+            let parent = g.immediate_parent.unwrap();
+            if entities.contains(&parent) && !births.contains_key(&parent) {
+                return true;
+            }
+            let mut emitted = Vec::new();
+            if frames > 0.0 {
+                for position in births.get(&parent).into_iter().flatten() {
+                    for _ in 0..emission_count(g) {
+                        emit(g, g.def.max_life_frames);
+                        if let Some(particle) = g.particles.last_mut() {
+                            if g.def.parent_position_copy {
+                                particle.pos += *position;
+                            }
+                            emitted.push(particle.pos);
+                        }
+                    }
+                }
+            }
+            births.insert(g.entity, emitted);
+            false
+        });
+        if pending.len() == before {
+            break;
+        }
     }
 }
 
@@ -864,6 +1142,13 @@ fn advance_generator(g: &mut LiveGenerator, frames: f32) {
             };
             emit(g, life);
         }
+    } else if !g.auto_run && g.emit_window_frames <= 0.0 {
+        // .agents/skills/retail-observe/references/2026-10-01-level-up-zero-time-emission.md first-positive-update rule.
+        if frames > 0.0 && !g.stopped && !g.emit_culled && g.age_frames <= frames {
+            for _ in 0..emission_count(g) {
+                emit(g, g.def.max_life_frames);
+            }
+        }
     } else if emitting {
         g.emit_accum += frames;
         while g.emit_accum >= g.def.frames_per_emission {
@@ -892,15 +1177,53 @@ fn advance_generator(g: &mut LiveGenerator, frames: f32) {
         .def
         .accel
         .map(|a| Vec3::from_array(a) * g.vel_basis * frames);
-    let spin = g.def.spin().map(|r| Vec3::from_array(r) * frames);
+    let osc_applier_x = g.def.oscillation_applier_x;
+    let osc_applier_y = g.def.oscillation_applier_y;
+    let osc_applier_z = g.def.oscillation_applier_z;
+    // CYyGenerator.cpp CYyGenerator::ElemIdle case 0x02 — retail position-steps the element
+    // only while the generator's sec3 carries the 0x02 PositionUpdater, so a velocity without
+    // the block never moves the particle (research/xim ParticleUpdaters.kt PositionUpdater is
+    // the only integrator of the position transform's velocity).
+    let position_updater = g.def.position_updater;
     for p in g.particles.iter_mut().take(pre_emit_len) {
         p.age_frames += frames;
         if let Some(a) = accel {
             p.vel += a;
         }
-        p.pos += p.vel * frames;
-        if let Some(r) = spin {
-            p.rotation += r;
+        if position_updater {
+            p.pos += p.vel * frames;
+        }
+        // FFXiMain.dll retail-2026-09 VA 0x1004C6CB: authored damping raised to renderer delta.
+        if let Some([damping, _]) = g.def.velocity_dampener {
+            p.vel *= damping.powf(frames);
+        }
+        // sec3 0x29/0x2A/0x2B OscillationApplier (X/Y/Z): after the base position step, add
+        // the amplitude change over the tick per active axis (research/xim
+        // ParticleUpdaters.kt OscillationApplier — particle.position += direction × delta).
+        for (axis, applier) in [(0, osc_applier_x), (1, osc_applier_y), (2, osc_applier_z)] {
+            if let (Some(applier), Some(osc)) = (applier, p.osc.as_mut()) {
+                p.pos += oscillation_delta(
+                    applier,
+                    axis,
+                    osc,
+                    p.rel_vel,
+                    p.age_frames - frames,
+                    p.age_frames,
+                    g.actor_local,
+                );
+            }
+        }
+        p.scale += p.scale_vel * frames;
+        p.rotation += p.spin * frames;
+        if g.def.rotation_updater {
+            if let Some(accel) = g.def.rotation_accel {
+                p.spin += Vec3::from_array(accel) * frames;
+            }
+        }
+        if g.def.scale_updater {
+            if let Some(accel) = g.def.scale_accel {
+                p.scale_vel += Vec2::new(accel[0], accel[1]) * frames;
+            }
         }
     }
     reap_expired(g);
@@ -919,6 +1242,63 @@ fn continuous_active(g: &LiveGenerator) -> bool {
     !g.stopped && (g.auto_run || g.age_frames <= g.emit_window_frames.max(1.0))
 }
 
+// research/xim ParticleUpdaters.kt OscillationApplier — the position delta the applier adds
+// to a particle: with oscillationRate = 180f / divisor (a zero divisor is an infinite rate,
+// which xim skips), frequency = π × age / rate, and
+// baseAmplitude = 0.5 × (sin(baseOffset + frequency − π/2) + cos(baseOffset)), the amplitude
+// is 0.5 × accel × baseAmplitude × rate and the delta is its change since the previous
+// frame. The engine ticks by a variable frame count, so the previous amplitude is evaluated
+// at age − frames instead of read from memory (the two coincide while the applier runs
+// every tick). The direction is the particle's relative-velocity direction (getOscillationDirection:
+// X = forward, Y = forward × Ẑ, Z = forward × Ŷ, the FFXI-frame unit hats basised into the
+// integration frame for world-space generators; vel_basis is an involution with det +1, so it
+// commutes with the cross products), falling back to the unit axis when the relative velocity
+// is near zero.
+fn oscillation_delta(
+    applier: [f32; 3],
+    axis: usize,
+    osc: &mut Oscillation,
+    rel_vel: Vec3,
+    prev_age_frames: f32,
+    age_frames: f32,
+    actor_local: bool,
+) -> Vec3 {
+    let divisor = applier[0];
+    if divisor == 0.0 {
+        return Vec3::ZERO;
+    }
+    let rate = 180.0 / divisor;
+    let base_offset = applier[1];
+    let amplitude = |age: f32| -> f32 {
+        let frequency = std::f32::consts::PI * (age / rate);
+        let base = 0.5
+            * ((base_offset + frequency - std::f32::consts::FRAC_PI_2).sin() + base_offset.cos());
+        0.5 * osc.accel[axis] * base * rate
+    };
+    let delta = amplitude(age_frames) - amplitude(prev_age_frames);
+    osc.prev_amplitude[axis] = amplitude(age_frames);
+    let (y_hat, z_hat) = if actor_local {
+        (Vec3::Y, Vec3::Z)
+    } else {
+        (Vec3::new(0.0, -1.0, 0.0), Vec3::new(0.0, 0.0, -1.0))
+    };
+    let direction = if rel_vel.length() < 1e-7 {
+        match axis {
+            0 => Vec3::X,
+            1 => y_hat,
+            _ => z_hat,
+        }
+    } else {
+        let forward = rel_vel.normalize();
+        match axis {
+            0 => forward,
+            1 => forward.cross(z_hat).normalize_or_zero(),
+            _ => forward.cross(y_hat).normalize_or_zero(),
+        }
+    };
+    direction * delta
+}
+
 // research/XIClient/src/XIClient/source/World/Generator/CYyGenerator.cpp CYyGenerator::Idle counter — the emit loop
 // runs `for counter in 0..=floor(v161)` over `v161 = (flags & 0x1FF) * scale`, i.e. floor + 1. That
 // trailing +1 is deliberately not reproduced: it would raise every already-tuned non-weather
@@ -934,24 +1314,207 @@ fn emit(g: &mut LiveGenerator, life_frames: f32) {
     // elem, skipping it when CheckFlag29 is set because a batched elem carries its own
     // sub-particles. Our Particle models the sub-particle in that case, so the spread applies
     // either way — without it every drop of a rain curtain spawns on one point.
-    let pos = match g.def.position_variance {
+
+    // The 0x08 relative velocity lives in the generator's local space (the space the 0x02
+    // base is scaled into by vel_basis), so its direction comes off the pre-basis offset
+    // (research/xim ParticleInitializers.kt RelativeVelocitySetup).
+    let mut pos_local = match g.def.position_variance {
         Some(v) => {
             let u = next_unit(&mut g.emit_rng);
             let yaw = (next_unit(&mut g.emit_rng) * 2.0 - 1.0) * std::f32::consts::PI;
             let pitch = (next_unit(&mut g.emit_rng) * 2.0 - 1.0) * std::f32::consts::PI;
-            Vec3::from_array(v.offset(u, yaw, pitch)) * g.vel_basis
+            Vec3::from_array(v.offset(u, yaw, pitch))
         }
         None => Vec3::ZERO,
     };
+    // 0x1F SphericalPositionVarianceFull: a spherical spawn spread whose azimuth is a random
+    // draw or one of the generator's evenly spaced steps (CYyGenerator.cpp
+    // CYyGenerator::ElemGenerate case 0x1F — the stepped azimuth indexes field_9C, the
+    // element counter advanced once per emitted element). Added on top of the 0x06/0x07
+    // spread, so the 0x08 relative direction sees the sum.
+    if let Some(sp) = g.def.spherical_full {
+        let u = next_unit(&mut g.emit_rng);
+        let azimuth = if sp.azimuth_steps == 0 {
+            (next_unit(&mut g.emit_rng) * 2.0 - 1.0) * std::f32::consts::PI
+        } else {
+            let step = (g.elements_emitted % sp.azimuth_steps) as f32 / sp.azimuth_steps as f32;
+            2.0 * std::f32::consts::PI * (step - 0.5)
+        };
+        let tilt = sp.tilt + (next_unit(&mut g.emit_rng) * 2.0 - 1.0) * sp.tilt_variance;
+        let offset = Vec3::from_array(sp.offset(u, azimuth, tilt));
+        pos_local += if sp.camera_oriented {
+            g.actor_rot.inverse() * g.cam_view * offset
+        } else {
+            offset
+        };
+    }
+    g.elements_emitted += 1;
+    let mut pos = pos_local * g.vel_basis;
+    // 0x03 VelocityVarianceSetup: a uniform [-v, v] draw per axis on top of the 0x02 base
+    // (research/xim ParticleInitializers.kt VelocityVarianceSetup — the shipped blocks all
+    // sit after their 0x02, so base-plus-variance is the authored order).
+    let mut vel = Vec3::from_array(g.def.init_velocity);
+    if let Some(var) = g.def.velocity_variance {
+        vel += Vec3::new(
+            (next_unit(&mut g.emit_rng) * 2.0 - 1.0) * var[0],
+            (next_unit(&mut g.emit_rng) * 2.0 - 1.0) * var[1],
+            (next_unit(&mut g.emit_rng) * 2.0 - 1.0) * var[2],
+        );
+    }
+    // 0x08 RelativeVelocitySetup: the payload speed along the spawn offset's direction; with
+    // no offset there is no direction and the block contributes nothing (research/xim
+    // ParticleInitializers.kt RelativeVelocitySetup — normalize of the initial position
+    // relative to the spawn point).
+    let mut rel_vel = Vec3::ZERO;
+    if let Some(speed) = g.def.relative_velocity {
+        if pos_local.length_squared() > 0.0 {
+            let add = pos_local.normalize() * speed;
+            vel += add;
+            rel_vel += add;
+        }
+    }
+    // 0x41 RelativeVelocityVarianceSetup: a uniform [-v, v] draw along the same spawn offset
+    // direction as 0x08, no direction without an offset (research/xim
+    // ParticleInitializers.kt RelativeVelocityVarianceSetup — retail's CYyGenerator.cpp
+    // CYyGenerator::ElemGenerate case 0x41 scales the normalized offset by frand of the
+    // value and adds it to the same allocation vector as 0x08).
+    if let Some(v) = g.def.relative_velocity_variance {
+        if pos_local.length_squared() > 0.0 {
+            let add = pos_local.normalize() * ((next_unit(&mut g.emit_rng) * 2.0 - 1.0) * v);
+            vel += add;
+            rel_vel += add;
+        }
+    }
+    // 0x67 ReverseDisplacementSetup: the particle spawns at the trajectory's endpoint and
+    // traces the path backward — position'(t) = P0 + v × (maxAge − t)
+    // (research/xim ParticleInitializers.kt ReverseDisplacementSetup — position gains the
+    // total velocity × maxAge, then the velocity is negated; the payload float is unused).
+    if g.def.reverse_displacement.is_some() {
+        pos += vel * g.vel_basis * life_frames;
+        vel = -vel;
+        rel_vel = -rel_vel;
+    }
+    // 0x0A RotationVarianceInitializer: a uniform [-v, v] draw per axis on top of the 0x09
+    // base rotation (research/xim ParticleInitializers.kt RotationVarianceInitializer).
+    let mut rotation = Vec3::from_array(g.def.init_rotation);
+    if let Some(var) = g.def.rotation_variance {
+        rotation += Vec3::new(
+            (next_unit(&mut g.emit_rng) * 2.0 - 1.0) * var[0],
+            (next_unit(&mut g.emit_rng) * 2.0 - 1.0) * var[1],
+            (next_unit(&mut g.emit_rng) * 2.0 - 1.0) * var[2],
+        );
+    }
+    // 0x3B IncrementalRotationApplier: the increment × the element's index into this
+    // generator's emission, on top of the base rotation, plus the render-time y-flip
+    // (research/xim ParticleInitializers.kt IncrementalRotationApplier — rotation +=
+    // incr × (1 + the particles emitted before this one); xim verifies the y-flip fires
+    // even for an all-zero payload). The counter above already counts this element, so
+    // its value is exactly xim's multiplier.
+    let mut negate_rotation_y = false;
+    if let Some(incr) = g.def.incremental_rotation {
+        let m = g.elements_emitted as f32;
+        rotation += Vec3::new(incr[0] * m, incr[1] * m, incr[2] * m);
+        negate_rotation_y = true;
+    }
+    // 0x0C VelocityVarianceSetup (rotation): a uniform [-v, v] draw per axis on top of the
+    // 0x0B spin rate, per particle (research/xim ParticleInitializers.kt
+    // VelocityVarianceSetup — the allocationOffset binds it to the rotation transform; retail's
+    // shared 0x03/0x0C/0x13 case adds frand(bounds) to the transform's velocity).
+    let spin = match g.def.spin() {
+        Some(base) => {
+            let mut spin = Vec3::from_array(base);
+            if let Some(var) = g.def.rotation_velocity_variance {
+                spin += Vec3::new(
+                    (next_unit(&mut g.emit_rng) * 2.0 - 1.0) * var[0],
+                    (next_unit(&mut g.emit_rng) * 2.0 - 1.0) * var[1],
+                    (next_unit(&mut g.emit_rng) * 2.0 - 1.0) * var[2],
+                );
+            }
+            spin
+        }
+        None => Vec3::ZERO,
+    };
+    // 0x11 SingleScaleVarianceInitializer: one [0, v) draw shared by every scale axis, on top
+    // of the 0x0F base (research/xim ParticleInitializers.kt — scale += posRand(v); retail's
+    // ElemGenerate case 0x11 adds a single ufrand to x, y and z).
+    let mut scale = Vec2::new(g.def.init_scale[0], g.def.init_scale[1]);
+    if let Some(v) = g.def.single_scale_variance {
+        scale += Vec2::splat(next_unit(&mut g.emit_rng) * v);
+    }
+    // 0x10 ScaleVarianceInitializer: a per-axis [0, v) draw on top of the 0x0F base; the z
+    // bound has no axis on the engine's 2D sprite (CYyGenerator.cpp
+    // CYyGenerator::ElemGenerate case 0x10 — field_EC.x/y/z += ufrand(payload)).
+    if let Some(var) = g.def.scale_variance {
+        scale += Vec2::new(
+            next_unit(&mut g.emit_rng) * var[0],
+            next_unit(&mut g.emit_rng) * var[1],
+        );
+    }
+    // 0x12 ScaleVelocitySetup: the per-frame growth the sec3 0x08 ScaleUpdater integrates
+    // (research/xim ParticleUpdaters.kt — scale += velocity × elapsedFrames); zero while the
+    // updater is off, so a rate without it stays inert.
+    // 0x13 VelocityVarianceSetup (scale): a uniform [-v, v] draw per axis on top of the
+    // 0x12 rate (research/xim ParticleInitializers.kt VelocityVarianceSetup — the
+    // allocationOffset binds it to the scale transform; retail's shared 0x03/0x0C/0x13 case
+    // adds frand(bounds) to the transform's velocity). The draw lands on the same transform
+    // velocity the sec3 0x08 ScaleUpdater integrates, so it is inert without the updater,
+    // as for 0x0C; the z bound has no axis on the engine's 2D sprite, as for 0x10.
+    let mut scale_vel = Vec2::ZERO;
+    if let Some(rate) = g.def.scale_rate() {
+        scale_vel = Vec2::new(rate[0], rate[1]);
+        if let Some(var) = g.def.scale_velocity_variance {
+            scale_vel += Vec2::new(
+                (next_unit(&mut g.emit_rng) * 2.0 - 1.0) * var[0],
+                (next_unit(&mut g.emit_rng) * 2.0 - 1.0) * var[1],
+            );
+        }
+    }
+    // 0x17 ColorVarianceSetup: each rgb channel gains its bound times one [0, 1) draw, on top
+    // of the 0x16 base (research/xim ParticleInitializers.kt ColorVarianceSetup — the shipped
+    // alpha byte is always 0 and the engine's alpha comes from the 0x16 base / alpha track).
+    let mut rgb = Vec3::from_slice(&g.def.init_color[..3]);
+    if let Some(var) = g.def.color_variance {
+        rgb += Vec3::new(
+            var[0] * next_unit(&mut g.emit_rng),
+            var[1] * next_unit(&mut g.emit_rng),
+            var[2] * next_unit(&mut g.emit_rng),
+        );
+    }
+    // sec2 0x3D OscillationSetup + 0x3E/0x3F/0x40 OscillationAccelerationSetup: the
+    // per-particle oscillation state — each present axis gets acceleration + one [−1, 1)
+    // variance draw, absent axes stay 0 (research/xim ParticleInitializers.kt
+    // OscillationAccelerationSetup — acceleration + variance × RandHelper rand()).
+    let osc = g.def.oscillation.then(|| {
+        let mut accel = [0.0f32; 3];
+        for (axis, block) in accel.iter_mut().zip([
+            g.def.oscillation_accel_x,
+            g.def.oscillation_accel_y,
+            g.def.oscillation_accel_z,
+        ]) {
+            if let Some(a) = block {
+                *axis = a[0] + a[1] * (next_unit(&mut g.emit_rng) * 2.0 - 1.0);
+            }
+        }
+        Oscillation {
+            accel,
+            prev_amplitude: [0.0; 3],
+        }
+    });
     g.particles.push(Particle {
         pos,
         spawn_origin: g.origin,
-        vel: Vec3::from_array(g.def.init_velocity) * g.vel_basis,
+        vel: vel * g.vel_basis,
         age_frames: 0.0,
         life_frames: life_frames.max(1.0),
-        rgb: Vec3::from_slice(&g.def.init_color[..3]),
-        scale: Vec2::new(g.def.init_scale[0], g.def.init_scale[1]),
-        rotation: Vec3::from_array(g.def.init_rotation),
+        rgb,
+        scale,
+        scale_seed: scale,
+        scale_vel,
+        rotation,
+        spin,
+        negate_rotation_y,
+        rel_vel: rel_vel * g.vel_basis,
+        osc,
     });
 }
 
@@ -990,6 +1553,14 @@ pub struct RebuildTrace {
     gated: u32,
 }
 
+/// Per-frame draw gate and mesh writer for the live generators.
+///
+/// A camera-pinned generator sits at the eye by construction, inside every band, so it
+/// skips the cull test. The frustum test keeps the near plane and drops the far plane
+/// (reverse-z infinite perspective), matching Bevy's own CPU-culling call shape.
+/// `built_key` is left alone while a generator is hidden: it stays the key of what is
+/// actually in the mesh asset, so the first drawable frame rebuilds to whatever the sim
+/// has reached.
 pub fn sync_particle_meshes(
     cam: Query<
         (&GlobalTransform, Option<&bevy::camera::primitives::Frustum>),
@@ -1008,7 +1579,8 @@ pub fn sync_particle_meshes(
     let frusta: Vec<&bevy::camera::primitives::Frustum> =
         cam.iter().filter_map(|(_, f)| f).collect();
     let (cam_rot, cam_pos) = (cam_xf.rotation(), cam_xf.translation());
-    // XiZone::GetDrawDistance, the band a 0x0A block with no authored maximum falls back to.
+    // XiZone.cpp XiZone::GetDrawDistance: the band a 0x0A block with no authored maximum
+    // falls back to.
     let zone_draw = draw
         .map(|d| d.world)
         .unwrap_or(crate::dat_mzb::RETAIL_FALLBACK_DRAW_DISTANCE);
@@ -1018,6 +1590,7 @@ pub fn sync_particle_meshes(
 
     // (index, despawn-needed); indices ascending so the reverse sweep below can
     // swap_remove safely.
+    let parents: std::collections::HashSet<_> = sim.generators.iter().map(|g| g.entity).collect();
     let mut reap: Vec<(usize, bool)> = Vec::new();
     for (i, g) in sim.generators.iter_mut().enumerate() {
         // The mesh entity despawns with its actor (auto-run generators are
@@ -1026,7 +1599,13 @@ pub fn sync_particle_meshes(
             reap.push((i, false));
             continue;
         };
-        // A camera-pinned generator sits at the eye by construction, inside every band.
+        // The 0x1F camera-oriented ring resolves against the camera and the actor's world
+        // rotation; sync runs after tick, so both reach emit() one frame behind like
+        // `emit_culled` (research/xim ParticleGeneratorParser.kt SphericalPositionVarianceFull).
+        g.cam_view = cam_rot;
+        if g.actor_local {
+            g.actor_rot = entity_xf.rotation();
+        }
         if let Some(cull) = g.def.emit_cull.filter(|_| !g.camera_relative) {
             let emitter = if g.actor_local {
                 entity_xf.transform_point(g.origin)
@@ -1083,8 +1662,6 @@ pub fn sync_particle_meshes(
         let drawable = g.camera_relative
             || frusta.is_empty()
             || generator_bounds(g, &clock).is_some_and(|b| {
-                // bevy_camera visibility check_visibility_cpu_culling's own call shape: the near
-                // plane culls, the far plane does not (reverse-z infinite perspective).
                 frusta
                     .iter()
                     .any(|f| f.intersects_obb(&b, &entity_xf.affine(), true, false))
@@ -1098,8 +1675,6 @@ pub fn sync_particle_meshes(
         }
         let view = CameraView { rot, pos: cam_pos };
         if drawable {
-            // `built_key` is left alone when hidden: it stays the key of what is actually in the
-            // mesh asset, so the first drawable frame rebuilds to whatever the sim has reached.
             let key = mesh_key(g, view, &clock);
             if needs_rebuild(&g.built_key, &key) {
                 if let Some(mut mesh) = meshes.get_mut(&g.mesh) {
@@ -1118,8 +1693,11 @@ pub fn sync_particle_meshes(
         } else if trace_rebuilds {
             trace.gated += 1;
         }
-        let window_over =
-            g.stopped || (!g.auto_run && g.age_frames > g.emit_window_frames.max(1.0));
+        let window_over = if let Some(parent) = g.immediate_parent {
+            !parents.contains(&parent)
+        } else {
+            g.stopped || (!g.auto_run && g.age_frames > g.emit_window_frames.max(1.0))
+        };
         let done = window_over && g.particles.is_empty();
         if done {
             reap.push((i, true));
@@ -1182,12 +1760,12 @@ fn particle_draw(g: &LiveGenerator, p: &Particle, clock: &CelestialClock) -> Par
     let sx = g
         .scale_x
         .as_ref()
-        .map(|t| t.sample_from(progress, Some(p.scale.x)))
+        .map(|t| t.sample_from(progress, Some(p.scale_seed.x)))
         .unwrap_or(p.scale.x);
     let sy = g
         .scale_y
         .as_ref()
-        .map(|t| t.sample_from(progress, Some(p.scale.y)))
+        .map(|t| t.sample_from(progress, Some(p.scale_seed.y)))
         .unwrap_or(p.scale.y);
     // research/XIClient/src/XIClient/source/World/Generator/CYyGenerator.cpp HandleOne
     // initializes field_F8 from opcode 0x16; persistent effects retain its authored alpha.
@@ -1297,7 +1875,7 @@ const MESH_KEY_COLOR_QUANTUM: f32 = 1.0 / 256.0;
 // Quantized snapshot of every dynamic input rebuild_mesh consumes (via particle_draw, plus the
 // billboard rotation and UV scroll it reads directly). Zero live particles rebuild to the same
 // hidden primitive whatever those inputs are, hence the input-free Empty variant.
-#[derive(PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 enum MeshKey {
     Empty,
     Live {
@@ -1320,7 +1898,7 @@ struct CameraView {
     pos: Vec3,
 }
 
-#[derive(PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 struct ParticleKey {
     world: [i32; 3],
     flipbook_frame: usize,
@@ -1393,12 +1971,14 @@ fn template_bound_radius(template: &SpriteTemplate, sprite_frames: &[SpriteTempl
         .fold(0.0f32, |acc, p| acc.max(p.length()))
 }
 
-// The live particle set's bounds in the frame `rebuild_mesh` writes positions in (entity-local for
-// an actor-local generator, Bevy world space otherwise), so the caller supplies the entity
-// transform. `None` when nothing is alive to draw.
-//
-// This over-approximates on purpose: a partially visible generator has to stay in, and the
-// per-particle radius folds in a scale the individual vertex may not use.
+/// The live particle set's bounds in the frame `rebuild_mesh` writes positions in
+/// (entity-local for an actor-local generator, Bevy world space otherwise), so the caller
+/// supplies the entity transform. `None` when nothing is alive to draw.
+///
+/// This over-approximates on purpose: a partially visible generator has to stay in, and the
+/// per-particle radius folds in a scale the individual vertex may not use. The z-scale
+/// follows `rebuild_mesh`: a flat screen billboard leaves its unused depth axis at 1.0,
+/// everything else scales by the untracked init z.
 fn generator_bounds(
     g: &LiveGenerator,
     clock: &CelestialClock,
@@ -1407,8 +1987,6 @@ fn generator_bounds(
         return None;
     }
     let axial = is_axial_camera_billboard(g);
-    // The same z-scale `rebuild_mesh` picks: a flat screen billboard leaves its unused depth
-    // axis at 1.0, everything else scales by the untracked init z.
     let sz = if g.orientation.is_some() || axial {
         g.def.init_scale[2]
     } else {
@@ -1477,7 +2055,7 @@ fn rebuild_mesh(g: &LiveGenerator, cam: CameraView, clock: &CelestialClock, mesh
         } else if g.orientation.is_some() {
             particle_rotation(p)
         } else {
-            cam.rot
+            cam.rot * particle_rotation(p)
         };
         // Billboard sprites are flat (z unused); a 3-D particle mesh — a fixed-orientation
         // one, or an axial camera billboard, which stays a world-oriented solid — keeps its
@@ -1490,13 +2068,14 @@ fn rebuild_mesh(g: &LiveGenerator, cam: CameraView, clock: &CelestialClock, mesh
         // Fixed-orientation zone sheets carry raw FFXI-frame geometry; apply the
         // generator's FFXI->Bevy basis (the same flip on origin/velocity, matching
         // dat_mzb.rs to_bevy) so a falling water sheet hangs down into the basin
-        // instead of standing up above the emitter (kuluu-czc6). Actor-local generators
-        // integrate in the actor frame.
+        // instead of standing up above the emitter. Actor-local generators integrate in the
+        // actor frame, whose parent transform already carries the dat_mzb.rs to_bevy basis.
         let world_basis = (g.orientation.is_some() || axial) && !g.actor_local;
         // A screen billboard's template is DAT-frame geometry too (Y down: the campfire flame
         // `hi12` rises toward negative y). An actor-local generator inherits the FFXI->Bevy basis
         // from its parent transform; a world-space one folds it into the template before the
-        // view rotation, or the flame hangs below its wick.
+        // view rotation, or the flame hangs below its wick (the same flip dat_mzb.rs to_bevy
+        // applies to zone origins).
         let screen_basis = g.orientation.is_none() && !axial && !g.actor_local;
         let base = positions.len() as u32;
         for ((tp, uv), vertex) in tpl.positions.iter().zip(&tpl.uvs).zip(&tpl.colors) {
@@ -1767,6 +2346,7 @@ mod tests {
             follow_camera: false,
             camera_attached_base: false,
             position_variance: None,
+            spherical_full: None,
             continuous: false,
             auto_run: false,
             batched: false,
@@ -1778,34 +2358,93 @@ mod tests {
             attach_joint_target: 0,
             attach_source_oriented: false,
             init_scale: [0.1, 0.1, 1.0],
+            single_scale_variance: None,
+            scale_variance: None,
             init_color: [0.2, 0.2, 0.6, 0.5],
+            color_variance: None,
+            color_transform: None,
+            color_transform_modifier: None,
             init_velocity: [0.0, 0.01, 0.0],
+            velocity_variance: None,
+            relative_velocity: None,
+            relative_velocity_variance: None,
+            reverse_displacement: None,
+            rotation_variance: None,
             init_rotation: [0.0; 3],
+            incremental_rotation: None,
             blend: ffxi_dat::particle_gen::ParticleBlend::Additive,
             blend_byte: 0x48,
             ignore_texture_alpha: false,
             fog_enabled: true,
             draw_priority: Default::default(),
             sort_offset: 0.0,
+            projection_bias: None,
             depth_write: false,
             scale_x_track: None,
             scale_y_track: None,
+            scale_z_track: None,
             alpha_track: None,
+            color_r_track: None,
+            color_g_track: None,
+            color_b_track: None,
             day_of_week_color: None,
             moon_phase_color: None,
             uv_scroll: [0.0, 0.0],
             accel: None,
+            rotation_accel: None,
+            scale_accel: None,
             emit_cull: None,
+            association: None,
+            foot_mark: false,
+            oscillation: false,
+            parent_position_copy: false,
+            parent_velocity: None,
+            child_generator: None,
+            immediate_generator: None,
+            oscillation_accel_z: None,
+            oscillation_accel_x: None,
+            oscillation_accel_y: None,
+            oscillation_applier_x: None,
+            oscillation_applier_z: None,
+            oscillation_applier_y: None,
             rotation_velocity: None,
+            rotation_velocity_variance: None,
             rotation_updater: false,
+            position_updater: true,
+            scale_velocity: None,
+            scale_updater: false,
+            scale_velocity_variance: None,
             relife_on_expiry: false,
             specular_element: false,
             specular: None,
+            specular_rot_y_track: None,
+            camera_shake_track: None,
+            camera_shake: None,
+            haze_offset_x: None,
+            parent_rotate: false,
+            parent_color: false,
+            parent_scale: false,
+            velocity_dampener_track: None,
+            velocity_dampener: None,
+            velocity_rotator: None,
+            fixed_point_position_variance: None,
+            fixed_point_position_variance_2: None,
+            child_generator_2: None,
+            specular_rot_z_track: None,
+            specular_color_a_track: None,
+            parent_rotate_2: false,
+            batching_setup: false,
+            parent_tex_coord: false,
+            point_list_position: None,
+            velocity_y_track: None,
+            specular_rot_x_track: None,
+            specular_color_g_track: None,
         }
     }
 
     fn live(def: ParticleGeneratorDef, window: f32) -> LiveGenerator {
         LiveGenerator {
+            immediate_parent: None,
             def,
             template: SpriteTemplate {
                 positions: vec![Vec3::ZERO; 3],
@@ -1838,6 +2477,9 @@ mod tests {
             emit_culled: false,
             emit_scale: UNSCALED_EMISSION,
             emit_rng: emit_seed(Entity::PLACEHOLDER),
+            elements_emitted: 0,
+            cam_view: Quat::IDENTITY,
+            actor_rot: Quat::IDENTITY,
             built_key: MeshKey::Empty,
             bound_radius: 0.0,
         }
@@ -1848,9 +2490,66 @@ mod tests {
         advance_generator(g, frames);
     }
 
-    // The campfire flame `hi12` rises toward negative DAT y; a world-space screen billboard has
-    // to fold the FFXI->Bevy basis into that template itself, while an actor-local one leaves
-    // it to the parent transform.
+    // 0x1E ParticleDampen: emission stops and the already-live particles are force-expired
+    // at once (research/xim EffectRoutineInstance.kt handleParticleEffectDampen), unlike
+    // StopParticle which lets them play out.
+    #[test]
+    fn authored_velocity_damping_applies_after_position_with_fractional_delta() {
+        const DAMPING_PER_FRAME: f32 = 0.25;
+        const HALF_FRAME: f32 = 0.5;
+        let mut d = def(60.0, 1.0, 1);
+        d.velocity_dampener = Some([DAMPING_PER_FRAME, 0.0]);
+        let mut g = live(d, 0.0);
+        emit(&mut g, 60.0);
+        g.stopped = true;
+        g.particles[0].pos = Vec3::ZERO;
+        g.particles[0].vel = Vec3::X;
+        advance_generator(&mut g, HALF_FRAME);
+        assert_eq!(g.particles[0].pos, Vec3::X * HALF_FRAME);
+        assert_eq!(g.particles[0].vel, Vec3::X * HALF_FRAME);
+        advance_generator(&mut g, HALF_FRAME);
+        assert_eq!(
+            g.particles[0].pos,
+            Vec3::X * (HALF_FRAME + DAMPING_PER_FRAME)
+        );
+        assert_eq!(g.particles[0].vel, Vec3::X * DAMPING_PER_FRAME);
+    }
+
+    #[test]
+    fn dampen_generator_stops_emission_and_clears_live_particles() {
+        let owner = Entity::from_raw_u32(1).unwrap();
+        let mut sim = ParticleSimulator {
+            generators: vec![live(def(60.0, 1.0, 1), 60.0)],
+            clock: CelestialClock::default(),
+        };
+        sim.generators[0].origin_routine = Some(RoutineOrigin {
+            owner,
+            gen_id: *b"gr01",
+            routine: *b"cate",
+        });
+        advance(&mut sim.generators[0], 2.0);
+        assert!(
+            !sim.generators[0].particles.is_empty(),
+            "two frames emit two particles"
+        );
+
+        sim.dampen_generator(owner, *b"gr01");
+        assert!(sim.generators[0].stopped);
+        assert!(
+            sim.generators[0].particles.is_empty(),
+            "the live particles expire at once"
+        );
+
+        advance(&mut sim.generators[0], 10.0);
+        assert!(
+            sim.generators[0].particles.is_empty(),
+            "no re-emission after the dampen"
+        );
+    }
+
+    /// The campfire flame `hi12` rises toward negative DAT y; a world-space screen billboard
+    /// has to fold the FFXI->Bevy basis into that template itself, while an actor-local one
+    /// leaves it to the parent transform.
     #[test]
     fn world_space_screen_billboard_folds_the_dat_basis_into_its_template() {
         fn built_vertex(actor_local: bool) -> [f32; 3] {
@@ -1951,8 +2650,8 @@ mod tests {
         );
     }
 
-    // The default `PerspectiveProjection` looks down -Z with a 1:1 aspect, so a generator at +Z
-    // is behind the camera and one far enough out on +X is past a side plane.
+    /// The default `PerspectiveProjection` looks down -Z with a 1:1 aspect, so a generator at
+    /// +Z is behind the camera and one far enough out on +X is past a side plane.
     fn frustum_camera(world: &mut World, xf: GlobalTransform) -> Entity {
         use bevy::camera::{CameraProjection, PerspectiveProjection};
         let frustum = PerspectiveProjection::default().compute_frustum(&xf);
@@ -1978,8 +2677,8 @@ mod tests {
             .expect("mesh positions")
     }
 
-    // A generator wired to a live mesh asset and mesh entity, with `frames` of emission already
-    // simulated so it has particles to bound.
+    /// A generator wired to a live mesh asset and mesh entity, with `frames` of emission
+    /// already simulated so it has particles to bound.
     fn gated_world(origin: Vec3, bound_radius: f32, frames: f32) -> (World, Handle<Mesh>, Entity) {
         let mut world = World::new();
         world.insert_resource(Time::<()>::default());
@@ -2057,8 +2756,6 @@ mod tests {
     fn partially_visible_generator_is_not_culled() {
         use bevy::ecs::system::RunSystemOnce;
 
-        // Past the +X side plane at 10 units of depth (half-width ~4.1 at the default 45-degree
-        // vertical fov and 1:1 aspect), so only the template radius can pull it back in.
         let edge = Vec3::new(6.0, 0.0, -10.0);
         for (bound_radius, want) in [(0.1, Visibility::Hidden), (4.0, Visibility::Inherited)] {
             let (mut world, _mesh, entity) = gated_world(edge, bound_radius, 1.0);
@@ -2067,7 +2764,7 @@ mod tests {
             assert_eq!(
                 *world.get::<Visibility>(entity).unwrap(),
                 want,
-                "radius {bound_radius}"
+                "edge sits past the +X side plane; only the template radius pulls it back in: {bound_radius}"
             );
         }
     }
@@ -2109,14 +2806,14 @@ mod tests {
         );
     }
 
-    // One colour on every template vertex, so a stage-chain expectation is a single number
-    // per particle instead of a gradient.
+    /// One colour on every template vertex, so a stage-chain expectation is a single number
+    /// per particle instead of a gradient.
     fn set_template_color(g: &mut LiveGenerator, rgba: Vec4) {
         g.template.colors = vec![rgba; g.template.positions.len()];
     }
 
-    // The colour a particle actually draws with: `particle_draw` now returns only the
-    // per-particle half, and the template's per-vertex half folds in at `vertex_color`.
+    /// The colour a particle actually draws with: `particle_draw` returns only the
+    /// per-particle half, and the template's per-vertex half folds in at `vertex_color`.
     fn drawn_color(g: &LiveGenerator, clock: &CelestialClock) -> Vec4 {
         let draw = particle_draw(g, &g.particles[0], clock);
         Vec4::from_array(vertex_color(g, &draw, g.template.colors[0]))
@@ -2255,7 +2952,6 @@ mod tests {
         let born = sim.generators[0].particles.len();
         assert!(born > 0);
 
-        // The camera walks 100 yalms.
         let moved = Vec3::new(100.0, 0.0, 0.0);
         sim.set_camera_relative_origins(moved);
         advance(&mut sim.generators[0], 10.0);
@@ -2333,6 +3029,100 @@ mod tests {
             "a constant-radius shell leaves the interior empty"
         );
         assert!(centroid.length() < RADIUS * 0.2, "off-centre: {centroid}");
+    }
+
+    // 0x1F SphericalPositionVarianceFull: with a zero tilt the ring lies flat, and the stepped
+    // azimuth puts consecutive particles on consecutive steps of the ring (CYyGenerator.cpp
+    // CYyGenerator::ElemGenerate case 0x1F — the step indexes the element counter).
+    #[test]
+    fn spherical_full_stepped_azimuth_walks_the_ring() {
+        const STEPS: u32 = 6;
+        let mut d = def(60.0, 1.0, STEPS);
+        d.init_velocity = [0.0; 3];
+        d.spherical_full = Some(ffxi_dat::particle_gen::SphericalPositionVarianceFull {
+            radius_variance: 0.0,
+            base_radius: 2.0,
+            axis_scale: [1.0; 3],
+            rotation_z: 0.0,
+            rotation_y: 0.0,
+            tilt: 0.0,
+            tilt_variance: 0.0,
+            camera_oriented: false,
+            azimuth_steps: STEPS,
+        });
+        let mut g = live(d, f32::MAX);
+        advance(&mut g, 1.0);
+        assert_eq!(g.particles.len(), STEPS as usize);
+
+        let mut angles: Vec<f32> = g
+            .particles
+            .iter()
+            .map(|p| {
+                let (x, z) = (p.pos.x, p.pos.z);
+                let mut a = z.atan2(x);
+                if a < 0.0 {
+                    a += 2.0 * std::f32::consts::PI;
+                }
+                a
+            })
+            .collect();
+        angles.sort_by(|a, b| a.total_cmp(b));
+        let step = 2.0 * std::f32::consts::PI / STEPS as f32;
+        for (i, a) in angles.iter().enumerate() {
+            let expected = i as f32 * step;
+            assert!(
+                (a - expected).abs() < 1e-4,
+                "step {i} at {a}, expected {expected}"
+            );
+        }
+    }
+
+    /// The camera flag authors the ring in the camera's frame: the same flat ring that a
+    /// non-oriented block puts on the x/z axes rides the camera's rotation instead.
+    #[test]
+    fn spherical_full_camera_oriented_ring_follows_the_camera() {
+        let ring = |camera_oriented: bool| {
+            let mut d = def(60.0, 1.0, 2);
+            d.init_velocity = [0.0; 3];
+            d.spherical_full = Some(ffxi_dat::particle_gen::SphericalPositionVarianceFull {
+                radius_variance: 0.0,
+                base_radius: 2.0,
+                axis_scale: [1.0; 3],
+                rotation_z: 0.0,
+                rotation_y: 0.0,
+                tilt: 0.0,
+                tilt_variance: 0.0,
+                camera_oriented,
+                azimuth_steps: 2,
+            });
+            let mut g = live(d, f32::MAX);
+            g.cam_view = Quat::from_axis_angle(Vec3::Y, std::f32::consts::FRAC_PI_2);
+            advance(&mut g, 1.0);
+            g.particles
+                .iter()
+                .map(|p| (p.pos.x, p.pos.z))
+                .collect::<Vec<_>>()
+        };
+
+        let free = ring(false);
+        for (x, z) in &free {
+            assert!(
+                z.abs() < 1e-5,
+                "the un-oriented ring stays on the x axis: {x} {z}"
+            );
+        }
+
+        let oriented = ring(true);
+        for (x, z) in &oriented {
+            assert!(
+                x.abs() < 1e-5,
+                "the camera ring moves off the x axis: {x} {z}"
+            );
+        }
+        assert!(
+            oriented[0].1 > 0.0 && oriented[1].1 < 0.0,
+            "the ring spans the z axis"
+        );
     }
 
     // research/XIClient/src/XIClient/source/Resource/Derived/CMoD3m.cpp ZeroOneTSS. A template
@@ -2438,7 +3228,6 @@ mod tests {
                 D3mDrawPath::Mmb,
             );
             assert!((textured.x - rgb.x * 2.0).abs() < 1e-6);
-            // The forced ignore-texture-alpha table has no texture alpha to ignore here.
             let (_, forced) = d3m_stage_chain(
                 Vec3::splat(identity),
                 identity,
@@ -2510,7 +3299,13 @@ mod tests {
                 life_frames: 100.0,
                 rgb: Vec3::ONE,
                 scale: Vec2::ONE,
+                scale_seed: Vec2::ONE,
+                scale_vel: Vec2::ZERO,
                 rotation: Vec3::ZERO,
+                spin: Vec3::ZERO,
+                negate_rotation_y: false,
+                rel_vel: Vec3::ZERO,
+                osc: None,
             });
             g
         }
@@ -2599,7 +3394,8 @@ mod tests {
     }
 
     // The Home Point crystal `bnd0`: 0x0B (0, -0.0157, 0) with the sec3 0x05 updater turns the
-    // particle by that much every 60 Hz frame; the rate alone must not.
+    // particle by that much every 60 Hz frame; the rate alone must not
+    // (research/xim ParticleGeneratorParser.kt RotationUpdater).
     #[test]
     fn spin_integrates_only_with_the_rotation_updater() {
         const YAW_PER_FRAME: f32 = -0.0157;
@@ -2628,6 +3424,199 @@ mod tests {
         advance(&mut g, 1.0);
         advance(&mut g, 10.0);
         assert_eq!(g.particles[0].rotation, Vec3::new(0.0, 0.5, 0.0));
+    }
+
+    // 0x0C VelocityVarianceSetup (rotation): every emitted particle draws a uniform [-v, v]
+    // offset per axis on top of the 0x0B spin rate (research/xim ParticleInitializers.kt
+    // VelocityVarianceSetup — the allocationOffset binds it to the rotation transform; retail's
+    // shared 0x03/0x0C/0x13 case adds frand(bounds) to the transform's velocity). The burst is
+    // held (stopped) so the 10-frame tick ages only the original eight, not the re-emissions it
+    // would otherwise add behind them.
+    #[test]
+    fn rotation_velocity_variance_spreads_the_spin_per_particle() {
+        let mut d = def(120.0, 1.0, 8);
+        d.camera_billboard = false;
+        d.rotation_velocity = Some([0.0, 0.01, 0.0]);
+        d.rotation_velocity_variance = Some([0.0, 0.005, 0.0]);
+        d.rotation_updater = true;
+        let mut g = live(d, 1000.0);
+        advance(&mut g, 1.0);
+        assert_eq!(g.particles.len(), 8, "one burst of eight");
+        g.stopped = true;
+        advance(&mut g, 10.0);
+        let mut yaws = Vec::new();
+        for p in &g.particles {
+            let yaw = p.rotation.y;
+            yaws.push(yaw);
+            assert!(
+                (0.05f32 - 1e-6..=0.15f32 + 1e-6).contains(&yaw),
+                "spin out of band: {yaw}"
+            );
+        }
+        assert!(
+            yaws.windows(2).any(|w| w[0] != w[1]),
+            "the variance must differ between particles: {yaws:?}"
+        );
+
+        let mut no_updater = d;
+        no_updater.rotation_updater = false;
+        let mut g = live(no_updater, 1000.0);
+        advance(&mut g, 1.0);
+        advance(&mut g, 10.0);
+        for p in &g.particles {
+            assert_eq!(p.rotation, Vec3::ZERO, "no rotation updater, no spin");
+        }
+    }
+
+    // 0x13 VelocityVarianceSetup (scale): every emitted particle draws a uniform [-v, v]
+    // offset per axis on top of the 0x12 scale velocity (research/xim
+    // ParticleInitializers.kt VelocityVarianceSetup — the allocationOffset binds it to the
+    // scale transform; retail's shared 0x03/0x0C/0x13 case adds frand(bounds) to the
+    // transform's velocity). The burst is held (stopped) so the 10-frame tick ages only the
+    // original eight, not the re-emissions it would otherwise add behind them.
+    #[test]
+    fn scale_velocity_variance_spreads_the_rate_per_particle() {
+        let mut d = def(120.0, 1.0, 8);
+        d.scale_velocity = Some([0.0, 0.01, 0.0]);
+        d.scale_velocity_variance = Some([0.0, 0.005, 0.0]);
+        d.scale_updater = true;
+        let mut g = live(d, 1000.0);
+        advance(&mut g, 1.0);
+        assert_eq!(g.particles.len(), 8, "one burst of eight");
+        g.stopped = true;
+        advance(&mut g, 10.0);
+        let mut scales = Vec::new();
+        for p in &g.particles {
+            scales.push(p.scale.y);
+            assert!(
+                (0.15f32 - 1e-6..=0.25f32 + 1e-6).contains(&p.scale.y),
+                "scale out of band: {}",
+                p.scale.y
+            );
+        }
+        assert!(
+            scales.windows(2).any(|w| w[0] != w[1]),
+            "the variance must differ between particles: {scales:?}"
+        );
+
+        let mut no_updater = d;
+        no_updater.scale_updater = false;
+        let mut g = live(no_updater, 1000.0);
+        advance(&mut g, 1.0);
+        advance(&mut g, 10.0);
+        for p in &g.particles {
+            assert_eq!(p.scale.y, 0.1, "no scale updater, no growth");
+        }
+    }
+
+    // 0x11 SingleScaleVarianceInitializer: every emitted particle draws one [0, v) offset
+    // shared by the scale axes, on top of the 0x0F base (research/xim ParticleInitializers.kt
+    // — scale += posRand(v); retail's ElemGenerate case 0x11 adds a single ufrand to x, y, z).
+    #[test]
+    fn single_scale_variance_spreads_the_scale_per_particle() {
+        let mut d = def(120.0, 1.0, 8);
+        d.single_scale_variance = Some(0.05);
+        let mut g = live(d, 1000.0);
+        advance(&mut g, 1.0);
+        assert_eq!(g.particles.len(), 8, "one burst of eight");
+        let mut scales = Vec::new();
+        for p in &g.particles {
+            scales.push(p.scale.x);
+            assert!(
+                (0.1f32..=0.15f32 + 1e-6).contains(&p.scale.x),
+                "scale out of band: {}",
+                p.scale.x
+            );
+            assert_eq!(p.scale.x, p.scale.y, "one draw feeds both axes");
+        }
+        assert!(
+            scales.windows(2).any(|w| w[0] != w[1]),
+            "the variance must differ between particles: {scales:?}"
+        );
+    }
+
+    // 0x10 ScaleVarianceInitializer: each scale axis draws its own [0, v) offset on top of
+    // the 0x0F base, so the axes decorrelate (CYyGenerator.cpp
+    // CYyGenerator::ElemGenerate case 0x10 — field_EC.x/y/z += ufrand(payload)).
+    #[test]
+    fn scale_variance_spreads_each_axis_independently() {
+        let mut d = def(120.0, 1.0, 16);
+        d.scale_variance = Some([0.2, 0.1, 0.0]);
+        let mut g = live(d, 1000.0);
+        advance(&mut g, 1.0);
+        assert_eq!(g.particles.len(), 16, "one burst of sixteen");
+        for p in &g.particles {
+            assert!(
+                (0.1f32..=0.3f32 + 1e-6).contains(&p.scale.x),
+                "x scale out of band: {}",
+                p.scale.x
+            );
+            assert!(
+                (0.1f32..=0.2f32 + 1e-6).contains(&p.scale.y),
+                "y scale out of band: {}",
+                p.scale.y
+            );
+        }
+        assert!(
+            g.particles
+                .iter()
+                .any(|p| (p.scale.x - 0.1) / 0.2 != (p.scale.y - 0.1) / 0.1),
+            "the axis draws must be independent"
+        );
+    }
+
+    #[test]
+    fn transform_acceleration_does_not_translate_particles() {
+        let mut d = def(120.0, 1.0, 1);
+        d.init_velocity = [0.0; 3];
+        d.rotation_velocity = Some([0.0; 3]);
+        d.scale_velocity = Some([0.0; 3]);
+        d.rotation_updater = true;
+        d.scale_updater = true;
+        d.rotation_accel = Some([0.0, 0.0, 0.01]);
+        d.scale_accel = Some([0.01, 0.0, 0.0]);
+        let mut g = live(d, 1000.0);
+        advance(&mut g, 1.0);
+        g.stopped = true;
+        let initial = g.particles[0].pos;
+        advance(&mut g, 1.0);
+        advance(&mut g, 1.0);
+        let p = &g.particles[0];
+        assert_eq!(p.pos, initial);
+        assert!((p.rotation.z - 0.01).abs() < 1e-6);
+        assert!((p.scale.x - 0.11).abs() < 1e-6);
+    }
+
+    // 0x12 ScaleVelocitySetup: the sec3 0x08 ScaleUpdater adds the per-axis rate every frame
+    // (research/xim ParticleUpdaters.kt — scale += velocity × elapsedFrames); a rate without
+    // the updater stays inert, and the track seed keeps the spawn-time scale. The burst is
+    // held (stopped) so the 10-frame tick ages only the original eight, not the re-emissions it
+    // would otherwise add behind them.
+    #[test]
+    fn scale_velocity_grows_the_scale_per_frame() {
+        let mut d = def(120.0, 1.0, 8);
+        d.scale_velocity = Some([0.0, 0.01, 0.0]);
+        d.scale_updater = true;
+        let mut g = live(d, 1000.0);
+        advance(&mut g, 1.0);
+        assert_eq!(g.particles.len(), 8, "one burst of eight");
+        g.stopped = true;
+        advance(&mut g, 10.0);
+        for p in &g.particles {
+            assert_eq!(p.scale.x, 0.1, "no x rate, no x growth");
+            let sy = p.scale.y;
+            assert!((sy - 0.2).abs() < 1e-5, "10 frames at 0.01: {sy}");
+            assert_eq!(p.scale_seed, Vec2::new(0.1, 0.1), "the seed stays at spawn");
+        }
+
+        let mut no_updater = d;
+        no_updater.scale_updater = false;
+        let mut g = live(no_updater, 1000.0);
+        advance(&mut g, 1.0);
+        advance(&mut g, 10.0);
+        for p in &g.particles {
+            assert_eq!(p.scale, Vec2::new(0.1, 0.1), "no scale updater, no growth");
+        }
     }
 
     // CYyGenerator.cpp CYyGenerator::ElemDie case 5 — a relife generator keeps its element past
@@ -2671,7 +3660,8 @@ mod tests {
         );
     }
 
-    // A turning particle changes the built mesh, so the rebuild key has to follow its rotation.
+    /// A turning particle changes the built mesh, so the rebuild key has to follow its
+    /// rotation.
     #[test]
     fn rotation_changes_the_mesh_key() {
         let mut d = def(120.0, 1.0, 1);
@@ -2716,6 +3706,143 @@ mod tests {
         assert!(count(&mesh) > 0, "empty rebuild must not be zero-length");
     }
 
+    // sec2 0x3D + 0x3E with the sec3 0x29 applier: the particle's x position sways with the
+    // applier's amplitude curve (research/xim ParticleUpdaters.kt OscillationApplier —
+    // rate = 180f / 2 = 90, baseOffset 0, so the amplitude peaks at half a period, 90 frames,
+    // and returns to zero at the full period).
+    #[test]
+    fn oscillation_applier_x_oscillates_the_position() {
+        let mut d = def(1000.0, 1.0, 1);
+        d.oscillation = true;
+        d.oscillation_accel_x = Some([0.5, 0.0]);
+        d.oscillation_applier_x = Some([2.0, 0.0, 0.0]);
+        let mut g = live(d, 1000.0);
+        advance(&mut g, 1.0);
+        assert_eq!(g.particles.len(), 1, "one particle");
+        g.stopped = true;
+        for _ in 0..90 {
+            advance(&mut g, 1.0);
+        }
+        let x_peak = g.particles[0].pos.x;
+        assert!((x_peak - 22.5).abs() < 1e-2, "half-period peak: {x_peak}");
+        for _ in 0..90 {
+            advance(&mut g, 1.0);
+        }
+        let x_full = g.particles[0].pos.x;
+        assert!(x_full.abs() < 1e-2, "full-period return: {x_full}");
+    }
+
+    // sec3 0x2B OscillationApplier (Z): the z position sways with the amplitude curve
+    // (research/xim ParticleGeneratorParser.kt OscillationApplier). The default generator is
+    // world-space, so the FFXI +Z unit hat lands on Bevy −Z through the (x, −y, −z) basis —
+    // the peak is negative.
+    #[test]
+    fn oscillation_applier_z_oscillates_the_position() {
+        let mut d = def(1000.0, 1.0, 1);
+        d.oscillation = true;
+        d.oscillation_accel_z = Some([0.5, 0.0]);
+        d.oscillation_applier_z = Some([2.0, 0.0, 0.0]);
+        let mut g = live(d, 1000.0);
+        advance(&mut g, 1.0);
+        assert_eq!(g.particles.len(), 1, "one particle");
+        g.stopped = true;
+        for _ in 0..90 {
+            advance(&mut g, 1.0);
+        }
+        let z_peak = g.particles[0].pos.z;
+        assert!((z_peak + 22.5).abs() < 1e-2, "half-period peak: {z_peak}");
+        for _ in 0..90 {
+            advance(&mut g, 1.0);
+        }
+        let z_full = g.particles[0].pos.z;
+        assert!(z_full.abs() < 1e-2, "full-period return: {z_full}");
+    }
+
+    // sec3 0x2A OscillationApplier (Y): the y position sways with the amplitude curve
+    // (research/xim ParticleGeneratorParser.kt OscillationApplier). The default generator is
+    // world-space, so the FFXI +Y unit hat lands on Bevy −Y through the (x, −y, −z) basis —
+    // the peak is negative. The base velocity is zeroed so its drift does not mix into the
+    // asserted axis.
+    #[test]
+    fn oscillation_applier_y_oscillates_the_position() {
+        let mut d = def(1000.0, 1.0, 1);
+        d.init_velocity = [0.0; 3];
+        d.oscillation = true;
+        d.oscillation_accel_y = Some([0.5, 0.0]);
+        d.oscillation_applier_y = Some([2.0, 0.0, 0.0]);
+        let mut g = live(d, 1000.0);
+        advance(&mut g, 1.0);
+        assert_eq!(g.particles.len(), 1, "one particle");
+        g.stopped = true;
+        for _ in 0..90 {
+            advance(&mut g, 1.0);
+        }
+        let y_peak = g.particles[0].pos.y;
+        assert!((y_peak + 22.5).abs() < 1e-2, "half-period peak: {y_peak}");
+        for _ in 0..90 {
+            advance(&mut g, 1.0);
+        }
+        let y_full = g.particles[0].pos.y;
+        assert!(y_full.abs() < 1e-2, "full-period return: {y_full}");
+    }
+
+    // The 0x3E acceleration without the sec3 0x29 applier is parsed but never moves the
+    // particle (research/xim ParticleUpdaters.kt — the applier is the only integrator).
+    #[test]
+    fn oscillation_without_the_applier_stays_inert() {
+        let mut d = def(1000.0, 1.0, 1);
+        d.oscillation = true;
+        d.oscillation_accel_x = Some([0.5, 0.0]);
+        let mut g = live(d, 1000.0);
+        advance(&mut g, 1.0);
+        g.stopped = true;
+        for _ in 0..180 {
+            advance(&mut g, 1.0);
+        }
+        let p = &g.particles[0];
+        assert_eq!(p.pos.x, 0.0, "no applier, no x motion");
+    }
+
+    // With a relative velocity the applier moves the particle along it, not along the axis
+    // (research/xim ParticleUpdaters.kt getOscillationDirection — the X axis follows the
+    // relative-velocity direction).
+    #[test]
+    fn oscillation_applier_x_follows_the_relative_velocity_direction() {
+        let mut d = def(1000.0, 1.0, 1);
+        d.oscillation_applier_x = Some([2.0, 0.0, 0.0]);
+        let mut g = live(d, 1000.0);
+        g.stopped = true;
+        g.particles.push(Particle {
+            pos: Vec3::ZERO,
+            spawn_origin: Vec3::ZERO,
+            vel: Vec3::ZERO,
+            age_frames: 0.0,
+            life_frames: 1000.0,
+            rgb: Vec3::ONE,
+            scale: Vec2::ONE,
+            scale_seed: Vec2::ONE,
+            scale_vel: Vec2::ZERO,
+            rotation: Vec3::ZERO,
+            spin: Vec3::ZERO,
+            negate_rotation_y: false,
+            rel_vel: Vec3::Y,
+            osc: Some(Oscillation {
+                accel: [0.5, 0.0, 0.0],
+                prev_amplitude: [0.0; 3],
+            }),
+        });
+        for _ in 0..90 {
+            advance(&mut g, 1.0);
+        }
+        let p = &g.particles[0];
+        assert!(
+            (p.pos.y - 22.5).abs() < 1e-2,
+            "along the relative velocity: {}",
+            p.pos.y
+        );
+        assert_eq!(p.pos.x, 0.0, "no x motion");
+    }
+
     // kuluu-b5nt: rebuild_mesh only fires when its quantized inputs differ from the last BUILT
     // mesh, so a tracked get_mut (AssetEvent::Modified, a full GPU re-upload) stops scaling
     // with fps.
@@ -2732,7 +3859,13 @@ mod tests {
                 life_frames: 100.0,
                 rgb: Vec3::ONE,
                 scale: Vec2::ONE,
+                scale_seed: Vec2::ONE,
+                scale_vel: Vec2::ZERO,
                 rotation: Vec3::ZERO,
+                spin: Vec3::ZERO,
+                negate_rotation_y: false,
+                rel_vel: Vec3::ZERO,
+                osc: None,
             });
             g
         }
@@ -2872,9 +4005,8 @@ mod tests {
         );
     }
 
-    // kuluu-czc6 assumed screen billboards needed no flip; the Selbina lantern showed
-    // otherwise (kuluu-3v98): the campfire ribbon hi12 rises toward DAT -y and hung below its
-    // wick, so a world-space screen billboard folds the same basis into its template.
+    /// The campfire ribbon hi12 rises toward DAT -y, so a world-space screen billboard folds
+    /// the FFXI->Bevy basis into its template, or the flame hangs below its wick.
     #[test]
     fn camera_billboard_sheet_flipped_into_the_bevy_frame() {
         let g = sheet_gen(None);
@@ -2954,6 +4086,198 @@ mod tests {
             sim.generators[0].particles.is_empty(),
             "live particles finish their lifetime and none replace them"
         );
+    }
+
+    // 0x11 AssociationUpdater: retail re-snaps the associated position to the attach actor's
+    // position every frame (research/xim ParticleGeneratorAttachment.kt updateAssociatedPosition),
+    // so the live origin tracks the actor instead of staying at the spawn-time position.
+    #[test]
+    fn attached_generator_origin_tracks_the_actor_while_the_effect_runs() {
+        use bevy::ecs::system::RunSystemOnce;
+
+        let mut world = World::new();
+        let owner = world.spawn(Transform::from_translation(Vec3::ZERO)).id();
+        let mut d = def(600.0, 1.0, 1);
+        d.association = Some(ffxi_dat::particle_gen::AssociationFollow {
+            follow_position: true,
+            follow_facing: false,
+            factor: 255,
+        });
+        let mut g = live(d, 0.0);
+        g.origin_routine = Some(RoutineOrigin {
+            owner,
+            gen_id: *b"gn10",
+            routine: *b"cabk",
+        });
+        g.origin = Vec3::new(9.0, 0.0, 0.0);
+        let mut sim = ParticleSimulator::default();
+        sim.generators.push(g);
+        world.insert_resource(sim);
+
+        world.run_system_once(track_attached_origins).unwrap();
+        assert_eq!(
+            world.resource::<ParticleSimulator>().generators[0].origin,
+            Vec3::new(0.0, 0.5, 0.0),
+            "the origin snaps to the actor's position plus base height"
+        );
+
+        *world.get_mut::<Transform>(owner).unwrap() =
+            Transform::from_translation(Vec3::new(3.0, 0.0, -4.0));
+        world.run_system_once(track_attached_origins).unwrap();
+        assert_eq!(
+            world.resource::<ParticleSimulator>().generators[0].origin,
+            Vec3::new(3.0, 0.5, -4.0),
+            "and keeps tracking as the actor moves"
+        );
+    }
+
+    // Without the 0x11 updater the origin stays where the spawn path put it - retail's handler
+    // only runs for defs that carry the updater (research/xim
+    // ParticleGeneratorParser.kt AssociationUpdater).
+    #[test]
+    fn generator_without_the_association_updater_keeps_its_spawn_origin() {
+        use bevy::ecs::system::RunSystemOnce;
+
+        let mut world = World::new();
+        let owner = world
+            .spawn(Transform::from_translation(Vec3::new(3.0, 0.0, 0.0)))
+            .id();
+        let g = {
+            let d = def(600.0, 1.0, 1);
+            let mut g = live(d, 0.0);
+            g.origin_routine = Some(RoutineOrigin {
+                owner,
+                gen_id: *b"gn10",
+                routine: *b"cabk",
+            });
+            g.origin = Vec3::new(9.0, 0.0, 0.0);
+            g
+        };
+        let mut sim = ParticleSimulator::default();
+        sim.generators.push(g);
+        world.insert_resource(sim);
+
+        world.run_system_once(track_attached_origins).unwrap();
+        assert_eq!(
+            world.resource::<ParticleSimulator>().generators[0].origin,
+            Vec3::new(9.0, 0.0, 0.0),
+            "no 0x11 follow: the spawn-time origin is untouched"
+        );
+    }
+
+    #[test]
+    fn unlinked_screen_billboard_keeps_authored_rotation() {
+        const TOLERANCE: f32 = 1e-4;
+        let mut g = live(def(ROUTINE_FPS, ROUTINE_FPS, 1), 0.0);
+        g.def.init_rotation[2] = std::f32::consts::FRAC_PI_2;
+        emit(&mut g, ROUTINE_FPS);
+        assert!(g.immediate_parent.is_none());
+        let camera = view(Quat::from_rotation_y(std::f32::consts::FRAC_PI_4));
+        let (rotated, _) = rebuilt(&g, camera);
+        g.particles[0].rotation = Vec3::ZERO;
+        let (unrotated, _) = rebuilt(&g, camera);
+        let expected =
+            camera.rot * Quat::from_rotation_z(std::f32::consts::FRAC_PI_2) * camera.rot.inverse();
+        for (actual, original) in rotated.iter().zip(unrotated.iter()) {
+            assert!((*actual - expected * *original).length() < TOLERANCE);
+        }
+    }
+
+    #[test]
+    fn linked_multiple_births_keep_parent_insertion_order() {
+        const BIRTHS: u32 = 3;
+        let mut parent = live(def(ROUTINE_FPS, ROUTINE_FPS, BIRTHS), 0.0);
+        parent.entity = Entity::from_bits(1);
+        parent.def.position_variance = Some(ffxi_dat::particle_gen::PositionVariance {
+            radius_variance: 1.0,
+            base_radius: 1.0,
+            axis_scale: [1.0; 3],
+        });
+        let mut child = live(def(ROUTINE_FPS, ROUTINE_FPS, 1), 0.0);
+        child.entity = Entity::from_bits(2);
+        child.immediate_parent = Some(parent.entity);
+        child.def.parent_position_copy = true;
+        child.stopped = true;
+        let mut sim = ParticleSimulator {
+            generators: vec![child, parent],
+            ..default()
+        };
+        advance_simulator(&mut sim, 1.0);
+        assert_eq!(sim.generators[0].particles.len(), BIRTHS as usize);
+        assert_ne!(
+            sim.generators[1].particles[0].pos,
+            sim.generators[1].particles[1].pos
+        );
+        for (child, parent) in sim.generators[0]
+            .particles
+            .iter()
+            .zip(&sim.generators[1].particles)
+        {
+            assert_eq!(child.pos, parent.pos);
+        }
+    }
+
+    #[test]
+    fn immediate_linked_emission_copies_birth_position_once_and_keeps_its_rotation() {
+        const PARENT_POSITION: Vec3 = Vec3::new(11.0, 4.0, -7.0);
+        let mut parent = live(def(30.0, 100.0, 1), 0.0);
+        parent.origin = PARENT_POSITION;
+        parent.entity = Entity::from_bits(1);
+        let mut child = live(def(30.0, 100.0, 1), 0.0);
+        child.entity = Entity::from_bits(2);
+        child.immediate_parent = Some(parent.entity);
+        child.origin = parent.origin;
+        child.def.parent_position_copy = true;
+        child.def.init_rotation[2] = std::f32::consts::FRAC_PI_2;
+        child.stopped = true;
+        let mut sim = ParticleSimulator {
+            generators: vec![child, parent],
+            ..default()
+        };
+        advance_simulator(&mut sim, 0.0);
+        assert!(sim.generators.iter().all(|g| g.particles.is_empty()));
+        advance_simulator(&mut sim, 1.0);
+        assert_eq!(sim.generators[0].particles.len(), 1);
+        let child = &sim.generators[0];
+        assert_eq!(child.particles[0].pos, sim.generators[1].particles[0].pos);
+        assert_eq!(
+            particle_draw(child, &child.particles[0], &sim.clock).world,
+            PARENT_POSITION
+        );
+        assert_eq!(
+            child.particles[0].scale,
+            Vec2::from_array(child.def.init_scale[..2].try_into().unwrap())
+        );
+        assert_eq!(child.particles[0].rotation.z, std::f32::consts::FRAC_PI_2);
+        advance_simulator(&mut sim, 0.0);
+        advance_simulator(&mut sim, 1.0);
+        assert_eq!(sim.generators[0].elements_emitted, 1);
+        sim.generators.remove(1);
+        advance_simulator(&mut sim, 30.0);
+        assert!(sim.generators[0].particles.is_empty());
+    }
+
+    #[test]
+    fn scheduled_zero_window_waits_for_positive_time_and_does_not_repeat_when_paused() {
+        const POSITIVE_TICK_FRAMES: f32 = 1.0;
+        const PAUSED_TICK_FRAMES: f32 = 0.0;
+        let mut g = live(def(ROUTINE_FPS, ROUTINE_FPS, 1), 0.0);
+        advance(&mut g, PAUSED_TICK_FRAMES);
+        advance(&mut g, PAUSED_TICK_FRAMES);
+        assert_eq!(g.elements_emitted, 0);
+        assert!(g.particles.is_empty());
+
+        advance(&mut g, POSITIVE_TICK_FRAMES);
+        assert_eq!(g.elements_emitted, 1);
+        assert_eq!(g.particles.len(), 1);
+        let age_before_pause = g.particles[0].age_frames;
+        advance(&mut g, PAUSED_TICK_FRAMES);
+        assert_eq!(g.elements_emitted, 1);
+        assert_eq!(g.particles[0].age_frames, age_before_pause);
+        advance(&mut g, POSITIVE_TICK_FRAMES);
+        assert_eq!(g.elements_emitted, 1);
+        assert_eq!(g.particles.len(), 1);
+        assert!(g.particles[0].age_frames > age_before_pause);
     }
 
     // The cast aura's own generators sit on dur=0 Particle stages (global-dir `ner1`: gn1s dur=0;
@@ -3060,6 +4384,248 @@ mod tests {
         assert!(g.particles[0].pos.y > 0.0, "velocity integrated");
     }
 
+    // 0x03 VelocityVarianceSetup: every emitted particle draws a uniform [-v, v] offset
+    // per axis on top of the 0x02 base velocity (research/xim ParticleInitializers.kt
+    // VelocityVarianceSetup; RandHelper rand() in [-1, 1)).
+    #[test]
+    fn velocity_variance_spreads_each_axis_around_the_base() {
+        let mut d = def(10.0, 1.0, 1);
+        d.velocity_variance = Some([0.001, 0.002, 0.003]);
+        let mut g = live(d, 30.0);
+        advance(&mut g, 5.0);
+        assert_eq!(g.particles.len(), 5, "one draw per particle");
+        for p in &g.particles {
+            assert!(
+                (-0.001..=0.001).contains(&p.vel.x)
+                    && (0.008..=0.012).contains(&p.vel.y)
+                    && (-0.003..=0.003).contains(&p.vel.z),
+                "each axis inside base ± bound: {:?}",
+                p.vel
+            );
+        }
+        assert!(
+            g.particles.windows(2).any(|w| w[0].vel != w[1].vel),
+            "the variance is a per-particle draw, not a constant"
+        );
+    }
+
+    #[test]
+    fn velocity_without_variance_is_exactly_the_base() {
+        let mut g = live(def(0.0, 1.0, 1), 30.0);
+        advance(&mut g, 1.0);
+        assert_eq!(g.particles.len(), 1);
+        assert_eq!(g.particles[0].vel, Vec3::from_array([0.0, 0.01, 0.0]));
+    }
+
+    // sec3 0x02 PositionUpdater off: the velocity still exists (the 0x03/0x06/0x09 accelerators
+    // keep charging it) but the position never steps, retail's ElemIdle behavior for the 8
+    // shipped generators that carry a base velocity without the block (CYyGenerator.cpp
+    // CYyGenerator::ElemIdle).
+    #[test]
+    fn position_updater_off_holds_the_particle_at_its_spawn() {
+        let mut d = def(10.0, 1.0, 1);
+        d.position_updater = false;
+        d.accel = Some([0.0, 0.001, 0.0]);
+        let mut g = live(d, 30.0);
+        for _ in 0..3 {
+            advance(&mut g, 1.0);
+        }
+        let p = &g.particles[0];
+        assert_eq!(p.pos, Vec3::ZERO, "no position step");
+        assert!(p.vel.y > 0.01, "the velocity keeps charging: {:?}", p.vel);
+    }
+
+    // 0x08 RelativeVelocitySetup: each particle's velocity gains the payload speed along its
+    // own spawn offset's direction (research/xim ParticleInitializers.kt
+    // RelativeVelocitySetup).
+    #[test]
+    fn relative_velocity_points_along_the_spawn_offset() {
+        let mut d = def(10.0, 1.0, 1);
+        d.position_variance = Some(ffxi_dat::particle_gen::PositionVariance {
+            radius_variance: 0.0,
+            base_radius: 1.0,
+            axis_scale: [1.0; 3],
+        });
+        d.relative_velocity = Some(0.5);
+        let mut g = live(d, 30.0);
+        advance(&mut g, 1.0);
+        assert_eq!(g.particles.len(), 1);
+        let p = &g.particles[0];
+        let extra = p.vel - Vec3::from_array([0.0, 0.01, 0.0]);
+        let offset = p.pos;
+        assert!(
+            (extra - offset.normalize() * 0.5).length() < 1e-6,
+            "the added velocity is 0.5 along the spawn offset: {extra:?} vs {offset:?}"
+        );
+    }
+
+    // With no spawn offset there is no direction, so 0x08 contributes nothing (research/xim
+    // ParticleInitializers.kt RelativeVelocitySetup).
+    #[test]
+    fn relative_velocity_without_a_spawn_offset_is_inert() {
+        let mut d = def(0.0, 1.0, 1);
+        d.relative_velocity = Some(0.5);
+        let mut g = live(d, 30.0);
+        advance(&mut g, 1.0);
+        assert_eq!(g.particles.len(), 1);
+        assert_eq!(g.particles[0].vel, Vec3::from_array([0.0, 0.01, 0.0]));
+    }
+
+    // 0x41 RelativeVelocityVarianceSetup: each particle's velocity gains a uniform
+    // [-v, v] draw along its own spawn offset's direction, on top of the 0x08 speed
+    // (research/xim ParticleInitializers.kt RelativeVelocityVarianceSetup).
+    #[test]
+    fn relative_velocity_variance_spreads_along_the_spawn_offset() {
+        let mut d = def(10.0, 1.0, 1);
+        d.position_variance = Some(ffxi_dat::particle_gen::PositionVariance {
+            radius_variance: 0.0,
+            base_radius: 1.0,
+            axis_scale: [1.0; 3],
+        });
+        d.relative_velocity = Some(0.5);
+        d.relative_velocity_variance = Some(0.2);
+        let mut g = live(d, 30.0);
+        advance(&mut g, 3.0);
+        assert_eq!(g.particles.len(), 3);
+        for p in &g.particles {
+            let dir = p.pos.normalize();
+            let extra = p.vel - Vec3::from_array([0.0, 0.01, 0.0]);
+            let along = extra.dot(dir);
+            assert!(
+                (0.3..0.7).contains(&along),
+                "the added speed is 0.5 plus a [-0.2, 0.2) draw along the offset: {along}"
+            );
+            let perpendicular = extra - dir * along;
+            assert!(
+                perpendicular.length() < 1e-5,
+                "the added velocity stays on the spawn offset's direction: {perpendicular:?}"
+            );
+        }
+    }
+
+    // 0x17 ColorVarianceSetup: each rgb channel gains its bound times one [0, 1) draw on top
+    // of the 0x16 base (research/xim ParticleInitializers.kt ColorVarianceSetup).
+    #[test]
+    fn color_variance_spreads_each_channel_upward() {
+        let mut d = def(10.0, 1.0, 1);
+        d.init_color = [0.5, 0.5, 0.5, 1.0];
+        d.color_variance = Some([0.5, 0.25, 0.125, 0.0]);
+        let mut g = live(d, 30.0);
+        advance(&mut g, 3.0);
+        assert_eq!(g.particles.len(), 3);
+        for p in &g.particles {
+            let c = p.rgb;
+            assert!(
+                (0.5..1.0).contains(&c.x),
+                "the red channel stays in [base, base + bound): {c:?}"
+            );
+            assert!(
+                (0.5..0.75).contains(&c.y),
+                "the green channel stays in [base, base + bound): {c:?}"
+            );
+            assert!(
+                (0.5..0.625).contains(&c.z),
+                "the blue channel stays in [base, base + bound): {c:?}"
+            );
+        }
+    }
+
+    // With no spawn offset there is no direction, so 0x41 contributes nothing even with
+    // 0x08 present (research/xim ParticleInitializers.kt RelativeVelocityVarianceSetup).
+    #[test]
+    fn relative_velocity_variance_without_a_spawn_offset_is_inert() {
+        let mut d = def(0.0, 1.0, 1);
+        d.relative_velocity = Some(0.5);
+        d.relative_velocity_variance = Some(0.2);
+        let mut g = live(d, 30.0);
+        advance(&mut g, 1.0);
+        assert_eq!(g.particles.len(), 1);
+        assert_eq!(g.particles[0].vel, Vec3::from_array([0.0, 0.01, 0.0]));
+    }
+
+    // 0x67 ReverseDisplacementSetup: the particle spawns at the trajectory's endpoint and
+    // traces the path backward (research/xim ParticleInitializers.kt ReverseDisplacementSetup
+    // — position += total velocity × maxAge, then velocity ×= −1).
+    #[test]
+    fn reverse_displacement_spawns_at_the_endpoint_and_reverses() {
+        let mut d = def(10.0, 1.0, 1);
+        d.init_velocity = [0.0, 0.1, 0.0];
+        d.reverse_displacement = Some(0.0);
+        let mut g = live(d, 30.0);
+        advance(&mut g, 1.0);
+        assert_eq!(g.particles.len(), 1);
+        let p = &g.particles[0];
+        assert_eq!(p.vel, Vec3::from_array([0.0, -0.1, 0.0]));
+        assert_eq!(p.pos, Vec3::from_array([0.0, 1.0, 0.0]));
+        advance(&mut g, 5.0);
+        assert_eq!(g.particles[0].pos, Vec3::from_array([0.0, 0.5, 0.0]));
+    }
+
+    // 0x3B IncrementalRotationApplier: element N's rotation gains the increment × (N + 1) on
+    // top of the 0x09 base, and its orientation step flips the rotation y (research/xim
+    // ParticleInitializers.kt IncrementalRotationApplier).
+    #[test]
+    fn incremental_rotation_scales_with_the_element_index_and_flips_y() {
+        let mut d = def(10.0, 1.0, 1);
+        d.init_rotation = [0.0, 0.05, 0.0];
+        d.incremental_rotation = Some([0.0, 0.1, 0.0]);
+        let mut g = live(d, 30.0);
+        advance(&mut g, 3.0);
+        assert_eq!(g.particles.len(), 3);
+        for (i, p) in g.particles.iter().enumerate() {
+            let y = 0.05 + 0.1 * (i + 1) as f32;
+            assert_eq!(p.rotation, Vec3::new(0.0, y, 0.0));
+            assert!(p.negate_rotation_y);
+            assert_eq!(
+                particle_rotation(p),
+                Quat::from_euler(EulerRot::XYZ, 0.0, -y, 0.0)
+            );
+        }
+    }
+
+    // 0x0A RotationVarianceInitializer: each particle's rotation draws a uniform
+    // [-v, v] offset per axis on top of the 0x09 base (research/xim
+    // ParticleInitializers.kt RotationVarianceInitializer).
+    #[test]
+    fn rotation_variance_spreads_each_axis_around_the_base() {
+        let mut d = def(10.0, 1.0, 1);
+        d.init_rotation = [0.1, 0.2, 0.3];
+        d.rotation_variance = Some([0.05, 0.1, 0.15]);
+        let mut g = live(d, 30.0);
+        advance(&mut g, 3.0);
+        assert_eq!(g.particles.len(), 3);
+        let bounds = [
+            (0.1f32 - 0.05f32, 0.1f32 + 0.05f32),
+            (0.2f32 - 0.1f32, 0.2f32 + 0.1f32),
+            (0.3f32 - 0.15f32, 0.3f32 + 0.15f32),
+        ];
+        for p in &g.particles {
+            let r = p.rotation;
+            assert!(
+                (bounds[0].0 - 1e-6..=bounds[0].1 + 1e-6).contains(&r.x)
+                    && (bounds[1].0 - 1e-6..=bounds[1].1 + 1e-6).contains(&r.y)
+                    && (bounds[2].0 - 1e-6..=bounds[2].1 + 1e-6).contains(&r.z),
+                "each axis inside base ± bound (one f32 rounding of slack): {r:?}"
+            );
+        }
+        assert!(
+            g.particles
+                .windows(2)
+                .any(|w| w[0].rotation != w[1].rotation),
+            "the variance is a per-particle draw, not a constant"
+        );
+    }
+
+    #[test]
+    fn rotation_without_variance_is_exactly_the_base() {
+        let mut d = def(0.0, 1.0, 1);
+        d.init_rotation = [0.1, 0.2, 0.3];
+        let mut g = live(d, 30.0);
+        advance(&mut g, 1.0);
+        assert_eq!(g.particles.len(), 1);
+        assert_eq!(g.particles[0].rotation, Vec3::from_array([0.1, 0.2, 0.3]));
+    }
+
     #[test]
     fn auto_run_keeps_emitting_past_window() {
         let mut g = live(def(2.0, 1.0, 1), 3.0);
@@ -3086,7 +4652,13 @@ mod tests {
             life_frames: 1.0,
             rgb: Vec3::from_slice(&g.def.init_color[..3]),
             scale: Vec2::ONE,
+            scale_seed: Vec2::ONE,
+            scale_vel: Vec2::ZERO,
             rotation: Vec3::ZERO,
+            spin: Vec3::ZERO,
+            negate_rotation_y: false,
+            rel_vel: Vec3::ZERO,
+            osc: None,
         });
         g
     }
@@ -3499,7 +5071,7 @@ mod tests {
         // `kasa`'s 0x4F alpha lane as shipped, dumped byte-for-byte from f_ro.
         const HALO_PHASE_ALPHA_BYTE: [u8; ffxi_dat::particle_gen::MOON_PHASES] =
             [0, 0, 0, 0, 0, 60, 128, 60, 0, 0, 0, 0];
-        // DAT 210 kasa: initializer alpha 128/255 and weekday/phase modulation gain 160/255.
+        /// DAT 210 kasa: initializer alpha 128/255 and weekday/phase modulation gain 160/255.
         const HALO_CHAIN_GAIN: f32 = (128.0 / 255.0) * (160.0 / 255.0);
         const ALPHA_EPS: f32 = 1e-6;
 
@@ -3540,8 +5112,9 @@ mod tests {
     }
 
     // The alpha lattice a decoded-then-remapped DXT3 texture can sit on: the 4-bit plane holds
-    // multiples of 0x11, and `apply_ffxi_alpha_remap` doubles with saturation. Any other value
-    // is a neighbourhood mean, i.e. proof the undither ran.
+    // multiples of the dither step, and `apply_ffxi_alpha_remap` doubles with saturation
+    // (ffxi-dat/src/texture.rs DXT3_ALPHA_DITHER_STEP, ffxi_alpha_remap). Any other value is a
+    // neighbourhood mean, i.e. proof the undither ran.
     fn off_nibble_lattice(alpha: &[u8]) -> usize {
         use ffxi_dat::texture::{ffxi_alpha_remap, DXT3_ALPHA_DITHER_STEP};
 
@@ -3562,19 +5135,19 @@ mod tests {
             .collect()
     }
 
-    // The premise kuluu-d9wv rests on, read off the shipped f_ro DAT rather than assumed: the
-    // lunar halo sheet `kasa` is a DXT3 whose alpha is entirely the nibble 7/8 dithered-opaque
-    // pair (`dat-sky-alpha-histogram` on zone files 210/331), so the plain particle converter
-    // hands the GPU a 238/255 per-texel stipple and only the celestial converter averages it
-    // back to the authored half-step. Skips without a retail install.
+    // Read off the shipped f_ro DAT: the lunar halo sheet `kasa` is a DXT3 whose alpha is
+    // entirely the nibble 7/8 dithered-opaque pair (ffxi-dat/examples/dat-sky-alpha-histogram.rs
+    // on zone files 210/331), so the plain particle converter hands the GPU a 238/255
+    // per-texel stipple and only the celestial converter averages it back to the authored
+    // half-step. Skips without a retail install.
     #[test]
     fn zone_210_halo_sheet_is_dithered_and_only_the_celestial_converter_resolves_it() {
         const F_RO: u32 = 210;
         const HALO_TEX: [u8; 4] = *b"kasa";
         const DITHER_LO: u8 = 0x77;
         const DITHER_HI: u8 = 0x88;
-        // 0x80's recovered mean is 127.5, which no 8-bit alpha holds; the remap doubles that to
-        // a 254/255 split.
+        // 0x80's recovered mean is 127.5, which no 8-bit alpha holds; the remap doubles that
+        // to a 254/255 split (ffxi-dat/src/texture.rs apply_ffxi_alpha_remap).
         const RESOLVED_RESIDUAL_MAX: u8 = 1;
 
         let Some(bytes) = zone_bytes(F_RO) else {
@@ -3761,7 +5334,13 @@ mod tests {
             life_frames: 4.0,
             rgb: Vec3::ONE,
             scale: Vec2::splat(0.1),
+            scale_seed: Vec2::splat(0.1),
+            scale_vel: Vec2::ZERO,
             rotation: Vec3::ZERO,
+            spin: Vec3::ZERO,
+            negate_rotation_y: false,
+            rel_vel: Vec3::ZERO,
+            osc: None,
         };
         cont.particles = vec![particle(3.0)];
         spray.particles = vec![particle(3.0)];
@@ -3902,8 +5481,9 @@ mod tests {
 
         // ROM/0/28.DAT (file 100) carries 25 Imgs and every one of them is type byte 0x81; its
         // `smok` 0x21 sheet names `effect  smoke01 `, which only that 0x81 Img (offset 3389984)
-        // supplies. While extract_texture_tokens rejected 0x81 the sheet resolved no texture at
-        // all -- 105 of the install's 113 name-unresolvable sheets are this case.
+        // supplies. The 0x81 header is the compressed-format flag extract_texture_tokens reads
+        // (ffxi-dat/src/texture.rs FLG_FMT0_COMPRESSED); 105 of the install's 113
+        // name-unresolvable sheets are this case.
         #[test]
         fn real_dat_sprite_sheet_resolves_a_format0_texture() {
             const SMOKE_FILE_ID: u32 = 100;
@@ -3955,7 +5535,8 @@ mod tests {
         }
 
         // ROM/338/100.DAT declares the D3M `grw1` in both `geo0` and `run0`; `geo0/gl02` links
-        // it, and the two copies are a different width with a different texture.
+        // it, and the two copies are a different width with a different texture. The scoped
+        // lookup is scheduler_runtime.rs particle_def_scoped.
         #[test]
         fn real_dat_static_mesh_resolves_in_the_generators_own_directory() {
             const GEO_EFFECT_FILE_ID: u32 = 13259;
@@ -4005,7 +5586,8 @@ mod tests {
 
         // ROM/1/33.DAT declares the 0x21 sprite sheet `ligh` in `ligh`, `tour` and `fire`;
         // `ligh/lt05` links it, and the `fire` copy the flat map keeps is a different quad
-        // backed by a different texture.
+        // backed by a different texture. The scoped lookup is scheduler_runtime.rs
+        // particle_def_scoped.
         #[test]
         fn real_dat_sprite_sheet_resolves_in_the_generators_own_directory() {
             const LIGHT_EFFECT_FILE_ID: u32 = 333;
@@ -4295,7 +5877,7 @@ mod tests {
     }
 
     // ROM/27/82.DAT `hm_s`, the HumeM skeleton whose reaction routines the melee chain walks
-    // (kuluu-render::scheduler_runtime tests).
+    // (scheduler_runtime.rs tests).
     const HUME_M_SKELETON_FILE: u32 = 7072;
 
     fn retail_hume_m_skeleton() -> Option<ffxi_dat::skel::Skeleton> {
@@ -4308,8 +5890,9 @@ mod tests {
             .next()
     }
 
-    // The bead's retail dump of ROM/0/0.DAT (kuluu-w7xd, 2026-07-31): the melee hit sparks the
-    // `chit` chain reaches, each attaching to the victim at a nearest-joint selector.
+    // ROM/0/0.DAT as shipped (scheduler_runtime.rs parse_action_bytes,
+    // GLOBAL_EFFECT_DIR_FILE_ID): the melee hit sparks the `chit` chain reaches, each attaching
+    // to the victim at a nearest-joint selector.
     const HIT_SPARK_DIR: [u8; 4] = *b"hit1";
     const HIT_SPARK_JOINT_REFERENCE: u8 = 49;
     const HIT_SPARK_GENERATORS: [([u8; 4], ffxi_dat::particle_gen::AttachType); 4] = [
@@ -4332,7 +5915,7 @@ mod tests {
     }
 
     // Directory-scoped, because ROM/0/0.DAT defines `g010` several times over and only the `hit1`
-    // copy is the spark (kuluu-render::scheduler_runtime tests).
+    // copy is the spark (scheduler_runtime.rs tests).
     fn retail_hit_spark_defs() -> Option<Vec<([u8; 4], ParticleGeneratorDef)>> {
         let assets = retail_global_effect_assets()?;
         Some(
@@ -4348,9 +5931,10 @@ mod tests {
         )
     }
 
-    // The bead's premise, pinned against the install: every `hit1` spark generator attaches to the
-    // TARGET actor and names a nearest-joint selector there, so the spawn origin cannot be the
-    // victim's root transform alone.
+    // Pinned against the install: every `hit1` spark generator attaches to the TARGET actor and
+    // names a nearest-joint selector there (ffxi-dat/src/particle_gen.rs
+    // ParticleGeneratorDef attach fields), so the spawn origin cannot be the victim's root
+    // transform alone.
     #[test]
     fn real_dat_hit_sparks_name_a_target_joint_reference() {
         let Some(defs) = retail_hit_spark_defs() else {
@@ -4369,9 +5953,9 @@ mod tests {
         }
     }
 
-    // The coordinate-space half of the fix: the joint the def names is resolved in the actor's
-    // pose frame (FFXI axes, -Y up) and must arrive in Bevy world space, i.e. ABOVE the victim's
-    // feet and on the side the attacker stands on -- the whole point of kuluu-w7xd.
+    // The joint the def names is resolved in the actor's pose frame (FFXI axes, -Y up) and must
+    // arrive in Bevy world space (ffxi-actor/src/skeleton_instance.rs pose_world), i.e. ABOVE
+    // the victim's feet and on the side the attacker stands on.
     #[test]
     fn real_dat_hit_spark_offset_lands_on_the_struck_side_in_bevy_space() {
         let (Some(skeleton), Some(defs)) = (retail_hume_m_skeleton(), retail_hit_spark_defs())
@@ -4386,11 +5970,10 @@ mod tests {
         );
         const VICTIM_WORLD: Vec3 = Vec3::new(30.0, 2.0, -14.0);
         const ATTACKER_REACH: f32 = 3.0;
-        // Read off the same install the pose came from rather than transcribed here -- the ring
-        // geometry itself is pinned by ffxi-actor's
-        // `real_dat_retail_skeleton_resolves_the_nearest_joint_selector_onto_its_ring`. Pose space
-        // is -Y up, so the Bevy-space height is its negation; anything at or below 0 is the feet
-        // bug this bead is about.
+        // Read off the same install the pose came from; the ring geometry itself is pinned by
+        // ffxi-actor's `real_dat_retail_skeleton_resolves_the_nearest_joint_selector_onto_its_ring`
+        // (ffxi-actor/src/skeleton_instance.rs). Pose space is -Y up, so the Bevy-space height is
+        // its negation; anything at or below 0 is the feet bug.
         let ring_height_above_root = -ffxi_actor::skeleton_instance::standard_joint_world_position(
             &pose,
             &skeleton,
@@ -4451,8 +6034,9 @@ mod tests {
             .spawn(Transform::from_translation(world))
             .id();
         app.world_mut().spawn((
-            // ffxi_actor_render::spawn_live_actor's actor root, verbatim: the FFXI->Bevy basis in
-            // the LOCAL transform and a default (identity) GlobalTransform until PostUpdate runs.
+            // ffxi_actor_render.rs spawn_live_actor's actor root, verbatim: the FFXI->Bevy basis
+            // in the LOCAL transform and a default (identity) GlobalTransform until PostUpdate
+            // runs.
             Transform::from_rotation(crate::ffxi_actor_render::ffxi_to_bevy_basis()),
             GlobalTransform::default(),
             crate::ffxi_actor_render::render_actor_for_test(skeleton.clone(), pose.to_vec()),
@@ -4483,6 +6067,8 @@ mod tests {
                 actor_fade: None,
                 idle_transition_time: None,
                 flinch_duration: None,
+                model_visibility: None,
+                spell_effect: None,
             },
         }
     }
@@ -4517,8 +6103,11 @@ mod tests {
         app.world_mut()
             .write_message(crate::scheduler_runtime::SchedulerStageEvent {
                 actor: attacker,
+                target: Some(victim),
                 stage: particle_stage(gen_id),
                 scheduler: HIT_SPARK_DIR,
+                cutscene_motion: false,
+                scheduler_instance: None,
             });
         app.update();
         app.world()
@@ -4528,11 +6117,12 @@ mod tests {
             .map(|g| g.origin)
     }
 
-    // The whole wiring, driven through the real system rather than through `attach_joint_offset`
-    // alone: the actor root carrying the pose is a CHILD of the wire entity the stage fires on and
-    // PostUpdate has propagated nothing on the frame it is inserted, so the child descent, the
-    // local-transform composition, the source/target side of the selector and the `+ joint_offset`
-    // at the spawn site all have to hold for the spark to leave the victim's feet.
+    /// The whole wiring, driven through the real system rather than through
+    /// `attach_joint_offset` alone: the actor root carrying the pose is a CHILD of the wire
+    /// entity the stage fires on and PostUpdate has propagated nothing on the frame it is
+    /// inserted, so the child descent, the local-transform composition, the source/target side
+    /// of the selector and the `+ joint_offset` at the spawn site all have to hold for the
+    /// spark to leave the victim's feet.
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn real_dat_hit_spark_spawns_on_the_victims_ring_not_its_root() {
@@ -4597,9 +6187,9 @@ mod tests {
         }
     }
 
-    // With no second actor the selector has nothing to measure against, and with no posed skeleton
-    // (a door, or a model still loading) there is no joint at all: both must fall back to the plain
-    // root origin rather than throwing the effect somewhere arbitrary.
+    /// With no second actor the selector has nothing to measure against, and with no posed
+    /// skeleton (a door, or a model still loading) there is no joint at all: both must fall
+    /// back to the plain root origin rather than throwing the effect somewhere arbitrary.
     #[test]
     fn attach_joint_offset_falls_back_to_the_root() {
         let Some(skeleton) = retail_hume_m_skeleton() else {
@@ -4628,6 +6218,273 @@ mod tests {
                 None,
             ),
             Vec3::ZERO
+        );
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn real_dat_level_up_linked_sparkle_emits_a_rotated_cross_and_bounds_cycles() {
+        use crate::scheduler_runtime::{parse_action_bytes, LEVEL_UP_EFFECT_DAT_ID};
+        const SOURCE: [u8; 4] = *b"g001";
+        const LINK: [u8; 4] = *b"g002";
+        const ACTOR_POSITION: Vec3 = Vec3::new(11.0, 4.0, -7.0);
+        let Some(root) = ffxi_dat::archive::open_test_install() else {
+            return;
+        };
+        let bytes = std::fs::read(
+            root.resolve(LEVEL_UP_EFFECT_DAT_ID)
+                .unwrap()
+                .path_under(&root),
+        )
+        .unwrap();
+        let (schedulers, mut assets, _) = parse_action_bytes(&bytes);
+        let stage = schedulers
+            .iter()
+            .flat_map(|s| &s.stages)
+            .find(|s| s.stage.kind == StageKind::Particle && s.stage.id == SOURCE)
+            .copied()
+            .unwrap();
+        let source = *assets.particle_def(stage.stage.local_dir, &SOURCE).unwrap();
+        assert_eq!(source.immediate_generator, Some(LINK));
+        assert_eq!(source.child_generator, None);
+        let (dir, _) = assets
+            .particle_def_scoped(stage.stage.local_dir, &LINK)
+            .unwrap();
+        assets
+            .particle_defs_by_dir
+            .get_mut(&(dir, LINK))
+            .unwrap()
+            .immediate_generator = Some(SOURCE);
+        let mut app = App::new();
+        app.add_plugins(bevy::asset::AssetPlugin::default())
+            .init_asset::<Mesh>()
+            .init_asset::<Image>()
+            .init_asset::<FfxiParticleMaterial>()
+            .init_resource::<ParticleSimulator>()
+            .add_message::<SchedulerStageEvent>()
+            .add_systems(Update, spawn_particle_generators);
+        let skeleton = retail_hume_m_skeleton().expect("installed HumeM skeleton is readable");
+        let pose = ffxi_actor::skeleton_instance::pose_world(
+            &skeleton,
+            |_| None,
+            ffxi_actor::skeleton_instance::RootTransform::identity(),
+            &[],
+        );
+        let turn = Quat::from_rotation_y(std::f32::consts::FRAC_PI_2);
+        let joint = attach_joint_reference(&source)
+            .and_then(|reference| {
+                ffxi_actor::skeleton_instance::attach_joint_position(
+                    &pose,
+                    &skeleton,
+                    reference,
+                    Some(Vec3::ZERO),
+                )
+            })
+            .unwrap_or(Vec3::ZERO);
+        let expected_origin = ACTOR_POSITION
+            + turn * crate::ffxi_actor_render::ffxi_to_bevy_basis() * joint
+            + Vec3::Y * source.base_position[1];
+        let actor = spawn_posed_actor(&mut app, &skeleton, &pose, ACTOR_POSITION);
+        app.world_mut().entity_mut(actor).insert((
+            Transform::from_translation(ACTOR_POSITION).with_rotation(turn),
+            assets,
+            crate::scheduler_runtime::ActionTarget(Some(actor)),
+        ));
+        app.world_mut().write_message(SchedulerStageEvent {
+            actor,
+            target: Some(actor),
+            stage,
+            scheduler: *b"main",
+            cutscene_motion: false,
+            scheduler_instance: None,
+        });
+        app.update();
+        let mut sim = app.world_mut().resource_mut::<ParticleSimulator>();
+        assert_eq!(
+            sim.generators.len(),
+            2,
+            "cyclic links must not allocate forever"
+        );
+        let first_delta = sim.generators[0].def.frames_per_emission;
+        advance_simulator(&mut sim, first_delta);
+        let parent = &sim.generators[0];
+        let child = &sim.generators[1];
+        assert!(!parent.particles.is_empty());
+        assert_eq!(child.particles.len(), parent.particles.len());
+        assert_eq!(child.particles[0].pos, parent.particles[0].pos);
+        assert_eq!(child.origin, parent.origin);
+        assert!(parent.origin.distance(expected_origin) < AXIS_TOLERANCE);
+        assert!(
+            particle_draw(child, &child.particles[0], &sim.clock)
+                .world
+                .distance(expected_origin + parent.particles[0].pos)
+                < AXIS_TOLERANCE,
+            "the actor transform must not apply twice"
+        );
+        sim.generators[0].stopped = true;
+        advance_simulator(&mut sim, ROUTINE_FPS / 4.0);
+        let child = &sim.generators[1];
+        let mut mesh = empty_mesh();
+        rebuild_mesh(
+            child,
+            view(Quat::IDENTITY),
+            &CelestialClock::default(),
+            &mut mesh,
+        );
+        let positions = mesh
+            .attribute(Mesh::ATTRIBUTE_POSITION)
+            .unwrap()
+            .as_float3()
+            .unwrap();
+        let template = &child.template.positions;
+        let (a, b) = (0..template.len())
+            .flat_map(|a| (a + 1..template.len()).map(move |b| (a, b)))
+            .find(|&(a, b)| template[a].x == template[b].x && template[a].y != template[b].y)
+            .unwrap();
+        let edge = Vec3::from_array(positions[a]) - Vec3::from_array(positions[b]);
+        const AXIS_TOLERANCE: f32 = 0.001;
+        assert!(edge.x.abs() > 0.0);
+        assert!(
+            edge.y.abs() < edge.x.abs() * AXIS_TOLERANCE,
+            "the authored vertical edge rotates onto the horizontal camera axis: {edge:?}"
+        );
+        let entities = sim.drain_entities();
+        assert_eq!(
+            entities.len(),
+            2,
+            "session cleanup drains parent and linked mesh ownership"
+        );
+        assert!(sim.generators.is_empty());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn real_dat_level_up_zero_window_emits_and_rises_in_bevy_space() {
+        use crate::scheduler_runtime::{parse_action_bytes, LEVEL_UP_EFFECT_DAT_ID};
+        const LETTERING_MESH: [u8; 4] = *b"lvu1";
+        const FIRST_TICK_FRAMES: f32 = ROUTINE_FPS;
+        let Some(root) = ffxi_dat::archive::open_test_install() else {
+            eprintln!("SKIP: level-up DAT test needs a registered install");
+            return;
+        };
+        let bytes = std::fs::read(
+            root.resolve(LEVEL_UP_EFFECT_DAT_ID)
+                .unwrap()
+                .path_under(&root),
+        )
+        .unwrap();
+        let g000_raw = ffxi_dat::chunk::walk(&bytes)
+            .flatten()
+            .find(|c| c.name == *b"g000")
+            .expect("level-up DAT contains the lettering generator");
+        const TEST_PINNED_POSITION_HEADER: u32 = 0x8102;
+        const TEST_PINNED_DAMPING_HEADER: u32 = 0x832c;
+        let header_offset = |header: u32| {
+            g000_raw
+                .data
+                .windows(size_of::<u32>())
+                .position(|bytes| bytes == header.to_le_bytes())
+                .expect("level-up DAT carries the updater header")
+        };
+        assert!(
+            header_offset(TEST_PINNED_POSITION_HEADER) < header_offset(TEST_PINNED_DAMPING_HEADER)
+        );
+        let (schedulers, assets, _) = parse_action_bytes(&bytes);
+        let stage = schedulers
+            .iter()
+            .flat_map(|s| &s.stages)
+            .find(|s| {
+                s.stage.kind == StageKind::Particle
+                    && assets
+                        .particle_def(s.stage.local_dir, &s.stage.id)
+                        .is_some_and(|d| d.mesh_id == LETTERING_MESH)
+            })
+            .copied()
+            .expect("level-up DAT schedules its lettering generator");
+        assert_eq!(stage.stage.duration_frames, 0);
+        let mut app = App::new();
+        app.add_plugins(bevy::asset::AssetPlugin::default())
+            .init_asset::<Mesh>()
+            .init_asset::<Image>()
+            .init_asset::<FfxiParticleMaterial>()
+            .init_resource::<ParticleSimulator>()
+            .add_message::<SchedulerStageEvent>()
+            .add_systems(Update, spawn_particle_generators);
+        let skeleton = retail_hume_m_skeleton().expect("installed HumeM skeleton is readable");
+        let pose = ffxi_actor::skeleton_instance::pose_world(
+            &skeleton,
+            |_| None,
+            ffxi_actor::skeleton_instance::RootTransform::identity(),
+            &[],
+        );
+        const ACTOR_WORLD: Vec3 = Vec3::new(7.0, 2.0, -3.0);
+        let def = assets
+            .particle_def(stage.stage.local_dir, &stage.stage.id)
+            .unwrap();
+        let joint = ffxi_actor::skeleton_instance::standard_joint_world_position(
+            &pose,
+            &skeleton,
+            def.attach_joint_source as usize,
+        )
+        .expect("the authored lettering source joint exists");
+        let expected_origin = ACTOR_WORLD
+            + crate::ffxi_actor_render::ffxi_to_bevy_basis() * joint
+            + Vec3::Y * def.base_position[1];
+        let actor = spawn_posed_actor(&mut app, &skeleton, &pose, ACTOR_WORLD);
+        app.world_mut().entity_mut(actor).insert(assets);
+        app.world_mut().write_message(SchedulerStageEvent {
+            actor,
+            target: None,
+            stage,
+            scheduler: *b"main",
+            cutscene_motion: false,
+            scheduler_instance: None,
+        });
+        app.update();
+        let mut sim = app.world_mut().resource_mut::<ParticleSimulator>();
+        let g = sim
+            .generators
+            .iter_mut()
+            .find(|g| g.def.mesh_id == LETTERING_MESH)
+            .unwrap();
+        assert!(
+            g.origin
+                .abs_diff_eq(expected_origin, f32::EPSILON * ROUTINE_FPS),
+            "lettering origin {:?} must follow the posed authored joint {:?}",
+            g.origin,
+            expected_origin
+        );
+        assert!(g.def.frames_per_emission > FIRST_TICK_FRAMES);
+        assert!(g.def.init_velocity[1] < 0.0);
+        advance_generator(g, FIRST_TICK_FRAMES);
+        assert_eq!(g.particles.len(), 1);
+        let initial_velocity = g.particles[0].vel;
+        let authored_damping = g
+            .def
+            .velocity_dampener
+            .expect("level-up lettering has authored damping")[0];
+        advance_generator(g, FIRST_TICK_FRAMES);
+        assert_eq!(
+            g.particles[0].vel,
+            initial_velocity * authored_damping.powf(FIRST_TICK_FRAMES)
+        );
+        assert_eq!(g.particles.len(), 1);
+        assert!(
+            g.particles[0].pos.y > 0.0,
+            "authored upward DAT motion rises in Bevy"
+        );
+        assert_eq!(
+            g.vel_basis,
+            crate::scene::mzb_to_bevy(kuluu_snapshot::Vec3 {
+                x: Vec3::ONE.x,
+                y: Vec3::ONE.y,
+                z: Vec3::ONE.z
+            })
+        );
+        let life_frames = g.def.max_life_frames;
+        advance_generator(g, life_frames);
+        assert!(
+            g.particles.is_empty(),
+            "zero-window burst expires without respawning"
         );
     }
 }

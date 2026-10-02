@@ -62,12 +62,13 @@ pub fn decoded_sky_texture_to_image(t: &ffxi_dat::texture::DecodedTexture) -> Im
     convert(t, true)
 }
 
+/// Convert one decoded D3M texture; when `undither` is set the DXT3 alpha dither is
+/// resolved before the remap, which doubles whatever alpha it is handed — see the note
+/// on `resolve_dxt3_alpha_dither`.
 fn convert(t: &ffxi_dat::texture::DecodedTexture, undither: bool) -> Image {
     use bevy::image::{ImageAddressMode, ImageFilterMode, ImageSampler, ImageSamplerDescriptor};
     use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
     let mut rgba = t.rgba.clone();
-    // Before the remap, which doubles whatever it is handed — see the note on
-    // `resolve_dxt3_alpha_dither`.
     if undither {
         ffxi_dat::texture::resolve_dxt3_alpha_dither(&mut rgba, t.width, t.height);
     }
@@ -160,10 +161,11 @@ mod tests {
         );
     }
 
-    // A DXT3 alpha plane holds nibble multiples only, so an authored half-opaque 0x80 ships as
-    // the nibble 7/8 pair stippled across neighbours - what `weat/<type>/kasa` is, end to end.
-    // The celestial converter averages that back out; the shared particle converter every other
-    // D3M sheet still goes through must keep leaving it alone (kuluu-d9wv).
+    /// A DXT3 alpha plane holds nibble multiples only, so an authored half-opaque 0x80 ships
+    /// as the nibble 7/8 pair stippled across neighbours - what `weat/<type>/kasa` is, end to
+    /// end. The sky converter averages that back out; the shared particle converter the other
+    /// D3M sheets go through leaves the stipple in place.
+    /// texture.rs
     #[test]
     fn only_the_sky_converter_resolves_the_dxt3_alpha_stipple() {
         use ffxi_dat::texture::{ffxi_alpha_remap, DecodedTexture, TexFormat};
@@ -171,8 +173,9 @@ mod tests {
         const DITHER_LO: u8 = 0x77;
         const DITHER_HI: u8 = 0x88;
         const SIDE: u32 = 8;
-        // 0x80's recovered mean is 127.5, which no 8-bit alpha holds; the remap doubles that
-        // to a 254/255 split. One step is the floor, not a slack tolerance.
+        /// 0x80's recovered mean is 127.5, which no 8-bit alpha holds; the remap doubles that
+        /// to a 254/255 split. One step is the floor, not a slack tolerance.
+        /// texture.rs
         const RESOLVED_RESIDUAL_MAX: u8 = 1;
 
         let mut rgba = Vec::with_capacity((SIDE * SIDE * 4) as usize);

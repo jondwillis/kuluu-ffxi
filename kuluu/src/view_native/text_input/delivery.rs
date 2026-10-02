@@ -2,7 +2,9 @@ use super::*;
 
 /// Drive `InputMode` in lock-step with the server-owned delivery box: enter
 /// `DeliveryBox` once the box is open (and no dialog is mid-transition), leave
-/// on PostClose ack. Resets the transient screen state on each edge.
+/// on PostClose ack. Resets the transient screen state on each edge. A
+/// Receive/Send switch keeps the mode, so the focus reset keys off the box as
+/// well: the panels do not draw the same regions.
 pub fn delivery_mode_sync_system(
     state: Res<SceneState>,
     mut mode: ResMut<InputMode>,
@@ -25,8 +27,6 @@ pub fn delivery_mode_sync_system(
         }
         _ => {}
     }
-    // A Receive/Send switch keeps the mode, so the focus reset has to key off
-    // the box as well: the panels do not draw the same regions.
     if let (InputMode::DeliveryBox, Some(box_no)) = (&*mode, box_no) {
         if screen.box_no != Some(box_no) {
             screen.open(box_no);
@@ -49,6 +49,9 @@ const RECIPIENT_NAME_MAX: usize = 15;
 /// `DeliveryScreenState` + deliverable inventory, drives focus/spinner/recipient
 /// entry, and emits delivery `AgentCommand`s. Mode transitions are owned by
 /// `delivery_mode_sync_system`, so this never changes `InputMode` directly.
+/// Moving the cursor disarms a pending dispatch confirmation so it can't be
+/// answered by accident later. Dispatch is irreversible, so it takes a second
+/// press: the first arms the confirmation, the second sends.
 pub(super) fn handle_delivery_key(
     key: &Key,
     bindings: &Bindings,
@@ -166,8 +169,6 @@ pub(super) fn handle_delivery_key(
         return;
     }
 
-    // 3. Navigation + confirm/cancel. Moving the cursor disarms a pending
-    // dispatch confirmation so it can never be answered by accident later.
     if bindings.matches_logical(Action::NavUp, key) {
         screen.confirm_send = false;
         delivery::focus_up(screen, &ctx);
@@ -282,8 +283,6 @@ pub(super) fn handle_delivery_key(
                 }
             }
         }
-        // Dispatch is irreversible, so it takes a second press: the first arms
-        // the confirmation, the second sends.
         DeliveryFocus::SendOk => {
             let staged: Vec<u8> = d
                 .slots

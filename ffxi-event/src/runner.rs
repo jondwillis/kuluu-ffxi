@@ -157,23 +157,23 @@ impl DialogRunner {
         self.vm.hold_action(actor, key, units);
     }
 
-    /// Replace the entity Type table the 0x5B/0x66 gate reads; see
-    /// [`EventVm::set_actor_types`]. The session calls this with its current
-    /// map before every drive.
+    /// Replace the entity Type table the LOADEXTSCHEDULER/LOADEXTSCHEDULER2 gate
+    /// reads; see [`EventVm::set_actor_types`]. The session calls this with its
+    /// current map before every drive.
     pub fn set_actor_types(&mut self, types: &std::collections::HashMap<u32, u8>) {
         self.vm.set_actor_types(types);
     }
 
-    /// Arm the 0x2C SCHEDULOR hold the WAIT* family parks on until the
-    /// renderer reports the routine finished; see
-    /// [`EventVm::hold_action_pending`]. The session calls this when it
-    /// publishes a 0x2C motion cue, whose routine this host never reads.
+    /// Arm the SCHEDULOR hold the WAIT* family parks on until the renderer
+    /// reports the routine finished; see [`EventVm::hold_action_pending`]. The
+    /// session calls this when it publishes a SCHEDULOR motion cue, whose
+    /// routine this host does not read.
     pub fn hold_action_pending(&mut self, actor: ActorLookup, key: FourCc) {
         self.vm.hold_action_pending(actor, key);
     }
 
-    /// Release the 0x2C SCHEDULOR hold the renderer's finish report names;
-    /// see [`EventVm::release_action_hold`].
+    /// Release the SCHEDULOR hold the renderer's finish report names; see
+    /// [`EventVm::release_action_hold`].
     pub fn release_action_hold(&mut self, actor: ActorLookup, key: FourCc) {
         self.vm.release_action_hold(actor, key);
     }
@@ -222,7 +222,7 @@ impl DialogRunner {
     }
 
     /// Whether ESC may cancel this event right now (retail's `CliEventCancelFlag`;
-    /// armed at start, flipped by the 0x2E/0x42 opcodes).
+    /// armed at start, flipped by the CANCEL_ARM/CANCEL_DISARM opcodes).
     pub fn cancel_armed(&self) -> bool {
         self.vm.cancel_armed()
     }
@@ -569,11 +569,10 @@ mod tests {
     /// magic = 0x1000_0000 + data_len, offsets XOR 0x8080_8080).
     fn empty_strings() -> StringDat {
         const DMSG_MAGIC_BASE: u32 = 0x1000_0000;
-        const DMSG_OFFSET_XOR: u32 = 0x8080_8080;
         let data_len = 4u32;
         let mut buf = Vec::new();
         buf.extend_from_slice(&(DMSG_MAGIC_BASE + data_len).to_le_bytes());
-        buf.extend_from_slice(&(4u32 ^ DMSG_OFFSET_XOR).to_le_bytes());
+        buf.extend_from_slice(&(4u32 ^ ffxi_dat::dmsg::OFFSET_XOR).to_le_bytes());
         StringDat::parse(&buf).expect("synthetic DialogTable")
     }
 

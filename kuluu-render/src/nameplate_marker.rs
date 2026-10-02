@@ -42,14 +42,15 @@ pub mod glyph {
     pub const AUTO_PARTY: u8 = 0x9D;
     /// Ballista/besieged nation markers, selected by `Flags3.BallistaTeam`
     /// (ALLEGIANCE_TYPE) when the allegiance is a nation value. Retail
-    /// `GetPrimaryActorNameMarker`'s ballista block.
+    /// `GetPrimaryActorNameMarker`'s ballista block
+    /// (research/XIClient/src/XIClient/source/World/Actor/ActorTelemetry.cpp).
     pub const NATION_SAN_DORIA: u8 = 0x9E; // ALLEGIANCE SAN_DORIA (2)
     pub const NATION_BASTOK: u8 = 0x9F; // BASTOK (3)
     pub const NATION_WINDURST: u8 = 0xA0; // WINDURST (4)
     pub const NATION_BEAUFORT: u8 = 0xA3; // WYVERNS/Beaufort (5)
     pub const NATION_RABANASTRE: u8 = 0xA4; // GRIFFONS/Rabanastre (6)
     /// Besieged markers, returned immediately for the ballista team codes
-    /// 0x20..=0x27 (even/odd).
+    /// 0x20 through 0x27 (even/odd; ActorTelemetry.cpp).
     pub const BESIEGED_EVEN: u8 = 0xA6;
     pub const BESIEGED_ODD: u8 = 0xA7;
     /// Monstrosity marker — `MonstrosityFlags != 0` in the Model block.
@@ -159,13 +160,13 @@ fn primary_marker(flags: &CharFlags, monstrosity: bool) -> Option<u8> {
     if flags.linkdead {
         return Some(glyph::LINKDEAD);
     }
-    // `AUDIT_210 != 0` — the Model block's MonstrosityFlags. Above away/GM.
     if monstrosity {
         return Some(glyph::MONSTROSITY);
     }
 
-    // The ballista/besieged block (`status = AUDIT_1FF` = Flags3.BallistaTeam).
-    // The besieged team codes 0x20..=0x27 return immediately, above away/GM/etc.
+    // The ballista/besieged block (Flags3.BallistaTeam, AUDIT_1FF): the
+    // besieged team codes 0x20 through 0x27 return immediately, above
+    // away/GM/etc (ActorTelemetry.cpp).
     let status = flags.allegiance;
     if (0x20u8..=0x27).contains(&status) {
         return Some(if status & 1 == 0 {
@@ -195,7 +196,6 @@ fn primary_marker(flags: &CharFlags, monstrosity: bool) -> Option<u8> {
     if flags.lfg {
         return Some(glyph::SEEKING);
     }
-    // New Adventurer "?" — retail checks it above bazaar (AUDIT_130.BIT_21).
     if flags.new_character {
         return Some(glyph::NEW_PLAYER);
     }
@@ -203,7 +203,6 @@ fn primary_marker(flags: &CharFlags, monstrosity: bool) -> Option<u8> {
         return Some(glyph::BAZAAR);
     }
 
-    // Nothing higher matched: the pending ballista nation marker, else the pearl.
     ballista_nation_marker(status).or(seed)
 }
 
@@ -234,7 +233,6 @@ fn secondary_marker(flags: &CharFlags) -> Option<u8> {
     if !in_range {
         return None;
     }
-    // Same dual source as the primary slot — see `primary_marker`.
     if flags.lfg_master || flags.job_master_display {
         return Some(glyph::JOB_MASTER);
     }
@@ -367,17 +365,22 @@ mod tests {
         e.char_flags.new_character = true;
         assert_eq!(nameplate_markers(&e), vec![glyph::NEW_PLAYER]);
 
-        // Retail checks the "?" above bazaar and the pearl/nation fallback.
         e.char_flags.bazaar = true;
         e.char_flags.linkshell = true;
         e.char_flags.allegiance = 2;
-        assert_eq!(nameplate_markers(&e), vec![glyph::NEW_PLAYER]);
+        assert_eq!(
+            nameplate_markers(&e),
+            vec![glyph::NEW_PLAYER],
+            "the ? beats bazaar, the pearl and the nation fallback"
+        );
 
-        // ...but below seeking-party, which retail checks first. (Allegiance back
-        // to 0 so the secondary slot stays shut and only the primary is asserted.)
         e.char_flags.allegiance = 0;
         e.char_flags.lfg = true;
-        assert_eq!(nameplate_markers(&e), vec![glyph::SEEKING]);
+        assert_eq!(
+            nameplate_markers(&e),
+            vec![glyph::SEEKING],
+            "seeking outranks the ?; allegiance back to 0 keeps the secondary slot shut"
+        );
     }
 
     #[test]
@@ -423,8 +426,6 @@ mod tests {
             vec![glyph::JOB_MASTER, glyph::JOB_MASTER_TAIL]
         );
 
-        // ...and it sits at retail's priority: below away/GM, above auto-party,
-        // seeking and bazaar.
         e.char_flags.away = true;
         assert_eq!(nameplate_markers(&e), vec![glyph::AWAY]);
         e.char_flags.away = false;
@@ -433,7 +434,8 @@ mod tests {
         e.char_flags.bazaar = true;
         assert_eq!(
             nameplate_markers(&e),
-            vec![glyph::JOB_MASTER, glyph::JOB_MASTER_TAIL]
+            vec![glyph::JOB_MASTER, glyph::JOB_MASTER_TAIL],
+            "retail priority: below away/GM, above auto-party, seeking and bazaar"
         );
     }
 
@@ -491,7 +493,6 @@ mod tests {
         e.char_flags.gm_level = 5;
         assert_eq!(nameplate_markers(&e), vec![glyph::MONSTROSITY]);
 
-        // LinkDead is above the Monstrosity marker in retail's order.
         e.char_flags.linkdead = true;
         assert_eq!(nameplate_markers(&e), vec![glyph::LINKDEAD]);
     }
@@ -506,8 +507,6 @@ mod tests {
 
     #[test]
     fn ballista_nation_allegiance_selects_the_nation_marker() {
-        // ALLEGIANCE_TYPE 2..=6 are the five nations; with no higher-priority state
-        // the pending nation marker is what shows (it beats the pearl fallback).
         let cases = [
             (2u8, glyph::NATION_SAN_DORIA),
             (3, glyph::NATION_BASTOK),
@@ -524,8 +523,6 @@ mod tests {
 
     #[test]
     fn a_nation_marker_is_pending_below_away() {
-        // Away is checked after the ballista block's immediate return but before the
-        // pending marker is returned, so it wins over a nation allegiance.
         let mut e = pc();
         e.char_flags.allegiance = 2;
         e.char_flags.away = true;
@@ -534,8 +531,6 @@ mod tests {
 
     #[test]
     fn besieged_team_codes_return_immediately_above_away_and_gm() {
-        // 0x20..=0x27 are the ballista team codes: even -> 0xA6, odd -> 0xA7,
-        // returned before away/GM/etc are consulted.
         let mut e = pc();
         e.char_flags.allegiance = 0x20;
         e.char_flags.away = true;
@@ -548,9 +543,6 @@ mod tests {
 
     #[test]
     fn every_marker_is_inside_the_shape_group_icon_range() {
-        // First-match-wins means one entity exercises one branch; sweep the new
-        // branches (monstrosity, ballista allegiance) plus a fully-flagged player
-        // and assert every emitted marker sits in retail's icon glyph span 0x8E..=0xB1.
         let mut e = pc();
         e.char_flags = CharFlags {
             play_online: true,

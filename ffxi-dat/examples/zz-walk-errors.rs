@@ -3,13 +3,14 @@
 //! where the error lands, what the error chunk's header says, and what the
 //! clean prefix still carries — because an earlier census found 2,282 walk-error
 //! files (4.3% of the install), and the open question was whether any of them hide
-//! 0x2D scene-key carriers (scheduler chunks) or attached camera routes
-//! (kind 0x06, AttachmentInfo nonzero).
+//! MAPSCHEDULOR scene-key carriers (scheduler chunks) or attached camera routes
+//! (the `ChunkKind::Camera` kind, AttachmentInfo nonzero).
 //!
 //! Census result (retail install; the exposure sections below are the close
-//! criteria): 52,926 files, 2,282 walk errors (4.3%), all five known 0x2D
-//! carriers and every zone model DAT walk clean, and no failing prefix carries
-//! a resolvable 0x2D key or a kind-0x06 route with nonzero AttachmentInfo —
+//! criteria): 52,926 files, 2,282 walk errors (4.3%), all five known
+//! MAPSCHEDULOR carriers and every zone model DAT walk clean, and no failing
+//! prefix carries a resolvable MAPSCHEDULOR key or a `ChunkKind::Camera` route
+//! with nonzero AttachmentInfo —
 //! the two failing files with a scheduler chunk in the prefix carry garbage
 //! names, not routine carriers. Nothing the client can reach is hidden in a
 //! walk error, so the census closes without code.
@@ -20,11 +21,10 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use ffxi_dat::chunk::CHUNK_KIND_MASK;
+use ffxi_dat::kind::ChunkKind;
 use ffxi_dat::scheduler::NON_MODEL_SCENE_CARRIERS;
 use ffxi_dat::{walk, DatError};
-
-const KIND_CAMERA: u8 = 0x06;
-const KIND_SCHEDULER: u8 = 0x07;
 
 #[derive(Default)]
 struct Prefix {
@@ -55,7 +55,7 @@ fn walk_to_error(bytes: &[u8]) -> Option<(usize, usize, usize, Prefix)> {
             Ok(chunk) => {
                 prefix.chunks += 1;
                 *prefix.kinds.entry(chunk.kind).or_default() += 1;
-                if chunk.kind == KIND_CAMERA {
+                if chunk.kind == ChunkKind::Camera as u8 {
                     if let Some(info) = chunk.data.get(0..4) {
                         let bytes: [u8; 4] = info.try_into().unwrap();
                         let attach = u32::from_le_bytes(bytes);
@@ -64,7 +64,7 @@ fn walk_to_error(bytes: &[u8]) -> Option<(usize, usize, usize, Prefix)> {
                         }
                     }
                 }
-                if chunk.kind == KIND_SCHEDULER {
+                if chunk.kind == ChunkKind::Scheduler as u8 {
                     prefix.scheduler_names.push(chunk.name_str());
                 }
             }
@@ -75,11 +75,7 @@ fn walk_to_error(bytes: &[u8]) -> Option<(usize, usize, usize, Prefix)> {
                         needed,
                         available,
                     } => (*offset, *needed, *available),
-                    other => {
-                        // The walk only yields TruncatedChunk; anything else is
-                        // a scanner bug, not a file property.
-                        panic!("unexpected walk error: {other}");
-                    }
+                    other => panic!("unexpected walk error: {other}"),
                 };
                 return Some((offset, needed, available, prefix));
             }
@@ -95,7 +91,7 @@ fn header_at(bytes: &[u8], offset: usize) -> (Option<u8>, Option<String>) {
         return (None, None);
     };
     let value = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
-    let kind = (value & 0x7F) as u8;
+    let kind = (value & CHUNK_KIND_MASK) as u8;
     let name = header
         .iter()
         .take(4)
@@ -267,7 +263,7 @@ fn main() {
     }
 
     push("");
-    push("== 0x2D carrier exposure: known carriers among the failing files ==");
+    push("== MAPSCHEDULOR carrier exposure: known carriers among the failing files ==");
     let fail_paths: std::collections::HashSet<String> =
         fails.iter().map(|f| f.rel.clone()).collect();
     let dat_root = ffxi_dat::DatRoot::open(root).expect("install root opens");
@@ -292,7 +288,7 @@ fn main() {
     }
 
     push("");
-    push("== 0x2D carrier exposure: zone model DATs among the failing files ==");
+    push("== MAPSCHEDULOR carrier exposure: zone model DATs among the failing files ==");
     let mut zone_model_fails: Vec<(u16, String)> = Vec::new();
     for &(zone, file_id) in ffxi_dat::zone_dat::ZONE_DAT_TABLE {
         if let Ok(loc) = dat_root.resolve(file_id) {
@@ -316,7 +312,7 @@ fn main() {
     }
 
     push("");
-    push("== 0x2D carrier exposure: failing files with scheduler chunks in the clean prefix ==");
+    push("== MAPSCHEDULOR carrier exposure: failing files with scheduler chunks in the clean prefix ==");
     let sched_fails: Vec<&FailRecord> = fails
         .iter()
         .filter(|f| !f.prefix.scheduler_names.is_empty())

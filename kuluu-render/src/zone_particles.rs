@@ -31,11 +31,11 @@ pub(crate) struct ZoneStaticDef {
     pub dat_offset: usize,
 }
 
-// The same emitter is sometimes authored twice (West Ronfaure's effe/fir1 campfire subtree
-// appears in file 200 twice, byte for byte), and a second additive flame on the same spot
-// doubles its brightness, so an exact repeat of (name, mesh, base position) collapses to one.
-// A repeated NAME alone is not a repeat: 4,562 corpus-wide sit at distinct positions
-// (Manaclipper's g000 under saki/, sira/ and shik/) and every one of them runs in retail.
+/// The same emitter is sometimes authored twice (West Ronfaure's effe/fir1 campfire subtree
+/// appears in file 200 twice, byte for byte), and a second additive flame on the same spot
+/// doubles its brightness, so an exact repeat of (name, mesh, base position) collapses to
+/// one. A repeated NAME alone is not a repeat: many sit at distinct positions
+/// (Manaclipper's g000 under saki/, sira/ and shik/) and every one of them runs in retail.
 fn zone_static_defs(bytes: &[u8]) -> Vec<ZoneStaticDef> {
     fn walk(
         node: &ffxi_dat::chunk::ChunkNode<'_>,
@@ -79,6 +79,12 @@ fn zone_static_defs(bytes: &[u8]) -> Vec<ZoneStaticDef> {
     out
 }
 
+/// Spawns the zone's static particle generators. The load key carries the global
+/// effect dir's arrival (it loads off-thread): a set built before it lands is
+/// missing every generator whose mesh ships there (the campfire flame sheet
+/// syst/effe/hi12 among them) and has to be rebuilt once. Camera-relative
+/// generators start at the origin as a placeholder; track_zone_particles
+/// rewrites them from the camera before the first mesh rebuild.
 fn sync_zone_particles(
     scene_state: Res<SceneState>,
     global: Option<Res<GlobalEffectDir>>,
@@ -94,9 +100,6 @@ fn sync_zone_particles(
         return;
     };
     let file_id = effective_zone_file_id(&scene_state.snapshot);
-    // The global effect dir loads off-thread, so the key carries its arrival: a set built before
-    // it lands is missing every generator whose mesh ships there (the campfire flame sheet
-    // syst/effe/hi12 among them) and has to be rebuilt once.
     let key = (file_id, global.is_some());
     if store.loaded == Some(key) {
         return;
@@ -133,8 +136,6 @@ fn sync_zone_particles(
     {
         let bp = def.base_position;
         let origin = if def.camera_relative {
-            // Placeholder: track_zone_particles rewrites it from the camera before the first
-            // mesh rebuild.
             Vec3::ZERO
         } else {
             mzb_to_bevy(WireVec3 {
@@ -189,6 +190,9 @@ fn sync_zone_particles(
     );
 }
 
+/// Runs before particle_sim::sync_particle_meshes: the simulator bakes each
+/// generator's world positions into its mesh, so the camera-relative origins
+/// have to land first.
 fn track_zone_particles(
     cam: Query<&GlobalTransform, With<crate::camera::OperatorCamera>>,
     mut sim: ResMut<ParticleSimulator>,
@@ -207,8 +211,6 @@ impl Plugin for ZoneParticlesPlugin {
             Update,
             (sync_zone_particles, track_zone_particles)
                 .chain()
-                // The simulator bakes each generator's world positions into its mesh, so the
-                // camera-relative origins have to land before it rebuilds.
                 .before(crate::particle_sim::sync_particle_meshes),
         );
     }
@@ -257,8 +259,8 @@ mod tests {
         );
     }
 
-    // Before the weat/ subtree was carved out this path spawned 16 weather emitters as permanent
-    // zone scenery across eight zones — Batallia Downs among them.
+    /// Before the weat/ subtree was carved out this path spawned 16 weather emitters as
+    /// permanent zone scenery across eight zones — Batallia Downs among them.
     #[test]
     fn real_dat_zone_static_defs_skip_the_weat_subtree() {
         let Some(bytes) = zone_dat(BATALLIA_DOWNS_ZONE_DAT) else {
@@ -313,9 +315,10 @@ mod tests {
         assert!(assets.mmbs.contains_key(b"ligh"));
     }
 
-    // The campfire flame sheet hi12 ships only in the global effect dir (syst/effe/hi12): the
-    // zone-local assets alone cannot spawn fir1, which is how a Selbina session logged
-    // "0 zone-static particle generator(s)" beside its seven lit point lights.
+    /// The campfire flame sheet hi12 ships only in the global effect dir
+    /// (syst/effe/hi12): the zone-local assets alone cannot spawn fir1, which
+    /// is how a Selbina session logged "0 zone-static particle generator(s)"
+    /// beside its seven lit point lights.
     #[test]
     fn real_dat_selbina_flame_sheet_lives_in_the_global_effect_dir() {
         let Some(bytes) = zone_dat(SELBINA_ZONE_DAT) else {
@@ -341,9 +344,9 @@ mod tests {
         );
     }
 
-    // West Ronfaure authors its effe/fir1 and effe/fir2 campfire subtrees twice each; the exact
-    // repeats collapse while the like-named lamps under mode/ligh/s_li and mode/ligh/taki, at
-    // their own positions, all stay.
+    /// West Ronfaure authors its effe/fir1 and effe/fir2 campfire subtrees twice
+    /// each; the exact repeats collapse while the like-named lamps under
+    /// mode/ligh/s_li and mode/ligh/taki, at their own positions, all stay.
     #[test]
     fn real_dat_west_ronfaure_repeated_campfire_collapses_to_one() {
         let Some(bytes) = zone_dat(WEST_RONFAURE_ZONE_DAT) else {

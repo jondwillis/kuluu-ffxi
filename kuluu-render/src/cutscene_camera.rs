@@ -39,7 +39,6 @@ pub fn progression_curve(smoothing: CameraSmoothType, t: f32) -> f32 {
             }
         }
         CameraSmoothType::AccelerateAndDecelerate => 0.5 * (1.0 - (t * std::f32::consts::PI).cos()),
-        // The keyframe resource is not in this tree; retail's own fallback for a missing one.
         CameraSmoothType::Keyframe(_) => t,
     }
 }
@@ -60,6 +59,10 @@ struct SplineTrack {
 }
 
 impl SplineTrack {
+    /// Builds the per-segment Hermite-basis matrices (research/XIClient
+    /// source/Common/Math/Spline.cpp PrecomputeSpline): row 0 is the position
+    /// basis, row 1 the first-derivative (tangent) basis, row 2 the
+    /// second-derivative (curvature) basis, row 3 the constraint row.
     fn build(components: [Vec<f32>; 3]) -> Option<Self> {
         let n = components[0].len();
         if n < 2 || components[1].len() != n || components[2].len() != n {
@@ -107,24 +110,20 @@ impl SplineTrack {
             let right_endpoint_influence = next_weight * next_weight / next_complement;
 
             matrices.push([
-                // Row 0: position basis.
                 left_endpoint_influence,
                 (prev_complement + cross_influence) / prev_weight,
                 -(prev_complement + cross_influence) / next_complement,
                 right_endpoint_influence,
-                // Row 1: first-derivative (tangent) basis.
                 (prev_complement_sq + prev_complement_sq) / prev_weight,
                 -(prev_complement + prev_complement + cross_influence) / prev_weight,
                 (prev_complement + prev_complement
                     - (next_weight - (cross_influence + cross_influence)))
                     / next_complement,
                 -right_endpoint_influence,
-                // Row 2: second-derivative (curvature) basis.
                 left_endpoint_influence,
                 (1.0 - (prev_weight + prev_weight)) / prev_weight,
                 prev_weight,
                 0.0,
-                // Row 3: constraint row.
                 0.0,
                 1.0,
                 0.0,
@@ -206,10 +205,11 @@ pub struct Endpoint {
     focal_length: f32,
 }
 
+/// The kind 0x06 points (camera.rs) are retail world coordinates (Y up); the
+/// operator camera lives in Bevy space, whose up axis is -native-y like every
+/// other placed asset.
 impl From<&CameraControlPoint> for Endpoint {
     fn from(p: &CameraControlPoint) -> Self {
-        // The kind 0x06 points are retail world coordinates (Y up); the operator camera lives
-        // in Bevy space, whose up axis is -native-y like every other placed asset.
         Self {
             eye: crate::scene::mzb_to_bevy(kuluu_snapshot::Vec3 {
                 x: p.position[0],
@@ -319,6 +319,8 @@ impl CutsceneCameraTask {
     /// 0x45 duration operand (scheduler_speed_ratio). An attached route carries its attach
     /// context: the points are local to the attach actor and each frame's eye/at transform
     /// out through the smoothed attach matrix (CameraTask.cpp constructor and OnMove).
+    /// The straight/locked endpoints and the spline tracks all need the full point set;
+    /// only the first and last are kept for the non-spline modes.
     pub fn start(
         resource: &CameraResource,
         total_frames: f32,
@@ -363,8 +365,6 @@ impl CutsceneCameraTask {
 
         let mode = resource.path_mode();
 
-        // The straight/locked endpoints and the spline tracks all need the full point set; keep
-        // the first and last for the non-spline modes.
         let start_point = points[0];
         let end_point = *points.last().unwrap();
 
@@ -540,31 +540,51 @@ pub fn eid_model_point(
     locator_height_fraction(locator).map(|frac| Vec3::new(0.0, height * frac, 0.0))
 }
 
-/// research/XIClient include/World/Actor/EID_INDEX.h - the named body points as fractions of
-/// the actor's height, standing in for the skeleton reference table when the model did not
-/// load.
+// research/XIClient include/World/Actor/EID_INDEX.h - the named body point indices; the
+// height fractions below stand in for the skeleton reference table when the model did not
+// load.
+const EID_CURRENT: u32 = 0;
+const EID_WAIST: u32 = 1;
+const EID_NAME: u32 = 2;
+const EID_NECK: u32 = 3;
+const EID_LOOK_AT: u32 = 4;
+const EID_HEAD_TOP: u32 = 5;
+const EID_EYE_CENTER: u32 = 6;
+const EID_CHEST: u32 = 7;
+const EID_R_FOOT: u32 = 8;
+const EID_L_FOOT: u32 = 9;
+const EID_R_HAND: u32 = 10;
+const EID_L_HAND: u32 = 11;
+const EID_HEIGHT: u32 = 12;
+const EID_BODY_CENTER: u32 = 21;
+const EID_HEAD_CENTER: u32 = 22;
+const EID_MAGIC0: u32 = 23;
+const EID_REACH_H: u32 = 32;
+const EID_R_EYE0: u32 = 33;
+const EID_CAMERA3: u32 = 42;
+
 fn locator_height_fraction(locator: u32) -> Option<f32> {
     Some(match locator {
-        0 => 0.0,        // EID_CURRENT
-        1 => 0.45,       // EID_WAIST
-        2 => 1.05,       // EID_NAME
-        3 => 0.85,       // EID_NECK
-        4 => 0.75,       // EID_LOOK_AT
-        5 => 1.0,        // EID_HEAD_TOP
-        6 => 0.9,        // EID_EYE_CENTER
-        7 => 0.6,        // EID_CHEST
-        8 | 9 => 0.05,   // EID_R_FOOT | EID_L_FOOT
-        10 | 11 => 0.65, // EID_R_HAND | EID_L_HAND
-        12..=21 => 0.5,  // EID_HEIGHT..EID_BODY_CENTER
-        22 => 0.95,      // EID_HEAD_CENTER
-        23..=32 => 0.7,  // EID_MAGIC0..EID_REACH_H
-        33..=42 => 0.5,  // EID_R_EYE0..EID_CAMERA3
+        EID_CURRENT => 0.0,
+        EID_WAIST => 0.45,
+        EID_NAME => 1.05,
+        EID_NECK => 0.85,
+        EID_LOOK_AT => 0.75,
+        EID_HEAD_TOP => 1.0,
+        EID_EYE_CENTER => 0.9,
+        EID_CHEST => 0.6,
+        EID_R_FOOT | EID_L_FOOT => 0.05,
+        EID_R_HAND | EID_L_HAND => 0.65,
+        EID_HEIGHT..=EID_BODY_CENTER => 0.5,
+        EID_HEAD_CENTER => 0.95,
+        EID_MAGIC0..=EID_REACH_H => 0.7,
+        EID_R_EYE0..=EID_CAMERA3 => 0.5,
         _ => return None,
     })
 }
 
 /// The running camera route, singular: retail's CameraManager::CurrentCameraTask is one task,
-/// and CreateCameraTask deletes the previous one before installing the new.
+/// and CreateCameraTask deletes the prior one before installing the new.
 #[derive(Resource, Default)]
 pub struct CutsceneCameraTasks {
     current: Option<CutsceneCameraTask>,
@@ -682,7 +702,10 @@ pub fn capture_current_camera(cam_t: &Transform, proj: &Projection) -> Option<Cu
 /// advance it while the scene holds the camera and write its output onto the operator camera's
 /// transform and projection. While the lock outlives the route, the last applied frame is held
 /// over resolve_camera's chase writes (this system runs after it); released at CutsceneEnded or
-/// DEFCAMERA case 0 like the fade, when the chase camera resumes on the frame after.
+/// DEFCAMERA case 0 like the fade, when the chase camera resumes on the frame after. With no
+/// route running, the hold parks on the finished route's final frame, retail-style (event 503
+/// holds its camera from +037F7 to +04683 across all its MESWAITs); a lock with no route yet
+/// captures the operator state once and freezes it.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn advance_cutscene_camera_task(
     time: Res<Time>,
@@ -732,10 +755,6 @@ pub fn advance_cutscene_camera_task(
 
     let live = tasks.live_attach_matrix(&q_attach, &q_children, &q_render);
     let Some(frame) = tasks.advance(time.delta_secs(), live) else {
-        // No route running: hold the last applied frame over resolve_camera's chase writes. A
-        // lock that outlives every task (event 503 holds its camera from +037F7 to +04683 across
-        // all its MESWAITs) parks on the finished route's final frame, retail-style; a lock with
-        // no route yet captures the operator state once and freezes it.
         let held = match tasks.held() {
             Some(held) => Some(held),
             None => q_cam
@@ -772,14 +791,14 @@ pub fn advance_cutscene_camera_task(
 }
 
 /// One route frame onto the operator camera: eye and look-at with roll as an up-axis twist,
-/// focal length inverted into the projection with retail's fixed half-height.
+/// focal length inverted into the projection with retail's fixed half-height. The roll
+/// rotates the up vector about the view direction: Bevy's look_at takes an up axis rather
+/// than a roll angle.
 fn apply_frame(
     frame: &CameraFrame,
     q_cam: &mut Query<(&mut Transform, &mut Projection), With<crate::camera::OperatorCamera>>,
 ) {
     for (mut cam_t, mut proj) in q_cam.iter_mut() {
-        // The roll rotates the up vector about the view direction: Bevy's look_at takes an up
-        // axis rather than a roll angle.
         let dir = (frame.target - frame.eye).normalize_or(Vec3::NEG_Z);
         let up = Quat::from_axis_angle(dir, frame.roll) * Vec3::Y;
         cam_t.translation = frame.eye;
@@ -881,10 +900,10 @@ mod tests {
             (progression_curve(CameraSmoothType::AccelerateAndDecelerate, 0.5) - 0.5).abs() < 1e-6
         );
 
-        // A keyframe smoothing type falls back to linear time (the resource is not in this tree).
         assert_eq!(
             progression_curve(CameraSmoothType::Keyframe(0x4B), 0.25),
-            0.25
+            0.25,
+            "keyframe falls back to linear time"
         );
     }
 
@@ -905,8 +924,6 @@ mod tests {
             None,
         );
 
-        // Half the duration at linear smoothing: halfway along every channel (the authored
-        // points are retail Y-up; their Bevy images negate y and z).
         let frame = task
             .advance(50.0 / crate::scheduler_runtime::ROUTINE_FPS, None)
             .unwrap();
@@ -915,11 +932,13 @@ mod tests {
         assert!((frame.focal_length - 481.0).abs() < 1e-2);
         assert!((frame.roll - 0.25).abs() < 1e-5);
 
-        // The last frame lands on the end point and the next advance reports done.
         let last = task
             .advance(50.0 / crate::scheduler_runtime::ROUTINE_FPS, None)
             .unwrap();
-        assert!((last.eye - Vec3::new(4.0, 0.0, 0.0)).length() < 1e-4);
+        assert!(
+            (last.eye - Vec3::new(4.0, 0.0, 0.0)).length() < 1e-4,
+            "last frame on the end point"
+        );
         assert!(task
             .advance(1.0 / crate::scheduler_runtime::ROUTINE_FPS, None)
             .is_none());
@@ -939,11 +958,13 @@ mod tests {
             None,
         );
 
-        // Frame zero starts on the camera's own state, not on the authored point.
         let frame = task
             .advance(1.0 / crate::scheduler_runtime::ROUTINE_FPS, None)
             .unwrap();
-        assert!((frame.eye - Vec3::new(1.0, 2.0, 3.0)).length() < 0.5);
+        assert!(
+            (frame.eye - Vec3::new(1.0, 2.0, 3.0)).length() < 0.5,
+            "frame zero starts on the camera's own state"
+        );
     }
 
     #[test]
@@ -960,7 +981,6 @@ mod tests {
             None,
         );
 
-        // The last frame lands on the default chase eye, not the camera's start state.
         let dt = 1.0 / crate::scheduler_runtime::ROUTINE_FPS;
         let mut last: Option<CameraFrame> = None;
         for _ in 0..60 {
@@ -1005,24 +1025,24 @@ mod tests {
             )),
         );
 
-        // The locked point is local to the attach actor; the frame transforms out through the
-        // attach matrix.
         let frame = task
             .advance(1.0 / crate::scheduler_runtime::ROUTINE_FPS, None)
             .unwrap();
-        assert!((frame.eye - Vec3::new(10.0, 0.0, 0.0)).length() < 1e-5);
+        assert!(
+            (frame.eye - Vec3::new(10.0, 0.0, 0.0)).length() < 1e-5,
+            "the locked point is local to the attach actor; the frame transforms out through the attach matrix"
+        );
     }
 
+    /// The model's +X is the actor's facing; a 90-degree yaw turns it toward -Z in Bevy's
+    /// right-handed Y-up space. The EID point lands at the origin plus the yaw-rotated facing
+    /// offset; a local +X step keeps riding the facing.
     #[test]
     fn the_attach_matrix_carries_the_actor_origin_and_yaw() {
-        // The model's +X is the actor's facing; a 90-degree yaw turns it toward -Z in Bevy's
-        // right-handed Y-up space.
         let actor = Transform::from_xyz(5.0, 0.0, 0.0)
             * Transform::from_rotation(Quat::from_rotation_y(std::f32::consts::FRAC_PI_2));
         let m = attach_matrix(&actor, Vec3::new(1.0, 0.0, 0.0));
-        // The EID point lands at the origin plus the yaw-rotated facing offset.
         assert!((m.transform_point3(Vec3::ZERO) - Vec3::new(5.0, 0.0, -1.0)).length() < 1e-5);
-        // A local +X step keeps riding the facing.
         assert!((m.transform_point3(Vec3::X) - Vec3::new(5.0, 0.0, -2.0)).length() < 1e-5);
     }
 
@@ -1045,13 +1065,15 @@ mod tests {
             )),
         );
 
-        // The live matrix moves away; the frozen start matrix wins every frame.
         let live = Mat4::from_translation(Vec3::new(99.0, 0.0, 0.0));
         for _ in 0..3 {
             let frame = task
                 .advance(1.0 / crate::scheduler_runtime::ROUTINE_FPS, Some(live))
                 .unwrap();
-            assert!((frame.eye - Vec3::new(10.0, 0.0, 0.0)).length() < 1e-5);
+            assert!(
+                (frame.eye - Vec3::new(10.0, 0.0, 0.0)).length() < 1e-5,
+                "the frozen start matrix wins over the live matrix"
+            );
         }
     }
 
@@ -1061,7 +1083,6 @@ mod tests {
         let live = Mat4::from_translation(Vec3::new(10.0, 0.0, 0.0));
         let dt = 1.0 / crate::scheduler_runtime::ROUTINE_FPS;
 
-        // A full interp jumps to the live matrix in one frame.
         let mut task = CutsceneCameraTask::start(
             &resource(
                 CameraSmoothType::Linear,
@@ -1074,9 +1095,11 @@ mod tests {
             Some(attach_start(Entity::PLACEHOLDER, 21, 1.0, start)),
         );
         let frame = task.advance(dt, Some(live)).unwrap();
-        assert!((frame.eye - Vec3::new(10.0, 0.0, 0.0)).length() < 1e-5);
+        assert!(
+            (frame.eye - Vec3::new(10.0, 0.0, 0.0)).length() < 1e-5,
+            "a full interp jumps to the live matrix in one frame"
+        );
 
-        // A half interp lands halfway on the first step.
         let mut task = CutsceneCameraTask::start(
             &resource(
                 CameraSmoothType::Linear,
@@ -1089,7 +1112,10 @@ mod tests {
             Some(attach_start(Entity::PLACEHOLDER, 21, 0.5, start)),
         );
         let frame = task.advance(dt, Some(live)).unwrap();
-        assert!((frame.eye - Vec3::new(5.0, 0.0, 0.0)).length() < 1e-5);
+        assert!(
+            (frame.eye - Vec3::new(5.0, 0.0, 0.0)).length() < 1e-5,
+            "a half interp lands halfway on the first step"
+        );
     }
 
     #[test]
@@ -1107,22 +1133,24 @@ mod tests {
             Some(attach_start(Entity::PLACEHOLDER, 21, 0.0, initial)),
         );
 
-        // The camera state is mapped into the local space by the inverse initial matrix and the
-        // first frame maps it back out: the eye round-trips to the camera's own state.
         let frame = task
             .advance(1.0 / crate::scheduler_runtime::ROUTINE_FPS, None)
             .unwrap();
-        assert!((frame.eye - current_state().eye).length() < 0.5);
+        assert!(
+            (frame.eye - current_state().eye).length() < 0.5,
+            "the eye round-trips to the camera's own state through the local space"
+        );
     }
 
+    /// EID_NAME stands above the head, EID_BODY_CENTER at half height, EID_CURRENT on the
+    /// ground; the special locators and untabled empties stay unresolvable, and without a
+    /// baked actor the fallback height stands in.
     #[test]
     fn the_eid_fallback_reads_the_named_points_off_the_actor_height() {
         let baked = BakedActor {
             min_mesh_y: 0.0,
             actor_height: 2.0,
         };
-        // EID_NAME stands above the head, EID_BODY_CENTER at half height, EID_CURRENT on the
-        // ground.
         assert!(
             (eid_model_point(2, Some(&baked), None).unwrap() - Vec3::new(0.0, 2.1, 0.0)).length()
                 < 1e-5
@@ -1132,10 +1160,8 @@ mod tests {
                 < 1e-5
         );
         assert_eq!(eid_model_point(0, Some(&baked), None), Some(Vec3::ZERO));
-        // The special locators and the untabled empties stay unresolvable.
         assert!(eid_model_point(48, Some(&baked), None).is_none());
         assert!(eid_model_point(44, Some(&baked), None).is_none());
-        // No baked actor: the fallback height stands in.
         assert!(
             (eid_model_point(2, None, None).unwrap()
                 - Vec3::new(0.0, 1.05 * crate::camera::FALLBACK_ACTOR_HEIGHT, 0.0))
@@ -1169,8 +1195,6 @@ mod tests {
             &[],
         );
         let render = crate::ffxi_actor_render::render_actor_for_test(skeleton, pose);
-        // The reference table wins over the height fallback: EID 7 sits at the joint plus its
-        // offset.
         assert!(
             (eid_model_point(7, None, Some(&render)).unwrap() - Vec3::new(0.0, 7.0, 0.0)).length()
                 < 1e-4
@@ -1214,8 +1238,6 @@ mod tests {
             None,
         );
 
-        // The first advance applies the point and finishes in one frame (CreateCameraTask's
-        // hard-cut branch).
         let frame = task
             .advance(1.0 / crate::scheduler_runtime::ROUTINE_FPS, None)
             .unwrap();
@@ -1247,17 +1269,12 @@ mod tests {
         );
 
         let dt = 1.0 / crate::scheduler_runtime::ROUTINE_FPS;
-        // Frame one of a linear 300-frame route has moved one frame along the tangent from
-        // the first control point (sqrt(14)/150 units here); anything larger means the start
-        // is not on it.
         let first = task.advance(dt, None).unwrap();
         assert!(
             (first.eye - Vec3::ZERO).length() < 0.03,
             "t~0 on the first point: {first:?}"
         );
 
-        // Advance #150 (elapsed 150 of 300 frames, t exactly 0.5) sits on the middle control
-        // point.
         for _ in 0..148 {
             let _ = task.advance(dt, None);
         }
@@ -1267,7 +1284,6 @@ mod tests {
             "t=0.5 on the middle point: {mid:?}"
         );
 
-        // Frame 300 lands on the last control point and the next advance reports done.
         for _ in 0..149 {
             let _ = task.advance(dt, None);
         }
@@ -1281,7 +1297,6 @@ mod tests {
 
     #[test]
     fn path_mode_selection_follows_the_effective_point_count() {
-        // One authored point plus both flags is three effective points: a spline.
         let res = resource(
             CameraSmoothType::Linear,
             ffxi_dat::camera::CameraFlags::START_AT_CURRENT_POS
@@ -1290,7 +1305,6 @@ mod tests {
         );
         assert_eq!(res.path_mode(), CameraPathMode::Spline);
 
-        // The task builds for it and runs to completion without panicking.
         let mut task =
             CutsceneCameraTask::start(&res, 60.0, current_state(), default_chase(), None);
         for _ in 0..70 {
@@ -1303,10 +1317,10 @@ mod tests {
         }
     }
 
+    /// The kind 0x06 points are retail world coordinates (Y up); Bevy's up axis is
+    /// -native-y, so the vertical and horizontal-z components both negate (camera.rs).
     #[test]
     fn dat_points_convert_to_bevy_space() {
-        // The kind 0x06 points are retail world coordinates (Y up); Bevy's up axis is
-        // -native-y, so the vertical and horizontal-z components both negate.
         let p = point([1.0, 2.0, 3.0], 500.0, [4.0, 5.0, 6.0], 0.0);
         let e = Endpoint::from(&p);
         assert_eq!(e.eye, Vec3::new(1.0, -2.0, -3.0));
@@ -1322,8 +1336,6 @@ mod tests {
             (fov.to_degrees() - crate::graphics_settings::retail_default_fov_deg()).abs() < 1e-4
         );
     }
-
-    // ===== System-level hold tests: the lock outliving its route =====
 
     /// Simulates resolve_camera, which rewrites the operator eye every frame in Chase mode:
     /// whatever the hold does not overwrite this frame is lost.
@@ -1352,7 +1364,6 @@ mod tests {
                 ..Default::default()
             }),
         ));
-        // chase_steal first, exactly like resolve_camera runs before the cutscene system.
         app.add_systems(Update, (chase_steal, advance_cutscene_camera_task).chain());
         app
     }
@@ -1379,11 +1390,11 @@ mod tests {
         (t.translation, p.fov)
     }
 
+    /// Event 503's shape: DEFCAMERA case 1 at +037F7, camera routes throughout, MESWAITs
+    /// between them, case 0 only at +04683. A route that drains mid-MESWAIT parks on its
+    /// final frame instead of handing the eye back to the chase.
     #[test]
     fn a_finished_route_holds_its_last_frame_while_the_lock_outlives_it() {
-        // Event 503's shape: DEFCAMERA case 1 at +037F7, camera routes throughout, MESWAITs
-        // between them, case 0 only at +04683. A route that drains mid-MESWAIT must park on
-        // its final frame instead of handing the eye back to the chase.
         let mut app = hold_app();
         let task = CutsceneCameraTask::start(
             &resource(
@@ -1403,15 +1414,13 @@ mod tests {
             .resource_mut::<CutsceneCameraTasks>()
             .start(task);
 
-        hold_step(&mut app, 60); // the route runs to completion while locked
+        hold_step(&mut app, 60);
         let (last_eye, last_fov) = hold_cam(&mut app);
         assert!(
             (last_eye - Vec3::new(4.0, 0.0, 0.0)).length() < 1e-3,
             "route end: {last_eye:?}"
         );
 
-        // The lock outlives the route: chase_steal rewrites the eye every frame and the hold
-        // must win all of them, keeping both position and focal parked.
         hold_step(&mut app, 120);
         let (held_eye, held_fov) = hold_cam(&mut app);
         assert!(
@@ -1423,8 +1432,6 @@ mod tests {
             "focal drifted while holding"
         );
 
-        // DEFCAMERA case 0: retail kills all tasks and re-seats the chase; the hold drops and
-        // the focal returns to the settings default.
         app.world_mut().resource_mut::<CutsceneMode>().camera_locked = false;
         hold_step(&mut app, 2);
         let tasks = app.world().resource::<CutsceneCameraTasks>();
@@ -1440,11 +1447,11 @@ mod tests {
         );
     }
 
+    /// A lock with no route yet (event 503's first MESWAIT at +03846 precedes its camera
+    /// routines): retail's user-control-disabled camera stays put, so the operator state is
+    /// captured once and held over every chase write.
     #[test]
     fn a_lock_before_any_route_freezes_the_operator_state() {
-        // A lock with no route yet (event 503's first MESWAIT at +03846 precedes its camera
-        // routines): retail's user-control-disabled camera stays put, so the operator state is
-        // captured once and held over every chase write.
         let mut app = hold_app();
         hold_step(&mut app, 3);
         let (first_eye, _) = hold_cam(&mut app);
@@ -1456,12 +1463,12 @@ mod tests {
         );
     }
 
-    // ===== System-level attach test: the route rides the attach actor =====
-
+    /// An attached route re-resolves the attach matrix from the actor's wire transform each
+    /// frame; a full interp follows every move. EID_BODY_CENTER is half the actor's height in
+    /// the model frame; mzb_to_bevy maps the model's up to Bevy -Y, so the eye parks one unit
+    /// below the actor's origin.
     #[test]
     fn an_attached_route_tracks_the_actor_as_it_moves() {
-        // An attached route re-resolves the attach matrix from the actor's wire transform each
-        // frame; a full interp follows every move.
         let mut app = hold_app();
         let actor = app
             .world_mut()
@@ -1478,7 +1485,6 @@ mod tests {
                 },
             ))
             .with_children(|parent| {
-                // A child stands in for the render actor's slot so the attach can resolve.
                 parent.spawn(crate::components::InGameEntity);
             })
             .id();
@@ -1507,14 +1513,11 @@ mod tests {
 
         hold_step(&mut app, 2);
         let (eye, _) = hold_cam(&mut app);
-        // EID_BODY_CENTER is half the actor's height in the model frame; mzb_to_bevy maps the
-        // model's up to Bevy -Y, so the eye parks one unit below the actor's origin.
         assert!(
             (eye - Vec3::new(10.0, -1.0, 0.0)).length() < 1e-3,
             "parked: {eye:?}"
         );
 
-        // The actor moves; the live matrix re-resolves and the full interp follows.
         {
             let mut entity = app.world_mut().entity_mut(actor);
             let mut actor_t = entity.get_mut::<Transform>().unwrap();

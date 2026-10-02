@@ -74,7 +74,8 @@ fn take<T: serde::de::DeserializeOwned>(v: &serde_json::Value, key: &str) -> Opt
 /// runtime capability, set by update_dlss_availability_system at startup.
 /// The Retail+ gates (`dlss_menu_enabled`, `job_display`, `mob_hp_under`) DO
 /// round-trip: they are user choices that must survive a restart (default off
-/// when absent).
+/// when absent). A pre-rename file carries the former `dynamic_light_count`
+/// key; both spellings load.
 fn parse_graphics_settings(bytes: &[u8]) -> Result<GraphicsSettings> {
     use kuluu_render::{
         AaMode, CharacterRenderPath, DlssQuality, DynamicLights, MinimapRadar, QualityPreset,
@@ -155,7 +156,6 @@ fn parse_graphics_settings(bytes: &[u8]) -> Result<GraphicsSettings> {
     if let Some(x) = take(&v, "light_flicker") {
         s.light_flicker = x;
     }
-    // Pre-rename files carry the old key; honour both.
     if let Some(x) = take(&v, "model_light_count").or_else(|| take(&v, "dynamic_light_count")) {
         s.model_light_count = x;
     }
@@ -198,7 +198,6 @@ fn parse_graphics_settings(bytes: &[u8]) -> Result<GraphicsSettings> {
     if let Some(x) = take(&v, "windowed_fullscreen") {
         s.windowed_fullscreen = x;
     }
-    // Retail+ gates (dev-only Debug menu): persisted user choices.
     if let Some(x) = take(&v, "dlss_menu_enabled") {
         s.dlss_menu_enabled = x;
     }
@@ -378,7 +377,7 @@ mod tests {
         std::fs::remove_file(store.path()).ok();
     }
 
-    /// A `NaN` ui_scale means a corrupt/failed write (our own save() can never
+    /// A `NaN` ui_scale means a corrupt/failed write (our own save() can't
     /// emit one; serde_json rejects non-finite f32 on serialize), so the whole
     /// document is rejected: load returns Err, callers fall back to defaults.
     #[test]

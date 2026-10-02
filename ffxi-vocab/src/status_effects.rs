@@ -36,9 +36,9 @@ pub fn is_cancelable(icon: u16) -> bool {
 mod tests {
     use super::*;
 
+    /// weakness(1), sleep(2), poison(3), paralysis(4) all carry `no_cancel`.
     #[test]
     fn no_cancel_debuffs_are_not_cancelable() {
-        // weakness(1), sleep(2), poison(3), paralysis(4) all carry `no_cancel`.
         for icon in [1u16, 2, 3, 4] {
             assert!(!is_cancelable(icon), "icon {icon} must be non-cancelable");
         }

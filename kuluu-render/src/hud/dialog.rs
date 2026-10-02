@@ -234,10 +234,6 @@ pub fn update_dialog_panel_system(
     }
 }
 
-/// Drive the delivery-box style item grid from `DialogState::grid`: show the
-/// container when a grid is present, size it to `cols`, and fill each cell's
-/// frame/icon/label (cursor highlight follows the choice cursor; sent cells
-/// are dimmed).
 #[allow(clippy::too_many_arguments)]
 pub fn update_dialog_grid_system(
     state: Res<SceneState>,
@@ -254,7 +250,14 @@ pub fn update_dialog_grid_system(
         (&DialogGridIcon, &mut Node, &mut ImageNode),
         (Without<DialogGridBox>, Without<DialogGridCellFrame>),
     >,
-    mut label_q: Query<(&DialogGridLabel, &mut Text, &mut Node), Without<DialogGridIcon>>,
+    mut label_q: Query<
+        (&DialogGridLabel, &mut Text, &mut Node),
+        (
+            Without<DialogGridBox>,
+            Without<DialogGridCellFrame>,
+            Without<DialogGridIcon>,
+        ),
+    >,
 ) {
     if !state.is_changed() && !mode.is_changed() {
         return;
@@ -337,8 +340,6 @@ pub fn update_dialog_grid_system(
         }
     }
 
-    // The count rides a chip, so nothing to count hides the node rather than
-    // leaving an empty plate on the art.
     for (label, mut text, mut node) in &mut label_q {
         let cell = grid.cells.get(label.index);
         let want = match cell {
@@ -595,7 +596,7 @@ mod tests {
         /// session emits it: speakerless line carries a blank header, no choices.
         fn narration_frame() -> DialogState {
             let mut x = d();
-            x.event_id = 0x0006_01F7; // (unique_no 6 << 16) | 503
+            x.event_id = (6u32 << 16) | 503;
             x.npc_id = 6;
             x.npc_name = Some(String::new());
             x.act_index = 1024;
@@ -630,9 +631,9 @@ mod tests {
             app
         }
 
+        /// The two systems that own the panel's visible state; in the live app
+        /// they run after `dialog_mode_sync_system` has already flipped World→Dialog.
         fn run_draw(app: &mut App) {
-            // The two systems that own the panel's visible state; in the live app
-            // they run after `dialog_mode_sync_system` has already flipped World→Dialog.
             app.world_mut()
                 .run_system_once(update_dialog_panel_system)
                 .unwrap();
@@ -717,8 +718,6 @@ mod tests {
                 let mut state = app.world_mut().resource_mut::<SceneState>();
                 state.snapshot.dialog = Some(narration_frame());
             }
-            // Same-frame reality: dialog_mode_sync_system has already flipped the
-            // mode, so the panel draws with a live cursor.
             app.world_mut()
                 .insert_resource(InputMode::Dialog(DialogCursor {
                     cursor: 0,
@@ -729,21 +728,23 @@ mod tests {
             assert_eq!(
                 panel_display(app.world_mut()),
                 Display::Flex,
-                "panel root must flip visible"
+                "panel root must flip visible (same-frame: dialog_mode_sync_system already flipped the mode)"
             );
-            // Speakerless narration carries a blank header — never the player's name.
             assert_eq!(
                 header_text(app.world_mut()),
                 "",
-                "narration header must be blank"
+                "narration header must be blank (speakerless, not the player's name)"
             );
             let want_body = format!(
                 "The fortress city of San d'Oria lies to the\nnorth on the great continent of Quon. The\nbeating heart of an ancient kingdom, it is\nhome to a thousand legends past.\n\n{CONTINUE_MARKER} Enter to continue"
             );
             assert_eq!(body_text(app.world_mut()), want_body);
-            // No choices: every pooled row stays hidden with empty labels.
             let displays = row_displays(app.world_mut());
-            assert_eq!(displays.len(), MAX_OPTION_ROWS as usize);
+            assert_eq!(
+                displays.len(),
+                MAX_OPTION_ROWS as usize,
+                "no choices: every pooled row stays hidden with empty labels"
+            );
             assert!(displays.iter().all(|d| *d == Display::None));
             assert!(row_labels(app.world_mut()).iter().all(|s| s.is_empty()));
         }
@@ -763,10 +764,10 @@ mod tests {
             run_draw(&mut app);
 
             assert_eq!(panel_display(app.world_mut()), Display::Flex);
-            // A menu's body is the prompt alone — options render as rows.
             assert_eq!(
                 body_text(app.world_mut()),
-                "What would you like to hear about?"
+                "What would you like to hear about?",
+                "a menu's body is the prompt alone; options render as rows"
             );
 
             let displays = row_displays(app.world_mut());
@@ -803,7 +804,6 @@ mod tests {
                 }));
             run_draw(&mut app);
 
-            // Player moves the cursor to row 2 ("Making easy money.").
             let mut mode = app.world_mut().resource_mut::<InputMode>();
             if let InputMode::Dialog(c) = &mut *mode {
                 c.cursor = 2;
@@ -889,6 +889,62 @@ mod tests {
             assert!(row_displays(app.world_mut())
                 .iter()
                 .all(|d| *d == Display::None));
+        }
+
+        #[test]
+        fn grid_draw_runs_with_disjoint_node_queries() {
+            use kuluu_snapshot::{DialogGrid, DialogGridCell};
+
+            let mut app = app_with_panel();
+            app.world_mut().init_resource::<ItemDatRoot>();
+            app.world_mut().init_resource::<ItemIconCache>();
+            {
+                let mut state = app.world_mut().resource_mut::<SceneState>();
+                let mut frame = d();
+                frame.grid = Some(DialogGrid {
+                    cols: 2,
+                    rows: 1,
+                    cells: vec![
+                        DialogGridCell {
+                            choice: Some(0),
+                            item_no: Some(4096),
+                            quantity: 3,
+                            sent: false,
+                        },
+                        DialogGridCell::default(),
+                    ],
+                });
+                state.snapshot.dialog = Some(frame);
+            }
+            // B0001: the box/frame/icon/label queries all take &mut Node, so the
+            // system only initializes if their filters keep them disjoint.
+            app.world_mut()
+                .run_system_once(update_dialog_grid_system)
+                .unwrap();
+
+            let box_node = app
+                .world_mut()
+                .query_filtered::<&Node, With<DialogGridBox>>()
+                .iter(app.world())
+                .next()
+                .expect("grid box spawned")
+                .clone();
+            assert_eq!(box_node.display, Display::Flex);
+            let want_cols = 2.0;
+            assert_eq!(
+                box_node.width,
+                Val::Px(want_cols * CELL_PX + (want_cols - 1.0) * CELL_GAP_PX)
+            );
+
+            let mut counts: Vec<String> = app
+                .world_mut()
+                .query_filtered::<(&DialogGridLabel, &Text), ()>()
+                .iter(app.world())
+                .filter(|(l, _)| l.index < 2)
+                .map(|(l, t)| format!("{}:{}", l.index, t.as_str()))
+                .collect();
+            counts.sort();
+            assert_eq!(counts, vec!["0:3".to_string(), "1:".to_string()]);
         }
     }
 }

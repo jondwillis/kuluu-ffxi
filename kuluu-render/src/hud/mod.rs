@@ -69,11 +69,15 @@ pub struct HudPanels {
     /// in movement. Grounding stays on. Toggled from the Debug menu NoClip row
     /// or /noclip; both flip this same flag.
     pub noclip: bool,
+    /// Enhanced build only: forces the retail weapon draw/sheathe movement
+    /// hold back on (the gated build lifts it by default).
+    #[cfg(feature = "enhanced-engage-move-lock-off")]
+    pub engage_anim_lock: bool,
     /// Debug auto-enter (enternity-style): when on, event-dialog message frames
     /// advance themselves after their read time instead of waiting for Enter.
     /// Choice frames, item lines, text-entry frames, server custom menus, and
     /// the enternity blacklist (Paintbrush of Souls, Geomantic Reservoir) are
-    /// never advanced. Toggled from the Debug menu "Auto-Enter CS" row.
+    /// not advanced. Toggled from the Debug menu "Auto-Enter CS" row.
     pub auto_enter_cs: bool,
     /// Stair-climber debug: when true, shows the status panel populated by
     /// the input crate's stair detection state (orbs, slopes, classification
@@ -91,7 +95,7 @@ pub struct HudPanels {
     /// Runtime-only, no persist.
     pub nameplate_debug: bool,
     /// Rolling panel-position capture to panelpositions.txt. Runtime-only,
-    /// default off so the game never spams a log unasked. No persist.
+    /// default off so the game does not spam a log unasked. No persist.
     pub position_log: bool,
     /// Party-frame UI Settings panel (Debug menu): layout overrides, bar
     /// toggles, distance readouts, scale. Runtime-only, no persist.
@@ -176,8 +180,6 @@ pub fn spawn_bottom_left_stack(
 
                     item_screen::spawn_item_detail_card_as_child(col, icon_placeholder);
 
-                    // Retail docks the item card where the compass and clock
-                    // sit, so the two swap visibility with the Items window.
                     col.spawn((
                         item_screen::CompassClockCluster,
                         Node {
@@ -256,7 +258,6 @@ impl Plugin for HudPlugin {
         app.init_resource::<mesh_debug::MeshHoverDebug>();
         app.init_resource::<stair_debug::StairDebugSnapshot>();
         app.init_resource::<graphics_debug::GraphicsDebugState>();
-        // Render-world probe for the surface size (see graphics_debug).
         if let Some(render_app) = app.get_sub_app_mut(bevy::render::RenderApp) {
             render_app.add_systems(
                 bevy::render::Render,
@@ -296,6 +297,11 @@ impl Plugin for HudPlugin {
 
         app.init_resource::<delivery::DeliveryScreenState>();
         app.init_resource::<delivery::DeliveryInventory>();
+
+        app.add_systems(
+            PostUpdate,
+            item_grid::sync_count_outlines.before(bevy::ui::UiSystems::Content),
+        );
 
         app.init_resource::<shop::ShopScreenState>();
         app.add_message::<shop::ShopRowActivated>();
@@ -375,9 +381,6 @@ impl Plugin for HudPlugin {
             ),
         );
 
-        // Separate call: the main HUD tuple above is already at Bevy's 20-element
-        // limit. In-place distance readouts — must follow the row rebuild so
-        // freshly spawned distance texts get their value same-frame.
         app.add_systems(
             Update,
             party_frame::update_party_dist_text_system
@@ -530,6 +533,9 @@ impl Plugin for HudPlugin {
     }
 }
 
+/// Bevy's add_systems tuple bound caps at 20 elements, and the main spawner
+/// tuple above sits at that limit, so the remaining spawners go in separate
+/// calls.
 pub fn add_hud_spawners<L: bevy::ecs::schedule::ScheduleLabel + Clone>(app: &mut App, schedule: L) {
     app.add_systems(
         schedule.clone(),
@@ -555,8 +561,6 @@ pub fn add_hud_spawners<L: bevy::ecs::schedule::ScheduleLabel + Clone>(app: &mut
             network_status::spawn_network_status,
         ),
     );
-    // Separate call: bevy's add_systems tuple bound caps at 20, and we're
-    // already at 20 above.
     app.add_systems(schedule.clone(), stair_debug::spawn_stair_debug_hud);
     app.add_systems(schedule.clone(), graphics_debug::spawn_graphics_debug_hud);
     app.add_systems(schedule.clone(), graphics_debug::spawn_nameplate_debug_hud);
@@ -608,3 +612,5 @@ mod tests {
         );
     }
 }
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod quantity_capture;

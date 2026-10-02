@@ -32,7 +32,7 @@ const LOADING_TEXT: &str = "Downloading data";
 /// ground — so wait, but only while an event that could still set it is running.
 /// With nothing running, nothing is going to move us: a server that simply
 /// stored the origin is no reason to sit on a loading screen. `timed_out` is the
-/// backstop for an event that runs but never places us.
+/// backstop for an event that runs but does not place us.
 fn hold_for_spawn(pos_real: bool, correctable: bool, timed_out: bool) -> bool {
     !pos_real && correctable && !timed_out
 }
@@ -308,42 +308,42 @@ fn apply_zone_overlay_alpha(
 mod tests {
     use super::*;
 
+    /// A first-login character at the origin with the quest cutscene running:
+    /// wait, or the player lands under the world before it places them. The
+    /// same origin with no event running: nothing is going to move us, so the
+    /// world comes up where the server put us instead of on a timer. An event
+    /// that ran but did not place us stops holding at the backstop. A real
+    /// position does not wait, event or not.
     #[test]
     fn an_origin_position_only_holds_the_overlay_while_an_event_can_place_us() {
-        // A first-login character at the origin with the quest cutscene running:
-        // wait, or the player lands under the world before it places them.
         assert!(hold_for_spawn(false, true, false));
-        // The same origin with no event running: nothing is going to move us, so
-        // the world comes up where the server put us instead of on a timer.
         assert!(!hold_for_spawn(false, false, false));
-        // An event that ran but never placed us stops holding at the backstop.
         assert!(!hold_for_spawn(false, true, true));
-        // A real position never waits, event or not.
         assert!(!hold_for_spawn(true, true, false));
         assert!(!hold_for_spawn(true, false, false));
     }
 
+    /// The pre-cutscene "unplaced" sentinel is the origin; a real spawn
+    /// (Bastok's first-login correction) is far from it. A single non-zero
+    /// axis counts as real (a ground-plane spawn), and sub-centimeter jitter
+    /// at the origin stays "unplaced".
     #[test]
     fn position_is_real_separates_origin_from_spawn() {
-        // The pre-cutscene "unplaced" sentinel is the origin.
         assert!(!position_is_real(&WireVec3 {
             x: 0.0,
             y: 0.0,
             z: 0.0
         }));
-        // A real spawn (Bastok's first-login correction) is far from it.
         assert!(position_is_real(&WireVec3 {
             x: -280.0,
             y: -12.0,
             z: -90.0
         }));
-        // A single non-zero axis counts as real (a ground-plane spawn).
         assert!(position_is_real(&WireVec3 {
             x: 0.0,
             y: 0.0,
             z: 5.0
         }));
-        // Sub-centimeter jitter at the origin stays "unplaced".
         assert!(!position_is_real(&WireVec3 {
             x: 0.001,
             y: 0.0,

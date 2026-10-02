@@ -1,9 +1,11 @@
 //! Bring an installed client to the patch server's current version the way
 //! PlayOnline Viewer does, minus the viewer: version check, manifest, then
 //! per file either the current `.slc`/zlib image or the chain of `.olc`
-//! deltas, each result verified against its manifest signature. Decision
-//! rule from PlayOnlineViewer/viewer/com/polcore.dll (viewer 1.18.15e,
-//! SHA-256 73b1864b...) FUN_1003219e case 0x44c.
+//! deltas, each result verified against its manifest signature. The patch
+//! system's functions live in app.dll/polcore.dll
+//! (research/XiPackets/patch/Reversing.md). Decision rule from
+//! PlayOnlineViewer/viewer/com/polcore.dll (viewer 1.18.15e, SHA-256
+//! 73b1864b...) FUN_1003219e case 0x44c.
 
 use std::collections::HashMap;
 use std::fs;
@@ -138,6 +140,9 @@ fn workers(jobs: usize) -> usize {
         .max(1)
 }
 
+/// Scan the install against the manifest and build the update plan. The plan
+/// runs in manifest order, so what a given install produces does not depend
+/// on how the parallel scan interleaved.
 pub fn plan(root: &Path, manifest: &Manifest, report: &Reporter) -> Result<UpdatePlan, String> {
     let total = manifest.files.len();
     let next = AtomicUsize::new(0);
@@ -200,8 +205,6 @@ pub fn plan(root: &Path, manifest: &Manifest, report: &Reporter) -> Result<Updat
     }
     report(Progress::UpdateScanning { done: total, total });
 
-    // Manifest order, so the plan a given install produces does not depend on
-    // how the scan happened to interleave.
     let mut decided = decided.into_inner().expect("scan result lock");
     decided.sort_unstable_by_key(|(i, _, _)| *i);
     let mut plan = UpdatePlan {
@@ -287,6 +290,10 @@ impl Connection {
     }
 }
 
+/// Produce the post-update bytes for one file. The progress callback reports
+/// bytes cumulative within that file; a caller feeding a shared counter takes
+/// the delta so it stays monotone while other connections report against the
+/// same total.
 fn produce(
     conn: &mut Connection,
     root: &Path,
@@ -391,9 +398,6 @@ fn fetch_plan(
                     }
                     let item = &plan.files[index];
                     let history = by_path[item.path.as_str()];
-                    // `produce` reports bytes cumulative within one file; the
-                    // shared counter wants the delta so it stays monotone while
-                    // other connections report against the same total.
                     let mut counted = 0u64;
                     let data = produce(&mut conn, root, history, &item.action, &mut |n| {
                         let delta = n.saturating_sub(counted);
@@ -439,7 +443,7 @@ const LINEAGE_DISAGREEMENT_LIMIT: f64 = 8.0;
 /// Refuses an install whose code and data come from different lineages, which
 /// is what a private server's client looks like from here: patching it toward
 /// retail would overwrite exactly the files that make it work. Skipped for an
-/// install PlayOnline has never patched, since Square Enix's own base image
+/// install PlayOnline left unpatched, since Square Enix's own base image
 /// predates most of the manifest's history and so matches little of it - the
 /// one case where a low score is expected and harmless.
 fn refuse_foreign_lineage(root: &Path, plan: &UpdatePlan) -> Result<(), String> {

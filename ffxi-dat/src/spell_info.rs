@@ -274,8 +274,8 @@ mod tests {
         enc
     }
 
-    // Retail chunk walker (crate::chunk::ChunkWalker): a 16-byte header whose size
-    // field counts 16-byte units; only the name word and the kind/size word are used.
+    /// Retail chunk walker (crate::chunk::ChunkWalker): a 16-byte header whose size
+    /// field counts 16-byte units; only the name word and the kind/size word are used.
     const CHUNK_HEADER_BYTES: usize = 16;
     const CHUNK_HEADER_USED_BYTES: usize = SPELL_LIST_CHUNK_NAME.len() + size_of::<u32>();
 
@@ -307,8 +307,8 @@ mod tests {
         ])
     }
 
-    // The chunk padding must never land inside the block grid, so the body is kept a
-    // whole number of header-sized units.
+    /// The body is kept a whole number of header-sized units so chunk padding stays
+    /// out of the block grid.
     const SYNTH_BLOCKS: usize = 4;
     const _: () = assert!((SYNTH_BLOCKS * SPELL_BLOCK_SIZE).is_multiple_of(CHUNK_HEADER_BYTES));
 
@@ -416,7 +416,7 @@ mod tests {
         assert!(!SpellTable::open(dir.path()).is_empty());
     }
 
-    // Measured identical on horizonxi-2023 and retail-2026-09: 1024 blocks, block 0 empty.
+    /// Measured identical on horizonxi-2023 and retail-2026-09: 1024 blocks, block 0 empty.
     const INSTALLED_BLOCK_COUNT: usize = 1024;
 
     // vendor/server/sql/spell_list.sql rows (spellid, castTime, recastTime); the magic

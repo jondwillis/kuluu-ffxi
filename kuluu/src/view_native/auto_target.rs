@@ -58,11 +58,13 @@ pub fn pick_auto_target<'a>(
 }
 
 /// Re-engage on target death. Fires on the frame the main target leaves the
-/// slot with no server retarget filling it: a 0x058 that already committed a
-/// new main target leaves the slot filled and is left alone, and a Switch
-/// Target confirm in flight owns the slot until its 0x058 lands. The weapon
-/// must be out — the server's ATTACK byte (0x037 CHAR_STATUS) — so a
-/// disengaged player never re-arms.
+/// slot with no server retarget filling it: a 0x058 assist that already
+/// committed a new main target
+/// (vendor/server/src/map/packets/s2c/0x058_assist.cpp) leaves the slot
+/// filled and is left alone, and a Switch Target confirm in flight owns the
+/// slot until its 0x058 lands. The weapon must be out — the server's ATTACK
+/// byte (0x037 CHAR_STATUS, vendor/server/src/map/packets/char_status.cpp) —
+/// so a disengaged player never re-arms.
 pub fn auto_attack_retarget_system(
     auto: Res<AutoAttack>,
     target: Res<Target>,
@@ -175,11 +177,12 @@ mod tests {
         }
     }
 
+    /// .is_none() rather than assert_eq!(.., None): rkyv's cross-type
+    /// PartialEq impls (via ffxi-nav-recast) break bare-None inference in
+    /// assert_eq!.
     #[test]
     fn nothing_hits_self_means_no_candidate() {
         let ents = vec![mob(MOB_A, EntityKind::Mob, 5.0, 0.0, 0, 0)];
-        // .is_none() (not assert_eq!(.., None)): rkyv's cross-type PartialEq
-        // impls (via ffxi-nav-recast) break bare-None inference in assert_eq!
         assert!(pick_auto_target(&ents, Some(SELF), here(), &[], 0).is_none());
     }
 
@@ -249,7 +252,6 @@ mod tests {
         let a = pick_auto_target(&ents, Some(SELF), here(), &[], 0).unwrap();
         let b = pick_auto_target(&ents, Some(SELF), here(), &[], 1).unwrap();
         assert_ne!(a.id, b.id);
-        // Every seed lands on a real candidate.
         for seed in 0..64 {
             let pick = pick_auto_target(&ents, Some(SELF), here(), &[], seed).unwrap();
             assert!(matches!(pick.id, MOB_A | MOB_B));
@@ -290,17 +292,17 @@ mod tests {
         ];
     }
 
+    /// The first frame carries no previous target, so nothing fires; then
+    /// auto_clear drops the dead target and the retarget queues behind.
     #[test]
     fn the_death_frame_sends_the_change_target() {
         let (mut app, mut rx) = retarget_app();
         death_frame_scene(&mut app, ffxi_proto::decode::animation::ATTACK);
         app.world_mut().resource_mut::<Target>().id = Some(MOB_A);
 
-        // First frame carries no previous target: nothing fires.
         app.update();
         assert!(rx.try_recv().is_err());
 
-        // auto_clear drops the dead target; the retarget queues behind.
         app.world_mut().resource_mut::<Target>().id = None;
         app.update();
         assert_eq!(
@@ -313,13 +315,15 @@ mod tests {
         );
     }
 
+    /// The 0x058 assist committed a new main target instead of clearing the
+    /// slot (vendor/server/src/map/packets/s2c/0x058_assist.cpp): the
+    /// retarget stays suppressed.
     #[test]
     fn a_server_retarget_fill_suppresses_the_fire() {
         let (mut app, mut rx) = retarget_app();
         death_frame_scene(&mut app, ffxi_proto::decode::animation::ATTACK);
         app.world_mut().resource_mut::<Target>().id = Some(MOB_A);
         app.update();
-        // The 0x058 committed a new main target instead of clearing the slot.
         app.world_mut().resource_mut::<Target>().id = Some(MOB_B);
         app.update();
         assert!(rx.try_recv().is_err());

@@ -606,8 +606,6 @@ impl LocalMenuSession {
             // Retail lets you choose which box to open (Receive default); the
             // dedicated screen also toggles between them in-window.
             Action::OpenDeliveryBox => Advance::Frame(self.push(delivery_menu())),
-            // The levels stay: the caller suspends them so the panel's close
-            // can land back on the Receive/Send submenu.
             Action::DeliveryOpen { box_no } => Advance::DeliveryOpen { box_no },
             Action::DeliverySlot { box_no, slot } => {
                 let item = self

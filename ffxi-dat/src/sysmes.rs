@@ -65,10 +65,10 @@ const SLOT_TARGET_NAME: u8 = 0x11;
 /// The entity the message is by — a battle line's actor.
 const SLOT_CASTER_NAME: u8 = 0x10;
 
-// Resource-name codes: `<code> <n>` names the resource whose id the caller put
-// in message parameter `n`. Which table each resolves against is the caller's
-// business, so composition takes the finished name from
-// [`SysMesParams::names`]; [`MesBasicDat::resource_refs`] reports the pairing.
+/// Resource-name codes: `<code> <n>` names the resource whose id the caller put
+/// in message parameter `n`. Which table each resolves against is the caller's
+/// business, so composition takes the finished name from
+/// [`SysMesParams::names`]; [`MesBasicDat::resource_refs`] reports the pairing.
 /// Combat-skill name ("Dagger", "Evasion").
 const CC_COMBAT_SKILL: u8 = 0x05;
 /// Spell name.
@@ -449,7 +449,7 @@ fn compose(entry: &[u8], params: &SysMesParams) -> Composed {
                 AUTO_JOB_ABILITY => c.push_resource(MesBasicResource::JobAbility, param, params),
                 AUTO_SUBJECT_AGREEMENT => c.alt = Alt::Entity,
                 AUTO_RESULT_CLAUSE => {}
-                // The caster-emphasis pair and the gender alternatives carry no
+                // dmsg.rs: the caster-emphasis pair and the gender alternatives carry no
                 // parameter of their own.
                 dmsg::AUTO_EMOTE_CASTER_OPEN | dmsg::AUTO_EMOTE_CASTER_CLOSE => {
                     i += 2;
@@ -918,15 +918,15 @@ mod tests {
     }
 
     /// A code the composer does not know leaves a hole, so the entry must say
-    /// so rather than hand back text a caller would print.
+    /// so rather than hand back text a caller would print: the merit-name code
+    /// (no parameter array here) and an unresolved resource — AUTO_JOB_ABILITY
+    /// with a missing parameter — are the same failure from the caller's side.
     #[test]
     fn an_unknown_code_clears_fully_rendered() {
         let known = b"plain text";
         assert!(compose(known, &SysMesParams::default()).fully_rendered);
-        // 0x7f 0xb0 is the merit-name code, which has no parameter array here.
         let unknown = b"Your \x7f\xb0\x00 rose.";
         assert!(!compose(unknown, &SysMesParams::default()).fully_rendered);
-        // An unresolved resource is the same failure from the caller's side.
         let unresolved = b"\x7f\x8f\x00";
         assert!(!compose(unresolved, &SysMesParams::default()).fully_rendered);
     }

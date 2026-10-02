@@ -47,11 +47,14 @@ pub struct Install {
 }
 
 /// The directory above `SquareEnix/`, which is how a detected install is
-/// usually recognised (`HorizonXI`, `PlayOnline`, a bottle name).
+/// usually recognised (`HorizonXI`, `PlayOnline`, a bottle name). A root
+/// shallower than that (a bare folder, a bottle mount) takes its own name;
+/// a full path carries separators, which `valid_name` rejects.
 fn detected_name(root: &Path) -> String {
     root.parent()
         .and_then(Path::parent)
         .and_then(Path::file_name)
+        .or_else(|| root.file_name())
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| root.display().to_string())
 }
@@ -137,7 +140,7 @@ pub fn shell_dat_path() -> Option<&'static str> {
 /// The install the process will load, and why: the launcher's saved path when
 /// its override tick is set, else `FFXI_DAT_PATH`, else the registry's
 /// `default` install, else the launcher's saved path. A saved path that no
-/// longer holds an install is skipped, never loaded.
+/// longer holds an install is skipped.
 pub fn resolve(settings: &Settings) -> Result<Located, Unresolved> {
     let env_path = shell_dat_path().map(PathBuf::from);
     let config = Some(settings.dat_path.value.trim())
@@ -218,7 +221,7 @@ pub fn persist(root: &Path) -> Result<String, String> {
 }
 
 /// The registry half of [`persist`], with the directory as a parameter so
-/// tests never touch the real registry.
+/// tests run against a fixture instead of the real registry.
 fn persist_registry(root: &Path) -> Result<String, String> {
     persist_registry_in(
         &install::installs_dir().ok_or("no installs registry directory")?,
@@ -302,9 +305,9 @@ pub fn download(
     Ok(root)
 }
 
-/// A known non-retail build (a private server's pinned client) must never be
-/// patched toward retail; an unknown build is allowed through, since a
-/// freshly patched retail install is unknown until its row is measured.
+/// A known non-retail build (a private server's pinned client) is refused the
+/// patch toward retail; an unknown build is allowed through, since a freshly
+/// patched retail install is unknown until its row is measured.
 pub fn refuse_non_retail(root: &Path) -> Result<(), String> {
     match ClientProfile::probe(root).known {
         Some(k) if !k.retail => Err(format!(
@@ -355,8 +358,8 @@ pub struct SetupOutcome {
 }
 
 /// One shot from nothing to a current retail client: reuse an install already
-/// carrying `name` (never re-downloaded over), else download it, then patch
-/// it. Selecting it is the caller's decision.
+/// carrying `name` (not re-downloaded over), else download it, then patch it.
+/// Selecting it is the caller's decision.
 pub fn setup(
     opts: &SetupOptions,
     cancel: &ffxi_install::Cancel,
@@ -851,9 +854,9 @@ mod tests {
         root
     }
 
-    // The DAT-gate picker commits through this: the selection has to land in
-    // the registry default, which is what cold starts and the lobby version
-    // stamp resolve.
+    /// The DAT-gate picker commits through this: the selection has to land in
+    /// the registry default, which is what cold starts and the lobby version
+    /// stamp resolve.
     #[test]
     fn persist_registry_makes_the_choice_the_default_install() {
         let dir = std::env::temp_dir().join(format!("kuluu-persist-{}", std::process::id()));
@@ -867,7 +870,6 @@ mod tests {
         let r = install::resolve_in(Some(&dir), None).unwrap();
         assert_eq!(r.path, new);
 
-        // a folder outside the registry is linked in, then defaulted
         let foreign = fake_root("foreign");
         let name = persist_registry_in(&dir, &foreign).unwrap();
         assert_eq!(
@@ -882,8 +884,8 @@ mod tests {
         drop(old);
     }
 
-    // The shell value is captured once per process, so this test pins both
-    // orderings against whatever the test runner's shell had.
+    /// The shell value is captured once per process, so this test pins both
+    /// orderings against whatever the test runner's shell had.
     #[test]
     fn config_beats_the_shell_only_with_its_override_tick() {
         let cfg = fake_root("cfg");
@@ -938,6 +940,7 @@ mod era_tests {
             client_ver: client_ver.map(str::to_string),
             ver_lock,
             preferred_client: None,
+            terms_acknowledged: false,
         }
     }
 

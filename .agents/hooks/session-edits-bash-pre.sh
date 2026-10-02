@@ -33,6 +33,8 @@ root=$(repo_root "$cwd")
 
 mkdir -p "$(snap_dir)" || exit 0
 snap_sweep
+ledger_touch "$session_id"
+ledger_sweep
 snap=$(snap_path "$session_id" "$cmd") || exit 0
 git -C "$root" status --porcelain 2>/dev/null > "$snap" || true
 

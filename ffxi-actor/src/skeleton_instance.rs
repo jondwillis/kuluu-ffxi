@@ -874,15 +874,16 @@ mod tests {
         assert!(standard_joint_world_position(&world, &s, 5).is_none());
     }
 
-    // Ring geometry transcribed from the retail HumeM skeleton (ROM/27/82.DAT directory `hm_s`,
-    // skeleton `hum_`), as posed positions rather than raw offsets so the fixture root can stay
-    // unrotated: references 13..20 are filed on joint 0 around a torso-sized, front/back-
-    // asymmetric ellipse 1.1 above the root (pose space is -Y up), and 49..53 carry a zero
-    // offset there. `real_dat_retail_skeleton_resolves_the_nearest_joint_selector_onto_its_ring`
-    // holds this table to the install.
     const RING_HEIGHT: f32 = -1.1;
     const REFERENCE_TABLE_LEN: usize = 128;
     const ABOVE_HEAD_HEIGHT: f32 = -1.81;
+
+    /// Posed positions, not raw offsets, so the fixture root stays unrotated: transcribed from
+    /// the retail HumeM skeleton (ROM/27/82.DAT directory `hm_s`, skeleton `hum_`); references
+    /// 13..20 sit on joint 0 around a torso-sized, front/back-asymmetric ellipse at
+    /// `RING_HEIGHT`, 49..53 carry a zero offset. The real-DAT test
+    /// `real_dat_retail_skeleton_resolves_the_nearest_joint_selector_onto_its_ring` holds this
+    /// table to the install.
     const RETAIL_RING_POSITIONS: [[f32; 3]; 8] = [
         [0.24, RING_HEIGHT, 0.0],
         [0.2, RING_HEIGHT, -0.2],
@@ -913,9 +914,6 @@ mod tests {
         }
     }
 
-    // Independent oracle for the nearest-of-eight rule, stated as a projection rather than a
-    // distance: with the other actor at R*dir, |p - R*dir|^2 = |p|^2 - 2R(p.dir) + R^2, so for R
-    // far outside the ring the nearest point is the one reaching furthest along `dir`.
     const OTHER_ACTOR_REACH: f32 = 20.0;
 
     fn ring_positions(world: &[Mat4], s: &Skeleton) -> Vec<Vec3> {
@@ -924,6 +922,9 @@ mod tests {
             .collect()
     }
 
+    /// Nearest-of-eight as a projection rather than a distance: with the other actor at R*dir,
+    /// |p - R*dir|^2 = |p|^2 - 2R(p.dir) + R^2, so for R far outside the ring the nearest
+    /// point is the one reaching furthest along `dir`.
     fn most_forward_ring_point(world: &[Mat4], s: &Skeleton, dir: Vec3) -> Vec3 {
         ring_positions(world, s)
             .into_iter()
@@ -931,8 +932,8 @@ mod tests {
             .unwrap()
     }
 
-    // Bearings for the other actor: the eight authored ring directions plus off-axis ones, so the
-    // selector is exercised where the answer is not simply the ring point it points at.
+    /// The eight authored ring directions plus off-axis ones, so the selector is exercised
+    /// where the answer is not simply the ring point it points at.
     fn other_actor_bearings() -> Vec<Vec3> {
         (0..16)
             .map(|i| {
@@ -1008,12 +1009,10 @@ mod tests {
         }
     }
 
-    // Real-DAT oracle for the fixture above and for the whole selector rule: the retail HumeM
-    // skeleton, posed, must put a j1=49 attach (the ROM/0/0.DAT hit sparks g010/g011/g013) on the
-    // ring point nearest the attacker -- never at the actor root, which is what reference 49's own
-    // table entry resolves to.
-    // ROM/27/82.DAT directory `hm_s`, skeleton `hum_`, the same skeleton kuluu-render's
-    // melee-hit-chain test walks.
+    /// The retail HumeM skeleton (ROM/27/82.DAT directory `hm_s`, skeleton `hum_`; the same
+    /// skeleton kuluu-render's `melee_hit_chain_flattens_to_target_attached_sparks` walks): posed,
+    /// it puts the j1=49 attach (the ROM/0/0.DAT hit sparks g010/g011/g013) on the ring point
+    /// nearest the attacker, not the actor root that reference 49's own table entry resolves to.
     const HUME_M_SKELETON_FILE: u32 = 7072;
 
     #[test]

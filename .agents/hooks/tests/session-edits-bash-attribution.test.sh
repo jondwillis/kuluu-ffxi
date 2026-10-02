@@ -21,6 +21,11 @@ CASE=""
 
 fail() { printf 'FAIL - %s: %s\n' "$CASE" "$1"; FAILURES=$((FAILURES + 1)); }
 
+# Git hooks export repository selectors that would redirect fixture commands into the caller.
+while IFS= read -r git_local_var; do
+  unset "$git_local_var"
+done < <(git rev-parse --local-env-vars)
+
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
 ROOT=$(mktemp -d)
 trap 'rm -rf "$ROOT"' EXIT
@@ -146,16 +151,56 @@ test_named_but_unchanged_path_not_attributed() {
   assert_not_in_ledger "$SID" src/b.txt
 }
 
-# The broad arm, pinned as intended behaviour: a writer form with no path
-# operand credits whatever changed in its window. Narrowing it risks dropping
-# a real edit, which would silence the commit nudge on work that is ours.
+# A bare writer form with no file operand still credits a real reformat: the
+# plausible set for cargo fmt/fix is the workspace's tracked *.rs, and
+# dropping this arm would silence the commit nudge on work that is ours.
 test_writer_form_without_named_path_attributed() {
   new_repo
   local p; p=$(payload "$SID" "cargo fmt --all")
   run_hook session-edits-bash-pre.sh "$p"
-  printf 'formatted\n' > "$REPO/src/a.txt"
+  printf 'formatted\n' > "$REPO/mod.rs"
   run_hook session-edits-bash-post.sh "$p"
-  assert_in_ledger "$SID" src/a.txt
+  assert_in_ledger "$SID" mod.rs
+}
+
+# The race closed for non-writer commands: a peer's write to a path cargo
+# fmt cannot touch, concurrent with a bare cargo fmt --all, must land in the
+# suspect log, not the ledger.
+test_peer_write_outside_fmt_plausible_set_is_suspect() {
+  new_repo
+  local p; p=$(payload "$SID" "cargo fmt --all")
+  run_hook session-edits-bash-pre.sh "$p"
+  printf 'peer\n' >> "$REPO/src/a.txt"
+  run_hook session-edits-bash-post.sh "$p"
+  assert_not_in_ledger "$SID" src/a.txt
+  assert_in_suspect "$SID" src/a.txt
+}
+
+# cargo fmt formats the workspace's tracked sources; an untracked .rs file a
+# peer drops into the tree during the window is not in the plausible set.
+test_untracked_rs_outside_fmt_plausible_set_is_suspect() {
+  new_repo
+  local p; p=$(payload "$SID" "cargo fmt --all")
+  run_hook session-edits-bash-pre.sh "$p"
+  printf 'peer\n' > "$REPO/src/peer.rs"
+  run_hook session-edits-bash-post.sh "$p"
+  assert_not_in_ledger "$SID" src/peer.rs
+  assert_in_suspect "$SID" src/peer.rs
+}
+
+# rmcm names its operands, so only its operands are plausible (a directory
+# operand reaches into its tree); a peer write elsewhere in the window is a
+# suspect.
+test_rmcm_plausible_set_is_its_operands() {
+  new_repo
+  local p; p=$(payload "$SID" "rmcm hud")
+  run_hook session-edits-bash-pre.sh "$p"
+  printf 'formatted\n' > "$REPO/hud/mod.rs"
+  printf 'peer\n' >> "$REPO/src/a.txt"
+  run_hook session-edits-bash-post.sh "$p"
+  assert_in_ledger "$SID" hud/mod.rs
+  assert_not_in_ledger "$SID" src/a.txt
+  assert_in_suspect "$SID" src/a.txt
 }
 
 # Without this carve-out almost every command is a writer form and the whole
@@ -205,6 +250,63 @@ test_stale_snapshot_pair_is_swept() {
   fresh=$(snap_path "$SID" "wc -l src/a.txt")
   [ -f "$fresh" ] || fail "sweep took the live snapshot"
   return 0
+}
+
+# A dead session's ledger and suspect log would accumulate for the life of the
+# temp dir, and a stale <sid>.suspect keeps counting into the commit nudge if
+# the session id is reused. The sweep's policy is mtime-based: a file is reaped
+# once its owner's last hook touch is older than the ledger TTL, and every hook
+# touch refreshes that mtime, so the backdated touch stands in for a dead
+# session.
+test_stale_ledger_is_swept() {
+  new_repo
+  local p lp sp
+  p=$(payload "$SID" "sed -i '' 's/alpha/beta/' src/a.txt")
+  run_hook session-edits-bash-pre.sh "$p"
+  printf 'beta\n' > "$REPO/src/a.txt"
+  run_hook session-edits-bash-post.sh "$p"
+  p=$(payload "$SID" "wc -l README.md")
+  run_hook session-edits-bash-pre.sh "$p"
+  printf 'peer\n' >> "$REPO/src/b.txt"
+  run_hook session-edits-bash-post.sh "$p"
+  lp=$(ledger_path "$SID")
+  sp=$(suspect_path "$SID")
+  [ -f "$lp" ] || fail "ledger missing before the sweep"
+  [ -f "$sp" ] || fail "suspect log missing before the sweep"
+  touch -t 202001010000 "$lp" "$sp"
+  run_hook session-edits-bash-pre.sh "$(payload "sess-b" "wc -l README.md")"
+  [ -f "$lp" ] && fail "stale ledger survived the sweep"
+  [ -f "$sp" ] && fail "stale suspect log survived the sweep"
+  return 0
+}
+
+# The mtime refreshes on every tool call, not only on writes: a live session
+# mid-way through a long read-only phase must not lose its ledger to the
+# sweep.
+test_live_ledger_survives_the_sweep() {
+  new_repo
+  local p lp
+  p=$(payload "$SID" "sed -i '' 's/alpha/beta/' src/a.txt")
+  run_hook session-edits-bash-pre.sh "$p"
+  printf 'beta\n' > "$REPO/src/a.txt"
+  run_hook session-edits-bash-post.sh "$p"
+  lp=$(ledger_path "$SID")
+  touch -t 202001010000 "$lp"
+  run_hook session-edits-bash-pre.sh "$(payload "$SID" "wc -l README.md")"
+  [ -f "$lp" ] || fail "sweep took the live session's ledger"
+  return 0
+}
+
+# Same guard as the snapshot TTL: an operator's junk ledger-TTL override must
+# not turn a hook into a talker.
+test_malformed_ledger_ttl_override_stays_silent() {
+  new_repo
+  export SESSION_EDITS_LEDGER_TTL=not-a-number
+  local p; p=$(payload "$SID" "sed -i '' 's/alpha/beta/' src/a.txt")
+  run_hook session-edits-bash-pre.sh "$p"
+  printf 'beta\n' > "$REPO/src/a.txt"
+  run_hook session-edits-bash-post.sh "$p"
+  assert_in_ledger "$SID" src/a.txt
 }
 
 # stat_shim <flavour>: put a stand-in `stat` first on PATH. "gnu" rejects the
@@ -473,6 +575,41 @@ test_naming_a_basename_does_not_credit_a_nested_path() {
   assert_in_suspect "$SID" hud/mod.rs
 }
 
+# A read-only command names its paths to read them: a peer's concurrent write
+# to the named path is a suspect, not a ledger line, whatever the content did.
+test_read_only_named_path_not_attributed() {
+  new_repo
+  local p; p=$(payload "$SID" "wc -l src/a.txt")
+  run_hook session-edits-bash-pre.sh "$p"
+  printf 'peer\n' >> "$REPO/src/a.txt"
+  run_hook session-edits-bash-post.sh "$p"
+  assert_not_in_ledger "$SID" src/a.txt
+  assert_in_suspect "$SID" src/a.txt
+}
+
+# git is judged by subcommand: diff reads the path it names, so the peer's
+# write to it stays a suspect even though the content genuinely moved.
+test_git_diff_named_path_not_attributed() {
+  new_repo
+  local p; p=$(payload "$SID" "git diff src/a.txt")
+  run_hook session-edits-bash-pre.sh "$p"
+  printf 'peer\n' >> "$REPO/src/a.txt"
+  run_hook session-edits-bash-post.sh "$p"
+  assert_not_in_ledger "$SID" src/a.txt
+  assert_in_suspect "$SID" src/a.txt
+}
+
+# A compound command that also writes is not read-only: the sed -i in the
+# second clause keeps the naming arm alive for the path it names.
+test_compound_read_only_plus_write_still_attributed() {
+  new_repo
+  local p; p=$(payload "$SID" "wc -l src/a.txt && sed -i '' 's/alpha/beta/' src/a.txt")
+  run_hook session-edits-bash-pre.sh "$p"
+  printf 'beta\n' > "$REPO/src/a.txt"
+  run_hook session-edits-bash-post.sh "$p"
+  assert_in_ledger "$SID" src/a.txt
+}
+
 # bd names no file on its command line, and .beads/issues.jsonl is the export
 # that has to cross into git - withholding it silences the commit nudge on a
 # file almost every session writes. Crediting stays scoped to the directory bd
@@ -507,16 +644,52 @@ test_commit_nudge_names_the_suspect_log() {
     || fail "commit nudge does not name the suspect log"
 }
 
-CASES=(  test_peer_write_not_attributed
+test_redirect_write_attributed() {
+  new_repo
+  local p; p=$(payload "$SID" "printf beta > src/a.txt")
+  run_hook session-edits-bash-pre.sh "$p"
+  printf 'beta\n' > "$REPO/src/a.txt"
+  printf 'peer\n' >> "$REPO/src/b.txt"
+  run_hook session-edits-bash-post.sh "$p"
+  assert_in_ledger "$SID" src/a.txt
+  assert_not_in_ledger "$SID" src/b.txt
+}
+
+test_absolute_writer_attributed() {
+  new_repo
+  local p; p=$(payload "$SID" "/usr/bin/python3 gen.py src/a.txt")
+  run_hook session-edits-bash-pre.sh "$p"
+  printf 'beta\n' > "$REPO/src/a.txt"
+  run_hook session-edits-bash-post.sh "$p"
+  assert_in_ledger "$SID" src/a.txt
+}
+
+test_write_capable_utility_not_readonly() {
+  for cmd in 'sort -o src/a.txt src/a.txt' 'uniq src/a.txt src/b.txt' 'xxd -r src/a.txt src/b.txt' 'git diff -- src/b.txt && git restore src/a.txt'; do
+    cmd_readonly "$cmd" && fail "write classified as read-only: $cmd"
+  done
+  return 0
+}
+
+CASES=(  test_write_capable_utility_not_readonly
+  test_redirect_write_attributed
+  test_absolute_writer_attributed
+  test_peer_write_not_attributed
   test_peer_write_recorded_as_suspect
   test_named_sed_write_attributed
   test_named_write_to_already_dirty_path_attributed
   test_named_but_unchanged_path_not_attributed
   test_writer_form_without_named_path_attributed
+  test_peer_write_outside_fmt_plausible_set_is_suspect
+  test_untracked_rs_outside_fmt_plausible_set_is_suspect
+  test_rmcm_plausible_set_is_its_operands
   test_redirect_to_dev_null_is_not_a_writer_form
   test_redirect_into_tree_is_a_writer_form
   test_snapshot_key_matches_between_pre_and_post
   test_stale_snapshot_pair_is_swept
+  test_stale_ledger_is_swept
+  test_live_ledger_survives_the_sweep
+  test_malformed_ledger_ttl_override_stays_silent
   test_portable_snapshot_mtime
   test_attribution_survives_gnu_only_stat
   test_snapshot_key_is_single_sourced
@@ -534,6 +707,9 @@ CASES=(  test_peer_write_not_attributed
   test_suspect_log_records_a_reason_not_the_command
   test_naming_a_nested_path_does_not_credit_its_basename
   test_naming_a_basename_does_not_credit_a_nested_path
+  test_read_only_named_path_not_attributed
+  test_git_diff_named_path_not_attributed
+  test_compound_read_only_plus_write_still_attributed
   test_owned_tool_write_is_attributed
   test_commit_nudge_names_the_suspect_log
 )

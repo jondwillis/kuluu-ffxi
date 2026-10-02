@@ -599,12 +599,12 @@ mod char_status_tests {
         assert_eq!(CharStatus::BALLISTA_FLG_SHIFT, 21);
     }
 
+    /// BallistaFlg sits at bits 21..28 of Flags2, with a PetIndex (bits 3..18)
+    /// that must not leak into the byte, so the fixture ORs noise into the word.
     #[test]
     fn char_status_decodes_allegiance_from_flags2_ballista_flg() {
         const PET_INDEX_NOISE: u32 = 0x1234;
         let mut body = vec![0u8; CharStatus::MIN_LEN];
-        // BallistaFlg at bits 21..28, with a PetIndex (bits 3..18) that must
-        // not leak into the byte.
         let flags2 = (5u32 << CharStatus::BALLISTA_FLG_SHIFT) | PET_INDEX_NOISE;
         body[CharStatus::FLAGS2_OFFSET..CharStatus::FLAGS2_OFFSET + 4]
             .copy_from_slice(&flags2.to_le_bytes());

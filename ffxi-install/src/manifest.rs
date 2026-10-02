@@ -1,7 +1,10 @@
 //! The patch server's file manifest, the same text the viewer keeps as
-//! `patch.cfg`. Format from PlayOnlineViewer/viewer/com/polcore.dll (viewer
-//! 1.18.15e, SHA-256 73b1864b...): FUN_1004011e tokenises, FUN_10040060 maps
-//! the keywords, FUN_10038fed fills the per-version fields, and the worker
+//! `patch.cfg`. The status reply that carries it:
+//! research/XiPackets/patch/packets/0x0002/README.md. The patch system's
+//! functions live in app.dll/polcore.dll (research/XiPackets/patch/Reversing.md).
+//! Format from PlayOnlineViewer/viewer/com/polcore.dll (viewer 1.18.15e,
+//! SHA-256 73b1864b...): FUN_1004011e tokenises, FUN_10040060 maps the
+//! keywords, FUN_10038fed fills the per-version fields, and the worker
 //! case 0xf of FUN_1003e241 computes the signature every line is checked
 //! against.
 
@@ -82,7 +85,7 @@ pub struct Version {
     /// Server path of the whole file (`<stamp>/Direct/<path>.slc`).
     pub direct: String,
     pub direct_len: u64,
-    /// Server path of the delta from the previous line, when one exists.
+    /// Server path of the delta from the earlier line, when one exists.
     pub indirect: Option<Delta>,
 }
 

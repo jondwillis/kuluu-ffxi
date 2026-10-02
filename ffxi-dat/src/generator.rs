@@ -304,10 +304,10 @@ impl Generator {
     const LINKED_DATA_PARTICLE: u8 = 0x0B;
     const BILLBOARD_XYZ: u16 = 0x0001;
 
-    // No opcode sink here on purpose: this walks the very section 2 that
-    // `ParticleGeneratorDef::parse_reporting` decodes in full, reading only the mesh/position/
-    // scale/tint a billboard emitter needs. Its misses are that narrow intent, not coverage gaps,
-    // and counting them would double every initializer block in the stream.
+    /// No opcode sink here on purpose: this walks the very section 2 that
+    /// `ParticleGeneratorDef::parse_reporting` decodes in full, reading only the mesh/position/
+    /// scale/tint a billboard emitter needs. Its misses are that narrow intent, not coverage
+    /// gaps, and counting them would double every initializer block in the stream.
     pub fn parse_particle_emitter(body: &[u8]) -> Result<Option<ParticleEmitter>> {
         const HEADER_LEN: usize = 0x80;
         if body.len() < HEADER_LEN {

@@ -100,6 +100,10 @@ fn resolve_menu_entry(kind: MenuKind, label: &str) -> MenuDispatch {
 
 const EQUIP_SLOT_INDEX_MAX: u8 = (kuluu_render::equip_slot::EquipmentIndex::ALL.len() - 1) as u8;
 
+/// Confirm the entry under the cursor. Retail lists Use for every item and
+/// refuses an unusable or cooling-down one silently: no sub-target cursor, no
+/// chat line, the submenu stays put. The item drop confirm unwinds both the
+/// confirm and the Item submenu back to the list on either answer.
 pub(super) fn confirm_menu_at_cursor(
     bindings: &mut Bindings,
     stack: &mut MenuStack,
@@ -130,8 +134,6 @@ pub(super) fn confirm_menu_at_cursor(
         if label == kuluu_render::hud::menu::DEBUG_VOLUME {
             return None;
         }
-        // Retail+ section rows live in GraphicsSettings (persisted), not
-        // HudPanels — handle them before the panel toggles.
         if handle_retail_plus_row(label, graphics, scene_state) {
             return None;
         }
@@ -253,9 +255,6 @@ pub(super) fn confirm_menu_at_cursor(
                 }
                 return None;
             }
-            // Retail lists Use for every item and refuses an unusable or
-            // cooling-down one silently: no sub-target cursor, no chat line,
-            // the submenu stays put (kuluu-5ndh capture).
             if let A::UseItem {
                 container, index, ..
             } = action
@@ -286,15 +285,13 @@ pub(super) fn confirm_menu_at_cursor(
                 );
                 return None;
             }
-            let sub_action = sub_target_action_for(action);
-            if let Some(sub_action) = sub_action {
-                if !selected_target_valid(sub_action, target_id, scene_state) {
-                    // No valid target selected: retail's sub-target confirm step
-                    // fires the action only after the flashing cursor is confirmed.
-                    // Esc restores this menu with its cursor intact.
-                    let return_to = InputMode::Menu(stack.clone());
-                    return open_sub_target(sub_action, target_id, scene_state, return_to);
-                }
+            if let Some(sub_action) = sub_target_action_for(action) {
+                // Retail's sub-target confirm step: the cursor always shows,
+                // seeded on the current target when it passes the mask, else
+                // self, else the nearest candidate (initial_candidate). Esc
+                // restores this menu with its cursor intact.
+                let return_to = InputMode::Menu(stack.clone());
+                return open_sub_target(sub_action, target_id, scene_state, return_to);
             }
             let moved = matches!(action, A::MoveItem { .. });
             let entities = scene_state.snapshot.entities.clone();
@@ -341,7 +338,6 @@ pub(super) fn confirm_menu_at_cursor(
                 push_system_chat_line(scene_state, format!("[menu] drop dropped: {e}"));
             }
         }
-        // Either answer unwinds the confirm and the Item submenu back to the list.
         stack.pop();
         stack.pop();
         return None;
@@ -399,7 +395,11 @@ fn activate_current_time(
 /// `toggle_debug_panel`. The live toggles flip GraphicsSettings fields, so
 /// `persist_graphics_on_change` writes graphics.json automatically. Mob HP
 /// Under / Job Display only exist in enhanced builds (their rows are absent
-/// from DEBUG_ENTRIES without their feature).
+/// from DEBUG_ENTRIES without their feature). The section-chrome rows
+/// (separator + label) carry no state and answer with no banner. The DLSS
+/// row reads N/A and its toggle is inert when this build can't run DLSS at
+/// all (no dlss feature, or no RTX/Vulkan/DLLs), so the persisted gate does
+/// not flip.
 fn handle_retail_plus_row(
     label: &str,
     graphics: &mut kuluu_render::GraphicsSettings,
@@ -411,11 +411,8 @@ fn handle_retail_plus_row(
     use kuluu_render::hud::menu::RETAIL_MOB_HP_UNDER;
     use kuluu_render::hud::menu::{DEBUG_RETAIL_LABEL, DEBUG_RETAIL_SEPARATOR, RETAIL_DLSS_MENU};
     match label {
-        // Section chrome: no state, no banner.
         DEBUG_RETAIL_SEPARATOR | DEBUG_RETAIL_LABEL => true,
         RETAIL_DLSS_MENU => {
-            // This build can't run DLSS at all (no dlss feature, or no RTX/Vulkan/DLLs):
-            // the row reads N/A and the toggle is inert - don't flip a persisted gate.
             if !graphics.dlss_supported {
                 push_system_chat_line(
                     scene_state,
@@ -466,6 +463,9 @@ fn handle_retail_plus_row(
     }
 }
 
+/// Flip a Debug-menu toggle and report it. The weather/fog rows report the
+/// feature's live state, so they invert the off flags: Weather [on] = weather
+/// effects applied.
 fn toggle_debug_panel(
     label: &str,
     hud_panels: &mut kuluu_render::hud::HudPanels,
@@ -474,6 +474,8 @@ fn toggle_debug_panel(
     self_pos: kuluu_snapshot::Vec3,
     scene_state: &mut SceneState,
 ) {
+    #[cfg(feature = "enhanced-engage-move-lock-off")]
+    use kuluu_render::hud::menu::DEBUG_ENGAGE_ANIM_LOCK;
     use kuluu_render::hud::menu::{
         DEBUG_AUTO_ENTER_CS, DEBUG_ENTITY_LIST, DEBUG_FOG, DEBUG_GRAPHICS_DEBUG, DEBUG_MESH,
         DEBUG_NAMEPLATES, DEBUG_NET_STATUS, DEBUG_NOCLIP, DEBUG_PERF, DEBUG_POSITION_LOG,
@@ -511,12 +513,15 @@ fn toggle_debug_panel(
             hud_panels.noclip = !hud_panels.noclip;
             hud_panels.noclip
         }
+        #[cfg(feature = "enhanced-engage-move-lock-off")]
+        DEBUG_ENGAGE_ANIM_LOCK => {
+            hud_panels.engage_anim_lock = !hud_panels.engage_anim_lock;
+            hud_panels.engage_anim_lock
+        }
         DEBUG_AUTO_ENTER_CS => {
             hud_panels.auto_enter_cs = !hud_panels.auto_enter_cs;
             hud_panels.auto_enter_cs
         }
-        // The rows report the feature's live state, so they invert the "off"
-        // flags: Weather [on] = weather effects applied.
         DEBUG_WEATHER => {
             hud_panels.weather_off = !hud_panels.weather_off;
             !hud_panels.weather_off
@@ -576,6 +581,10 @@ fn toggle_debug_panel(
     );
 }
 
+/// Route one keypress in the open menu. In the sort pane, any key the pane
+/// does not own maps to SortPaneKey::Other so it can't leak into list
+/// navigation. Commands > Items opens on the inventory; only the Mog Menu
+/// storage rows open the window on another bag.
 pub(super) fn handle_menu_key(
     key: &Key,
     key_code: KeyCode,
@@ -715,7 +724,6 @@ pub(super) fn handle_menu_key(
                 {
                     SortPaneKey::Exit
                 } else {
-                    // Swallow any other key so it can't leak into list navigation.
                     SortPaneKey::Other
                 };
                 match sort_pane_key(item_menu_focus, sort_options, pane_key) {
@@ -887,8 +895,6 @@ pub(super) fn handle_menu_key(
             target_id,
             self_pos,
         );
-        // Commands > Items always opens on the inventory; only the Mog Menu
-        // storage rows open the window on another bag.
         if kind == MenuKind::Root && stack.current().is_some_and(|l| l.kind == MenuKind::Items) {
             item_bag.0 = ffxi_proto::map::container::LOC_INVENTORY;
         }
@@ -1021,6 +1027,8 @@ mod menu_key_tests {
         world
     }
 
+    /// Row 0 of Config is the "Interface" section header, so the cursor
+    /// settles onto the first selectable row below it.
     #[test]
     fn config_keys_cycle_radar_and_open_controls_without_changing_bindings() {
         use kuluu_render::graphics_settings::config_rows;
@@ -1031,8 +1039,6 @@ mod menu_key_tests {
         let mut world = marker_world();
         let mut stack = MenuStack::root();
         stack.push(MenuKind::Config);
-        // Row 0 is the "Interface" section header; the cursor settles onto the
-        // first selectable row below it.
         let minimap_slot = settle_cursor(MenuKind::Config, false, 0, true);
         stack.current_mut().unwrap().cursor = minimap_slot;
         for (key, code, expected) in [
@@ -1440,23 +1446,26 @@ mod menu_dispatch_tests {
     }
 
     #[test]
-    fn self_only_actions_skip_sub_target() {
+    fn every_menu_action_takes_the_sub_target_confirm() {
         use kuluu_render::hud::menu::DynamicMenuAction as A;
         use kuluu_render::input_mode::SubTargetAction as S;
-        // Boost (ability 39, validTarget SELF) casts on <me> — no <st> prompt.
+        // Boost (39) and Mighty Strikes (16) are validTarget SELF and still prompt.
         assert_eq!(
             sub_target_action_for(A::JobAbility { ability_id: 39 }),
-            None
+            Some(S::Ability(39))
         );
-        // Provoke (ability 35, ENEMY) still opens the sub-target cursor.
+        assert_eq!(
+            sub_target_action_for(A::JobAbility { ability_id: 16 }),
+            Some(S::Ability(16))
+        );
         assert_eq!(
             sub_target_action_for(A::JobAbility { ability_id: 35 }),
             Some(S::Ability(35))
         );
-        // Cure (spell 1, PARTY) still prompts.
         assert_eq!(
             sub_target_action_for(A::CastSpell { spell_id: 1 }),
             Some(S::Spell(1))
         );
+        assert_eq!(sub_target_action_for(A::Dismount), None);
     }
 }

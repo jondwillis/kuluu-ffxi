@@ -1,8 +1,7 @@
 //! XIUI-style party/alliance frame — the single party/self HUD.
 //!
-//! Replaces the old self_hud panel: self is row 0 of Party A (XIUI behavior),
-//! so there is exactly ONE panel drawing player/party state. This module owns
-//! the ROSTER column slot.
+//! Self is row 0 of Party A (XIUI behavior), so there is exactly ONE panel
+//! drawing player/party state. This module owns the ROSTER column slot.
 //!
 //! Geometry:
 //! - Party A = L1 "compact vertical": no name row — the name overlays the HP
@@ -15,8 +14,9 @@
 //! Runtime knobs live in `PartyFrameSettings`, edited only from the Debug
 //! menu "UI Settings" panel. No user-facing settings UI.
 //!
-//! Data: SceneSnapshot.party (GROUP_LIST 0x0DD / GROUP_ATTR 0x0DF), Res<Target>,
-//! NameColorTable, ZoneNameResolver. Buffs/casts/sync are later steps.
+//! Data: SceneSnapshot.party (GROUP_LIST 0x0DD / GROUP_ATTR 0x0DF; see
+//! vendor/server/src/map/packets/s2c/0x0dd_group_list.cpp), Res<Target>,
+//! NameColorTable, ZoneNameResolver.
 
 use bevy::prelude::*;
 
@@ -28,34 +28,35 @@ use crate::nameplate_color::{ncol, NameColorTable};
 use crate::scene::Target;
 use crate::snapshot::SceneState;
 
-// ---- geometry constants -----------------------
-
 /// XIUI PARTY_BAR_BASE_WIDTH_MULT: applied to every template width.
 const BASE_MULT: f32 = 0.8;
 
-// L1 — Party A "compact vertical".
+// L1 — Party A "compact vertical" (display.lua layout 1).
 const L1_HP_BASE_W: f32 = 150.0;
 const L1_MP_BASE_W: f32 = 100.0;
 const L1_BAR_H: f32 = 20.0;
 const L1_ICON_SIZE: f32 = 28.0;
 const L1_BAR_INSET: f32 = 4.0;
-const L1_HP_W_MULT: f32 = 0.82; // XIUI HX_BAR_WIDTH_MULT
+// display.lua HX_BAR_WIDTH_MULT: HP/MP bar length in layout 1 only.
+const L1_HP_W_MULT: f32 = 0.82;
+// display.lua: the MP bar takes an extra 10% trim on top of HX_BAR_WIDTH_MULT.
 const L1_MP_EXTRA_W_MULT: f32 = 0.9;
 
-// L2 — Alliance B/C "super compact" (XIUI built-in template).
+// L2 — Alliance B/C "super compact" (display.lua layout 2).
 const L2_HP_BASE_W: f32 = 135.0;
 const L2_MP_BASE_W: f32 = 80.0;
 const L2_BAR_H: f32 = 12.0;
-const L2_ENTRY_W: f32 = 160.0; // box width, wider than the bars
-const L2_NAME_BAR_OVERLAP: f32 = 3.0; // text row dips into HP bar top
-const L2_MP_OVERLAP: f32 = 2.0; // MP bar shifted up under the HP bar
+/// Entry box width; wider than the bars, which sit right-aligned in it.
+const L2_ENTRY_W: f32 = 160.0;
+/// Text row dips this many px into the HP bar top.
+const L2_NAME_BAR_OVERLAP: f32 = 3.0;
+/// MP bar shifted up under the HP bar by this many px.
+const L2_MP_OVERLAP: f32 = 2.0;
 
-// Text sizes (px).
 const NAME_PX: f32 = 12.0;
 const JOB_PX: f32 = 10.0;
 const TITLE_PX: f32 = 14.0;
 
-// Colors.
 const MP_COLOR: Color = Color::srgb(0.30, 0.50, 0.90);
 const TP_FULL: Color = Color::srgb(1.00, 0.80, 0.20);
 const TP_DIM: Color = Color::srgb(0.55, 0.55, 0.55);
@@ -63,13 +64,13 @@ const OUT_OF_ZONE_BLOCK: Color = Color::srgb(0.02, 0.02, 0.02);
 const LEADER_DOT: Color = Color::srgb(1.00, 0.82, 0.25);
 const TARGET_BG: Color = Color::srgba(0.35, 0.55, 0.95, 0.30);
 const TARGET_BORDER: Color = Color::srgb(0.65, 0.80, 1.00);
-// Reserved for the subtarget highlight (Res<Target> carries one id until the
-// target-bar work lands a second slot).
+/// Reserved for the subtarget highlight: Res<Target> carries one id until a
+/// second slot lands.
 #[allow(dead_code)]
 const SUBTARGET_BG: Color = Color::srgba(0.95, 0.80, 0.25, 0.30);
 #[allow(dead_code)]
 const SUBTARGET_BORDER: Color = Color::srgb(1.00, 0.87, 0.40);
-const BAND_COLOR: Color = Color::srgba(0.35, 0.06, 0.06, 0.55); // L1 alternating band
+const BAND_COLOR: Color = Color::srgba(0.35, 0.06, 0.06, 0.55);
 const TREASURE_FLAG: Color = Color::srgb(1.00, 0.84, 0.00);
 // Activity-flag marker colors (XIUI display.lua DrawCurrentTarget block).
 const FLAG_DC: Color = Color::srgb(0.60, 0.60, 0.60);
@@ -80,8 +81,6 @@ const FLAG_AWAY: Color = Color::srgb(0.55, 0.55, 0.55);
 const FLAG_LFP: Color = Color::srgb(0.45, 0.70, 1.00);
 const FLAG_BAZAAR: Color = Color::srgb(1.00, 0.80, 0.20);
 
-// ---- settings (Debug-menu "UI Settings" only) ------------------------------
-
 #[derive(Resource, Clone)]
 pub struct PartyFrameSettings {
     /// Per-window layout override: 0 = default (A=L1, B/C=L2), 1 = force L1,
@@ -89,8 +88,8 @@ pub struct PartyFrameSettings {
     pub layout_a: u8,
     pub layout_b: u8,
     pub layout_c: u8,
-    /// Show Party A when solo. This is a client HUD, not XIUI — the frame
-    /// always shows; the flag only exists so the Debug menu can hide it.
+    /// Show Party A when solo. This is a client HUD, not XIUI: the frame
+    /// draws regardless; the flag only exists so the Debug menu can hide it.
     pub show_when_solo: bool,
     /// Draw the MP bar for no-MP jobs too.
     pub always_show_mp_bar: bool,
@@ -135,7 +134,8 @@ impl Default for PartyFrameSettings {
 /// Single activity marker per member, retail priority order (XIUI mirrors
 /// FFXI's player-icon rule: only one at a time):
 /// link-dead > GM > mentor > new-adv > away > LFP/LFG > bazaar.
-/// Sync is omitted — it needs buff data (0x076), not entity flags.
+/// Sync is omitted: it needs buff data (0x076, vendor/server/src/map/packets/s2c/0x076_group_effects.cpp),
+/// not entity flags.
 fn activity_marker(flags: &kuluu_snapshot::CharFlags) -> Option<(&'static str, Color)> {
     if flags.linkdead {
         Some(("D/C", FLAG_DC))
@@ -156,8 +156,8 @@ fn activity_marker(flags: &kuluu_snapshot::CharFlags) -> Option<(&'static str, C
     }
 }
 
+/// Returns true for L1, false for L2; window A defaults to L1, B/C to L2.
 fn layout_for(party_no: u8, s: &PartyFrameSettings) -> bool {
-    // returns true for L1, false for L2
     let forced = match party_no {
         0 => s.layout_a,
         1 => s.layout_b,
@@ -166,11 +166,9 @@ fn layout_for(party_no: u8, s: &PartyFrameSettings) -> bool {
     match forced {
         1 => true,
         2 => false,
-        _ => party_no == 0, // default: A=L1, B/C=L2
+        _ => party_no == 0,
     }
 }
-
-// ---- components -------------------------------------------------------------
 
 /// Root of one party window (A/B/C).
 #[derive(Component)]
@@ -189,8 +187,8 @@ pub struct PartyTitle {
 pub struct PartyTargetDist;
 
 /// Per-member distance text on an L1 name line. Updated in place between row
-/// rebuilds so movement never triggers a clear-and-respawn (which made the
-/// panel's measured size oscillate — the "double box" ghost).
+/// rebuilds: a clear-and-respawn made the panel's measured size oscillate —
+/// the "double box" ghost.
 #[derive(Component)]
 pub struct MemberDistText(pub u32);
 
@@ -209,8 +207,6 @@ pub struct PartyRowsHost {
 ///.
 #[derive(Component)]
 pub struct PartyRowTarget(pub u32);
-
-// ---- UI Settings panel (Debug menu) -----------------------------------------
 
 #[derive(Component)]
 pub struct UiSettingsPanel;
@@ -273,6 +269,8 @@ fn setting_label(key: UiSettingKey, s: &PartyFrameSettings) -> String {
     }
 }
 
+/// Cycles/toggles one setting. MinRows floors the placeholder row count at
+/// 0..=6.
 fn cycle_setting(key: UiSettingKey, s: &mut PartyFrameSettings) {
     match key {
         UiSettingKey::LayoutA => s.layout_a = (s.layout_a + 1) % 3,
@@ -286,7 +284,7 @@ fn cycle_setting(key: UiSettingKey, s: &mut PartyFrameSettings) {
         UiSettingKey::AlternatingBands => s.alternating_bands = !s.alternating_bands,
         UiSettingKey::SelectionBox => s.selection_box = !s.selection_box,
         UiSettingKey::HpDisplayMode => s.hp_display_mode = (s.hp_display_mode + 1) % 3,
-        UiSettingKey::MinRows => s.min_rows = (s.min_rows + 1) % 7, // 0..=6
+        UiSettingKey::MinRows => s.min_rows = (s.min_rows + 1) % 7,
         UiSettingKey::Scale => {
             let next = match s
                 .scale
@@ -301,8 +299,6 @@ fn cycle_setting(key: UiSettingKey, s: &mut PartyFrameSettings) {
         }
     }
 }
-
-// ---- HP color ramp -----------------------------
 
 pub fn hp_ramp(pct: u8) -> Color {
     let p = pct as f32;
@@ -362,8 +358,10 @@ fn hp_value_text(m: &kuluu_snapshot::PartyMember, mode: u8) -> String {
     }
 }
 
-/// Derived max (P0 stopgap until self max HP/MP lands from 0x063): only used
-/// for the "current/max" display mode.
+/// Derived max, used only for the "current/max" display mode: PartyMember
+/// carries no max HP/MP field, so the max is back-solved from the current
+/// value and its percentage; the authoritative source is the 0x061 CLISTATUS
+/// block (vendor/server/src/map/packets/s2c/0x061_clistatus.cpp).
 fn max_from_pct(m: &kuluu_snapshot::PartyMember) -> u32 {
     if m.hp_pct > 0 {
         (m.hp as f32 / m.hp_pct as f32 * 100.0).round() as u32
@@ -372,12 +370,15 @@ fn max_from_pct(m: &kuluu_snapshot::PartyMember) -> u32 {
     }
 }
 
-// ---- spawn -------------------------------------------------------------------
-
+/// Spawns the three window roots + the Debug-menu UI Settings panel. Window
+/// padding per layout: L1 x=10, L2 x=3. The title straddles the top border,
+/// centered; the treasure-pool flag sits left of the title (Party A only),
+/// lit while the pool holds items; the distance-to-target readout sits right
+/// (Party A only, owned by update_party_dist_text_system). The rows host
+/// (re)builds member entries each dirty frame.
 pub fn spawn_party_frames(mut commands: Commands) {
     for party_no in 0u8..3 {
         let is_l1_default = party_no == 0;
-        // Window padding per layout: L1 {10,6}, L2 {3,3}.
         let pad_x = if is_l1_default { 10.0 } else { 3.0 };
         let top_pad = if is_l1_default {
             TITLE_PX * 0.75 + 3.0
@@ -414,7 +415,6 @@ pub fn spawn_party_frames(mut commands: Commands) {
                 BorderColor::all(theme::FRAME_EDGE),
             ))
             .with_children(|root| {
-                // Title straddling the top border (centered).
                 root.spawn((
                     PartyTitle { party_no },
                     Text::new(if party_no == 0 { "Solo" } else { "" }),
@@ -429,8 +429,6 @@ pub fn spawn_party_frames(mut commands: Commands) {
                     },
                     TextLayout::justify(Justify::Center),
                 ));
-                // Treasure-pool flag on the title row, left of the title
-                // (Party A only) — lit while the pool holds items.
                 if party_no == 0 {
                     root.spawn((
                         PartyTreasureFlag,
@@ -445,7 +443,6 @@ pub fn spawn_party_frames(mut commands: Commands) {
                         },
                     ));
                 }
-                // Distance-to-target on the title row, right side (Party A only).
                 if party_no == 0 {
                     root.spawn((
                         PartyTargetDist,
@@ -460,7 +457,6 @@ pub fn spawn_party_frames(mut commands: Commands) {
                         },
                     ));
                 }
-                // Rows host (member entries are (re)built here each dirty frame).
                 root.spawn((
                     PartyRowsHost { party_no },
                     Node {
@@ -539,39 +535,48 @@ fn spawn_ui_settings_panel(mut commands: Commands) {
         });
 }
 
-// ---- per-frame update ---------------------------------------------------------
-
 /// Rebuilds member rows + titles from the snapshot when anything relevant
-/// changed: snapshot dirty, target changed (highlight must not wait for the
+/// changed: snapshot dirty, target changed (the highlight cannot wait for the
 /// next packet), or settings changed.
+///
+/// Rebuilds only when rendered content actually changes: `state.dirty` fires
+/// on every packet (position updates while moving), and a clear-and-respawn
+/// per frame made the panel's measured size oscillate between frames — a
+/// temporal double image ("double box"). `enhanced-job-display` is the
+/// compile-time half of the Retail+ gate: without it a persisted
+/// `job_display` from an enhanced build stays off in a plain one. A cheap
+/// field gate runs before the expensive key build: party_content_key
+/// deep-clones the party list and scans every entity per member, so it stays
+/// out of the idle path; ingest_system (PreUpdate) sets `dirty` only when
+/// fresh data lands, so with no new snapshot the cheap fields prove the whole
+/// key would be unchanged. A fresh snapshot still pays for the full scan:
+/// char_flags can move without touching any field the cheap gate reads (a
+/// member toggling seeking-party). Titles + treasure flag share one merged
+/// query: two separate `&mut Text` queries would conflict at runtime (B0001);
+/// Bevy cannot prove the entities disjoint. Self prefers the session's own
+/// char id over resolve_self's party.first() fallback: on a zone-in the group
+/// list can land before our own entry, and pulling a stranger into window A as
+/// "self" miscolours their row. Window show/hide is a client HUD, not XIUI:
+/// missing party data keeps window A up; retail hides the frame only while a
+/// map-server transition is in flight (Stage::Zoning), and its first draw
+/// after load is the self row with name + 0/0 until group data lands. Rows
+/// rebuild per window by clear-and-respawn (row counts are tiny); window A
+/// with no group data yet shows a synthetic self row, name + 0/0, instead of
+/// hiding, and min_rows keeps dimmed placeholder rows under the live members.
 pub fn update_party_frame_system(
     mut commands: Commands,
     state: Res<SceneState>,
     target: Res<Target>,
-    // Retail+ gate (dev-only Debug menu): the L1 job-icon column is hidden
-    // unless explicitly enabled — retail's party frame shows no jobs.
     graphics: Res<crate::graphics_settings::GraphicsSettings>,
     settings: Res<PartyFrameSettings>,
     colors: Res<NameColorTable>,
     zone_names: Option<Res<crate::hud::zone_flash::ZoneNameResolver>>,
     mut root_q: Query<(&PartyFrameRoot, &mut Node), Without<PartyRowsHost>>,
-    // One merged query: two separate `&mut Text` queries would conflict at
-    // runtime (B0001) — Bevy can't prove the entities disjoint. Distance texts
-    // are NOT touched here; update_party_dist_text_system keeps them fresh in
-    // place every frame.
     mut title_q: Query<(&mut Text, Option<&PartyTitle>, Option<&PartyTreasureFlag>)>,
     host_q: Query<(Entity, &PartyRowsHost, Option<&Children>)>,
     mut last_key: Local<Option<PartyContentKey>>,
 ) {
-    // Rebuild only when rendered content actually changes. `state.dirty` fires
-    // on EVERY packet (position updates while moving); clear-and-respawn per
-    // frame made the panel's measured size oscillate between frames — a
-    // temporal double image ("double box"). The old self_hud updated text in
-    // place and never churned entities, which is why it didn't have this.
     let snap = &state.snapshot;
-    // `enhanced-job-display` is the compile-time half of the Retail+ gate:
-    // without it a persisted `job_display` from an enhanced build can never
-    // light the column in a plain one.
     #[cfg(feature = "enhanced-job-display")]
     let job_on = graphics.job_display;
     #[cfg(not(feature = "enhanced-job-display"))]
@@ -579,14 +584,6 @@ pub fn update_party_frame_system(
         let _ = &graphics;
         false
     };
-    // Cheap gate before the expensive key build. party_content_key deep-clones
-    // the party list and scans every entity per member, so it must not run 60x
-    // a second while idle. ingest_system runs in PreUpdate and sets `dirty`
-    // only when fresh data lands; with no new snapshot this frame the scene is
-    // byte-identical to what last_key was built from — including the entity
-    // flags it scanned — so equal cheap fields prove the whole key would be
-    // unchanged. A fresh snapshot still pays for the full scan: char_flags can
-    // move without touching any field below (a member toggling seeking-party).
     if !target.is_changed() && !settings.is_changed() {
         if let Some(last) = last_key.as_ref() {
             let cheap_equal = snap.zone_id == last.zone_id
@@ -611,9 +608,6 @@ pub fn update_party_frame_system(
 
     let self_member = crate::snapshot::resolve_self(&snap.party, snap.self_char_id);
     let self_zone = self_member.map(|m| m.zone_no);
-    // Prefer the session's own char id over resolve_self's party.first()
-    // fallback: on a zone-in the group list can land before our own entry,
-    // and pulling a stranger into window A as "self" miscolours their row.
     let self_id = snap.self_char_id.or(self_member.map(|m| m.id));
     let self_pos = snap.self_pos.pos;
 
@@ -624,10 +618,6 @@ pub fn update_party_frame_system(
         .map(|m| m.party_no != ffxi_proto::decode::NO_PARTY)
         .unwrap_or(false);
 
-    // Show/hide window roots. This is a client HUD, not XIUI: missing party
-    // data never hides window A — retail hides the frame only while a
-    // map-server transition is in flight (Stage::Zoning), and its first draw
-    // after load is the self row with name + 0/0 until group data lands.
     let zoning = snap.stage == kuluu_snapshot::Stage::Zoning;
     for (root, mut node) in root_q.iter_mut() {
         let show = if zoning {
@@ -640,9 +630,6 @@ pub fn update_party_frame_system(
         node.display = if show { Display::Flex } else { Display::None };
     }
 
-    // Titles + treasure flag (one merged query — separate `&mut Text` queries
-    // would conflict B0001). Distance readouts are owned by
-    // update_party_dist_text_system.
     for (mut text, title, treasure) in title_q.iter_mut() {
         let want = if let Some(title) = title {
             match title.party_no {
@@ -671,7 +658,6 @@ pub fn update_party_frame_system(
         }
     }
 
-    // Rebuild rows per window (v1: clear-and-respawn; row counts are tiny).
     for (host_entity, host, children) in host_q.iter() {
         if let Some(children) = children {
             for c in children.iter() {
@@ -680,9 +666,6 @@ pub fn update_party_frame_system(
         }
         let is_l1 = layout_for(host.party_no, &settings);
 
-        // Zone-in default draw (retail parity): window A with no group data yet
-        // shows a synthetic self row — name + 0/0 — instead of hiding. The real
-        // entry replaces it the moment group data lands (key change -> rebuild).
         let synthetic_self;
         let members: Vec<&kuluu_snapshot::PartyMember> =
             if host.party_no == 0 && windows[0].is_empty() {
@@ -710,7 +693,6 @@ pub fn update_party_frame_system(
                 windows[host.party_no as usize].clone()
             };
 
-        // min_rows: keep dimmed placeholder rows under the live members.
         let total_rows = members.len().max(settings.min_rows as usize);
         commands.entity(host_entity).with_children(|host_cb| {
             for slot in 0..total_rows {
@@ -739,11 +721,11 @@ pub fn update_party_frame_system(
 }
 
 /// Everything that affects row/title rendering, cheaply comparable. Position
-/// data is deliberately EXCLUDED — distance readouts are updated in place by
-/// update_party_dist_text_system, so movement never triggers a rebuild.
-/// Zone + stage ARE included: a zone-in must force the first default draw even
-/// when the party list looks identical to the previous zone's (or empty), and
-/// Zoning<->InZone flips must re-run the show/hide logic.
+/// data is deliberately excluded: distance readouts are updated in place by
+/// update_party_dist_text_system, so movement does not trigger a rebuild.
+/// Zone + stage are included: a zone-in forces the first default draw even
+/// when the party list matches the last zone's (or is empty), and
+/// Zoning<->InZone flips re-run the show/hide logic.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PartyContentKey {
     self_char_id: Option<u32>,
@@ -754,8 +736,8 @@ pub struct PartyContentKey {
     zone_id: Option<u16>,
     stage: kuluu_snapshot::Stage,
     /// Monotonically increasing counter from the session, bumped on every zone
-    /// change. Guarantees the key differs after a zone transition even when the
-    /// actual party data is byte-identical, forcing the UI to rebuild.
+    /// change: after a zone transition the key differs even when the actual
+    /// party data is byte-identical, forcing the UI to rebuild.
     zone_generation: u64,
     /// NameColorTable content version (0 until the retail table loads). The
     /// table can land after the first draw and its colours feed every row's
@@ -822,6 +804,9 @@ fn target_dist_text(
 /// Keeps distance readouts fresh between row rebuilds (in place, no churn):
 /// per-member distances on L1 name lines + target distance on the Party A
 /// title line. Runs every frame; writes only when a string actually changes.
+/// Registered in its own add_systems call: the main HUD tuple above it is
+/// already at Bevy's 20-element limit, and it must follow the row rebuild so
+/// freshly spawned distance texts get their value same-frame.
 pub fn update_party_dist_text_system(
     state: Res<SceneState>,
     target: Res<Target>,
@@ -852,8 +837,14 @@ pub fn update_party_dist_text_system(
     }
 }
 
-// ---- member rows ---------------------------------------------------------------
-
+/// Builds one member row's data. Self's PartyMember.name is often None (the
+/// party packet does not carry the own name); fall back to the snapshot
+/// char_name, and vice versa. Retail party-aware name color: self = PC row,
+/// others = PARTY row (nameplate_color.rs ncol table). Member distance to
+/// self appears on L1 name lines; self gets none, its distance to itself is
+/// 0.0 (the "weird 0.0" behind the frame). The activity marker comes from
+/// entity flags; only members present as visible entities carry one
+/// (out-of-zone rows have no Entity).
 fn spawn_member_row(
     parent: &mut ChildSpawnerCommands,
     m: &kuluu_snapshot::PartyMember,
@@ -871,8 +862,6 @@ fn spawn_member_row(
     let out_of_zone = matches!((self_zone, Some(m.zone_no)), (Some(sz), Some(mz)) if sz != mz);
     let is_target = target_id == Some(m.id);
 
-    // Self's PartyMember.name is often None (the party packet doesn't carry
-    // the own name); fall back to the snapshot char_name, and vice versa.
     let name = if Some(m.id) == self_id {
         snap.char_name
             .clone()
@@ -888,12 +877,9 @@ fn spawn_member_row(
         name.clone()
     };
 
-    // Retail party-aware name color: self = PC row, others = PARTY row.
     let is_self = Some(m.id) == self_id;
     let name_color = colors.color(if is_self { ncol::PC } else { ncol::PARTY });
 
-    // Member distance to self (L1 name line). Self gets none — its distance
-    // to itself is always 0.0 (the "weird 0.0" behind the frame).
     let member_dist: Option<String> = if s.show_member_distance && !out_of_zone && !is_self {
         snap.entities
             .iter()
@@ -903,8 +889,6 @@ fn spawn_member_row(
         None
     };
 
-    // Activity marker from entity flags — only members present as visible
-    // entities carry one (out-of-zone rows have no Entity).
     let flag = snap
         .entities
         .iter()
@@ -940,6 +924,16 @@ fn spawn_member_row(
 
 /// L1 compact vertical (Party A): [icon slot | HP bar / MP bar], with the
 /// name line overlaid on the HP bar's top edge and distance right-aligned.
+/// Retail+ gate: with the job column off the row is just the bars, no icon
+/// slot, no gap (retail's party frame has no jobs). The row root is relative
+/// so the absolute name line anchors to it; uniform padding on every row, the
+/// selection box toggles colors, not geometry. The job icon slot is
+/// placeholder text until icon textures land, with no background box: the
+/// filled rectangle read as a leftover artifact. The bars column puts HP on
+/// top, MP right-aligned under it (display.lua L1); [TP value] [MP bar] share
+/// one line under the HP bar's right edge, TP a bare number (gold at 1000).
+/// The name line straddles the HP bar's top edge: [leader dot(s)] [name]
+/// ......... [distance].
 fn spawn_row_l1(
     parent: &mut ChildSpawnerCommands,
     m: &kuluu_snapshot::PartyMember,
@@ -956,14 +950,10 @@ fn spawn_row_l1(
     let hp_w = L1_HP_BASE_W * BASE_MULT * L1_HP_W_MULT * sc;
     let mp_w = L1_MP_BASE_W * BASE_MULT * L1_HP_W_MULT * L1_MP_EXTRA_W_MULT * sc;
     let bar_h = L1_BAR_H * sc;
-    // Retail+ gate: with the job column off the row is just the bars — no
-    // icon slot, no gap (retail's party frame has no jobs).
     let icon_size = if job_display { L1_ICON_SIZE * sc } else { 0.0 };
     let inset = if job_display { L1_BAR_INSET * sc } else { 0.0 };
     let entry_h = bar_h + 1.0 + bar_h;
 
-    // Row root: relative so the absolute name line anchors to it. Uniform
-    // padding on every row (selection box toggles colors, not geometry).
     let mut row = parent.spawn((
         Node {
             position_type: PositionType::Relative,
@@ -986,9 +976,6 @@ fn spawn_row_l1(
     }
 
     row.with_children(|row| {
-        // Job icon slot (placeholder text until icon textures land). No
-        // background box — the filled rectangle read as a leftover artifact.
-        // Retail+ gate: skipped entirely when job_display is off.
         if job_display {
             row.spawn((Node {
                 width: Val::Px(icon_size),
@@ -1007,7 +994,6 @@ fn spawn_row_l1(
                 });
         }
 
-        // Bars column: HP on top, MP right-aligned under it (XIUI L1).
         row.spawn((Node {
             flex_direction: FlexDirection::Column,
             row_gap: Val::Px(1.0),
@@ -1025,8 +1011,6 @@ fn spawn_row_l1(
                     );
                 });
 
-                // [TP value] [MP bar] on ONE line, right-aligned under the HP
-                // bar's right edge. TP is a bare number (gold at 1000) — no label.
                 let show_mp = s.always_show_mp_bar || m.mp > 0;
                 if show_mp || s.show_tp {
                     bars.spawn(Node {
@@ -1062,8 +1046,6 @@ fn spawn_row_l1(
                 }
             });
 
-        // Name line overlaid on the HP bar's top edge (straddles it):
-        // [leader dot(s)] [name] ......... [distance].
         row.spawn((Node {
             position_type: PositionType::Absolute,
             left: Val::Px(0.0),
@@ -1110,7 +1092,11 @@ fn spawn_row_l1(
 }
 
 /// L2 super compact (Alliance B/C): text row [name … HP value] dipping into
-/// the HP bar top; bars right-aligned in a box wider than they are.
+/// the HP bar top; bars right-aligned in an entry box wider than they are.
+/// The text row is [leader dot(s)] [name] ......... [HP value], dipping into
+/// the HP bar top by `overlap` px (the bar starts at hp_top). The HP bar is
+/// right-aligned in the entry box; the MP bar sits below it, shifted up so
+/// the HP bar covers its top sliver. The TP value is text only in L2.
 fn spawn_row_l2(
     parent: &mut ChildSpawnerCommands,
     m: &kuluu_snapshot::PartyMember,
@@ -1125,7 +1111,7 @@ fn spawn_row_l2(
     let hp_w = L2_HP_BASE_W * BASE_MULT * sc;
     let mp_w = L2_MP_BASE_W * BASE_MULT * sc;
     let bar_h = L2_BAR_H * sc;
-    let entry_w = (L2_ENTRY_W * BASE_MULT).max(hp_w) * 1.0; // box wider than bars
+    let entry_w = (L2_ENTRY_W * BASE_MULT).max(hp_w) * 1.0;
     let name_row_h = NAME_PX + 2.0;
     let overlap = L2_NAME_BAR_OVERLAP * sc;
     let mp_overlap = L2_MP_OVERLAP * sc;
@@ -1151,8 +1137,6 @@ fn spawn_row_l2(
     }
 
     row.with_children(|row| {
-        // Text row: [leader dot(s)] [name] ......... [HP value]. Dips into the
-        // HP bar top by `overlap` px (the bar starts at hp_top).
         row.spawn((Node {
             position_type: PositionType::Absolute,
             left: Val::Px(0.0),
@@ -1200,7 +1184,6 @@ fn spawn_row_l2(
                 }
             });
 
-        // HP bar: right-aligned in the entry box.
         row.spawn(Node {
             position_type: PositionType::Absolute,
             left: Val::Px(entry_w - hp_w),
@@ -1208,17 +1191,9 @@ fn spawn_row_l2(
             ..bar_track(hp_w, bar_h)
         })
         .with_children(|hp| {
-            fill_or_block(
-                hp,
-                out_of_zone,
-                m.hp_pct as f32,
-                hp_ramp(m.hp_pct),
-                "", // L2: HP value lives in the text row above
-                0.0,
-            );
+            fill_or_block(hp, out_of_zone, m.hp_pct as f32, hp_ramp(m.hp_pct), "", 0.0);
         });
 
-        // MP bar: below HP, shifted up so the HP bar covers its top sliver.
         let show_mp = s.always_show_mp_bar || m.mp > 0;
         if show_mp {
             row.spawn(Node {
@@ -1239,7 +1214,6 @@ fn spawn_row_l2(
             });
         }
 
-        // TP value (text only in L2).
         if s.show_tp {
             row.spawn((
                 Text::new(format!("TP {}", m.tp)),
@@ -1256,7 +1230,9 @@ fn spawn_row_l2(
     });
 }
 
-/// Dimmed empty row (min_rows floor).
+/// Dimmed empty row (min_rows floor). An empty track (no fill) reads as a
+/// dimmed empty slot; Bevy's Node has no per-node opacity in 0.19, so the
+/// dimming is the track's own colors, not an overlay.
 fn spawn_placeholder_row(parent: &mut ChildSpawnerCommands, is_l1: bool, s: &PartyFrameSettings) {
     let sc = s.scale;
     let hp_w = if is_l1 {
@@ -1278,13 +1254,9 @@ fn spawn_placeholder_row(parent: &mut ChildSpawnerCommands, is_l1: bool, s: &Par
             ..default()
         },))
         .with_children(|row| {
-            // Empty track (no fill) reads as a dimmed empty slot; Bevy's Node has
-            // no per-node opacity in 0.19, so we don't fake it with an overlay.
             row.spawn(bar_track(hp_w, bar_h));
         });
 }
-
-// ---- small builders -------------------------------------------------------------
 
 fn bar_track(w: f32, h: f32) -> Node {
     Node {
@@ -1366,13 +1338,14 @@ fn dot_node(color: Color) -> (Node, BackgroundColor) {
 }
 
 /// XIUI shortenZoneName over the resolved zone display name; falls back to a
-/// stable "Z{id}" placeholder when no name is known
-///.
+/// stable "Z{id}" placeholder when no name is known. Word slicing is
+/// char-based, not byte-sliced: a first word starting with a multi-byte char
+/// (CJK/emoji zone names) would panic on a byte index that is not a char
+/// boundary.
 fn short_zone(zone_no: u16, resolver: Option<&crate::hud::zone_flash::ZoneNameResolver>) -> String {
     let Some(name) = resolver.and_then(|r| r.0(zone_no)) else {
         return format!("Z{zone_no}");
     };
-    // Strip apostrophes.
     let cleaned: String = name.chars().filter(|c| *c != '\'').collect();
     let words: Vec<&str> = cleaned.split_whitespace().collect();
     match words.len() {
@@ -1380,9 +1353,6 @@ fn short_zone(zone_no: u16, resolver: Option<&crate::hud::zone_flash::ZoneNameRe
         1 => words[0].to_string(),
         _ if words.get(1) == Some(&"of") => words.last().copied().unwrap_or(words[0]).to_string(),
         2 => {
-            // Char-based, not byte-sliced: a first word starting with a
-            // multi-byte char (CJK/emoji zone names) would panic on a byte
-            // index that is not a char boundary.
             let head: String = words[0].chars().take(2).collect();
             format!("{}{}", head, words[1])
         }
@@ -1396,11 +1366,9 @@ fn short_zone(zone_no: u16, resolver: Option<&crate::hud::zone_flash::ZoneNameRe
     }
 }
 
-// ---- click-to-target ------------------------------
-
 /// Clicking a member row targets that entity — same path as world picking.
+/// Settings rows carry no PartyRowTarget, so no filter is needed here.
 pub fn party_row_click_system(
-    // Settings rows carry no PartyRowTarget, so no filter is needed here.
     mut q: Query<(&mut Interaction, &PartyRowTarget)>,
     mut target: ResMut<Target>,
 ) {
@@ -1411,8 +1379,6 @@ pub fn party_row_click_system(
         }
     }
 }
-
-// ---- UI Settings panel -------------------------------------------------------------
 
 /// Shows/hides the panel with the Debug menu flag and refreshes row labels
 /// when settings change.
@@ -1456,15 +1422,13 @@ pub fn ui_settings_click_system(
     }
 }
 
-// ---- tests ------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     /// The retail colour table can land after the first party draw; its content
-    /// version must be part of the key or late-loaded colours sit stale until an
-    /// unrelated field happens to change.
+    /// version has to be part of the key or late-loaded colours sit stale until
+    /// an unrelated field happens to change.
     #[test]
     fn content_key_tracks_name_color_table_generation() {
         let snap = kuluu_snapshot::SceneSnapshot::default();
@@ -1537,12 +1501,12 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(label(&f), Some("Baz"));
-        f.lfg = true; // outranks bazaar
-        assert_eq!(label(&f), Some("LFP"));
-        f.away = true; // outranks lfp
-        assert_eq!(label(&f), Some("Away"));
-        f.linkdead = true; // top priority
-        assert_eq!(label(&f), Some("D/C"));
+        f.lfg = true;
+        assert_eq!(label(&f), Some("LFP"), "lfg outranks bazaar");
+        f.away = true;
+        assert_eq!(label(&f), Some("Away"), "away outranks lfp");
+        f.linkdead = true;
+        assert_eq!(label(&f), Some("D/C"), "link-dead is top priority");
     }
 
     /// A two-word zone whose first word starts with multi-byte chars must not
@@ -1555,8 +1519,11 @@ mod tests {
 
     #[test]
     fn short_zone_rules() {
-        // No resolver -> placeholder.
-        assert_eq!(short_zone(234, None), "Z234");
+        assert_eq!(
+            short_zone(234, None),
+            "Z234",
+            "no resolver falls back to the placeholder"
+        );
     }
 
     #[test]

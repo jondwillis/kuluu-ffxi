@@ -245,7 +245,12 @@ pub struct CutsceneMode {
     pub active: bool,
     pub camera_locked: bool,
     /// The last 0x67/0x68 the running event staged; `None` until one arrives.
+    /// research/XiEvents/OpCodes/0x0067.md
     pub(crate) hud_event: Option<bool>,
+    /// True once the running event's 0x20 released the player's control
+    /// (retail's `CliEventUcFlag` written 0), lifting the event-wide pin
+    /// until a later 0x20 re-locks. research/XiEvents/OpCodes/0x0020.md
+    pub player_released: bool,
 }
 
 impl CutsceneMode {
@@ -255,11 +260,13 @@ impl CutsceneMode {
 
     /// An active session holding the camera, no 0x67/0x68 staged yet — what tests construct
     /// when they need a locked cutscene without driving the cue stream.
+    /// research/XiEvents/OpCodes/0x0067.md
     pub fn active_locked() -> Self {
         Self {
             active: true,
             camera_locked: true,
             hud_event: None,
+            player_released: false,
         }
     }
 }
@@ -424,6 +431,7 @@ fn event_name_string(name: &[u8; 16]) -> String {
 /// Event-scoped like every other cue: cleared at [`ViewerEvent::CutsceneEnded`]
 /// so the server-authored name returns. The nameplate pass reads these ahead
 /// of the entity-table record.
+/// research/XiEvents/OpCodes/0x00B5.md
 #[derive(Resource, Debug, Default)]
 pub struct EventNameOverrides {
     names: HashMap<u32, String>,
@@ -443,6 +451,8 @@ impl EventNameOverrides {
     }
 }
 
+/// Apply the cue to the mode and fade state; actor motion and non-fade
+/// schedulers are dispatched by scheduler_runtime::dispatch_cutscene_motion.
 fn apply_cue(
     cue: &CutsceneCue,
     programs: &FadePrograms,
@@ -451,6 +461,7 @@ fn apply_cue(
 ) {
     match *cue {
         CutsceneCue::CameraLock { lock } => mode.camera_locked = lock,
+        CutsceneCue::PlayerControl { locked } => mode.player_released = !locked,
         CutsceneCue::HudHide { hide } => mode.hud_event = Some(hide),
         CutsceneCue::Scheduler {
             dat_id,
@@ -468,14 +479,13 @@ fn apply_cue(
                 fade.start(&scaled(program, ratio));
             }
         }
-        // Actor motion and non-fade schedulers are dispatched by
-        // scheduler_runtime::dispatch_cutscene_motion.
         _ => {}
     }
 }
 
 /// The 0x77/0x78 game-clock hold, drained on its own cursor because [`VanaClock`] outlives this
 /// module's other systems; a session exit releases whatever it left held.
+/// research/XiEvents/OpCodes/0x0077.md
 pub fn drain_cutscene_clock(
     events: Res<EventLog>,
     mut cursor: Local<u64>,
@@ -489,9 +499,20 @@ pub fn drain_cutscene_clock(
     for g in (*cursor).max(first_global)..total {
         match &events.recent[(g - first_global) as usize] {
             ViewerEvent::Cutscene { cue } => match cue {
-                CutsceneCue::ClockHold { stop: true, hour } => match *hour {
-                    Some(hour) => clock.freeze_at_hour(hour),
-                    None => clock.freeze(),
+                CutsceneCue::ClockHold {
+                    stop: true,
+                    hour,
+                    minute,
+                    day_from_epoch,
+                } => match *day_from_epoch {
+                    Some(day) => {
+                        let hour = hour.unwrap_or(0);
+                        clock.freeze_at_day_hour_minute(day, hour, *minute as u32);
+                    }
+                    None => match *hour {
+                        Some(hour) => clock.freeze_at_hour_minute(hour, *minute as u32),
+                        None => clock.freeze(),
+                    },
                 },
                 CutsceneCue::ClockHold { stop: false, .. } => clock.thaw(),
                 _ => {}
@@ -640,6 +661,8 @@ mod tests {
                     actor_fade: None,
                     idle_transition_time: None,
                     flinch_duration: None,
+                    model_visibility: None,
+                    spell_effect: None,
                     random_group: None,
                     local_dir: ffxi_dat::scheduler::NO_LOCAL_DIR,
                 },
@@ -774,8 +797,49 @@ mod tests {
         assert!(!app.world().resource::<CutsceneMode>().camera_locked);
     }
 
+    /// The 0x20 write of retail's CliEventUcFlag: 0 lifts the event-wide pin,
+    /// 1 re-locks, and the session end resets it with the mode.
+    /// research/XiEvents/OpCodes/0x0020.md
+    #[test]
+    fn the_player_control_cue_writes_the_pin_flag() {
+        let mut app = test_app();
+        push(&mut app, ViewerEvent::CutsceneStarted { event_id: 100 });
+        step(&mut app, 1.0);
+        assert!(
+            !app.world().resource::<CutsceneMode>().player_released,
+            "the event pins until the script says otherwise"
+        );
+
+        push(
+            &mut app,
+            ViewerEvent::Cutscene {
+                cue: CutsceneCue::PlayerControl { locked: false },
+            },
+        );
+        step(&mut app, 1.0);
+        assert!(app.world().resource::<CutsceneMode>().player_released);
+
+        push(
+            &mut app,
+            ViewerEvent::Cutscene {
+                cue: CutsceneCue::PlayerControl { locked: true },
+            },
+        );
+        step(&mut app, 1.0);
+        assert!(!app.world().resource::<CutsceneMode>().player_released);
+
+        push(&mut app, ViewerEvent::CutsceneEnded);
+        step(&mut app, 1.0);
+        let mode = app.world().resource::<CutsceneMode>();
+        assert!(
+            !mode.active && !mode.player_released,
+            "session end resets the mode"
+        );
+    }
+
     /// Event 503's D1 shows the HUD while the camera stays locked until H7: an explicit
     /// 0x68 must win over the lock default, and both clear at session end.
+    /// research/XiEvents/OpCodes/0x0068.md
     #[test]
     fn an_explicit_show_hud_wins_over_the_camera_lock_and_clears_at_session_end() {
         let mut app = test_app();
@@ -835,7 +899,12 @@ mod tests {
 
     fn clock_hold(stop: bool, hour: Option<u32>) -> ViewerEvent {
         ViewerEvent::Cutscene {
-            cue: CutsceneCue::ClockHold { stop, hour },
+            cue: CutsceneCue::ClockHold {
+                stop,
+                hour,
+                minute: 0,
+                day_from_epoch: None,
+            },
         }
     }
 
@@ -896,12 +965,60 @@ mod tests {
     }
 
     #[test]
-    fn freeze_at_hour_lands_on_the_zero_minute_of_that_day() {
+    fn freeze_at_hour_minute_lands_on_the_authored_hour_and_minute() {
         let mut clock = VanaClock::default();
-        clock.freeze_at_hour(8);
+        clock.freeze_at_hour_minute(8, 0);
         assert_eq!(
             crate::vana_time::format_vana_time(clock.earth_unix_secs_now()),
             "8:00"
+        );
+        clock.freeze_at_hour_minute(8, 30);
+        assert_eq!(
+            crate::vana_time::format_vana_time(clock.earth_unix_secs_now()),
+            "8:30"
+        );
+    }
+
+    /// 0xA9's date jump: Vana day 14 from the epoch at 00:30 is 886/1/15.
+    #[test]
+    fn freeze_at_day_hour_minute_lands_on_the_authored_vana_day() {
+        let mut clock = VanaClock::default();
+        clock.freeze_at_day_hour_minute(14, 0, 30);
+        assert_eq!(
+            crate::vana_time::format_vana_time(clock.earth_unix_secs_now()),
+            "0:30"
+        );
+        let date = crate::vana_time::VanaDate::from_earth_unix(clock.earth_unix_secs_now());
+        assert_eq!(date.year, 886);
+        assert_eq!(date.month, 1);
+        assert_eq!(date.day, 15);
+    }
+
+    /// A 0xA9-style cue (a day_from_epoch) drives the date jump through the
+    /// drain, not just the VanaClock method.
+    #[test]
+    fn a_set_clock_date_cue_jumps_the_vana_date() {
+        let mut app = clock_app();
+        step(&mut app, 1.0);
+        push(
+            &mut app,
+            ViewerEvent::Cutscene {
+                cue: CutsceneCue::ClockHold {
+                    stop: true,
+                    hour: Some(0),
+                    minute: 30,
+                    day_from_epoch: Some(14),
+                },
+            },
+        );
+        step(&mut app, 1.0);
+        let clock = app.world().resource::<VanaClock>();
+        assert!(clock.is_frozen());
+        let date = crate::vana_time::VanaDate::from_earth_unix(clock.earth_unix_secs_now());
+        assert_eq!(date.day, 15, "jumped to Vana day 14 (1-based 15)");
+        assert_eq!(
+            crate::vana_time::format_vana_time(clock.earth_unix_secs_now()),
+            "0:30"
         );
     }
 
@@ -963,6 +1080,7 @@ mod tests {
 
     /// A 0xB5 rename resolves its actor to a server id (the local player
     /// through the table's self id) and holds the name until the session ends.
+    /// research/XiEvents/OpCodes/0x00B5.md
     #[test]
     fn an_entity_name_cue_overrides_the_plate_name_until_session_end() {
         const SELF: u32 = 0x010E_6001;

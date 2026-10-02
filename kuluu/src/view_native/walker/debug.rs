@@ -19,8 +19,8 @@ use super::{HorizontalOutcome, StepResult, VerticalDecision, WalkMode};
 /// Ring length: 120 ticks = 2 s at the production 60 Hz.
 pub const RING_LEN: usize = 120;
 
-// Manual Default: arrays longer than 32 have no `Default` impl on this
-// toolchain, so the ring is built with from_fn.
+/// Manual `Default`: the ring is built with `from_fn`, so a derived `Default`
+/// would need the `Default` impl the long array lacks on this toolchain.
 #[derive(Resource)]
 pub struct FieldDebug {
     /// The last recorded tick's ramp field (None until dispatch has run).
@@ -41,10 +41,11 @@ pub struct FieldDebug {
     decisions: [Option<VerticalDecision>; 2],
     /// Last two detected horizontal outcomes, oldest first (panel header +
     /// the blocking-contact gizmo). A no-input tick overwrites only while the
-    /// newest slot is not already NoInput: idle holds the last stop reason
-    /// instead of erasing it, and the ring never shows two no-inputs.
+    /// newest slot is not already NoInput: idle ticks carry no new information,
+    /// so they hold the last stop reason in place instead of erasing it.
     outcomes: [Option<HorizontalOutcome>; 2],
-    ring: [Option<(Option<f32>, Option<f32>, f32)>; RING_LEN], // (h0, target, y)
+    /// Per-tick (h0, target, y) samples; `history` reads them oldest-first.
+    ring: [Option<(Option<f32>, Option<f32>, f32)>; RING_LEN],
 
     head: usize,
     count: usize,
@@ -120,7 +121,8 @@ impl FieldDebug {
 /// Sample the field at a wire position and record it into the ring. Called from
 /// dispatch at both `walker::step` sites so panel and gizmos show the same
 /// tick's data that moved the player; `res` is that tick's StepResult (mode,
-/// vy, decision, outcome).
+/// vy, decision, outcome). Facing maps from the wire forward (cos a, -sin a)
+/// to bevy xz as (fwd_x, -fwd_y), since bevy.z = -wire.y.
 pub fn record_tick(
     dbg: &mut FieldDebug,
     geom: &MzbCollisionGeometry,
@@ -141,8 +143,6 @@ pub fn record_tick(
     });
     let feet_xz = Vec2::new(p.x, p.z);
     let feet_y = p.y;
-    // Facing in bevy xz: the wire forward (cos a, -sin a) maps to
-    // (fwd_x, -fwd_y) under bevy.z = -wire.y.
     let (fwd_x, fwd_y) = crate::view_native::input::heading_to_forward(heading);
     let m = Vec2::new(fwd_x, -fwd_y);
 
@@ -157,7 +157,6 @@ pub fn record_tick(
     };
     dbg.record(h0, target, feet_y);
 
-    // Mode / vy / decision for the panel header.
     dbg.mode = res.mode;
     dbg.vy = match res.mode {
         WalkMode::Airborne { vy } => vy,
@@ -166,10 +165,6 @@ pub fn record_tick(
     let prev = dbg.decisions[1];
     dbg.decisions[0] = prev;
     dbg.decisions[1] = Some(res.decision);
-    // Idle ticks are the only ones that don't overwrite: once the newest
-    // slot is NoInput, further idle ticks hold the last two detected states
-    // in place (the panel's value is the last stop reason; idle ticks carry
-    // no new information).
     let idle_repeat = matches!(res.outcome, HorizontalOutcome::NoInput)
         && matches!(dbg.outcomes[1], Some(HorizontalOutcome::NoInput));
     if !idle_repeat {
@@ -192,7 +187,22 @@ pub fn sync_field_debug_enabled(
 /// In-world ramp-field gizmos behind the `stair_draw` toggle. bevy_gizmos has
 /// no world-anchored text (only z=0-plane `text_2d`, which would not track a
 /// moving character), so the riser count and decisions live in the panel; this
-/// draws geometry only.
+/// draws geometry only. Legend: sample spheres at (xz, h_k) colored by status,
+/// the dead-band window dimmed blue because the field carries no ramp there;
+/// a lip-filtered sample adds a line to the raw height showing how far the
+/// filter moved it; a miss draws a red X at the feet height, where no floor
+/// sits under the column. The envelope is a green segment along m from
+/// -LOOKBEHIND to +LOOKAHEAD at target + g.x * d, the plane of gradient g
+/// touching the highest sample, plus a small outline quad when the lateral
+/// gradient tilts it off the move line by g.y * LATERAL_OFFSET at each end
+/// (bevy_gizmos has no filled-quad primitive). Support probes: five spheres at
+/// feet +- FOOT_RADIUS, green accepted / red not, with a short bar at h0. Three
+/// bars at the feet xz mark wire Y (cyan), target (green) and h0 (white);
+/// bars coincident within 1e-3 collapse to one. A cyan arrow at the feet gives
+/// the move direction, and the last tick's blocking contact, where a wall or a
+/// mob withheld the move so the cause is visible in-world, not just in the
+/// panel, draws a sphere and bar in the WallAhead magenta for walls and the
+/// reject red for an actor.
 pub fn draw_walker_field_gizmos(
     dbg: Res<FieldDebug>,
     panels: Res<kuluu_render::hud::HudPanels>,
@@ -205,8 +215,6 @@ pub fn draw_walker_field_gizmos(
         return;
     };
 
-    // Sample spheres at (xz, h_k), colored by status. A dead-band window dims
-    // everything blue: the field carries no ramp and nothing here is a signal.
     for s in &field.samples {
         let pos = Vec3::new(s.xz.x, 0.0, s.xz.y);
         match s.status {
@@ -227,7 +235,6 @@ pub fn draw_walker_field_gizmos(
                         Color::srgb(1.0, 0.9, 0.2),
                     );
                 }
-                // Thin line to the raw height: how much the filter moved it.
                 if let (Some(raw), Some(filt)) = (s.raw, s.filtered) {
                     gizmos.line(
                         pos + Vec3::Y * raw,
@@ -246,7 +253,6 @@ pub fn draw_walker_field_gizmos(
                 }
             }
             field::SampleStatus::Miss => {
-                // Red X at the feet height: no floor under this column.
                 let c = Color::srgb(1.0, 0.2, 0.2);
                 let a = pos + Vec3::Y * dbg.feet_y;
                 gizmos.line(
@@ -272,8 +278,6 @@ pub fn draw_walker_field_gizmos(
         }
     }
 
-    // Envelope: a green segment along m from -LOOKBEHIND to +LOOKAHEAD at
-    // target + g.x * d (the plane of gradient g touching the highest sample).
     if let Some(target) = field.target {
         let back = Vec3::new(
             field.feet_xz.x - field.m.x * LOOKBEHIND,
@@ -286,9 +290,6 @@ pub fn draw_walker_field_gizmos(
             field.feet_xz.y + field.m.y * LOOKAHEAD,
         );
         gizmos.line(back, front, Color::srgb(0.3, 1.0, 0.4));
-        // A small quad when the lateral gradient is non-zero: the plane tilts
-        // off the move line by g.y * LATERAL_OFFSET at each end (outline only;
-        // bevy_gizmos has no filled-quad primitive).
         if field.g.y.abs() > 1e-4 {
             let l = LATERAL_OFFSET;
             let perp = Vec2::new(-field.m.y, field.m.x);
@@ -302,8 +303,6 @@ pub fn draw_walker_field_gizmos(
         }
     }
 
-    // Support probes: five spheres at feet +- FOOT_RADIUS, green accepted /
-    // red not; a short bar at h0.
     if let Some(probe) = &dbg.probe {
         for (i, xz) in field::support_positions(field.feet_xz)
             .into_iter()
@@ -330,8 +329,6 @@ pub fn draw_walker_field_gizmos(
         }
     }
 
-    // Three bars at the feet xz: wire Y cyan, target green, h0 white. Coincident
-    // within 1e-3 collapse to one bar (the dedup below).
     let mut bars: Vec<(f32, Color)> = vec![(dbg.feet_y, Color::srgb(0.2, 0.9, 1.0))];
     if let Some(t) = field.target {
         bars.push((t, Color::srgb(0.3, 1.0, 0.4)));
@@ -343,12 +340,11 @@ pub fn draw_walker_field_gizmos(
     let c = Vec3::new(field.feet_xz.x, 0.0, field.feet_xz.y);
     for (i, &(h, col)) in bars.iter().enumerate() {
         if i > 0 && (h - bars[i - 1].0).abs() < 1e-3 {
-            continue; // coincident with the bar just drawn
+            continue;
         }
         gizmos.line(c + Vec3::Y * (h - 0.2), c + Vec3::Y * (h + 0.2), col);
     }
 
-    // Move direction arrow at the feet.
     let a = Vec3::new(field.feet_xz.x, dbg.feet_y + 0.1, field.feet_xz.y);
     gizmos.line(
         a,
@@ -356,9 +352,6 @@ pub fn draw_walker_field_gizmos(
         Color::srgb(0.2, 0.9, 1.0),
     );
 
-    // Last tick's blocking contact: where the wall or the mob withheld the
-    // move, so the cause is visible in-world, not just in the panel. Walls
-    // reuse the WallAhead magenta; an actor the reject red.
     if let Some(outcome) = dbg.outcomes[1] {
         if let Some(c) = outcome.contact_point() {
             let color = match outcome {

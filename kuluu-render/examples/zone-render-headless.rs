@@ -58,14 +58,16 @@ struct P {
     // LSB weather id driving the weat/<tag> canopy under --sky. None = whatever
     // an unset CurrentWeather resolves to, i.e. the client's own zone-in default.
     weather: Option<u16>,
+    /// The zone's own timed auto-run emitters (lantern flames/glows, chimney
+    /// smoke); --no-zone-particles leaves them out for an A/B frame-time read.
     zone_particles: bool,
-    // Some(n): Enhanced Dynamic Lights with n shadowed lamps, zone geometry casting.
+    /// Some(n): Enhanced Dynamic Lights with n shadowed lamps, zone geometry casting.
     enhanced_lights: Option<u32>,
-    // Skinned NPC actors placed in the zone (needs --sky), for reading how the
-    // lamps light and shadow a character standing in their pool.
+    /// Skinned NPC actors placed in the zone (needs --sky), for reading how the
+    /// lamps light and shadow a character standing in their pool.
     npcs: Vec<NpcPlacement>,
-    // Model Shadow Receiving off: the A/B against a default run isolates what the
-    // shadow maps change on the placed actors, since the zone reads identically.
+    /// Model Shadow Receiving off: the A/B against a default run isolates what the
+    /// shadow maps change on the placed actors, since the zone reads identically.
     no_receive: bool,
 }
 #[derive(Clone, Copy)]
@@ -300,7 +302,6 @@ fn main() {
             gfx.zone_shadow_cast = true;
         }
         app.insert_resource(gfx)
-            // The DAT's 0x47 point lights, and under --enhanced-lights their shadow maps.
             .add_plugins(kuluu_render::zone_point_lights::ZonePointLightsPlugin)
             .add_plugins(SkyboxPlugin)
             .add_plugins(MoonMaterialPlugin)
@@ -327,8 +328,6 @@ fn main() {
             // reads the HUD's mesh-debug flag, which only the full viewer inserts.
             .init_resource::<kuluu_render::hud::HudPanels>()
             .add_plugins(kuluu_render::weather_particles::WeatherParticlesPlugin)
-            // The zone's own timed auto-run emitters (lantern flames/glows, chimney smoke);
-            // --no-zone-particles leaves them out for an A/B frame-time read.
             .add_plugins(ZoneParticlesGate(zone_particles))
             .init_resource::<VanaSky>()
             .init_resource::<ZoneDirectionalLighting>()
@@ -424,9 +423,9 @@ fn spawn_npcs(
         commands.entity(entity).insert(NpcGrounded(false));
     }
 }
-// The harness has no player grounding, so each actor snaps to the MZB floor once
-// the collision blocks have streamed in. The nearest DAT lamps are printed with it,
-// which is what places a character in a chosen lantern pool.
+/// The harness has no player grounding, so each actor snaps to the MZB floor
+/// once the collision blocks have streamed in. The nearest DAT lamps are
+/// printed with it, which is what places a character in a chosen lantern pool.
 fn ground_npcs(
     collision: Res<MzbCollisionGeometry>,
     lamps: Res<kuluu_render::zone_point_lights::ZonePointLights>,
@@ -663,9 +662,11 @@ fn spawn_celestials(
         &settings,
     );
 }
-// Headless mirror of weather::load_zone_weather: that system derives the zone
-// from the live SceneState snapshot, but this example has no login flow — the
-// zone comes straight from `P.file_id`, so read the same DAT bytes directly.
+/// Headless mirror of weather::load_zone_weather: that system derives the zone
+/// from the live SceneState snapshot, but this example has no login flow — the
+/// zone comes straight from `P.file_id`, so read the same DAT bytes directly.
+/// The global effect dir is read inline here (the client loads it off-thread in
+/// scheduler_runtime): zone generators whose mesh ships in syst/effe/ resolve.
 fn load_weather(
     mut c: Commands,
     p: Res<P>,
@@ -682,8 +683,6 @@ fn load_weather(
     let Some(root) = dat_root.0.clone() else {
         return;
     };
-    // The client loads this off-thread (scheduler_runtime load_global_effect_dir); the harness
-    // reads it inline so zone generators whose mesh ships in syst/effe/ resolve.
     if let Some(global) = root
         .resolve(kuluu_render::scheduler_runtime::GLOBAL_EFFECT_DIR_FILE_ID)
         .ok()

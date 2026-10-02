@@ -157,8 +157,8 @@ fn mip_chain_byte_len(w: u32, h: u32, levels: u32) -> usize {
     total
 }
 
-// Each level downsamples from the slice it already occupies in the accumulating
-// chain: a separate `prev` buffer costs a second full-size copy for the whole build.
+/// Each level downsamples from the slice it already occupies in the accumulating
+/// chain: a separate `prev` buffer costs a second full-size copy for the whole build.
 fn build_mip_chain(mip0: Vec<u8>, w: u32, h: u32, target_cov: Option<f32>) -> (Vec<u8>, u32) {
     let levels = mip_level_count(w, h);
     let mut data = mip0;
@@ -348,6 +348,8 @@ mod tests {
         assert_eq!(img.data.as_ref().unwrap().len(), expected);
     }
 
+    /// The fixture uses distinct opaque texels (a uniform image hides an offset
+    /// slip), and keeps alpha at 255 so the cutout coverage rescale does not engage.
     #[test]
     fn mip_levels_match_the_box_filter_reference() {
         fn box_filter(src: &[u8], sw: usize, x: usize, y: usize) -> [u8; 4] {
@@ -372,8 +374,6 @@ mod tests {
             out
         }
 
-        // Distinct opaque texels: a uniform image hides an offset slip, and alpha
-        // stays at 255 so the cutout coverage rescale never engages.
         let rgba: Vec<u8> = (0..16)
             .flat_map(|i: u8| [i.wrapping_mul(17), 255 - i * 15, i * 3 + 7, 255])
             .collect();

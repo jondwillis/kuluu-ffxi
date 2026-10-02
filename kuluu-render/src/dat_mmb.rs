@@ -450,6 +450,10 @@ fn mmb_load_order_key(req: &LoadMmbRequest, self_pos: Vec3) -> f32 {
     }
 }
 
+/// A full water sheet is not a coplanar decal: decal z-bias would pull it toward
+/// the camera and let it float over terrain that should occlude it, so the water
+/// material keeps z_bias_level 0. A sea sheet hangs off a water generator, so it
+/// takes the two-stage CMoD3m chain with the water tint as its TEXTUREFACTOR.
 pub fn process_load_mmb_requests(
     mut events: MessageReader<LoadMmbRequest>,
     mut commands: Commands,
@@ -813,13 +817,8 @@ pub fn process_load_mmb_requests(
                                 crate::ffxi_zone_material::FfxiZoneMaterialKey {
                                     back_face_culling: false,
                                     mirrored,
-                                    // A full water sheet is not a coplanar decal:
-                                    // decal z-bias would pull it toward the camera and
-                                    // let it float over terrain that should occlude it.
                                     z_bias_level: 0,
                                     depth_write: false,
-                                    // A sea sheet hangs off a water generator, so it takes the
-                                    // two-stage CMoD3m chain with `w.tint` as its TEXTUREFACTOR.
                                     generator_stage_chain: true,
                                 },
                             )
@@ -867,6 +866,10 @@ pub fn process_load_mmb_requests(
                         Transform::default(),
                         ChildOf(parent),
                     ));
+
+                    if let Some(door) = req.door {
+                        child.insert(crate::zone_doors::ZoneDoorMesh(door));
+                    }
 
                     if let Some(w) = req.water {
                         child.insert((
@@ -1029,7 +1032,9 @@ fn push_system_msg(toasts: &mut MessageWriter<crate::snapshot::ToastEvent>, text
 /// changes. Only the sampler's anisotropy varies live; the bilinear+mip data is
 /// baked at load, so we patch the sampler in place rather than rebuild images.
 /// The applied-value guard skips the GPU re-upload when an unrelated graphics
-/// setting triggered the change.
+/// setting triggered the change. When a pool image's pixel data is already
+/// consumed, its asset usage drops to the default first, so the sampler patch
+/// re-extracts metadata without asking Bevy to take the data again.
 pub fn apply_texture_filtering_system(
     settings: Res<GraphicsSettings>,
     pools: Res<MmbTexPools>,
@@ -1042,7 +1047,6 @@ pub fn apply_texture_filtering_system(
     }
     let mut patch = |handle: &Handle<Image>| {
         if let Some(mut img) = images.get_mut(handle) {
-            // Re-extract sampler metadata without asking Bevy to take consumed pixel data again.
             if img.data.is_none() {
                 img.asset_usage = RenderAssetUsages::default();
             }

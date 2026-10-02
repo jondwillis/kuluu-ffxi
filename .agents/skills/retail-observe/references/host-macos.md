@@ -40,6 +40,31 @@ client's DirectX 8 rendering is. Prefer one of them over assembling your own:
 - **Plain `wine`** -- workable for the launcher and tools; the game's D3D8 path is
   the part that needs a wrapper's attention.
 
+### The wine binary is a variable, not a constant
+
+FFXI on Mac ships a **patched CrossOver build** (`athei/wine-build`, the
+`cx-*-macos-x86_64` releases) and treats it as mandatory, because a stock build
+"exits one second after login" -- its `docs/WINE-BUILD.md` measures the two side
+by side in one prefix. It is a self-contained tree: unpack it and point the
+profile's `runner` at its `bin/wine`, with `WINEPREFIX` in the environment.
+
+Two things follow for this skill. **Give it its own prefix.** A prefix built by
+one wine build and then opened by another spends minutes in `wineboot` and can
+wedge there; a fresh prefix boots in about two. And **`show` starts working**:
+`System Events` can raise the CrossOver build's windows, where the Homebrew
+build exposes no AX windows at all and reports the terminal as frontmost no
+matter what you do -- which is worth knowing before you go hunting a focus bug
+that belongs to the wine build.
+
+A fresh prefix needs the client's own registry facts put back, none of which
+come from the install: the PlayOnline `InstallFolder` and `Interface` values
+(see the traps below), `regsvr32` for the viewer's `polcore.dll` and the game's
+`FFXi.dll` / `FFXiMain.dll` / `FFXiVersions.dll`, and the
+`PlayOnlineUS\SquareEnix\FinalFantasyXI` settings key -- with no settings key
+the client exits at boot exactly as if the interface check had failed. Those
+registrations are per-install, so switching the prefix between two installs
+means re-running `regsvr32` for the one you want.
+
 What was verified on this host (macOS 26, Apple Silicon, Homebrew `wine-stable`
 11.0, driving a Win32 app under Wine):
 
@@ -56,8 +81,25 @@ What was verified on this host (macOS 26, Apple Silicon, Homebrew `wine-stable`
 - `System Events` lists the GUI process as `wine`, which is how `show` focuses
   it when the window's owning pid is a child process it cannot address.
 
-Two Wine-specific traps:
+Four Wine-specific traps:
 
+- **The game exits about a second after login, with no window and no error.**
+  This is not the renderer: under `WINEDEBUG=+d3d8` the client makes no D3D
+  calls at all, so it quits before graphics. It is FFXI's `patch.ver`
+  interface-id check reading `HKLM\SOFTWARE\PlayOnlineUS\Interface`, and it
+  needs all three of: the values present in the **32-bit view**
+  (`Software\Wow6432Node\...`, which is the one a 32-bit client reads -- having
+  them only in the 64-bit view reads as "absent"), `0001` holding a real
+  interface id rather than `"0"`, and `0002`/`1000` likewise. A private-server
+  install ships those values in its own registry script; run its NSIS installer
+  unattended (`wine <installer>.exe /S`) rather than clicking through it. A
+  server whose client expects Ashita's Sandbox to fake the check instead will
+  write `0001="0"`, and then the client only boots under Ashita.
+- **A registry edit does not reach the next launch while `wineserver` lives.**
+  The running server holds the pre-edit registry, so the game reads the old
+  values and the change looks like it did nothing -- which turns one wrong
+  value into an afternoon of contradictory results. `wineserver -k` between the
+  edit and the launch, every time.
 - **A window can outlive its app.** Kill `wineserver` (or the app hangs) and
   macOS keeps compositing the last frame: the window still resolves, captures
   fine, and accepts no input. The tell is OCR that is byte-identical across
@@ -135,6 +177,7 @@ with an override, e.g.
 |---|---|
 | Black or empty capture | Screen Recording not granted, or the display is asleep -> `doctor`, and keep `caffeinate -d -u` for long sessions |
 | Keys/clicks silently ignored | Accessibility not granted, or the window is not frontmost -> `doctor`, then `show` |
+| Captures and OCR keep working, but no input has any effect, and `show` reports some other app frontmost | The Mac is **locked**. The window server still hands `screencapture -l` the client's window, so every read-only verb looks healthy while the login window swallows all synthesized input. `doctor` reports the lock and the input verbs refuse. Unlock the machine; nothing on the agent side can work around it |
 | Input lands in the terminal instead of the game | A raise that happened in an *earlier* invocation. Every input verb re-raises in-invocation; do not batch keys around a single `show` |
 | OCR identical across several inputs, caret/counter frozen | Wine app orphaned from its `wineserver` (stale composited window) -> relaunch the client |
 | No window matches, but the client is running | It is titled differently (launcher, config tool) -> `targets`, then set `FFXI_OBSERVE_WINDOW_TITLE` |

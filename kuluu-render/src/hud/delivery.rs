@@ -155,8 +155,8 @@ pub struct InvRow {
     pub item_no: u16,
     pub quantity: u32,
     pub deliverable: bool,
-    /// The item DAT's display name, so a list row and the card beside it never
-    /// disagree about what the item is called.
+    /// The item DAT's display name, so a list row and the card beside it show
+    /// the item by the same name.
     pub name: String,
 }
 
@@ -250,8 +250,8 @@ pub fn focus_down(state: &mut DeliveryScreenState, ctx: &DeliveryCtx) {
     };
 }
 
-/// Move focus left: one grid cell, or a page back inside the item list. Arrows
-/// never cross between the grid and the list.
+/// Move focus left: one grid cell, or a page back inside the item list.
+/// Arrows stay within one surface: grid or list, not both.
 pub fn focus_left(state: &mut DeliveryScreenState, ctx: &DeliveryCtx) {
     state.remember(ctx.box_no);
     state.focus = match state.focus {
@@ -277,7 +277,7 @@ pub fn focus_right(state: &mut DeliveryScreenState, ctx: &DeliveryCtx) {
 }
 
 /// Left/Right inside a list page it, the way every other retail item window
-/// does ([`list_view::page_cursor`]); they never leave the list.
+/// does ([`list_view::page_cursor`]); the cursor stays inside the list.
 fn page_list(
     state: &mut DeliveryScreenState,
     cursor: usize,
@@ -802,6 +802,8 @@ fn recipient_value_text(d: &DeliveryBoxState, editing: Option<&String>) -> Strin
     }
 }
 
+/// The inventory list viewport only moves while the cursor is in the list, so
+/// a background inventory change does not scroll it under the player.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn update_delivery_screen(
     state: Res<SceneState>,
@@ -890,8 +892,6 @@ pub(crate) fn update_delivery_screen(
     let (detail_name, detail_rows) =
         item_ui::focus_detail(focus_item, None, snap, &dat_root, &mut icon_cache);
 
-    // Inventory list viewport. The page only moves when the cursor is in the
-    // list, so a background inventory change cannot scroll it under the player.
     let total = inv.rows.len();
     let inv_cursor = match focus {
         DeliveryFocus::InvRow(i) => i,
@@ -1010,6 +1010,8 @@ pub(crate) fn update_delivery_screen(
     }
 }
 
+/// Dispatch takes a second, deliberate press: the parcels leave the bag the
+/// moment it lands and only the recipient can send them back.
 #[allow(clippy::too_many_arguments)]
 fn text_value(
     role: Role,
@@ -1145,8 +1147,6 @@ fn text_value(
             theme::MUTED,
             true,
         ),
-        // Dispatch takes a second, deliberate press: the parcels leave the bag
-        // the moment it lands and only the recipient can send them back.
         Role::ConfirmPrompt => {
             let staged = d
                 .slots

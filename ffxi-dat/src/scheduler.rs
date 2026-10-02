@@ -19,6 +19,9 @@ const STAGE_LENGTH_MASK: u16 = 0x1F;
 
 // research/xim EffectRoutineParser.kt parseSection,96-98 / :275-285.
 const END_ROUTINE_OPCODE: u8 = 0x00;
+
+// FFXiMain.dll retail-2026-09 RVA 0x5B5DA gates playback through the control-actor predicate.
+pub const PLAYER_ONLY_SOUND_OPCODE: u8 = 0x4A;
 const RANDOM_BLOCK_OPEN: u8 = 0x3D;
 const RANDOM_BLOCK_CLOSE: u8 = 0x3E;
 
@@ -31,6 +34,15 @@ const CONTROL_FLOW_BLOCK_CLOSE: u8 = 0x6A;
 const CONTROL_FLOW_CONDITION: u8 = 0x6B;
 const ANIMATION_LOCK_OPCODE: u8 = 0x07;
 const ANIMATION_LOCK_MAGIC_OPCODE: u8 = 0x59;
+// research/xim EffectRoutineParser.kt parseSection2 — the argument-less stages: StartRoutineMarker,
+// ActorPositionSnapshotEffect, MovementLockEffect, FacingLockEffect, and the two
+// ToggleBroadcastEffect arms.
+const START_ROUTINE_MARKER_OPCODE: u8 = 0x01;
+const ACTOR_POSITION_SNAPSHOT_OPCODE: u8 = 0x15;
+const MOVEMENT_LOCK_OPCODE: u8 = 0x2E;
+const FACING_LOCK_OPCODE: u8 = 0x2F;
+const TOGGLE_BROADCAST_ON_OPCODE: u8 = 0x31;
+const TOGGLE_BROADCAST_OFF_OPCODE: u8 = 0x32;
 const FLINCH_CASTER_OPCODE: u8 = 0x21;
 const FLINCH_TARGET_OPCODE: u8 = 0x25;
 const TRANSITION_TO_IDLE_OPCODE: u8 = 0x28;
@@ -40,6 +52,24 @@ const KNOCKBACK_OPCODE: u8 = 0x5E;
 const KNOCKBACK_ALT_OPCODE: u8 = 0xBF;
 const STOP_ROUTINE_OPCODE: u8 = 0x5F;
 const DISPLAY_DEAD_OPCODE: u8 = 0x78;
+// research/xim EffectRoutineParser.kt parseSection2 0x75 SetModelVisibilityRoutine: the payload
+// after delay/duration is hidden (u32 == 1), slot (u16), ifEngaged (u16 == 1) - a 4-dword
+// stage, no DatId.
+const SET_MODEL_VISIBILITY_OPCODE: u8 = 0x75;
+const SET_MODEL_VISIBILITY_PAYLOAD_LEN: usize = 16;
+// research/xim EffectRoutineParser.kt parseSection2 0x22 JointSnapshotEffect: the u32 after
+// delay/duration is consumed and unused; the handler only sets the context's joint-snapshot
+// flag (EffectRoutineInstance.kt handleJointSnapshotEffect applyJointSnapshot(true)).
+const JOINT_SNAPSHOT_OPCODE: u8 = 0x22;
+// research/xim EffectRoutineParser.kt parseSection2 0x1E ParticleDampenRoutine: genRef
+// (DatId) + zero32 after delay/duration - a 4-dword stage.
+const PARTICLE_DAMPEN_OPCODE: u8 = 0x1E;
+// research/xim EffectRoutineParser.kt parseSection2 0x19 SpellEffect: the u32 after
+// delay/duration is the spell animation index, not a DatId - the handler resolves the
+// spell file-table offset plus the index to the effect DAT and runs its `main` routine
+// on the actor (EffectRoutineInstance.kt handleSpellEffect).
+const SPELL_EFFECT_OPCODE: u8 = 0x19;
+const ELEVATOR_TRAVEL_OPCODE: u8 = 0x1D;
 
 // research/xim EffectRoutineParser.kt — parseSection2 reads delay(+4) and duration(+6)
 // for EVERY opcode before dispatching, so the shortest stage the encoding admits is 8 bytes.
@@ -73,6 +103,13 @@ const MODEL_TRANSFORM_SUBCHUNK_OFFSET: usize = 20;
 // DATs: Rarab's `damg` carries 10.0 here and its stage is exactly nine dwords.
 const FLINCH_ANIMATION_DURATION_OFFSET: usize = 24;
 const FLINCH_PAYLOAD_LEN: usize = FLINCH_ANIMATION_DURATION_OFFSET + 4;
+
+// research/xim EffectRoutineParser.kt parseSection2, 0x5E / 0xBF: after delay/duration the
+// knockback payload is u16, u16, f32 animationDuration, f32, u32. The duration is how long
+// the victim's bf0? knock-down plays before the bf1? stand-up
+// (EffectRoutineInterpolatedEffects.kt KnockBackInstance).
+const KNOCKBACK_ANIMATION_DURATION_OFFSET: usize = ID_OFFSET + 4;
+const KNOCKBACK_DURATION_PAYLOAD_LEN: usize = KNOCKBACK_ANIMATION_DURATION_OFFSET + 4;
 
 // A stage addresses a slot of the group `mzb::underscore_at_groups` builds, so the bound is
 // that builder's rather than a second reading of the same retail array.
@@ -150,15 +187,26 @@ pub struct ModelTransform {
     pub subchunk: u32,
 }
 
+/// 0x75 SetModelVisibility payload (research/xim EffectRoutineParser.kt parseSection2):
+/// show or hide one model slot of the actor for the stage's duration. Slot 2 is the
+/// weapon slot, hidden by default in retail (research/xim ActorModel.kt getHiddenSlotIds);
+/// `if_engaged` limits the override to engaged actors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelVisibility {
+    pub hidden: bool,
+    pub slot: u16,
+    pub if_engaged: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SchedulerStage {
     pub kind: StageKind,
 
     pub raw_type: u8,
 
-    // `unkCombo & STAGE_LENGTH_MASK`, the dword count the stage spans. `StageKind::from_stage` is
-    // length-conditional for several opcodes, so a consumer that wants to re-classify a stage
-    // needs the same length the parser used.
+    /// `unkCombo & STAGE_LENGTH_MASK`, the dword count the stage spans. `StageKind::from_stage`
+    /// is length-conditional for several opcodes, so a consumer that wants to re-classify a
+    /// stage needs the same length the parser used.
     pub stage_words: u8,
 
     pub delay_frames: u16,
@@ -192,11 +240,23 @@ pub struct SchedulerStage {
     // xim EffectRoutineParser.kt parseSection2); `id` is `NO_STAGE_ID` there.
     pub idle_transition_time: Option<f32>,
 
-    // `Some` exactly for the two flinch kinds when the stage carries the full 9-dword payload:
-    // the animationDuration f32 at +24 (research/xim EffectRoutineParser.kt parseFlinchEffect).
-    // Retail plays the dfi?/dfm? flinch clip with transition in/out of
-    // animationDuration/2 frames each (EffectRoutineInterpolatedEffects.kt FlinchAnimationInstance).
+    // The stage's animationDuration. `Some` for the two flinch kinds when the stage carries
+    // the full 9-dword payload (the f32 at +24, research/xim EffectRoutineParser.kt
+    // parseFlinchEffect; retail plays the dfi?/dfm? flinch clip with transition in/out of
+    // animationDuration/2 frames each, EffectRoutineInterpolatedEffects.kt
+    // FlinchAnimationInstance), and for the knockback kind (the f32 at +12,
+    // parseSection2 0x5E / 0xBF; the bf0? knock-down's length, KnockBackInstance).
     pub flinch_duration: Option<f32>,
+
+    // `Some` exactly for `SetModelVisibility`, whose payload (hidden u32, slot u16, ifEngaged
+    // u16) occupies the dwords the generic decoder reads `id` from (research/xim
+    // EffectRoutineParser.kt parseSection2); `id` is `NO_STAGE_ID` there.
+    pub model_visibility: Option<ModelVisibility>,
+
+    // `Some` exactly for `SpellEffect`: the +8 dword is the spell animation index, not a
+    // DatId (research/xim EffectRoutineParser.kt parseSection2 0x19); `id` is
+    // `NO_STAGE_ID` there.
+    pub spell_effect: Option<u32>,
 
     // research/xim EffectRoutineParser.kt parseSection2,553-559 — stages between a 0x3D and its 0x3E
     // are children of one RandomChildRoutine, not siblings on the timeline: retail runs exactly
@@ -251,6 +311,12 @@ pub enum StageKind {
 
     StopParticle,
 
+    /// 0x1E - ParticleDampen: `id` names the generator; emission stops and the already-live
+    /// particles are force-expired at once (research/xim EffectRoutineInstance.kt
+    /// handleParticleEffectDampen: stopEmitting plus forceExpire, with the looping audio
+    /// faded out).
+    ParticleDampen,
+
     DamageCallback,
 
     FollowPoints,
@@ -262,12 +328,47 @@ pub enum StageKind {
     /// not lock.
     AnimationLock,
 
+    /// 0x2E - MovementLock for `duration_frames` frames of the routine clock (research/xim
+    /// EffectRoutineParser.kt parseSection2 MovementLockEffect): the actor's movement is
+    /// withheld for the interval, the pose is untouched - facing is the separate 0x2F lock.
+    MovementLock,
+
+    /// 0x75 - SetModelVisibility: show or hide one model slot of the actor for the stage's
+    /// duration (research/xim EffectRoutineParser.kt parseSection2 SetModelVisibilityRoutine);
+    /// the payload is [`SchedulerStage::model_visibility`].
+    SetModelVisibility,
+
+    /// 0x15 - ActorPositionSnapshot: argument-less. From this stage on, the routine's effect
+    /// context freezes the actor's position and joints at their current values, so effects
+    /// spawned later anchor where the routine fired even if the actor moves (research/xim
+    /// EffectRoutineInstance.kt handleActorPositionSnapshot: applyPositionSnapshot plus
+    /// applyJointSnapshot(true)).
+    ActorPositionSnapshot,
+
+    /// 0x22 - JointSnapshot: the u32 after delay/duration is consumed and unused in retail
+    /// (research/xim EffectRoutineParser.kt parseSection2); the handler only sets the
+    /// context's joint-snapshot flag (research/xim EffectRoutineInstance.kt
+    /// handleJointSnapshotEffect: applyJointSnapshot(true)).
+    JointSnapshot,
+
+    /// 0x19 - SpellEffect: `spell_effect` is the spell animation index; the handler loads
+    /// the effect DAT at the spell file-table offset plus the index and runs its `main`
+    /// routine on the actor as a child sequence (research/xim EffectRoutineInstance.kt
+    /// handleSpellEffect).
+    SpellEffect,
+
+    /// 0x01 - StartRoutineMarker: argument-less; retail's handler is a no-op
+    /// (research/xim EffectRoutineInstance.kt handleEffect: StartRoutineMarker ->
+    /// EffectResult.noop()), so the stage only marks the routine's start on the timeline.
+    StartRoutineMarker,
+
     /// 0x5F - StopRoutine: stop the running routine named by `id` (research/xim
     /// EffectRoutineParser.kt parseSection2 StopRoutineEffect). The worm's `ini1` stops `init`
     /// and `init` stops `ini1` this way.
     StopRoutine,
 
-    /// 0x21 (caster) / 0x25 (target) - flinch; SE `GetDamageDirId` picks the dfi/dbi/dfm/dbm
+    /// `FLINCH_CASTER_OPCODE` / `FLINCH_TARGET_OPCODE` - flinch (research/xim
+    /// EffectRoutineParser.kt parseFlinchEffect); SE `GetDamageDirId` picks the dfi/dbi/dfm/dbm
     /// front/back clip by hit direction.
     FlinchOnCaster,
     FlinchOnTarget,
@@ -295,6 +396,14 @@ pub enum StageKind {
     /// duration (research/XIClient Game/Scheduler/Tags/0x04.cpp HandleTag0x04 looks the
     /// resource up by the tag's four-char name and calls CameraResource::CreateCameraTask).
     CameraRoute,
+
+    /// 0x1D - a lift platform's travel between the two floor heights its zone-DAT
+    /// RID entry states, over `duration_frames`. The `@`-group routines
+    /// research/xim/src/jsMain/kotlin/xim/poc/Actor.kt updateElevatorDisplay names
+    /// (`mv01` up, `mv10` down, `mv00`/`mv11` settle) each carry exactly one;
+    /// in the shipped zone DATs its length is the lift's travel time (480 frames
+    /// for the Metalworks lifts, 720 for Pso'Xja's three tall shafts).
+    ElevatorTravel,
 
     Unknown,
 }
@@ -327,9 +436,26 @@ pub const fn is_control_flow_opcode(raw_type: u8) -> bool {
     )
 }
 
-// The shortest stage `from_stage` can be asked about, and the longest the length field can
-// express: sweeping this range is how a consumer discovers the handled opcode set without
-// restating the match arms.
+// Opcodes whose stage carries only delay/duration — two dwords, no id/payload dword after them.
+// research/xim EffectRoutineParser.kt parseSection2: each of these arms reads nothing past
+// delay/duration, so the id-dword gate must not require the +8 slot for them. The id-carrying
+// AnimationLock form is not listed: it reads a zero dword, so its stage is three dwords.
+pub const fn argless_stage_opcode(raw_type: u8) -> bool {
+    matches!(
+        raw_type,
+        START_ROUTINE_MARKER_OPCODE
+            | ACTOR_POSITION_SNAPSHOT_OPCODE
+            | MOVEMENT_LOCK_OPCODE
+            | FACING_LOCK_OPCODE
+            | TOGGLE_BROADCAST_ON_OPCODE
+            | TOGGLE_BROADCAST_OFF_OPCODE
+            | ANIMATION_LOCK_MAGIC_OPCODE
+    )
+}
+
+/// The shortest stage `from_stage` can be asked about, and the longest the length field can
+/// express: sweeping this range is how a consumer discovers the handled opcode set without
+/// restating the match arms.
 pub const STAGE_WORDS_RANGE: std::ops::RangeInclusive<usize> = 1..=STAGE_LENGTH_MASK as usize;
 
 impl StageKind {
@@ -356,6 +482,10 @@ impl StageKind {
             // research/xim EffectRoutineParser.kt parseSection2 — StopParticleGeneratorRoutine, id =
             // the generator DatId to stop (ROM/0/0.DAT `stbk` stops the cast aura's gn10..gn13).
             0x2D => Self::StopParticle,
+            // research/xim EffectRoutineParser.kt parseSection2 - ParticleDampenRoutine:
+            // genRef + zero32; the handler force-expires the generator's live particles as
+            // well as stopping emission (EffectRoutineInstance.kt handleParticleEffectDampen).
+            PARTICLE_DAMPEN_OPCODE => Self::ParticleDampen,
             // research/xim EffectRoutineParser.kt parseSection2 — DamageCallbackRoutine, the stage the
             // damage/battle-message callback is invoked on (EffectRoutineInstance.kt handleDamageCallbackRoutine).
             // Every spell routine tail-calls a `mdam` sub-routine that holds exactly this stage.
@@ -365,6 +495,25 @@ impl StageKind {
             // ActionTimer1 animation lock, refcounted across overlapping routines. The first
             // form carries a zero dword after delay/duration; the magic form is argument-less.
             ANIMATION_LOCK_OPCODE | ANIMATION_LOCK_MAGIC_OPCODE => Self::AnimationLock,
+            // research/xim EffectRoutineParser.kt parseSection2 - MovementLockEffect, argument-less.
+            MOVEMENT_LOCK_OPCODE => Self::MovementLock,
+            // research/xim EffectRoutineParser.kt parseSection2 - SetModelVisibilityRoutine:
+            // hidden u32, slot u16, ifEngaged u16 after delay/duration; no DatId.
+            SET_MODEL_VISIBILITY_OPCODE if length_words * 4 >= SET_MODEL_VISIBILITY_PAYLOAD_LEN => {
+                Self::SetModelVisibility
+            }
+            // research/xim EffectRoutineParser.kt parseSection2 - ActorPositionSnapshotEffect,
+            // argument-less.
+            ACTOR_POSITION_SNAPSHOT_OPCODE => Self::ActorPositionSnapshot,
+            // research/xim EffectRoutineParser.kt parseSection2 - JointSnapshotEffect: the +8
+            // u32 is consumed and unused, so it is not a DatId.
+            JOINT_SNAPSHOT_OPCODE => Self::JointSnapshot,
+            // research/xim EffectRoutineParser.kt parseSection2 - SpellEffect: the +8 u32 is
+            // the spell animation index, not a DatId.
+            SPELL_EFFECT_OPCODE => Self::SpellEffect,
+            // research/xim EffectRoutineParser.kt parseSection2 - StartRoutineMarker:
+            // argument-less; retail's handler is a no-op.
+            START_ROUTINE_MARKER_OPCODE => Self::StartRoutineMarker,
             // research/xim EffectRoutineParser.kt parseSection2 - FlinchRoutine (SE `GetDamageDirId`
             // picks the dfi/dbi/dfm/dbm front/back clip by hit direction).
             FLINCH_CASTER_OPCODE => Self::FlinchOnCaster,
@@ -386,6 +535,7 @@ impl StageKind {
             // research/xim EffectRoutineParser.kt parseSection2 - DisplayDeadRoutine: the actor is
             // dead from this stage on.
             DISPLAY_DEAD_OPCODE => Self::DisplayDead,
+            ELEVATOR_TRAVEL_OPCODE => Self::ElevatorTravel,
             // research/xim EffectRoutineParser.kt parseSection2 — LinkedEffectRoutine with
             // `blocking = true`: the same sub-routine call as 0x03, except the parent stalls
             // until the child finishes (EffectRoutineInstance.kt createChild `blockers += newSequences`).
@@ -398,7 +548,7 @@ impl StageKind {
             // for anyone who later needs the distinction. Without these arms both
             // fall to `Unknown` and never fire — eight effect DATs in 2800-3300 have
             // no other sound stage and are completely silent.
-            0x4A | 0x60 => Self::SoundNonPositional,
+            PLAYER_ONLY_SOUND_OPCODE | 0x60 => Self::SoundNonPositional,
             // research/xim EffectRoutineParser.kt parseSection2 — a plain LinkedEffectRoutine, the
             // form every melee routine uses (`ati0` links the weapon's `skaz` whoosh, `atk0`
             // the race/face `vatk` grunt).
@@ -486,8 +636,15 @@ impl Scheduler {
                 };
                 let duration = read_u16(DURATION_OFFSET);
                 let has_id = stage_bytes >= STAGE_WITH_ID_LEN;
-                let kind = if has_id {
+                // Argument-less opcodes are complete at two dwords; every other opcode needs the
+                // +8 id/payload dword present to map, so a short stage of an id opcode stays
+                // Unknown rather than misreading a neighbour's bytes as its id. The lift travel
+                // stage is the one other id-less opcode with a meaning of its own: eight bytes,
+                // delay and duration both the leg length.
+                let kind = if has_id || argless_stage_opcode(raw_type) {
                     StageKind::from_stage(raw_type, length_words)
+                } else if raw_type == ELEVATOR_TRAVEL_OPCODE {
+                    StageKind::ElevatorTravel
                 } else {
                     StageKind::Unknown
                 };
@@ -521,30 +678,45 @@ impl Scheduler {
                 let idle_transition_time = payload
                     .filter(|_| kind == StageKind::TransitionToIdle)
                     .map(f32::from_le_bytes);
-                // Flinch animationDuration sits at +24, past the id slot - read it straight off
-                // the stage bytes when the full 9-dword payload is present.
-                let flinch_duration =
-                    (matches!(kind, StageKind::FlinchOnCaster | StageKind::FlinchOnTarget)
-                        && stage_bytes >= FLINCH_PAYLOAD_LEN)
-                        .then(|| {
-                            f32::from_le_bytes([
-                                body[cursor + FLINCH_ANIMATION_DURATION_OFFSET],
-                                body[cursor + FLINCH_ANIMATION_DURATION_OFFSET + 1],
-                                body[cursor + FLINCH_ANIMATION_DURATION_OFFSET + 2],
-                                body[cursor + FLINCH_ANIMATION_DURATION_OFFSET + 3],
-                            ])
-                        });
+                // research/xim EffectRoutineParser.kt parseSection2 0x75 - the payload is
+                // hidden u32, slot u16, ifEngaged u16 straight after delay/duration.
+                let model_visibility = (kind == StageKind::SetModelVisibility
+                    && stage_bytes >= SET_MODEL_VISIBILITY_PAYLOAD_LEN)
+                    .then(|| ModelVisibility {
+                        hidden: read_u32(ID_OFFSET) == 1,
+                        slot: read_u16(ID_OFFSET + 4),
+                        if_engaged: read_u16(ID_OFFSET + 6) == 1,
+                    });
+                // research/xim EffectRoutineParser.kt parseSection2 0x19 - the +8 dword is
+                // the spell animation index, not a DatId.
+                let spell_effect = payload
+                    .filter(|_| kind == StageKind::SpellEffect)
+                    .map(u32::from_le_bytes);
+                let flinch_duration = match kind {
+                    StageKind::FlinchOnCaster | StageKind::FlinchOnTarget
+                        if stage_bytes >= FLINCH_PAYLOAD_LEN =>
+                    {
+                        Some(f32::from_bits(read_u32(FLINCH_ANIMATION_DURATION_OFFSET)))
+                    }
+                    StageKind::Knockback if stage_bytes >= KNOCKBACK_DURATION_PAYLOAD_LEN => Some(
+                        f32::from_bits(read_u32(KNOCKBACK_ANIMATION_DURATION_OFFSET)),
+                    ),
+                    _ => None,
+                };
                 // Flinch and knockback payloads are floats/ints from +8 on (research/xim
                 // EffectRoutineParser.kt parseSection2), so their id slot is not a DatId either.
                 let non_id_payload = model_transform.is_some()
                     || screen_color.is_some()
                     || actor_fade.is_some()
                     || idle_transition_time.is_some()
+                    || model_visibility.is_some()
                     || matches!(
                         kind,
                         StageKind::FlinchOnCaster
                             | StageKind::FlinchOnTarget
                             | StageKind::Knockback
+                            | StageKind::JointSnapshot
+                            | StageKind::SpellEffect
                     );
                 let id = match payload {
                     Some(bytes) if !non_id_payload => bytes,
@@ -587,6 +759,8 @@ impl Scheduler {
                         actor_fade,
                         idle_transition_time,
                         flinch_duration,
+                        model_visibility,
+                        spell_effect,
                         random_group: open_group,
                         local_dir,
                     },
@@ -662,46 +836,37 @@ pub struct SoundEvent {
     pub on_caster: bool,
 }
 
-/// The entrance/instance zone pairs whose 0x2D MAPSCHEDULOR keys resolve in the
-/// partner zone's model DAT rather than their own. Hand-built from one scan of
-/// the retail corpus, which turned up 27 "another zone's model DAT" pairs;
-/// retail's loader rule for the partner fallback is unknown, and these five are
-/// the observed clean instance/entrance cases.
-const ZONE_SCENE_PARTNERS: [(u16, u16); 5] = [
-    (242, 170), // Heavens' Tower -> Full Moon Fountain
-    (194, 192), // Outer Horutoto Ruins -> Inner Horutoto Ruins
-    (31, 34),   // Monarch's Linn -> Grand Palace of Hu'Xzoi
-    (32, 11),   // Sealion's Den -> Oldton Movalpolos
-    (32, 8),    // Sealion's Den -> Boneyard Gully
-];
+/// The entrance/instance zone pairs whose MAPSCHEDULOR scene keys resolve in
+/// the partner zone's model DAT rather than their own: (242, 170) Heavens'
+/// Tower -> Full Moon Fountain, (194, 192) Outer Horutoto Ruins -> Inner
+/// Horutoto Ruins, (31, 34) Monarch's Linn -> Grand Palace of Hu'Xzoi,
+/// (32, 11) Sealion's Den -> Oldton Movalpolos, (32, 8) Sealion's Den ->
+/// Boneyard Gully. Hand-built; retail's loader rule for the partner fallback is
+/// unknown, and these five are the observed clean instance/entrance cases.
+const ZONE_SCENE_PARTNERS: [(u16, u16); 5] = [(242, 170), (194, 192), (31, 34), (32, 11), (32, 8)];
 
-/// The handful of non-model files that carry 0x2D scene keys no per-zone slot
-/// owns: the Spire of Holla/Dem/Mea, Sealion's Den and Al'Taieu scene families
-/// (`sc11..sc41` / `kc51..kc54` / `kci1..kci4`). Hand-built from the same corpus
-/// scan; retail's loader rule for these is unknown. `zz-walk-errors` re-checks
-/// that all five walk clean.
-pub const NON_MODEL_SCENE_CARRIERS: [u32; 5] = [
-    641,   // ROM/3/48.DAT
-    30705, // ROM/123/85.DAT
-    57075, // ROM/213/92.DAT
-    57082, // ROM/216/12.DAT
-    57204, // ROM/241/3.DAT
-];
+/// The handful of non-model files that carry MAPSCHEDULOR scene keys no
+/// per-zone slot owns: the Spire of Holla/Dem/Mea, Sealion's Den and Al'Taieu
+/// scene families (`sc11..sc41` / `kc51..kc54` / `kci1..kci4`), file ids 641
+/// (ROM/3/48.DAT), 30705 (ROM/123/85.DAT), 57075 (ROM/213/92.DAT), 57082
+/// (ROM/216/12.DAT), 57204 (ROM/241/3.DAT). Hand-built; retail's loader rule
+/// for these is unknown. `zz-walk-errors` re-checks that all five walk clean.
+pub const NON_MODEL_SCENE_CARRIERS: [u32; 5] = [641, 30705, 57075, 57082, 57204];
 
-/// Resolve the 0x2D MAPSCHEDULOR key to the DAT file that carries its routine,
-/// following retail's per-zone rule: the routine lives in the CURRENT zone's own
-/// model DAT (already loaded for rendering via
+/// Resolve a MAPSCHEDULOR key (the `ffxi_event::vm` scene opcode) to the DAT file
+/// that carries its routine, following retail's per-zone rule: the routine lives in the
+/// CURRENT zone's own model DAT (already loaded for rendering via
 /// [`zone_dat::zone_id_to_mzb_file_id`]); on a miss, the entrance/instance partner
 /// zone's model DAT; on a further miss, the non-model scene carriers. Returns the
 /// file id, or `None` when no candidate file carries the key. The host arms the
-/// 0x54 WAITMAPSCHEDULOR hold from the file the key resolved in; the renderer plays
+/// WAITMAPSCHEDULOR hold from the file the key resolved in; the renderer plays
 /// it from the same file.
 ///
 /// Memoized per process: the result is a pure function of the install's DATs,
 /// while deriving it costs up to eight full DAT reads plus parses per call (the
-/// zone's model DAT is a large MZB file) on every 0x2D cue. One install per
-/// process (the renderer and the session are separate processes, each with its
-/// own memo), so the memo keys on (zone, key) alone. An overlay swap changes
+/// zone's model DAT is a large MZB file) on every MAPSCHEDULOR cue. One install
+/// per process (the renderer and the session are separate processes, each with
+/// its own memo), so the memo keys on (zone, key) alone. An overlay swap changes
 /// which file a resolve reads, so [`DatRoot::set_overlays`] clears it.
 pub fn zone_scene_file_id(root: &DatRoot, zone: u16, key: [u8; 4]) -> Option<u32> {
     let cache = ZONE_SCENE_CACHE
@@ -736,7 +901,7 @@ static ZONE_SCENE_CACHE: std::sync::LazyLock<std::sync::Mutex<ZoneSceneMemo>> =
 /// Drop the [`zone_scene_file_id`] memo: called from `DatRoot::set_overlays`,
 /// because the swap changes which file a later resolve reads. A lookup racing
 /// the swap may re-memoize a pre-swap result until the next swap; the memo
-/// holds only 0x2D answers, so the exposure is one stale zone-scene file id.
+/// holds only MAPSCHEDULOR answers, so the exposure is one stale zone-scene file id.
 pub(crate) fn clear_zone_scene_cache() {
     ZONE_SCENE_CACHE
         .lock()
@@ -810,6 +975,8 @@ const ROUTE_NAME_HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
 const ROUTE_NAME_ZONE_MAX: u16 = 0xFF;
 /// A two-digit decimal index fits this bound.
 const ROUTE_NAME_INDEX_MAX: u8 = 99;
+/// The zone id's upper or lower hex digit.
+const ROUTE_NAME_NIBBLE: u16 = 0xF;
 
 /// The zone-coded camera route name in the title-screen scene DAT (ROM/0/23.DAT):
 /// `zone_id` as two lowercase hex digits followed by a two-digit decimal `index`
@@ -817,8 +984,8 @@ const ROUTE_NAME_INDEX_MAX: u8 = 99;
 pub fn zone_camera_route_name(zone_id: u16, index: u8) -> [u8; 4] {
     debug_assert!(zone_id <= ROUTE_NAME_ZONE_MAX && index <= ROUTE_NAME_INDEX_MAX);
     let mut name = [0u8; 4];
-    name[0] = ROUTE_NAME_HEX_DIGITS[(zone_id >> 4 & 0xF) as usize];
-    name[1] = ROUTE_NAME_HEX_DIGITS[(zone_id & 0xF) as usize];
+    name[0] = ROUTE_NAME_HEX_DIGITS[(zone_id >> 4 & ROUTE_NAME_NIBBLE) as usize];
+    name[1] = ROUTE_NAME_HEX_DIGITS[(zone_id & ROUTE_NAME_NIBBLE) as usize];
     name[2] = b'0' + index / 10;
     name[3] = b'0' + index % 10;
     name
@@ -878,15 +1045,15 @@ mod tests {
         let mut body = vec![0u8; SCHEDULER_HEADER_LEN];
         for op in [FLINCH_CASTER_OPCODE, FLINCH_TARGET_OPCODE] {
             body.extend_from_slice(&[op, FLINCH_STAGE_WORDS, 0, 0]);
-            body.extend_from_slice(&2u16.to_le_bytes()); // +4 delay
-            body.extend_from_slice(&0u16.to_le_bytes()); // +6 duration
-            body.extend_from_slice(&1.0f32.to_le_bytes()); // +8
-            body.extend_from_slice(&1.0f32.to_le_bytes()); // +12
-            body.extend_from_slice(&2u32.to_le_bytes()); // +16
-            body.extend_from_slice(&1.0f32.to_le_bytes()); // +20
-            body.extend_from_slice(&10.0f32.to_le_bytes()); // +24 animationDuration
-            body.extend_from_slice(&0u32.to_le_bytes()); // +28
-            body.extend_from_slice(&0u32.to_le_bytes()); // +32
+            body.extend_from_slice(&2u16.to_le_bytes());
+            body.extend_from_slice(&0u16.to_le_bytes());
+            body.extend_from_slice(&1.0f32.to_le_bytes());
+            body.extend_from_slice(&1.0f32.to_le_bytes());
+            body.extend_from_slice(&2u32.to_le_bytes());
+            body.extend_from_slice(&1.0f32.to_le_bytes());
+            body.extend_from_slice(&10.0f32.to_le_bytes());
+            body.extend_from_slice(&0u32.to_le_bytes());
+            body.extend_from_slice(&0u32.to_le_bytes());
         }
 
         let s = Scheduler::parse(*b"damg", &body).unwrap();
@@ -898,20 +1065,19 @@ mod tests {
             let st = s.stages[i].stage;
             assert_eq!(st.kind, want_kind, "opcode of stage {i}");
             assert_eq!(st.flinch_duration, Some(10.0), "animationDuration at +24");
-            // The flinch payload's id slot is not a DatId (XIM reads no ref there).
             assert_eq!(&st.id, &[0; 4]);
         }
     }
 
-    // A flinch stage shorter than the full payload carries no animationDuration: the consumer
-    // must fall back to its default transitions rather than reading past the stage.
+    /// A flinch stage shorter than the full payload carries no animationDuration: the
+    /// consumer falls back to its default transitions rather than reading past the stage.
     #[test]
     fn short_flinch_stage_has_no_animation_duration() {
         let mut body = vec![0u8; SCHEDULER_HEADER_LEN];
         body.extend_from_slice(&[FLINCH_CASTER_OPCODE, ARGLESS_STAGE_WORDS + 1, 0, 0]);
         body.extend_from_slice(&2u16.to_le_bytes());
         body.extend_from_slice(&0u16.to_le_bytes());
-        body.extend_from_slice(&[0u8; 4]); // +8 id slot - not a DatId for flinch
+        body.extend_from_slice(&[0u8; 4]);
 
         let s = Scheduler::parse(*b"damg", &body).unwrap();
         assert_eq!(s.stages[0].stage.kind, StageKind::FlinchOnCaster);
@@ -975,6 +1141,18 @@ mod tests {
             assert_eq!(s.stages[0].stage.raw_type, op, "raw opcode is preserved");
             assert_eq!(&s.stages[0].stage.id, b"4063");
         }
+    }
+
+    #[test]
+    fn opcode_1d_is_the_lift_travel_stage() {
+        const TRAVEL_FRAMES: u16 = 480;
+        let mut body = vec![0u8; SCHEDULER_HEADER_LEN];
+        body.extend_from_slice(&[ELEVATOR_TRAVEL_OPCODE, 0x02, 0, 0]);
+        body.extend_from_slice(&TRAVEL_FRAMES.to_le_bytes());
+        body.extend_from_slice(&TRAVEL_FRAMES.to_le_bytes());
+        let s = Scheduler::parse(*b"mv01", &body).unwrap();
+        assert_eq!(s.stages[0].stage.kind, StageKind::ElevatorTravel);
+        assert_eq!(s.stages[0].stage.duration_frames, TRAVEL_FRAMES);
     }
 
     // Boost's effect DAT (ROM/16/0.DAT) plays its caster sound via opcode 0x0A with
@@ -1651,10 +1829,15 @@ mod tests {
             .collect();
         grouped.sort();
         assert_eq!(grouped, vec![*b"atk1", *b"atk2", *b"atk3", *b"atk4"]);
+        // The routine opens with an unconditional `START_ROUTINE_MARKER_OPCODE` marker
+        // whose retail handler is a no-op, so the inert stages are the unknowns plus
+        // that marker.
         assert!(
-            vatk.stages
-                .iter()
-                .all(|t| t.stage.random_group.is_some() || t.stage.kind == StageKind::Unknown),
+            vatk.stages.iter().all(|t| {
+                t.stage.random_group.is_some()
+                    || t.stage.kind == StageKind::Unknown
+                    || t.stage.kind == StageKind::StartRoutineMarker
+            }),
             "every sound in vatk is an alternative, not an unconditional stage"
         );
     }
@@ -1729,6 +1912,25 @@ mod tests {
     fn mob_routine_opcodes_map_to_their_kinds() {
         for (opcode, words, kind) in [
             (ANIMATION_LOCK_MAGIC_OPCODE, 2, StageKind::AnimationLock),
+            (MOVEMENT_LOCK_OPCODE, 2, StageKind::MovementLock),
+            (
+                SET_MODEL_VISIBILITY_OPCODE,
+                4,
+                StageKind::SetModelVisibility,
+            ),
+            (
+                ACTOR_POSITION_SNAPSHOT_OPCODE,
+                2,
+                StageKind::ActorPositionSnapshot,
+            ),
+            (JOINT_SNAPSHOT_OPCODE, 3, StageKind::JointSnapshot),
+            (SPELL_EFFECT_OPCODE, 3, StageKind::SpellEffect),
+            (
+                START_ROUTINE_MARKER_OPCODE,
+                2,
+                StageKind::StartRoutineMarker,
+            ),
+            (PARTICLE_DAMPEN_OPCODE, 4, StageKind::ParticleDampen),
             (FLINCH_CASTER_OPCODE, 3, StageKind::FlinchOnCaster),
             (FLINCH_TARGET_OPCODE, 3, StageKind::FlinchOnTarget),
             (
@@ -1753,8 +1955,48 @@ mod tests {
         }
     }
 
+    // The 0x75 payload is hidden u32, slot u16, ifEngaged u16 (research/xim
+    // EffectRoutineParser.kt parseSection2), so its id slot must not surface as a DatId.
+    #[test]
+    fn set_model_visibility_payload_is_not_a_datid() {
+        let mut body = vec![0u8; SCHEDULER_HEADER_LEN];
+        body.extend(timed_stage_bytes(SET_MODEL_VISIBILITY_OPCODE, 4, 0, 0));
+        body.extend_from_slice(&1u32.to_le_bytes());
+        body.extend_from_slice(&2u16.to_le_bytes());
+        body.extend_from_slice(&1u16.to_le_bytes());
+
+        let s = Scheduler::parse(*b"splg", &body).unwrap();
+        let stage = &s.stages[0].stage;
+        assert_eq!(stage.kind, StageKind::SetModelVisibility);
+        assert_eq!(
+            stage.model_visibility,
+            Some(ModelVisibility {
+                hidden: true,
+                slot: 2,
+                if_engaged: true
+            })
+        );
+        assert_eq!(stage.id, NO_STAGE_ID);
+    }
+
+    // The 0x19 payload is the spell animation index (research/xim EffectRoutineParser.kt
+    // parseSection2), so its id slot must not surface as a DatId.
+    #[test]
+    fn spell_effect_payload_is_not_a_datid() {
+        let mut body = vec![0u8; SCHEDULER_HEADER_LEN];
+        body.extend(timed_stage_bytes(SPELL_EFFECT_OPCODE, 3, 0, 0));
+        body.extend_from_slice(&617u32.to_le_bytes());
+
+        let s = Scheduler::parse(*b"sdep", &body).unwrap();
+        let stage = &s.stages[0].stage;
+        assert_eq!(stage.kind, StageKind::SpellEffect);
+        assert_eq!(stage.spell_effect, Some(617));
+        assert_eq!(stage.id, NO_STAGE_ID);
+    }
+
     // The flinch and knockback payloads are floats/ints from +8 on (research/xim
     // EffectRoutineParser.kt parseSection2), so their id slot must not surface as a DatId.
+    // Knockback: u16 u16 f32 f32 u32.
     #[test]
     fn flinch_and_knockback_payloads_are_not_datids() {
         let mut body = vec![0u8; SCHEDULER_HEADER_LEN];
@@ -1765,7 +2007,6 @@ mod tests {
             0,
         ));
         body.extend(std::iter::repeat_n(0u8, FLINCH_PAYLOAD_LEN));
-        // Knockback payload: u16 u16 f32 f32 u32.
         body.extend(timed_stage_bytes(
             KNOCKBACK_OPCODE,
             KNOCKBACK_STAGE_WORDS,
@@ -1781,6 +2022,28 @@ mod tests {
         assert_eq!(s.stages[1].stage.id, NO_STAGE_ID);
     }
 
+    // research/xim EffectRoutineParser.kt parseSection2 0x5E: u16, u16, then the f32
+    // animationDuration, so it sits four bytes into the payload.
+    #[test]
+    fn knockback_stage_reads_its_animation_duration() {
+        let mut body = vec![0u8; SCHEDULER_HEADER_LEN];
+        body.extend(timed_stage_bytes(
+            KNOCKBACK_OPCODE,
+            KNOCKBACK_STAGE_WORDS,
+            0,
+            0,
+        ));
+        body.extend_from_slice(&0u16.to_le_bytes());
+        body.extend_from_slice(&0u16.to_le_bytes());
+        body.extend_from_slice(&12.5f32.to_le_bytes());
+        body.extend_from_slice(&0f32.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+
+        let s = Scheduler::parse(*b"kb00", &body).unwrap();
+        assert_eq!(s.stages[0].stage.kind, StageKind::Knockback);
+        assert_eq!(s.stages[0].stage.flinch_duration, Some(12.5));
+    }
+
     // The 0x28 payload is an f32 transition time in the id slot (research/xim
     // EffectRoutineParser.kt parseSection2).
     #[test]
@@ -1793,6 +2056,26 @@ mod tests {
         let st = s.stages[0].stage;
         assert_eq!(st.kind, StageKind::TransitionToIdle);
         assert_eq!(st.idle_transition_time, Some(1.5));
+        assert_eq!(st.id, NO_STAGE_ID);
+    }
+
+    // research/xim EffectRoutineParser.kt parseSection2 — the magic lock form is two dwords total, so
+    // it must map without the +8 id dword: the blanket gate read every shipped two-dword lock
+    // stage as Unknown.
+    #[test]
+    fn magic_animation_lock_maps_at_two_dwords() {
+        let mut body = vec![0u8; SCHEDULER_HEADER_LEN];
+        body.extend(timed_stage_bytes(
+            ANIMATION_LOCK_MAGIC_OPCODE,
+            ARGLESS_STAGE_WORDS,
+            0,
+            112,
+        ));
+
+        let s = Scheduler::parse(*b"waso", &body).unwrap();
+        let st = s.stages[0].stage;
+        assert_eq!(st.kind, StageKind::AnimationLock);
+        assert_eq!(st.duration_frames, 112);
         assert_eq!(st.id, NO_STAGE_ID);
     }
 
@@ -2055,11 +2338,10 @@ mod vehicle_contract_tests {
         assert_eq!(scheduler.stages[0].stage.follow_points, None);
     }
 
+    /// Route anchors: ex1a plays the 1c* routes, ex1b the 2c* routes, mov2 the
+    /// c1* through c4* routes; each assert's zone id is that route's hex prefix.
     #[test]
     fn zone_camera_route_name_spells_the_hex_zone_prefix_and_decimal_index() {
-        // Anchors from the global scene file's census: ex1a plays 1c* routes
-        // (zone 28 = 0x1C), ex1b plays 2c* (44 = 0x2C), mov2 plays c1* to c4*
-        // (zones 193 to 196).
         assert_eq!(zone_camera_route_name(0x1C, 1), *b"1c01");
         assert_eq!(zone_camera_route_name(0x2C, 14), *b"2c14");
         assert_eq!(zone_camera_route_name(0xC1, 7), *b"c107");
@@ -2067,9 +2349,9 @@ mod vehicle_contract_tests {
         assert_eq!(zone_camera_route_name(0, 0), *b"0000");
     }
 
-    // Retail-byte guard (skips without an install). The 0x2D keys of the Chamber of
-    // Oracles (168) live in zone 168's own model DAT (ROM/2/11.DAT): the corpus
-    // scan's dominant rule.
+    /// Retail-byte guard (skips without an install). The MAPSCHEDULOR keys of the
+    /// Chamber of Oracles (168) live in zone 168's own model DAT (ROM/2/11.DAT),
+    /// the dominant resolution rule.
     #[test]
     fn zone_scene_resolves_in_the_zones_own_model_dat() {
         let Some(root) = crate::archive::open_test_install() else {
@@ -2086,8 +2368,8 @@ mod vehicle_contract_tests {
         }
     }
 
-    // Retail-byte guard (skips without an install). Sealion's Den (32) event 100
-    // runs `lwon` out of zone 32's own model DAT (ROM/3/98.DAT).
+    /// Retail-byte guard (skips without an install). Sealion's Den (32) event 100
+    /// runs `lwon` out of zone 32's own model DAT (ROM/3/98.DAT).
     #[test]
     fn zone_scene_resolves_sealions_den_lwon_in_its_own_model_dat() {
         let Some(root) = crate::archive::open_test_install() else {
@@ -2098,11 +2380,11 @@ mod vehicle_contract_tests {
         assert_eq!(zone_scene_file_id(&root, 32, *b"lwon"), Some(file));
     }
 
-    // Retail-byte guard (skips without an install). A repeated 0x2D lookup for the
-    // same (zone, key) is served from the memo instead of re-reading the zone's
-    // model DAT; an overlay-swap clear forces one re-resolve. The probe key is
-    // unique to this test so parallel tests resolving real keys cannot move the
-    // per-key counter.
+    /// Retail-byte guard (skips without an install). A repeated MAPSCHEDULOR lookup
+    /// for the same (zone, key) is served from the memo instead of re-reading the
+    /// zone's model DAT; an overlay-swap clear forces one re-resolve. The probe key
+    /// is unique to this test so parallel tests resolving real keys leave its
+    /// per-key counter alone.
     #[test]
     fn zone_scene_lookups_are_memoized_and_cleared() {
         let Some(root) = crate::archive::open_test_install() else {
@@ -2131,9 +2413,9 @@ mod vehicle_contract_tests {
         );
     }
 
-    // Retail-byte guard (skips without an install). Heavens' Tower (242) carries no
-    // `hshi` in its own model DAT; the key resolves in the partner zone Full Moon
-    // Fountain (170)'s model DAT: a ZONE_SCENE_PARTNERS instance/entrance pair.
+    /// Retail-byte guard (skips without an install). Heavens' Tower (242) carries no
+    /// `hshi` in its own model DAT; the key resolves in the partner zone Full Moon
+    /// Fountain (170)'s model DAT: a ZONE_SCENE_PARTNERS instance/entrance pair.
     #[test]
     fn zone_scene_falls_back_to_the_partner_zone_model_dat() {
         let Some(root) = crate::archive::open_test_install() else {

@@ -43,8 +43,9 @@ mod tests {
         }
     }
 
-    // DAT 345's sea group: `down` (low priority) first, then everything depth-sorted, then
-    // `col1`, `sea2`, `sea1` (all pinned) in chunk order — the base plane under the sheets.
+    /// DAT 345's sea group: `down` (low priority) first, then everything
+    /// depth-sorted, then `col1`, `sea2`, `sea1` (all pinned) in chunk order —
+    /// the base plane under the sheets.
     #[test]
     fn lower_jeuno_sea_group_draws_bottom_up() {
         let down = transparent_sort_bias(&def(DrawPriority::Low, 0.0), 0x1000);

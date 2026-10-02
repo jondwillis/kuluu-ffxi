@@ -1,5 +1,13 @@
 // vendor/server/src/map/enums/action/category.h ActionCategory - `action.cmd_no`, 4 bits.
 pub const CATEGORY_BASIC_ATTACK: u8 = 1;
+// vendor/server/src/map/enums/action/category.h ActionCategory::RangedFinish - the
+// shot motion after a completed aim.
+pub const CATEGORY_RANGED_FINISH: u8 = 2;
+// vendor/server/src/map/action/interrupts.cpp RangedInterrupt - an interrupted aim
+// re-issues the ranged-start category with this per-target animation id
+// (ActionAnimation::SkillInterrupt, vendor/server/src/map/enums/action/animation.h)
+// alongside the "splg" FourCC.
+pub const RANGED_INTERRUPT_ANIMATION: u16 = 0x1FC;
 // The finish categories that key a completion effect DAT (scheduler_runtime's
 // action_dat_file_id) and the start categories that carry a cast-loop routine (the "ca??" family).
 pub const CATEGORY_SKILL_FINISH: u8 = 3;
@@ -317,8 +325,9 @@ mod tests {
         assert_eq!(MeleeResult::from_wire(0, 5, 0, 0, 0), None);
     }
 
-    // The outcome bits are validated against the pinned enums: hitDistortion is a 2-bit field and
-    // knockback a 3-bit one on the wire, so out-of-range values cannot round-trip.
+    /// The outcome bits are validated against the pinned enums: hitDistortion is
+    /// a 2-bit field and knockback a 3-bit one on the wire, so out-of-range
+    /// values cannot round-trip.
     #[test]
     fn outcome_bits_roundtrip() {
         let r = MeleeResult::from_wire(0, 1, 2, 3, 2).expect("in-range bits");
@@ -329,8 +338,8 @@ mod tests {
         assert_eq!(r.knockback, KnockbackLevel::Level2);
     }
 
-    // from_wire(to_wire(x)) == x for a table of non-zero outcomes: the lossless property the
-    // snapshot contract relies on.
+    /// from_wire(to_wire(x)) == x for a table of non-zero outcomes: the lossless
+    /// property the snapshot contract relies on.
     #[test]
     fn melee_result_to_wire_is_lossless() {
         let cases = [
@@ -347,16 +356,16 @@ mod tests {
         }
     }
 
-    // The outcome bits ride through unvalidated: the bit reader already bounds them to their
-    // field widths (info 5, hitDistortion 2, knockback 3).
+    /// The outcome bits ride through unvalidated: the bit reader already bounds
+    /// them to their field widths (info 5, hitDistortion 2, knockback 3).
+    /// recordDamage sets hitDistortion from the damage share alone: Heavy without
+    /// the flag is not a crit, and a crit can land Light.
     #[test]
     fn outcome_bits_roundtrip_and_flags() {
         let o = ResultOutcome::from_wire(INFO_CRITICAL_HIT, 3, 2);
         assert_eq!(o.to_wire(), (INFO_CRITICAL_HIT, 3, 2));
         assert!(o.is_critical());
         assert!(!o.defeated());
-        // recordDamage sets hitDistortion from the damage share alone: Heavy without the flag
-        // is not a crit, and a crit can land Light.
         assert!(!ResultOutcome::from_wire(0, 3, 0).is_critical());
         assert!(ResultOutcome::from_wire(INFO_CRITICAL_HIT, 1, 0).is_critical());
         assert!(ResultOutcome::from_wire(INFO_DEFEATED, 0, 0).defeated());

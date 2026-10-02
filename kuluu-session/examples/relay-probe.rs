@@ -6,7 +6,7 @@
 //! per-entity update lines, or sends one viewer command.
 //!
 //! The stream is the session state's own view of what the wire delivered:
-//! every relay snapshot is diffed against the previous one, so `ADD`/`DEL`/`UP`
+//! every relay snapshot is diffed against the earlier one, so `ADD`/`DEL`/`UP`
 //! lines are exactly which entities changed and how (status byte, hp,
 //! nameplate-driving flags) — the per-entity "update list" for diagnosing
 //! stale-table bugs without touching game state. Cross-platform: unlike the
@@ -29,6 +29,8 @@ use futures_util::{SinkExt, StreamExt};
 use kuluu_snapshot::{CharFlags, ClientFrame, Entity, Frame, ViewerCommand, ViewerEvent};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
+/// The relay URL: the `--url=` arg, else `FFXI_RELAY_URL`. The relay defaults
+/// to postcard binary, so append `?format=json` for text frames.
 fn relay_url(args: &[String]) -> String {
     let from_arg = args.iter().find_map(|a| a.strip_prefix("--url="));
     let url = from_arg
@@ -36,11 +38,10 @@ fn relay_url(args: &[String]) -> String {
         .or_else(|| std::env::var("FFXI_RELAY_URL").ok())
         .unwrap_or_else(|| {
             panic!(
-                "no relay URL: pass --url=ws://127.0.0.1:<port> or set FFXI_RELAY_URL \
-                 (the client prints `relay listening on ws://...` at startup)"
+                "no relay URL: pass --url=ws:\u{002F}\u{002F}127.0.0.1:<port> or set FFXI_RELAY_URL \
+                 (the client prints `relay listening on ws:\u{002F}\u{002F}...` at startup)"
             )
         });
-    // The relay defaults to postcard binary; ask for JSON text frames.
     if url.contains('?') {
         url
     } else {
@@ -49,7 +50,7 @@ fn relay_url(args: &[String]) -> String {
 }
 
 /// The fields a stale-table diagnosis actually reads; position is excluded so
-/// movement never spams the diff. `claim` drives the white→claimed plate colour.
+/// movement does not spam the diff. `claim` drives the white→claimed plate colour.
 #[derive(Clone, Copy, PartialEq)]
 struct Key {
     status: u8,
@@ -123,7 +124,7 @@ async fn main() -> Result<()> {
             let text = args
                 .get(1)
                 .filter(|a| !a.starts_with("--url="))
-                .context("usage: relay-probe chat <text> [--url=ws://host:port]")?;
+                .context("usage: relay-probe chat <text> [--url=ws:\u{002F}\u{002F}host:port]")?;
             send_one(
                 &url,
                 &ViewerCommand::Chat {
@@ -139,7 +140,6 @@ async fn main() -> Result<()> {
                 .get(1)
                 .filter(|a| !a.starts_with("--url="))
                 .context("usage: relay-probe engage <entity_id> (hex or decimal)")?;
-            // Watch lines print ids as 08X hex; accept both.
             let id = if let Some(hex) = raw.strip_prefix("0x") {
                 u32::from_str_radix(hex, 16).with_context(|| format!("bad hex id: {raw}"))?
             } else {
@@ -170,7 +170,7 @@ async fn main() -> Result<()> {
                         verbose = true;
                         i += 1;
                     }
-                    _ => i += 1, // --url=... handled by relay_url()
+                    _ => i += 1,
                 }
             }
             watch(&url, filter.as_deref(), verbose).await?;
@@ -179,7 +179,9 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Send one viewer command (postcard binary frame) and drain ~2s of replies.
+/// Send one viewer command (postcard binary frame) and drain ~2s of replies
+/// (events, or nothing for screenshots — the PNG lands in the client's CWD
+/// instead).
 async fn send_one(url: &str, cmd: &ViewerCommand) -> Result<()> {
     let (ws, _resp) = connect_async(url)
         .await
@@ -191,8 +193,6 @@ async fn send_one(url: &str, cmd: &ViewerCommand) -> Result<()> {
         .await
         .context("sending command")?;
 
-    // Give the server a moment to answer (events, or nothing for screenshots —
-    // the PNG lands in the client's CWD instead).
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -220,6 +220,8 @@ async fn send_one(url: &str, cmd: &ViewerCommand) -> Result<()> {
     Ok(())
 }
 
+/// Streams the relay's snapshots as per-entity update lines. The relay only
+/// emits full snapshots; a Delta frame is a protocol surprise worth surfacing.
 async fn watch(url: &str, filter: Option<&str>, verbose: bool) -> Result<()> {
     let (ws, _resp) = connect_async(url)
         .await
@@ -227,7 +229,6 @@ async fn watch(url: &str, filter: Option<&str>, verbose: bool) -> Result<()> {
     eprintln!("relay-probe: attached to {url}");
     let (_sink, mut stream) = ws.split();
 
-    // id -> (name, last key); the diff source for every incoming snapshot.
     let mut prev: HashMap<u32, (String, Key)> = HashMap::new();
     let mut zone: Option<u16> = None;
     let mut stage: Option<kuluu_snapshot::Stage> = None;
@@ -286,7 +287,6 @@ async fn watch(url: &str, filter: Option<&str>, verbose: bool) -> Result<()> {
                     now.insert(e.id, (name_of(e), key_of(e)));
                 }
 
-                // Additions and changes.
                 for e in &snap.entities {
                     match prev.get(&e.id) {
                         None => {
@@ -302,7 +302,6 @@ async fn watch(url: &str, filter: Option<&str>, verbose: bool) -> Result<()> {
                                     println!("{line}");
                                 }
                             } else if verbose {
-                                // Key unchanged but present: movement/heading only.
                                 eprintln!(
                                     "    (move id={:08X} {} -> ({:.1},{:.1}))",
                                     e.id,
@@ -314,7 +313,6 @@ async fn watch(url: &str, filter: Option<&str>, verbose: bool) -> Result<()> {
                         }
                     }
                 }
-                // Removals.
                 for (id, (name, _)) in prev.iter().filter(|(id, _)| !now.contains_key(id)) {
                     let line = del_line(*id, name);
                     if keep(filter, &line) {
@@ -334,8 +332,6 @@ async fn watch(url: &str, filter: Option<&str>, verbose: bool) -> Result<()> {
                 }
             }
             Frame::Delta(_) => {
-                // The relay only emits full snapshots; a delta here would be a
-                // protocol surprise worth surfacing.
                 eprintln!("relay-probe: unexpected Delta frame");
             }
             Frame::Event(ev) => {

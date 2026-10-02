@@ -13,13 +13,13 @@ pub const BACKUP_SUFFIX: &str = ".kuluu-backup";
 pub const CONTROLLER_CONFIGS_DIR: &str = "Steam Controller Configs";
 pub const DECK_LAYOUT_FILE: &str = "controller_neptune.vdf";
 
-// Steam marks shortcut app ids with the high bit; the low 31 bits are the
-// CRC32 of "\"<exe>\"<AppName>". Documented at
-// github.com/CorporalQuesadilla/Steam-Shortcut-Manager/wiki/Steam-Shortcuts-Documentation
+/// Steam marks shortcut app ids with the high bit; the low 31 bits are the
+/// CRC32 of "\"<exe>\"<AppName>". Documented at
+/// https://github.com/CorporalQuesadilla/Steam-Shortcut-Manager/wiki/Steam-Shortcuts-Documentation
 const NON_STEAM_APPID_FLAG: u32 = 0x8000_0000;
 
-// developer.valvesoftware.com/wiki/SteamID: individual-account SteamID64s
-// are this constant plus the 32-bit account id that names userdata/<id>.
+/// Individual-account SteamID64s are this constant plus the 32-bit account
+/// id that names userdata/<id> (https://developer.valvesoftware.com/wiki/SteamID).
 const STEAMID64_ACCOUNT_BASE: u64 = 76_561_197_960_265_728;
 
 pub mod vdf {
@@ -275,7 +275,7 @@ pub fn quoted_strings(line: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut chars = line.chars();
     while let Some(c) = chars.next() {
-        if c == '/' && line.trim_start().starts_with("//") {
+        if c == '/' && line.trim_start().starts_with("\u{002F}\u{002F}") {
             break;
         }
         if c != '"' {
@@ -593,7 +593,7 @@ pub fn add_non_steam_game_url(exe: &Path) -> String {
             other => format!("%{other:02X}"),
         })
         .collect();
-    format!("steam://addnonsteamgame/{encoded}")
+    format!("steam:\u{002F}\u{002F}addnonsteamgame/{encoded}")
 }
 
 fn open_url(url: &str) -> Result<()> {
@@ -1058,13 +1058,14 @@ mod tests {
         );
     }
 
+    /// Windows candidates are machine-level Program Files paths a fixture
+    /// cannot own, so the test picks the home-relative candidate: a real
+    /// Steam install there would answer the first assertion before the
+    /// fixture does.
     #[test]
     fn find_steam_root_requires_a_userdata_dir() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path();
-        // Windows candidates are machine-level Program Files paths a fixture
-        // cannot own: a real Steam install there answers the first assertion
-        // before the fixture does.
         let Some(candidate) = steam_root_candidates(home)
             .into_iter()
             .find(|c| c.starts_with(home))
@@ -1081,7 +1082,7 @@ mod tests {
     fn add_non_steam_game_url_percent_encodes_spaces_and_quotes() {
         assert_eq!(
             add_non_steam_game_url(Path::new("/home/deck/My Games/kuluu")),
-            "steam://addnonsteamgame//home/deck/My%20Games/kuluu"
+            "steam:\u{002F}\u{002F}addnonsteamgame\u{002F}\u{002F}home/deck/My%20Games/kuluu"
         );
     }
 }

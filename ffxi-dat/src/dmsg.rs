@@ -17,7 +17,10 @@
 //! in NA English dialog).
 
 const TEXT_XOR: u8 = 0x80;
-const OFFSET_XOR: u32 = 0x8080_8080;
+/// Offset entries in the DialogTable header are stored XORed with this value;
+/// exported so other crates' fixtures can synthesise a valid table without
+/// re-typing the format's value.
+pub const OFFSET_XOR: u32 = 0x8080_8080;
 const MAGIC_BASE: u32 = 0x1000_0000;
 
 // DialogTable control codes (POLUtils Things/DialogTableEntry.cs).
@@ -138,8 +141,8 @@ pub const MAX_PARAM_SLOT: u32 = 31;
 
 // Emote chat-text control sequences, observed in the emote DialogTable
 // (ROM/27/70.DAT, byte-identical on horizonxi-2023 and retail-2026-09; see
-// [`EmoteTextDat`]). Each line wraps its slots
-// in CC_AUTO (0x7f) sequences the generic decoder only knows as `{Auto:N}`:
+// [`EmoteTextDat`]). Each line wraps its slots in CC_AUTO (0x7f) sequences the generic
+// decoder (POLUtils Things/DialogTableEntry.cs, the 0x7f branch) only knows as `{Auto:N}`:
 //   7f fc <caster-name slot> 7f fb   — leading caster block
 //   7f 88 01 "[the /]" <target-name slot> — article alternative + target
 //   7f 90 "[his/her]"                — caster-gender alternative
@@ -430,8 +433,8 @@ impl StringDat {
     }
 }
 
-/// The `num[]` slots `text` substitutes. Reads the rendered markers rather than
-/// the raw control codes so it can never disagree with what the line prints.
+/// The `num[]` slots `text` substitutes. Reads the rendered markers, so the mask
+/// reflects exactly what the line prints.
 fn param_slots_of(text: &str) -> u32 {
     let mut mask = 0u32;
     for tail in text.split('{').skip(1) {
@@ -469,7 +472,6 @@ fn decode_dialog_text(bytes: &[u8]) -> String {
     while i < bytes.len() {
         let b = bytes[i];
         match b {
-            // Layout directives: consume both position bytes, emit nothing.
             CC_SET_X | CC_SET_Y => i += 2,
             CC_NEWLINE => out.push('\n'),
             CC_PLAYER_NAME => push_plain(&mut out, MARKER_PLAYER_NAME),
@@ -676,10 +678,10 @@ mod tests {
         );
     }
 
+    /// "You obtain {Num:1} {Item:0}!" — the parameterized shape that tells the entry apart
+    /// from the parameterless lines it shares a block with.
     #[test]
     fn param_slots_reports_the_num_bank_an_entry_reads() {
-        // "You obtain {Num:1} {Item:0}!", whose shape is what tells it apart
-        // from the parameterless lines it shares a block with.
         let obtain = [b'x', CC_NUM, 1, b' ', CC_ITEM, 0, b'!'];
         let dat = StringDat::parse(&synth(&[&obtain])).expect("parse");
         assert_eq!(dat.param_slots(0), Some(0b11));
@@ -694,8 +696,6 @@ mod tests {
 
     #[test]
     fn param_slots_ignores_markers_that_do_not_read_the_num_bank() {
-        // {Auto:N} is a formatting kind and {SetColor:N} a colour index; the
-        // chocobo name comes from the packet's string field, not num[].
         let entry = [
             CC_AUTO,
             0x31,

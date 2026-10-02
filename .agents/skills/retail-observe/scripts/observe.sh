@@ -73,12 +73,20 @@ command -v jq >/dev/null 2>&1 || die "jq is required (\`observe.sh doctor\`)"
 # SAME invocation. Skipping this does not merely fail: the keystrokes land in
 # whatever window is frontmost, which is usually the terminal driving the run.
 ensure_focus() {
+  host_input_or_die
   [ -n "${BG:-}" ] && return 0
   host_show >/dev/null 2>&1
 }
 
 capture_to() {
   local out=${1:-"$ARTIFACTS/$(date +%Y%m%d-%H%M%S).png"}
+  # A bare name is a label, not a path: keep the burst together in ARTIFACTS
+  # instead of scattering extensionless PNGs through the caller's directory.
+  case $out in
+    */*) ;;
+    *.png) out="$ARTIFACTS/$out" ;;
+    *) out="$ARTIFACTS/$out.png" ;;
+  esac
   mkdir -p "$(dirname "$out")"
   host_capture "$WID" "$out"
   printf '%s\n' "$out"
@@ -135,6 +143,7 @@ case $cmd in
   ocr|click-text)
     if [ "$cmd" = click-text ]; then
       pat=${1:?usage: observe.sh [--bg] click-text <regex> [right|double]}; kind=${2:-left}
+      host_input_or_die   # before the OCR round trip, not after announcing a click
     fi
     need_window
     tmp="${TMPDIR:-/tmp}/observe-ocr-$$.png"

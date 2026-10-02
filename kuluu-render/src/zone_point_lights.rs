@@ -748,8 +748,8 @@ mod tests {
         assert!(authored_point_light_indices(&lights, &slots(&[])).is_empty());
     }
 
-    // `//lights` emitters carry UNAUTHORED_LIGHT_ID; a chunk binding must never
-    // resolve onto one.
+    /// `//lights` emitters carry UNAUTHORED_LIGHT_ID; a chunk binding does not
+    /// resolve onto one.
     #[test]
     fn emitters_are_never_bound_by_a_chunk() {
         let lights = [light(Vec3::ZERO, 10.0)];
@@ -781,9 +781,9 @@ mod tests {
         );
     }
 
-    // point_shadow.wgsl resolves a per-actor slot to its shadow map by matching the
-    // slot's position against the clustered light's, so the uniform pack and the
-    // PointLight entity must carry the same f32s for the same light.
+    /// point_shadow.wgsl resolves a per-actor slot to its shadow map by matching the
+    /// slot's position against the clustered light's, so the uniform pack and the
+    /// PointLight entity carry the same f32s for the same light.
     #[test]
     fn packed_slot_position_is_the_spawned_light_s_translation() {
         const NIGHT_VANA_HOUR: f32 = 22.0;

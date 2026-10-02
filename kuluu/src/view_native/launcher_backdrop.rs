@@ -75,10 +75,10 @@ const FADE_IN_SECS: f32 = 0.35;
 
 const FADE_COLOR: Color = Color::srgb(0.04, 0.04, 0.05);
 
-// Flythrough tuning, matched to the retail character-select backdrop observed
-// on HorizonXI (screenshots taken 2026-07-19): a continuous slow dolly
-// covering roughly a run-speed's distance per second, with no cut inside a 37s
-// observation window.
+/// Flythrough tuning, matched to the retail character-select backdrop
+/// observed on HorizonXI (screenshots taken 2026-07-19): a continuous slow
+/// dolly covering roughly a run-speed's distance per second, with no cut
+/// inside a 37s observation window.
 const FLIGHT_SPEED: f32 = 5.0;
 const FLIGHT_SEGMENT_SECS: f32 = 45.0;
 // High enough to clear most MMB tree canopies, which the MZB collision probes
@@ -401,7 +401,8 @@ fn seat_at_vantage(bvh: &CollisionBvh, flight: &mut BackdropFlight, cam: &mut Tr
 // splitmix64 finalizer (Steele et al., "Fast Splittable Pseudorandom Number
 // Generators") — deterministic vantage sequence, no RNG state to carry.
 fn vantage_hash(segment: u32, attempt: u32) -> u64 {
-    let mut z = ((segment as u64) << 32 | attempt as u64).wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = ((segment as u64) << 32 | attempt as u64)
+        .wrapping_add(kuluu_render::scheduler_runtime::SPLITMIX64_GOLDEN_RATIO);
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     z ^ (z >> 31)

@@ -139,14 +139,14 @@ fn text(text: impl Into<String>, size: f32, color: Color) -> impl Bundle {
 }
 
 /// One line that clips instead of wrapping: paths and field contents. The
-/// clip lives on a wrapper because a node only clips its children, never its
+/// clip lives on a wrapper because a node clips only its children, not its
 /// own glyphs.
 fn clipped_text(text: impl Into<String>, size: f32, color: Color) -> impl Bundle {
     clipped_text_tagged(text, size, color, ())
 }
 
 /// As [`clipped_text`], with `tag` on the inner entity. A marker on the
-/// wrapper would never be seen by a `Text` query: the wrapper carries the
+/// wrapper would not be seen by a `Text` query: the wrapper carries the
 /// clip, the child carries the glyphs.
 fn clipped_text_tagged(
     text: impl Into<String>,
@@ -823,6 +823,15 @@ fn go_back(ret: &mut DatSetupReturn, next: &mut NextState<LauncherState>) {
     next.set(ret.0.take().unwrap_or(LauncherState::Login));
 }
 
+/// The selection has to become the registry's default install, not just the
+/// launcher's saved path: cold starts and the lobby version stamp
+/// (lobby_client::client_version_code) resolve the registry default, so a
+/// choice saved only here reverted on relaunch and kept reporting the old
+/// install's era to the server.
+///
+/// persist() clears the legacy saved path; re-arm it only while the shell
+/// exports FFXI_DAT_PATH, which otherwise outranks the registry at every
+/// launch (this screen is reached exactly in that situation).
 fn try_continue(
     form: &mut DatSetupForm,
     commands: &mut Commands,
@@ -841,11 +850,6 @@ fn try_continue(
         return;
     }
 
-    // The selection has to become the registry's default install, not just the
-    // launcher's saved path: cold starts and the lobby version stamp
-    // (lobby_client::client_version_code) resolve the registry default, so a
-    // choice saved only here reverted on relaunch and kept reporting the old
-    // install's era to the server.
     if let Err(e) = ffxi_client::persist(Path::new(&path)) {
         form.feedback = Some(Err(format!("Could not make that the default install: {e}")));
         dirty.0 = true;
@@ -853,9 +857,6 @@ fn try_continue(
     }
 
     let mut store = launcher_store::load();
-    // persist() clears the legacy saved path; re-arm it only while the shell
-    // exports FFXI_DAT_PATH, which otherwise outranks the registry at every
-    // launch (this screen is reached exactly in that situation).
     if ffxi_client::shell_dat_path().is_some() {
         store.settings.dat_path = EnvOverride {
             value: path.clone(),

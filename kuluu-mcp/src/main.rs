@@ -9,7 +9,7 @@ use rmcp::{
     model::{
         CallToolResult, ContentBlock, ListResourcesResult, PaginatedRequestParams, ProtocolVersion,
         ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Resource,
-        ResourceContents, ResourceUpdatedNotificationParam, ServerCapabilities, ServerInfo,
+        ResourceContents, ResourceUpdatedNotificationParam, ServerCapabilities, ServerConfig,
         SubscribeRequestParams, UnsubscribeRequestParams,
     },
     service::{serve_server, Peer, RequestContext, RoleServer},
@@ -274,7 +274,7 @@ impl FfxiServer {
     }
 
     #[tool(
-        description = "Focus-less GUI driving: trigger the client's `//debug heights` grounding dump at the current position. Server/nav/mzb heights are written to the client log under target `debug_heights` (grep the client log; not returned here). GUI session only."
+        description = "Focus-less GUI driving: trigger the client's `/debug heights` grounding dump at the current position. Server/nav/mzb heights are written to the client log under target `debug_heights` (grep the client log; not returned here). GUI session only."
     )]
     async fn debug_heights(&self) -> Result<CallToolResult, McpError> {
         self.send(AgentCommand::DebugHeights).await
@@ -563,14 +563,14 @@ impl FfxiServer {
 
 #[tool_handler]
 impl ServerHandler for FfxiServer {
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> ServerConfig {
         let caps = ServerCapabilities::builder()
             .enable_tools()
             .enable_resources()
             .enable_resources_subscribe()
             .build();
 
-        let mut info = ServerInfo::default();
+        let mut info = ServerConfig::default();
         info.protocol_version = ProtocolVersion::V_2025_11_25;
         info.capabilities = caps;
         info.instructions = Some(
@@ -1112,8 +1112,9 @@ async fn main() -> Result<()> {
     let relay_handles = if let Some(addr) = relay_addr {
         let (state_tx, state_rx) = tokio::sync::watch::channel(SessionState::default());
         let folder_rx = event_tx.subscribe();
-        // The relay path has no translator: change batches are drained
-        // by the folder but never consumed.
+        // The relay path has no scene translator (bridge.rs consumes these
+        // batches in the GUI path), so the folder's change batches are drained
+        // but the receiving end is unused (hence the underscore).
         let (changes_tx, _entity_changes_rx) = tokio::sync::mpsc::unbounded_channel();
         let folder_h = tokio::spawn(session::run_event_folder(folder_rx, state_tx, changes_tx));
         let relay_event_tx = event_tx.clone();
@@ -1179,6 +1180,10 @@ mod tests {
         ActionKind, Entity, EntityKind, PartyMember, Position, Stage, Vec3,
     };
 
+    /// The party roster resource URI. The server's resources/read handler
+    /// (main.rs) serves this exact string; the fixture below pins it.
+    const PARTY_MEMBERS_URI: &str = "party://members";
+
     #[tokio::test]
     async fn legacy_mcp_resource_wire_contract() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -1205,15 +1210,19 @@ mod tests {
             .as_bytes()).await.unwrap();
             let init: serde_json::Value = serde_json::from_str(&reader.next_line().await.unwrap().unwrap()).unwrap();
             assert_eq!(init["result"]["protocolVersion"], "2025-11-25");
-            writer.write_all(concat!(
-                "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n",
-                "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"resources/read\",\"params\":{\"uri\":\"party://members\"}}\n"
-            ).as_bytes()).await.unwrap();
+            let initialized =
+                "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n";
+            let read_request = format!(
+                "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"resources/read\",\"params\":{{\"uri\":\"{PARTY_MEMBERS_URI}\"}}}}\n"
+            );
+            writer.write_all(format!("{initialized}{read_request}").as_bytes())
+                .await
+                .unwrap();
             let response: serde_json::Value = serde_json::from_str(&reader.next_line().await.unwrap().unwrap()).unwrap();
             assert_eq!(response, serde_json::json!({
                 "jsonrpc": "2.0", "id": 2,
                 "result": { "contents": [{
-                    "uri": "party://members", "mimeType": "text/plain", "text": expected_party
+                    "uri": PARTY_MEMBERS_URI, "mimeType": "text/plain", "text": expected_party
                 }] }
             }));
             drop(writer);

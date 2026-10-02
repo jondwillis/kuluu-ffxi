@@ -20,7 +20,8 @@ pub struct SubTargetEntity {
     pub is_alliance: bool,
     pub is_enemy: bool,
     pub is_npc: bool,
-    /// The player's own up pet (0x068 PetSync targid match).
+    /// The player's own up pet (the PetSync targid match, s2c
+    /// `ffxi_proto::map::ENTITY_UPDATE2`).
     pub is_own_pet: bool,
     pub is_dead: bool,
     /// Squared distance from the player, used for initial pick + cycling order.
@@ -183,6 +184,17 @@ mod tests {
     }
 
     #[test]
+    fn a_self_only_mask_seeds_on_self_past_a_targeted_mob() {
+        // A SELF-only action (Boost, Mighty Strikes) prompts with the cursor
+        // seeded on the player even while a mob is the current target
+        // (record: "Menu actions always confirm through the sub-target
+        // cursor").
+        let flags = TargetFlags(TargetFlags::SELF);
+        let ents = [me(), mob(7, 5.0)];
+        assert_eq!(initial_candidate(flags, Some(7), &ents), Some(1));
+    }
+
+    #[test]
     fn cure_defaults_to_self_without_target() {
         let flags = TargetFlags(TargetFlags::SELF | TargetFlags::PLAYER_PARTY);
         let ents = [me(), mob(10, 5.0)];
@@ -268,17 +280,24 @@ mod tests {
             is_own_pet: true,
             ..ent(9, 3.0)
         };
-        // Sic (72) carries the PET bit; Provoke (35) does not.
-        assert!(entity_valid(
-            ffxi_vocab::valid_target::ability(72).expect("Sic present"),
-            &pet
-        ));
-        assert!(!entity_valid(
-            ffxi_vocab::valid_target::ability(35).expect("Provoke present"),
-            &pet
-        ));
-        // Switch Target is ENEMY-only: the own pet is not a re-engage target.
-        assert!(!entity_valid(action_flags(SubTargetAction::PickSub), &pet));
+        assert!(
+            entity_valid(
+                ffxi_vocab::valid_target::ability(72).expect("Sic present"),
+                &pet
+            ),
+            "Sic (72) carries the PET bit"
+        );
+        assert!(
+            !entity_valid(
+                ffxi_vocab::valid_target::ability(35).expect("Provoke present"),
+                &pet
+            ),
+            "Provoke (35) does not carry the PET bit"
+        );
+        assert!(
+            !entity_valid(action_flags(SubTargetAction::PickSub), &pet),
+            "Switch Target is ENEMY-only: the own pet is not a re-engage target"
+        );
     }
 
     #[test]

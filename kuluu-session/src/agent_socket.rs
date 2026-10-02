@@ -70,6 +70,9 @@ pub async fn serve(
 /// Like `serve`, but the session behind the socket can be swapped (or cleared
 /// with `None`, e.g. while the window sits at the launcher) by sending on the
 /// watch channel. The listener itself is bound once for the life of the task.
+/// Each peer reads the current channels with `borrow_and_update` so the shared
+/// marker is current; the per-peer receiver clone then fires only on the NEXT
+/// swap, not the one already in effect.
 pub async fn serve_dynamic(
     listen: ResolvedListen,
     mut sessions: watch::Receiver<Option<SessionChannels>>,
@@ -124,8 +127,6 @@ pub async fn serve_dynamic(
             }
         };
         let (reader, writer) = stream.into_split();
-        // borrow_and_update: the per-peer receiver clone below must only fire
-        // on the NEXT swap, not re-fire on the one that brought us here.
         let Some(channels) = sessions.borrow_and_update().clone() else {
             let mut writer = writer;
             let ev = AgentEvent::Error {

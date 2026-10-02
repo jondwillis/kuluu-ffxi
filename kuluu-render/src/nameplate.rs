@@ -80,6 +80,10 @@ pub fn format_coord(pos: Vec3) -> String {
     format!("{:.1} / {:.1} / {:.1}", pos.x, pos.y, pos.z)
 }
 
+/// Doors and namevis-hidden helpers carry no plate at all: retail shows no
+/// floating name over a door in any state (verified against retail
+/// 2026-08-26), and the door's name still shows in the target panel when
+/// targeted. Suppression culls EXISTING plates as well as skipping new ones.
 pub fn update_nameplates_system(
     state: Res<SceneState>,
     settings: Res<crate::graphics::settings::GraphicsSettings>,
@@ -113,10 +117,6 @@ pub fn update_nameplates_system(
         pos_by_id.insert(w.id, (t.translation, nameplate_anchor(t, locator, mounted)));
     }
 
-    // Doors and namevis-hidden helpers never keep a plate: retail shows no
-    // floating name over a door in any state. Cull EXISTING plates here (the
-    // earlier gate only filtered the HP map, which never controlled plate
-    // existence -- that's why door names survived it).
     let suppressed: std::collections::HashSet<u32> = state
         .snapshot
         .entities
@@ -131,10 +131,6 @@ pub fn update_nameplates_system(
     if dirty {
         hp_by_id.clear();
         for ent in &state.snapshot.entities {
-            // Retail-hidden helpers (namevis hide bits) never get a plate,
-            // and neither do DOORS: retail draws no floating name over a door
-            // in any state (verified against retail 2026-08-26). The door's
-            // name still shows in the target panel when targeted.
             if ent.name_hidden() || ent.is_door() {
                 continue;
             }
@@ -165,7 +161,7 @@ pub fn update_nameplates_system(
                 // Retail+ gate: the "{name} {pct}%" suffix shares the billboard
                 // bar's toggle (off by default); enhanced-mob-hp-under is its
                 // compile-time half, so a persisted on from an enhanced build
-                // can't light it in a plain one.
+                // can't light it in a plain one (nameplate_billboard.rs).
                 #[cfg(feature = "enhanced-mob-hp-under")]
                 let hp_pct = if settings.mob_hp_under {
                     hp_by_id.get(&np.entity_id).copied().flatten()

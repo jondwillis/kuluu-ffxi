@@ -18,8 +18,8 @@ const XIDB_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 const FIXTURE_PASSWORD: &str = "TestPass!1234";
 
-// Southern San d'Oria: the fixture's default home zone; the 503 live test
-// logs in here.
+/// Southern San d'Oria: the fixture's default home zone; the 503 live test
+/// logs in here.
 const DEFAULT_POS_ZONE: u32 = 230;
 
 // vendor/server/sql/triggers.sql `char_insert` (BEFORE INSERT ON chars).
@@ -120,13 +120,13 @@ pub struct EphemeralChar {
     pool: Pool,
 }
 
-// A saturated or shutting-down mysqld still accepts the TCP connection and
-// then refuses the handshake with an ERR packet, so it arrives here as
-// Error::Server, not Error::Io. These are the codes that mean "the daemon is
-// up but cannot serve anyone right now", as opposed to a credential/schema
-// mistake this fixture is responsible for (1045 access denied, 1049 unknown
-// database), which must still fail the test.
-// https://mariadb.com/kb/en/mariadb-error-code-reference/
+/// A saturated or shutting-down mysqld still accepts the TCP connection and
+/// then refuses the handshake with an ERR packet, so it arrives here as
+/// Error::Server, not Error::Io. These are the codes that mean "the daemon is
+/// up but cannot serve anyone right now", as opposed to a credential/schema
+/// mistake this fixture is responsible for (1045 access denied, 1049 unknown
+/// database), which must still fail the test.
+/// https://mariadb.com/kb/en/mariadb-error-code-reference/
 const ER_CON_COUNT_ERROR: u16 = 1040;
 const ER_SERVER_SHUTDOWN: u16 = 1053;
 const ER_HOST_IS_BLOCKED: u16 = 1129;
@@ -148,11 +148,11 @@ fn xidb_unavailable(err: &mysql_async::Error) -> bool {
     }
 }
 
-// Ok(None) = xidb cannot hand out a usable session (timed out mid-handshake,
-// the accept-then-drop / refused IO class, or a server that answered the
-// handshake with a capacity/availability error) and the caller should
-// self-skip; any other failure is a real provisioning error and still
-// propagates.
+/// Ok(None) = xidb cannot hand out a usable session (timed out mid-handshake,
+/// the accept-then-drop / refused IO class, or a server that answered the
+/// handshake with a capacity/availability error) and the caller should
+/// self-skip; any other failure is a real provisioning error and still
+/// propagates.
 async fn xidb_conn(db_url: &str, connect_timeout: Duration) -> Result<Option<(Pool, Conn)>> {
     let pool = Pool::new(db_url);
     match tokio::time::timeout(connect_timeout, pool.get_conn()).await {
@@ -475,8 +475,8 @@ mod xidb_conn_tests {
         assert!(got.is_none());
     }
 
-    // A TCP-reachability gate reads a saturated mysqld as healthy and fails
-    // the live test; only the handshake result distinguishes the two.
+    /// A TCP-reachability gate reads a saturated mysqld as healthy and fails
+    /// the live test; only the handshake result distinguishes the two.
     #[tokio::test]
     async fn saturated_server_self_skips() {
         let port =
@@ -488,8 +488,8 @@ mod xidb_conn_tests {
         assert!(got.is_none());
     }
 
-    // The other half of the gate: a handshake refusal this fixture caused is
-    // not an unhealthy server, and must still fail the test loudly.
+    /// The other half of the gate: a handshake refusal this fixture caused is
+    /// not an unhealthy server, and must still fail the test loudly.
     #[tokio::test]
     async fn access_denied_still_errors() {
         const ER_ACCESS_DENIED_ERROR: u16 = 1045;
@@ -512,14 +512,20 @@ mod xidb_conn_tests {
 
     #[tokio::test]
     async fn refused_port_self_skips() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
+        let reserved_unlistened_socket = tokio::net::TcpSocket::new_v4().unwrap();
+        reserved_unlistened_socket
+            .bind(std::net::SocketAddr::from((
+                std::net::Ipv4Addr::LOCALHOST,
+                0,
+            )))
+            .unwrap();
+        let port = reserved_unlistened_socket.local_addr().unwrap().port();
 
         let got = xidb_conn(&db_url(port), HANDSHAKE_TIMEOUT)
             .await
             .expect("connect-refused must self-skip, not error");
         assert!(got.is_none());
+        drop(reserved_unlistened_socket);
     }
 }
 

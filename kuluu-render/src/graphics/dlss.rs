@@ -19,7 +19,7 @@ use bevy::prelude::*;
 use super::settings::{DlssQuality, GraphicsSettings};
 
 /// Stable project id for the NVIDIA DLSS SDK (it keys per-app driver
-/// behavior/telemetry on this). Fixed at first release and must never change
+/// behavior/telemetry on this). Fixed at first release and must not change
 /// for the lifetime of the project — regenerating it makes the driver treat
 /// kuluu as a brand-new application.
 pub const KULUU_DLSS_PROJECT_ID: u128 = 0xa7c3_f2e1_9d4b_4e8a_b6f5_2c8d_91e0_734a;
@@ -48,7 +48,7 @@ pub fn update_dlss_availability_system(
 }
 
 /// Settings tier -> dlss_wgpu tier. One-to-one; `DlssQuality` exists so the
-/// menu/serde layer never has to name a feature-gated foreign type.
+/// menu/serde layer does not have to name a feature-gated foreign type.
 pub fn to_bevy_quality(q: DlssQuality) -> DlssPerfQualityMode {
     match q {
         DlssQuality::Auto => DlssPerfQualityMode::Auto,

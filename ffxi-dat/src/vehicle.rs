@@ -11,7 +11,7 @@ pub struct VoyageLayout {
     pub ship_mzb: usize,
 }
 
-// Retail voyage DATs place the passenger hull under mode/ship, separately from the scenery MZB.
+/// Retail voyage DATs place the passenger hull under mode/ship, separately from the scenery MZB.
 pub fn voyage_layout(bytes: &[u8]) -> Option<VoyageLayout> {
     let mut directories = Vec::new();
     let mut scenery_mzb = None;

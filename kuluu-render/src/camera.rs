@@ -314,6 +314,13 @@ pub fn spawn_camera(mut commands: Commands, settings: Res<GraphicsSettings>) {
     commands.insert_resource(ChaseCamera::default());
 }
 
+/// DLSS SR replaces both MSAA and TAA (settings.msaa() reports Off for
+/// AaMode::Dlss, and dlss_active() is not true at the same time as wants_taa()).
+/// The component's #[require] pulls in TemporalJitter, MipBias, DepthPrepass,
+/// MotionVectorPrepass and Hdr automatically. The insert is gated on
+/// dlss_active(), not the raw mode: with the runtime unsupported (or on a
+/// default build, where this block does not compile at all) the camera comes
+/// up plain and the menu shows DLSS (N/A).
 pub fn build_operator_camera(
     commands: &mut Commands,
     settings: &GraphicsSettings,
@@ -380,13 +387,6 @@ pub fn build_operator_camera(
         camera.insert(TemporalAntiAliasing::default());
     }
 
-    // DLSS SR replaces both MSAA and TAA (settings.msaa() reports Off for
-    // AaMode::Dlss, and dlss_active() can't be true at the same time as
-    // wants_taa()). The component's #[require] pulls in TemporalJitter,
-    // MipBias, DepthPrepass, MotionVectorPrepass and Hdr automatically. Gated
-    // on dlss_active(), not the raw mode: with the runtime unsupported (or on
-    // a default build, where this block doesn't compile at all) the camera
-    // comes up plain and the menu shows DLSS (N/A).
     #[cfg(all(not(target_arch = "wasm32"), feature = "dlss"))]
     if settings.dlss_active() {
         camera.insert(bevy::anti_alias::dlss::Dlss::<
@@ -398,7 +398,8 @@ pub fn build_operator_camera(
     }
 }
 
-// Native camera collision owns the transform; retain its shared scheduling anchor.
+/// Native camera collision owns the transform; this retains its shared
+/// scheduling anchor.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn chase_camera_system() {}
 
@@ -679,10 +680,6 @@ mod tests {
             "look {look:?} != expected {expected:?}"
         );
     }
-
-    // snap_to_anchor_places_eye_behind_player_without_smoothing migrated to
-    // kuluu::view_native::camera_collision after the WIP camera work retired this
-    // crate's chase authority (resolve_camera is now the single eye owner).
 
     #[test]
     fn operator_camera_renders_world_and_gizmo_layers() {

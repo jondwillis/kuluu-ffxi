@@ -42,7 +42,7 @@ pub struct ActorContact {
 impl ActorContact {
     /// The post-nearest-actor half of the rule: `mob` is the single nearest
     /// candidate and is confirmed overlapping. True when this tick's movement
-    /// must be dropped.
+    /// is dropped.
     pub fn contact(&mut self, mob: u32, dt: f32) -> bool {
         if self.target != Some(mob) {
             self.target = Some(mob);
@@ -234,8 +234,9 @@ impl VerticalDecision {
 pub use step::step;
 
 /// Registers the walker's resources and systems: the obstacle rebuild runs in
-/// FixedUpdate before dispatch (the slot the avian collider syncs used); the
-/// debug gizmo + snapshot systems run every frame.
+/// FixedUpdate before dispatch, so the walker reads fresh obstacles (the slot
+/// the avian collider syncs used); the debug gizmo + snapshot systems run
+/// every frame.
 pub struct WalkerPlugin;
 
 impl Plugin for WalkerPlugin {
@@ -243,7 +244,6 @@ impl Plugin for WalkerPlugin {
         app.init_resource::<obstacles::ObstacleSet>();
         app.init_resource::<debug::FieldDebug>();
         app.init_resource::<debug::StairDebugZoneCache>();
-        // Dynamic obstacles before the walker reads them.
         app.add_systems(
             FixedUpdate,
             (
@@ -252,13 +252,10 @@ impl Plugin for WalkerPlugin {
             )
                 .run_if(in_state(super::AppPhase::InGame)),
         );
-        // In-world ramp-field gizmos behind the `stair_draw` toggle.
         app.add_systems(
             Update,
             debug::draw_walker_field_gizmos.run_if(in_state(super::AppPhase::InGame)),
         );
-        // Panel snapshot: FieldDebug -> StairDebugSnapshot every frame (the
-        // render crate's stair_debug panel reads it).
         app.add_systems(
             Update,
             debug::update_stair_debug_snapshot_system.run_if(in_state(super::AppPhase::InGame)),

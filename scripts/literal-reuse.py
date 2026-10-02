@@ -64,7 +64,7 @@ def path_deps():
     """crate -> transitive set of workspace crates it depends on (incl. itself)."""
     direct = {}
     for toml in glob.glob("*/Cargo.toml"):
-        crate = toml.split("/")[0]
+        crate = toml.replace(os.sep, "/").split("/", 1)[0]
         deps = {crate}
         with open(toml, encoding="utf-8", errors="replace") as f:
             for line in f:
@@ -107,7 +107,8 @@ def build_registry(paths):
     not a name the rest of the tree is expected to import."""
     registry = {}
     for path in paths:
-        if is_test_source(path):
+        norm = path.replace(os.sep, "/")
+        if is_test_source(norm):
             continue
         try:
             with open(path, encoding="utf-8", errors="replace") as f:
@@ -120,11 +121,11 @@ def build_registry(paths):
                     value = parse_int(m.group(2))
                     if value is None or trivial(value) or PINNED in m.group(1):
                         continue
-                    if "/out/" in path:
-                        crate = path.split("/out/")[0].split("/")[-1].rsplit("-", 1)[0]
+                    if "/out/" in norm:
+                        crate = norm.split("/out/")[0].split("/")[-1].rsplit("-", 1)[0]
                         label = crate
                     else:
-                        crate, label = crate_of(path), path
+                        crate, label = crate_of(norm), norm
                     registry.setdefault(value, set()).add((crate, f"{m.group(1)} ({label})"))
         except OSError:
             continue

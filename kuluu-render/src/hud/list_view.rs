@@ -91,12 +91,12 @@ pub fn row_node() -> Node {
 /// The label column of a list row: takes the slack the other columns leave and
 /// clips whatever still does not fit, rather than wrapping. The label's text
 /// goes *inside* this node, because a node's clip bounds its children and not
-/// its own glyphs.
+/// its own glyphs. Text reports its whole width as its basis, so the basis
+/// starts at 0 or a long name would take the fixed columns' space instead of
+/// being clipped.
 pub fn row_label_clip() -> Node {
     Node {
         flex_grow: 1.0,
-        // Text reports its whole width as its basis, which would hand a long
-        // name the fixed columns' space instead of clipping it.
         flex_basis: Val::Px(0.0),
         min_width: Val::Px(0.0),
         overflow: Overflow::clip(),
@@ -156,7 +156,7 @@ pub fn apply_wheel_delta(
 }
 
 /// Track + thumb for a list that outgrows its page. Each caller tags its own
-/// pair so two windows' scrollbars never answer one query.
+/// pair so two windows' scrollbars do not answer one query.
 pub fn spawn_scrollbar(parent: &mut ChildSpawnerCommands, track: impl Bundle, thumb: impl Bundle) {
     parent
         .spawn((

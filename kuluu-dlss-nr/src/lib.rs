@@ -4,49 +4,45 @@
 //! detours. This crate is the single home for every unsafe touch of that ABI;
 //! everything above it (kuluu-render) stays safe code.
 //!
-//! # The parameter-map ABI (why this looks the way it does)
+//! Parameter-map ABI (why this looks the way it does)
 //! `NVSDK_NGX_Parameter*` is NOT a flat name/value array. It points at an
 //! object whose first qword is a table of function pointers, called as
 //! `fn(param_ptr, name_str, value_or_out)` — decoded from the SDK's static host
 //! lib (`nvsdk_ngx_parameters_lib.obj`) and cross-checked against the v310.8
-//! runtime parser. Consequence: we never hand-build
-//! its layout. We allocate through the host layer's own `AllocateParameters`
+//! runtime parser. Consequence: no hand-built
+//! layout. We allocate through the host layer's own `AllocateParameters`
 //! and fill it with its own `Set*` accessors, exactly what the RenoDX-DLSS5
 //! addon does with its bundled copy of the same host layer.
 //!
-//! # Link sources
-//! * **Static host layer** — `NVSDK_NGX_VULKAN_AllocateParameters/
+//! Link sources
+//! - Static host layer — `NVSDK_NGX_VULKAN_AllocateParameters/
 //!   DestroyParameters` + `NVSDK_NGX_Parameter_Set*`: declared as externs here,
 //!   resolved at final link from nvsdk_ngx_s.lib (linked by dlss_wgpu under
 //!   bevy's `dlss` feature). Build this crate only in that configuration.
-//! * **NR runtime** — `nvngx_dlssnr.dll`: loaded at runtime via LoadLibraryW
+//! - NR runtime — `nvngx_dlssnr.dll`: loaded at runtime via LoadLibraryW
 //!   from next to the executable. Missing => NR unavailable, SR unaffected.
 
 #![cfg(target_os = "windows")]
-#![allow(non_snake_case)] // C ABI names stay verbatim at the FFI boundary
-#![allow(clippy::too_many_arguments)] // evaluate_nr carries the full per-frame knob set
+#![allow(non_snake_case)]
+#![allow(clippy::too_many_arguments)]
 
 use std::ffi::{c_char, c_int, c_void, CString};
 
-// ash handle tuple fields are private; the public `Handle` trait is the only
-// sanctioned way to read the raw u64 out of a vk::* handle.
+/// Ash handle tuple fields are private; the public `Handle` trait is the only
+/// sanctioned way to read the raw u64 out of a vk::* handle.
 use ash::vk::Handle;
 
-// Windows-only path encoding for LoadLibraryW (this crate already assumes
-// Win32 throughout — its externs and wgpu-hal Vulkan extraction are native).
+/// Windows-only path encoding for LoadLibraryW (this crate already assumes
+/// Win32 throughout — its externs and wgpu-hal Vulkan extraction are native).
 use std::os::windows::ffi::OsStrExt;
 
-// ---------------------------------------------------------------------------
-// C ABI types (hand-declared; mirror nvsdk_ngx_defs.h / nvsdk_ngx_vk.h)
-// ---------------------------------------------------------------------------
-
-/// `NVSDK_NGX_Result` — a C enum. Note: success is **0x1**, not 0.
+/// `NVSDK_NGX_Result` — a C enum. Note: success is [`NGX_SUCCESS`] (1), not 0.
 pub type NvngxResult = c_int;
 
 pub const NGX_SUCCESS: NvngxResult = 0x1;
 
 const FAIL_FEATURE_NOT_SUPPORTED: u32 = 0xBAD0_0001;
-const FAIL_PLATFORM_ERROR: u32 = 0xBAD0_0002;
+pub const FAIL_PLATFORM_ERROR: u32 = 0xBAD0_0002;
 const FAIL_FEATURE_ALREADY_EXISTS: u32 = 0xBAD0_0003;
 const FAIL_FEATURE_NOT_FOUND: u32 = 0xBAD0_0004;
 const FAIL_INVALID_PARAMETER: u32 = 0xBAD0_0005;
@@ -64,10 +60,18 @@ const FAIL_UNSUPPORTED_FORMAT: u32 = 0xBAD0_000E;
 /// backend — no vk::Result covers that case; callers only log it.
 pub const WAIT_IDLE_NOT_VULKAN: i32 = -1;
 
+/// `NGX_SUCCESS` as the u32 the name match runs on; the c_int const itself
+/// cannot be a match pattern.
+const SUCCESS_AS_U32: u32 = 1;
+
+/// `FWD_NULL_TARGET` reinterpreted as u32 for the name match (the i32 const
+/// cannot be a match pattern); the forwarder's null-target sentinel.
+const FWD_NULL_TARGET_AS_U32: u32 = FWD_NULL_TARGET as u32;
+
 /// Short human-readable name for a result code (log lines).
 pub fn result_name(r: NvngxResult) -> &'static str {
     match r as u32 {
-        0x1 => "Success", // NGX_SUCCESS (a const cast is not a valid pattern)
+        SUCCESS_AS_U32 => "Success",
         FAIL_FEATURE_NOT_SUPPORTED => "FeatureNotSupported",
         FAIL_PLATFORM_ERROR => "PlatformError",
         FAIL_FEATURE_ALREADY_EXISTS => "FeatureAlreadyExists",
@@ -82,7 +86,7 @@ pub fn result_name(r: NvngxResult) -> &'static str {
         FAIL_OUT_OF_DATE => "OutOfDate",
         FAIL_OUT_OF_GPU_MEMORY => "OutOfGPUMemory",
         FAIL_UNSUPPORTED_FORMAT => "UnsupportedFormat",
-        0xF0F0_0001 => "ForwarderNullTarget", // FWD_NULL_TARGET: forwarder got a null target
+        FWD_NULL_TARGET_AS_U32 => "ForwarderNullTarget",
         _ => "Unknown",
     }
 }
@@ -90,10 +94,10 @@ pub fn result_name(r: NvngxResult) -> &'static str {
 /// `NVSDK_NGX_Handle` for this NR runtime build: an OPAQUE object pointer, not
 /// the public header's `{ unsigned int Id; }`. CreateFeature writes a full
 /// 64-bit heap-object pointer into *OutHandle (the backend create stores it as
-/// a qword @ 0x1800183AE); Evaluate/Release receive that exact value cast to a
-/// pointer and read its first u32 as the FNV feature-table key. Callers never
-/// interpret the value — they store it, pass it back verbatim, and zero it on
-/// release.
+/// a qword at a fixed heap offset); Evaluate/Release receive that exact value
+/// cast to a pointer and read its first u32 as the FNV feature-table key.
+/// Callers do not interpret the value — they store it, pass it back verbatim,
+/// and zero it on release.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct NvngxHandle {
@@ -109,7 +113,7 @@ impl NvngxHandle {
 }
 
 /// Opaque parameter map (`NVSDK_NGX_Parameter*`). The pointee layout is owned
-/// by the host layer (function-pointer table, see module docs); never
+/// by the host layer (function-pointer table, see module docs) and is not
 /// dereferenced here.
 pub type NvngxParameter = *mut c_void;
 
@@ -125,16 +129,17 @@ pub struct VkImageSubresourceRange {
 }
 
 /// `NVSDK_NGX_Resource_VK`. The C union is represented by its largest member
-/// (ImageViewInfo); BufferInfo is a strict prefix of it. Layout:
+/// (ImageViewInfo); BufferInfo is a strict prefix of it. Layout (byte offsets
+/// in the 56-byte struct):
 /// ```text
-///  +0x00 VkImageView            (u64)
-///  +0x08 VkImage                (u64)
-///  +0x10 VkImageSubresourceRange(5 x u32 = 20 bytes, ends at 0x28)
-///  +0x24 VkFormat               (u32)
-///  +0x28 Width                  (u32)
-///  +0x2C Height                 (u32)   <- ImageViewInfo ends at 0x30
-///  +0x30 Type                   (u32, enum: 0 = VK_IMAGEVIEW)
-///  +0x34 ReadWrite              (bool)  <- struct size 0x38
+///   0  VkImageView            (u64)
+///   8  VkImage                (u64)
+///  16  VkImageSubresourceRange (5 x u32, ends at byte 36)
+///  36  VkFormat               (u32)
+///  40  Width                  (u32)
+///  44  Height                 (u32)   <- ImageViewInfo ends at byte 48
+///  48  Type                   (u32, enum: 0 = VK_IMAGEVIEW)
+///  52  ReadWrite              (bool)  <- struct size 56
 /// ```
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -233,10 +238,6 @@ impl NvngxResourceVk {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Static host layer (resolved at final link from nvsdk_ngx_s.lib via dlss_wgpu)
-// ---------------------------------------------------------------------------
-
 extern "C" {
     fn NVSDK_NGX_VULKAN_AllocateParameters(out_params: *mut NvngxParameter) -> NvngxResult;
     fn NVSDK_NGX_VULKAN_DestroyParameters(params: NvngxParameter) -> NvngxResult;
@@ -265,7 +266,7 @@ unsafe impl Send for NrParams {}
 unsafe impl Sync for NrParams {}
 
 impl NrParams {
-    /// `NVSDK_NGX_VULKAN_AllocateParameters`. Must be called after a
+    /// `NVSDK_NGX_VULKAN_AllocateParameters`. Needs to be called after a
     /// successful runtime Init (the host layer validates its own state).
     pub fn allocate() -> Result<Self, NvngxResult> {
         let mut ptr: NvngxParameter = std::ptr::null_mut();
@@ -309,7 +310,7 @@ impl NrParams {
         unsafe { NVSDK_NGX_Parameter_SetF(self.ptr, cstr(name).as_ptr(), value) };
     }
 
-    /// Unsets a previously set void-pointer entry (stores NULL). The runtime's
+    /// Unsets an earlier void-pointer entry (stores NULL). The runtime's
     /// lookup then returns its default (NULL) as if the key were absent — how a
     /// resource is withdrawn from this map, which has no remove API of its own.
     pub fn clear_void_pointer(&self, name: &str) {
@@ -336,15 +337,11 @@ impl Drop for NrParams {
     }
 }
 
-/// Borrow a NUL-terminated C string for the duration of one FFI call.
+/// Borrow a NUL-terminated C string for the duration of one FFI call. The
+/// names are fixed ASCII literals, so allocation failure is off the table.
 fn cstr(s: &str) -> CString {
-    // Parameter names are fixed ASCII literals; infallible in practice.
     CString::new(s).unwrap_or_else(|_| CString::new("").expect("empty is valid"))
 }
-
-// ---------------------------------------------------------------------------
-// NR runtime entry points (nvngx_dlssnr.dll, loaded at runtime)
-// ---------------------------------------------------------------------------
 
 /// `NVSDK_NGX_VULKAN_Init_Ext` — the v310.8 signature (public header shape,
 /// stable across versions).
@@ -358,9 +355,9 @@ type FnInitExt = unsafe extern "C" fn(
     params: NvngxParameter,
 ) -> NvngxResult;
 
-/// `NVSDK_NGX_VULKAN_CreateFeature`. Feature id 0x12 (decimal 18) is DLSSNR —
-/// beyond the public enum's RayReconstruction=13; confirmed from the RenoDX
-/// addon's call site and the runtime's per-feature dispatch table.
+/// `NVSDK_NGX_VULKAN_CreateFeature`. Feature id [`FEATURE_DLSSNR`] (18) is
+/// DLSSNR — beyond the public enum's RayReconstruction=13; confirmed from the
+/// RenoDX addon's call site and the runtime's per-feature dispatch table.
 type FnCreateFeature = unsafe extern "C" fn(
     cmd: u64,
     feature_id: u32,
@@ -388,21 +385,17 @@ type FnShutdown1 = unsafe extern "C" fn(device: u64) -> NvngxResult;
 
 extern "system" {
     fn LoadLibraryW(name: *const u16) -> *mut c_void;
-    // `*const c_char` (i8 on Windows) — matches CString::as_ptr() exactly.
+    /// `*const c_char` (i8 on Windows) — matches CString::as_ptr() exactly.
     fn GetProcAddress(h_module: *mut c_void, proc_name: *const c_char) -> *mut c_void;
     /// Thread-local error code set by the last failing Win32 call.
     fn GetLastError() -> u32;
 }
 
-/// The NR feature id (0x12). Not in the public v310.5.3 enum — see module docs.
+/// The NR feature id (18). Not in the public v310.5.3 enum — see module docs.
 pub const FEATURE_DLSSNR: u32 = 0x12;
 
 /// `NVSDK_NGX_Version_API` from nvsdk_ngx_defs.h (NGX_VERSION_DOT 1.5.0).
 const NGX_VERSION_API: c_int = 0x0000_0015;
-
-// ---------------------------------------------------------------------------
-// The "nvngx.dll" calling-module forwarder
-// ---------------------------------------------------------------------------
 
 /// Staged next to kuluu.exe as nvngx.dll_kuluu.dll (renamed from kuluu_ngx_fwd.dll;
 /// see CONTRIBUTING.md#optional-dlss-and-neural-uplift-builds for the copy step).
@@ -413,12 +406,14 @@ const NGX_VERSION_API: c_int = 0x0000_0015;
 pub const FORWARDER_DLL: &str = "nvngx.dll_kuluu.dll";
 
 /// ABI version the forwarder must report via `kuluu_ngx_fwd_abi_version`.
-const FORWARDER_ABI: u32 = 2; // v1: init_ext only; v2: + create_feature, release_feature
+/// Version 1 exposed only the Init_Ext trampoline; version 2 adds the gated
+/// CreateFeature/ReleaseFeature trampolines.
+const FORWARDER_ABI: u32 = 2;
 
 /// Sentinel returned by the forwarder when it received a null target pointer —
-/// outside NGX's 0xBAD0_xxxx range so it can never be confused with an NGX error.
-// u32 -> i32 cast keeps the bit pattern (the forwarder returns it in eax);
-// a bare literal would not fit c_int's range.
+/// outside the NGX FAIL_* error range so it is not confused with an NGX error.
+/// The u32 -> i32 cast keeps the bit pattern (the forwarder returns it in
+/// eax); a bare literal would not fit c_int's range.
 pub const FWD_NULL_TARGET: NvngxResult = 0xF0F0_0001u32 as i32;
 
 /// The forwarder's trampolines, declared with OUR existing types (ABI-identical to the
@@ -466,8 +461,6 @@ impl VulkanHandles {
         // SAFETY: as_hal only reads the backend tag of an already-created
         // device and returns its hal view; no state is mutated.
         let hal_device = unsafe { device.as_hal::<Vulkan>() }?;
-        // ash 0.38 dispatchable handles are `*mut u8`; the NGX runtime wants
-        // the raw pointer value as a u64 (VkInstance/VkPhysicalDevice/VkDevice).
         Some(Self {
             instance: hal_device
                 .shared_instance()
@@ -576,10 +569,12 @@ impl NrRuntime {
     /// entry point. The absolute path makes the search deterministic (the app
     /// dir is LoadLibraryW's first stop anyway, but a miss then becomes a real
     /// load error we can diagnose instead of a silent NULL).
+    ///
+    /// The forwarder is resolved here too: without it the gated entry points
+    /// (Init_Ext, CreateFeature, ReleaseFeature) all fail with PlatformError,
+    /// and failing at load gives a clear one-shot error instead of a
+    /// per-second retry loop at init.
     pub fn load() -> Result<Self, LoadError> {
-        // Materialize the exe dir once: both the NR DLL path and the forwarder
-        // path are built from it. `to_str()` borrows from a joined PathBuf, so
-        // the join must not be a temporary (build 7's E0515).
         let mut exe_dir = std::path::PathBuf::from(".");
         if let Ok(exe) = std::env::current_exe() {
             if let Some(dir) = exe.parent() {
@@ -594,8 +589,6 @@ impl NrRuntime {
         // SAFETY: `wide` is a valid NUL-terminated UTF-16 string for the call.
         let hmod = unsafe { LoadLibraryW(wide.as_ptr()) };
         if hmod.is_null() {
-            // Thread-local, set by the failed call above; read it before
-            // anything else can clobber it.
             return Err(LoadError::Win32("nvngx_dlssnr.dll", unsafe {
                 GetLastError()
             }));
@@ -603,15 +596,10 @@ impl NrRuntime {
 
         macro_rules! resolve {
             ($sym:literal) => {{
-                // Rust string literals are NOT C strings — `as_ptr()` would hand
-                // GetProcAddress an unterminated name and it would search for the
-                // symbol plus whatever bytes follow in .rodata (build 7's NULL).
                 let c_name = cstr($sym);
                 // SAFETY: `c_name` is a valid NUL-terminated ASCII string.
                 let p = unsafe { GetProcAddress(hmod, c_name.as_ptr()) };
                 if p.is_null() {
-                    // Thread-local; read before anything else can clobber it
-                    // (127 = name absent, 126 = bad module handle).
                     return Err(LoadError::MissingSymbol($sym, unsafe { GetLastError() }));
                 }
                 // SAFETY: `p` is a valid function pointer from the DLL's export
@@ -620,10 +608,6 @@ impl NrRuntime {
             }};
         }
 
-        // The forwarder must be present too: without it the gated entry points
-        // (Init_Ext, CreateFeature, ReleaseFeature) all fail with PlatformError.
-        // Failing here — not at init time — gives a clear,
-        // one-shot load error instead of a per-second retry loop.
         let fwd = Self::load_forwarder(&exe_dir)?;
 
         Ok(Self {
@@ -645,8 +629,6 @@ impl NrRuntime {
     /// inside a module whose file name contains "nvngx.dll".
     fn load_forwarder(exe_dir: &std::path::Path) -> Result<ForwarderExports, LoadError> {
         let path = exe_dir.join(FORWARDER_DLL);
-        // NUL-terminated UTF-16 for LoadLibraryW (encode_wide expects the NUL
-        // included; build it directly from the Path here).
         let wide: Vec<u16> = path
             .as_os_str()
             .encode_wide()
@@ -678,7 +660,7 @@ impl NrRuntime {
     }
 
     /// `NVSDK_NGX_VULKAN_Init_Ext` — once per process, before any Create.
-    /// `data_path` must be a writable directory (NGX logs/models land there).
+    /// `data_path` needs to be a writable directory (NGX logs/models land there).
     /// Routed through the forwarder: the NR runtime gates this entry on the
     /// calling module's file name containing "nvngx.dll", and kuluu.exe does
     /// not — but the staged `nvngx.dll_kuluu.dll` does (§2.10–§3.5).
@@ -711,7 +693,7 @@ impl NrRuntime {
         }
     }
 
-    /// Creates the DLSSNR feature (id 0x12) on `cmd` and fills in every
+    /// Creates the DLSSNR feature (id 18) on `cmd` and fills in every
     /// create-time parameter the runtime expects — the exact set the RenoDX
     /// addon sets before its CreateFeature call:
     /// generic Width/Height/OutWidth/OutHeight, the DLSSNR.* dimension aliases,
@@ -726,9 +708,6 @@ impl NrRuntime {
         out_w: u32,
         out_h: u32,
     ) -> Result<NvngxHandle, NvngxResult> {
-        // The runtime looks the same dimensions up under several name aliases;
-        // set them all (cheap) so a v310.8 parser variant finds each one it
-        // asks for instead of falling back to 0.
         params.set_ui("Width", render_w);
         params.set_ui("Height", render_h);
         params.set_ui("OutWidth", out_w);
@@ -741,14 +720,9 @@ impl NrRuntime {
         params.set_ui("DLSSNR.OutputHeight", out_h);
         params.set_ui("DLSSNR.Output.Width", out_w);
         params.set_ui("DLSSNR.Output.Height", out_h);
-        // Native-resolution enhancement pass: input and output are the same
-        // size, so no upscaling. (The addon's dynamic-ratio callback is for
-        // games that resize between frames; we recreate on resize instead.)
         params.set_i("DLSSNR.Upscaling", 1);
         params.set_f("DLSSNR.ScalingRatio", 1.0);
         params.set_f("DLSSNR.Scale", 1.0);
-        // Which internal compute nodes the runtime builds/enables. The addon
-        // sets both to 1; without them the feature creates but does nothing.
         params.set_ui("CreationNodeMask", 1);
         params.set_ui("VisibilityNodeMask", 1);
 
@@ -778,7 +752,7 @@ impl NrRuntime {
     /// the depth prepass — otherwise pass the texture's full size.
     ///
     /// Every parameter is written unconditionally: the map persists across frames,
-    /// and a conditional write would leave the previous frame's value in place
+    /// and a conditional write would leave the last-written value in place
     /// (stale subrects after an SR toggle, a stale Reset=1, a stale depth pointer
     /// under MSAA). `reset` flushes the runtime's temporal history for this frame
     /// only; pass false on steady-state frames.
@@ -800,41 +774,26 @@ impl NrRuntime {
         reset: bool,
     ) -> NvngxResult {
         params.set_void_pointer("DLSSNR.Color", color);
-        // Motion vectors are always provided — the RenoDX addon's contract.
-        // Kuluu passes a zero-filled stand-in sized to the input: an explicit
-        // "no motion" instead of a NULL, whose semantics this build does not
-        // define (the parser stores it; eval never null-checks it).
         params.set_void_pointer("DLSSNR.MVec", mvec);
         match depth {
             Some(depth) => {
                 params.set_void_pointer("DLSSNR.Depth", depth);
                 params.set_i("DLSSNR.DepthInverted", i32::from(depth_inverted));
-                // No-dot names, read through the parser's INT getter slot (+0x58)
-                // — verified in this build's disasm; a SetUI value is invisible to
-                // it. Always explicit: full texture when the scene rendered at full
-                // res (the map would otherwise keep the last SR subrect).
                 let sub_w = i32::try_from(valid_subrect_w).unwrap_or(i32::MAX);
                 let sub_h = i32::try_from(valid_subrect_h).unwrap_or(i32::MAX);
                 params.set_i("DLSSNR.DepthSubrectWidth", sub_w);
                 params.set_i("DLSSNR.DepthSubrectHeight", sub_h);
             }
             None => {
-                // Depth unavailable this frame (MSAA): withdraw it. Without the
-                // NULL store, a stale pointer to a texture wgpu may already have
-                // freed would be sampled by the runtime.
                 params.clear_void_pointer("DLSSNR.Depth");
             }
         }
         params.set_void_pointer("DLSSNR.Output", output);
 
-        // The menu knobs. Intensity 1.0 is the parser default and can read as
-        // "no visible effect" — kuluu's default is 1.01 (the addon's).
         params.set_f("DLSSNR.Intensity", intensity);
         params.set_f("DLSSNR.LocalToneStrength", local_tone_strength);
         params.set_f("DLSSNR.LocalStructureStrength", structure_strength);
         params.set_i("DLSSNR.Enabled", 1);
-        // Read through the INT slot like Enabled; always explicit so a stale
-        // Reset=1 from a config-change frame cannot keep flushing history.
         params.set_i("DLSSNR.Reset", i32::from(reset));
 
         // SAFETY: `cmd` is a valid in-flight VkCommandBuffer; `handle.ptr` is
@@ -863,8 +822,6 @@ impl NrRuntime {
         let r = unsafe {
             (self.fwd_release_feature)(Some(self.release_feature), handle.ptr as *mut c_void)
         };
-        // Zeroing is our bookkeeping only — the runtime never stores through
-        // InHandle (verified in disasm).
         handle.ptr = 0;
         r
     }
@@ -878,7 +835,7 @@ impl NrRuntime {
     }
 }
 
-/// Waits for all previously submitted GPU work to complete (Vulkan only).
+/// Waits for all already-submitted GPU work to complete (Vulkan only).
 /// Must run before releasing an NGX feature whose evaluate command buffers may
 /// still be in flight — otherwise the runtime can free internal resources that
 /// in-flight compute references, which surfaces as a driver error and eventual
@@ -888,8 +845,6 @@ impl NrRuntime {
 pub fn wait_device_idle(device: &wgpu::Device) -> Result<(), i32> {
     use wgpu::hal::api::Vulkan;
 
-    // Unreachable in practice (every caller sits behind a Vulkan-only init),
-    // but keep the guard panic-free like the rest of this function.
     let hal_opt = unsafe { device.as_hal::<Vulkan>() };
     let Some(hal_device) = hal_opt else {
         return Err(WAIT_IDLE_NOT_VULKAN);

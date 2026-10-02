@@ -3,6 +3,10 @@ use super::*;
 /// UV moved per arrow press by the Markers placement crosshair.
 const MAP_CURSOR_STEP_UV: f32 = 0.02;
 
+/// Route one keypress on the Map screen. While an event's SAY frame is
+/// pending over the Map (the beat after MAP_TUTORIAL), confirm/cancel advance
+/// the event instead of navigating; the Map stays open until CLOSE_MAP
+/// arrives.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn handle_map_key(
     key: &Key,
@@ -21,9 +25,6 @@ pub(super) fn handle_map_key(
         change_map_targets, widescan_rows, MapSubMode, COMMAND_ROWS,
     };
 
-    // While an event's SAY frame is pending over the Map (the beat after
-    // MAP_TUTORIAL), confirm/cancel advance the event instead of navigating;
-    // the Map stays open until CLOSE_MAP arrives.
     if let Some(d) = scene_state.snapshot.dialog.as_ref() {
         if bindings.matches_logical(Action::NavConfirm, key) {
             let _ = super::confirm_dialog_choice(0, scene_state, cmd_tx);
@@ -449,6 +450,7 @@ mod tests {
         ));
     }
 
+    /// A player-opened /map pops to the menu it opened from, not the world.
     #[test]
     fn cancel_without_a_pending_frame_still_closes_the_map() {
         let (mut scene_state, mut stack, cmd_tx, _cmd_rx, mut world) = map_key_harness(None);
@@ -462,7 +464,6 @@ mod tests {
             &mut world,
         );
 
-        // A player-opened /map pops to the menu it opened from, not the world.
         assert!(next.is_none());
         assert_eq!(stack.current().unwrap().kind, MenuKind::Root);
     }

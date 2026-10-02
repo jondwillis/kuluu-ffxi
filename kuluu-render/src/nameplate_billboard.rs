@@ -99,10 +99,11 @@ const HP_BAR_WIDTH_FRACTION: f32 = 1.0;
 // off-screen.
 const ON_SCREEN_MARGIN_YALMS: f32 = 5.0;
 
-// Bounds worst-case raster-key staleness for a plate outside the view
-// frustum to about half a second; irrelevant to what the player can see
-// since the frustum test itself is recomputed every frame regardless of this
-// throttle, so a plate that turns on-screen is rechecked that same frame.
+/// Bounds worst-case raster-key staleness for a plate outside the view
+/// frustum to about half a second; irrelevant to what the player can see
+/// since the frustum test itself is recomputed every frame regardless of
+/// this throttle, so a plate that turns on-screen is rechecked that same
+/// frame.
 const OFFSCREEN_RASTER_CHECK_INTERVAL_FRAMES: u32 = RETAIL_FPS as u32 / 2;
 
 #[derive(Resource)]
@@ -176,7 +177,7 @@ pub struct NameplateBillboardDebug {
     pub hidden_depth: u32,
     /// Plates set Visible + transformed this frame.
     pub visible: u32,
-    /// Billboards whose actor no longer exists — despawned mid-frame.
+    /// Billboards whose actor is gone — despawned mid-frame.
     pub despawned: u32,
 }
 
@@ -255,7 +256,8 @@ pub struct RasterInputs<'w> {
     pub font: Res<'w, BillboardFont>,
     pub name_colors: Res<'w, crate::nameplate_color::NameColorTable>,
     pub icons: Res<'w, crate::nameplate_icons::NameplateIcons>,
-    /// A running event's 0xB5 renames; win over the record's name while set.
+    /// A running event's 0xB5 renames (event_dialog.rs); win over the
+    /// record's name while set.
     pub name_overrides: Res<'w, crate::cutscene::EventNameOverrides>,
 }
 
@@ -271,6 +273,70 @@ pub fn self_plate_hidden(is_self: bool, mode: CameraMode) -> bool {
     is_self && matches!(mode, CameraMode::FirstPerson)
 }
 
+/// Drives every nameplate billboard each frame. Plate existence is owned
+/// here, not by sync_entities_system: every frame, any table record with a
+/// name whose model exists (a position) but which has no billboard gets one,
+/// read from the same source the Entity List overlay reads; gating on
+/// pos_by_id keeps this flap-free while the floor gate holds new models back
+/// and during despawn races (no model, no plate yet). A freshly spawned plate
+/// is Hidden at y=-1e6 until the next frame's pass positions and rasters it.
+///
+/// No dirty gate: the re-raster inputs (colour, hp, markers, tint) are
+/// recomputed from LIVE entity-table records per billboard, so a plate holds
+/// no stale key past the frame its facts changed; the stored-key comparison
+/// keeps the raster itself off the hot path. Server-hidden entities draw no
+/// plate: namevis VIS_HIDE_NAME (mannequins, "blank" cutscene actors),
+/// STATUS_TYPE::INVISIBLE (worms underground), or Flags1.InvisFlag on a PC
+/// (GM-hidden / EFFECTFLAG_INVISIBLE;
+/// vendor/server/src/map/entities/char_entity.h) — retail's CanBuildActorName
+/// returns false while InvisFlag is set, and the model is hidden on the same
+/// signals. The cull reads the live EntityTable record rather than a
+/// snapshot-rebuilt id set, so it moves with the packet that changed it.
+/// Self is exempt from the STATUS/namevis pair: the server does not hide
+/// players on those bytes, and a stray byte must not delete our own plate
+/// (same exemption as the model); InvisFlag is not exempt — the server sets
+/// it for self too (m_isGMHidden), and retail hides the local player's name
+/// with it.
+///
+/// View-depth gate: behind the camera forward plane (or inside
+/// MIN_VIEW_DEPTH_YALMS) the plate is hidden and its transform/pulse are
+/// skipped, but only those — the raster-key pass still runs for a hidden
+/// plate, because rastering is a fact about the actor, not about where the
+/// camera points; a plate that zones in behind the camera is already correct
+/// the frame it first becomes visible. The target pulse is time-driven
+/// (steps at RETAIL_FPS via pulse_frame; the last_alpha guard bounds writes
+/// to 30/s) and runs every frame. Premultiplied fade: the whole texel (color
+/// and coverage) scales together, or the pulse would turn additive.
+///
+/// A plate outside the view frustum only rechecks its raster key once every
+/// OFFSCREEN_RASTER_CHECK_INTERVAL_FRAMES: the raster is the hot path in a
+/// crowd, and nothing off-screen can show a stale bake; a plate behind the
+/// view-depth gate stays unthrottled. The key is recomputed from LIVE table
+/// facts every checked frame: an hp tick, a claim flip or the colour-table
+/// load all re-raster on the next checked frame. The name lives on the
+/// component, not the record: a later update can drop it and the plate keeps
+/// the name it spawned with. A 0xB5 rename (event_dialog.rs) overrides the
+/// record's name for the event's duration; when the override clears the
+/// record's name returns. A live plate with no record is anomalous: surface
+/// it instead of silently holding the last raster, deduped per id (a despawn
+/// race can drop the record for one or two frames).
+///
+/// The mob_hp diagnostic fires only on a real hp or colour move off the last
+/// rastered key; paired with the session-side 0x0E UPDATE_HP line it proves
+/// or breaks the table -> billboard link, and the white-on-load fix shows up
+/// here as a colour move off the fallback bake.
+///
+/// A FRESH image handle per raster, not `images.insert` into the existing
+/// one: Bevy's GpuImage prepare reuses a same-size texture and only
+/// re-uploads mip level 0 (write_texture), leaving every upper mip stale on
+/// the last bake; plates draw minified almost everywhere, so a
+/// colour/hp/claim move kept sampling the old mips. A new handle gets a fresh
+/// texture with the full CPU-built mip chain, and the final pass's
+/// view-mismatch rebuild picks it up in the same frame: PrepareAssets runs
+/// before PrepareBindGroups. The displaced texture is unreferenced after the
+/// swap and bevy GCs it.
+///
+/// Debug breakdown mirrors each gate; see NameplateBillboardDebug.
 pub fn update_nameplate_billboards_system(
     state: Res<SceneState>,
     settings: Res<crate::graphics::settings::GraphicsSettings>,
@@ -326,16 +392,6 @@ pub fn update_nameplate_billboards_system(
     }
 
     let self_char_id: Option<u32> = state.snapshot.self_char_id;
-    // Plate existence is owned here, not by sync_entities_system (which used to
-    // spawn plates on its dirty-gated clock and could leave a live named entity
-    // without one — e.g. a worm that zones in underground). Every frame: any
-    // table record with a name whose model exists (a position above) but which
-    // has no billboard gets one, read from the same source the Entity List
-    // overlay reads. Gating on pos_by_id keeps this flap-free while the floor
-    // gate holds new models back and during despawn races: no model, no plate
-    // yet. A freshly spawned plate is Hidden at y=-1e6 until next frame's pass
-    // positions and rasters it — one frame later than the old same-frame spawn,
-    // invisible in practice.
     {
         let mut have: std::collections::HashSet<u32> = billboards
             .iter_mut()
@@ -346,9 +402,6 @@ pub fn update_nameplate_billboards_system(
             if have.contains(&id) || !pos_by_id.get(&id).is_some_and(Option::is_some) {
                 continue;
             }
-            // A running event's 0xB5 rename (EventNameOverrides) wins over the
-            // record's name; with neither there is no plate yet — this pass
-            // re-runs every frame, so a name that arrives later still gets one.
             let name = raster
                 .name_overrides
                 .get(id)
@@ -375,13 +428,6 @@ pub fn update_nameplate_billboards_system(
         }
     }
 
-    // No dirty gate: the re-raster inputs (colour, hp, markers, tint) are
-    // recomputed from LIVE entity-table records per billboard below, so a
-    // plate can never hold a stale key past the frame its facts changed. The
-    // stored-key comparison keeps the raster itself off the hot path: only
-    // plates whose key actually moved re-run it.
-
-    // Debug breakdown mirrors each gate below; see NameplateBillboardDebug.
     let mut total = 0u32;
     let mut hide_self = 0u32;
     let mut hidden_status = 0u32;
@@ -398,19 +444,6 @@ pub fn update_nameplate_billboards_system(
             continue;
         }
 
-        // Server-hidden entities draw no plate — namevis VIS_HIDE_NAME
-        // (mannequins, "blank" cutscene actors), STATUS_TYPE::INVISIBLE
-        // (worms underground), or Flags1.InvisFlag on a PC (GM-hidden /
-        // EFFECTFLAG_INVISIBLE). Retail shows nothing for any of them: the model
-        // is hidden by sync_entities_system / apply_invis_flag_system on the same
-        // signals, and retail's CanBuildActorName returns false while InvisFlag is
-        // set. The cull reads the live `EntityTable` record rather than a
-        // snapshot-rebuilt id set, so it moves with the packet that changed it
-        // and needs no rebuild frame. Self is exempt from the STATUS/namevis pair — the server never
-        // hides players on those bytes, and a stray byte must not delete our own
-        // plate (same exemption as the model). InvisFlag is NOT exempt: the server
-        // sets it for self too (m_isGMHidden), and retail hides the local player's
-        // name with it.
         if table
             .get(np.entity_id)
             .is_some_and(|r| r.invis_flag() || (!is_self && (r.is_invisible() || r.name_hidden())))
@@ -431,16 +464,6 @@ pub fn update_nameplate_billboards_system(
             continue;
         };
         let view_depth = (head_pos - cam_pos).dot(cam_forward);
-        // View-depth gate. Behind the camera forward plane (or inside
-        // MIN_VIEW_DEPTH_YALMS) the plate is hidden and its transform/pulse
-        // are skipped -- but ONLY those. The raster-key pass below still runs
-        // for a hidden plate: an actor that zones in behind the camera used
-        // to keep its white spawn bake until the camera turned, because this
-        // gate `continue`d past the colour logic, and the fix-up then hinged
-        // on the first in-view frame racing the texture swap. Rastering is a
-        // fact about the actor, not about where the camera points; keeping it
-        // view-independent means a plate is already correct the frame it
-        // first becomes visible.
         let legible = legibility_scale_for_view_depth(view_depth);
         let mut on_screen = false;
         match legible {
@@ -479,10 +502,6 @@ pub fn update_nameplate_billboards_system(
                     true,
                 );
 
-                // Pulse is time-driven (steps at RETAIL_FPS via pulse_frame, so the
-                // last_alpha guard bounds writes to 30/s) and runs every frame;
-                // the live-key re-raster below does too -- neither waits on a
-                // snapshot.
                 let want_alpha = if target.id == Some(np.entity_id) {
                     target_alpha_pulse(pulse_frame)
                 } else {
@@ -490,8 +509,6 @@ pub fn update_nameplate_billboards_system(
                 };
                 if want_alpha != np.last_alpha {
                     if let Some(mut mat_data) = materials.get_mut(&mat.0) {
-                        // Premultiplied fade: the whole texel (color and coverage)
-                        // scales together, or the pulse would turn additive.
                         mat_data.base_color = Color::LinearRgba(LinearRgba::new(
                             want_alpha, want_alpha, want_alpha, want_alpha,
                         ));
@@ -505,12 +522,6 @@ pub fn update_nameplate_billboards_system(
             continue;
         }
 
-        // A plate outside the view frustum (but in front of the camera, past
-        // the view-depth gate above) only rechecks its raster key once every
-        // OFFSCREEN_RASTER_CHECK_INTERVAL_FRAMES: the raster is the hot path
-        // in a crowd, and nothing off-screen can show a stale bake. A plate
-        // behind the view-depth gate (hidden_depth) stays unthrottled per the
-        // comment above it.
         let due_for_check =
             legible.is_none() || on_screen || np.next_key_check_frame <= pulse_frame;
         if !due_for_check {
@@ -520,15 +531,6 @@ pub fn update_nameplate_billboards_system(
             np.next_key_check_frame = pulse_frame + OFFSCREEN_RASTER_CHECK_INTERVAL_FRAMES;
         }
 
-        // The key is recomputed from LIVE table facts every checked frame —
-        // an hp tick, a claim flip or the colour-table load all re-raster on
-        // the next checked frame without waiting for a dirty rebuild. The
-        // name lives on the component, not the record: a later update can
-        // drop it and the plate must keep the name it spawned with.
-        // Plates are spawned from this same table (the ensure pass above), so
-        // a live plate with no record is anomalous — surface it instead of
-        // silently holding the last raster. Deduped per id: a despawn race can
-        // drop the record for one or two frames and must not spam.
         let Some(rec) = table.get(np.entity_id) else {
             if missing_record_warned.insert(np.entity_id) {
                 tracing::error!(
@@ -544,11 +546,6 @@ pub fn update_nameplate_billboards_system(
             party: &state.snapshot.party,
         };
         let key = raster_key_for(&rec.entity, ctx, &raster.name_colors, settings.mob_hp_under);
-        // A 0xB5 rename overrides the record's name for the event's duration;
-        // when the override clears at session end the record's name returns,
-        // and with neither present the plate keeps the name it spawned with
-        // (the "name lives on the component" contract below). A move of
-        // `base_name` breaks `matches` and re-rasters on this frame.
         let effective_name = raster
             .name_overrides
             .get(np.entity_id)
@@ -574,12 +571,6 @@ pub fn update_nameplate_billboards_system(
             text: np.base_name.clone(),
             ..key
         };
-        // mob_hp diagnostic: fires only on a real transition — an hp or
-        // colour move off the previously rastered key (first rasters and
-        // marker/tint-only changes stay silent). Paired with the session-side
-        // "0x0E UPDATE_HP" line, this proves or breaks the table -> billboard
-        // link; the white-on-load fix shows up here as a colour move off the
-        // fallback bake.
         if let Some(done) = np.rastered.as_ref() {
             if done.hp != want.hp || done.color != want.color {
                 tracing::info!(
@@ -616,18 +607,6 @@ pub fn update_nameplate_billboards_system(
         aspect.width = new_img.image.width();
         aspect.height = new_img.image.height();
         aspect.text_center_y_px = new_img.text_center_y_px;
-        // A FRESH handle per raster — never `images.insert` into the existing
-        // one. Bevy's GpuImage prepare reuses a same-size texture and only
-        // re-uploads mip level 0 (write_texture), leaving every upper mip stale
-        // on the previous bake; plates draw minified almost everywhere, so a
-        // colour/hp/claim move kept sampling the old mips — a dead worm stayed
-        // yellow at range while its entity-table record was already grey, and
-        // the HP bar fill looked frozen for the same reason. A new handle gets
-        // a fresh texture with the full CPU-built mip chain (create_texture_
-        // with_data uploads every level), and the final pass's view-mismatch
-        // rebuild picks it up in the SAME frame: PrepareAssets runs before
-        // PrepareBindGroups, so no stale-plate beat. The displaced texture is
-        // unreferenced after this swap and bevy GCs it.
         mat_data.base_color_texture = Some(images.add(new_img.image));
         if np.rastered.is_none() {
             *vis = Visibility::Hidden;
@@ -645,19 +624,18 @@ pub fn update_nameplate_billboards_system(
 
 /// The full raster input for one entity: retail's name colour, its icon
 /// markers, the pearl tint those icons draw with, and — when the Retail+ gate
-/// is on — the mob/pet HP bar.
+/// is on — the mob/pet HP bar. The colour resolves to the retail row once the
+/// install's table has loaded, the built-in stand-in until then
+/// (NameColorTable::color). `enhanced-mob-hp-under` is the compile-time half
+/// of the HP-bar gate: without it a persisted `mob_hp_under` from an enhanced
+/// build stays off in a plain one.
 fn raster_key_for(
     ent: &kuluu_snapshot::Entity,
     ctx: crate::nameplate_color::SelfContext<'_>,
     name_colors: &crate::nameplate_color::NameColorTable,
     show_mob_hp: bool,
 ) -> RasterKey {
-    // Infallible: the retail row once the install's table has loaded, the
-    // built-in stand-in until then (NameColorTable::color).
     let color = crate::nameplate_color::name_color_choice(ent, ctx).resolve(name_colors);
-    // `enhanced-mob-hp-under` is the compile-time half of this gate: without
-    // it a persisted `mob_hp_under` from an enhanced build can never light a
-    // bar in a plain one.
     #[cfg(feature = "enhanced-mob-hp-under")]
     let hp = if show_mob_hp {
         matches!(ent.kind, EntityKind::Mob | EntityKind::Pet)
@@ -1816,7 +1794,7 @@ mod tests {
         );
     }
 
-    /// An actor directly in the camera's view is never throttled: a key change
+    /// An actor directly in the camera's view is not throttled: a key change
     /// re-rasters on the very next frame regardless of `next_key_check_frame`.
     #[test]
     fn onscreen_plate_reraster_is_never_throttled() {

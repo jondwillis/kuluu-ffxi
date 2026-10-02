@@ -565,6 +565,8 @@ pub struct SunMoonRenderCfg<'w> {
     pub dat_celestials: Res<'w, DatCelestials>,
 }
 
+/// The sun's depth map self-shadows, so it tracks the illuminating light;
+/// retail's ground-projected shadow direction is not an occlusion ray.
 pub fn sun_moon_system(
     mut sky: ResMut<VanaSky>,
     mut q_sun: Query<
@@ -732,8 +734,6 @@ pub fn sun_moon_system(
             light.color = sun_color;
             light.illuminance = sun_lux;
             light.shadow_maps_enabled = !indoors && sun_lux > 0.0;
-            // A depth map used for self-shadowing must follow the illuminating light;
-            // retail's ground-projected shadow direction is not an occlusion ray.
             *xf = Transform::from_translation(sun_to_dir * LIGHT_DISTANCE)
                 .looking_at(Vec3::ZERO, Vec3::Y);
         }
@@ -1211,8 +1211,8 @@ mod tests {
         assert!((lit.sun_k - 0.45).abs() < 1e-6);
     }
 
-    // The celestial arc still gates the outdoor lights: a light below the horizon
-    // contributes nothing, whatever area the player stands in.
+    /// The celestial arc still gates the outdoor lights: a light below the horizon
+    /// contributes nothing, whatever area the player stands in.
     #[test]
     fn landscape_lighting_gates_outdoor_lights_on_the_horizon() {
         let rec = terrain_rec([0.9, 0.9, 0.9, 1.0], [0.3, 0.3, 0.5, 1.0], [0.2; 4]);

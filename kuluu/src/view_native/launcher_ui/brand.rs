@@ -34,6 +34,8 @@ fn decode_emblem() -> Result<Image, TextureError> {
     )
 }
 
+/// Uploads the embedded emblem. On decode failure the wordmark still
+/// renders; a corrupt embedded asset must not brick the launcher.
 fn upload_brand_mark(app: &mut App) -> BrandMark {
     let Some(mut images) = app.world_mut().get_resource_mut::<Assets<Image>>() else {
         tracing::warn!("no image assets yet; launcher emblem omitted");
@@ -41,8 +43,6 @@ fn upload_brand_mark(app: &mut App) -> BrandMark {
     };
     match decode_emblem() {
         Ok(image) => BrandMark(Some(images.add(image))),
-        // The wordmark still renders; a corrupt embedded asset must not brick
-        // the launcher.
         Err(e) => {
             tracing::warn!(error = %e, "launcher emblem failed to decode");
             BrandMark(None)
@@ -52,6 +52,8 @@ fn upload_brand_mark(app: &mut App) -> BrandMark {
 
 /// The emblem plus wordmark retail shows above its world-selection screen.
 /// Spawn as the first child of a `common::screen_root`, before the panel.
+/// The emblem's explicit size is load-bearing, not decorative: ImageNode's
+/// intrinsic size is the 256px source art.
 pub(super) fn spawn_brand_mark(parent: &mut ChildSpawnerCommands, mark: &BrandMark) {
     parent
         .spawn(Node {
@@ -66,8 +68,6 @@ pub(super) fn spawn_brand_mark(parent: &mut ChildSpawnerCommands, mark: &BrandMa
             if let Some(emblem) = &mark.0 {
                 column.spawn((
                     ImageNode::new(emblem.clone()),
-                    // ImageNode's intrinsic size is the 256px source art, so
-                    // this is load-bearing, not decorative.
                     Node {
                         width: Val::Px(EMBLEM_PX),
                         height: Val::Px(EMBLEM_PX),
