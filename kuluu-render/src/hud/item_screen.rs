@@ -454,7 +454,7 @@ fn spawn_bag_tabs(col: &mut ChildSpawnerCommands) {
 }
 
 /// The list box; retail overlays each row's stack count on the icon's top-left
-/// corner rather than suffixing the name, so the badge chip is a child of the icon.
+/// corner rather than suffixing the name, so the count is a child of the icon.
 fn spawn_list_box(col: &mut ChildSpawnerCommands, placeholder: Handle<Image>) {
     let (mut n, bg, bd) = framed_box();
     n.width = Val::Px(LIST_WIDTH_PX);
@@ -491,22 +491,18 @@ fn spawn_list_box(col: &mut ChildSpawnerCommands, placeholder: Handle<Image>) {
                         ImageNode::new(placeholder.clone()),
                     ))
                     .with_children(|icon| {
-                        let (badge, badge_bg, badge_edge) = item_grid::stack_badge_chip(Node {
+                        let placement = Node {
                             position_type: PositionType::Absolute,
                             left: Val::Px(0.0),
                             top: Val::Px(-2.0),
                             display: Display::None,
                             ..default()
-                        });
-                        icon.spawn((
+                        };
+                        item_grid::spawn_stack_count(
+                            icon,
                             ItemText(ItemRole::ListBadge(i)),
-                            Text::new(""),
-                            text_font(item_grid::BADGE_FONT_PX),
-                            TextColor(theme::TEXT),
-                            badge,
-                            badge_bg,
-                            badge_edge,
-                        ));
+                            placement,
+                        );
                     });
                     row.spawn(list_view::row_label_clip()).with_children(|col| {
                         col.spawn((
