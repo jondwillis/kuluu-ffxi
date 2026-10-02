@@ -4497,6 +4497,8 @@ mod tests {
                 target: target_bound.then_some(target),
                 stage: stage(0, StageKind::SoundNonPositional, raw_type, STAGE_ID),
                 scheduler: *b"test",
+                cutscene_motion: false,
+                scheduler_instance: None,
             });
             app.update();
             let got = &app.world().resource::<CapturedSfx>().0;

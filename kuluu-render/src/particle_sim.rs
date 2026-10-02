@@ -6294,6 +6294,8 @@ mod tests {
             target: Some(actor),
             stage,
             scheduler: *b"main",
+            cutscene_motion: false,
+            scheduler_instance: None,
         });
         app.update();
         let mut sim = app.world_mut().resource_mut::<ParticleSimulator>();
@@ -6434,6 +6436,8 @@ mod tests {
             target: None,
             stage,
             scheduler: *b"main",
+            cutscene_motion: false,
+            scheduler_instance: None,
         });
         app.update();
         let mut sim = app.world_mut().resource_mut::<ParticleSimulator>();
