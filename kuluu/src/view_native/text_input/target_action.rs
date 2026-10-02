@@ -198,8 +198,7 @@ pub(super) fn handle_target_action_key(
                 cmd_tx,
             );
         }
-        // Any other key drops the confirm and falls through to the rows.
-        state.dismount_confirm = false;
+        return None;
     }
 
     if state.cursor >= count {
@@ -438,8 +437,7 @@ pub(super) fn confirm_target_action_at_cursor(
             Some(InputMode::World)
         }
         TargetActionId::Dismount => {
-            state.dismount_confirm = true;
-            state.cursor = 0;
+            state.confirm_dismount();
             None
         }
     }
@@ -590,6 +588,37 @@ mod mounted_tests {
     use super::*;
     use kuluu_render::hud::action_model::{TargetActionContext, TargetActionId};
     use kuluu_render::input_mode::TargetActionState;
+
+    #[test]
+    fn dismount_menu_confirmation_starts_on_no() {
+        let ctx = TargetActionContext {
+            mounted: true,
+            ..Default::default()
+        };
+        let entries = kuluu_render::hud::overlay::RETAIL.resolve_target_actions(&ctx);
+        let mut state = TargetActionState::open(ctx);
+        state.cursor = entries
+            .iter()
+            .position(|e| e.id == TargetActionId::Dismount)
+            .unwrap();
+        let mut scene = SceneState::default();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        assert!(confirm_target_action_at_cursor(
+            &mut state,
+            &entries,
+            &mut scene,
+            None,
+            &[],
+            &tx,
+            &mut Default::default(),
+            &mut Default::default(),
+            &mut Default::default(),
+        )
+        .is_none());
+        assert!(state.dismount_confirm);
+        assert_eq!(state.cursor, TargetActionState::DISMOUNT_NO_ROW);
+        assert!(rx.try_recv().is_err());
+    }
 
     #[test]
     fn dismount_confirmation_cancel_sends_nothing_and_yes_targets_self() {
