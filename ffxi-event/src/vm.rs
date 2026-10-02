@@ -1873,14 +1873,9 @@ impl EventVm {
                 // (the flag byte); 0x6A eases them to work[1] * 0.001 over
                 // work[3] frames (research/XiEvents/OpCodes/0x0069.md, 0x006A.md).
                 OP_SET_SOUND_VOLUME | OP_CHANGE_SOUND_VOLUME => self.advance(op),
-                // 0x4C/0x4D/0x4F write the event entity's StatusEvent: the door's
-                // open/close byte and the M1..M8 event-motion range
-                // (research/XiEvents/OpCodes/0x004C.md, 0x004D.md, 0x004F.md;
-                // research/XIClient/src/XIClient/include/World/Actor/GameStatus.h).
-                // Each is gated on a Render.Flags0 bit no tier names; the door
-                // consumer's change-dedup is the modelled equivalent, and the
-                // cue rides 0x7E's Mount shape — the same field, so the whole
-                // path is already there.
+                // Status writes: retail-2026-09 RVAs 0xB6950, 0xB6A00, 0xB69B0;
+                // .agents/skills/retail-observe/references/2026-10-02-event-control-clock-doors.md.
+                // Native actor render-bit gating is not represented by VM state.
                 OP_DOOR_OPEN => {
                     self.emit_status_event_cue(STATUS_EVENT_DOOR_OPEN);
                     self.advance(op);
