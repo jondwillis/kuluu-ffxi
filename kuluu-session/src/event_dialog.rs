@@ -150,10 +150,6 @@ pub struct DialogSession {
     /// tag) with misses included so a re-issued routine does not re-read its
     /// file.
     routine_lengths: std::collections::HashMap<(u32, FourCc), Option<f32>>,
-    /// The emote-file base for the lens race, cached: `None` unattempted,
-    /// `Some(None)` no DLL, `Some(Some(base))` read. The emote hold timer
-    /// reads routine lengths from this race's DATs (race-uniform lengths).
-    emote_base_index: Option<Option<u32>>,
     /// Last known position of every entity the server has placed since the
     /// zone-in, in event coordinates: the source for MOVE hold lengths while a
     /// scene walks its actors.
@@ -201,7 +197,6 @@ impl DialogSession {
             cues: Vec::new(),
             fishing: std::collections::HashMap::new(),
             routine_lengths: std::collections::HashMap::new(),
-            emote_base_index: None,
             entity_positions: std::collections::HashMap::new(),
             entity_types: std::collections::HashMap::new(),
             pending_motion_holds: std::collections::HashMap::new(),
@@ -299,7 +294,6 @@ impl DialogSession {
         let step = runner.advance(None, strings);
         self.scene_actions.extend(runner.take_scene_actions());
         let raw_cues = runner.take_cues();
-        let emote_base = self.emote_base();
         arm_motion_holds(
             &mut runner,
             &raw_cues,
@@ -307,7 +301,6 @@ impl DialogSession {
             &mut self.routine_lengths,
             unique_no,
             event_zone,
-            emote_base,
             &mut self.pending_motion_holds,
         );
         arm_move_holds(&mut runner, &raw_cues, &self.entity_positions, unique_no);
@@ -453,7 +446,6 @@ impl DialogSession {
 
     fn drive(&mut self, step: impl FnOnce(&mut DialogRunner, &StringDat) -> DialogStep) -> Advance {
         let types = self.entity_types.clone();
-        let emote_base = self.emote_base();
         let (Some(strings), Some(runner), Some(active)) = (
             self.strings.as_ref(),
             self.runner.as_mut(),
@@ -479,7 +471,6 @@ impl DialogSession {
             &mut self.routine_lengths,
             event_entity,
             zone,
-            emote_base,
             &mut self.pending_motion_holds,
         );
         arm_move_holds(runner, &raw_cues, &self.entity_positions, event_entity);
@@ -526,22 +517,6 @@ impl DialogSession {
     /// resolves to.
     pub fn note_player_id(&mut self, id: u32) {
         self.player_id = id;
-    }
-
-    /// The emote-file base for the lens race, read once from the install's
-    /// FFXiMain.dll: the emote hold timer reads routine lengths from this
-    /// race's DATs. `None` when the install or the DLL is unavailable.
-    fn emote_base(&mut self) -> Option<u32> {
-        if self.emote_base_index.is_none() {
-            let base = self
-                .dat_root
-                .as_deref()
-                .and_then(|root| ffxi_dat::main_dll::MainDll::load(root.root()).ok())
-                .and_then(|dll| dll.base_emote_index(ffxi_vocab::emote_anim::EMOTE_LENS_RACE))
-                .map(u32::from);
-            self.emote_base_index = Some(base);
-        }
-        self.emote_base_index.and_then(|base| base)
     }
 
     /// Remember where the server placed an entity, in event coordinates:
@@ -1824,7 +1799,6 @@ fn arm_motion_holds(
     cache: &mut std::collections::HashMap<(u32, FourCc), Option<f32>>,
     event_entity: u32,
     zone: u16,
-    emote_base: Option<u32>,
     pending: &mut std::collections::HashMap<
         (CutsceneActor, FourCc),
         (ActorLookup, u32, std::time::Instant, std::time::Duration),
@@ -1931,36 +1905,6 @@ fn arm_motion_holds(
                     key,
                     units,
                 );
-            }
-            // 0x6E/0x63: the renderer plays the emote fire-and-forget (no finish
-            // report on that path), so the 0x99 hold stays timed from the emote
-            // DAT's authored routine length, the way the 0x45 fades do. An
-            // unmapped emote or an unreadable DAT arms nothing, so the wait
-            // falls through (the fade's missing-DAT degradation).
-            // research/XiEvents/OpCodes/0x006E.md
-            EventCue::Emote {
-                actor,
-                emote_id,
-                param,
-            } => {
-                let Some(base) = emote_base else {
-                    continue;
-                };
-                let Some((file_offset, routine)) =
-                    ffxi_vocab::emote_anim::emote_routine(emote_id, param)
-                else {
-                    continue;
-                };
-                let units = routine_units(
-                    root,
-                    cache,
-                    base + file_offset,
-                    routine,
-                    ffxi_event::SCHEDULER_DURATION_FROM_DAT,
-                );
-                if let Some(units) = units {
-                    runner.hold_action(actor, ffxi_event::EMOTE_ANIMATION_KEY, units);
-                }
             }
             _ => {}
         }
