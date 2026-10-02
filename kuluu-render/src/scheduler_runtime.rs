@@ -5939,15 +5939,16 @@ mod tests {
         );
         assert!(entity.contains::<ActionAssets>());
         assert!(entity.contains::<ActionTarget>());
-        let mut actor = app
-            .world_mut()
-            .get_mut::<crate::ffxi_actor_render::FfxiRenderActor>(child)
-            .unwrap();
-        assert!(!actor.has_action(), "the stop cue clears the held pose");
-        crate::ffxi_actor_render::advance_actor_pose_standalone_locked(&mut actor, 1.0, false);
-        assert!(actor.is_pose_idle(), "one pose pass after the stop is idle");
-        assert_eq!(actor.current_clip_id(), Some(&clip));
-        drop(actor);
+        {
+            let mut actor = app
+                .world_mut()
+                .get_mut::<crate::ffxi_actor_render::FfxiRenderActor>(child)
+                .unwrap();
+            assert!(!actor.has_action(), "the stop cue clears the held pose");
+            crate::ffxi_actor_render::advance_actor_pose_standalone_locked(&mut actor, 1.0, false);
+            assert!(actor.is_pose_idle(), "one pose pass after the stop is idle");
+            assert_eq!(actor.current_clip_id(), Some(&clip));
+        }
         app.init_resource::<crate::snapshot::SceneState>()
             .add_systems(Update, release_cutscene_actors);
         app.world_mut()
