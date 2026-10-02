@@ -1705,10 +1705,7 @@ pub enum CutsceneCue {
     },
     /// Take camera control away from the player, or give it back.
     CameraLock { lock: bool },
-    /// 0x38: the lower word of retail's `CliEventModeLocal` (the operand's
-    /// high byte with 0x20 forced). While it holds, hide the local player
-    /// model and the HUD pieces; the event end clears the flag
-    /// (research/XiEvents/OpCodes/0x0038.md).
+    /// The decoded 0x38 mode word; visibility policy is unresolved.
     LocalMode { mode: u16 },
     /// 0x20: write retail's `CliEventUcFlag`; while it holds, the player's
     /// `CanIMove` is false (research/XiEvents/OpCodes/0x0020.md,

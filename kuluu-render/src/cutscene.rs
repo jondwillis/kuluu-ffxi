@@ -251,10 +251,6 @@ pub struct CutsceneMode {
     /// (retail's `CliEventUcFlag` written 0), lifting the event-wide pin
     /// until a later 0x20 re-locks. research/XiEvents/OpCodes/0x0020.md
     pub player_released: bool,
-    /// The lower word of retail's `CliEventModeLocal` the running event's 0x38
-    /// last wrote; `None` until one arrives. While set, the local player model
-    /// and the HUD pieces stay hidden. research/XiEvents/OpCodes/0x0038.md
-    pub local_mode: Option<u16>,
 }
 
 impl CutsceneMode {
@@ -271,7 +267,6 @@ impl CutsceneMode {
             camera_locked: true,
             hud_event: None,
             player_released: false,
-            local_mode: None,
         }
     }
 }
@@ -368,7 +363,7 @@ pub fn apply_cutscene_hud_hide(mode: Res<CutsceneMode>, mut hidden: ResMut<HudHi
     // mode hides the HUD pieces for its whole run (research/XiEvents/OpCodes/0x0038.md).
     let cutscene = match mode.hud_event {
         Some(hide) => hide,
-        None => mode.camera_locked || mode.local_mode.is_some(),
+        None => mode.camera_locked,
     };
     if hidden.cutscene != cutscene {
         hidden.cutscene = cutscene;
@@ -469,10 +464,6 @@ fn apply_cue(
         CutsceneCue::CameraLock { lock } => mode.camera_locked = lock,
         CutsceneCue::PlayerControl { locked } => mode.player_released = !locked,
         CutsceneCue::HudHide { hide } => mode.hud_event = Some(hide),
-        // 0x38's 0x20 is forced by the handler, so every authored word keeps
-        // the base cinematic mode set; the event end's `end()` clears it
-        // (research/XiEvents/OpCodes/0x0038.md).
-        CutsceneCue::LocalMode { mode: word } => mode.local_mode = Some(word),
         CutsceneCue::Scheduler {
             dat_id,
             tag,
@@ -898,11 +889,8 @@ mod tests {
         );
     }
 
-    /// 0x38's local mode hides the HUD pieces for the event's whole run and
-    /// keeps the applied word on the mode; the session end clears both
-    /// (research/XiEvents/OpCodes/0x0038.md).
     #[test]
-    fn local_mode_hides_the_hud_and_clears_at_session_end() {
+    fn local_mode_does_not_invent_hud_visibility() {
         let mut app = test_app();
         push(&mut app, ViewerEvent::CutsceneStarted { event_id: 30035 });
         push(
@@ -912,26 +900,15 @@ mod tests {
             },
         );
         step(&mut app, 1.0);
-        assert_eq!(
-            app.world().resource::<CutsceneMode>().local_mode,
-            Some(0x20)
+        assert!(!app.world().resource::<HudHidden>().cutscene);
+        push(
+            &mut app,
+            ViewerEvent::Cutscene {
+                cue: CutsceneCue::CameraLock { lock: true },
+            },
         );
-        assert!(
-            app.world().resource::<HudHidden>().cutscene,
-            "local mode hides the HUD pieces"
-        );
-
-        push(&mut app, ViewerEvent::CutsceneEnded);
         step(&mut app, 1.0);
-        assert_eq!(
-            app.world().resource::<CutsceneMode>().local_mode,
-            None,
-            "session end clears the mode"
-        );
-        assert!(
-            !app.world().resource::<HudHidden>().cutscene,
-            "cleared at session end"
-        );
+        assert!(app.world().resource::<HudHidden>().cutscene);
     }
 
     fn clock_app() -> App {

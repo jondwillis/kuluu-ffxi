@@ -2901,30 +2901,6 @@ pub fn apply_cutscene_actor_cues(
                     );
                 }
             }
-            // 0x38: while CliEventModeLocal holds, the event hides the local
-            // player model so it can drive the camera apart from it
-            // (research/XiEvents/OpCodes/0x0038.md); the HUD half rides
-            // CutsceneMode.local_mode in crate::cutscene, and
-            // release_cutscene_actors owns the unhide at CutsceneEnded.
-            CutsceneCue::LocalMode { .. } => {
-                let Some(id) = self_id else {
-                    continue;
-                };
-                let Some(&entity) = tracked.by_id.get(&id) else {
-                    continue;
-                };
-                commands.entity(entity).insert(CutsceneHidden);
-                state.hide(id);
-                if let Ok(mut v) = q_vis.get_mut(entity) {
-                    *v = Visibility::Hidden;
-                }
-                tracing::debug!(
-                    target: "kuluu_render::scheduler_runtime",
-                    id,
-                    "cutscene local mode hides the self actor"
-                );
-            }
-
             _ => {}
         }
     }
@@ -7436,12 +7412,9 @@ mod tests {
         );
     }
 
-    /// 0x38's local mode hides the local player model for the event's whole
-    /// run; release_cutscene_actors owns the unhide at CutsceneEnded
-    /// (research/XiEvents/OpCodes/0x0038.md).
     #[test]
     #[cfg(not(target_arch = "wasm32"))]
-    fn local_mode_cue_hides_the_self_actor() {
+    fn local_mode_cue_preserves_self_visibility() {
         const SELF: u32 = 7;
         let mut app = actor_cue_app();
         let player = spawn_tracked_actor(&mut app, SELF);
@@ -7456,17 +7429,17 @@ mod tests {
             });
         app.update();
         assert!(
-            app.world().get::<CutsceneHidden>(player).is_some(),
-            "local mode hides the self model for the event's whole run"
+            app.world().get::<CutsceneHidden>(player).is_none(),
+            "unresolved local-mode policy must not hide the actor"
         );
         assert_eq!(
             *app.world().get::<Visibility>(player).unwrap(),
-            Visibility::Hidden
+            Visibility::Inherited
         );
         let state = app.world().resource::<CutsceneActorState>();
         assert!(
-            state.hidden.contains(&SELF),
-            "the event-end release must know this id"
+            !state.hidden.contains(&SELF),
+            "no visibility override was acquired"
         );
     }
 

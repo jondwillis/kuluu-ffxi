@@ -1074,10 +1074,7 @@ pub enum CutsceneCue {
     CameraLock {
         lock: bool,
     },
-    /// 0x38: the lower word of retail's `CliEventModeLocal` (the operand's
-    /// high byte with 0x20 forced). While it holds, the local player model
-    /// and the HUD pieces stay hidden
-    /// (research/XiEvents/OpCodes/0x0038.md).
+    /// The decoded 0x38 mode word; visibility policy is unresolved.
     LocalMode {
         mode: u16,
     },
