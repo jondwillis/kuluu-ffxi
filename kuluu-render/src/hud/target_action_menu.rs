@@ -7,7 +7,7 @@ use crate::input_mode::{InputMode, SubAction};
 
 const MAX_ROWS: usize = 7;
 
-const SUBMENU_ARROW: &str = "▶";
+const SUBMENU_ARROW: &str = ">";
 
 /// First list index the pane shows. The row entities are spawned once and fixed at `MAX_ROWS`,
 /// so a longer list — a BST/THF's job abilities plus the pet commands a charmed pet adds —
