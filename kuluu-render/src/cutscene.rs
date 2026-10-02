@@ -358,9 +358,8 @@ pub fn apply_screen_fade(
 }
 
 pub fn apply_cutscene_hud_hide(mode: Res<CutsceneMode>, mut hidden: ResMut<HudHidden>) {
-    // 0x67/0x68 drive the whole-HUD flag independently of the camera (research/XiEvents/OpCodes/
-    // 0x0068.md), so an explicit show wins over the lock default; 0x38's local
-    // mode hides the HUD pieces for its whole run (research/XiEvents/OpCodes/0x0038.md).
+    // Explicit HUD state wins over the camera-lock default.
+    // research/XiEvents/OpCodes/0x0068.md
     let cutscene = match mode.hud_event {
         Some(hide) => hide,
         None => mode.camera_locked,
