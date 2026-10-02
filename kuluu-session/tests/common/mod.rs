@@ -332,6 +332,23 @@ impl EphemeralChar {
         Ok(())
     }
 
+    pub async fn prepare_warrior_at(&self, level: u8, position: [f32; 3]) -> Result<()> {
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .context("DB conn for fixture placement")?;
+        "UPDATE char_jobs SET war = ? WHERE charid = ?"
+            .with((level, self.charid))
+            .ignore(&mut conn)
+            .await?;
+        "UPDATE chars SET pos_x = ?, pos_y = ?, pos_z = ?, gmlevel = 0 WHERE charid = ?"
+            .with((position[0], position[1], position[2], self.charid))
+            .ignore(&mut conn)
+            .await?;
+        Ok(())
+    }
+
     pub async fn add_key_item(&self, id: u16) -> Result<()> {
         let mut conn = self.pool.get_conn().await.context("DB conn for key item")?;
         let blob: Option<Vec<u8>> = "SELECT keyitems FROM chars WHERE charid = ?"

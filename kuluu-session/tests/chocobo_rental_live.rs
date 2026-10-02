@@ -1,25 +1,3 @@
-// Live reproduction of the chocobo-rental cutscene (zone 230 event 601)
-// against a local LSB stack with retail DATs mounted.
-//
-// Self-skips when the auth port or xidb is unreachable, or when no FFXI
-// install can be opened. This is the item-1 reproduction harness: it drives
-// the rental CS with the `!cs` GM command and records the full protocol
-// timeline — every CutsceneCue, every mount-state write (SelfServerStatus
-// from the server's 0x037 and CsMountArmed from the CS 0x7E cue), and every
-// dialog frame — with t0-relative timestamps, so the summary and the JSONL
-// show exactly which entity's visibility / mount state flaps and when. It
-// asserts only that the CS actually ran (started and ended); the flap
-// analysis lives in the captured evidence. With the cs_mount_armed latch,
-// the CS cue's mount write (CsMountArmed status=5) survives the server's
-// stale on-foot 0x037 at CS end, so the mount no longer flaps invisible.
-//
-// The rental CS program (ffxi-event example zz-cs-trace 230 600, block
-// 0x010E6030): frames 0-1 are the chat-only "You can rent a chocobo…" lines
-// (the user's "chocobo lines"); then CameraLock + the NPC chocobo (0x010E6033)
-// sits; then Scheduler chc0/fdo0 on the sentinel 0x7FFFFF08, ActorHide on the
-// NPC chocobo, Mount status 5 on the sentinel 0x7FFFFF00, and fdi0 on
-// 0x7FFFFF08.
-
 mod common;
 
 use std::{
@@ -32,7 +10,9 @@ use std::{
 
 use kuluu_session::{
     session::{self, CharSelection, Config},
-    state::{AgentCommand, AgentEvent, CutsceneCue, DialogState, Stage},
+    state::{
+        ActionKind, AgentCommand, AgentEvent, CutsceneCue, DialogState, InventoryUpdate, Stage,
+    },
 };
 use tokio::{
     net::TcpStream,
@@ -47,20 +27,13 @@ const SANDORIA: u32 = 230;
 /// npcs/Meuneille.lua eventSucceed); 604 is the fail event. Blocks 0x010E6031
 /// (renter) + 0x010E6034 (chocobo NPC).
 const RENTAL_CS: u16 = 601;
-/// `!cs 601 <price> <currency> <soundParam>` — the operands the retail
-/// renterOnTrigger passes (vendor/server/scripts/globals/chocobo.lua). The
-/// event program gates the mount path on currency (op2) >= price (op1), so
-/// op2 must be the char's real gil.
-const CS_TRIGGER: &str = "!cs 601 50 100 0";
-/// The fixture's starting gil; must be >= the CS price (50).
-const FIXTURE_GIL: u32 = 100;
-/// CHOCOBO_LICENSE (vendor/server/scripts/enum/key_item.lua).
-const CHOCOBO_LICENSE: u16 = 138;
+const FIXTURE_GIL: u32 = 10_000;
+const FIXTURE_LEVEL: u8 = 20;
+// vendor/server/scripts/zones/Southern_San_dOria/npcs/Meuneille.lua placement.
+const RENTER_POSITION: [f32; 3] = [-12.3, 1.4, -98.0];
+const RENTER_NAME: &str = "Meuneille";
 
 const LOGIN_DEADLINE: Duration = Duration::from_secs(90);
-/// Observe this long after the CS starts: the CS itself is a few seconds, but
-/// the mount is set when the event finishes and any flap happens around/after
-/// that, so the window has to outlive the CS plus the post-CS settle.
 const OBSERVE_SECS: u32 = 90;
 
 fn open_dat_root() -> Option<ffxi_dat::DatRoot> {
@@ -91,6 +64,12 @@ struct Tally {
     /// (t secs, text snippet) for every dialog frame.
     frames: Vec<(f32, String)>,
     disconnected_reason: Option<String>,
+    renter: Option<(u32, u16)>,
+    authoritative_mounted: bool,
+    rental_price: Option<u32>,
+    remaining_gil: Option<u32>,
+    handoff_zone: Option<u16>,
+    errors: Vec<String>,
     /// The dialog frame currently up, for driving the manual frames/choices.
     last_dialog: Option<DialogState>,
     /// When the current frame appeared, so the drive can hold it briefly before
@@ -181,6 +160,28 @@ async fn maybe_drive_frame(tally: &mut Tally, cmd_tx: &mpsc::Sender<AgentCommand
 fn handle_event(tally: &mut Tally, ev: &AgentEvent, now: Instant, t0: Instant) {
     let t = now.duration_since(t0).as_secs_f32();
     match ev {
+        AgentEvent::EntityUpserted { entity, .. }
+            if entity.name.as_deref() == Some(RENTER_NAME) =>
+        {
+            tally.renter = Some((entity.id, entity.act_index));
+        }
+        AgentEvent::Error { message } if tally.cs_started_at.is_some() => {
+            tally.errors.push(message.clone())
+        }
+        AgentEvent::ZoneChanged { to, .. }
+            if tally.cs_started_at.is_some() && *to != 0 && u32::from(*to) != SANDORIA =>
+        {
+            tally.handoff_zone = Some(*to);
+        }
+        AgentEvent::InventoryUpdated {
+            container: 0,
+            update:
+                InventoryUpdate::QuantityChanged {
+                    index: 0, quantity, ..
+                },
+        } if tally.cs_started_at.is_some() => {
+            tally.remaining_gil = Some(*quantity);
+        }
         AgentEvent::StageChanged { stage } => {
             if !tally.stages_seen.contains(stage) {
                 tally.stages_seen.push(*stage);
@@ -205,12 +206,19 @@ fn handle_event(tally: &mut Tally, ev: &AgentEvent, now: Instant, t0: Instant) {
         AgentEvent::SelfServerStatus { status, mount_id } => {
             eprintln!("[live] t+{t:.2}s SelfServerStatus status={status} mount_id={mount_id}");
             tally.mount_states.push((t, *status, *mount_id));
+            tally.authoritative_mounted |= ffxi_proto::decode::animation::is_mounted(*status);
         }
         AgentEvent::CsMountArmed { status, mount_id } => {
             eprintln!("[live] t+{t:.2}s CsMountArmed status={status} mount_id={mount_id}");
             tally.mount_states.push((t, *status, *mount_id));
         }
         AgentEvent::EventDialog { dialog } => {
+            if dialog.event_num == RENTAL_CS && tally.rental_price.is_none() {
+                tally.rental_price = dialog
+                    .nums
+                    .first()
+                    .and_then(|price| u32::try_from(*price).ok());
+            }
             let prompt = dialog.prompt.clone().unwrap_or_default();
             eprintln!(
                 "[live] t+{t:.2}s frame ({} choices): {:?}",
@@ -235,7 +243,7 @@ fn handle_event(tally: &mut Tally, ev: &AgentEvent, now: Instant, t0: Instant) {
 }
 
 #[tokio::test]
-async fn chocobo_rental_cs_protocol_timeline() {
+async fn chocobo_rental_npc_completes_server_handoff() {
     let server_host = std::env::var("SERVER_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
     let auth_port = std::env::var("AUTH_PORT")
         .ok()
@@ -292,9 +300,20 @@ async fn chocobo_rental_cs_protocol_timeline() {
         .await
         .expect("granting fixture gil");
     fixture
-        .add_key_item(CHOCOBO_LICENSE)
+        .add_key_item(
+            ffxi_vocab::key_item_names::KEY_ITEM_NAMES
+                .iter()
+                .find(|(_, name)| *name == "Chocobo License")
+                .expect("LSB license name")
+                .0,
+        )
         .await
         .expect("granting fixture the Chocobo License");
+
+    fixture
+        .prepare_warrior_at(FIXTURE_LEVEL, RENTER_POSITION)
+        .await
+        .expect("eligible rental fixture");
 
     let cfg = Config {
         server: server_host.clone(),
@@ -330,17 +349,18 @@ async fn chocobo_rental_cs_protocol_timeline() {
         if let Some(inzone) = tally.inzone_at {
             let elapsed = t0.elapsed();
             let since_inzone = inzone.elapsed();
-            // Once in-zone, fire the CS trigger once (after a short settle so
-            // the zone's entities are present), then observe for OBSERVE_SECS.
             if !cs_sent && since_inzone > Duration::from_secs(6) {
-                eprintln!("[live] sending {CS_TRIGGER:?}");
-                let _ = cmd_tx
-                    .send(AgentCommand::Chat {
-                        kind: 0,
-                        text: CS_TRIGGER.to_string(),
-                    })
-                    .await;
-                cs_sent = true;
+                if let Some((target_id, target_index)) = tally.renter {
+                    cmd_tx
+                        .send(AgentCommand::Action {
+                            target_id,
+                            target_index,
+                            kind: ActionKind::Talk,
+                        })
+                        .await
+                        .expect("talk to actual renter");
+                    cs_sent = true;
+                }
             }
             if since_inzone > Duration::from_secs(OBSERVE_SECS as u64) {
                 break Some("observation window complete".into());
@@ -415,7 +435,20 @@ async fn chocobo_rental_cs_protocol_timeline() {
     );
     assert!(
         tally.cs_started_at.is_some(),
-        "the rental CS never started after {CS_TRIGGER:?} (stop: {stop_reason})"
+        "the actual NPC did not start the rental event (stop: {stop_reason})"
+    );
+    assert!(tally.cs_ended_at.is_some(), "rental did not finish");
+    assert!(
+        tally.authoritative_mounted,
+        "server did not confirm mounted status"
+    );
+    assert!(tally.errors.is_empty(), "rental errors: {:?}", tally.errors);
+    let price = tally.rental_price.expect("authored rental price");
+    assert!(price > 0 && price <= FIXTURE_GIL);
+    assert_eq!(tally.remaining_gil, Some(FIXTURE_GIL - price));
+    assert!(
+        tally.handoff_zone.is_some(),
+        "server did not zone the renter out"
     );
     eprintln!(
         "[live] captured {} cues and {} mount-state events; summary in artifacts/verify",
