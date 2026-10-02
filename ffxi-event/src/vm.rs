@@ -362,8 +362,6 @@ const DEFCAMERA_CASE_LOCK: u8 = 1;
 const EVENTHIDE_FLAG_OFS: usize = 1; // 0x004E
 const EVENTHIDE_FLAG_MASK: u8 = 1;
 const EVENTHIDE_TARGET_OFS: usize = 2;
-// 0x006C TRANSPAR: the actor lookup at +1, the destination alpha byte at +5,
-// and the fade length in frames at +7 (research/XiEvents/OpCodes/0x006C.md).
 const MUSICVOLUME_LEVEL_OFS: usize = 1; // 0x005D
 const MUSICVOLUME_FADE_OFS: usize = 3;
 /// 0x77's hour operand (research/XiEvents/OpCodes/0x0077.md); its weather
@@ -371,10 +369,6 @@ const MUSICVOLUME_FADE_OFS: usize = 3;
 const STOP_CLOCK_HOUR_OFS: usize = 1;
 /// `OP_STOP_CLOCK`'s "no time change" sentinel for the hour operand.
 const STOP_CLOCK_NO_HOUR: i32 = 255;
-/// 0x69's on/off flag byte (0 -> full volume, non-zero -> mute) and its
-/// sound-type mask at +2 (research/XiEvents/OpCodes/0x0069.md).
-/// 0x6A's volume (work[1] * 0.001), fade frames (work[3]) and sound-type mask
-/// (work[5]) (research/XiEvents/OpCodes/0x006A.md).
 /// 0xA9's day operand: the clock jumps to Vana day `7 * work[1]` at 00:30
 /// (research/XiEvents/OpCodes/0x00A9.md).
 const SET_CLOCK_DATE_DAY_OFS: usize = 1;
@@ -1751,9 +1745,6 @@ impl EventVm {
                     });
                     self.advance(op);
                 }
-                // 0x6C fades the target's alpha to the work(5) byte over the
-                // work(7) frames and parks the script for that fade
-                // (research/XiEvents/OpCodes/0x006C.md).
                 OP_TRANSPAR => self.advance(op),
                 // 0xC8 opens the map window on the work-slot zone id —
                 // research/XiEvents/OpCodes/0x00C8.md.
@@ -1869,9 +1860,6 @@ impl EventVm {
                     });
                     self.advance(op);
                 }
-                // 0x69 sets the named sound types to full volume or mutes them
-                // (the flag byte); 0x6A eases them to work[1] * 0.001 over
-                // work[3] frames (research/XiEvents/OpCodes/0x0069.md, 0x006A.md).
                 OP_SET_SOUND_VOLUME | OP_CHANGE_SOUND_VOLUME => self.advance(op),
                 // Status writes: retail-2026-09 RVAs 0xB6950, 0xB6A00, 0xB69B0;
                 // .agents/skills/retail-observe/references/2026-10-02-event-control-clock-doors.md.
@@ -3606,9 +3594,6 @@ mod tests {
         }
     }
 
-    /// 0x6C emits the fade cue and parks the script for the authored frame
-    /// count; a zero-length fade still costs one frame, retail's `AlphaTime`
-    /// 0 → 1 (research/XiEvents/OpCodes/0x006C.md).
     #[test]
     fn unsupported_transparency_keeps_baseline_skip_without_wait() {
         let mut data = vec![OP_TRANSPAR];
