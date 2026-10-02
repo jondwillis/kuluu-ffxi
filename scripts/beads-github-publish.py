@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """beads -> GitHub Issues publisher (one-way projection).
 
-beads (`.beads/issues.jsonl`) is the single source of truth for the backlog;
-this projects it onto GitHub Issues so contributors have a browsable, linkable
-view. Each bead maps to exactly one issue, keyed by a hidden marker
+Beads is the durable backlog; its JSONL export is this publisher's snapshot input.
+This projects it onto GitHub Issues so contributors have a browsable, linkable
+view. Each generated projection maps to one issue, keyed by a hidden marker
 `<!-- beads-id: <id> -->` in the ISSUE BODY (never the title, which we rewrite).
 
 Per run, for each in-scope bead:
@@ -25,13 +25,16 @@ alone.
 
 Usage:
   scripts/beads-github-publish.py [--repo owner/repo] [--all] [--dry-run]
+  scripts/beads-github-publish.py --id ID [--id ID ...] [--include-closed]
+                                [--source-export PATH] [--dry-run]
 Env:
   REPO                  default jondwillis/kuluu-ffxi
   BEADS_PUBLISH_FILTER  label a bead must carry to be published (default
                         "roadmap"); --all clears it so every bead is published
   DRY_RUN=1             same as --dry-run
 
-Requires: gh (authenticated), python3. Run where .beads/issues.jsonl lives.
+Imported external_ref gh-N records link existing issues without rewriting them.
+Requires: gh (authenticated), python3. The default source is the checkout export.
 """
 
 from __future__ import annotations
@@ -39,9 +42,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
+from urllib.parse import urlsplit
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 JSONL = REPO_ROOT / ".beads" / "issues.jsonl"
@@ -104,17 +109,18 @@ def project_body(bead: dict, repo: str) -> str:
     footer = (
         "---\n"
         f"Tracked in beads as **`{bid}`** (`bd show {bid}`). This issue is a "
-        "read-only projection of `.beads/issues.jsonl` — edits made here are "
-        "overwritten on the next publish; claim and update the work in beads.\n"
+        "maintainer-managed projection of Beads — title/body edits are "
+        "overwritten on the next publish. Contributors can discuss here; "
+        "maintainers record accepted changes in Beads.\n"
         f"{MARKER.format(id=bid)}"
     )
     parts.append(footer)
     return "\n\n".join(parts)
 
 
-def load_beads(filter_label: str | None) -> list[dict]:
+def load_beads(filter_label: str | None, source_export: Path | None = None) -> list[dict]:
     beads = []
-    for line in JSONL.read_text().splitlines():
+    for line in (source_export or JSONL).read_text().splitlines():
         line = line.strip()
         if not line:
             continue
@@ -125,6 +131,60 @@ def load_beads(filter_label: str | None) -> list[dict]:
             continue
         beads.append(bead)
     return beads
+
+
+def select_beads(beads: list[dict], ids: list[str]) -> list[dict]:
+    selected = set(ids)
+    counts = {bid: sum(bead["id"] == bid for bead in beads) for bid in selected}
+    invalid = {bid: count for bid, count in counts.items() if count != 1}
+    if invalid:
+        raise ValueError(f"selected IDs must occur exactly once in the export: {invalid}")
+    return [bead for bead in beads if bead["id"] in selected]
+
+
+def is_imported(bead: dict) -> bool:
+    return str(bead.get("external_ref") or "").startswith("gh-")
+
+
+def issue_number_from_url(url: str, repo: str) -> int:
+    parsed = urlsplit(url)
+    host = os.environ.get("GH_HOST", "github.com")
+    match = re.fullmatch(f"/{re.escape(repo)}/issues/([1-9][0-9]*)", parsed.path, re.IGNORECASE)
+    if (
+        parsed.scheme != "https"
+        or parsed.netloc.lower() != host.lower()
+        or not match
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError(f"issue URL does not match {repo}: {url!r}")
+    return int(match.group(1))
+
+
+def marker_id(body: str) -> str | None:
+    start = body.rfind("<!-- beads-id:")
+    if start == -1:
+        return None
+    end = body.find("-->", start)
+    if end == -1:
+        return None
+    return body[start + len("<!-- beads-id:"):end].strip()
+
+
+def verify_imported_issue(bead: dict, repo: str) -> str:
+    reference = bead["external_ref"]
+    match = re.fullmatch(r"gh-([1-9][0-9]*)", reference)
+    if not match:
+        raise ValueError(f"{bead['id']}: invalid imported issue reference {reference!r}")
+    number = int(match.group(1))
+    issue = json.loads(gh(
+        ["issue", "view", str(number), "--repo", repo, "--json", "number,url"],
+        capture=True,
+    ))
+    url = issue.get("url") or ""
+    if issue.get("number") != number or issue_number_from_url(url, repo) != number:
+        raise ValueError(f"{bead['id']}: imported issue does not match {repo}#{number}: {url}")
+    return url
 
 
 def fetch_issues(repo: str) -> dict[str, dict]:
@@ -138,17 +198,12 @@ def fetch_issues(repo: str) -> dict[str, dict]:
     )
     by_id: dict[str, dict] = {}
     for issue in json.loads(out or "[]"):
-        body = issue.get("body") or ""
         # rfind, not find: project_body appends the real marker last, so a bead
         # whose own description quotes the marker syntax would otherwise index
         # under that literal and get republished as a duplicate every run.
-        i = body.rfind("<!-- beads-id:")
-        if i == -1:
+        bid = marker_id(issue.get("body") or "")
+        if bid is None:
             continue
-        j = body.find("-->", i)
-        if j == -1:
-            continue
-        bid = body[i + len("<!-- beads-id:"):j].strip()
         issue["labels"] = [lbl["name"] for lbl in issue.get("labels") or []]
         by_id[bid] = issue
     return by_id
@@ -171,6 +226,9 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--repo", default=os.environ.get("REPO", "jondwillis/kuluu-ffxi"))
     ap.add_argument("--all", action="store_true", help="publish every bead, not just the filtered set")
+    ap.add_argument("--id", action="append", default=[], help="publish only this exact bead ID; repeat for multiple IDs")
+    ap.add_argument("--source-export", type=Path, default=JSONL, help="read this explicit Beads JSONL snapshot instead of the checkout export")
+    ap.add_argument("--include-closed", action="store_true", help="backfill selected closed beads as closed issues; requires --id")
     ap.add_argument(
         "--prune-unmarked",
         action="store_true",
@@ -181,20 +239,53 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true", default=os.environ.get("DRY_RUN") == "1")
     args = ap.parse_args()
 
-    if not JSONL.exists():
-        print(f"error: {JSONL} not found", file=sys.stderr)
+    if args.id and (args.all or args.prune_unmarked):
+        ap.error("--id cannot be combined with --all or --prune-unmarked")
+    if args.include_closed and not args.id:
+        ap.error("--include-closed requires --id")
+    if not args.source_export.exists():
+        print(f"error: {args.source_export} not found", file=sys.stderr)
         return 1
 
-    filter_label = None if args.all else os.environ.get("BEADS_PUBLISH_FILTER", "roadmap")
+    filter_label = None if args.all or args.id else os.environ.get("BEADS_PUBLISH_FILTER", "roadmap")
     dry = args.dry_run
 
-    beads = load_beads(filter_label)
-    scope = "all beads" if args.all else f'beads labelled "{filter_label}"'
-    print(f">> repo={args.repo}  scope={scope}  count={len(beads)}  DRY_RUN={int(dry)}")
+    protected_imports: set[str] = set()
+    try:
+        exported = load_beads(None, args.source_export)
+        beads = [bead for bead in exported if not filter_label or filter_label in (bead.get("labels") or [])]
+        if args.id:
+            beads = select_beads(beads, args.id)
+        for bead in exported:
+            if is_imported(bead):
+                match = re.fullmatch(r"gh-([1-9][0-9]*)", bead["external_ref"])
+                if not match:
+                    if args.prune_unmarked:
+                        raise ValueError(f"{bead['id']}: invalid imported issue reference")
+                else:
+                    protected_imports.add(match.group(1))
+    except (ValueError, OSError) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    scope = f"selected IDs {','.join(sorted(set(args.id)))}" if args.id else (
+        "all beads" if args.all else f'beads labelled "{filter_label}"'
+    )
+    print(f">> repo={args.repo}  source={args.source_export.resolve()}  scope={scope}  count={len(beads)}  DRY_RUN={int(dry)}")
 
-    existing = {} if dry else fetch_issues(args.repo)
-    if dry:
-        print(">> (dry run: skipping the gh issue-list fetch; all beads shown as CREATE)")
+    imported = [bead for bead in beads if is_imported(bead)]
+    if args.id:
+        try:
+            for bead in imported:
+                url = verify_imported_issue(bead, args.repo)
+                print(f"   reference: {bead['id']} {url} (contributor issue; not modified)")
+        except (ValueError, subprocess.CalledProcessError) as error:
+            print(f"error: {error}", file=sys.stderr)
+            return 1
+    elif imported:
+        print(f">> skip {len(imported)} imported GitHub references (not outbound projections)")
+    beads = [bead for bead in beads if not is_imported(bead)]
+
+    existing = fetch_issues(args.repo)
 
     # Pre-create every managed label we'll reference.
     wanted_labels: set[str] = set()
@@ -212,19 +303,47 @@ def main() -> int:
         issue = existing.get(bid)
 
         if issue is None:
-            if bead_closed:
+            if bead_closed and not args.include_closed:
                 skipped += 1
                 continue
             print(f"   create: [{','.join(sorted(want_labels))}] {bid} {title}")
-            gh(
+            created_url = gh(
                 ["issue", "create", "--repo", args.repo, "--title", title,
                  "--body", body, *(sum((["--label", l] for l in sorted(want_labels)), []))],
                 dry=dry,
+                capture=True,
             )
             created += 1
+            if not dry:
+                print(f"   published: {bid} {created_url.strip()}")
+            if bead_closed:
+                print(f"   close:  {created_url.strip() or '(new issue)'} {bid}")
+                if dry:
+                    print("+ gh issue close <new issue URL> --repo " + args.repo)
+                else:
+                    try:
+                        number = issue_number_from_url(created_url.strip(), args.repo)
+                        confirmed = json.loads(gh(
+                            ["issue", "view", str(number), "--repo", args.repo, "--json", "number,url,body"],
+                            capture=True,
+                        ))
+                        if (
+                            confirmed.get("number") != number
+                            or issue_number_from_url(confirmed.get("url") or "", args.repo) != number
+                            or marker_id(confirmed.get("body") or "") != bid
+                        ):
+                            raise ValueError(f"created issue does not match selected bead {bid}")
+                        gh(["issue", "close", str(number), "--repo", args.repo])
+                    except (ValueError, subprocess.CalledProcessError) as error:
+                        print(f"error: {error}", file=sys.stderr)
+                        return 1
+                closed += 1
             continue
 
         num = str(issue["number"])
+        if num in protected_imports:
+            print(f"   reference: {bid} #{num} (imported issue; not modified)")
+            continue
         cur_managed = {l for l in issue["labels"] if is_managed(l)}
         add = want_labels - cur_managed
         remove = cur_managed - want_labels
@@ -267,6 +386,8 @@ def main() -> int:
             if "<!-- beads-id:" in (issue.get("body") or ""):
                 continue
             num = str(issue["number"])
+            if num in protected_imports:
+                continue
             print(f"   prune:  #{num} (no beads-id marker)")
             gh(["issue", "close", num, "--repo", args.repo, "--reason", "not planned"], dry=dry)
             pruned += 1
