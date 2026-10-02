@@ -9,8 +9,7 @@ use crate::cue::{
     EventCue, ExtSchedulerMotion, FourCc, EMOTE_ANIMATION_KEY, LOCAL_PLAYER_SCHEDULER_DAT_ID_BASE,
     MAGIC_DAT_ID_BASE, MAGIC_ROUTINE_TAG, MUSIC_VOLUME_MAX, NO_ACTION_KEY, SCHEDULER_DAT_ID_BASE,
     SCHEDULER_DURATION_FROM_DAT, STATUS_EVENT_CHOCOBO, STATUS_EVENT_DOOR_CLOSE,
-    STATUS_EVENT_DOOR_CLOSE2, STATUS_EVENT_DOOR_OPEN, STATUS_EVENT_DOOR_OPEN2, STATUS_EVENT_IDLE,
-    STATUS_EVENT_MOTION_BASE, STATUS_EVENT_MOUNT,
+    STATUS_EVENT_DOOR_OPEN, STATUS_EVENT_IDLE, STATUS_EVENT_MOTION_BASE, STATUS_EVENT_MOUNT,
 };
 use crate::opcode_meta::{
     OPCODE_META, OP_ENTITYSPEED, OP_EVENTPOSSET, OP_ITEMINFO, OP_LOADROOM, OP_LOOKSET, OP_MENU,
@@ -1980,14 +1979,7 @@ impl EventVm {
                     self.emit_status_event_cue(status);
                     self.advance(op);
                 }
-                OP_DOOR_OPEN2 => {
-                    self.emit_status_event_cue(STATUS_EVENT_DOOR_OPEN2);
-                    self.advance(op);
-                }
-                OP_DOOR_CLOSE2 => {
-                    self.emit_status_event_cue(STATUS_EVENT_DOOR_CLOSE2);
-                    self.advance(op);
-                }
+                OP_DOOR_OPEN2 | OP_DOOR_CLOSE2 => self.advance(op),
                 // The Flags1 half of 0x90 has no tier-named meaning, so the cue
                 // carries only the hide write.
                 OP_EVENT_HIDE_ALWAYS => {
@@ -5113,9 +5105,6 @@ mod tests {
         );
     }
 
-    /// 0x4C/0x4D/0x4F/0x8E/0x8F write the event entity's StatusEvent on the
-    /// Mount cue: the door's open/close byte, its D_OPEN2/D_CLOSE2 pair, and
-    /// work(1) + 18 into the M1..M8 range.
     #[test]
     fn door_status_opcodes_write_the_event_entity_status() {
         let door = |status_event| {
@@ -5133,14 +5122,11 @@ mod tests {
             cues_of(OP_DOOR_CLOSE, &[], vec![]),
             door(STATUS_EVENT_DOOR_CLOSE)
         );
-        assert_eq!(
-            cues_of(OP_DOOR_OPEN2, &[], vec![]),
-            door(STATUS_EVENT_DOOR_OPEN2)
-        );
-        assert_eq!(
-            cues_of(OP_DOOR_CLOSE2, &[], vec![]),
-            door(STATUS_EVENT_DOOR_CLOSE2)
-        );
+        for op in [OP_DOOR_OPEN2, OP_DOOR_CLOSE2] {
+            let mut e = vm(vec![op, OP_END], vec![]);
+            assert_eq!(e.step(), StepResult::Done);
+            assert!(e.take_cues().is_empty());
+        }
         assert_eq!(
             cues_of(OP_STATUS_EVENT, &REF1, vec![0, 3]),
             door(STATUS_EVENT_MOTION_BASE as u8 + 3)
