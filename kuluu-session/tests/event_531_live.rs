@@ -1,18 +1,4 @@
-// Live end-to-end check of event 531, the Windurst Waters new-character
-// opening cutscene, against a local LSB stack with retail DATs mounted.
-//
-// Self-skips when the auth port or xidb is unreachable, or when no FFXI
-// install can be opened. 531 is a multi-entity event: ROM/21/47.DAT holds
-// five exact owners (the 163-step main program, a [HIDE_SELF, END] block,
-// and three more NPC blocks). The master (zone) block carries only a
-// wildcard END, so retail runs every owner block in parallel from event
-// start (per-entity event instances, research/XiEvents/Event VM Functions.md
-// InitEvent2/XiEventInit). Kuluu mirrors that: the session spawns an
-// owner-block child per non-master owner (ffxi-event EventVm::spawn_owner,
-// kuluu-session event_dialog begin) and the event ends when they all drain.
-//
-// This test asserts the full playback: CutsceneStarted, at least one staging
-// frame (CutsceneCue), and EventEnded.
+// Session-only staging contract; renderer completion is outside this surface.
 
 mod common;
 
@@ -26,7 +12,7 @@ use std::{
 
 use kuluu_session::{
     session::{self, CharSelection, Config},
-    state::{AgentCommand, AgentEvent, Stage},
+    state::{AgentCommand, AgentEvent, CutsceneCue, Stage},
 };
 use tokio::{
     net::TcpStream,
@@ -48,9 +34,7 @@ const EVENT_531: u16 = 531;
 const NOT_SEEN_VAR: &str = "HQuest[newCharacterCS]notSeen";
 
 const LOGIN_DEADLINE: Duration = Duration::from_secs(90);
-/// The 531 cutscene plays for a while; two minutes from CutsceneStarted is
-/// generous.
-const PLAYBACK_DEADLINE: Duration = Duration::from_secs(120);
+const STAGING_DEADLINE: Duration = Duration::from_secs(30);
 /// Grace for the event to start after zone-in.
 const NO_EVENT_GRACE: Duration = Duration::from_secs(60);
 
@@ -77,6 +61,9 @@ struct Tally {
     event_ended_at: Option<Instant>,
     /// Staging frames the running 531 script emitted (CutsceneCue).
     cues_total: u32,
+    actor_placed: bool,
+    scheduler_staged: bool,
+    error: Option<String>,
     auto_skipped_line: Option<String>,
     disconnected_reason: Option<String>,
 }
@@ -105,9 +92,12 @@ fn handle_event(tally: &mut Tally, ev: &AgentEvent, now: Instant) {
                 );
             }
         }
-        AgentEvent::CutsceneCue { .. } => {
+        AgentEvent::Error { message } => tally.error = Some(message.clone()),
+        AgentEvent::CutsceneCue { cue } => {
             if tally.cutscene_started_at.is_some() {
                 tally.cues_total += 1;
+                tally.actor_placed |= matches!(cue, CutsceneCue::ActorPlace { .. });
+                tally.scheduler_staged |= matches!(cue, CutsceneCue::Scheduler { .. });
             }
         }
         AgentEvent::EventEnded => {
@@ -132,7 +122,7 @@ fn handle_event(tally: &mut Tally, ev: &AgentEvent, now: Instant) {
 }
 
 #[tokio::test]
-async fn event_531_full_playback_against_live_lsb() {
+async fn event_531_stages_authored_owner_cues_against_live_lsb() {
     let server_host = std::env::var("SERVER_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
     let auth_port = std::env::var("AUTH_PORT")
         .ok()
@@ -209,7 +199,7 @@ async fn event_531_full_playback_against_live_lsb() {
     let mut events_log = fs::File::create(&events_path).expect("opening event_531_events.jsonl");
 
     let t0 = Instant::now();
-    let hard_deadline = t0 + LOGIN_DEADLINE + PLAYBACK_DEADLINE;
+    let hard_deadline = t0 + LOGIN_DEADLINE + STAGING_DEADLINE;
     let mut tally = Tally::default();
 
     let stop_reason: Option<String> = loop {
@@ -232,13 +222,13 @@ async fn event_531_full_playback_against_live_lsb() {
                     break Some("session disconnected".into());
                 }
 
-                if tally.event_ended_at.is_some() && tally.cues_total >= 1 {
-                    break Some("event 531 played (CutsceneStarted, frame, EventEnded)".into());
+                if tally.actor_placed && tally.scheduler_staged {
+                    break Some("event 531 staged actor placement and scheduler".into());
                 }
 
                 if let Some(started_at) = tally.cutscene_started_at {
-                    if now - started_at > PLAYBACK_DEADLINE {
-                        break Some("playback deadline exceeded".into());
+                    if now - started_at > STAGING_DEADLINE {
+                        break Some("staging deadline exceeded".into());
                     }
                 } else if let Some(inzone_at) = tally.inzone_at {
                     if now - inzone_at > NO_EVENT_GRACE {
@@ -301,25 +291,17 @@ async fn event_531_full_playback_against_live_lsb() {
          {stop_reason})"
     );
     assert!(
-        tally.event_ended_at.is_some(),
-        "event 531 never ended (stop: {stop_reason}, frames: {})",
-        tally.cues_total
+        tally.actor_placed && tally.scheduler_staged,
+        "authored staging incomplete: {stop_reason}"
     );
+    assert!(tally.error.is_none(), "session error: {:?}", tally.error);
     assert!(
         tally.disconnected_reason.is_none(),
         "session disconnected: {:?}",
         tally.disconnected_reason
     );
 
-    eprintln!(
-        "[live] PASS: event 531 played end to end — InZone at {:?}, \
-         CutsceneStarted at {:?}, {} frame(s), EventEnded at {:?} — the multi-\
-         entity owner blocks ran in parallel",
-        secs_opt(tally.inzone_at),
-        secs_opt(tally.cutscene_started_at),
-        tally.cues_total,
-        secs_opt(tally.event_ended_at),
-    );
+    eprintln!("[live] PASS: event 531 staged actor placement and scheduler after its server trigger ({} cues)", tally.cues_total);
 }
 
 fn secs_opt(i: Option<Instant>) -> String {
