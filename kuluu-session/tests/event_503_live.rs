@@ -1,13 +1,4 @@
-// Live end-to-end playback of event 503, the Southern San d'Oria new-character
-// opening cutscene, against a local LSB stack with retail DATs mounted.
-//
-// Self-skips when the auth port or xidb is unreachable, or when no FFXI install
-// can be opened. Proves every instruction of event 503 fires start to end:
-// camera/fade/gesture cues in authored order, all input-gated frames on the
-// G1 "adventuring" -> G4a "helping people" path, the H2 coupon line, then the
-// server-side onEventFinish rewards — item 536 and setPos to the gate
-// (vendor/server/scripts/quests/hiddenQuests/New_Character_Cutscenes.lua
-// SOUTHERN_SAN_DORIA).
+// vendor/server/scripts/quests/hiddenQuests/New_Character_Cutscenes.lua SOUTHERN_SAN_DORIA.
 
 mod common;
 
@@ -21,7 +12,7 @@ use std::{
 
 use kuluu_session::{
     session::{self, CharSelection, Config},
-    state::{AgentCommand, AgentEvent, DialogState, InventoryUpdate, Stage},
+    state::{AgentCommand, AgentEvent, DialogState, InventoryUpdate, SessionState, Stage},
 };
 use tokio::{
     net::TcpStream,
@@ -42,7 +33,7 @@ const COUPON_ITEM_NO: u16 = 536;
 /// vendor/server/scripts/quests/hiddenQuests/New_Character_Cutscenes.lua).
 const NOT_SEEN_VAR: &str = "HQuest[newCharacterCS]notSeen";
 
-/// onEventFinish[503] setPos(-100, 1, -40, 224)
+/// onZoneIn setPos(-100, 1, -40, 224)
 /// (vendor/server/scripts/quests/hiddenQuests/New_Character_Cutscenes.lua):
 /// native (x=-100, y=+1, z=-40) arrives as wire Position pos = (-100, -40, +1);
 /// the wire .y is horizontal Z and .z is vertical.
@@ -63,7 +54,7 @@ const MIN_DIALOG_FRAMES: u32 = 25;
 
 const LOGIN_DEADLINE: Duration = Duration::from_secs(90);
 const PLAYBACK_DEADLINE: Duration = Duration::from_secs(8 * 60);
-/// After the event ends, onEventFinish rewards (item grant + setPos) arrive
+/// After the event ends, onEventFinish item grant arrive
 /// as ordinary s2c traffic; allow this long before giving up on them.
 const SERVER_RESPONSE_GRACE: Duration = Duration::from_secs(30);
 /// The zone-in event fires on entry; no start within a minute of InZone means
@@ -107,6 +98,7 @@ struct Tally {
     actor_moves: u32,
     item_536_slot: Option<u8>,
     forced_move_target: Option<[f32; 3]>,
+    entry_position: Option<[f32; 3]>,
     disconnected_reason: Option<String>,
 }
 
@@ -136,6 +128,11 @@ fn pick_choice(dialog: &DialogState) -> u32 {
 /// one tallied.
 fn handle_event(tally: &mut Tally, ev: &AgentEvent, now: Instant) {
     match ev {
+        AgentEvent::PositionChanged { pos } => {
+            tally
+                .entry_position
+                .get_or_insert([pos.pos.x, pos.pos.y, pos.pos.z]);
+        }
         AgentEvent::StageChanged { stage } => {
             if !tally.stages_seen.contains(stage) {
                 tally.stages_seen.push(*stage);
@@ -330,6 +327,7 @@ async fn event_503_full_playback_against_live_lsb() {
     let t0 = Instant::now();
     let hard_deadline = t0 + LOGIN_DEADLINE + PLAYBACK_DEADLINE;
     let mut tally = Tally::default();
+    let mut observed_state = SessionState::default();
 
     let stop_reason: Option<String> = loop {
         if Instant::now() >= hard_deadline {
@@ -339,6 +337,7 @@ async fn event_503_full_playback_against_live_lsb() {
             Ok(Ok(ev)) => {
                 let now = Instant::now();
                 handle_event(&mut tally, &ev, now);
+                observed_state.apply_event(&ev);
 
                 let event_value = serde_json::to_value(&ev).expect("serializing AgentEvent");
                 let line = serde_json::json!({
@@ -376,8 +375,8 @@ async fn event_503_full_playback_against_live_lsb() {
                 }
 
                 if let Some(ended_at) = tally.event_ended_at {
-                    if tally.item_536_slot.is_some() && tally.forced_move_target.is_some() {
-                        break Some("event ended and both server rewards observed".into());
+                    if tally.item_536_slot.is_some() {
+                        break Some("event ended and server reward observed".into());
                     }
                     if now - ended_at > SERVER_RESPONSE_GRACE {
                         break Some("server-response grace expired after event end".into());
@@ -402,6 +401,7 @@ async fn event_503_full_playback_against_live_lsb() {
         }
     };
 
+    let final_position = observed_state.self_position();
     if tally.disconnected_reason.is_none() {
         let _ = cmd_tx.send(AgentCommand::Disconnect).await;
     }
@@ -420,6 +420,10 @@ async fn event_503_full_playback_against_live_lsb() {
         ),
     }
 
+    let saved = fixture
+        .saved_position_and_var(NOT_SEEN_VAR)
+        .await
+        .expect("saved completion state");
     if let Err(e) = fixture.cleanup().await {
         eprintln!("fixture cleanup failed (non-fatal for this test): {e:#}");
     }
@@ -515,14 +519,17 @@ async fn event_503_full_playback_against_live_lsb() {
         tally.item_536_slot.is_some(),
         "onEventFinish never granted item {COUPON_ITEM_NO} (stop: {stop_reason})"
     );
-    let target = tally
-        .forced_move_target
-        .unwrap_or_else(|| panic!("no ForcedMove observed after event end (stop: {stop_reason})"));
+    let pos = final_position.expect("authoritative player position").pos;
+    let target = [pos.x, pos.y, pos.z];
+    let entry = tally.entry_position.expect("server entry position");
+    assert_eq!(entry, [GATE_WIRE_X, GATE_WIRE_Y, GATE_WIRE_Z]);
+    eprintln!("[live] final session position={target:?}, persisted server state={saved:?}");
+    assert_eq!(saved.3, 0, "server must clear the notSeen quest flag");
     assert!(
-        (target[0] - GATE_WIRE_X).abs() <= GATE_TOLERANCE
-            && (target[1] - GATE_WIRE_Y).abs() <= GATE_TOLERANCE
-            && (target[2] - GATE_WIRE_Z).abs() <= GATE_TOLERANCE,
-        "ForcedMove target {target:?} is not the gate setPos (-100, -40, +1 wire)"
+        (saved.0 - target[0]).abs() <= GATE_TOLERANCE
+            && (saved.1 - target[2]).abs() <= GATE_TOLERANCE
+            && (saved.2 - target[1]).abs() <= GATE_TOLERANCE,
+        "persisted server position {saved:?} differs from final session position"
     );
 
     eprintln!(

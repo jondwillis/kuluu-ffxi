@@ -308,6 +308,18 @@ impl EphemeralChar {
         Ok(())
     }
 
+    pub async fn saved_position_and_var(&self, varname: &str) -> Result<(f32, f32, f32, i32)> {
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .context("DB conn for saved state")?;
+        "SELECT pos_x, pos_y, pos_z, COALESCE((SELECT value FROM char_vars WHERE charid = ? AND varname = ?), 0) FROM chars WHERE charid = ?"
+            .with((self.charid, varname, self.charid))
+            .first(&mut conn).await.context("reading saved character state")?
+            .ok_or_else(|| anyhow!("fixture character missing"))
+    }
+
     /// Grant `amount` gil: gil is the currency item (id 0) of the main
     /// inventory (vendor/server/src/map/lua/lua_base_entity.cpp getGil reads
     /// getStorage(LOC_INVENTORY)->GetItem(0)). The fixture's char-creation
