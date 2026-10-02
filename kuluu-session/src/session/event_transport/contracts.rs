@@ -401,6 +401,81 @@ async fn nested_player_position_contract() {
     }
 }
 
+async fn timed_prompt_nested_movement_contract() {
+    const OP_SNAP: u8 = 0x37;
+    const OP_REQUEST: u8 = 0x27;
+    const OP_SLEEP: u8 = 0x6F;
+    const OP_SMOVE: u8 = 0x31;
+    const OP_SPEED: u8 = 0x32;
+    let mut program = Vec::new();
+    message(&mut program, 0);
+    message(&mut program, 1);
+    program.push(OP_END);
+    let child_offset = program.len() as u16;
+    program.push(OP_SNAP);
+    for _ in 0..4 {
+        operand(&mut program, REFERENCE + 2);
+    }
+    program.push(OP_SPEED);
+    operand(&mut program, REFERENCE + 5);
+    program.extend([OP_SMOVE, 0]);
+    for index in [3, 2, 2, 4] {
+        operand(&mut program, REFERENCE + index);
+    }
+    program.extend([OP_SMOVE, 1, OP_END]);
+    let player = EventBlock {
+        actor: ZONE_PLAYER_ACTOR,
+        event_ids: vec![EVENT, 0],
+        event_offsets: vec![0, child_offset],
+        event_data: program,
+        references: vec![3, 0, 0, 41_000, 600, 40],
+    };
+    let mut request = vec![OP_SLEEP, OP_REQUEST, 0];
+    request.extend(ZONE_PLAYER_ACTOR.to_le_bytes());
+    request.extend([1, OP_END]);
+    let mut owner = block(request, vec![]);
+    owner.actor = NPC + 1;
+    let mut host = Host::new(
+        EventDat {
+            blocks: vec![player, owner],
+        },
+        FARE,
+    )
+    .await;
+    for _ in 0..4 {
+        assert!(matches!(
+            host.step(Drive::Tick(TICK)).advance,
+            Advance::Waiting
+        ));
+    }
+    assert!(
+        host.dialog.controls_player_position(),
+        "child SLEEP and REQSET run during narration"
+    );
+    let before = host.position;
+    let step = host.step(Drive::Tick(1.0));
+    assert!(
+        matches!(step.advance, Advance::Waiting),
+        "timed frame remains displayed"
+    );
+    assert!(
+        host.position.pos.x > before.pos.x,
+        "nested player movement advances during narration"
+    );
+    assert!(packets(&step)
+        .iter()
+        .any(|packet| packet.opcode == map::c2s::POS));
+    let step = host.step(Drive::Tick(4.0));
+    let Advance::Frame(frame) = step.advance else {
+        panic!("countdown must reach next manual frame")
+    };
+    assert_eq!(frame.auto_advance, None);
+    assert!(matches!(
+        host.step(Drive::Tick(1.0)).advance,
+        Advance::Waiting
+    ));
+}
+
 async fn acknowledgement_contract() {
     for child in [false, true] {
         for position_first in [false, true] {
@@ -881,6 +956,7 @@ fn ferry_and_bootstrap_contracts_hold() {
 async fn event_state_contract() {
     numeric_contract().await;
     nested_player_position_contract().await;
+    timed_prompt_nested_movement_contract().await;
     acknowledgement_contract().await;
     server_reply_contract().await;
     submap_reply_contract().await;

@@ -535,20 +535,13 @@ impl DialogSession {
         self.auto_advance_remaining = auto.map(f32::from);
     }
 
-    /// Run the host clock into the scene: a frame with a retail auto-prompt
-    /// counts down on this host clock and dismisses itself exactly like a key
-    /// press when it reaches zero (the `7F 34/35/36 NN` continue-prompt code,
-    /// research/cexi-docs/dialog/format.md); while that clock runs the VM is
-    /// parked on the frame, so the runner's own tick is a no-op. Every other
-    /// park advances the scene's timed waits; a manual frame is a no-op
-    /// ([`Advance::Waiting`]) instead. Call only while [`active_end`] is
-    /// `Some` — like [`advance`](Self::advance), a desynced call releases the
-    /// event rather than wedging it open.
-    ///
-    /// [`active_end`]: Self::active_end
     fn tick(&mut self, dt_secs: f32) -> Advance {
         self.sweep_pending_motion_holds();
         if let Some(remaining) = self.auto_advance_remaining {
+            let advance = self.drive(|runner, strings| runner.tick(dt_secs, strings));
+            if !matches!(advance, Advance::Waiting) {
+                return self.check_liveness(advance);
+            }
             let next = remaining - dt_secs;
             if next <= 0.0 {
                 self.auto_advance_remaining = None;
@@ -2790,6 +2783,7 @@ pub(crate) mod tests {
                 b"Balance {Num:0}, fare {Num:1}\0",
                 b"Accepted: {Num:0}, fare {Num:1}\0",
                 b"Insufficient: {Num:0}, fare {Num:1}\0",
+                b"Narration\x7f\x34\x05\x00",
             ]))
             .unwrap(),
         );

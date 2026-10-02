@@ -57,6 +57,7 @@ const MANUAL_GUARD: Duration = Duration::from_millis(500);
 /// name, the same `get_mob_by_target('t')` the addon checks).
 pub fn eligible(d: &DialogState) -> bool {
     d.prompt.is_some()
+        && d.auto_advance.is_none()
         && !d.contains_item
         && d.choices.is_empty()
         && !d.text_entry
@@ -174,6 +175,10 @@ mod tests {
     #[test]
     fn only_plain_message_frames_are_eligible() {
         assert!(eligible(&frame("hello")));
+
+        let mut d = frame("narration");
+        d.auto_advance = Some(5);
+        assert!(!eligible(&d), "authored countdown owns timed narration");
 
         let mut d = frame("hello");
         d.choices.push("A".into());
