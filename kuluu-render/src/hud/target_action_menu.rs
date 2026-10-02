@@ -124,7 +124,7 @@ fn spawn_target_action_rows(p: &mut ChildSpawnerCommands) {
 }
 
 pub fn update_target_action_menu(
-    mode: Res<InputMode>,
+    mut mode: ResMut<InputMode>,
     overlay: Res<ActiveOverlay>,
 
     scene: Res<crate::snapshot::SceneState>,
@@ -141,6 +141,15 @@ pub fn update_target_action_menu(
     let Ok(mut panel) = panel_q.single_mut() else {
         return;
     };
+
+    if matches!(&*mode, InputMode::TargetAction(state) if state.ctx.modern_mount)
+        && !matches!(
+            scene.snapshot.self_mount,
+            Some(kuluu_snapshot::Mount::Other { .. })
+        )
+    {
+        *mode = InputMode::World;
+    }
 
     let InputMode::TargetAction(state) = &*mode else {
         if panel.display != Display::None {
@@ -406,8 +415,45 @@ mod tests {
             engaged: false,
             usable_items_available: true,
             can_fish: false,
-            mounted: false,
+            modern_mount: false,
         }
+    }
+
+    #[test]
+    fn modern_mount_menu_closes_when_server_mount_disappears() {
+        let mut app = App::new();
+        app.init_resource::<crate::snapshot::SceneState>()
+            .init_resource::<ActiveOverlay>()
+            .insert_resource(InputMode::TargetAction(TargetActionState::open(
+                TargetActionContext {
+                    modern_mount: true,
+                    ..default()
+                },
+            )))
+            .add_systems(Update, update_target_action_menu);
+        app.world_mut().spawn((TargetActionMenu, Node::default()));
+        app.world_mut()
+            .resource_mut::<crate::snapshot::SceneState>()
+            .snapshot
+            .self_mount = Some(kuluu_snapshot::Mount::Other { mount_id: u8::MAX });
+        app.update();
+        assert!(matches!(
+            app.world().resource::<InputMode>(),
+            InputMode::TargetAction(_)
+        ));
+        app.world_mut()
+            .resource_mut::<crate::snapshot::SceneState>()
+            .snapshot
+            .self_mount = None;
+        app.update();
+        assert!(matches!(
+            app.world().resource::<InputMode>(),
+            InputMode::World
+        ));
+        let mut panel = app
+            .world_mut()
+            .query_filtered::<&Node, With<TargetActionMenu>>();
+        assert_eq!(panel.single(app.world()).unwrap().display, Display::None);
     }
 
     #[test]

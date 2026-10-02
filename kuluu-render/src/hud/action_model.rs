@@ -16,7 +16,6 @@ pub enum TargetActionId {
     Check,
     Open,
     Fish,
-    Dig,
     Dismount,
 }
 
@@ -29,7 +28,6 @@ impl TargetActionId {
             TargetActionId::Open
             | TargetActionId::Check
             | TargetActionId::Chat
-            | TargetActionId::Dig
             | TargetActionId::Dismount
             | TargetActionId::SwitchTarget => true,
             TargetActionId::Attack
@@ -95,7 +93,7 @@ pub struct TargetActionContext {
     /// (research/xim UiState.kt `getCurrentActions`).
     pub can_fish: bool,
 
-    pub mounted: bool,
+    pub modern_mount: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -146,7 +144,7 @@ impl AbilityGroup {
     }
 }
 
-fn applies_to(id: TargetActionId, kind: TargetKindLite, engaged: bool, mounted: bool) -> bool {
+fn applies_to(id: TargetActionId, kind: TargetKindLite, engaged: bool) -> bool {
     use TargetKindLite::*;
     match id {
         TargetActionId::Attack => matches!(kind, Mob) && !engaged,
@@ -173,8 +171,7 @@ fn applies_to(id: TargetActionId, kind: TargetKindLite, engaged: bool, mounted: 
         // appends it independently of the target).
         TargetActionId::Fish => true,
 
-        TargetActionId::Dig => kind == SelfPc && mounted,
-        TargetActionId::Dismount => mounted,
+        TargetActionId::Dismount => false,
     }
 }
 
@@ -191,23 +188,18 @@ pub fn build_target_action_entries(
         TargetActionId::Abilities,
         TargetActionId::Trust,
         TargetActionId::Items,
-        TargetActionId::Dismount,
         TargetActionId::Trade,
         TargetActionId::Disengage,
         TargetActionId::Fish,
         TargetActionId::Check,
     ];
 
-    // .agents/skills/retail-observe/references/2026-09-24-chocobo-mounted-menu.md
-    if ctx.mounted && (ctx.target_kind == TargetKindLite::SelfPc || !ctx.has_target) {
-        return [
-            TargetActionId::Chat,
-            TargetActionId::Dig,
-            TargetActionId::Dismount,
-        ]
-        .iter()
-        .map(|&id| entry_for(id, ctx))
-        .collect();
+    // .agents/skills/retail-observe/references/2026-10-02-mounted-command-menu.md
+    if ctx.modern_mount && (ctx.target_kind == TargetKindLite::SelfPc || !ctx.has_target) {
+        return [TargetActionId::Chat, TargetActionId::Dismount]
+            .iter()
+            .map(|&id| entry_for(id, ctx))
+            .collect();
     }
 
     let mut out = Vec::new();
@@ -218,7 +210,7 @@ pub fn build_target_action_entries(
         if id == TargetActionId::Fish && !ctx.can_fish {
             continue;
         }
-        if !applies_to(id, ctx.target_kind, ctx.engaged, ctx.mounted) {
+        if !applies_to(id, ctx.target_kind, ctx.engaged) {
             continue;
         }
         out.push(entry_for(id, ctx));
@@ -267,7 +259,6 @@ fn entry_for(id: TargetActionId, ctx: &TargetActionContext) -> ActionEntry {
         TargetActionId::Check => (ActionEntryKind::Plain, "Check".to_string()),
         TargetActionId::Open => (ActionEntryKind::Plain, "Open".to_string()),
         TargetActionId::Fish => (ActionEntryKind::Plain, "Fish".to_string()),
-        TargetActionId::Dig => (ActionEntryKind::Plain, "Dig".to_string()),
         TargetActionId::Dismount => (ActionEntryKind::Plain, "Dismount".to_string()),
     };
 
@@ -296,7 +287,7 @@ pub fn context_for_target(
     engaged: bool,
     usable_items_available: bool,
     can_fish: bool,
-    mounted: bool,
+    modern_mount: bool,
 ) -> TargetActionContext {
     use kuluu_snapshot::EntityKind;
 
@@ -331,7 +322,7 @@ pub fn context_for_target(
         engaged,
         usable_items_available,
         can_fish,
-        mounted,
+        modern_mount,
     }
 }
 
@@ -371,13 +362,13 @@ mod tests {
             engaged: false,
             usable_items_available: true,
             can_fish: false,
-            mounted: false,
+            modern_mount: false,
         }
     }
 
     fn mounted_ctx(kind: TargetKindLite) -> TargetActionContext {
         TargetActionContext {
-            mounted: true,
+            modern_mount: true,
             ..ctx(kind, true)
         }
     }
@@ -526,49 +517,33 @@ mod tests {
         }
     }
 
-    /// The mounted no-target context: the command menu opens on the self
-    /// target, which is the no-target menu, not an explicit self target.
     fn mounted_no_target() -> TargetActionContext {
         TargetActionContext {
             has_target: false,
             target_kind: TargetKindLite::None,
-            mounted: true,
+            modern_mount: true,
             ..Default::default()
         }
     }
 
     #[test]
-    fn mounted_self_menu_is_chat_dig_dismount() {
+    fn mounted_self_menu_is_chat_dismount() {
         let entries = build_target_action_entries(&mounted_ctx(TargetKindLite::SelfPc), &RETAIL);
         let ids: Vec<_> = entries.iter().map(|e| e.id).collect();
-        assert_eq!(
-            ids,
-            vec![
-                TargetActionId::Chat,
-                TargetActionId::Dig,
-                TargetActionId::Dismount
-            ]
-        );
+        assert_eq!(ids, vec![TargetActionId::Chat, TargetActionId::Dismount]);
         assert!(entries.iter().all(|e| e.enabled));
     }
 
     #[test]
-    fn mounted_no_target_menu_is_chat_dig_dismount() {
+    fn mounted_no_target_menu_is_chat_dismount() {
         let entries = build_target_action_entries(&mounted_no_target(), &RETAIL);
         let ids: Vec<_> = entries.iter().map(|e| e.id).collect();
-        assert_eq!(
-            ids,
-            vec![
-                TargetActionId::Chat,
-                TargetActionId::Dig,
-                TargetActionId::Dismount
-            ]
-        );
+        assert_eq!(ids, vec![TargetActionId::Chat, TargetActionId::Dismount]);
         assert!(entries.iter().all(|e| e.enabled));
     }
 
     #[test]
-    fn mounted_other_menus_gain_dismount_but_not_dig() {
+    fn mounted_other_menus_keep_existing_entries() {
         for kind in [
             TargetKindLite::Mob,
             TargetKindLite::Pc,
@@ -577,10 +552,9 @@ mod tests {
             let entries = build_target_action_entries(&mounted_ctx(kind), &RETAIL);
             let ids: Vec<_> = entries.iter().map(|e| e.id).collect();
             assert!(
-                ids.contains(&TargetActionId::Dismount),
-                "{kind:?} loses Dismount"
+                !ids.contains(&TargetActionId::Dismount),
+                "{kind:?} gains Dismount"
             );
-            assert!(!ids.contains(&TargetActionId::Dig), "{kind:?} gains Dig");
         }
     }
 
@@ -593,7 +567,6 @@ mod tests {
         ] {
             let entries = build_target_action_entries(&ctx(kind, true), &RETAIL);
             let ids: Vec<_> = entries.iter().map(|e| e.id).collect();
-            assert!(!ids.contains(&TargetActionId::Dig), "{kind:?} gains Dig");
             assert!(
                 !ids.contains(&TargetActionId::Dismount),
                 "{kind:?} gains Dismount"

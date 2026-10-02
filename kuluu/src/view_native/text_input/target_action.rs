@@ -12,7 +12,7 @@ pub(super) fn handle_world_key(
     engaged: bool,
     usable_items_available: bool,
     can_fish: bool,
-    mounted: bool,
+    modern_mount: bool,
     cmd_tx: &Sender<AgentCommand>,
     scene_state: &mut SceneState,
     check_target: &mut kuluu_render::hud::check_view::CheckTarget,
@@ -53,7 +53,7 @@ pub(super) fn handle_world_key(
                         engaged,
                         usable_items_available,
                         can_fish,
-                        mounted,
+                        modern_mount,
                         cmd_tx,
                         scene_state,
                         check_target,
@@ -74,7 +74,7 @@ pub(super) fn handle_world_key(
                 engaged,
                 usable_items_available,
                 can_fish,
-                mounted,
+                modern_mount,
                 cmd_tx,
                 scene_state,
                 check_target,
@@ -98,7 +98,7 @@ fn open_target_action_menu(
     engaged: bool,
     usable_items_available: bool,
     can_fish: bool,
-    mounted: bool,
+    modern_mount: bool,
     cmd_tx: &Sender<AgentCommand>,
     scene_state: &mut SceneState,
     check_target: &mut kuluu_render::hud::check_view::CheckTarget,
@@ -114,7 +114,7 @@ fn open_target_action_menu(
         engaged,
         usable_items_available,
         can_fish,
-        mounted,
+        modern_mount,
     );
     let entries = kuluu_render::hud::overlay::RETAIL.resolve_target_actions(&ctx);
     if entries.is_empty() {
@@ -426,16 +426,6 @@ pub(super) fn confirm_target_action_at_cursor(
             }
             Some(InputMode::World)
         }
-        TargetActionId::Dig => {
-            send_self_action(
-                ActionKind::ChocoboDig,
-                &entry.label,
-                scene_state,
-                entities,
-                cmd_tx,
-            );
-            Some(InputMode::World)
-        }
         TargetActionId::Dismount => {
             state.confirm_dismount();
             None
@@ -443,7 +433,7 @@ pub(super) fn confirm_target_action_at_cursor(
     }
 }
 
-/// The self-targeted 0x01A actions (Dig, Dismount): the vendor acts on the
+/// The self-targeted 0x01A dismount: the vendor acts on the
 /// sender and ignores the target fields
 /// (vendor/server/src/map/packets/c2s/0x01a_action.cpp
 /// GP_CLI_COMMAND_ACTION::process).
@@ -592,7 +582,7 @@ mod mounted_tests {
     #[test]
     fn dismount_menu_confirmation_starts_on_no() {
         let ctx = TargetActionContext {
-            mounted: true,
+            modern_mount: true,
             ..Default::default()
         };
         let entries = kuluu_render::hud::overlay::RETAIL.resolve_target_actions(&ctx);
@@ -624,7 +614,7 @@ mod mounted_tests {
     fn dismount_confirmation_cancel_sends_nothing_and_yes_targets_self() {
         const SELF_ID: u32 = 1234;
         let ctx = TargetActionContext {
-            mounted: true,
+            modern_mount: true,
             ..Default::default()
         };
         let entries = kuluu_render::hud::overlay::RETAIL.resolve_target_actions(&ctx);
