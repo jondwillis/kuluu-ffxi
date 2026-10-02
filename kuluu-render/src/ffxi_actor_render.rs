@@ -7483,10 +7483,6 @@ mod pose_resolution_tests {
         );
     }
 
-    /// B: feed 10 consecutive POS updates (~400 ms apart) with the same gait; the walk clip
-    /// registers exactly once and its frame cursor advances monotonically (mod length) without
-    /// resetting to 0 mid-run. A re-registration on an unchanged gait would snap the cursor back
-    /// toward frame 0, which this catches step by step.
     #[test]
     fn releasing_event_idle_preserves_a_later_ordinary_motion() {
         let Some(loaded) = load_hume_m() else { return };
