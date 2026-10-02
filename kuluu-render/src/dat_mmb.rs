@@ -867,6 +867,10 @@ pub fn process_load_mmb_requests(
                         ChildOf(parent),
                     ));
 
+                    if let Some(door) = req.door {
+                        child.insert(crate::zone_doors::ZoneDoorMesh(door));
+                    }
+
                     if let Some(w) = req.water {
                         child.insert((
                             GenWaterScroll {
