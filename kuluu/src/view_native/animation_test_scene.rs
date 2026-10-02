@@ -2625,6 +2625,7 @@ fn tear_down(
     // default backdrop block back at its own offset; release any lamp-room clock hold too.
     commands.insert_resource(TestZoneActive(false));
     commands.insert_resource(LampRoomActive(false));
+    commands.remove_resource::<kuluu_render::particle_sim::TestAlphaOverride>();
 
     // Resetting shadows to "on" makes `sync_shadow_override` restore whatever the suppression
     // replaced on its next pass (still in Launcher either way); leaving the Launcher phase itself
@@ -2701,4 +2702,29 @@ fn tear_down_test_scene(
         &mut meshes,
         &mut materials,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kuluu_render::particle_sim::TestAlphaOverride;
+
+    #[test]
+    fn launcher_exit_removes_tester_alpha_override() {
+        let mut app = App::new();
+        app.init_resource::<TrackedEntities>()
+            .init_resource::<SceneState>()
+            .init_resource::<kuluu_render::graphics_settings::GraphicsSettings>()
+            .init_resource::<ShadowOverrides>()
+            .init_resource::<EnhanceRestore>()
+            .init_resource::<crate::graphics_store::GraphicsPersistSuspended>()
+            .init_resource::<Assets<Mesh>>()
+            .init_resource::<Assets<StandardMaterial>>()
+            .insert_resource(TestAlphaOverride([*b"g141", *b"g144"].into()))
+            .add_systems(Update, tear_down_test_scene);
+
+        app.update();
+
+        assert!(!app.world().contains_resource::<TestAlphaOverride>());
+    }
 }
