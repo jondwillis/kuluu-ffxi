@@ -55,14 +55,6 @@ pub(super) fn server_ack_matches(
             dialog.set_submap_num(result.map_num);
             dialog.pending_tag() == Some(PendingTag::SubMapNum)
         }),
-        map::s2c::FRIENDPASS => {
-            decode::FriendPass::decode(sub.data).is_ok()
-                && matches!(dialog.pending_tag(), Some(PendingTag::FriendPass { .. }))
-        }
-        map::s2c::RECIPE => {
-            decode::Recipe::decode(sub.data).is_ok()
-                && matches!(dialog.pending_tag(), Some(PendingTag::Recipe { .. }))
-        }
         map::s2c::EVENTUCOFF => {
             super::eventucoff_mode_of(sub.data)
                 == Some(map::event_position_wire::EVENT_RECV_PENDING)

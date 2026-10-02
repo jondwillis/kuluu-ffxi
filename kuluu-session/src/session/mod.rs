@@ -27,13 +27,12 @@ pub use codec::{
     build_subpacket_auc_lot_in, build_subpacket_auc_work_check, build_subpacket_bazaar_buy,
     build_subpacket_bazaar_exit, build_subpacket_bazaar_list, build_subpacket_buffcancel,
     build_subpacket_camp, build_subpacket_emote_list_req, build_subpacket_equip_inspect,
-    build_subpacket_equip_set, build_subpacket_fishing, build_subpacket_friendpass,
-    build_subpacket_item_move, build_subpacket_item_stack, build_subpacket_item_use,
-    build_subpacket_motion, build_subpacket_myroom_job, build_subpacket_pbx,
-    build_subpacket_recipe, build_subpacket_reqlogout, build_subpacket_reqsubmapnum,
-    build_subpacket_shop_buy, build_subpacket_shop_sell_req, build_subpacket_shop_sell_set,
-    build_subpacket_tracking_end, build_subpacket_tracking_list, build_subpacket_tracking_start,
-    log_action_sent,
+    build_subpacket_equip_set, build_subpacket_fishing, build_subpacket_item_move,
+    build_subpacket_item_stack, build_subpacket_item_use, build_subpacket_motion,
+    build_subpacket_myroom_job, build_subpacket_pbx, build_subpacket_reqlogout,
+    build_subpacket_reqsubmapnum, build_subpacket_shop_buy, build_subpacket_shop_sell_req,
+    build_subpacket_shop_sell_set, build_subpacket_tracking_end, build_subpacket_tracking_list,
+    build_subpacket_tracking_start, log_action_sent,
 };
 
 struct NpcNameResolver {
@@ -2433,25 +2432,6 @@ async fn send_pending_tag(
         // 0xA6 case 0: the header-only 0x0EB sub-map request; the 0x10E s2c is
         // its answer (vendor/server/src/map/packets/c2s/0x0eb_reqsubmapnum.cpp).
         PendingTag::SubMapNum => build_subpacket_reqsubmapnum(*sub_seq),
-        // 0x87/0x88 send cases: the 0x01B world-pass request with the case's
-        // Para; the 0x059 s2c is its answer
-        // (vendor/server/src/map/packets/c2s/0x01b_friendpass.cpp).
-        PendingTag::FriendPass { para } => build_subpacket_friendpass(*sub_seq, *para),
-        // 0x8C send cases: the 0x058 recipe/synth-support request with the
-        // case's Mode and work-slot fields; the 0x031 s2c is its answer
-        // (vendor/server/src/map/packets/c2s/0x058_recipe.cpp).
-        PendingTag::Recipe {
-            mode,
-            skill,
-            level,
-            param0,
-            param1,
-            param2,
-            param3,
-            param4,
-        } => build_subpacket_recipe(
-            *sub_seq, *mode, *skill, *level, *param0, *param1, *param2, *param3, *param4,
-        ),
     };
     let header = datagram_header_id(*sub_seq);
     *sub_seq = sub_seq.wrapping_add(1);
