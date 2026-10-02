@@ -1776,8 +1776,7 @@ pub enum CutsceneCue {
         actor: CutsceneActor,
         target: CutsceneActor,
     },
-    /// Stop the named routine on `actor`, or every routine when `key` is
-    /// None, and return it to idle.
+    /// Stop the current action; `key` supplies the replacement idle motion.
     ActorStopAction {
         actor: CutsceneActor,
         key: Option<FourCc>,
