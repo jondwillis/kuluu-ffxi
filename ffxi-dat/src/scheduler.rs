@@ -19,6 +19,9 @@ const STAGE_LENGTH_MASK: u16 = 0x1F;
 
 // research/xim EffectRoutineParser.kt parseSection,96-98 / :275-285.
 const END_ROUTINE_OPCODE: u8 = 0x00;
+
+// FFXiMain.dll retail-2026-09 RVA 0x5B5DA gates playback through the control-actor predicate.
+pub const PLAYER_ONLY_SOUND_OPCODE: u8 = 0x4A;
 const RANDOM_BLOCK_OPEN: u8 = 0x3D;
 const RANDOM_BLOCK_CLOSE: u8 = 0x3E;
 
@@ -545,7 +548,7 @@ impl StageKind {
             // for anyone who later needs the distinction. Without these arms both
             // fall to `Unknown` and never fire — eight effect DATs in 2800-3300 have
             // no other sound stage and are completely silent.
-            0x4A | 0x60 => Self::SoundNonPositional,
+            PLAYER_ONLY_SOUND_OPCODE | 0x60 => Self::SoundNonPositional,
             // research/xim EffectRoutineParser.kt parseSection2 — a plain LinkedEffectRoutine, the
             // form every melee routine uses (`ati0` links the weapon's `skaz` whoosh, `atk0`
             // the race/face `vatk` grunt).

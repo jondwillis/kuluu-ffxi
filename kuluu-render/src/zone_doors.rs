@@ -545,7 +545,7 @@ fn swing_door(dir: &DoorDir, routine: &[u8; 4], entity: Entity, commands: &mut C
     let Some(active) = ActiveScheduler::from_main(&dir.routines, routine) else {
         return;
     };
-    crate::scheduler_runtime::enqueue_routine(commands, entity, active);
+    crate::scheduler_runtime::enqueue_routine(commands, entity, active.with_target(Some(entity)));
     commands.entity(entity).try_insert_if_new(ActionAssets {
         seps: dir.seps.clone(),
         ..Default::default()

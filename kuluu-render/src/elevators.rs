@@ -354,7 +354,7 @@ pub fn drive_elevators(
         let Some(active) = ActiveScheduler::from_main(&shaft.dir.routines, &routine) else {
             continue;
         };
-        enqueue_routine(&mut commands, entity, active);
+        enqueue_routine(&mut commands, entity, active.with_target(Some(entity)));
         commands.entity(entity).try_insert_if_new(ActionAssets {
             seps: shaft.dir.seps.clone(),
             generators: shaft.dir.generators.clone(),

@@ -4289,7 +4289,11 @@ pub fn tick_live_ffxi_actors(
         // retail; each carries the StopRoutine that stops the other, so the overlap resolves
         // through StopRoutine. The push path leaves the first writer's ActionAssets/ActionTarget
         // alone.
-        crate::scheduler_runtime::enqueue_routine(&mut commands, wire_e, active);
+        crate::scheduler_runtime::enqueue_routine(
+            &mut commands,
+            wire_e,
+            active.with_target(Some(wire_e)),
+        );
         commands
             .entity(wire_e)
             .try_insert_if_new(actor.action_assets().clone())
