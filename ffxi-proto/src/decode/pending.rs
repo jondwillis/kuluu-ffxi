@@ -71,6 +71,37 @@ impl ReqSubMapNum {
     }
 }
 
+// vendor/server/src/map/packets/s2c/0x0bf_registration.h GP_SERV_COMMAND_REGISTRATION::PacketData.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Registration {
+    pub result: u16,
+    pub act_index: u32,
+}
+
+impl Registration {
+    const SIZE: usize = 24;
+    const RESULT_OFFSET: usize = 2;
+    const ACT_INDEX_OFFSET: usize = 8;
+
+    pub fn decode(body: &[u8]) -> Result<Self, DecodeError> {
+        if body.len() < Self::SIZE {
+            return Err(DecodeError::Truncated(Self::SIZE, body.len()));
+        }
+        Ok(Self {
+            result: u16::from_le_bytes(
+                body[Self::RESULT_OFFSET..Self::RESULT_OFFSET + 2]
+                    .try_into()
+                    .unwrap(),
+            ),
+            act_index: u32::from_le_bytes(
+                body[Self::ACT_INDEX_OFFSET..Self::ACT_INDEX_OFFSET + 4]
+                    .try_into()
+                    .unwrap(),
+            ),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

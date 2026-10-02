@@ -652,53 +652,25 @@ fn lerp_records(a: &WeatherRecord, b: &WeatherRecord, t: f32, time_minutes: u32)
     }
 }
 
-// ---------------------------------------------------------------------------
-// 0x72 GETWEATHER: the global weather forecast table
-// ---------------------------------------------------------------------------
-
-/// The 2160-day cycle 0x72 indexes the forecast by
-/// (research/XiEvents/OpCodes/0x0072.md: `work[4] % 2160`).
+// FFXiMain.dll retail-2026-09 RVA 0xB84B0: byte lookup at head * 6480 + 3 * (day % 2160).
 pub const FORECAST_DAYS: u32 = 2160;
-
-/// The u32 offset past which the per-head forecast values begin in the data
-/// DATs; 0x72 reads `WeatherData[6480 + head + 3*day]`
-/// (research/XiEvents/OpCodes/0x0072.md).
-pub const FORECAST_DATA_BASE: usize = 6480;
-
-/// The three values 0x72 copies into `Work_Zone[2..5)` per day
-/// (research/XiEvents/OpCodes/0x0072.md `PTR_Work_Zone[2..5)` loop).
 pub const FORECAST_VALUES_PER_DAY: usize = 3;
-
-/// The head-table entry counts: 7032 serves regions < 100 (100 entries), 7036
-/// serves regions >= 100 (200 entries).
+pub const FORECAST_BYTES_PER_HEAD: usize = FORECAST_DAYS as usize * FORECAST_VALUES_PER_DAY;
 pub const FORECAST_HEADS_LOW: usize = 100;
 pub const FORECAST_HEADS_HIGH: usize = 200;
 
-/// The DAT file ids the forecast table ships in: 7032/7033 for regions < 100,
-/// 7036/7037 for regions >= 100. The pairing is settled by value range: 7032's
-/// head values top out at 37, which indexes 7033's 38 heads (61560 u32 =
-/// 38 x 6480); 7036's top out at 51, indexing 7037's 52 heads (84240 u32 =
-/// 52 x 6480). The PS2 pseudo-code's `WeatherHead`/`WeatherHead2` names are
-/// swapped relative to the XIClient port (research/XIClient StringManager.cpp
-/// loads 7032 into `WeatherHead`), so the pairing is taken from the measured
-/// ranges, not the names.
+// research/XIClient/src/XIClient/source/Resource/Text/StringManager.cpp StringManager::Init.
 pub const FORECAST_HEAD_LOW_FILE: u32 = 7032;
 pub const FORECAST_DATA_LOW_FILE: u32 = 7033;
 pub const FORECAST_HEAD_HIGH_FILE: u32 = 7036;
 pub const FORECAST_DATA_HIGH_FILE: u32 = 7037;
 
-/// The global weather forecast table 0x72 GETWEATHER reads: a per-region head
-/// (which of the region group's heads the region uses) plus the per-head,
-/// per-day forecast values. research/XiEvents/OpCodes/0x0072.md shows the index
-/// arithmetic; the layout (head tables 7032/7036, data 7033/7037) is measured
-/// from the shipped DATs. The three values are the raw u32s the opcode copies
-/// into `Work_Zone[2..5)`; the script that authors 0x72 decides what they mean.
 #[derive(Debug, Clone)]
 pub struct WeatherForecast {
     head_low: [u8; FORECAST_HEADS_LOW],
-    data_low: Vec<u32>,
+    data_low: Vec<u8>,
     head_high: [u8; FORECAST_HEADS_HIGH],
-    data_high: Vec<u32>,
+    data_high: Vec<u8>,
 }
 
 impl WeatherForecast {
@@ -706,9 +678,9 @@ impl WeatherForecast {
     /// [`load_weather_forecast`]; tests build it directly with synthetic cells.
     pub fn from_parts(
         head_low: [u8; FORECAST_HEADS_LOW],
-        data_low: Vec<u32>,
+        data_low: Vec<u8>,
         head_high: [u8; FORECAST_HEADS_HIGH],
-        data_high: Vec<u32>,
+        data_high: Vec<u8>,
     ) -> Self {
         Self {
             head_low,
@@ -724,18 +696,22 @@ impl WeatherForecast {
     /// derived index falls outside the shipped table.
     pub fn values(&self, region: u32, day: u32) -> Option<[u32; 3]> {
         let day = (day % FORECAST_DAYS) as usize;
-        let (head_table, data) = if region < 100 {
+        let (head_table, data) = if region < FORECAST_HEADS_LOW as u32 {
             (&self.head_low[..], &self.data_low)
         } else {
             (&self.head_high[..], &self.data_high)
         };
-        let head_idx = (if region < 100 { region } else { region - 100 }) as usize;
+        let head_idx = (if region < FORECAST_HEADS_LOW as u32 {
+            region
+        } else {
+            region - FORECAST_HEADS_LOW as u32
+        }) as usize;
         let head = *head_table.get(head_idx)? as usize;
-        let base = FORECAST_DATA_BASE + head + FORECAST_VALUES_PER_DAY * day;
+        let base = head * FORECAST_BYTES_PER_HEAD + FORECAST_VALUES_PER_DAY * day;
         if base + FORECAST_VALUES_PER_DAY > data.len() {
             return None;
         }
-        Some([data[base], data[base + 1], data[base + 2]])
+        Some(std::array::from_fn(|i| u32::from(data[base + i])))
     }
 }
 
@@ -751,13 +727,6 @@ pub fn load_weather_forecast(root: &DatRoot) -> Result<WeatherForecast> {
             source: e,
         })
     }
-    fn to_u32s(bytes: &[u8]) -> Vec<u32> {
-        bytes
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect()
-    }
-
     let head_low = read_file(root, FORECAST_HEAD_LOW_FILE)?;
     let head_high = read_file(root, FORECAST_HEAD_HIGH_FILE)?;
     if head_low.len() < FORECAST_HEADS_LOW || head_high.len() < FORECAST_HEADS_HIGH {
@@ -769,8 +738,8 @@ pub fn load_weather_forecast(root: &DatRoot) -> Result<WeatherForecast> {
             FORECAST_HEADS_HIGH
         )));
     }
-    let data_low = to_u32s(&read_file(root, FORECAST_DATA_LOW_FILE)?);
-    let data_high = to_u32s(&read_file(root, FORECAST_DATA_HIGH_FILE)?);
+    let data_low = read_file(root, FORECAST_DATA_LOW_FILE)?;
+    let data_high = read_file(root, FORECAST_DATA_HIGH_FILE)?;
 
     Ok(WeatherForecast {
         head_low: head_low[..FORECAST_HEADS_LOW].try_into().unwrap(),
@@ -1430,32 +1399,31 @@ mod tests {
         assert_eq!(sets.flat.len(), 1);
     }
 
+    #[test]
+    fn forecast_uses_byte_values_and_whole_head_strides() {
+        let mut heads = [0; FORECAST_HEADS_LOW];
+        heads[0] = 2;
+        let stride = FORECAST_DAYS as usize * FORECAST_VALUES_PER_DAY;
+        let mut data = vec![0; 3 * stride];
+        data[2 * stride..2 * stride + 3].copy_from_slice(&[1, 2, 255]);
+        let forecast =
+            WeatherForecast::from_parts(heads, data, [0; FORECAST_HEADS_HIGH], Vec::new());
+        assert_eq!(forecast.values(0, 0), Some([1, 2, 255]));
+    }
+
     fn synth_forecast() -> WeatherForecast {
-        let head_low = std::array::from_fn(|i| i as u8);
-        let head_high = std::array::from_fn(|i| i as u8);
-        let mut data_low = vec![0u32; 14000];
-        let mut data_high = vec![0u32; 14000];
-        data_low[6515] = 1;
-        data_low[6516] = 2;
-        data_low[6517] = 3;
-        data_high[6485] = 4;
-        data_high[6486] = 5;
-        data_high[6487] = 6;
-        WeatherForecast {
-            head_low,
-            data_low,
-            head_high,
-            data_high,
-        }
+        let heads = [0; FORECAST_HEADS_LOW];
+        let data: Vec<u8> = (0..FORECAST_BYTES_PER_HEAD).map(|i| i as u8).collect();
+        WeatherForecast::from_parts(heads, data.clone(), [0; FORECAST_HEADS_HIGH], data)
     }
 
     #[test]
     fn forecast_values_index_the_head_and_day() {
         let fc = synth_forecast();
-        assert_eq!(fc.values(5, 10), Some([1, 2, 3]));
-        assert_eq!(fc.values(105, 0), Some([4, 5, 6]));
+        assert_eq!(fc.values(5, 10), Some([30, 31, 32]));
+        assert_eq!(fc.values(105, 0), Some([0, 1, 2]));
         assert_eq!(fc.values(5, FORECAST_DAYS), fc.values(5, 0));
-        assert_eq!(fc.values(0, 0), Some([0, 0, 0]));
+        assert_eq!(fc.values(0, FORECAST_DAYS - 1), Some([77, 78, 79]));
     }
 
     #[test]
@@ -1471,9 +1439,6 @@ mod tests {
             return;
         };
         let fc = load_weather_forecast(&root).expect("forecast loads");
-        assert_eq!(
-            fc.values(0, 0),
-            Some([0x01FF_FF01, 0xFF01_FFFF, 0xFFFF_01FF])
-        );
+        assert_eq!(fc.values(0, 0), Some([1, 2, 255]));
     }
 }

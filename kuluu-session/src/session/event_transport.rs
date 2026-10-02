@@ -51,17 +51,31 @@ pub(super) fn server_ack_matches(
             ) && result.result == map::pbx::result::OK
                 && dialog.pending_tag() == Some(PendingTag::DeliveryOpen)
         }),
+        map::s2c::REGISTRATION => decode::Registration::decode(sub.data).is_ok_and(|result| {
+            if !matches!(dialog.pending_tag(), Some(PendingTag::Registration { .. }))
+                || !dialog
+                    .active_end()
+                    .is_some_and(|(_, index, _)| u32::from(index) == result.act_index)
+            {
+                return false;
+            }
+            dialog.set_registration_result(result.result)
+        }),
         map::s2c::REQSUBMAPNUM => decode::ReqSubMapNum::decode(sub.data).is_ok_and(|result| {
             dialog.set_submap_num(result.map_num);
             dialog.pending_tag() == Some(PendingTag::SubMapNum)
         }),
         map::s2c::EVENTUCOFF => {
-            super::eventucoff_mode_of(sub.data)
-                == Some(map::event_position_wire::EVENT_RECV_PENDING)
-                && matches!(
-                    dialog.pending_tag(),
-                    Some(PendingTag::SendTag { .. } | PendingTag::SendXzy { .. })
-                )
+            if super::eventucoff_mode_of(sub.data)
+                != Some(map::event_position_wire::EVENT_RECV_PENDING)
+            {
+                return false;
+            }
+            match dialog.pending_tag() {
+                Some(PendingTag::Registration { .. }) => dialog.ack_registration_update(),
+                Some(PendingTag::SendTag { .. } | PendingTag::SendXzy { .. }) => true,
+                _ => false,
+            }
         }
         _ => false,
     }

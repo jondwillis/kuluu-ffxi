@@ -315,8 +315,7 @@ pub enum ExtSchedulerMotion {
 pub const NO_ACTION_KEY: FourCc = *b"xxxx";
 
 /// One staging effect the running event asked for. Emitted in execution order.
-/// Not `Eq`: [`EventCue::ActorMove`] carries a float MoveTime budget.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventCue {
     /// 0x2C SCHEDULOR: play action `key` on `actor1`, with `actor2` as the
     /// action's partner (research/XiEvents/OpCodes/0x002C.md).
@@ -430,17 +429,12 @@ pub enum EventCue {
     /// 0x1F MOVE case 0 on a non-player actor: walk the event entity to `goal`
     /// at `speed` (research/XiEvents/OpCodes/0x001F.md). The host arms the
     /// arrival hold from its own distance and speed; the VM never measures it.
-    /// `max_time` is 0x31 SMOVE's MoveTime budget in seconds: when set and
-    /// shorter than the distance-derived length, the host caps the hold to it
-    /// (research/XiEvents/OpCodes/0x0031.md).
     ActorMove {
         actor: ActorLookup,
         goal: EventPosition,
         /// Raw MainSpeed operand of the trigger packet; the host scales it
         /// with [`crate::vm::scene::EVENT_SPEED_SCALE`].
         speed: i32,
-        /// 0x31 SMOVE's MoveTime budget in seconds; `None` for 0x1F.
-        max_time: Option<f32>,
     },
     /// 0x37 on a non-player actor: set the event entity's position (teleport,
     /// no hold; research/XiEvents/OpCodes/0x0037.md).
@@ -569,16 +563,10 @@ impl EventCue {
                 status_event,
                 mount_id,
             },
-            Self::ActorMove {
-                actor,
-                goal,
-                speed,
-                max_time,
-            } => Self::ActorMove {
+            Self::ActorMove { actor, goal, speed } => Self::ActorMove {
                 actor: resolve(actor),
                 goal,
                 speed,
-                max_time,
             },
             Self::ActorPlace { actor, position } => Self::ActorPlace {
                 actor: resolve(actor),

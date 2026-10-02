@@ -163,6 +163,13 @@ impl DialogRunner {
         self.vm.hold_action(actor, key, units);
     }
 
+    pub fn set_entity_positions(
+        &mut self,
+        positions: &std::collections::HashMap<u32, crate::vm::scene::EventPosition>,
+    ) {
+        self.vm.set_entity_positions(positions);
+    }
+
     /// Replace the entity Type table the LOADEXTSCHEDULER/LOADEXTSCHEDULER2 gate
     /// reads; see [`EventVm::set_actor_types`]. The session calls this with its
     /// current map before every drive.
@@ -272,6 +279,10 @@ impl DialogRunner {
         self.vm.apply_pending_str(strings);
     }
 
+    pub fn set_registration_result(&mut self, result: u16) {
+        self.vm.set_registration_result(result);
+    }
+
     /// s2c 0x10E REQSUBMAPNUM's MapNum into the VM's 0xA6 result slot
     /// (research/XiEvents/OpCodes/0x00A6.md); lands before the next step even
     /// while the SubMapNum tag is held, like [`Self::apply_pending_num`].
@@ -282,6 +293,10 @@ impl DialogRunner {
     /// The pending tag the VM holds on its case-1 poll, if any.
     pub fn pending_tag(&self) -> Option<&PendingTag> {
         self.vm.pending_tag()
+    }
+
+    pub fn progress_stamp(&self) -> u64 {
+        self.vm.progress_stamp()
     }
 
     /// Why the VM is not advancing right now, for the host's liveness check;

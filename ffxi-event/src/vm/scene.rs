@@ -146,6 +146,35 @@ impl Scene {
 }
 
 impl EventVm {
+    pub fn progress_stamp(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut state = std::collections::hash_map::DefaultHasher::new();
+        self.exec_pointer.hash(&mut state);
+        self.move_units_remaining().to_bits().hash(&mut state);
+        self.work_local.hash(&mut state);
+        self.work_zone.lock().unwrap().hash(&mut state);
+        self.wait
+            .as_ref()
+            .map(|w| w.remaining_units.to_bits())
+            .hash(&mut state);
+        for hold in &self.move_holds {
+            hold.remaining_units.to_bits().hash(&mut state);
+        }
+        for hold in &self.action_holds {
+            hold.remaining_units.to_bits().hash(&mut state);
+        }
+        if let Some(scene) = &self.scene {
+            (scene.player.x, scene.player.y, scene.player.z).hash(&mut state);
+            for stack in &scene.stacks {
+                stack.actor.hash(&mut state);
+                for request in &stack.requests {
+                    request.vm.progress_stamp().hash(&mut state);
+                }
+            }
+        }
+        state.finish()
+    }
+
     pub fn attach_scene(&mut self, dat: Arc<EventDat>, actor: u32, player: EventPosition) {
         if self.shared_player.is_none() {
             self.shared_player = Some(Arc::new(std::sync::Mutex::new(player)));
@@ -191,15 +220,14 @@ impl EventVm {
             .map(|scene| self.shared_player_position().unwrap_or(scene.player))
     }
 
-    /// The event entity's tracked position in the zone-interaction (RID) float
-    /// space 0x82 RANGE_RECT hit-tests against
-    /// (research/XiEvents/OpCodes/0x0082.md): the scene's tracked position
-    /// rescaled from event units back to float coords, still in the event VM's
-    /// own axes (x, y = height, z = ground) — note this is NOT the wire's
-    /// (x, y = ground, z = height). `None` when no scene is attached, so the
-    /// caller sees retail's null-entity early return.
+    // research/XiEvents/OpCodes/0x0082.md reads the event actor in native RID coordinates.
     pub(super) fn event_entity_rid_position(&self) -> Option<[f32; 3]> {
-        let p = self.scene.as_ref()?.player;
+        let scene = self.scene.as_ref()?;
+        let p = if scene.actor == ZONE_PLAYER_ACTOR {
+            self.shared_player_position().unwrap_or(scene.player)
+        } else {
+            *self.entity_positions.get(&scene.actor)?
+        };
         Some([
             p.x as f32 / EVENT_COORD_UNITS,
             p.y as f32 / EVENT_COORD_UNITS,
@@ -580,6 +608,7 @@ impl EventVm {
             Arc::clone(&self.work_zone),
         );
         child.actor_types = self.actor_types.clone();
+        child.entity_positions = self.entity_positions.clone();
         child.weather_forecast = self.weather_forecast.clone();
         child.zone_rects = self.zone_rects.clone();
         child.current_zone = self.current_zone;
@@ -643,6 +672,7 @@ impl EventVm {
             Arc::clone(&self.work_zone),
         );
         child.actor_types = self.actor_types.clone();
+        child.entity_positions = self.entity_positions.clone();
         child.weather_forecast = self.weather_forecast.clone();
         child.zone_rects = self.zone_rects.clone();
         child.current_zone = self.current_zone;
@@ -816,7 +846,6 @@ impl EventVm {
                         actor: ActorLookup::EVENT_ENTITY,
                         goal,
                         speed,
-                        max_time: None,
                     });
                     self.advance(op);
                 } else if self.byte_at(1) == 1 {
