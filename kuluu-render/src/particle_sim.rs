@@ -6241,7 +6241,7 @@ mod tests {
             .find(|s| s.stage.kind == StageKind::Particle && s.stage.id == SOURCE)
             .copied()
             .unwrap();
-        let source = assets.particle_def(stage.stage.local_dir, &SOURCE).unwrap();
+        let source = *assets.particle_def(stage.stage.local_dir, &SOURCE).unwrap();
         assert_eq!(source.immediate_generator, Some(LINK));
         assert_eq!(source.child_generator, None);
         let (dir, _) = assets
@@ -6260,16 +6260,36 @@ mod tests {
             .init_resource::<ParticleSimulator>()
             .add_message::<SchedulerStageEvent>()
             .add_systems(Update, spawn_particle_generators);
-        let actor = app
-            .world_mut()
-            .spawn((
-                Transform::from_translation(ACTOR_POSITION)
-                    .with_rotation(Quat::from_rotation_y(std::f32::consts::FRAC_PI_2)),
-                assets,
-            ))
-            .id();
+        let skeleton = retail_hume_m_skeleton().expect("installed HumeM skeleton is readable");
+        let pose = ffxi_actor::skeleton_instance::pose_world(
+            &skeleton,
+            |_| None,
+            ffxi_actor::skeleton_instance::RootTransform::identity(),
+            &[],
+        );
+        let turn = Quat::from_rotation_y(std::f32::consts::FRAC_PI_2);
+        let joint = attach_joint_reference(&source)
+            .and_then(|reference| {
+                ffxi_actor::skeleton_instance::attach_joint_position(
+                    &pose,
+                    &skeleton,
+                    reference,
+                    Some(Vec3::ZERO),
+                )
+            })
+            .unwrap_or(Vec3::ZERO);
+        let expected_origin = ACTOR_POSITION
+            + turn * crate::ffxi_actor_render::ffxi_to_bevy_basis() * joint
+            + Vec3::Y * source.base_position[1];
+        let actor = spawn_posed_actor(&mut app, &skeleton, &pose, ACTOR_POSITION);
+        app.world_mut().entity_mut(actor).insert((
+            Transform::from_translation(ACTOR_POSITION).with_rotation(turn),
+            assets,
+            crate::scheduler_runtime::ActionTarget(Some(actor)),
+        ));
         app.world_mut().write_message(SchedulerStageEvent {
             actor,
+            target: Some(actor),
             stage,
             scheduler: *b"main",
         });
@@ -6288,11 +6308,12 @@ mod tests {
         assert_eq!(child.particles.len(), parent.particles.len());
         assert_eq!(child.particles[0].pos, parent.particles[0].pos);
         assert_eq!(child.origin, parent.origin);
+        assert!(parent.origin.distance(expected_origin) < AXIS_TOLERANCE);
         assert!(
             particle_draw(child, &child.particles[0], &sim.clock)
                 .world
-                .distance(ACTOR_POSITION)
-                < 1.0,
+                .distance(expected_origin + parent.particles[0].pos)
+                < AXIS_TOLERANCE,
             "the actor transform must not apply twice"
         );
         sim.generators[0].stopped = true;
