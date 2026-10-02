@@ -3380,7 +3380,6 @@ mod actor_reveal_tests {
 }
 
 #[cfg(test)]
-
 mod head_look_tests {
     use super::*;
 

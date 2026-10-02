@@ -213,7 +213,9 @@ fn handle_event(tally: &mut Tally, ev: &AgentEvent, now: Instant, t0: Instant) {
             tally.mount_states.push((t, *status, *mount_id));
         }
         AgentEvent::EventDialog { dialog } => {
-            if dialog.event_num == RENTAL_CS && tally.rental_price.is_none() {
+            if dialog.event_id & u32::from(u16::MAX) == u32::from(RENTAL_CS)
+                && tally.rental_price.is_none()
+            {
                 tally.rental_price = dialog
                     .nums
                     .first()
@@ -346,6 +348,15 @@ async fn chocobo_rental_npc_completes_server_handoff() {
     let mut cs_sent = false;
 
     let stop_reason: Option<String> = loop {
+        if tally.cs_ended_at.is_some()
+            && tally.authoritative_mounted
+            && tally.handoff_zone.is_some()
+            && tally
+                .rental_price
+                .is_some_and(|price| tally.remaining_gil == FIXTURE_GIL.checked_sub(price))
+        {
+            break Some("authoritative rental handoff complete".into());
+        }
         if let Some(inzone) = tally.inzone_at {
             let elapsed = t0.elapsed();
             let since_inzone = inzone.elapsed();
