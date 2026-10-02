@@ -23,6 +23,14 @@ payload=$(cat)
 stop_active=$(printf '%s' "$payload" | jq -r '.stop_hook_active // false')
 session_id=$(printf '%s' "$payload" | jq -r '.session_id // "unknown"')
 
+reason=$(printf '%s' "$payload" | bash "$here/stop.d/25-verify.sh")
+rc=$?
+if [ "$rc" -ne 0 ]; then
+  [ -n "$reason" ] || reason="Verification gate failed to run. Repair it before completing runtime changes."
+  jq -n --arg r "$reason" '{ decision: "block", reason: $r }'
+  exit 0
+fi
+
 # Loop guard — a bounded continuation DEPTH, not a one-shot.
 #
 # We deliberately do NOT bail on every stop_hook_active stop. That older
@@ -52,6 +60,7 @@ printf '%s' "$depth" > "$depth_file"
 
 for check in "$here"/stop.d/*.sh; do
   [ -e "$check" ] || continue  # literal glob when stop.d/ is empty
+  [ "$check" = "$here/stop.d/25-verify.sh" ] && continue
   reason=$(printf '%s' "$payload" | bash "$check")
   rc=$?
   if [ "$rc" -eq "$FIRE" ]; then
