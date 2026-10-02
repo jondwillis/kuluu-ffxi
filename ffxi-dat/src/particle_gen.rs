@@ -583,6 +583,7 @@ pub struct ParticleGeneratorDef {
     // Parsed but not applied until the child-generator runtime lands (the sec3 0x25/0x33
     // child updaters).
     pub child_generator: Option<[u8; 4]>,
+    pub immediate_generator: Option<[u8; 4]>,
 
     // sec2 0x40 OscillationAccelerationSetup (Z): [acceleration, accelerationVariance]; the
     // particle's Z oscillation acceleration is acceleration + variance × one [−1, 1) draw
@@ -697,13 +698,8 @@ pub struct ParticleGeneratorDef {
     // sec2 0x69 KeyFrameValueSetup (velocity dampener): the 0x27/0x28/0x29 track shape
     // bound to the element's velocity dampener (research/xim ParticleGeneratorParser.kt
     // sec2Handler 0x69; retail's keyframe pre-load pass references the same blocks as
-    // Keyframe resources). Parsed but not applied: the engine does not model the velocity
-    // dampener.
+    // Keyframe resources). Parsed but not applied.
     pub velocity_dampener_track: Option<[u8; 4]>,
-    // sec3 0x2C VelocityDampener: [dampen, unk] — velocity ×= dampeningFactor^dt, the
-    // factor coming from the sec2 0x69 track when present, else dampen (research/xim
-    // ParticleUpdaters.kt VelocityDampener). The engine does not model the velocity
-    // dampener, so parse-only.
     pub velocity_dampener: Option<[f32; 2]>,
     // sec3 0x26 VelocityRotator: three floats, the rotateAmount added to the velocity
     // rotation × (0.5 × dt) per frame (research/xim ParticleUpdaters.kt VelocityRotator —
@@ -866,6 +862,8 @@ const SEC2_OPCODE_OSCILLATION_ACCEL_X: u8 = 0x3E;
 const SEC2_OPCODE_OSCILLATION_ACCEL_Y: u8 = 0x3F;
 const SEC2_OPCODE_OSCILLATION_ACCEL_Z: u8 = 0x40;
 const SEC2_OPCODE_RELATIVE_VEL_VARIANCE: u8 = 0x41;
+// .agents/skills/retail-observe/references/2026-10-02-level-up-linked-sparkle.md native initializer dispatch.
+const SEC2_OPCODE_IMMEDIATE_GENERATOR: u8 = 0x3C;
 const SEC2_OPCODE_CHILD_GENERATOR: u8 = 0x44;
 const SEC2_OPCODE_PARENT_POSITION_COPY: u8 = 0x45;
 const SEC2_OPCODE_PARENT_VELOCITY: u8 = 0x46;
@@ -1037,6 +1035,7 @@ impl ParticleGeneratorDef {
         let mut parent_position_copy = false;
         let mut parent_velocity = None;
         let mut child_generator = None;
+        let mut immediate_generator = None;
         let mut child_generator_2 = None;
         let mut oscillation_accel_z = None;
         let mut oscillation_accel_x = None;
@@ -1366,6 +1365,10 @@ impl ParticleGeneratorDef {
                 // on the parent's total velocity copied into the child's velocity.
                 SEC2_OPCODE_PARENT_VELOCITY if payload + 4 <= body.len() => {
                     parent_velocity = Some(f32_le(body, payload));
+                }
+                // .agents/skills/retail-observe/references/2026-10-02-level-up-linked-sparkle.md native immediate initializer.
+                SEC2_OPCODE_IMMEDIATE_GENERATOR if payload + 8 <= body.len() => {
+                    immediate_generator = track_id(body, payload + 4);
                 }
                 // research/xim ParticleInitializers.kt ChildGeneratorSetup: the sibling
                 // generator emitted as a child of each particle.
@@ -1829,6 +1832,7 @@ impl ParticleGeneratorDef {
             parent_position_copy,
             parent_velocity,
             child_generator,
+            immediate_generator,
             oscillation_accel_z,
             oscillation_accel_x,
             oscillation_accel_y,
