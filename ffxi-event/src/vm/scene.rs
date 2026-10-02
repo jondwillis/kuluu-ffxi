@@ -188,7 +188,7 @@ impl EventVm {
         self.scene
             .as_ref()
             .filter(|_| self.controls_player_position())
-            .map(|scene| scene.player)
+            .map(|scene| self.shared_player_position().unwrap_or(scene.player))
     }
 
     /// The event entity's tracked position in the zone-interaction (RID) float
