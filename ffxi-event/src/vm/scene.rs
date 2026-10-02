@@ -420,19 +420,14 @@ impl EventVm {
         }
         self.scene_actions.extend(vm.take_scene_actions());
         self.param_len = vm.param_len;
-        // The local player's child owns the position this scene reports: mirror
-        // its tracked position and control flag up so a finished event still
-        // carries it (research/XiEvents/OpCodes/0x0047.md). NPC children keep
-        // their own.
-        let mirror = if actor == ZONE_PLAYER_ACTOR {
-            vm.scene.as_ref().map(|s| (s.player, s.controls_position))
-        } else {
-            None
-        };
-        if let Some((player, controls)) = mirror {
-            let scene = self.scene.as_mut().unwrap();
+        let controls = vm.controls_player_position();
+        let player = (actor == ZONE_PLAYER_ACTOR)
+            .then(|| vm.scene.as_ref().map(|scene| scene.player))
+            .flatten();
+        let scene = self.scene.as_mut().unwrap();
+        scene.controls_position |= controls;
+        if let Some(player) = player {
             scene.player = player;
-            scene.controls_position |= controls;
         }
         result
     }

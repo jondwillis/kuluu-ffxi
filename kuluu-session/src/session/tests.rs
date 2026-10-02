@@ -955,15 +955,18 @@ fn v(x: f32, y: f32, z: f32) -> Vec3 {
 fn walkaway_release_only_user_driven_past_threshold() {
     assert!(!should_release_on_walkaway(
         false,
+        false,
         Some(EVENT_WALKAWAY_YALMS + 1.0)
     ));
-    assert!(!should_release_on_walkaway(true, None));
+    assert!(!should_release_on_walkaway(true, false, None));
     assert!(!should_release_on_walkaway(
         true,
+        false,
         Some(EVENT_WALKAWAY_YALMS - 0.1)
     ));
     assert!(should_release_on_walkaway(
         true,
+        false,
         Some(EVENT_WALKAWAY_YALMS + 0.1)
     ));
 }

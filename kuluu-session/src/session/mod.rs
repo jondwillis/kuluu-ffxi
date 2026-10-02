@@ -4496,8 +4496,7 @@ async fn keepalive_loop(
                     let dz = self_pos.pos.z - anchor.z;
                     (dx * dx + dy * dy + dz * dz).sqrt()
                 });
-                let walked_away = !dialog_session.controls_player_position()
-                    && should_release_on_walkaway(user_driven_events, walk_dist);
+                let walked_away = should_release_on_walkaway(user_driven_events, dialog_session.controls_player_position(), walk_dist);
                 let moved_during_event = !walked_away
                     && !dialog_session.controls_player_position()
                     && walk_dist.is_some_and(|d| d > EVENT_WALKAWAY_YALMS);
@@ -7617,8 +7616,12 @@ fn should_emit_pos(
 /// Release a pinned event when the player walks away from it. Auto/headless
 /// mode does not release on drift (user_driven is false); there the caller
 /// warns once per episode instead.
-fn should_release_on_walkaway(user_driven: bool, walk_dist: Option<f32>) -> bool {
-    user_driven && walk_dist.is_some_and(|d| d > EVENT_WALKAWAY_YALMS)
+fn should_release_on_walkaway(
+    user_driven: bool,
+    event_controls_position: bool,
+    walk_dist: Option<f32>,
+) -> bool {
+    user_driven && !event_controls_position && walk_dist.is_some_and(|d| d > EVENT_WALKAWAY_YALMS)
 }
 
 /// Keepalive-tick state the pending-EVENT_END release reads. Named fields, not

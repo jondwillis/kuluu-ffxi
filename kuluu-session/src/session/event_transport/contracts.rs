@@ -332,59 +332,73 @@ async fn nested_player_position_contract() {
     const OP_REQUEST: u8 = 0x27;
     const OP_SLEEP: u8 = 0x6F;
     const FINAL_COORDS: [u32; 4] = [41_000, 52_000, 6_000, 0];
-    let mut master = vec![OP_SNAP];
-    for index in 0..4 {
-        operand(&mut master, REFERENCE + index);
+    for master_moves in [false, true] {
+        let mut master = Vec::new();
+        if master_moves {
+            master.push(OP_SNAP);
+            for index in 0..4 {
+                operand(&mut master, REFERENCE + index);
+            }
+        }
+        message(&mut master, 4);
+        master.push(OP_END);
+        let child_offset = master.len() as u16;
+        master.push(OP_SNAP);
+        for index in 5..9 {
+            operand(&mut master, REFERENCE + index);
+        }
+        master.push(OP_END);
+        let mut references = vec![1_000, 2_000, 3_000, 0, 0];
+        references.extend(FINAL_COORDS);
+        let player = EventBlock {
+            actor: ZONE_PLAYER_ACTOR,
+            event_ids: vec![EVENT, 0],
+            event_offsets: vec![0, child_offset],
+            event_data: master,
+            references,
+        };
+        let mut sibling = vec![OP_SLEEP, OP_REQUEST, 0];
+        sibling.extend(ZONE_PLAYER_ACTOR.to_le_bytes());
+        sibling.extend([1, OP_END]);
+        let mut owner = block(sibling, vec![]);
+        owner.actor = NPC + 1;
+        let mut host = Host::new(
+            EventDat {
+                blocks: vec![player, owner],
+            },
+            FARE,
+        )
+        .await;
+        for _ in 0..4 {
+            let step = host.step(Drive::Tick(TICK));
+            assert!(!matches!(step.advance, Advance::Ended { .. }));
+        }
+        assert!(
+            host.dialog.controls_player_position(),
+            "nested player child owns movement"
+        );
+        assert!(!super::super::should_release_on_walkaway(
+            true,
+            host.dialog.controls_player_position(),
+            Some(super::super::EVENT_WALKAWAY_YALMS + 1.0),
+        ));
+        let step = host.step(Drive::Choice(0));
+        assert!(matches!(step.advance, Advance::Ended { .. }));
+        let packets = packets(&step);
+        let position = packets
+            .iter()
+            .rev()
+            .find(|p| p.opcode == map::c2s::POS)
+            .unwrap();
+        assert_eq!(
+            [
+                float(position.data, 0),
+                float(position.data, 4),
+                float(position.data, 8)
+            ],
+            [41.0, 6.0, 52.0]
+        );
     }
-    message(&mut master, 4);
-    master.push(OP_END);
-    let child_offset = master.len() as u16;
-    master.push(OP_SNAP);
-    for index in 5..9 {
-        operand(&mut master, REFERENCE + index);
-    }
-    master.push(OP_END);
-    let mut references = vec![1_000, 2_000, 3_000, 0, 0];
-    references.extend(FINAL_COORDS);
-    let player = EventBlock {
-        actor: ZONE_PLAYER_ACTOR,
-        event_ids: vec![EVENT, 0],
-        event_offsets: vec![0, child_offset],
-        event_data: master,
-        references,
-    };
-    let mut sibling = vec![OP_SLEEP, OP_REQUEST, 0];
-    sibling.extend(ZONE_PLAYER_ACTOR.to_le_bytes());
-    sibling.extend([1, OP_END]);
-    let mut owner = block(sibling, vec![]);
-    owner.actor = NPC + 1;
-    let mut host = Host::new(
-        EventDat {
-            blocks: vec![player, owner],
-        },
-        FARE,
-    )
-    .await;
-    for _ in 0..4 {
-        let step = host.step(Drive::Tick(TICK));
-        assert!(!matches!(step.advance, Advance::Ended { .. }));
-    }
-    let step = host.step(Drive::Choice(0));
-    assert!(matches!(step.advance, Advance::Ended { .. }));
-    let packets = packets(&step);
-    let position = packets
-        .iter()
-        .rev()
-        .find(|p| p.opcode == map::c2s::POS)
-        .unwrap();
-    assert_eq!(
-        [
-            float(position.data, 0),
-            float(position.data, 4),
-            float(position.data, 8)
-        ],
-        [41.0, 6.0, 52.0]
-    );
 }
 
 async fn acknowledgement_contract() {
