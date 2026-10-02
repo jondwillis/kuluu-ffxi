@@ -63,6 +63,52 @@ fn sub_packet_events(opcode: u16, body: &[u8]) -> Vec<AgentEvent> {
     )
 }
 
+#[test]
+fn level_up_battle_packets_preserve_the_leveling_caster_through_viewer_dispatch() {
+    // vendor/server/src/map/packets/s2c/0x029_battle_message.h PacketData;
+    // vendor/server/src/map/packets/s2c/0x02d_battle_message2.h PacketData;
+    // vendor/server/src/map/utils/charutils.cpp DistributeExperiencePoints;
+    // vendor/server/src/map/enums/msg_basic.h MsgBasic::LevelUp.
+    const TEST_PINNED_LEVEL_UP_MESSAGE: u16 = 9;
+    const TEST_PINNED_BATTLE_BODY_LEN: usize = 24;
+    const TEST_PINNED_MESSAGE_OFFSET: usize = 20;
+    const LEVELING_CASTER: u32 = 0x1234_5678;
+    const DEFEATED_TARGET: u32 = 0x8765_4321;
+    let mut body = [0u8; TEST_PINNED_BATTLE_BODY_LEN];
+    body[..4].copy_from_slice(&LEVELING_CASTER.to_le_bytes());
+    body[4..8].copy_from_slice(&DEFEATED_TARGET.to_le_bytes());
+    body[TEST_PINNED_MESSAGE_OFFSET..TEST_PINNED_MESSAGE_OFFSET + 2]
+        .copy_from_slice(&TEST_PINNED_LEVEL_UP_MESSAGE.to_le_bytes());
+    for opcode in [
+        ffxi_proto::map::s2c::BATTLE_MESSAGE,
+        ffxi_proto::map::s2c::BATTLE_MESSAGE2,
+    ] {
+        let events = sub_packet_events(opcode, &body);
+        let level_ups: Vec<_> = events
+            .into_iter()
+            .filter(|event| matches!(event, AgentEvent::LevelUp { .. }))
+            .filter_map(crate::wire_translate::event_to_viewer_event)
+            .collect();
+        assert_eq!(level_ups.len(), 1);
+        assert!(matches!(
+            level_ups[0],
+            kuluu_snapshot::ViewerEvent::LevelUp {
+                player_id: LEVELING_CASTER
+            }
+        ));
+        assert!(
+            !sub_packet_events(opcode, &body[..TEST_PINNED_MESSAGE_OFFSET])
+                .iter()
+                .any(|event| matches!(event, AgentEvent::LevelUp { .. }))
+        );
+        let mut unrelated = body;
+        unrelated[TEST_PINNED_MESSAGE_OFFSET..TEST_PINNED_MESSAGE_OFFSET + 2].fill(0);
+        assert!(!sub_packet_events(opcode, &unrelated)
+            .iter()
+            .any(|event| matches!(event, AgentEvent::LevelUp { .. })));
+    }
+}
+
 fn sub_packet_events_with_names(
     opcode: u16,
     body: &[u8],
