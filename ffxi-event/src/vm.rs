@@ -340,11 +340,12 @@ const OP_PLAYANIM: u8 = 0x63;
 const OP_BITTEST: u8 = 0x3E;
 const OP_QUERYWAIT2: u8 = 0x7F;
 
-// Advances the load/turn opcodes take when their entity does not resolve —
-// retail's own `!GetActorIndex` / `!entity` early exit, which is the only
-// path this actor-less VM can be on (research/XiEvents/OpCodes/0x0080.md,
-// 0x0076.md).
+// Advances the load/turn/transpar opcodes take when their entity does not
+// resolve — retail's own `!GetActorIndex` / `!entity` early exit, which is the
+// only path this actor-less VM can be on (research/XiEvents/OpCodes/0x0080.md,
+// 0x0076.md, 0x006C.md).
 const LOADWAIT_SIZE: usize = 5;
+const TRANSPAR_SIZE: usize = 9;
 /// 0x0034.md (and 0x0035.md, the same handler without the zone close) spreads
 /// its zone load over three `EventIdle` ticks driven by two file-scope counters,
 /// advancing only on the last; the net effect of the sequence is +3, and this VM
@@ -2272,7 +2273,6 @@ impl EventVm {
                     });
                     self.advance(op);
                 }
-                OP_TRANSPAR => self.advance(op),
                 // 0xC8 opens the map window on the work-slot zone id —
                 // research/XiEvents/OpCodes/0x00C8.md.
                 OP_MAP_TUTORIAL => {
@@ -2481,6 +2481,7 @@ impl EventVm {
                 // actors, so each takes its own "no such entity" advance
                 // (research/XiEvents/OpCodes/0x0080.md, 0x0076.md).
                 OP_LOADWAIT | OP_TURNCHECK => self.exec_pointer += LOADWAIT_SIZE,
+                OP_TRANSPAR => self.exec_pointer += TRANSPAR_SIZE,
                 OP_MAPLOAD | OP_MAPLOAD_KEEP => self.exec_pointer += MAPLOAD_SIZE,
                 OP_MUSICREADWAIT | OP_YIELD => self.exec_pointer += YIELD_SIZE,
                 // 0x98 yields while the zone is reading ext data; an event
@@ -4575,6 +4576,7 @@ mod tests {
         for (op, size) in [
             (OP_LOADWAIT, LOADWAIT_SIZE),
             (OP_TURNCHECK, LOADWAIT_SIZE),
+            (OP_TRANSPAR, TRANSPAR_SIZE),
             (OP_MAPLOAD, MAPLOAD_SIZE),
             (OP_MAPLOAD_KEEP, MAPLOAD_SIZE),
             (OP_MUSICREADWAIT, YIELD_SIZE),
