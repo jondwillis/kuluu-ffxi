@@ -5821,6 +5821,7 @@ mod tests {
                 stage: particle_stage(gen_id),
                 scheduler: HIT_SPARK_DIR,
                 cutscene_motion: false,
+                scheduler_instance: None,
             });
         app.update();
         app.world()

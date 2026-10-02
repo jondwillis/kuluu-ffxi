@@ -1354,6 +1354,7 @@ pub struct FfxiRenderActor {
     knockback: Option<KnockbackPlayback>,
 
     action: Option<ActionPlayback>,
+    event_idle: Option<DatId>,
     action_clips: Vec<SkeletonAnimation>,
 
     head_neck: Option<usize>,
@@ -1407,14 +1408,34 @@ impl FfxiRenderActor {
     /// event, not by combat: when the event ends, the pose must not outlive it. The pose pass
     /// re-selects idle from the cleared `action` on its next run.
     pub(crate) fn release_cutscene_owned_action(&mut self) {
+        self.event_idle = None;
         if self.action.is_some_and(|action| action.cutscene_owned) {
             self.clear_cutscene_action();
         }
     }
 
+    // FFXiMain.dll retail-2026-09 RVA 0xB71E0 / 0xB7070 stop the actor's
+    // current action before assigning the operand as its default motion.
+    pub(crate) fn stop_current_action(&mut self, idle: Option<[u8; 4]>) -> Option<u64> {
+        let owner = self.action.and_then(|action| action.scheduler_instance);
+        self.clear_cutscene_action();
+        self.event_idle = idle.map(|id| DatId::from_name(&id));
+        self.current_clip = None;
+        owner
+    }
+
+    pub(crate) fn release_event_idle(&mut self) {
+        if self.event_idle.take().is_some() && self.action.is_none() {
+            self.current_clip = None;
+        }
+    }
+
     pub fn clear_cutscene_action(&mut self) {
+        self.event_idle = None;
         self.action = None;
         self.action_clips.clear();
+        self.coordinator.clear();
+        self.current_clip = None;
     }
 
     /// A scheduler Motion stage's action is in flight on this model.
@@ -1553,10 +1574,12 @@ impl FfxiRenderActor {
         clip_id: DatId,
         motion: CompletionMotion,
         cutscene_owned: bool,
+        scheduler_instance: Option<u64>,
     ) {
         self.begin_completion_motion(clip_id, motion);
         if let Some(action) = &mut self.action {
             action.cutscene_owned = cutscene_owned;
+            action.scheduler_instance = scheduler_instance;
         }
     }
 
@@ -1575,17 +1598,14 @@ impl FfxiRenderActor {
         let len = rest_clip_len_frames(&self.action_clips, clip_id)
             .max(rest_clip_len_frames(&self.battle_clips, clip_id))
             .max(rest_clip_len_frames(&self.animations, clip_id));
-        // research/xim EffectRoutineInterpolatedEffects.kt SkeletonAnimationInstance - maxLoops
-        // passes through to the coordinator verbatim: 0 loops until the effect ends, N ≥ 1 plays
-        // N times and pins the end frame (SkeletonAnimator.kt applyLoopBounds). Retail holds the
-        // pose for the whole authored loop count - the cast's mw2? hold, released when the
-        // sequence ends - so the countdown must cover every loop or the cleared action leaves
-        // the pinned end frame behind.
+        // Keep the completion countdown consistent with the coordinator's decoded loop count;
+        // clearing it after one clip would discard a still-running repeated motion.
         let num_loops = (motion.max_loops != 0).then_some(motion.max_loops as u32);
         let loop_total = len * num_loops.unwrap_or(1) as f32;
         self.action = Some(ActionPlayback {
             clip_id,
             cutscene_owned: false,
+            scheduler_instance: None,
             looping: num_loops.is_some(),
             remaining: loop_total.max(motion.duration_frames * 0.5).max(1.0),
             num_loops,
@@ -1695,6 +1715,7 @@ fn half_frames(v: u16) -> f32 {
 struct ActionPlayback {
     clip_id: DatId,
     cutscene_owned: bool,
+    scheduler_instance: Option<u64>,
 
     looping: bool,
 
@@ -2103,6 +2124,7 @@ pub fn make_render_actor(
         engage: EngageMachine::NotEngaged,
         knockback: None,
         action: None,
+        event_idle: None,
         action_clips: Vec::new(),
         head_neck,
         head_subtree,
@@ -2759,6 +2781,7 @@ fn advance_actor_pose(
         death_phase,
         engage,
         action,
+        event_idle,
         action_clips,
         head_neck,
         head_subtree,
@@ -2981,7 +3004,11 @@ fn advance_actor_pose(
         })
         .or_else(|| {
             let s = actor_state::selected_animation(inputs);
-            try_tier(s.id, s.idle, PoseTier::Locomotion)
+            s.idle
+                .then_some(*event_idle)
+                .flatten()
+                .and_then(|id| try_tier(id, true, PoseTier::Locomotion))
+                .or_else(|| try_tier(s.id, s.idle, PoseTier::Locomotion))
         });
 
     // Terminal fallback: even the lowest tier resolved to nothing, so fall back to the idle family
@@ -4906,6 +4933,7 @@ pub fn dispatch_action_overlay(
                 actor.action = Some(ActionPlayback {
                     clip_id,
                     cutscene_owned: false,
+                    scheduler_instance: None,
                     looping,
                     remaining,
                     num_loops: None,
@@ -6971,6 +6999,7 @@ mod pose_resolution_tests {
         actor.action = Some(ActionPlayback {
             clip_id: wind_up,
             cutscene_owned: false,
+            scheduler_instance: None,
             looping: false,
             remaining: len,
             num_loops: None,
@@ -7598,6 +7627,85 @@ mod pose_resolution_tests {
     /// registers exactly once and its frame cursor advances monotonically (mod length) without
     /// resetting to 0 mid-run. A re-registration on an unchanged gait would snap the cursor back
     /// toward frame 0, which this catches step by step.
+    #[test]
+    fn releasing_event_idle_preserves_a_later_ordinary_motion() {
+        let Some(loaded) = load_hume_m() else { return };
+        const CAST: [u8; 4] = *b"mw2?";
+        let mut actor = make_render_actor(&loaded, 0, Vec::new(), 1, 0.0, 1.0);
+        actor.stop_current_action(Some(*b"idl?"));
+        actor.begin_scheduler_motion(
+            DatId::from_name(&CAST),
+            CompletionMotion {
+                local_clips: &[],
+                duration_frames: 600.0,
+                max_loops: 2,
+                transition_in: HalfFrames::ZERO,
+                transition_out: HalfFrames::ZERO,
+            },
+            false,
+            None,
+        );
+        advance_actor_pose_standalone_locked(&mut actor, 10.0, true);
+        let clip = actor.current_clip;
+        let frame = actor.last_frame;
+        actor.release_event_idle();
+        actor.release_cutscene_owned_action();
+        assert!(actor.has_action());
+        assert_eq!(actor.current_clip, clip);
+        advance_actor_pose_standalone_locked(&mut actor, 1.0, true);
+        assert_eq!(actor.last_frame, frame + 1.0);
+    }
+
+    #[test]
+    fn explicit_event_release_removes_held_cast_from_pose_coordinator() {
+        let Some(loaded) = load_hume_m() else { return };
+        const CAST: [u8; 4] = *b"mw2?";
+        const IDLE: [u8; 4] = *b"idl?";
+        for stop in [false, true] {
+            let mut actor = make_render_actor(&loaded, 0, Vec::new(), 1, 0.0, 1.0);
+            actor.begin_scheduler_motion(
+                DatId::from_name(&CAST),
+                CompletionMotion {
+                    local_clips: &[],
+                    duration_frames: 600.0,
+                    max_loops: 2,
+                    transition_in: HalfFrames::ZERO,
+                    transition_out: HalfFrames::ZERO,
+                },
+                true,
+                None,
+            );
+            advance_actor_pose_standalone_locked(&mut actor, 30.0, true);
+            assert!(actor
+                .coordinator
+                .animations
+                .iter()
+                .flatten()
+                .any(|slot| slot.current_animation.as_ref().is_some_and(|c| c
+                    .animation
+                    .id
+                    .parameterized_match(&DatId::from_name(&CAST)))));
+            if stop {
+                actor.stop_current_action(Some(IDLE));
+            } else {
+                actor.release_cutscene_owned_action();
+            }
+            advance_actor_pose_standalone_locked(&mut actor, 1.0, false);
+            assert!(
+                actor
+                    .coordinator
+                    .animations
+                    .iter()
+                    .flatten()
+                    .all(|slot| slot.current_animation.as_ref().is_none_or(|c| !c
+                        .animation
+                        .id
+                        .parameterized_match(&DatId::from_name(&CAST)))),
+                "released cast still owns the rendered skeleton"
+            );
+        }
+    }
+
     #[test]
     fn locomotion_clip_loops_continuously_across_updates() {
         let Some(loaded) = load_hume_m() else { return };
