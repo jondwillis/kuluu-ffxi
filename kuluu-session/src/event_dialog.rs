@@ -341,6 +341,7 @@ impl DialogSession {
             return;
         }
         self.loaded_zone_rects_zone = Some(zone);
+        self.zone_rects = None;
         let Some(root) = self.dat_root.clone() else {
             return;
         };
@@ -2615,6 +2616,17 @@ mod zone_text_skew_tests {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn missing_new_zone_rects_discards_previous_zone_cache() {
+        let mut session = DialogSession::new(None, "Test".into());
+        session.loaded_zone_rects_zone = Some(1);
+        session.zone_rects = Some(Arc::new(Vec::new()));
+        session.ensure_zone_rects(2);
+        assert_eq!(session.loaded_zone_rects_zone, Some(2));
+        assert!(session.zone_rects.is_none());
+    }
+
     use crate::session::event_transport::contracts::NPC;
     use ffxi_event::{SOUND_TYPE_EFFECT, SOUND_TYPE_SPECIAL_CHAT};
 
