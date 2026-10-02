@@ -15,6 +15,7 @@ pub(crate) const CELL_GAP_PX: f32 = 4.0;
 const NAME_FONT_PX: f32 = 11.0;
 
 const COUNT_FONT_PX: f32 = 11.0;
+// A small dark edge keeps pale digits readable over bright item art.
 const COUNT_SHADOW_PX: f32 = 1.0;
 const COUNT_SHADOW_COLOR: Color = Color::srgba(0.0, 0.0, 0.0, 0.95);
 
