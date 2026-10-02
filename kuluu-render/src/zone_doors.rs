@@ -526,7 +526,11 @@ pub fn trigger_zone_doors(
         let Some(active) = ActiveScheduler::from_main(&dir.routines, &routine) else {
             continue;
         };
-        crate::scheduler_runtime::enqueue_routine(&mut commands, entity, active);
+        crate::scheduler_runtime::enqueue_routine(
+            &mut commands,
+            entity,
+            active.with_target(Some(entity)),
+        );
         commands.entity(entity).try_insert_if_new(ActionAssets {
             seps: dir.seps.clone(),
             ..Default::default()
