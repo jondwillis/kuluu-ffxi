@@ -337,32 +337,15 @@ impl EphemeralChar {
         Ok(())
     }
 
-    /// Grant a key item by its id (vendor/server/scripts/enum/key_item.lua),
-    /// e.g. 138 = CHOCOBO_LICENSE. The keyitems column is a fixed blob of
-    /// little-endian uint16 ids; an empty slot is 0.
     pub async fn add_key_item(&self, id: u16) -> Result<()> {
         let mut conn = self.pool.get_conn().await.context("DB conn for key item")?;
-        // A fresh fixture char's keyitems is NULL; start from an empty blob of
-        // the column's width (512 uint16s) in that case.
         let blob: Option<Vec<u8>> = "SELECT keyitems FROM chars WHERE charid = ?"
             .with((self.charid,))
             .first(&mut conn)
             .await
             .context("reading keyitems blob")?
             .ok_or_else(|| anyhow!("chars row {charid} not found", charid = self.charid))?;
-        let blob = blob.unwrap_or_else(|| vec![0u8; 512 * 2]);
-        let mut ids: Vec<u16> = blob
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
-            .collect();
-        // Find a free slot (0) or reuse the last one; the blob is large enough
-        // that a free slot always exists for a fresh fixture char.
-        let slot = ids.iter().position(|&v| v == 0).unwrap_or(ids.len() - 1);
-        ids[slot] = id;
-        let mut new_blob = Vec::with_capacity(ids.len() * 2);
-        for &v in &ids {
-            new_blob.extend_from_slice(&v.to_le_bytes());
-        }
+        let new_blob = grant_key_item_blob(blob.unwrap_or_default(), id)?;
         "UPDATE chars SET keyitems = ? WHERE charid = ?"
             .with((&new_blob, self.charid))
             .ignore(&mut conn)
@@ -370,6 +353,86 @@ impl EphemeralChar {
             .context("UPDATE chars keyitems")?;
         Ok(())
     }
+}
+
+// vendor/server/src/common/mmo.h keyitems_table_t, keyitems_t.
+fn key_item_layout() -> (usize, usize, usize) {
+    let source = include_str!("../../../vendor/server/src/common/mmo.h");
+    let table = source
+        .split("struct keyitems_table_t")
+        .nth(1)
+        .unwrap()
+        .split('}')
+        .next()
+        .unwrap();
+    let bits: usize = table
+        .split("xi::bitset<")
+        .nth(1)
+        .unwrap()
+        .split('>')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let fields = table.matches("xi::bitset<").count();
+    let tables: usize = source
+        .split("std::array<keyitems_table_t,")
+        .nth(1)
+        .unwrap()
+        .split('>')
+        .next()
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    (bits, fields, tables)
+}
+
+fn grant_key_item_blob(mut blob: Vec<u8>, id: u16) -> Result<Vec<u8>> {
+    let (bits, fields, tables) = key_item_layout();
+    let width = bits / u8::BITS as usize;
+    anyhow::ensure!(
+        usize::from(id) < bits * tables,
+        "key item outside LSB table capacity"
+    );
+    blob.resize(blob.len().max(width * fields * tables), 0);
+    // vendor/server/src/map/utils/charutils.cpp addKeyItem: ownership only.
+    let table = usize::from(id) / bits;
+    let bit = usize::from(id) % bits;
+    blob[table * fields * width + bit / u8::BITS as usize] |= 1 << (bit % u8::BITS as usize);
+    Ok(blob)
+}
+
+#[test]
+fn key_item_fixture_preserves_lsb_bitsets() {
+    const TABLE_BITS_PINNED: usize = 512;
+    const TABLE_COUNT_PINNED: usize = 8;
+    const TABLE_FIELDS_PINNED: usize = 2;
+    const KEY_ITEM_PINNED: u16 = 138;
+    assert_eq!(
+        key_item_layout(),
+        (TABLE_BITS_PINNED, TABLE_FIELDS_PINNED, TABLE_COUNT_PINNED)
+    );
+    let width = TABLE_BITS_PINNED / u8::BITS as usize;
+    let mut before = vec![0; width * TABLE_FIELDS_PINNED * TABLE_COUNT_PINNED];
+    before[width] = u8::MAX;
+    before[width * TABLE_FIELDS_PINNED] = u8::MAX;
+    let mut expected = before.clone();
+    expected[usize::from(KEY_ITEM_PINNED) / u8::BITS as usize] |=
+        1 << (u32::from(KEY_ITEM_PINNED) % u8::BITS);
+    assert_eq!(
+        grant_key_item_blob(before, KEY_ITEM_PINNED).unwrap(),
+        expected
+    );
+    let second_table_id = TABLE_BITS_PINNED as u16 + KEY_ITEM_PINNED;
+    let mut expected_second = expected.clone();
+    expected_second
+        [width * TABLE_FIELDS_PINNED + usize::from(KEY_ITEM_PINNED) / u8::BITS as usize] |=
+        1 << (u32::from(KEY_ITEM_PINNED) % u8::BITS);
+    assert_eq!(
+        grant_key_item_blob(expected, second_table_id).unwrap(),
+        expected_second
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
