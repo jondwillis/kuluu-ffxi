@@ -320,20 +320,15 @@ impl EphemeralChar {
             .ok_or_else(|| anyhow!("fixture character missing"))
     }
 
-    /// Grant `amount` gil: gil is the currency item (id 0) of the main
-    /// inventory (vendor/server/src/map/lua/lua_base_entity.cpp getGil reads
-    /// getStorage(LOC_INVENTORY)->GetItem(0)). The fixture's char-creation
-    /// trigger already inserts an empty (itemId 65535) row at the currency
-    /// slot, so upsert it.
+    // vendor/server/sql/triggers.sql char_insert; vendor/server/src/map/utils/itemutils.cpp spawn.
     pub async fn add_gil(&self, amount: u32) -> Result<()> {
         let mut conn = self.pool.get_conn().await.context("DB conn for gil")?;
-        "INSERT INTO char_inventory(charid, location, slot, itemId, quantity) \
-         VALUES (?, 0, 0, 0, ?) \
-         ON DUPLICATE KEY UPDATE itemId = 0, quantity = VALUES(quantity)"
-            .with((self.charid, amount))
+        "UPDATE char_inventory SET quantity = ? WHERE charid = ? AND location = 0 AND slot = 0"
+            .with((amount, self.charid))
             .ignore(&mut conn)
             .await
-            .context("upserting gil into char_inventory")?;
+            .context("funding the fixture currency item")?;
+        anyhow::ensure!(conn.affected_rows() == 1, "fixture currency row missing");
         Ok(())
     }
 
