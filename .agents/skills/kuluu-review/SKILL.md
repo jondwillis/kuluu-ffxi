@@ -21,6 +21,8 @@ Look for unrelated changes that add review cost, regress established behavior or
 
 Product-only developer tooling needs a concrete development use case, its activation boundary and evidence that player behavior is preserved. Do not call it retail parity merely because it drives game controls. If its justification claims a control or workflow is retail, support that premise with retail evidence too; a tooling label does not waive an embedded client-behavior claim.
 
+For tooling or partial feature slices, trace the new capability to an implemented consumer and a specific task that existing paths cannot perform adequately. Demonstrate that task through the production path, or state the precise evidence gap. Key recognition alone does not prove an action works. Explain why the slice is useful on its own and should land separately from the missing player-facing behavior; "enables future work", "helps verification" and small diff size are insufficient. Remove speculative scope without a current consumer, or stack it with the implementation that supplies the benefit. An independent, demonstrated development need can justify tooling without implementing unrelated controls.
+
 ## Contributor-facing issue references
 
 Prefer verified GitHub issue URLs in PR bodies and review reports; retain Beads as the durable tracking source. Resolve the publisher's exact `<!-- beads-id: ID -->` marker across open and closed GitHub issues, or verify an imported bead's `external_ref: gh-N` against the issue. Do not infer an issue number from a bead ID or create a second issue merely to satisfy the template.
