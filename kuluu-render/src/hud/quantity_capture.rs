@@ -1,4 +1,4 @@
-use super::{delivery, dialog, item_dat_root, item_detail, item_screen};
+use super::{delivery, dialog, item_dat_root, item_detail, item_grid, item_screen};
 use crate::input_mode::{DialogCursor, InputMode, MenuKind, MenuStack};
 use crate::snapshot::SceneState;
 use bevy::prelude::*;
@@ -49,6 +49,10 @@ fn quantity_overlay_production_capture() {
         .init_resource::<item_screen::ItemScreenContainer>()
         .init_resource::<item_screen::ItemListViewport>()
         .init_resource::<crate::keybinds::Bindings>()
+        .add_systems(
+            PostUpdate,
+            item_grid::sync_count_outlines.before(bevy::ui::UiSystems::Content),
+        )
         .add_systems(
             Startup,
             (

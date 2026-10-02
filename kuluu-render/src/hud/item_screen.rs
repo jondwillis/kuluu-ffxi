@@ -498,11 +498,11 @@ fn spawn_list_box(col: &mut ChildSpawnerCommands, placeholder: Handle<Image>) {
                             display: Display::None,
                             ..default()
                         };
-                        icon.spawn((
+                        item_grid::spawn_stack_count(
+                            icon,
                             ItemText(ItemRole::ListBadge(i)),
-                            Text::new(""),
-                            item_grid::stack_count_style(placement),
-                        ));
+                            placement,
+                        );
                     });
                     row.spawn(list_view::row_label_clip()).with_children(|col| {
                         col.spawn((
