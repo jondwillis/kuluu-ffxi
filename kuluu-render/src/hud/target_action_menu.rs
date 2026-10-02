@@ -7,7 +7,7 @@ use crate::input_mode::{InputMode, SubAction};
 
 const MAX_ROWS: usize = 7;
 
-const SUBMENU_ARROW: &str = "▶";
+const SUBMENU_ARROW: &str = ">";
 
 /// First list index the pane shows. The row entities are spawned once and fixed at `MAX_ROWS`,
 /// so a longer list — a BST/THF's job abilities plus the pet commands a charmed pet adds —
@@ -44,6 +44,13 @@ pub fn entries_for_mode(mode: &InputMode, overlay: &ActiveOverlay) -> Option<Vec
 }
 
 pub fn entry_count(mode: &InputMode, overlay: &ActiveOverlay) -> usize {
+    // The Dismount confirm replaces the rows with its two Yes/No slots, so the
+    // mouse hit-test limits to those while it holds.
+    if let InputMode::TargetAction(state) = mode {
+        if state.dismount_confirm {
+            return 2;
+        }
+    }
     entries_for_mode(mode, overlay)
         .map(|e| e.len())
         .unwrap_or(0)
@@ -117,7 +124,7 @@ fn spawn_target_action_rows(p: &mut ChildSpawnerCommands) {
 }
 
 pub fn update_target_action_menu(
-    mode: Res<InputMode>,
+    mut mode: ResMut<InputMode>,
     overlay: Res<ActiveOverlay>,
 
     scene: Res<crate::snapshot::SceneState>,
@@ -134,6 +141,15 @@ pub fn update_target_action_menu(
     let Ok(mut panel) = panel_q.single_mut() else {
         return;
     };
+
+    if matches!(&*mode, InputMode::TargetAction(state) if state.ctx.modern_mount)
+        && !matches!(
+            scene.snapshot.self_mount,
+            Some(kuluu_snapshot::Mount::Other { .. })
+        )
+    {
+        *mode = InputMode::World;
+    }
 
     let InputMode::TargetAction(state) = &*mode else {
         if panel.display != Display::None {
@@ -184,6 +200,59 @@ pub fn update_target_action_menu(
         }
     }
     let cursor = state.cursor;
+
+    if state.dismount_confirm && sub_active.is_none() {
+        // The Dismount confirm: Yes/No replace the rows, the breadcrumb names
+        // the pending action. Slot 0 is Yes, slot 1 is No; the cursor is the
+        // confirm's own 0/1.
+        if let Ok((mut node, mut text, mut color)) = crumb_q.single_mut() {
+            if node.display != Display::Flex {
+                node.display = Display::Flex;
+            }
+            if **text != "> Dismount" {
+                **text = "> Dismount".into();
+            }
+            if color.0 != theme::TITLE {
+                color.0 = theme::TITLE;
+            }
+        }
+        for (row, mut node, mut text, mut color) in row_q.iter_mut() {
+            let (want, want_color) = match row.slot {
+                0 => (
+                    format!("{}Yes", style::cursor_prefix(cursor == 0)),
+                    if cursor == 0 {
+                        theme::CURSOR
+                    } else {
+                        theme::TEXT
+                    },
+                ),
+                1 => (
+                    format!("{}No", style::cursor_prefix(cursor == 1)),
+                    if cursor == 1 {
+                        theme::CURSOR
+                    } else {
+                        theme::TEXT
+                    },
+                ),
+                _ => {
+                    if node.display != Display::None {
+                        node.display = Display::None;
+                    }
+                    continue;
+                }
+            };
+            if node.display != Display::Flex {
+                node.display = Display::Flex;
+            }
+            if **text != want {
+                **text = want;
+            }
+            if color.0 != want_color {
+                color.0 = want_color;
+            }
+        }
+        return;
+    }
 
     if let Some(SubAction::AbilitiesGroup(group)) = sub_active {
         let rows = crate::hud::menu::ability_group_rows(&scene.snapshot, group);
@@ -346,7 +415,45 @@ mod tests {
             engaged: false,
             usable_items_available: true,
             can_fish: false,
+            modern_mount: false,
         }
+    }
+
+    #[test]
+    fn modern_mount_menu_closes_when_server_mount_disappears() {
+        let mut app = App::new();
+        app.init_resource::<crate::snapshot::SceneState>()
+            .init_resource::<ActiveOverlay>()
+            .insert_resource(InputMode::TargetAction(TargetActionState::open(
+                TargetActionContext {
+                    modern_mount: true,
+                    ..default()
+                },
+            )))
+            .add_systems(Update, update_target_action_menu);
+        app.world_mut().spawn((TargetActionMenu, Node::default()));
+        app.world_mut()
+            .resource_mut::<crate::snapshot::SceneState>()
+            .snapshot
+            .self_mount = Some(kuluu_snapshot::Mount::Other { mount_id: u8::MAX });
+        app.update();
+        assert!(matches!(
+            app.world().resource::<InputMode>(),
+            InputMode::TargetAction(_)
+        ));
+        app.world_mut()
+            .resource_mut::<crate::snapshot::SceneState>()
+            .snapshot
+            .self_mount = None;
+        app.update();
+        assert!(matches!(
+            app.world().resource::<InputMode>(),
+            InputMode::World
+        ));
+        let mut panel = app
+            .world_mut()
+            .query_filtered::<&Node, With<TargetActionMenu>>();
+        assert_eq!(panel.single(app.world()).unwrap().display, Display::None);
     }
 
     #[test]
