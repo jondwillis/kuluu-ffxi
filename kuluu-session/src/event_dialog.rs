@@ -16,10 +16,7 @@ use ffxi_dat::event_dat::{EventBlockSource, EventDat};
 use ffxi_dat::kind::ChunkKind;
 use ffxi_dat::scheduler::Scheduler;
 use ffxi_dat::DatRoot;
-use ffxi_event::{
-    ActorLookup, DialogRunner, DialogStep, EventCue, FourCc, PendingTag, SOUND_TYPE_MASTER,
-    SOUND_TYPE_ZONE,
-};
+use ffxi_event::{ActorLookup, DialogRunner, DialogStep, EventCue, FourCc, PendingTag};
 use tokio::sync::broadcast;
 
 use crate::state::{AgentEvent, CutsceneActor, CutsceneCue, DialogState};
@@ -751,8 +748,6 @@ pub enum ResolvedCue {
     /// 0x5D rides the existing [`AgentEvent::MusicVolumeChanged`] instead of
     /// the cue stream.
     MusicVolume { volume: u8, fade_frames: u16 },
-    /// 0x69/0x6A ride the existing [`AgentEvent::MusicVolumeChanged`], scoped
-    /// to the BGM slots the retail sound-type `mask` reaches.
     SoundVolume {
         mask: u8,
         volume: u8,
@@ -1002,24 +997,6 @@ pub fn resolve_cue(cue: EventCue, event_entity: u32, zone: u16, player_id: u32) 
     })
 }
 
-/// The BGM slots a retail 0x69/0x6A sound-type `mask` reaches. 0x08 master
-/// reaches every slot; 0x04 zone reaches the day/night zone slots; 0x01
-/// effect, 0x02 system and 0x10 special chat are SFX channels kuluu has no
-/// event-scoped gain for, so they resolve to no slot.
-/// research/XiEvents/OpCodes/0x0069.md; research/XIClient/src/XIClient/include/World/Generator/Effects/CYySoundElem.h;
-/// vendor/server/data/enums/music_slot.yaml.
-fn sound_type_slots(mask: u8) -> Vec<u8> {
-    const ZONE_DAY: u8 = 0;
-    const ZONE_NIGHT: u8 = 1;
-    let mut slots = Vec::new();
-    if mask & SOUND_TYPE_MASTER != 0 {
-        slots.extend(0..crate::state::MUSIC_SLOT_COUNT);
-    } else if mask & SOUND_TYPE_ZONE != 0 {
-        slots.extend([ZONE_DAY, ZONE_NIGHT]);
-    }
-    slots
-}
-
 /// The event-entity selector and the default handler's fallback both mean "the
 /// entity this event belongs to"; only a literal server id names another.
 fn resolve_actor(lookup: ActorLookup, event_entity: u32) -> CutsceneActor {
@@ -1088,20 +1065,8 @@ impl CutsceneScope {
                     let _ = event_tx.send(AgentEvent::MusicVolumeChanged { slot, volume });
                 }
             }
-            ResolvedCue::SoundVolume {
-                mask,
-                volume,
-                fade_frames,
-            } => {
-                tracing::debug!(
-                    mask,
-                    volume,
-                    fade_frames,
-                    "event script set sound volume (0x69/0x6A)"
-                );
-                for slot in sound_type_slots(mask) {
-                    let _ = event_tx.send(AgentEvent::MusicVolumeChanged { slot, volume });
-                }
+            ResolvedCue::SoundVolume { .. } => {
+                tracing::warn!("unsupported event sound-volume cue ignored");
             }
             ResolvedCue::Map(op) => {
                 let ev = match op {
@@ -3408,48 +3373,19 @@ pub(crate) mod tests {
         );
     }
 
-    /// 0x69/0x6A scope the volume to the BGM slots the retail sound-type mask
-    /// reaches: zone hits the day/night slots, master hits every slot, and the
-    /// SFX-only bits hit none.
     #[test]
-    fn sound_volume_rides_the_music_event_on_the_masked_slots() {
-        const VOLUME: u8 = 64;
-        let slots_for = |mask: u8| -> Vec<u8> {
-            let (tx, mut rx) = broadcast::channel(32);
-            let mut scope = CutsceneScope::default();
-            scope.start(1, &tx);
-            scope.push(
-                ResolvedCue::SoundVolume {
-                    mask,
-                    volume: VOLUME,
-                    fade_frames: 0,
-                },
-                &tx,
-            );
-            drain(&mut rx)
-                .into_iter()
-                .filter_map(|ev| match ev {
-                    AgentEvent::MusicVolumeChanged { slot, volume } => {
-                        assert_eq!(volume, VOLUME);
-                        Some(slot)
-                    }
-                    _ => None,
-                })
-                .collect()
-        };
-        assert_eq!(slots_for(0x04), vec![0, 1], "zone -> day/night slots");
-        assert_eq!(
-            slots_for(0x08),
-            (0..crate::state::MUSIC_SLOT_COUNT).collect::<Vec<_>>(),
-            "master -> every slot"
+    fn unsupported_sound_volume_does_not_apply_partial_music_changes() {
+        let (tx, mut rx) = broadcast::channel(16);
+        let mut scope = CutsceneScope::default();
+        scope.push(
+            ResolvedCue::SoundVolume {
+                mask: ffxi_event::SOUND_TYPE_MASTER,
+                volume: 0,
+                fade_frames: 60,
+            },
+            &tx,
         );
-        assert!(slots_for(0x01).is_empty(), "effect has no BGM slot");
-        assert!(slots_for(0x10).is_empty(), "special chat has no BGM slot");
-        assert_eq!(
-            slots_for(0x04 | 0x08),
-            (0..crate::state::MUSIC_SLOT_COUNT).collect::<Vec<_>>(),
-            "master subsumes zone"
-        );
+        assert!(drain(&mut rx).is_empty());
     }
 
     /// The VM leaves its actor operands unresolved on purpose: the local
