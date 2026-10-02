@@ -901,8 +901,10 @@ impl EventVm {
             // turns onto it (the body's yaw follows the snapshot heading).
             OP_SET_FACING => {
                 let heading = self.getworkofs(SET_FACING_OFS, 0);
+                let position = self.shared_player_position();
                 let updated = {
                     let scene = self.scene.as_mut().unwrap();
+                    scene.player = position.unwrap_or(scene.player);
                     scene.player.heading = heading;
                     scene.controls_position = true;
                     scene.player

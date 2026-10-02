@@ -328,6 +328,7 @@ async fn numeric_contract() {
     }
 }
 async fn nested_player_position_contract() {
+    const OP_FACE: u8 = 0x39;
     const OP_SNAP: u8 = 0x37;
     const OP_REQUEST: u8 = 0x27;
     const OP_SLEEP: u8 = 0x6F;
@@ -341,6 +342,8 @@ async fn nested_player_position_contract() {
             }
         }
         message(&mut master, 4);
+        master.push(OP_FACE);
+        operand(&mut master, REFERENCE + 8);
         master.push(OP_END);
         let child_offset = master.len() as u16;
         master.push(OP_SNAP);
