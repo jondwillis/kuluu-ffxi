@@ -255,9 +255,6 @@ const OP_QUERYWAIT2: u8 = 0x7F;
 // path this actor-less VM can be on (research/XiEvents/OpCodes/0x0080.md,
 // 0x0076.md).
 const LOADWAIT_SIZE: usize = 5;
-// 0x6C TRANSPAR's width: the fade parks the script for its authored length,
-// then advances past itself (research/XiEvents/OpCodes/0x006C.md).
-const TRANSPAR_SIZE: usize = 9;
 /// 0x0034.md (and 0x0035.md, the same handler without the zone close) spreads
 /// its zone load over three `EventIdle` ticks driven by two file-scope counters,
 /// advancing only on the last; the net effect of the sequence is +3, and this VM
@@ -367,9 +364,6 @@ const EVENTHIDE_FLAG_MASK: u8 = 1;
 const EVENTHIDE_TARGET_OFS: usize = 2;
 // 0x006C TRANSPAR: the actor lookup at +1, the destination alpha byte at +5,
 // and the fade length in frames at +7 (research/XiEvents/OpCodes/0x006C.md).
-const TRANSPAR_ACTOR_OFS: usize = 1;
-const TRANSPAR_ALPHA_OFS: usize = 5;
-const TRANSPAR_TIME_OFS: usize = 7;
 const MUSICVOLUME_LEVEL_OFS: usize = 1; // 0x005D
 const MUSICVOLUME_FADE_OFS: usize = 3;
 /// 0x77's hour operand (research/XiEvents/OpCodes/0x0077.md); its weather
@@ -1760,17 +1754,7 @@ impl EventVm {
                 // 0x6C fades the target's alpha to the work(5) byte over the
                 // work(7) frames and parks the script for that fade
                 // (research/XiEvents/OpCodes/0x006C.md).
-                OP_TRANSPAR => {
-                    let actor = ActorLookup(self.eventgetcode2(TRANSPAR_ACTOR_OFS));
-                    let end_alpha = self.getworkofs(TRANSPAR_ALPHA_OFS, 0);
-                    let frames = self.getworkofs(TRANSPAR_TIME_OFS, 0).max(1);
-                    self.cues.push(EventCue::Transpar {
-                        actor,
-                        end_alpha,
-                        duration_frames: frames,
-                    });
-                    return self.arm_wait(frames as f32, TRANSPAR_SIZE);
-                }
+                OP_TRANSPAR => self.advance(op),
                 // 0xC8 opens the map window on the work-slot zone id —
                 // research/XiEvents/OpCodes/0x00C8.md.
                 OP_MAP_TUTORIAL => {
@@ -3631,41 +3615,15 @@ mod tests {
     /// count; a zero-length fade still costs one frame, retail's `AlphaTime`
     /// 0 → 1 (research/XiEvents/OpCodes/0x006C.md).
     #[test]
-    fn transpar_opcode_parks_for_its_fade_length() {
-        let program = || {
-            let mut data = vec![OP_TRANSPAR];
-            data.extend_from_slice(&NPC_SERVER_ID.to_le_bytes());
-            data.extend_from_slice(&REF0);
-            data.extend_from_slice(&REF1);
-            data.push(OP_END);
-            data
-        };
-        let mut e = vm(program(), vec![128, 60]);
-        assert_eq!(e.step(), StepResult::Waiting, "the fade is running");
-        assert_eq!(
-            e.take_cues(),
-            [EventCue::Transpar {
-                actor: ActorLookup(NPC_SERVER_ID),
-                end_alpha: 128,
-                duration_frames: 60,
-            }]
-        );
-        e.tick(0.5);
-        assert_eq!(e.step(), StepResult::Waiting, "half way is still waiting");
-        e.tick(0.6);
-        assert_eq!(e.step(), StepResult::Done);
-
-        let mut e = vm(program(), vec![0, 0]);
-        assert_eq!(e.step(), StepResult::Waiting);
-        assert_eq!(
-            e.take_cues(),
-            [EventCue::Transpar {
-                actor: ActorLookup(NPC_SERVER_ID),
-                end_alpha: 0,
-                duration_frames: 1,
-            }],
-            "a zero-length fade reads as one frame"
-        );
+    fn unsupported_transparency_keeps_baseline_skip_without_wait() {
+        let mut data = vec![OP_TRANSPAR];
+        data.extend_from_slice(&NPC_SERVER_ID.to_le_bytes());
+        data.extend_from_slice(&REF0);
+        data.extend_from_slice(&REF1);
+        data.push(OP_END);
+        let mut event = vm(data, vec![128, 60]);
+        assert_eq!(event.step(), StepResult::Done);
+        assert!(event.take_cues().is_empty());
     }
 
     /// 0x3E BITTEST program: bit index from References[1], work word named by

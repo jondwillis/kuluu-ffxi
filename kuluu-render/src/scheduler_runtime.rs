@@ -2599,10 +2599,6 @@ pub struct CutsceneActorState {
     touched: std::collections::HashSet<u32>,
     /// Server ids hidden by a running cutscene's EVENT_HIDE cue; cleared at CutsceneEnded.
     hidden: std::collections::HashSet<u32>,
-    /// Server ids with a running 0x6C TRANSPAR fade (the
-    /// crate::ffxi_actor_render::CutsceneTranspar component); cleared at
-    /// CutsceneEnded.
-    faded: std::collections::HashSet<u32>,
 }
 
 /// A model root hidden by a running cutscene's ActorHide cue (ffxi-event/src/cue.rs).
@@ -2634,19 +2630,8 @@ impl CutsceneActorState {
         self.hidden.remove(&id);
     }
 
-    pub fn fade(&mut self, id: u32) {
-        self.faded.insert(id);
-    }
-
-    pub fn unfade(&mut self, id: u32) {
-        self.faded.remove(&id);
-    }
-
     pub fn is_empty(&self) -> bool {
-        self.touched.is_empty()
-            && self.walks.is_empty()
-            && self.hidden.is_empty()
-            && self.faded.is_empty()
+        self.touched.is_empty() && self.walks.is_empty() && self.hidden.is_empty()
     }
 }
 
@@ -2888,37 +2873,6 @@ pub fn apply_cutscene_actor_cues(
                     );
                 }
             }
-            // 0x6C: drive the target's opacity to the authored byte over the
-            // authored frames; the fade stops at CutsceneEnded at whatever
-            // value it has reached (ffxi-event/src/cue.rs Transpar).
-            CutsceneCue::Transpar {
-                target,
-                end_alpha,
-                duration_frames,
-            } => {
-                // Fading the local player model is a valid ask, so resolve
-                // without excluding self.
-                let Some(id) = cutscene_actor_server_id(self_id, target) else {
-                    continue;
-                };
-                let Some(&entity) = tracked.by_id.get(&id) else {
-                    continue;
-                };
-                commands
-                    .entity(entity)
-                    .insert(crate::ffxi_actor_render::CutsceneTranspar::new(
-                        (end_alpha as f32 / 255.0).clamp(0.0, 1.0),
-                        (duration_frames as f32).max(1.0) / 60.0,
-                    ));
-                state.fade(id);
-                tracing::debug!(
-                    target: "kuluu_render::scheduler_runtime",
-                    id,
-                    end_alpha,
-                    duration_frames,
-                    "cutscene actor transpar"
-                );
-            }
             _ => {}
         }
     }
@@ -2980,7 +2934,6 @@ pub fn release_cutscene_actors(
     mut cursor: Local<u64>,
     mut q_xform: Query<&mut Transform, With<WorldEntity>>,
     q_hidden: Query<Entity, With<CutsceneHidden>>,
-    q_faded: Query<Entity, With<crate::ffxi_actor_render::CutsceneTranspar>>,
     mut q_scheds: Query<(Entity, &mut ActiveSchedulers), With<WorldEntity>>,
     q_children: Query<&Children>,
     mut q_actors: Query<&mut crate::ffxi_actor_render::FfxiRenderActor>,
@@ -3064,17 +3017,9 @@ pub fn release_cutscene_actors(
     for e in q_hidden.iter() {
         commands.entity(e).remove::<CutsceneHidden>();
     }
-    // Stop every running 0x6C fade at its current value: retail drops the
-    // fade's driver with the event's own ExtData.
-    for e in q_faded.iter() {
-        commands
-            .entity(e)
-            .remove::<crate::ffxi_actor_render::CutsceneTranspar>();
-    }
     state.walks.clear();
     state.touched.clear();
     state.hidden.clear();
-    state.faded.clear();
 }
 
 // The routine the caster's cast-start effects were flattened from, so an interrupt can stop the
@@ -6988,23 +6933,6 @@ mod tests {
             });
     }
 
-    fn push_transpar(
-        app: &mut App,
-        target: kuluu_snapshot::CutsceneActor,
-        end_alpha: i32,
-        duration_frames: i32,
-    ) {
-        app.world_mut()
-            .resource_mut::<crate::snapshot::EventLog>()
-            .push(kuluu_snapshot::ViewerEvent::Cutscene {
-                cue: CutsceneCue::Transpar {
-                    target,
-                    end_alpha,
-                    duration_frames,
-                },
-            });
-    }
-
     /// Hides event 503's party lead (Curilla) and releases her on unhide.
     #[test]
     #[cfg(not(target_arch = "wasm32"))]
@@ -7095,54 +7023,5 @@ mod tests {
         );
         let state = app.world().resource::<CutsceneActorState>();
         assert!(state.is_empty());
-    }
-
-    /// 0x6C inserts the fade component on the target and stops it, at whatever
-    /// value it reached, on CutsceneEnded.
-    #[test]
-    #[cfg(not(target_arch = "wasm32"))]
-    fn transpar_cue_inserts_the_fade_and_end_stops_it() {
-        const NPC: u32 = 0x010E_60D5;
-        let mut app = actor_cue_app();
-        app.init_resource::<crate::snapshot::SceneState>()
-            .add_systems(Update, release_cutscene_actors);
-        let npc = spawn_tracked_actor(&mut app, NPC);
-
-        push_transpar(
-            &mut app,
-            kuluu_snapshot::CutsceneActor::Entity { server_id: NPC },
-            0,
-            60,
-        );
-        app.update();
-        let fade = app
-            .world()
-            .get::<crate::ffxi_actor_render::CutsceneTranspar>(npc)
-            .expect("the cue must insert the fade");
-        assert!(
-            (fade.end - 0.0).abs() < f32::EPSILON,
-            "alpha byte 0 is fully transparent"
-        );
-        assert!(
-            (fade.total_secs - 1.0).abs() < 1e-6,
-            "60 frames is one second"
-        );
-        let state = app.world().resource::<CutsceneActorState>();
-        assert!(
-            state.faded.contains(&NPC),
-            "the fade must be recorded so release finds it"
-        );
-
-        app.world_mut()
-            .resource_mut::<crate::snapshot::EventLog>()
-            .push(kuluu_snapshot::ViewerEvent::CutsceneEnded);
-        app.update();
-        assert!(
-            app.world()
-                .get::<crate::ffxi_actor_render::CutsceneTranspar>(npc)
-                .is_none(),
-            "ended must stop the fade at its current value"
-        );
-        assert!(app.world().resource::<CutsceneActorState>().is_empty());
     }
 }
