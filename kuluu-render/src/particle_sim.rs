@@ -5820,6 +5820,7 @@ mod tests {
                 actor: attacker,
                 stage: particle_stage(gen_id),
                 scheduler: HIT_SPARK_DIR,
+                cutscene_motion: false,
             });
         app.update();
         app.world()

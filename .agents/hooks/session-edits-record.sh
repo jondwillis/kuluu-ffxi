@@ -20,11 +20,17 @@ cwd=$(printf '%s' "$payload" | jq -r '.cwd // empty' 2>/dev/null || true)
 
 # Edit/Write use tool_input.file_path; the response echoes filePath on some
 # tools. Take whichever is present.
-file=$(printf '%s' "$payload" \
+files=$(printf '%s' "$payload" \
   | jq -r '.tool_response.filePath // .tool_input.file_path // .tool_input.notebook_path // empty' \
   2>/dev/null || true)
-[ -n "$file" ] || exit 0
+[ -n "$files" ] || files=$(printf '%s' "$payload" | jq -r '.tool_input.command // empty' \
+  | sed -n -E 's/^\*\*\* (Add|Update|Delete) File: (.*)$/\2/p; s/^\*\*\* Move to: (.*)$/\1/p')
+[ -n "$files" ] || exit 0
 
-ledger_add "$session_id" "$cwd" "$file"
+while IFS= read -r file; do
+  case "$file" in /*) ;; *) file="$cwd/$file" ;; esac
+  root=$(repo_root "$(dirname "$file")")
+  ledger_add "$session_id" "$root" "$file" || exit 1
+done <<< "$files"
 ledger_touch "$session_id"
 exit 0

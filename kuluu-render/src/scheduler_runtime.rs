@@ -400,6 +400,8 @@ pub struct SchedulerStageEvent {
     pub stage: TimedStage,
 
     pub scheduler: [u8; 4],
+
+    pub cutscene_motion: bool,
 }
 
 /// A cutscene motion routine the cue `(actor, key)` named has finished - or
@@ -436,6 +438,7 @@ pub fn tick_active_schedulers(
                     actor: entity,
                     stage: next,
                     scheduler: scheduler_name,
+                    cutscene_motion: sched.cutscene_motion_actor.is_some(),
                 });
                 sched.cursor += 1;
             }
@@ -1839,7 +1842,7 @@ pub fn dispatch_motion_stages(
         };
         for &child in children {
             if let Ok(mut actor) = q_actors.get_mut(child) {
-                actor.begin_completion_motion(
+                actor.begin_scheduler_motion(
                     clip,
                     crate::ffxi_actor_render::CompletionMotion {
                         local_clips,
@@ -1852,6 +1855,7 @@ pub fn dispatch_motion_stages(
                             stage.transition_out,
                         ),
                     },
+                    ev.cutscene_motion,
                 );
             }
         }
@@ -2995,7 +2999,7 @@ pub fn release_cutscene_actors(
     mut q_xform: Query<&mut Transform, With<WorldEntity>>,
     q_hidden: Query<Entity, With<CutsceneHidden>>,
     q_faded: Query<Entity, With<crate::ffxi_actor_render::CutsceneTranspar>>,
-    q_scheds: Query<(Entity, &ActiveSchedulers), With<WorldEntity>>,
+    mut q_scheds: Query<(Entity, &mut ActiveSchedulers), With<WorldEntity>>,
     q_children: Query<&Children>,
     mut q_actors: Query<&mut crate::ffxi_actor_render::FfxiRenderActor>,
     mut commands: Commands,
@@ -3003,11 +3007,15 @@ pub fn release_cutscene_actors(
     let total = events.pushed_total;
     let first_global = total.saturating_sub(events.recent.len() as u64);
     let mut ended = false;
+    let mut session_boundary = false;
     for g in (*cursor).max(first_global)..total {
         match &events.recent[(g - first_global) as usize] {
-            kuluu_snapshot::ViewerEvent::CutsceneEnded
-            | kuluu_snapshot::ViewerEvent::ZoneChanged { .. }
-            | kuluu_snapshot::ViewerEvent::Disconnected { .. } => ended = true,
+            kuluu_snapshot::ViewerEvent::CutsceneEnded => ended = true,
+            kuluu_snapshot::ViewerEvent::ZoneChanged { .. }
+            | kuluu_snapshot::ViewerEvent::Disconnected { .. } => {
+                ended = true;
+                session_boundary = true;
+            }
             _ => {}
         }
     }
@@ -3022,7 +3030,7 @@ pub fn release_cutscene_actors(
     // to idle on its next run. This runs even when no entity was touched
     // (the cast does not move the guard), so it precedes the touched-only
     // position reset below.
-    for (entity, scheds) in q_scheds.iter() {
+    for (entity, mut scheds) in &mut q_scheds {
         if !scheds
             .routines
             .iter()
@@ -3033,13 +3041,22 @@ pub fn release_cutscene_actors(
         if let Ok(children) = q_children.get(entity) {
             for &child in children {
                 if let Ok(mut actor) = q_actors.get_mut(child) {
-                    actor.clear_cutscene_action();
+                    if session_boundary {
+                        actor.clear_cutscene_action();
+                    } else {
+                        actor.release_cutscene_owned_action();
+                    }
                 }
             }
         }
-        commands
-            .entity(entity)
-            .remove::<(ActiveSchedulers, ActionAssets, ActionTarget)>();
+        scheds
+            .routines
+            .retain(|routine| !session_boundary && routine.cutscene_motion_actor.is_none());
+        if scheds.is_empty() {
+            commands
+                .entity(entity)
+                .remove::<(ActiveSchedulers, ActionAssets, ActionTarget)>();
+        }
     }
     if state.is_empty() {
         return;
@@ -4246,6 +4263,7 @@ mod tests {
             actor: caster,
             stage: stage(0, kind, 0, stage_id),
             scheduler: *b"test",
+            cutscene_motion: false,
         });
         app.update();
         std::mem::take(&mut app.world_mut().resource_mut::<CapturedSfx>().0)
@@ -5732,6 +5750,104 @@ mod tests {
         assert!(!actor.has_action(), "the event end releases the cast pose");
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn cutscene_end_preserves_overlapping_ordinary_routine_and_pose() {
+        for boundary in [
+            kuluu_snapshot::ViewerEvent::CutsceneEnded,
+            kuluu_snapshot::ViewerEvent::ZoneChanged { from: None, to: 1 },
+            kuluu_snapshot::ViewerEvent::Disconnected {
+                reason: String::new(),
+            },
+        ] {
+            for cutscene_owned in [false, true] {
+                const ACTOR_ID: u32 = 1;
+                const EVENT_ROUTINE: [u8; 4] = *b"evt0";
+                const ORDINARY_ROUTINE: [u8; 4] = *b"atk0";
+                let mut event =
+                    ActiveScheduler::from_scheduler(&make_scheduler(EVENT_ROUTINE, vec![]));
+                event.cutscene_motion_actor = Some(kuluu_snapshot::CutsceneActor::Entity {
+                    server_id: ACTOR_ID,
+                });
+                let ordinary =
+                    ActiveScheduler::from_scheduler(&make_scheduler(ORDINARY_ROUTINE, vec![]));
+                let mut assets = ActionAssets::default();
+                assets
+                    .particle_def_dirs
+                    .insert(ORDINARY_ROUTINE, ORDINARY_ROUTINE);
+                let mut actor = crate::ffxi_actor_render::render_actor_stub(ACTOR_ID);
+                actor.begin_scheduler_motion(
+                    ffxi_dat::datid::DatId::from_name(&ORDINARY_ROUTINE),
+                    crate::ffxi_actor_render::CompletionMotion {
+                        local_clips: &[],
+                        duration_frames: 0.0,
+                        max_loops: 1,
+                        transition_in: crate::ffxi_actor_render::HalfFrames::ZERO,
+                        transition_out: crate::ffxi_actor_render::HalfFrames::ZERO,
+                    },
+                    cutscene_owned,
+                );
+                let mut app = App::new();
+                app.init_resource::<crate::snapshot::EventLog>()
+                    .init_resource::<crate::snapshot::SceneState>()
+                    .init_resource::<crate::scene::TrackedEntities>()
+                    .init_resource::<CutsceneActorState>()
+                    .add_systems(Update, release_cutscene_actors);
+                let target = app.world_mut().spawn_empty().id();
+                let parent = app
+                    .world_mut()
+                    .spawn((
+                        WorldEntity {
+                            id: ACTOR_ID,
+                            act_index: 0,
+                            kind: kuluu_snapshot::EntityKind::Pc,
+                        },
+                        Transform::default(),
+                        ActiveSchedulers::many(vec![event, ordinary]),
+                        assets,
+                        ActionTarget(Some(target)),
+                    ))
+                    .id();
+                let child = app.world_mut().spawn((actor, ChildOf(parent))).id();
+                app.world_mut()
+                    .resource_mut::<crate::snapshot::EventLog>()
+                    .push(boundary.clone());
+                app.update();
+                let entity = app.world().entity(parent);
+                if matches!(boundary, kuluu_snapshot::ViewerEvent::CutsceneEnded) {
+                    let routines = entity
+                        .get::<ActiveSchedulers>()
+                        .expect("ordinary routine survives");
+                    assert_eq!(
+                        routines.routine_names().collect::<Vec<_>>(),
+                        vec![ORDINARY_ROUTINE]
+                    );
+                    assert_eq!(entity.get::<ActionTarget>().unwrap().0, Some(target));
+                    assert_eq!(
+                        entity
+                            .get::<ActionAssets>()
+                            .unwrap()
+                            .particle_def_dirs
+                            .get(&ORDINARY_ROUTINE),
+                        Some(&ORDINARY_ROUTINE)
+                    );
+                } else {
+                    assert!(!entity.contains::<ActiveSchedulers>());
+                    assert!(!entity.contains::<ActionAssets>());
+                    assert!(!entity.contains::<ActionTarget>());
+                }
+                assert_eq!(
+                    app.world()
+                        .get::<crate::ffxi_actor_render::FfxiRenderActor>(child)
+                        .unwrap()
+                        .has_action(),
+                    !cutscene_owned
+                        && matches!(boundary, kuluu_snapshot::ViewerEvent::CutsceneEnded)
+                );
+            }
+        }
+    }
+
     /// A stop-action cue kills the routine and releases the pose it started:
     /// the queue entry drops, the held action clears, and the emptied entity is
     /// stripped in the same cue (research/XiEvents/OpCodes/0x0050.md).
@@ -6368,6 +6484,7 @@ mod tests {
                     stage: flinch.stage,
                 },
                 scheduler: *b"damg",
+                cutscene_motion: false,
             });
             app.update();
 
