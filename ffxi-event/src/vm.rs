@@ -81,7 +81,7 @@ pub enum PendingTag {
     /// `FUNC_gcZoneSendQueSearch(0xEB)`: the header-only 0x0EB REQSUBMAPNUM
     /// request the 0xA6 case 0 sends; the 0x10E s2c's MapNum is its answer,
     /// and the server answers nothing when the char is not npc-locked, so the
-    /// session's grace watchdog releases an unanswered hold
+    /// session cancels an unanswered request after its deadline
     /// (research/XiEvents/OpCodes/0x00A6.md;
     /// vendor/server/src/map/packets/c2s/0x0eb_reqsubmapnum.cpp).
     SubMapNum,
@@ -630,8 +630,7 @@ pub struct EventVm {
     /// (research/XiEvents/OpCodes/0x00A7.md).
     a7_result: u32,
     /// 0xA6's response result: the MapNum the 0x10E s2c carried, which case 2
-    /// writes into its work slot; 0 when the server answered nothing and the
-    /// session's grace watchdog released the hold
+    /// writes into its work slot
     /// (research/XiEvents/OpCodes/0x00A6.md).
     a6_submap_num: u32,
     /// The request this VM queued via REQEW and is still tracking, as (actor,
@@ -1706,8 +1705,7 @@ impl EventVm {
                 // holds on the 0x10E answer; case 1 yields until it lands; case
                 // 2 writes the answered MapNum into the work slot its +2 operand
                 // selects. The server answers 0 when the char is npc-locked and
-                // nothing otherwise, so an unanswered request is released by the
-                // session's grace watchdog, which lands case 2 on 0
+                // nothing otherwise; the session cancels an unanswered request
                 // (research/XiEvents/OpCodes/0x00A6.md). Retail spins on any
                 // other case byte, so authored data cannot hold one.
                 OP_A6_SUBMAP => match self.byte_at(1) {

@@ -515,6 +515,38 @@ async fn submap_reply_contract() {
     assert!(!server_ack_matches(&mut host.dialog, &packet));
 }
 
+async fn submap_reply_cancellation_diagnostic_contract() {
+    const OP_SUBMAP: u8 = 0xA6;
+    const OP_UNSUPPORTED_FRIENDPASS: u8 = 0x87;
+    let mut host = Host::new(
+        EventDat {
+            blocks: vec![block(
+                vec![OP_SUBMAP, 0, OP_UNSUPPORTED_FRIENDPASS, 0, OP_END],
+                vec![],
+            )],
+        },
+        FARE,
+    )
+    .await;
+    let body = 0u32.to_le_bytes();
+    let packet = framing::SubPacket {
+        opcode: map::s2c::REQSUBMAPNUM,
+        sequence: 0,
+        data: &body,
+    };
+    assert!(server_ack_matches(&mut host.dialog, &packet));
+    let step = host.step(Drive::ServerAck);
+    let Advance::Ended { error, .. } = step.advance else {
+        panic!("unsupported reply continuation did not cancel")
+    };
+    assert!(error.is_some());
+    let (events, mut receiver) = broadcast::channel(16);
+    let mut scope = crate::event_dialog::CutsceneScope::default();
+    super::finish_server_ack(error, &mut scope, &events);
+    assert!(matches!(receiver.try_recv(), Ok(AgentEvent::Error { .. })));
+    assert!(matches!(receiver.try_recv(), Ok(AgentEvent::EventEnded)));
+}
+
 async fn abort_contract() {
     let mut replaced = Host::new(position_dat(false), FARE).await;
     replaced.begin(FARE).await;
@@ -777,6 +809,7 @@ async fn event_state_contract() {
     acknowledgement_contract().await;
     server_reply_contract().await;
     submap_reply_contract().await;
+    submap_reply_cancellation_diagnostic_contract().await;
     abort_contract().await;
     action_event_gate_contract().await;
     item_stack_gate_contract().await;

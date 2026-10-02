@@ -67,6 +67,21 @@ pub(super) fn server_ack_matches(
     }
 }
 
+pub(super) fn finish_server_ack(
+    error: Option<String>,
+    scope: &mut crate::event_dialog::CutsceneScope,
+    events: &broadcast::Sender<AgentEvent>,
+) {
+    let exit = if let Some(message) = error {
+        let _ = events.send(AgentEvent::Error { message });
+        crate::event_dialog::EventSessionExit::Cancelled
+    } else {
+        crate::event_dialog::EventSessionExit::ScriptEnded
+    };
+    scope.end(exit, events);
+    let _ = events.send(AgentEvent::EventEnded);
+}
+
 pub(super) fn prepare(
     dialog: &mut DialogSession,
     drive: Drive,

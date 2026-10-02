@@ -4840,9 +4840,8 @@ async fn keepalive_loop(
                                         emit_event_speech_to_chat(&event_tx, &dialog);
                                         let _ = event_tx.send(AgentEvent::EventDialog { dialog });
                                     }
-                                    crate::event_dialog::Advance::Ended { .. } => {
-                                        cutscene.end(crate::event_dialog::EventSessionExit::ScriptEnded, &event_tx);
-                                        let _ = event_tx.send(AgentEvent::EventEnded);
+                                    crate::event_dialog::Advance::Ended { error, .. } => {
+                                        event_transport::finish_server_ack(error, &mut cutscene, &event_tx);
                                     }
                                     crate::event_dialog::Advance::AwaitServerAck(tag) => {
                                         send_pending_tag(map, &mut sub_seq, server_last_seq, current_zone_id, u, a, n, &tag).await;
