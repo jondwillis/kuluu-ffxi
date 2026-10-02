@@ -512,14 +512,20 @@ mod xidb_conn_tests {
 
     #[tokio::test]
     async fn refused_port_self_skips() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
+        let reserved_unlistened_socket = tokio::net::TcpSocket::new_v4().unwrap();
+        reserved_unlistened_socket
+            .bind(std::net::SocketAddr::from((
+                std::net::Ipv4Addr::LOCALHOST,
+                0,
+            )))
+            .unwrap();
+        let port = reserved_unlistened_socket.local_addr().unwrap().port();
 
         let got = xidb_conn(&db_url(port), HANDSHAKE_TIMEOUT)
             .await
             .expect("connect-refused must self-skip, not error");
         assert!(got.is_none());
+        drop(reserved_unlistened_socket);
     }
 }
 
