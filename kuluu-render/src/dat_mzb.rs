@@ -1504,11 +1504,6 @@ impl ZoneMeshLod {
 /// column-vector T*Rz*Ry*Rx*S — glam's *extrinsic* XYZ. The intrinsic
 /// `EulerRot::XYZ` is Rx*Ry*Rz, the reverse. Self-proven by the
 /// order-reversed inverse chain at ZoneRenderer.cpp ZoneRenderer::OpenMzb.
-///
-/// `UnderscoreAtStruct::InitMatrix` rebuilds an animated `_`/`@` block's matrix
-/// from its own copy of the same three vectors in the same order, so a door leaf
-/// re-poses by re-calling this with the routine's offset folded in — see
-/// [`crate::zone_doors::ZoneDoorLeaf::posed_transform`].
 pub fn placement_bevy_transform(scale: Vec3, rot: Vec3, trans: Vec3) -> Mat4 {
     let to_bevy = Mat4::from_cols(
         Vec4::new(1.0, 0.0, 0.0, 0.0),

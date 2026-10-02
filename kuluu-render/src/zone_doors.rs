@@ -45,15 +45,9 @@ const ROUTINE_CLOSE: [u8; 4] = *b"clos";
 const ROUTINE_OPEN_ON_ARRIVAL: [u8; 4] = *b"into";
 const ROUTINE_CLOSE_ON_ARRIVAL: [u8; 4] = *b"intc";
 
-/// A leaf's routine-driven displacement from its authored MZB placement pose —
-/// what a 0x0C/0x0D stage's `final_value` targets. Zero is the authored pose,
-/// which is why retail keeps a per-slot copy of the placement's TRS to rebuild
-/// from (research/XIClient `UnderscoreAtStruct::InitMatrix`).
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct DoorPose {
-    /// Radians per FFXI axis, added to the placement's authored Euler triple.
     pub rotation: Vec3,
-    /// Yalms per FFXI axis, added to the placement's authored translation.
     pub translation: Vec3,
 }
 
@@ -73,6 +67,20 @@ pub struct ZoneDoorLeaf {
     base_rot: Vec3,
     base_trans: Vec3,
     world_offset: Vec3,
+}
+
+#[derive(Component, Debug, Clone, Copy)]
+pub struct ZoneDoorMesh(pub ZoneDoorLeaf);
+
+impl DoorPose {
+    fn local_transform(self) -> Transform {
+        Transform::from_translation(self.translation).with_rotation(Quat::from_euler(
+            EulerRot::XYZEx,
+            self.rotation.x,
+            self.rotation.y,
+            self.rotation.z,
+        ))
+    }
 }
 
 pub type DoorLeafKey = (u32, u32);
@@ -110,12 +118,11 @@ impl ZoneDoorLeaf {
     /// The leaf's world matrix under `pose`. [`DoorPose::default`] reproduces the
     /// matrix the placement spawned with, bit for bit.
     pub fn posed_transform(&self, pose: DoorPose) -> Mat4 {
+        // retail-2026-09 FFXiMain.dll RVA 0xACF90 composes the animated
+        // local matrix with the cached initial leaf matrix through RVA 0x27D10.
         Mat4::from_translation(self.world_offset)
-            * placement_bevy_transform(
-                self.base_scale,
-                self.base_rot + pose.rotation,
-                self.base_trans + pose.translation,
-            )
+            * placement_bevy_transform(self.base_scale, self.base_rot, self.base_trans)
+            * pose.local_transform().to_matrix()
     }
 }
 
@@ -321,13 +328,13 @@ impl ZoneDoors {
         self.platform_heights.contains_key(&four_cc)
     }
 
-    /// The pose a leaf renders with: its swing, plus the lift height override for
-    /// a platform group, which replaces the placement's authored height outright
-    /// the way XIM's ZoneDrawer writes the actor's y over the object's.
     pub fn leaf_pose(&self, leaf: &ZoneDoorLeaf) -> DoorPose {
         let mut pose = self.pose(leaf.key());
         if let Some(&y) = self.platform_heights.get(&leaf.four_cc) {
-            pose.translation.y = y - leaf.authored_translation().y;
+            let base = leaf.posed_transform(DoorPose::default());
+            let mut translated = base.transform_point3(pose.translation);
+            translated.y = leaf.world_offset.y - y;
+            pose.translation = base.inverse().transform_point3(translated);
         }
         pose
     }
@@ -716,7 +723,7 @@ pub fn apply_zone_door_stages(
 pub fn animate_zone_door_leaves(
     time: Res<Time>,
     mut doors: ResMut<ZoneDoors>,
-    mut q: Query<(&ZoneDoorLeaf, &mut Transform)>,
+    mut q: Query<(&ZoneDoorMesh, &mut Transform)>,
 ) {
     if doors.leaves.values().any(LeafMotion::animating) {
         let frames = time.delta_secs() * ROUTINE_FPS;
@@ -724,8 +731,8 @@ pub fn animate_zone_door_leaves(
             motion.advance(frames);
         }
     }
-    for (leaf, mut transform) in &mut q {
-        let posed = Transform::from_matrix(leaf.posed_transform(doors.leaf_pose(leaf)));
+    for (mesh, mut transform) in &mut q {
+        let posed = doors.leaf_pose(&mesh.0).local_transform();
         if *transform != posed {
             *transform = posed;
         }
@@ -887,7 +894,7 @@ mod tests {
         let m = app
             .world()
             .entity(leaf)
-            .get::<Transform>()
+            .get::<GlobalTransform>()
             .unwrap()
             .to_matrix();
         m.transform_point3(Vec3::X)
@@ -901,7 +908,8 @@ mod tests {
     fn an_animation_byte_change_swings_the_tagged_leaves() {
         let swing = SSANDY_STABLES_SWING_DEG.to_radians();
         let mut app = App::new();
-        app.init_resource::<Time>()
+        app.add_plugins(bevy::transform::TransformPlugin)
+            .init_resource::<Time>()
             .init_resource::<SceneState>()
             .init_resource::<TrackedEntities>()
             .init_resource::<ZoneDoors>()
@@ -943,8 +951,12 @@ mod tests {
         let leaves: Vec<Entity> = (0..2)
             .map(|slot| {
                 let leaf = ZoneDoorLeaf::new(slot, &placement(&SSANDY_STABLES_DOOR, 0.0, 1.0));
-                app.world_mut()
+                let parent = app
+                    .world_mut()
                     .spawn((leaf, Transform::from_matrix(shut[slot as usize])))
+                    .id();
+                app.world_mut()
+                    .spawn((ZoneDoorMesh(leaf), Transform::default(), ChildOf(parent)))
                     .id()
             })
             .collect();
@@ -992,7 +1004,8 @@ mod tests {
     fn an_event_cue_swings_the_door_and_dedups_on_the_same_state() {
         let swing = SSANDY_STABLES_SWING_DEG.to_radians();
         let mut app = App::new();
-        app.init_resource::<Time>()
+        app.add_plugins(bevy::transform::TransformPlugin)
+            .init_resource::<Time>()
             .init_resource::<SceneState>()
             .init_resource::<TrackedEntities>()
             .init_resource::<ZoneDoors>()
@@ -1030,8 +1043,12 @@ mod tests {
         let leaves: Vec<Entity> = (0..2)
             .map(|slot| {
                 let leaf = ZoneDoorLeaf::new(slot, &placement(&SSANDY_STABLES_DOOR, 0.0, 1.0));
-                app.world_mut()
+                let parent = app
+                    .world_mut()
                     .spawn((leaf, Transform::from_matrix(shut[slot as usize])))
+                    .id();
+                app.world_mut()
+                    .spawn((ZoneDoorMesh(leaf), Transform::default(), ChildOf(parent)))
                     .id()
             })
             .collect();
@@ -1247,23 +1264,109 @@ mod tests {
     }
 
     #[test]
-    fn mirrored_leaf_keeps_the_stage_sign() {
+    fn mirrored_pair_free_edges_open_to_the_same_side() {
         let swing = SSANDY_STABLES_SWING_DEG.to_radians();
-        let pose = DoorPose {
-            rotation: Vec3::new(0.0, swing, 0.0),
-            ..Default::default()
-        };
-        // The second Southern San d'Oria leaf is the first mirrored through
-        // scale.z; one positive stage value swings both outward, so the renderer
-        // must not negate it per leaf.
-        let mirrored = ZoneDoorLeaf::new(1, &placement(&SSANDY_STABLES_DOOR, 0.0, -1.0));
-        let plain = ZoneDoorLeaf::new(0, &placement(&SSANDY_STABLES_DOOR, 0.0, 1.0));
-        let mirrored_yaw = mirrored.posed_transform(pose) * Vec3::X.extend(0.0);
-        let plain_yaw = plain.posed_transform(pose) * Vec3::X.extend(0.0);
-        assert!(
-            (mirrored_yaw - plain_yaw).length() < 1e-5,
-            "the mirror lives in the placement's scale, not in the stage value"
-        );
+        for mirror in [Vec3::new(-1.0, 1.0, 1.0), Vec3::new(1.0, 1.0, -1.0)] {
+            for angle in [swing, -swing] {
+                let pose = DoorPose {
+                    rotation: Vec3::Y * angle,
+                    ..Default::default()
+                };
+                let plain = ZoneDoorLeaf::new(0, &placement(&SSANDY_STABLES_DOOR, 0.0, 1.0));
+                let mut mirrored_placement = placement(&SSANDY_STABLES_DOOR, 0.0, 1.0);
+                mirrored_placement.scale = mirror.to_array();
+                let mirrored = ZoneDoorLeaf::new(1, &mirrored_placement);
+                let plain_edge = plain
+                    .posed_transform(DoorPose::default())
+                    .inverse()
+                    .transform_vector3(Vec3::X);
+                let mirrored_edge = mirrored
+                    .posed_transform(DoorPose::default())
+                    .inverse()
+                    .transform_vector3(-Vec3::X);
+                let plain_push = plain.posed_transform(pose).transform_vector3(plain_edge).z;
+                let mirrored_push = mirrored
+                    .posed_transform(pose)
+                    .transform_vector3(mirrored_edge)
+                    .z;
+                assert!(
+                    plain_push * mirrored_push > 0.0,
+                    "mirror={mirror:?}, angle={angle}, pushes={plain_push},{mirrored_push}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mesh_hierarchy_preserves_nonuniform_mirrored_affine_and_cleanup() {
+        const NONUNIFORM_SCALE: Vec3 = Vec3::new(-0.89, 0.82, 1.0);
+        const MATRIX_TOLERANCE: f32 = 1e-5;
+        let mut p = placement(&SSANDY_STABLES_DOOR, std::f32::consts::FRAC_PI_4, 1.0);
+        p.scale = NONUNIFORM_SCALE.to_array();
+        let leaf = ZoneDoorLeaf::new(0, &p);
+        let mut app = App::new();
+        app.add_plugins(bevy::transform::TransformPlugin)
+            .init_resource::<Time>()
+            .init_resource::<ZoneDoors>()
+            .add_systems(Update, animate_zone_door_leaves);
+        app.world_mut()
+            .resource_mut::<ZoneDoors>()
+            .leaves
+            .entry(leaf.key())
+            .or_default()
+            .snap(
+                StageKind::ModelRotation,
+                Vec3::Y * std::f32::consts::FRAC_PI_4,
+            );
+        let parent = app
+            .world_mut()
+            .spawn((
+                leaf,
+                Transform::from_matrix(leaf.posed_transform(DoorPose::default())),
+            ))
+            .id();
+        let mesh = app
+            .world_mut()
+            .spawn((ZoneDoorMesh(leaf), Transform::default(), ChildOf(parent)))
+            .id();
+        app.update();
+        let actual = app
+            .world()
+            .get::<GlobalTransform>(mesh)
+            .unwrap()
+            .to_matrix();
+        let pose = app.world().resource::<ZoneDoors>().leaf_pose(&leaf);
+        let expected = leaf.posed_transform(pose);
+        assert!((actual - expected)
+            .to_cols_array()
+            .iter()
+            .all(|v| v.abs() < MATRIX_TOLERANCE));
+        let flattened = Transform::from_matrix(expected).to_matrix();
+        assert!((flattened - expected)
+            .to_cols_array()
+            .iter()
+            .any(|v| v.abs() > MATRIX_TOLERANCE));
+        app.world_mut().entity_mut(parent).despawn();
+        assert!(app.world().get_entity(mesh).is_err());
+    }
+
+    #[test]
+    fn platform_world_height_survives_local_translation_composition() {
+        const PLATFORM_HEIGHT: f32 = 7.0;
+        const WORLD_OFFSET: Vec3 = Vec3::new(3.0, 4.0, 5.0);
+        const HEIGHT_TOLERANCE: f32 = 1e-5;
+        let mut p = placement(&SSANDY_STABLES_DOOR, std::f32::consts::FRAC_PI_4, -1.0);
+        p.scale[1] = 2.0;
+        p.rot[0] = std::f32::consts::FRAC_PI_4;
+        let leaf = ZoneDoorLeaf::new(0, &p).with_world_offset(WORLD_OFFSET);
+        let mut doors = ZoneDoors::default();
+        doors.set_platform_height(leaf.four_cc, PLATFORM_HEIGHT);
+        let actual = leaf
+            .posed_transform(doors.leaf_pose(&leaf))
+            .transform_point3(Vec3::ZERO);
+        assert!((actual.y - (WORLD_OFFSET.y - PLATFORM_HEIGHT)).abs() < HEIGHT_TOLERANCE);
+        doors.clear_platform_height(leaf.four_cc);
+        assert_eq!(doors.leaf_pose(&leaf), DoorPose::default());
     }
 
     #[test]
