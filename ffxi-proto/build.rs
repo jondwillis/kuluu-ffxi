@@ -224,16 +224,14 @@ fn main() -> Result<()> {
     check_map_opcodes_against_lsb(&s2c_names, &c2s_names)?;
     let mut event_query_wire = String::new();
     for (direction, entries) in [("C2S", &c2s_names), ("S2C", &s2c_names)] {
-        for member in ["FRIENDPASS", "RECIPE", "REQSUBMAPNUM"] {
-            let opcode = entries
-                .iter()
-                .find(|(_, name)| name == member)
-                .with_context(|| format!("{direction} {member} opcode"))?
-                .0;
-            event_query_wire.push_str(&format!(
-                "pub const {direction}_{member}: u16 = {opcode};\n"
-            ));
-        }
+        let opcode = entries
+            .iter()
+            .find(|(_, name)| name == "REQSUBMAPNUM")
+            .with_context(|| format!("{direction} REQSUBMAPNUM opcode"))?
+            .0;
+        event_query_wire.push_str(&format!(
+            "pub const {direction}_REQSUBMAPNUM: u16 = {opcode};\n"
+        ));
     }
     fs::write(out_dir.join("event_query_wire.rs"), event_query_wire)?;
 
