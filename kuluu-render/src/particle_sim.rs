@@ -1016,7 +1016,7 @@ fn advance_generator(g: &mut LiveGenerator, frames: f32) {
             emit(g, life);
         }
     } else if !g.auto_run && g.emit_window_frames <= 0.0 {
-        // .agents/skills/retail-observe/references/2026-10-01-level-up-scheduled-emission.md zero-window DAT inference.
+        // .agents/skills/retail-observe/references/2026-10-01-level-up-scheduled-emission.md native zero-duration clamp and first emission.
         if !g.stopped && !g.emit_culled && g.age_frames <= frames {
             for _ in 0..emission_count(g) {
                 emit(g, g.def.max_life_frames);
@@ -6023,7 +6023,28 @@ mod tests {
             .init_resource::<ParticleSimulator>()
             .add_message::<SchedulerStageEvent>()
             .add_systems(Update, spawn_particle_generators);
-        let actor = app.world_mut().spawn((Transform::default(), assets)).id();
+        let skeleton = retail_hume_m_skeleton().expect("installed HumeM skeleton is readable");
+        let pose = ffxi_actor::skeleton_instance::pose_world(
+            &skeleton,
+            |_| None,
+            ffxi_actor::skeleton_instance::RootTransform::identity(),
+            &[],
+        );
+        const ACTOR_WORLD: Vec3 = Vec3::new(7.0, 2.0, -3.0);
+        let def = assets
+            .particle_def(stage.stage.local_dir, &stage.stage.id)
+            .unwrap();
+        let joint = ffxi_actor::skeleton_instance::standard_joint_world_position(
+            &pose,
+            &skeleton,
+            def.attach_joint_source as usize,
+        )
+        .expect("the authored lettering source joint exists");
+        let expected_origin = ACTOR_WORLD
+            + crate::ffxi_actor_render::ffxi_to_bevy_basis() * joint
+            + Vec3::Y * def.base_position[1];
+        let actor = spawn_posed_actor(&mut app, &skeleton, &pose, ACTOR_WORLD);
+        app.world_mut().entity_mut(actor).insert(assets);
         app.world_mut().write_message(SchedulerStageEvent {
             actor,
             target: None,
@@ -6037,6 +6058,13 @@ mod tests {
             .iter_mut()
             .find(|g| g.def.mesh_id == LETTERING_MESH)
             .unwrap();
+        assert!(
+            g.origin
+                .abs_diff_eq(expected_origin, f32::EPSILON * ROUTINE_FPS),
+            "lettering origin {:?} must follow the posed authored joint {:?}",
+            g.origin,
+            expected_origin
+        );
         assert!(g.def.frames_per_emission > FIRST_TICK_FRAMES);
         assert!(g.def.init_velocity[1] < 0.0);
         advance_generator(g, FIRST_TICK_FRAMES);
