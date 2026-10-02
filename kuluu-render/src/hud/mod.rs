@@ -298,6 +298,11 @@ impl Plugin for HudPlugin {
         app.init_resource::<delivery::DeliveryScreenState>();
         app.init_resource::<delivery::DeliveryInventory>();
 
+        app.add_systems(
+            PostUpdate,
+            item_grid::sync_count_outlines.before(bevy::ui::UiSystems::Content),
+        );
+
         app.init_resource::<shop::ShopScreenState>();
         app.add_message::<shop::ShopRowActivated>();
         app.init_resource::<auction::AuctionScreenState>();
@@ -607,3 +612,5 @@ mod tests {
         );
     }
 }
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod quantity_capture;
