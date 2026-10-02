@@ -486,6 +486,17 @@ async fn submap_reply_contract() {
         host.dialog.pending_tag(),
         Some(ffxi_event::PendingTag::SubMapNum)
     );
+    let generic_body = map::event_position_wire::EVENT_RECV_PENDING.to_le_bytes();
+    let generic_ack = framing::SubPacket {
+        opcode: map::s2c::EVENTUCOFF,
+        sequence: 0,
+        data: &generic_body,
+    };
+    assert!(!server_ack_matches(&mut host.dialog, &generic_ack));
+    assert_eq!(
+        host.dialog.pending_tag(),
+        Some(ffxi_event::PendingTag::SubMapNum)
+    );
     let request = super::super::codec::build_subpacket_reqsubmapnum(0);
     let request = framing::walk_sub_packets(&request).next().unwrap().unwrap();
     assert_eq!(request.opcode, map::c2s::REQSUBMAPNUM);

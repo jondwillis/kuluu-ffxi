@@ -58,7 +58,10 @@ pub(super) fn server_ack_matches(
         map::s2c::EVENTUCOFF => {
             super::eventucoff_mode_of(sub.data)
                 == Some(map::event_position_wire::EVENT_RECV_PENDING)
-                && dialog.has_pending_tag()
+                && matches!(
+                    dialog.pending_tag(),
+                    Some(PendingTag::SendTag { .. } | PendingTag::SendXzy { .. })
+                )
         }
         _ => false,
     }
