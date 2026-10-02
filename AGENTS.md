@@ -142,6 +142,22 @@ Unavailable retail access should narrow the claim, not silently turn a community
 approximation into vanilla truth or block unrelated work. Product-only tooling
 and explicitly requested enhancements do not acquire a retail-parity gate.
 
+**Rendered evidence is part of completing UI work.** Before changing rendering,
+HUD, menus, camera, animation, or input behavior, use the `verify` skill to
+choose the runtime surface and the visible result to inspect. Build the changed
+client, drive the affected view, capture it, and open the capture for pixel
+inspection before closing the bead or claiming completion. Include the evidence
+path and observation in the final report. Prefer evidence captured directly
+from the game or derived from its production rendering pipeline. When direct
+evidence cannot be gathered, state the reason and the limits of any secondary
+evidence. Unit tests and source inspection do not satisfy this requirement.
+A commit does not clear it, and work in another worktree still belongs to this
+session. If a concrete build, launch, capture,
+or access failure prevents verification, capture the diagnostic, keep the bead
+open, and report verification as blocked. Build duration or effort already spent
+is not a reason to skip the drive. Waiving visual verification requires the
+user's explicit opt-out for that change.
+
 ### Build-time vendor scrape (no hand-maintained tables)
 
 `build.rs` in `ffxi-proto`/`ffxi-vocab`/`ffxi-dat`/`kuluu-nav`/`ffxi-audio` (sharing the `lsb-scrape` helper crate) reads LSB SQL/headers/lua and POLUtils XML out of `vendor/` and emits **compile-time Rust constants** (blowfish subkeys, zlib tables, msg/effect/job/spell/item names, zone-DAT id formulas, ROM file mappings). Never hand-copy these values — update the upstream pin and let the build regenerate them (see the `vendor-scrape` skill). The vendor submodules are **build-only**; nothing under `vendor/` is needed at runtime.
