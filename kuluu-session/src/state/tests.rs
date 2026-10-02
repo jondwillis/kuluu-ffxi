@@ -2209,6 +2209,30 @@ fn char_status_and_target_clear_both_move_the_byte() {
 /// A cutscene's 0x7E mount cue arms the local mount on the client; a stale on-foot
 /// 0x037 must not clobber it until the server re-asserts a mounted byte of its own.
 #[test]
+fn cutscene_mount_latch_releases_on_terminal_lifecycle() {
+    use ffxi_proto::decode::animation::{CHOCOBO, NONE};
+    for terminal in [
+        AgentEvent::CutsceneEnded,
+        AgentEvent::Disconnected {
+            reason: "fixture".into(),
+        },
+    ] {
+        let mut state = SessionState::default();
+        state.apply_event(&AgentEvent::CsMountArmed {
+            status: CHOCOBO,
+            mount_id: 0,
+        });
+        state.apply_event(&terminal);
+        assert!(!state.cs_mount_armed);
+        state.apply_event(&AgentEvent::SelfServerStatus {
+            status: NONE,
+            mount_id: 0,
+        });
+        assert_eq!(state.self_server_status, NONE);
+    }
+}
+
+#[test]
 fn cs_mount_cue_holds_against_stale_on_foot_char_status() {
     use ffxi_proto::decode::animation::{CHOCOBO, NONE};
     let mut s = SessionState::default();

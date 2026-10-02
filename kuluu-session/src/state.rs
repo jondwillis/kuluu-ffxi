@@ -582,11 +582,8 @@ pub struct SessionState {
 
     /// Latched when a cutscene's 0x7E mount cue arms the local player's mount
     /// (`AgentEvent::CsMountArmed`): the cue is a client-side write the server
-    /// never sees, so a 0x037 that still says "on foot" is stale until the
-    /// server re-asserts a mounted byte of its own (the rental CS's
-    /// `addStatusEffect(MOUNTED)` at event finish, surfaced as 0x037 status
-    /// 5/85). While latched, a non-mounted 0x037 byte is ignored rather than
-    /// clobbering the cue's write; a mounted byte releases the latch.
+    /// never sees. The override lasts only through the event or until the
+    /// server confirms the mount (vendor/server/scripts/effects/mounted.lua).
     #[serde(default)]
     pub cs_mount_armed: bool,
 
@@ -1956,7 +1953,9 @@ impl SessionState {
                     || self.diagnostics.stage != Some(Stage::Disconnected)
                     || self.logout_countdown.is_some()
                     || self.voyage.is_some()
-                    || self.widescan != WidescanList::default();
+                    || self.widescan != WidescanList::default()
+                    || self.cs_mount_armed;
+                self.cs_mount_armed = false;
                 self.stage = Stage::Disconnected;
                 self.diagnostics.stage = Some(Stage::Disconnected);
 
@@ -2472,10 +2471,14 @@ impl SessionState {
             | AgentEvent::KeyRotated { .. }
             | AgentEvent::CutsceneStarted { .. }
             | AgentEvent::CutsceneCue { .. }
-            | AgentEvent::CutsceneEnded
             | AgentEvent::MapOpen { .. }
             | AgentEvent::MapMarkerPlaced { .. }
             | AgentEvent::MapClosed => false,
+            AgentEvent::CutsceneEnded => {
+                let changed = self.cs_mount_armed;
+                self.cs_mount_armed = false;
+                changed
+            }
             AgentEvent::EventDialog { dialog } => {
                 let changed = self.dialog.as_ref() != Some(dialog);
                 self.dialog = Some(dialog.clone());
@@ -2567,11 +2570,6 @@ impl SessionState {
                 changed
             }
             AgentEvent::SelfServerStatus { status, mount_id } => {
-                // A 0x037 that still says "on foot" is stale while a cutscene's
-                // 0x7E mount cue holds the mount: the server only re-asserts the
-                // mount as a mounted byte of its own (the MOUNTED effect added at
-                // event finish, vendor/server/scripts/effects/mounted.lua). A
-                // mounted byte releases the latch; a non-mounted one is dropped.
                 if self.cs_mount_armed && !ffxi_proto::decode::animation::is_mounted(*status) {
                     return false;
                 }
