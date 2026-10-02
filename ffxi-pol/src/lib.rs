@@ -8,12 +8,14 @@
 //! The wire rules are read from the Viewer binaries of an install the user
 //! supplies; the observation records under
 //! `.agents/skills/retail-observe/references/` name the build behind each one.
-//! No host is built in: the caller names the service it is talking to.
+//! The host names the binaries carry are in `hosts` and `profile::host`; the
+//! transport layer takes a connector, so nothing here opens a socket.
 
 pub mod authcode;
 pub mod chat;
 pub mod crypto;
 pub mod error;
+pub mod hosts;
 pub mod profile;
 pub mod rng;
 pub mod rsa;

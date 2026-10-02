@@ -62,6 +62,16 @@ pub enum AuthFlavor {
     Json,
 
     Binary,
+
+    /// No auth server: the PlayOnline account services, signed in to
+    /// in-house (`crate::pol_inhouse`), issue the lobby session.
+    PlayOnline,
+}
+
+impl AuthFlavor {
+    pub fn uses_auth_server(self) -> bool {
+        !matches!(self, AuthFlavor::PlayOnline)
+    }
 }
 
 impl std::str::FromStr for AuthFlavor {
@@ -70,8 +80,9 @@ impl std::str::FromStr for AuthFlavor {
         match s.to_ascii_lowercase().as_str() {
             "json" | "lsb" => Ok(AuthFlavor::Json),
             "binary" | "hxi" | "horizon" => Ok(AuthFlavor::Binary),
+            "playonline" | "pol" => Ok(AuthFlavor::PlayOnline),
             other => Err(format!(
-                "unknown auth-flavor `{other}`; expected json|binary"
+                "unknown auth-flavor `{other}`; expected json|binary|playonline"
             )),
         }
     }
@@ -279,6 +290,9 @@ impl AuthClient {
     }
 
     pub async fn ensure_account(&self, username: &str, password: &str) -> Result<()> {
+        if self.flavor == AuthFlavor::PlayOnline {
+            bail!("a PlayOnline account is registered with Square Enix, not through Kuluu");
+        }
         if self.flavor == AuthFlavor::Binary {
             return self.ensure_account_binary(username, password).await;
         }
@@ -303,8 +317,8 @@ impl AuthClient {
         current_password: &str,
         new_password: &str,
     ) -> Result<()> {
-        if self.flavor == AuthFlavor::Binary {
-            bail!("change_password unsupported in binary auth flavor");
+        if self.flavor != AuthFlavor::Json {
+            bail!("change_password is only offered by the JSON auth flavor");
         }
         let payload = json!({
             "command": LOGIN_CHANGE_PASSWORD,
@@ -324,9 +338,28 @@ impl AuthClient {
         }
     }
 
+    /// Sign in to a PlayOnline account. The flavor authenticates two
+    /// identities, which `login` has no room for.
+    pub async fn login_playonline(
+        &self,
+        creds: crate::pol_inhouse::Credentials,
+    ) -> Result<AuthSession> {
+        if self.flavor != AuthFlavor::PlayOnline {
+            bail!("this server does not use PlayOnline accounts");
+        }
+        crate::pol_inhouse::login(creds).await
+    }
+
     pub async fn login(&self, username: &str, password: &str) -> Result<AuthSession> {
-        if self.flavor == AuthFlavor::Binary {
-            return self.login_binary(username, password).await;
+        match self.flavor {
+            AuthFlavor::Json => {}
+            AuthFlavor::Binary => return self.login_binary(username, password).await,
+            AuthFlavor::PlayOnline => {
+                bail!(
+                    "a PlayOnline sign-in needs both the PlayOnline and the Square Enix \
+                     identity; call login_playonline"
+                )
+            }
         }
         let payload = json!({
             "command": LOGIN_ATTEMPT,

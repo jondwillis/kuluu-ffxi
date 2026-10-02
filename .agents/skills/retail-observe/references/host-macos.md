@@ -40,6 +40,31 @@ client's DirectX 8 rendering is. Prefer one of them over assembling your own:
 - **Plain `wine`** -- workable for the launcher and tools; the game's D3D8 path is
   the part that needs a wrapper's attention.
 
+### The wine binary is a variable, not a constant
+
+FFXI on Mac ships a **patched CrossOver build** (`athei/wine-build`, the
+`cx-*-macos-x86_64` releases) and treats it as mandatory, because a stock build
+"exits one second after login" -- its `docs/WINE-BUILD.md` measures the two side
+by side in one prefix. It is a self-contained tree: unpack it and point the
+profile's `runner` at its `bin/wine`, with `WINEPREFIX` in the environment.
+
+Two things follow for this skill. **Give it its own prefix.** A prefix built by
+one wine build and then opened by another spends minutes in `wineboot` and can
+wedge there; a fresh prefix boots in about two. And **`show` starts working**:
+`System Events` can raise the CrossOver build's windows, where the Homebrew
+build exposes no AX windows at all and reports the terminal as frontmost no
+matter what you do -- which is worth knowing before you go hunting a focus bug
+that belongs to the wine build.
+
+A fresh prefix needs the client's own registry facts put back, none of which
+come from the install: the PlayOnline `InstallFolder` and `Interface` values
+(see the traps below), `regsvr32` for the viewer's `polcore.dll` and the game's
+`FFXi.dll` / `FFXiMain.dll` / `FFXiVersions.dll`, and the
+`PlayOnlineUS\SquareEnix\FinalFantasyXI` settings key -- with no settings key
+the client exits at boot exactly as if the interface check had failed. Those
+registrations are per-install, so switching the prefix between two installs
+means re-running `regsvr32` for the one you want.
+
 What was verified on this host (macOS 26, Apple Silicon, Homebrew `wine-stable`
 11.0, driving a Win32 app under Wine):
 

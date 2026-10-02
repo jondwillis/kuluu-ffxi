@@ -62,3 +62,10 @@ tracing-subscriber.workspace = true
 # viewer command (chat / screenshot).
 name = "relay-probe"
 required-features = ["relay"]
+
+# Only the in-house PlayOnline login draws randomness, and it runs on blocking
+# TCP sockets, so it exists only where those do. Declaring the system source
+# unconditionally would reach the browser viewer through feature unification
+# and ask getrandom for a backend wasm32 has no default for.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rand = { workspace = true, features = ["std_rng", "sys_rng"] }

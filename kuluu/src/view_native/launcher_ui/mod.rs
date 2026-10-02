@@ -19,7 +19,6 @@ mod server_version_check;
 mod settings;
 mod updater;
 
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use crate::launcher_store::{AuthFlavorKind, ServerProfile};
@@ -35,8 +34,9 @@ use super::AppPhase;
 
 pub(crate) fn apply_server_profile(commands: &mut Commands, profile: &ServerProfile) {
     let flavor = match profile.flavor {
-        AuthFlavorKind::Json | AuthFlavorKind::PlayOnline => AuthFlavor::Json,
+        AuthFlavorKind::Json => AuthFlavor::Json,
         AuthFlavorKind::Binary => AuthFlavor::Binary,
+        AuthFlavorKind::PlayOnline => AuthFlavor::PlayOnline,
     };
     let auth = Arc::new(AuthClient::with_flavor_and_version(
         profile.host.clone(),
@@ -49,11 +49,11 @@ pub(crate) fn apply_server_profile(commands: &mut Commands, profile: &ServerProf
         profile.data_port,
         profile.view_port,
     ));
-    commands.insert_resource(LauncherClients {
-        auth,
-        lobby,
-        session_source: SessionSource::for_profile(profile),
-    });
+    commands.insert_resource(LauncherClients { auth, lobby });
+    // A lobby handle belongs to the server that opened it, so anything left
+    // over from the previous profile would be reused against a server that
+    // never issued it. Switching profiles drops it.
+    commands.insert_resource(OpenedLobby::default());
     commands.insert_resource(ServerInfo {
         server: profile.host.clone(),
         profile_name: Some(profile.name.clone()),
@@ -272,6 +272,8 @@ pub(crate) enum LoginField {
     #[default]
     User,
     Password,
+    PolId,
+    PolPassword,
 }
 
 #[derive(Resource, Default)]
@@ -282,10 +284,36 @@ pub(crate) struct LoginForm {
 
     pub remember_password: bool,
 
-    /// A PlayOnline profile signing in without the Viewer, running the
-    /// in-house account handshake rather than reading a session file.
-    /// Experimental: the handshake is not yet complete end to end.
-    pub pol_in_house: bool,
+    /// A PlayOnline account carries two identities and the handshake uses
+    /// both, so `user`/`pass` hold the Square Enix pair and these hold the
+    /// PlayOnline pair. Both are empty for every other auth flavor.
+    pub pol_id: String,
+    pub pol_pass: String,
+}
+
+impl LoginForm {
+    /// Whether the form has everything the flavor's login needs. A PlayOnline
+    /// account's Square Enix id is optional, exactly as the Viewer treats it,
+    /// but both passwords and the PlayOnline id are not.
+    pub fn is_complete(&self, playonline: bool) -> bool {
+        if self.pass.is_empty() {
+            return false;
+        }
+        if !playonline {
+            return !self.user.is_empty();
+        }
+        !self.pol_id.is_empty() && !self.pol_pass.is_empty()
+    }
+
+    /// The identifier a saved account is keyed on: whichever of the flavor's
+    /// identities always exists.
+    pub fn account_key(&self, playonline: bool) -> &str {
+        if playonline {
+            &self.pol_id
+        } else {
+            &self.user
+        }
+    }
 }
 
 #[allow(dead_code)]
@@ -303,7 +331,6 @@ pub(crate) enum ServerEditField {
     ClientVer,
     VerLock,
     PreferredClient,
-    PolSessionFile,
 }
 
 #[allow(dead_code)]
@@ -315,8 +342,7 @@ impl ServerEditField {
             Self::AuthPort => Self::DataPort,
             Self::DataPort => Self::ViewPort,
             Self::ViewPort => Self::Flavor,
-            Self::Flavor => Self::PolSessionFile,
-            Self::PolSessionFile => Self::XiloaderVersion,
+            Self::Flavor => Self::XiloaderVersion,
             Self::XiloaderVersion => Self::VersionCheckUrl,
             Self::VersionCheckUrl => Self::ClientVer,
             Self::ClientVer => Self::VerLock,
@@ -348,7 +374,6 @@ pub(crate) struct ServerEditForm {
     pub client_ver: String,
     pub ver_lock: Option<u8>,
     pub preferred_client: Option<String>,
-    pub pol_session_file: String,
     pub show_advanced: bool,
     #[allow(dead_code)]
     pub focus: ServerEditField,
@@ -385,11 +410,6 @@ impl ServerEditForm {
             client_ver: p.client_ver.clone().unwrap_or_default(),
             ver_lock: p.ver_lock,
             preferred_client: p.preferred_client.clone(),
-            pol_session_file: p
-                .pol_session_file
-                .as_ref()
-                .map(|f| f.display().to_string())
-                .unwrap_or_default(),
             show_advanced,
             focus: ServerEditField::default(),
             editing_index: None,
@@ -512,40 +532,23 @@ impl ServerInfo {
     }
 }
 
-/// Where the lobby session for the current profile comes from.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum SessionSource {
-    AuthServer,
-    /// The PlayOnline Viewer's session, read from the file the profile names
-    /// or from kuluu_session::playonline::default_session_file.
-    PlayOnline {
-        session_file: Option<PathBuf>,
-    },
-}
-
-impl SessionSource {
-    pub fn for_profile(profile: &ServerProfile) -> Self {
-        if profile.is_playonline() {
-            Self::PlayOnline {
-                session_file: profile.pol_session_file.clone(),
-            }
-        } else {
-            Self::AuthServer
-        }
-    }
-}
-
 #[derive(Resource, Clone)]
 pub(crate) struct LauncherClients {
     pub auth: Arc<AuthClient>,
     pub lobby: Arc<LobbyClient>,
-    pub session_source: SessionSource,
 }
 
 #[derive(Default)]
 pub(crate) struct OpenedLobbyInner {
     pub handle: Option<kuluu_session::lobby_client::LobbyHandle>,
     pub auth: Option<kuluu_session::auth_client::AuthSession>,
+}
+
+impl OpenedLobbyInner {
+    #[cfg(test)]
+    pub fn is_empty(&self) -> bool {
+        self.handle.is_none() && self.auth.is_none()
+    }
 }
 
 #[derive(Resource, Default)]
@@ -555,6 +558,9 @@ pub(crate) struct OpenedLobby(pub Mutex<OpenedLobbyInner>);
 pub(crate) struct Credentials {
     pub user: String,
     pub pass: String,
+    /// The PlayOnline identity, for the flavor that authenticates two.
+    pub pol_id: String,
+    pub pol_pass: String,
 }
 
 #[derive(Resource, Default)]
@@ -655,11 +661,7 @@ pub(crate) fn register(
             server: server.to_string(),
             profile_name: None,
         })
-        .insert_resource(LauncherClients {
-            auth,
-            lobby,
-            session_source: SessionSource::AuthServer,
-        })
+        .insert_resource(LauncherClients { auth, lobby })
         .insert_resource(OpenedLobby::default())
         .insert_resource(Credentials::default())
         .insert_resource(CharListData::default())
@@ -1267,6 +1269,84 @@ fn direct_mode_charlist_autoselect(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn switching_server_profiles_drops_the_lobby_opened_by_the_last_one() {
+        let mut app = App::new();
+        app.insert_resource(OpenedLobby::default());
+        app.world_mut()
+            .resource::<OpenedLobby>()
+            .0
+            .lock()
+            .unwrap()
+            .auth = Some(kuluu_session::auth_client::AuthSession {
+            account_id: 1,
+            session_hash: [7u8; kuluu_session::auth_client::SESSION_HASH_LEN],
+            auth_code: kuluu_session::auth_client::LobbyAuthCode::NONE,
+        });
+        assert!(!app
+            .world()
+            .resource::<OpenedLobby>()
+            .0
+            .lock()
+            .unwrap()
+            .is_empty());
+
+        let profile = crate::launcher_store::ServerProfile::playonline_defaults(
+            "PlayOnline",
+            ffxi_pol::hosts::LOBBY_HOST,
+        );
+        app.add_systems(Update, move |mut commands: Commands| {
+            apply_server_profile(&mut commands, &profile);
+        });
+        app.update();
+
+        assert!(
+            app.world()
+                .resource::<OpenedLobby>()
+                .0
+                .lock()
+                .unwrap()
+                .is_empty(),
+            "a handle from the previous server survived the switch"
+        );
+    }
+
+    #[test]
+    fn a_playonline_form_needs_both_identities_but_not_the_square_enix_id() {
+        let mut form = LoginForm {
+            user: String::new(),
+            pass: "sqexsecret".to_string(),
+            pol_id: "XAAA0000".to_string(),
+            pol_pass: "polsecret".to_string(),
+            ..default()
+        };
+        assert!(form.is_complete(true));
+        // The account is keyed on the identity that always exists.
+        assert_eq!(form.account_key(true), "XAAA0000");
+
+        form.pol_pass.clear();
+        assert!(!form.is_complete(true));
+        form.pol_pass = "polsecret".to_string();
+        form.pass.clear();
+        assert!(!form.is_complete(true));
+    }
+
+    #[test]
+    fn every_other_flavor_still_needs_its_username() {
+        let form = LoginForm {
+            user: "someone".to_string(),
+            pass: "secret".to_string(),
+            ..default()
+        };
+        assert!(form.is_complete(false));
+        assert_eq!(form.account_key(false), "someone");
+        assert!(!LoginForm {
+            pass: "secret".to_string(),
+            ..default()
+        }
+        .is_complete(false));
+    }
     use super::*;
     use bevy::ecs::system::RunSystemOnce;
     use bevy::input_focus::InputFocus;
@@ -1379,7 +1459,6 @@ mod tests {
                 ffxi_proto::login::LOGIN_DATA_PORT,
                 ffxi_proto::login::LOGIN_VIEW_PORT,
             )),
-            session_source: SessionSource::AuthServer,
         })
         .init_resource::<InputFocus>();
         app

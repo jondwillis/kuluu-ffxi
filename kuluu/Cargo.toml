@@ -117,6 +117,7 @@ debug-menu = ["kuluu-render?/debug-menu"]
 [dependencies]
 winit = { version = "0.30", default-features = false, optional = true }
 kuluu-session = { path = "../kuluu-session" }
+ffxi-pol = { path = "../ffxi-pol" }
 ffxi-proto = { path = "../ffxi-proto" }
 ffxi-vocab = { path = "../ffxi-vocab" }
 kuluu-nav = { path = "../kuluu-nav" }

@@ -147,36 +147,148 @@ fn cipher_encrypt(data: &[u8]) -> (Vec<u8>, [u8; 8]) {
 
 /// The 0x24-byte community request payload. It carries the world/service
 /// selection only; the member is bound by the request header authenticator.
-/// The fields come from the preceding world-select transaction.
+/// The world select sends the head of this same buffer and its reply fills
+/// the rest, so `SelectReply::confirm` is what normally builds one.
 pub struct CommunityRequest {
-    pub world_id: u8,
+    /// polcore `0x1001d7e0`: which of the account's content entries to play,
+    /// as the six-bit ordinal the Viewer shows as "Content ID-N". It is not a
+    /// world number; the world is the service slot below.
+    pub content_index: u8,
     pub service_available: bool,
+    /// Which of the content entry's eight service slots was selected.
     pub service_index: u8,
-    pub context_default: bool,
+    /// polcore writes the negation of its context flag here, so this is set
+    /// when no context has been established.
+    pub context_unset: bool,
     pub region: u16,
     pub world_index_plus1: u8,
-    pub flag_d8: bool,
+    pub service_flag: bool,
+    /// Set when every parameter came from the cached defaults rather than
+    /// being supplied by the caller.
     pub cached: bool,
 }
 
 /// The community request payload length before its checksum and encipherment.
 pub const REQUEST_PAYLOAD_LEN: usize = 0x24;
+/// polcore `0x1001d490` sends only this much of the buffer for a world select.
+pub const SELECT_PAYLOAD_LEN: usize = 0x14;
 const REQUEST_CONST_FLAG: u8 = 1;
 
+/// polcore `0x1001d220`: the region the selection globals start at, before
+/// any world select has confirmed one.
+const REGION_DEFAULT: u16 = 1000;
+
 impl CommunityRequest {
+    /// What a client that has never selected anything asks with. polcore's
+    /// selection globals start with no content entry and no world, and its
+    /// request builder turns that into a zeroed entry and index; the cached
+    /// flag is clear because nothing has been confirmed yet.
+    pub fn initial() -> Self {
+        Self {
+            content_index: 0,
+            service_available: false,
+            service_index: 0,
+            context_unset: true,
+            region: REGION_DEFAULT,
+            world_index_plus1: 0,
+            service_flag: false,
+            cached: false,
+        }
+    }
+
     /// polcore `0x1001d7e0`: build the request payload.
     pub fn payload(&self) -> [u8; REQUEST_PAYLOAD_LEN] {
         let mut body = [0u8; REQUEST_PAYLOAD_LEN];
-        body[0x10] = self.world_id;
+        body[0x10] = self.content_index;
         body[0x11] = u8::from(self.service_available);
         body[0x12] = self.service_index;
-        body[0x13] = u8::from(self.context_default);
+        body[0x13] = u8::from(self.context_unset);
         body[0x14..0x16].copy_from_slice(&self.region.to_le_bytes());
         body[0x16] = self.world_index_plus1;
-        body[0x17] = u8::from(self.flag_d8);
+        body[0x17] = u8::from(self.service_flag);
         body[0x18] = u8::from(self.cached);
         body[0x19] = REQUEST_CONST_FLAG;
         body
+    }
+}
+
+/// The world-select reply body as it arrives. polcore reads a fixed 0x80
+/// bytes for it, which like every declared body length counts the four-byte
+/// checksum the trailer carries.
+pub const SELECT_REPLY_WIRE_LEN: usize = 0x80;
+/// What is left once the trailer is stripped, which is what `parse` reads.
+/// The client reads the leading sixteen bytes of it and one flag near the end.
+pub const SELECT_REPLY_LEN: usize = SELECT_REPLY_WIRE_LEN - crate::profile::BODY_CHECKSUM_LEN;
+/// A content entry is addressed by a six-bit ordinal, so an index at or above
+/// this is not one.
+const CONTENT_INDEX_LIMIT: u8 = 0x40;
+/// polcore `0x1001d220` initialises the world index to this when the reply
+/// names no world.
+const WORLD_INDEX_DEFAULT: u8 = 4;
+const SELECT_CACHED_OFFSET: usize = 0x76;
+const SELECT_CACHED_BIT: u8 = 1;
+const SELECT_CONTEXT_SET: u8 = 1;
+
+/// polcore `0x1001d490` case 6: what the world select establishes. Every one
+/// of these lands in a global that the next community request reads back, so
+/// the reply is how a selection is confirmed rather than merely acknowledged.
+/// It carries no lobby address; the two dwords at 0x08 are stored and never
+/// read again by any code in the module.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SelectReply {
+    /// `None` when the reply names no world, which also resets the index.
+    pub content_index: Option<u8>,
+    pub service_available: bool,
+    pub service_index: u8,
+    pub context_set: bool,
+    pub region: u16,
+    pub world_index: u8,
+    pub service_flag: u8,
+    /// Stored by polcore and read by nothing in it.
+    pub opaque: [u32; 2],
+    pub cached: bool,
+}
+
+impl SelectReply {
+    pub fn parse(body: &[u8]) -> crate::Result<Self> {
+        if body.len() < SELECT_REPLY_LEN {
+            return Err(crate::Error::protocol("a world-select reply is 0x80 bytes"));
+        }
+        let named = body[0x06] != 0;
+        Ok(Self {
+            content_index: (named && body[0x00] < CONTENT_INDEX_LIMIT).then_some(body[0x00]),
+            service_available: body[0x01] != 0,
+            service_index: body[0x02],
+            context_set: body[0x03] == SELECT_CONTEXT_SET,
+            region: u16::from_le_bytes(body[0x04..0x06].try_into().unwrap()),
+            world_index: if named {
+                body[0x06] - 1
+            } else {
+                WORLD_INDEX_DEFAULT
+            },
+            service_flag: body[0x07],
+            opaque: [
+                u32::from_le_bytes(body[0x08..0x0C].try_into().unwrap()),
+                u32::from_le_bytes(body[0x0C..0x10].try_into().unwrap()),
+            ],
+            cached: body[SELECT_CACHED_OFFSET] & SELECT_CACHED_BIT != 0,
+        })
+    }
+
+    /// The community request this reply establishes. `previous` supplies the
+    /// content index when the reply named no world, which is how polcore's
+    /// globals behave: that case leaves the stored index alone.
+    pub fn confirm(&self, previous: &CommunityRequest) -> CommunityRequest {
+        CommunityRequest {
+            content_index: self.content_index.unwrap_or(previous.content_index),
+            service_available: self.service_available,
+            service_index: self.service_index,
+            context_unset: !self.context_set,
+            region: self.region,
+            world_index_plus1: self.world_index + 1,
+            service_flag: self.service_flag != 0,
+            cached: self.cached,
+        }
     }
 }
 
@@ -269,23 +381,80 @@ mod tests {
         assert_eq!(hex::encode(tag), "b8b15ec730836d17");
     }
 
-    #[test]
-    fn the_request_body_places_the_world_selection() {
-        let req = CommunityRequest {
-            world_id: 0x1C,
+    fn a_request() -> CommunityRequest {
+        CommunityRequest {
+            content_index: 0x1C,
             service_available: true,
             service_index: 3,
-            context_default: true,
+            context_unset: true,
             region: 0x03E8,
             world_index_plus1: 5,
-            flag_d8: true,
+            service_flag: true,
             cached: false,
-        };
-        let body = req.payload();
+        }
+    }
+
+    #[test]
+    fn the_request_body_places_the_world_selection() {
+        let body = a_request().payload();
         assert_eq!(&body[..0x10], &[0u8; 0x10]);
         assert_eq!(body[0x10], 0x1C);
         assert_eq!(u16::from_le_bytes([body[0x14], body[0x15]]), 0x03E8);
         assert_eq!(body[0x19], 1);
+        // The world select sends the head of the same buffer, so it carries
+        // the content entry and its service slot but not the region.
+        assert_eq!(&body[..SELECT_PAYLOAD_LEN][0x10..], &[0x1C, 1, 3, 1]);
+    }
+
+    #[test]
+    fn the_world_select_reply_confirms_the_selection() {
+        let mut reply = [0u8; SELECT_REPLY_LEN];
+        reply[0x00] = 0x1C;
+        reply[0x01] = 1;
+        reply[0x02] = 3;
+        reply[0x03] = 1;
+        reply[0x04..0x06].copy_from_slice(&0x03E8u16.to_le_bytes());
+        reply[0x06] = 5;
+        reply[0x07] = 1;
+        reply[0x76] = 1;
+
+        let decoded = SelectReply::parse(&reply).unwrap();
+        assert_eq!(decoded.content_index, Some(0x1C));
+        assert_eq!(decoded.world_index, 4);
+        assert_eq!(decoded.region, 0x03E8);
+        assert!(decoded.context_set);
+        assert!(decoded.cached);
+
+        let confirmed = decoded.confirm(&a_request());
+        assert_eq!(
+            confirmed.payload()[0x10..0x1A],
+            [0x1C, 1, 3, 0, 0xE8, 0x03, 5, 1, 1, 1]
+        );
+    }
+
+    #[test]
+    fn a_reply_that_names_no_world_keeps_the_previous_content() {
+        let reply = [0u8; SELECT_REPLY_LEN];
+        let decoded = SelectReply::parse(&reply).unwrap();
+        assert_eq!(decoded.content_index, None);
+        assert_eq!(decoded.world_index, 4);
+        assert_eq!(decoded.confirm(&a_request()).content_index, 0x1C);
+        assert!(SelectReply::parse(&reply[..SELECT_REPLY_LEN - 1]).is_err());
+    }
+
+    #[test]
+    fn the_reply_is_sized_by_its_payload_not_its_wire_body() {
+        // polcore reads a fixed 0x80-byte body, and like every declared
+        // length that counts the checksum trailer, so a reply that parsed
+        // only at the wire width would reject every real one.
+        assert_eq!(
+            SELECT_REPLY_LEN + crate::profile::BODY_CHECKSUM_LEN,
+            SELECT_REPLY_WIRE_LEN
+        );
+        let wire = crate::profile::seal_body(&[0u8; SELECT_REPLY_LEN]);
+        assert_eq!(wire.len(), SELECT_REPLY_WIRE_LEN);
+        let payload = crate::profile::open_body(&wire).unwrap();
+        assert!(SelectReply::parse(&payload).is_ok());
     }
 
     #[test]

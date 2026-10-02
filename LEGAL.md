@@ -119,13 +119,15 @@ reference promptly.
 Kuluu is an interoperable client. It speaks the FFXI wire protocol as the
 retail client does, and it can be pointed at any server that speaks it:
 community-run servers (LandSandBoat, Phoenix) or, where a player already holds
-an account, the official service through the PlayOnline Viewer they own.
+an account, the official service, signing in to the PlayOnline account with
+the player's own credentials the way the Viewer they own does.
 
 Connecting with a third-party client may breach the terms of service of the
 server you connect to. Square Enix's FINAL FANTASY XI User Agreement and
 PlayOnline terms prohibit third-party programs, and many community servers
 have rules of their own. Kuluu does not bypass, patch, or inject into any
-Square Enix program, and it ships no server address. Read the rules of the
+Square Enix program; the only official addresses it carries are the ones the
+retail client itself resolves. Read the rules of the
 server you intend to use before you log in; any consequence to your account
 is yours alone.
 

@@ -9,7 +9,7 @@ use bevy::prelude::*;
 use bevy::ui::{Checked, ComputedNode, Overflow, ScrollPosition, UiGlobalTransform};
 use bevy::ui_widgets::{Activate, ValueChange};
 
-use crate::launcher_store::{self, keyring_account_key, KEYRING_SERVICE};
+use crate::launcher_store::{self, keyring_account_key, keyring_square_enix_key, KEYRING_SERVICE};
 use crate::secret_store::SecretStore;
 
 use super::brand::{spawn_brand_mark, BrandMark};
@@ -22,11 +22,11 @@ use super::server_edit::ver_lock_label;
 use super::server_version_check::{ServerVersionStatus, VersionViolation};
 use super::{
     Credentials, DatSetupReturn, LauncherClients, LauncherState, LoginErrorMsg, LoginErrorReturn,
-    LoginField, LoginForm, ServerEditForm, ServerInfo, ServerSelectForm, SessionSource,
+    LoginField, LoginForm, ServerEditForm, ServerInfo, ServerSelectForm,
 };
 use crate::view_native::widgets::text_field::{text_field, TextField, TextFieldSubmitted};
 use crate::view_native::widgets::{TextFieldDisplay, TextFieldProps};
-use kuluu_session::playonline;
+use kuluu_session::auth_client::AuthFlavor;
 
 #[derive(Component)]
 pub(super) struct LoginUiRoot;
@@ -37,13 +37,17 @@ pub(super) struct LoginCredentialField;
 #[derive(Resource, Default)]
 pub(super) struct LoginUiDirty(pub bool);
 
-fn saved_accounts_for(form: &ServerSelectForm, info: &ServerInfo) -> (String, Vec<(String, bool)>) {
+/// A saved account as the sign-in form needs it: the identity it is keyed on,
+/// whether a password was kept, and the Square Enix id that rides with it.
+type SavedEntry = (String, bool, String);
+
+fn saved_accounts_for(form: &ServerSelectForm, info: &ServerInfo) -> (String, Vec<SavedEntry>) {
     let server_key = form.selected.clone().unwrap_or_else(|| info.server.clone());
     let accts = launcher_store::load()
         .accounts
         .into_iter()
         .filter(|a| a.server_name == server_key)
-        .map(|a| (a.username, a.remember_password))
+        .map(|a| (a.username, a.remember_password, a.square_enix_id))
         .collect();
     (server_key, accts)
 }
@@ -66,7 +70,7 @@ pub(super) fn spawn_login_ui(
         &version,
         &era,
         &mark,
-        &clients.session_source,
+        clients.auth.flavor,
     );
 }
 
@@ -97,7 +101,7 @@ pub(super) fn rebuild_login_ui_system(
         &version,
         &era,
         &mark,
-        &clients.session_source,
+        clients.auth.flavor,
     );
 }
 
@@ -123,13 +127,18 @@ fn build_login_ui(
     version: &ServerVersionStatus,
     era: &ClientEraStatus,
     mark: &BrandMark,
-    source: &SessionSource,
+    flavor: AuthFlavor,
 ) {
     let user_initial = form.user.clone();
     let pass_initial = form.pass.clone();
+    let pol_id_initial = form.pol_id.clone();
+    let pol_pass_initial = form.pol_pass.clone();
     let remember = form.remember_password;
-    let active_user = form.user.clone();
+    let active_user = form
+        .account_key(flavor == AuthFlavor::PlayOnline)
+        .to_string();
     let (server_key, accts) = saved_accounts_for(server_form, server);
+    let playonline = flavor == AuthFlavor::PlayOnline;
 
     commands
         .spawn((LoginUiRoot, screen_root()))
@@ -145,38 +154,84 @@ fn build_login_ui(
                 spawn_version_banner(panel, version);
                 spawn_client_era_banner(panel, era);
 
-                if let SessionSource::PlayOnline { session_file } = source {
-                    spawn_playonline_sign_in(
-                        panel,
-                        server.profile_name.as_deref(),
-                        session_file.as_deref(),
-                        login_blocked(version, era),
-                    );
-                } else {
-                    spawn_saved_accounts_row(panel, &server_key, &active_user, &accts);
+                if playonline && !terms_acknowledged(server.profile_name.as_deref()) {
+                    spawn_terms_gate(panel, server.profile_name.as_deref());
+                    return;
+                }
 
-                    spawn_field(panel, "Username", false, &user_initial, LoginField::User);
-                    spawn_field(panel, "Password", true, &pass_initial, LoginField::Password);
+                {
+                    spawn_saved_accounts_row(panel, &server_key, &active_user, &accts, playonline);
 
-                    let mut cb = panel.spawn(checkbox_bundle(
-                        (),
-                        Spawn((Text::new("Remember password"), ThemedText)),
-                    ));
-                    if remember {
-                        cb.insert(Checked);
+                    if playonline {
+                        for line in POL_CREDENTIAL_HINTS {
+                            panel.spawn((Text::new(line), ThemedText));
+                        }
+                        spawn_field(
+                            panel,
+                            "PlayOnline ID",
+                            false,
+                            &pol_id_initial,
+                            LoginField::PolId,
+                            playonline,
+                        );
+                        spawn_field(
+                            panel,
+                            "PlayOnline password",
+                            true,
+                            &pol_pass_initial,
+                            LoginField::PolPassword,
+                            playonline,
+                        );
                     }
-                    cb.observe(
-                        |ev: On<ValueChange<bool>>,
-                         mut form: ResMut<LoginForm>,
-                         mut commands: Commands| {
-                            form.remember_password = ev.value;
-                            if ev.value {
-                                commands.entity(ev.source).insert(Checked);
-                            } else {
-                                commands.entity(ev.source).remove::<Checked>();
-                            }
-                        },
+
+                    let user_label = if playonline {
+                        "Square Enix ID"
+                    } else {
+                        "Username"
+                    };
+                    let pass_label = if playonline {
+                        "Square Enix password"
+                    } else {
+                        "Password"
+                    };
+                    spawn_field(
+                        panel,
+                        user_label,
+                        false,
+                        &user_initial,
+                        LoginField::User,
+                        playonline,
                     );
+                    spawn_field(
+                        panel,
+                        pass_label,
+                        true,
+                        &pass_initial,
+                        LoginField::Password,
+                        playonline,
+                    );
+
+                    {
+                        let mut cb = panel.spawn(checkbox_bundle(
+                            (),
+                            Spawn((Text::new("Remember password"), ThemedText)),
+                        ));
+                        if remember {
+                            cb.insert(Checked);
+                        }
+                        cb.observe(
+                            |ev: On<ValueChange<bool>>,
+                             mut form: ResMut<LoginForm>,
+                             mut commands: Commands| {
+                                form.remember_password = ev.value;
+                                if ev.value {
+                                    commands.entity(ev.source).insert(Checked);
+                                } else {
+                                    commands.entity(ev.source).remove::<Checked>();
+                                }
+                            },
+                        );
+                    }
 
                     let blocked = login_blocked(version, era);
 
@@ -192,14 +247,17 @@ fn build_login_ui(
                         ))
                         .insert(DefaultFocusTarget)
                         .observe(
-                            |_ev: On<Activate>,
-                             form: Res<LoginForm>,
-                             mut next: ResMut<NextState<LauncherState>>| {
-                                if !form.user.is_empty() && !form.pass.is_empty() {
+                            move |_ev: On<Activate>,
+                                  form: Res<LoginForm>,
+                                  mut next: ResMut<NextState<LauncherState>>| {
+                                if form.is_complete(playonline) {
                                     next.set(LauncherState::AuthInFlight);
                                 }
                             },
                         );
+                        }
+                        if playonline {
+                            return;
                         }
 
                         r.spawn(button_bundle(
@@ -229,6 +287,17 @@ fn build_login_ui(
             });
         });
 }
+
+/// The label column has to hold the longest of the PlayOnline field names.
+const FIELD_LABEL_WIDTH: f32 = 160.0;
+
+/// A PlayOnline account carries both identities and the handshake uses both,
+/// so the form says which is which in the Viewer's own words.
+const POL_CREDENTIAL_HINTS: [&str; 3] = [
+    "Sign in with both of the account's identities, as the PlayOnline Viewer",
+    "asks for them. A PlayOnline ID is four capitals then four digits. The",
+    "Square Enix ID is the login name you chose, not your email address.",
+];
 
 /// LEGAL.md section 7, said once per profile where the player signs in.
 const POL_TERMS_NOTICE: [&str; 3] = [
@@ -260,149 +329,36 @@ fn acknowledge_terms(profile_name: Option<&str>) {
     }
 }
 
-fn describe_age(age: std::time::Duration) -> String {
-    let minutes = age.as_secs() / 60;
-    if minutes < 60 {
-        format!("{minutes} min")
-    } else if minutes < 60 * 24 {
-        format!("{} h", minutes / 60)
-    } else {
-        format!("{} d", minutes / (60 * 24))
+/// A profile that signs in to the official service shows the notice once;
+/// the sign-in form appears after the player has read it.
+fn spawn_terms_gate(panel: &mut ChildSpawnerCommands, profile_name: Option<&str>) {
+    for line in POL_TERMS_NOTICE {
+        panel.spawn(hint(line));
     }
-}
-
-/// A PlayOnline profile signs in with the viewer's session file, not a
-/// username and password: show what was found, the terms notice until the
-/// player has read it, and a Log in that opens the lobby with that session.
-fn spawn_playonline_sign_in(
-    panel: &mut ChildSpawnerCommands,
-    profile_name: Option<&str>,
-    session_file: Option<&std::path::Path>,
-    blocked: bool,
-) {
-    let located = playonline::locate(session_file);
-    let ready = matches!(located, Ok(Some(_)));
-    match &located {
-        Ok(Some(found)) => {
-            panel.spawn(hint(format!(
-                "PlayOnline session for account {} from {}",
-                found.session.account_id,
-                found.path.display()
-            )));
-            if let Some(age) = found.age(std::time::SystemTime::now()) {
-                panel.spawn(hint(format!("Issued {} ago.", describe_age(age))));
-            }
-        }
-        Ok(None) => {
-            panel.spawn(hint("No PlayOnline session found."));
-            panel.spawn(hint(format!(
-                "Sign in with the PlayOnline Viewer, then place the session at {}",
-                playonline::expected_session_path(session_file).display()
-            )));
-        }
-        Err(e) => {
-            panel.spawn(hint(format!("Session file: {e:#}")));
-        }
-    }
-
-    let acknowledged = terms_acknowledged(profile_name);
-    if !acknowledged {
-        for line in POL_TERMS_NOTICE {
-            panel.spawn(hint(line));
-        }
-    }
-
     let name = profile_name.map(str::to_string);
     panel.spawn(row()).with_children(|r| {
-        if !acknowledged {
-            r.spawn(button_bundle(
-                ButtonBundleProps {
-                    variant: ButtonVariant::Primary,
-                    ..default()
-                },
-                (),
-                Spawn((Text::new("I understand"), ThemedText)),
-            ))
-            .insert(DefaultFocusTarget)
-            .observe(move |_ev: On<Activate>, mut dirty: ResMut<LoginUiDirty>| {
-                acknowledge_terms(name.as_deref());
-                dirty.0 = true;
-            });
-        } else if ready && !blocked {
-            r.spawn(button_bundle(
-                ButtonBundleProps {
-                    variant: ButtonVariant::Primary,
-                    ..default()
-                },
-                (),
-                Spawn((Text::new("Log in"), ThemedText)),
-            ))
-            .insert(DefaultFocusTarget)
-            .observe(
-                |_ev: On<Activate>,
-                 mut form: ResMut<LoginForm>,
-                 mut next: ResMut<NextState<LauncherState>>| {
-                    form.pol_in_house = false;
-                    next.set(LauncherState::AuthInFlight);
-                },
-            );
-        }
         r.spawn(button_bundle(
-            ButtonBundleProps::default(),
+            ButtonBundleProps {
+                variant: ButtonVariant::Primary,
+                ..default()
+            },
             (),
-            Spawn((Text::new("Check again"), ThemedText)),
+            Spawn((Text::new("I understand"), ThemedText)),
         ))
-        .insert_if(DefaultFocusTarget, || acknowledged && !(ready && !blocked))
-        .observe(|_ev: On<Activate>, mut dirty: ResMut<LoginUiDirty>| {
+        .insert(DefaultFocusTarget)
+        .observe(move |_ev: On<Activate>, mut dirty: ResMut<LoginUiDirty>| {
+            acknowledge_terms(name.as_deref());
             dirty.0 = true;
         });
     });
-
-    if acknowledged && !blocked {
-        spawn_playonline_in_house(panel);
-    }
 }
-
-/// The in-house sign-in: sign in to a PlayOnline account without the Viewer.
-/// The account handshake is reimplemented from static research; running it
-/// contacts Square Enix with the player's own account, and it is not yet
-/// complete end to end, so it is offered separately from the session-file
-/// path and labelled experimental.
-fn spawn_playonline_in_house(panel: &mut ChildSpawnerCommands) {
-    for line in POL_IN_HOUSE_NOTICE {
-        panel.spawn(hint(line));
-    }
-    spawn_field(panel, "Member name", false, "", LoginField::User);
-    spawn_field(panel, "Password", true, "", LoginField::Password);
-    panel.spawn(row()).with_children(|r| {
-        r.spawn(button_bundle(
-            ButtonBundleProps::default(),
-            (),
-            Spawn((Text::new("In-house sign in (experimental)"), ThemedText)),
-        ))
-        .observe(
-            |_ev: On<Activate>,
-             mut form: ResMut<LoginForm>,
-             mut next: ResMut<NextState<LauncherState>>| {
-                if !form.user.is_empty() && !form.pass.is_empty() {
-                    form.pol_in_house = true;
-                    next.set(LauncherState::AuthInFlight);
-                }
-            },
-        );
-    });
-}
-
-const POL_IN_HOUSE_NOTICE: [&str; 2] = [
-    "Experimental: sign in to a PlayOnline account without the Viewer. This",
-    "contacts Square Enix with your own account and is not yet complete.",
-];
 
 fn spawn_saved_accounts_row(
     panel: &mut ChildSpawnerCommands,
     server_key: &str,
     active_user: &str,
-    accts: &[(String, bool)],
+    accts: &[SavedEntry],
+    playonline: bool,
 ) {
     if accts.is_empty() {
         return;
@@ -431,7 +387,7 @@ fn spawn_saved_accounts_row(
             ScrollRegion,
         ))
         .with_children(|r| {
-            for (u, remember) in accts.iter() {
+            for (u, remember, square_enix_id) in accts.iter() {
                 let label = if *remember {
                     format!("{u}  [saved]")
                 } else {
@@ -446,9 +402,12 @@ fn spawn_saved_accounts_row(
                 let pick_user = u.clone();
                 let pick_server = server_key.to_string();
                 let pick_remember = *remember;
+                let pick_playonline = playonline;
+                let pick_square_enix_id = square_enix_id.clone();
 
                 let forget_user = u.clone();
                 let forget_server = server_key.to_string();
+                let forget_playonline = playonline;
 
                 r.spawn(chip_group()).with_children(|chip| {
                     chip.spawn(button_bundle(
@@ -463,15 +422,32 @@ fn spawn_saved_accounts_row(
                         move |_ev: On<Activate>,
                               mut login: ResMut<LoginForm>,
                               mut dirty: ResMut<LoginUiDirty>| {
-                            login.user = pick_user.clone();
+                            // The saved account is keyed on whichever identity
+                            // the flavor always has, so a PlayOnline chip names
+                            // the PlayOnline id and carries the other beside it.
+                            if pick_playonline {
+                                login.pol_id = pick_user.clone();
+                                login.user = pick_square_enix_id.clone();
+                            } else {
+                                login.user = pick_user.clone();
+                            }
                             login.pass.clear();
+                            login.pol_pass.clear();
                             login.remember_password = pick_remember;
                             if pick_remember {
-                                if let Some(pw) = SecretStore::get(
+                                let primary = SecretStore::get(
                                     KEYRING_SERVICE,
                                     &keyring_account_key(&pick_server, &pick_user),
-                                ) {
-                                    login.pass = pw;
+                                );
+                                let secondary = SecretStore::get(
+                                    KEYRING_SERVICE,
+                                    &keyring_square_enix_key(&pick_server, &pick_user),
+                                );
+                                if pick_playonline {
+                                    login.pol_pass = primary.unwrap_or_default();
+                                    login.pass = secondary.unwrap_or_default();
+                                } else {
+                                    login.pass = primary.unwrap_or_default();
                                 }
                             }
                             login.focus = if login.pass.is_empty() {
@@ -509,10 +485,16 @@ fn spawn_saved_accounts_row(
                                 KEYRING_SERVICE,
                                 &keyring_account_key(&forget_server, &forget_user),
                             );
+                            SecretStore::delete(
+                                KEYRING_SERVICE,
+                                &keyring_square_enix_key(&forget_server, &forget_user),
+                            );
 
-                            if login.user == forget_user {
+                            if login.account_key(forget_playonline) == forget_user {
                                 login.user.clear();
                                 login.pass.clear();
+                                login.pol_id.clear();
+                                login.pol_pass.clear();
                                 login.remember_password = false;
                                 login.focus = LoginField::User;
                             }
@@ -534,6 +516,8 @@ fn spawn_saved_accounts_row(
                      mut dirty: ResMut<LoginUiDirty>| {
                         login.user.clear();
                         login.pass.clear();
+                        login.pol_id.clear();
+                        login.pol_pass.clear();
                         login.remember_password = false;
                         login.focus = LoginField::User;
                         dirty.0 = true;
@@ -730,6 +714,7 @@ fn spawn_field(
     mask: bool,
     initial: &str,
     binding: LoginField,
+    playonline: bool,
 ) {
     parent
         .spawn(Node {
@@ -743,7 +728,7 @@ fn spawn_field(
         .with_children(|row| {
             row.spawn((
                 Node {
-                    width: Val::Px(110.0),
+                    width: Val::Px(FIELD_LABEL_WIDTH),
                     ..default()
                 },
                 Text::new(label.to_string()),
@@ -774,6 +759,8 @@ fn spawn_field(
                 move |ev: On<ValueChange<String>>, mut form: ResMut<LoginForm>| match binding {
                     LoginField::User => form.user = ev.value.clone(),
                     LoginField::Password => form.pass = ev.value.clone(),
+                    LoginField::PolId => form.pol_id = ev.value.clone(),
+                    LoginField::PolPassword => form.pol_pass = ev.value.clone(),
                 },
             )
             .observe(
@@ -785,7 +772,7 @@ fn spawn_field(
                     if login_blocked(&version, &era) {
                         return;
                     }
-                    if !form.user.is_empty() && !form.pass.is_empty() {
+                    if form.is_complete(playonline) {
                         next.set(LauncherState::AuthInFlight);
                     }
                 },

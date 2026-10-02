@@ -34,20 +34,8 @@ pub async fn run(
     println!("FFXI agent launcher — server {server}");
     println!();
 
-    let (user, password, session) = match kuluu_session::playonline::session_from_env()? {
-        Some(session) => {
-            println!(
-                "Using the PlayOnline session (account_id={}).\n",
-                session.account_id
-            );
-            (
-                defaults.user.clone().unwrap_or_default(),
-                defaults.password.clone().unwrap_or_default(),
-                session,
-            )
-        }
-        None => login_loop(auth, defaults.user.as_deref(), defaults.password.as_deref()).await?,
-    };
+    let (user, password, session) =
+        login_loop(auth, defaults.user.as_deref(), defaults.password.as_deref()).await?;
     let handle = lobby
         .open(&session)
         .await

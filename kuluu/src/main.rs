@@ -336,13 +336,10 @@ async fn run_command_async(args: Args, auth: auth_client::AuthClient) -> Result<
             let (user, password, char_id, _char_name, initial_state) =
                 match (user, password, char_name) {
                     (Some(u), Some(p), Some(name)) => {
-                        let session = match kuluu_session::playonline::session_from_env()? {
-                            Some(session) => session,
-                            None => auth
-                                .login(&u, &p)
-                                .await
-                                .context("auth precheck (play direct mode)")?,
-                        };
+                        let session = auth
+                            .login(&u, &p)
+                            .await
+                            .context("auth precheck (play direct mode)")?;
                         let handle = lobby
                             .open(&session)
                             .await

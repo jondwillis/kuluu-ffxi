@@ -226,7 +226,15 @@ host_launch() {
   printf 'observe: %s %s %s\n' "${RUNNER:-}" "$loader" "$args"
   # cd into the install: loaders resolve DATs, Ashita config and their own
   # DLLs relative to the working directory, not to argv[0].
-  ( cd "$(dirname "$loader")" && exec ${RUNNER:-} "$loader" $args )
+  # A runner is either one executable -- possibly an absolute path with spaces
+  # in it, which is where a purpose-built wine build lands on macOS -- or a
+  # command line to word-split (`umu-run --some-flag`). Only the second may be
+  # split, so decide by asking whether the whole string names a file.
+  if [ -x "${RUNNER:-}" ]; then
+    ( cd "$(dirname "$loader")" && exec "$RUNNER" "$loader" $args )
+  else
+    ( cd "$(dirname "$loader")" && exec ${RUNNER:-} "$loader" $args )
+  fi
 }
 
 host_doctor() {

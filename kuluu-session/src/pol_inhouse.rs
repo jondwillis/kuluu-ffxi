@@ -1,42 +1,108 @@
 //! In-house PlayOnline login: the TCP transport that carries the `ffxi-pol`
-//! account handshake, and the entry the launcher drives.
+//! account handshake, and the entry `AuthClient` drives for the PlayOnline
+//! auth flavor.
 //!
-//! This is the road that removes the Viewer dependency: instead of reading a
-//! session the Viewer produced, Kuluu performs the PlayOnline account
-//! handshake itself and receives the session Square Enix issues, the same way
-//! the Viewer does. The wire layers live in `ffxi-pol`, proven against a mock;
-//! this module is the socket that carries them and the credential the player
-//! supplies.
+//! Kuluu performs the PlayOnline account handshake itself and receives the
+//! session Square Enix issues, the same way the Viewer does; no Viewer process
+//! and no session file are involved. The wire layers live in `ffxi-pol`,
+//! proven against a mock; this module is the socket that carries them and the
+//! credential the player supplies.
 //!
 //! Running it contacts Square Enix's account servers with the player's own
-//! account, so it is the player's action on their own machine, never
-//! Kuluu's automated traffic. The handshake reaches the chat key agreement
-//! today; the profile-service community reply that yields the lobby authCode is
-//! the remaining reverse-engineering, so `login` reports that boundary rather
-//! than returning a partial session.
+//! account, so it is the player's action on their own machine, never Kuluu's
+//! automated traffic. Nothing here is exercised by any automated run: the
+//! wire layers are proven against an in-process mock, and only a player
+//! signing in on their own machine reaches a real host.
 
 use std::io::{BufReader, Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
+use rand::SeedableRng as _;
 
 use ffxi_pol::transport::{ByteChannel, Connector};
 
-/// The account the player signs in with. The member name is the PlayOnline id;
-/// the password is theirs and never logged or persisted by this module.
-#[derive(Clone)]
+/// The account the player signs in with. A PlayOnline account carries two
+/// identities and the handshake uses both: the PlayOnline pair authenticates
+/// the connection and the Square Enix pair authenticates the member. Neither
+/// password is logged or persisted by this module.
+#[derive(Clone, Default)]
 pub struct Credentials {
-    pub member: String,
-    pub password: String,
+    /// Eight characters, four capitals then four digits.
+    pub playonline_id: String,
+    pub playonline_password: String,
+    /// The login name chosen for the Square Enix account, at most sixteen
+    /// characters. The Viewer leaves it empty for an account that has none
+    /// and requires it only when a one-time password is in use.
+    pub square_enix_id: String,
+    pub square_enix_password: String,
+    /// The six characters of a security token, for an account that uses one.
+    pub otp: Option<String>,
 }
 
 impl std::fmt::Debug for Credentials {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Credentials")
-            .field("member", &self.member)
-            .field("password", &"<redacted>")
+            .field("playonline_id", &self.playonline_id)
+            .field("playonline_password", &"<redacted>")
+            .field("square_enix_id", &self.square_enix_id)
+            .field("square_enix_password", &"<redacted>")
+            .field("otp", &self.otp.as_ref().map(|_| "<redacted>"))
             .finish()
+    }
+}
+
+impl Credentials {
+    /// Check every width against the Viewer's own before any of it reaches a
+    /// socket, so a mistyped field is named here rather than surfacing as a
+    /// refusal from the account service.
+    fn account(&self) -> Result<ffxi_pol::transport::Account> {
+        let playonline_id: [u8; ffxi_pol::profile::MEMBER_ID_LEN] =
+            self.playonline_id.as_bytes().try_into().map_err(|_| {
+                anyhow!(
+                    "a PlayOnline ID is exactly eight characters, four capitals then four digits"
+                )
+            })?;
+        if !playonline_id
+            .iter()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+        {
+            bail!("a PlayOnline ID uses capital letters and digits only");
+        }
+        if self.playonline_password.is_empty() {
+            bail!("the PlayOnline password is required");
+        }
+        if self.playonline_password.len() > ffxi_pol::profile::SECRET_MAX_LEN {
+            bail!("a PlayOnline password is at most 15 characters");
+        }
+        if self.square_enix_id.len() > ffxi_pol::profile::LOGIN_NAME_MAX {
+            bail!(
+                "a Square Enix ID is at most 16 characters; it is the login name chosen \
+                 for the Square Enix account, not the email address it is reached at"
+            );
+        }
+        if self.square_enix_password.is_empty() {
+            bail!("the Square Enix password is required");
+        }
+        if self.otp.is_some() && self.square_enix_id.is_empty() {
+            bail!("an account using a one-time password must give its Square Enix ID");
+        }
+        let otp = match &self.otp {
+            None => None,
+            Some(text) => Some(
+                text.as_bytes()
+                    .try_into()
+                    .map_err(|_| anyhow!("a one-time password is exactly six characters"))?,
+            ),
+        };
+        Ok(ffxi_pol::transport::Account {
+            playonline_id,
+            playonline_password: self.playonline_password.clone(),
+            square_enix_id: self.square_enix_id.clone(),
+            square_enix_password: self.square_enix_password.clone(),
+            otp,
+        })
     }
 }
 
@@ -111,31 +177,41 @@ impl Connector for TcpConnector {
 }
 
 /// Sign in to a PlayOnline account and produce a lobby session, without the
-/// Viewer. `chat_host` names the chat service and `profile_host` the profile
-/// service; both are the player's own account's hosts.
+/// Viewer. The chat host is the one the Viewer's own member records default
+/// to and the profile host is the one the chat service routes the account to,
+/// so the caller names neither.
 ///
-/// The handshake is not yet complete end to end: the profile community reply
-/// that yields the 64-byte authCode is the remaining reverse-engineering, so
-/// this reports that boundary rather than returning a session that would not
-/// open the lobby.
-pub async fn login(
-    _chat_host: String,
-    _profile_host: String,
-    creds: Credentials,
-) -> Result<crate::auth_client::AuthSession> {
+/// The account id stays zero: it is a LandSandBoat auth-server row, and the
+/// PlayOnline stack has no equivalent to read one from.
+pub async fn login(creds: Credentials) -> Result<crate::auth_client::AuthSession> {
     tokio::task::spawn_blocking(move || login_blocking(&creds))
         .await
         .context("in-house PlayOnline login task")?
 }
 
-fn login_blocking(_creds: &Credentials) -> Result<crate::auth_client::AuthSession> {
-    bail!(
-        "in-house PlayOnline login is not yet complete: the profile community \
-         reply that yields the lobby authCode, and the origin of the chat NICK \
-         credential for a first login, are the remaining reverse-engineering. \
-         The cipher, key agreement, and transaction framing are implemented \
-         and proven against a mock server."
+fn login_blocking(creds: &Credentials) -> Result<crate::auth_client::AuthSession> {
+    let account = creds.account()?;
+    let outcome = ffxi_pol::transport::login(
+        &mut TcpConnector,
+        &mut rand::rngs::StdRng::try_from_rng(&mut rand::rngs::SysRng)
+            .map_err(|e| anyhow!("seeding the key-agreement generator: {e}"))?,
+        &account,
+        ffxi_pol::hosts::CHAT_HOST,
+        &ffxi_pol::authcode::CommunityRequest::initial(),
     )
+    .map_err(|e| anyhow!("PlayOnline account handshake: {e}"))?;
+
+    tracing::info!(
+        profile_host = %outcome.profile_host,
+        world_index = outcome.selection.world_index,
+        "in-house PlayOnline login completed"
+    );
+
+    Ok(crate::auth_client::AuthSession {
+        account_id: 0,
+        session_hash: outcome.session.value,
+        auth_code: crate::auth_client::LobbyAuthCode(outcome.session.auth_code),
+    })
 }
 
 #[cfg(test)]
@@ -164,15 +240,77 @@ mod tests {
         server.join().unwrap();
     }
 
+    // Placeholder credentials throughout: the id satisfies the format the
+    // Viewer validates (four capitals, four digits, first character a check
+    // letter over the rest) without being anyone's.
+    fn creds() -> Credentials {
+        Credentials {
+            playonline_id: "XAAA0000".to_string(),
+            playonline_password: "polsecret".to_string(),
+            square_enix_id: "TESTMEMBER".to_string(),
+            square_enix_password: "sqexsecret".to_string(),
+            otp: Some("123456".to_string()),
+        }
+    }
+
     #[test]
-    fn credentials_never_print_the_password() {
-        let creds = Credentials {
-            member: "TESTMEMBER".to_string(),
-            password: "s3cr3t".to_string(),
-        };
-        let shown = format!("{creds:?}");
+    fn credentials_never_print_a_password() {
+        let shown = format!("{:?}", creds());
+        assert!(shown.contains("XAAA0000"));
         assert!(shown.contains("TESTMEMBER"));
-        assert!(!shown.contains("s3cr3t"));
-        assert!(shown.contains("redacted"));
+        for secret in ["polsecret", "sqexsecret", "123456"] {
+            assert!(!shown.contains(secret), "{secret} leaked into {shown}");
+        }
+    }
+
+    #[test]
+    fn an_account_carries_both_identities_and_rejects_wrong_widths() {
+        let account = creds().account().unwrap();
+        assert_eq!(&account.playonline_id, b"XAAA0000");
+        assert_eq!(account.square_enix_id, "TESTMEMBER");
+        assert_eq!(account.otp, Some(*b"123456"));
+
+        let mut short = creds();
+        short.playonline_id = "XAAA000".to_string();
+        assert!(short.account().is_err());
+
+        let mut bad_otp = creds();
+        bad_otp.otp = Some("12345".to_string());
+        assert!(bad_otp.account().is_err());
+    }
+
+    #[test]
+    fn a_full_width_square_enix_id_is_accepted_and_an_email_is_refused() {
+        let mut long = creds();
+        long.square_enix_id = "SIXTEENCHARSXYZ0".to_string();
+        assert!(long.account().is_ok());
+
+        let mut email = creds();
+        email.square_enix_id = "someone@example.com".to_string();
+        let err = match email.account() {
+            Ok(_) => panic!("an email address should not pass as a Square Enix id"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("not the email address"), "{err}");
+    }
+
+    #[test]
+    fn a_square_enix_id_is_optional_unless_a_token_is_in_use() {
+        let mut no_id = creds();
+        no_id.square_enix_id.clear();
+        no_id.otp = None;
+        assert!(no_id.account().is_ok());
+
+        no_id.otp = Some("123456".to_string());
+        assert!(no_id.account().is_err());
+    }
+
+    #[test]
+    fn a_malformed_playonline_id_is_named_before_anything_is_sent() {
+        for bad in ["xaaa0000", "XAAA000", "XAAA-000"] {
+            let mut c = creds();
+            c.playonline_id = bad.to_string();
+            assert!(c.account().is_err(), "{bad} should not pass");
+        }
     }
 }

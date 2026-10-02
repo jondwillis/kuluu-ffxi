@@ -16,7 +16,6 @@ use super::common::{
 };
 use crate::view_native::widgets::text_field::text_field;
 use crate::view_native::widgets::{TextFieldDisplay, TextFieldProps};
-use kuluu_session::playonline;
 
 use super::{LauncherState, ServerEditField, ServerEditForm, ServerInfo};
 
@@ -229,7 +228,9 @@ fn spawn_advanced_fields(panel: &mut ChildSpawnerCommands, form: &ServerEditForm
         }
     });
     if form.flavor == AuthFlavorKind::PlayOnline {
-        spawn_playonline_fields(panel, form);
+        for line in POL_FLAVOR_HINTS {
+            panel.spawn(hint(line));
+        }
     }
     spawn_field(
         panel,
@@ -282,26 +283,10 @@ fn spawn_advanced_fields(panel: &mut ChildSpawnerCommands, form: &ServerEditForm
     });
 }
 
-const POL_SESSION_HINTS: [&str; 3] = [
-    "The PlayOnline Viewer you own signs in; Kuluu reads the session it",
-    "produced from this file and opens the lobby with it. No auth server.",
-    "Third-party clients may breach the server's terms; the account risk is yours.",
+const POL_FLAVOR_HINTS: [&str; 2] = [
+    "Kuluu signs in to the PlayOnline account itself; no auth server, so the",
+    "auth port is unused. Host is the FFXI lobby server the account plays on.",
 ];
-
-fn spawn_playonline_fields(panel: &mut ChildSpawnerCommands, form: &ServerEditForm) {
-    spawn_field(
-        panel,
-        "Session file",
-        &form.pol_session_file,
-        playonline::SESSION_FILE_NAME,
-        ServerEditField::PolSessionFile,
-    );
-    let default_path = playonline::expected_session_path(None);
-    panel.spawn(hint(format!("Default: {}", default_path.display())));
-    for line in POL_SESSION_HINTS {
-        panel.spawn(hint(line));
-    }
-}
 
 fn save_form(form: &ServerEditForm, next: &mut NextState<LauncherState>) {
     if form.name.is_empty() || form.host.is_empty() {
@@ -338,14 +323,6 @@ fn save_form(form: &ServerEditForm, next: &mut NextState<LauncherState>) {
             Some(trimmed.to_string())
         }
     };
-    let pol_session_file = {
-        let trimmed = form.pol_session_file.trim();
-        if trimmed.is_empty() || form.flavor != AuthFlavorKind::PlayOnline {
-            None
-        } else {
-            Some(std::path::PathBuf::from(trimmed))
-        }
-    };
     let mut store = launcher_store::load();
     let terms_acknowledged = form
         .editing_index
@@ -363,7 +340,6 @@ fn save_form(form: &ServerEditForm, next: &mut NextState<LauncherState>) {
         client_ver,
         ver_lock: form.ver_lock,
         preferred_client: form.preferred_client.clone(),
-        pol_session_file,
         terms_acknowledged,
     };
     match form.editing_index {
@@ -448,9 +424,6 @@ fn spawn_field(
                     }
                     ServerEditField::ClientVer => {
                         form.client_ver = ev.value.clone();
-                    }
-                    ServerEditField::PolSessionFile => {
-                        form.pol_session_file = ev.value.clone();
                     }
                     ServerEditField::Flavor
                     | ServerEditField::VerLock

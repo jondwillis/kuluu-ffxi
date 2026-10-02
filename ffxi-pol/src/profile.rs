@@ -1,11 +1,12 @@
 //! The profile service: fixed-size request/reply framing, the per-request
 //! authenticator, the member-id codec, and the member-login body.
 //!
-//! Read from polcore.dll build 73b1864b. A transaction is a 0x28-byte request
-//! and a 0x18-byte reply header, optionally followed by a checksummed body;
-//! everything after the plaintext connect handshake is enciphered with the
-//! Blowfish key the chat service agreed. The bodies here are pure functions of
-//! bytes; the transport that carries them is `crate::transport`.
+//! Read from polcore.dll build 73b1864b, and from app.dll build 7ba99828 for
+//! the credential the Viewer stages into it. A transaction is a 0x28-byte
+//! request and a 0x18-byte reply header, optionally followed by a checksummed
+//! body; everything after the plaintext connect handshake is enciphered with
+//! the Blowfish key the chat service agreed. The bodies here are pure
+//! functions of bytes; the transport that carries them is `crate::transport`.
 
 use md5::{Digest as _, Md5};
 use sha1::{Digest as _, Sha1};
@@ -28,12 +29,40 @@ const REPLY_HEADER_LEN: usize = 0x18;
 /// polcore `0x1001f5e0`: request[0] on every application request.
 const REQUEST_MAGIC: u8 = 2;
 const DIGEST_LEN: usize = 16;
-const BODY_CHECKSUM_LEN: usize = 4;
+/// polcore `0x1001f970`: every body ends with a 4-byte checksum, and the
+/// declared length includes it.
+pub const BODY_CHECKSUM_LEN: usize = 4;
 /// Only 15 of the 16-byte secret slot are secret; byte 15 is always filler.
 pub const SECRET_MAX_LEN: usize = 0x0F;
 
 /// polcore `0x1001f690` / `0x1001f400`: a non-zero status maps to this base.
 const ERROR_BASE: i32 = -0x1450;
+
+/// What a refusal means, in our own words. The Viewer has a message for each
+/// of these in its own resources, which are game content and are not
+/// reproduced here; these are descriptions of the branch each status takes.
+///
+/// The distinction the Viewer's visible text loses is worth keeping: it shows
+/// the same sentence for a refused identifier and for an account that cannot
+/// sign in at all, and only the status byte tells them apart.
+pub fn status_meaning(status: u8) -> Option<&'static str> {
+    match status {
+        STATUS_ADDRESS_BLOCKED => Some("this address is blocked from the account service"),
+        STATUS_IDENTITY_REFUSED => {
+            Some("the Square Enix id, password or one-time password was refused")
+        }
+        STATUS_ACCOUNT_STATE => Some(
+            "the Square Enix account itself cannot sign in, which covers a closed or              suspended account and one with an unpaid balance, rather than a mistyped              password",
+        ),
+        STATUS_SERVICE_UNAVAILABLE => Some("the account service could not certify the account"),
+        _ => None,
+    }
+}
+
+const STATUS_ADDRESS_BLOCKED: u8 = 0x6E;
+const STATUS_IDENTITY_REFUSED: u8 = 0x6F;
+const STATUS_ACCOUNT_STATE: u8 = 0x70;
+const STATUS_SERVICE_UNAVAILABLE: u8 = 0xE2;
 
 /// A category and opcode name a profile transaction.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -46,12 +75,26 @@ impl Transaction {
     pub const fn new(category: u8, opcode: u8) -> Self {
         Self { category, opcode }
     }
+
+    /// What this transaction is for, so a refusal names the step rather than
+    /// a category and an opcode.
+    pub fn name(self) -> &'static str {
+        match self {
+            MEMBER_LOGIN => "the member login",
+            FRIEND_LIST => "the friend list",
+            SELECT_SERVICE => "the world select",
+            ENTER_COMMUNITY => "entering the community service",
+            _ => "a request",
+        }
+    }
 }
 
 /// polcore `0x1001e5d0`: the member login, the first application transaction.
 pub const MEMBER_LOGIN: Transaction = Transaction::new(4, 7);
-/// polcore `0x10024170`... `0x100237f0`: fetch the account's content-id list.
-pub const CONTENT_ID_LIST: Transaction = Transaction::new(2, 3);
+/// polcore `0x100237f0`: fetch the friend and ignore lists. app.dll builds
+/// its friend records from the reply, so despite its position in the
+/// transaction catalogue this is a social feature, not part of a login.
+pub const FRIEND_LIST: Transaction = Transaction::new(2, 3);
 /// polcore `0x1001d490`: select the world / service context.
 pub const SELECT_SERVICE: Transaction = Transaction::new(4, 6);
 /// polcore `0x1001db90`: enter the community service; its 0x20-byte reply is
@@ -85,10 +128,17 @@ pub fn id_decode(text: &[u8]) -> Result<u64> {
     Ok(value)
 }
 
-/// The profile host the session's own host index selects.
+/// polcore `0x1001e8d0`: the profile host an account's own host index selects.
+/// The index is not derivable from the member id: it is the 7-bit routing
+/// field the chat service assigns after registration, so it reaches this from
+/// `crate::chat::Routing`.
 pub fn host(host_index: u8) -> String {
-    format!("pp{:03}.pol.com", host_index & 0x7F)
+    format!("pp{:03}.pol.com", host_index & HOST_INDEX_MASK)
 }
+
+/// polcore `0x10019e20` takes the host index out of bits 9..15 of the packed
+/// identity's high dword, so it is seven bits wide.
+pub const HOST_INDEX_MASK: u8 = 0x7F;
 
 /// polcore `0x1001f5e0`: the per-request authenticator, `MD5(id8 || secret ||
 /// token)`. The token is a per-connection nonce from the handshake reply, so
@@ -188,40 +238,95 @@ pub fn declared_len(payload_len: usize) -> u32 {
     (payload_len + BODY_CHECKSUM_LEN) as u32
 }
 
+/// polcore `0x1001e4b0` wipes its stack copies with these widths right after
+/// the call, which is the binary's own statement of the argument sizes.
+pub const SECRET_LEN: usize = 20;
+pub const OTP_LEN: usize = 6;
+/// app.dll `0x1019ab29` appends this before the second digest.
+const SECRET_SALT: &[u8] = b"playonline";
+
 /// The account credential the member login proves possession of. The name is
-/// the PlayOnline id; `secret20` is the 20-byte value polcore stores without a
-/// terminator (its writer, in app.dll, was not traced, so its derivation from
-/// the typed password is unverified). `otp` is set only for a token account.
+/// the Square Enix id, which the Viewer leaves empty for an account that has
+/// none; every request is bound to the member by its authenticator either
+/// way. `secret20` is what `member_secret` derives from the typed password,
+/// and `otp` is set only for a token account.
 pub struct MemberCredential {
     pub name: String,
-    pub secret20: [u8; 20],
-    pub otp: Option<[u8; 6]>,
+    pub secret20: [u8; SECRET_LEN],
+    pub otp: Option<[u8; OTP_LEN]>,
 }
 
+impl MemberCredential {
+    /// Build the credential the Viewer would stage from a typed password.
+    pub fn new(name: impl Into<String>, password: &str, otp: Option<[u8; OTP_LEN]>) -> Self {
+        Self {
+            name: name.into(),
+            secret20: member_secret(password),
+            otp,
+        }
+    }
+}
+
+/// app.dll `0x1019ab29`: the 20-byte secret the member login proves possession
+/// of, `SHA1(hex(SHA1(password)) || "playonline")` with the inner digest
+/// rendered as forty lowercase hex characters. The Viewer holds the password
+/// as UTF-16 and feeds the low byte of each code unit, so a character outside
+/// Latin-1 is truncated before it is hashed rather than encoded.
+pub fn member_secret(password: &str) -> [u8; SECRET_LEN] {
+    let mut inner = Sha1::new();
+    for unit in password.encode_utf16() {
+        inner.update([unit as u8]);
+    }
+    let first: [u8; SECRET_LEN] = inner.finalize().into();
+
+    let mut outer = Sha1::new();
+    outer.update(hex_lower(&first));
+    outer.update(SECRET_SALT);
+    outer.finalize().into()
+}
+
+fn hex_lower(bytes: &[u8; SECRET_LEN]) -> [u8; 2 * SECRET_LEN] {
+    let mut out = [0u8; 2 * SECRET_LEN];
+    for (i, b) in bytes.iter().enumerate() {
+        out[2 * i] = HEX_DIGITS[(b >> NIBBLE_BITS) as usize];
+        out[2 * i + 1] = HEX_DIGITS[(b & NIBBLE_MASK) as usize];
+    }
+    out
+}
+
+/// polcore `0x1001f4d0(ctx, 4, 7, 0x40)` declares 0x40 bytes, which includes
+/// the 4-byte trailer `seal_body` appends.
 const LOGIN_BODY_LEN: usize = 0x40;
-const LOGIN_NAME_MAX: usize = 16;
+/// The payload the login declares, before its checksum.
+pub const LOGIN_PAYLOAD_LEN: usize = LOGIN_BODY_LEN - BODY_CHECKSUM_LEN;
+/// polcore `0x1001e760` rounds the stamp down to the minute so the client and
+/// the server agree on it without a clock exchange.
+const SECONDS_PER_MINUTE: u64 = 60;
+/// polcore `0x1001e760` copies the name while `i < 0x10`, into a body it has
+/// already zeroed, so sixteen characters fit with their terminator landing on
+/// the byte before the one-time password.
+pub const LOGIN_NAME_MAX: usize = 16;
 const LOGIN_DIGEST_OFFSET: usize = 0x20;
 const LOGIN_OTP_OFFSET: usize = 0x12;
 
-/// polcore `0x1001e760`: the 0x40-byte member-login body. Offset 0 is the mode
+/// polcore `0x1001e760`: the member-login payload. Offset 0 is the mode
 /// (1 id+password, 2 with a one-time password), offset 1 the NUL-terminated
 /// name, offset 0x20 a SHA-1 over the lowercase hex of the 20-byte secret
 /// concatenated with the minute-rounded unix time as decimal.
-pub fn member_login_body(cred: &MemberCredential, unix_secs: u64) -> Result<[u8; LOGIN_BODY_LEN]> {
+pub fn member_login_body(
+    cred: &MemberCredential,
+    unix_secs: u64,
+) -> Result<[u8; LOGIN_PAYLOAD_LEN]> {
     let name = cred.name.as_bytes();
-    if name.len() >= LOGIN_NAME_MAX {
-        return Err(Error::protocol("a member name is at most 15 characters"));
+    if name.len() > LOGIN_NAME_MAX {
+        return Err(Error::protocol("a Square Enix ID is at most 16 characters"));
     }
-    let mut body = [0u8; LOGIN_BODY_LEN];
+    let mut body = [0u8; LOGIN_PAYLOAD_LEN];
     body[0] = if cred.otp.is_some() { 2 } else { 1 };
     body[1..1 + name.len()].copy_from_slice(name);
 
-    let mut hex = [0u8; 40];
-    for (i, b) in cred.secret20.iter().enumerate() {
-        hex[2 * i] = HEX_DIGITS[(b >> 4) as usize];
-        hex[2 * i + 1] = HEX_DIGITS[(b & 0x0F) as usize];
-    }
-    let minute = unix_secs - unix_secs % 60;
+    let hex = hex_lower(&cred.secret20);
+    let minute = unix_secs - unix_secs % SECONDS_PER_MINUTE;
     let stamp = minute.to_string();
     let mut h = Sha1::new();
     h.update(hex);
@@ -236,6 +341,8 @@ pub fn member_login_body(cred: &MemberCredential, unix_secs: u64) -> Result<[u8;
 }
 
 const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
+const NIBBLE_MASK: u8 = 0x0F;
+const NIBBLE_BITS: u32 = 4;
 
 #[cfg(test)]
 mod tests {
@@ -281,6 +388,26 @@ mod tests {
     }
 
     #[test]
+    fn a_refused_identity_and_a_refused_account_are_told_apart() {
+        // The Viewer shows one sentence for both, so only the status
+        // distinguishes them; a client that collapses them would send a
+        // player to re-type a password that was never wrong.
+        let refused = status_meaning(STATUS_IDENTITY_REFUSED).unwrap();
+        let state = status_meaning(STATUS_ACCOUNT_STATE).unwrap();
+        assert_ne!(refused, state);
+        assert!(state.contains("unpaid"));
+        assert!(status_meaning(0x00).is_none());
+        assert!(status_meaning(0x79).is_none());
+    }
+
+    #[test]
+    fn a_transaction_names_the_step_it_is() {
+        assert_eq!(MEMBER_LOGIN.name(), "the member login");
+        assert_eq!(SELECT_SERVICE.name(), "the world select");
+        assert_ne!(Transaction::new(9, 9).name(), MEMBER_LOGIN.name());
+    }
+
+    #[test]
     fn the_reply_header_reads_only_the_four_live_fields() {
         let mut buf = [0u8; REPLY_HEADER_LEN];
         buf[0x01] = 0;
@@ -295,6 +422,57 @@ mod tests {
     }
 
     #[test]
+    fn the_login_body_takes_a_full_width_name_and_an_empty_one() {
+        let mut cred = MemberCredential::new("SIXTEENCHARSXYZ0", "hunter2", None);
+        assert_eq!(cred.name.len(), LOGIN_NAME_MAX);
+        let body = member_login_body(&cred, 0).unwrap();
+        assert_eq!(&body[1..1 + LOGIN_NAME_MAX], cred.name.as_bytes());
+        // The terminator lands on the byte before the one-time password.
+        assert_eq!(body[1 + LOGIN_NAME_MAX], 0);
+
+        cred.name.push('X');
+        assert!(member_login_body(&cred, 0).is_err());
+
+        // The Viewer allows an account with no Square Enix id at all.
+        cred.name.clear();
+        let body = member_login_body(&cred, 0).unwrap();
+        assert_eq!(&body[1..1 + LOGIN_NAME_MAX], &[0u8; LOGIN_NAME_MAX]);
+    }
+
+    #[test]
+    fn the_password_secret_is_two_sha1_passes_with_the_salt() {
+        // Self-derived from the static reading of app.dll 7ba99828, not
+        // captured from any live server.
+        assert_eq!(
+            hex::encode(member_secret("hunter2")),
+            "505b52b912143468cece9546d5118d9a20689222"
+        );
+        let want: [u8; SECRET_LEN] = {
+            let inner: [u8; SECRET_LEN] = Sha1::digest(b"hunter2").into();
+            let mut outer = Sha1::new();
+            outer.update(hex::encode(inner).as_bytes());
+            outer.update(SECRET_SALT);
+            outer.finalize().into()
+        };
+        assert_eq!(member_secret("hunter2"), want);
+    }
+
+    #[test]
+    fn the_password_secret_hashes_the_low_byte_of_each_code_unit() {
+        // The Viewer feeds UTF-16 code units one low byte at a time, so a
+        // character above U+00FF is truncated rather than encoded.
+        assert_eq!(member_secret("\u{100}"), member_secret("\u{0}"));
+        assert_ne!(member_secret("\u{e9}"), member_secret("e"));
+    }
+
+    #[test]
+    fn a_credential_from_a_password_carries_the_derived_secret() {
+        let cred = MemberCredential::new("TESTMEMBER", "hunter2", None);
+        assert_eq!(cred.secret20, member_secret("hunter2"));
+        assert!(cred.otp.is_none());
+    }
+
+    #[test]
     fn the_member_login_body_has_the_pinned_shape() {
         let cred = MemberCredential {
             name: "TESTMEMBER".to_string(),
@@ -303,13 +481,17 @@ mod tests {
         };
         let unix_secs = 1_700_000_077u64;
         let body = member_login_body(&cred, unix_secs).unwrap();
-        assert_eq!(body.len(), LOGIN_BODY_LEN);
+        assert_eq!(declared_len(body.len()) as usize, LOGIN_BODY_LEN);
         assert_eq!(body[0], 1);
         assert_eq!(&body[1..11], b"TESTMEMBER");
         // SHA-1 over hex(20x 0x11) and the minute-floored timestamp.
         let mut h = Sha1::new();
         h.update(b"1111111111111111111111111111111111111111");
-        h.update((unix_secs - unix_secs % 60).to_string().as_bytes());
+        h.update(
+            (unix_secs - unix_secs % SECONDS_PER_MINUTE)
+                .to_string()
+                .as_bytes(),
+        );
         let want: [u8; 20] = h.finalize().into();
         assert_eq!(&body[0x20..0x34], &want);
     }
