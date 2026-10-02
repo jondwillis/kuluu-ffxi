@@ -201,7 +201,7 @@ fn capture(app: &mut App, target: &Handle<Image>, path: &str) {
                 "production HUD capture contains only the background"
             );
         })
-        .observe(save_to_disk(path.to_owned()));
+        .observe(save_to_disk(std::path::PathBuf::from(path)));
     for _ in 0..MAX_CAPTURE_FRAMES {
         app.update();
         std::thread::sleep(FRAME_WAIT);
