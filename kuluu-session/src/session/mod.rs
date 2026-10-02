@@ -2397,15 +2397,17 @@ async fn send_pending_tag(
     tag: &PendingTag,
 ) {
     let payload = match tag {
-        PendingTag::SendTag { end_para } => build_subpacket_event_end(
-            *sub_seq,
-            unique_no,
-            act_index,
-            current_zone_id,
-            event_id,
-            *end_para,
-            ffxi_proto::map::c2s::event_end_mode::UPDATE_PENDING,
-        ),
+        PendingTag::SendTag { end_para } | PendingTag::Registration { end_para } => {
+            build_subpacket_event_end(
+                *sub_seq,
+                unique_no,
+                act_index,
+                current_zone_id,
+                event_id,
+                *end_para,
+                ffxi_proto::map::c2s::event_end_mode::UPDATE_PENDING,
+            )
+        }
         PendingTag::SendXzy {
             x,
             y,

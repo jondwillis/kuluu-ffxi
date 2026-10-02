@@ -642,6 +642,9 @@ pub mod s2c {
     // vendor/server/src/map/packets/s2c/0x10e_reqsubmapnum.h GP_SERV_COMMAND_REQSUBMAPNUM.
     pub const REQSUBMAPNUM: u16 = super::event_query_wire::S2C_REQSUBMAPNUM;
 
+    // vendor/server/src/map/packets/s2c/0x0bf_registration.h GP_SERV_COMMAND_REGISTRATION.
+    pub const REGISTRATION: u16 = super::event_query_wire::S2C_REGISTRATION;
+
     // GP_SERV_COMMAND_TRACKING_LIST, vendor/server/src/map/packets/s2c/0x0f4_tracking_list.h.
     // One wide-scan entry (ActIndex/Level/Type + relative x/z + sName[16]).
     pub const TRACKING_LIST: u16 = 0x0F4;

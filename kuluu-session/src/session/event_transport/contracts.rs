@@ -547,6 +547,87 @@ async fn submap_reply_cancellation_diagnostic_contract() {
     assert!(matches!(receiver.try_recv(), Ok(AgentEvent::EventEnded)));
 }
 
+async fn registration_reply_contract() {
+    const OP_REGISTRATION: u8 = 0xA7;
+    const OP_TAG: u8 = 0x43;
+    const RESULT: u16 = 4;
+    for result_first in [true, false] {
+        let mut program = vec![OP_REGISTRATION, 0, OP_REGISTRATION, 1];
+        operand(&mut program, WORK_GIL);
+        program.extend([OP_TAG, 0, OP_TAG, 1]);
+        message(&mut program, 0);
+        program.push(OP_END);
+        let mut host = Host::new(
+            EventDat {
+                blocks: vec![block(program, vec![0])],
+            },
+            FARE,
+        )
+        .await;
+        let generic = map::event_position_wire::EVENT_RECV_PENDING.to_le_bytes();
+        let generic_packet = framing::SubPacket {
+            opcode: map::s2c::EVENTUCOFF,
+            sequence: 0,
+            data: &generic,
+        };
+        // vendor/server/src/map/packets/s2c/0x0bf_registration.h GP_SERV_COMMAND_REGISTRATION::PacketData.
+        let mut body = [0; 24];
+        body[2..4].copy_from_slice(&RESULT.to_le_bytes());
+        body[8..12].copy_from_slice(&(u32::from(INDEX) + 1).to_le_bytes());
+        assert!(!server_ack_matches(
+            &mut host.dialog,
+            &framing::SubPacket {
+                opcode: map::s2c::REGISTRATION,
+                sequence: 0,
+                data: &body,
+            }
+        ));
+        body[8..12].copy_from_slice(&u32::from(INDEX).to_le_bytes());
+        let result_packet = framing::SubPacket {
+            opcode: map::s2c::REGISTRATION,
+            sequence: 0,
+            data: &body,
+        };
+        let packets = if result_first {
+            [&result_packet, &generic_packet]
+        } else {
+            [&generic_packet, &result_packet]
+        };
+        assert!(!server_ack_matches(&mut host.dialog, packets[0]));
+        assert!(server_ack_matches(&mut host.dialog, packets[1]));
+        let step = host.step(Drive::ServerAck);
+        assert!(matches!(
+            step.advance,
+            Advance::AwaitServerAck(ffxi_event::PendingTag::SendTag { .. })
+        ));
+        assert!(!server_ack_matches(&mut host.dialog, &result_packet));
+        assert!(server_ack_matches(&mut host.dialog, &generic_packet));
+        let step = host.step(Drive::ServerAck);
+        let Advance::Frame(frame) = step.advance else {
+            panic!("second request did not resume")
+        };
+        assert_eq!(frame.nums[0], i32::from(RESULT));
+    }
+}
+
+async fn progressing_child_wait_does_not_timeout_contract() {
+    const OP_WAIT: u8 = 0x1C;
+    const WAIT_FRAMES: u32 = 1200;
+    let mut child = block(vec![OP_WAIT, 0, 0x80, OP_END], vec![WAIT_FRAMES]);
+    child.actor = ZONE_PLAYER_ACTOR;
+    let mut host = Host::new(
+        EventDat {
+            blocks: vec![block(vec![OP_END], vec![]), child],
+        },
+        FARE,
+    )
+    .await;
+    host.waiting();
+    host.dialog
+        .age_liveness_for_test(std::time::Duration::from_secs(10));
+    host.waiting();
+}
+
 async fn abort_contract() {
     let mut replaced = Host::new(position_dat(false), FARE).await;
     replaced.begin(FARE).await;
@@ -810,6 +891,8 @@ async fn event_state_contract() {
     server_reply_contract().await;
     submap_reply_contract().await;
     submap_reply_cancellation_diagnostic_contract().await;
+    registration_reply_contract().await;
+    progressing_child_wait_does_not_timeout_contract().await;
     abort_contract().await;
     action_event_gate_contract().await;
     item_stack_gate_contract().await;

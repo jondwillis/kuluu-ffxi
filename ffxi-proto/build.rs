@@ -233,6 +233,14 @@ fn main() -> Result<()> {
             "pub const {direction}_REQSUBMAPNUM: u16 = {opcode};\n"
         ));
     }
+    let registration = s2c_names
+        .iter()
+        .find(|(_, name)| name == "REGISTRATION")
+        .context("S2C REGISTRATION opcode")?
+        .0;
+    event_query_wire.push_str(&format!(
+        "pub const S2C_REGISTRATION: u16 = {registration};\n"
+    ));
     fs::write(out_dir.join("event_query_wire.rs"), event_query_wire)?;
 
     let event_position_opcode = c2s_names
