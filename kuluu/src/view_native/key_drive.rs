@@ -87,12 +87,6 @@ impl KeyMsg {
             "f4" => (KeyCode::F4, Key::F4),
             "f5" => (KeyCode::F5, Key::F5),
             "f6" => (KeyCode::F6, Key::F6),
-            "f7" => (KeyCode::F7, Key::F7),
-            "f8" => (KeyCode::F8, Key::F8),
-            "f9" => (KeyCode::F9, Key::F9),
-            "f10" => (KeyCode::F10, Key::F10),
-            "f11" => (KeyCode::F11, Key::F11),
-            "f12" => (KeyCode::F12, Key::F12),
             "printscreen" | "prtsc" | "prtscn" => (KeyCode::PrintScreen, Key::PrintScreen),
             _ => return None,
         };
@@ -283,6 +277,61 @@ fn write_tap_char(events: &mut MessageWriter<KeyboardInput>, window: Entity, c: 
 mod tests {
     use super::*;
 
+    #[derive(Resource, Default)]
+    struct DrivenActions(Vec<kuluu_render::Action>);
+
+    fn observe_bound_actions(
+        keys: Res<ButtonInput<KeyCode>>,
+        bindings: Res<kuluu_render::Bindings>,
+        mut observed: ResMut<DrivenActions>,
+    ) {
+        observed.0.extend(
+            bindings
+                .iter()
+                .filter_map(|(action, _)| bindings.just_pressed(action, &keys).then_some(action)),
+        );
+    }
+
+    #[test]
+    fn injected_keys_reach_existing_control_bindings() {
+        use kuluu_render::keybinds::Preset;
+        use kuluu_render::Action;
+
+        let cases = [
+            ("F1", Action::TargetSelf),
+            ("F2", Action::TargetParty2),
+            ("F3", Action::TargetParty3),
+            ("F4", Action::TargetParty4),
+            ("F5", Action::TargetParty5),
+            ("F6", Action::TargetParty6),
+            ("PrintScreen", Action::Screenshot),
+            ("prtsc", Action::Screenshot),
+            ("prtscn", Action::Screenshot),
+        ];
+        for preset in [Preset::Standard, Preset::Compact1, Preset::Compact2] {
+            for (name, action) in cases {
+                let queue = Arc::new(Mutex::new(vec![KeyMsg::Press(name.to_owned())]));
+                let mut app = App::new();
+                app.add_plugins((MinimalPlugins, bevy::input::InputPlugin))
+                    .insert_resource(KeyDriveQueue(queue.clone()))
+                    .insert_resource(preset.bindings())
+                    .init_resource::<DrivenActions>()
+                    .add_systems(PreUpdate, key_drive_system)
+                    .add_systems(Update, observe_bound_actions);
+                app.world_mut().spawn(PrimaryWindow);
+                app.update();
+                app.update();
+                assert_eq!(app.world().resource::<DrivenActions>().0, [action]);
+                queue.lock().unwrap().push(KeyMsg::Release(name.to_owned()));
+                app.update();
+                app.update();
+                let keys = app.world().resource::<ButtonInput<KeyCode>>();
+                assert!(!keys.pressed(KeyMsg::resolve(name).unwrap().0));
+                assert_eq!(app.world().resource::<DrivenActions>().0, [action]);
+            }
+        }
+    }
+
     #[test]
     fn tap_line_parses() {
         assert!(matches!(
@@ -329,12 +378,6 @@ mod tests {
             ("F4", KeyCode::F4, Key::F4),
             ("F5", KeyCode::F5, Key::F5),
             ("F6", KeyCode::F6, Key::F6),
-            ("F7", KeyCode::F7, Key::F7),
-            ("F8", KeyCode::F8, Key::F8),
-            ("F9", KeyCode::F9, Key::F9),
-            ("F10", KeyCode::F10, Key::F10),
-            ("F11", KeyCode::F11, Key::F11),
-            ("F12", KeyCode::F12, Key::F12),
         ];
         for (name, physical, logical) in function_keys {
             assert_eq!(KeyMsg::resolve(name), Some((physical, logical)));
