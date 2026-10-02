@@ -6,7 +6,6 @@
 pub mod ability_names;
 pub mod action_anim;
 pub mod cast_time;
-pub mod emote_anim;
 pub mod emote_names;
 pub mod equip_info;
 pub mod gil;
