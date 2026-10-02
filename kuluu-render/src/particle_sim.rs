@@ -256,7 +256,9 @@ fn d3m_stage_chain(
     )
 }
 
+#[derive(Clone)]
 struct LiveGenerator {
+    immediate_parent: Option<Entity>,
     def: ParticleGeneratorDef,
     template: SpriteTemplate,
     draw_path: D3mDrawPath,
@@ -371,6 +373,7 @@ pub struct ActorAutoRunEffects {
     pub assets: std::sync::Arc<ActionAssets>,
 }
 
+#[derive(Clone)]
 struct Particle {
     pos: Vec3,
     // research/xim Particle.kt updateAssociatedPosition — cameraAttachedBasePosition resolves the offset from the
@@ -416,6 +419,7 @@ struct Particle {
 // research/xim ParticleGeneratorSettings.kt OscillationParams — the per-particle oscillation
 // state the sec3 appliers integrate: per-axis acceleration and the applier's previous-amplitude
 // memory. [0]/[1]/[2] are the X/Y/Z axes.
+#[derive(Clone)]
 struct Oscillation {
     accel: [f32; 3],
     prev_amplitude: [f32; 3],
@@ -655,6 +659,7 @@ pub fn spawn_particle_generators(
 
         let emit_window_frames = ev.stage.stage.duration_frames as f32;
         sim.generators.push(LiveGenerator {
+            immediate_parent: None,
             scale_x: resolve(def.scale_x_track),
             scale_y: resolve(def.scale_y_track),
             alpha: resolve(def.alpha_track),
@@ -696,6 +701,61 @@ pub fn spawn_particle_generators(
             actor_rot: Quat::IDENTITY,
             built_key: MeshKey::Empty,
         });
+
+        let mut chain = vec![(def_dir, ev.stage.stage.id)];
+        let mut linked_dir = def_dir;
+        while let Some(parent) = sim.generators.last() {
+            let Some(id) = parent.def.immediate_generator else {
+                break;
+            };
+            let Some((dir, linked_def)) = assets.particle_def_scoped(linked_dir, &id) else {
+                break;
+            };
+            if chain.contains(&(dir, id)) {
+                break;
+            }
+            chain.push((dir, id));
+            linked_dir = dir;
+            let linked_def = *linked_def;
+            let Some((template, sprite_frames, texture)) =
+                resolve_mesh(assets, dir, &linked_def, &mut images, false)
+            else {
+                break;
+            };
+            let mut linked = parent.clone();
+            linked.immediate_parent = Some(parent.entity);
+            linked.def = linked_def;
+            linked.origin = parent.origin;
+            linked.scale_x = resolve(linked_def.scale_x_track);
+            linked.scale_y = resolve(linked_def.scale_y_track);
+            linked.alpha = resolve(linked_def.alpha_track);
+            linked.tod_color = resolve_tod_tracks(&linked_def, assets);
+            linked.solid_mesh = is_solid_mesh(&template);
+            linked.bound_radius = template_bound_radius(&template, &sprite_frames);
+            linked.template = template;
+            linked.sprite_frames = sprite_frames;
+            linked.stopped = true;
+            linked.mesh = meshes.add(empty_mesh());
+            let material = mats.add(FfxiParticleMaterial::for_def(
+                &linked_def,
+                texture,
+                NO_DAT_ORDER,
+            ));
+            linked.entity = commands
+                .spawn((
+                    InGameEntity,
+                    Mesh3d(linked.mesh.clone()),
+                    MeshMaterial3d(material),
+                    Transform::IDENTITY,
+                    Visibility::default(),
+                    bevy::camera::visibility::NoFrustumCulling,
+                    bevy::light::NotShadowCaster,
+                    bevy::light::NotShadowReceiver,
+                ))
+                .id();
+            linked.emit_rng = emit_seed(linked.entity);
+            sim.generators.push(linked);
+        }
     }
 }
 
@@ -756,6 +816,7 @@ pub fn spawn_actor_auto_run_particles(
                 id.and_then(|i| fx.assets.keyframes.get(&i).cloned())
             };
             sim.generators.push(LiveGenerator {
+                immediate_parent: None,
                 scale_x: resolve(def.scale_x_track),
                 scale_y: resolve(def.scale_y_track),
                 alpha: resolve(def.alpha_track),
@@ -836,6 +897,7 @@ pub fn spawn_zone_particle_generator(
 
     let resolve = |id: Option<[u8; 4]>| keyframe(assets, global, id);
     sim.generators.push(LiveGenerator {
+        immediate_parent: None,
         scale_x: resolve(def.scale_x_track),
         scale_y: resolve(def.scale_y_track),
         alpha: resolve(def.alpha_track),
@@ -971,8 +1033,73 @@ pub fn track_attached_origins(
 
 pub fn tick_particle_simulator(time: Res<Time>, mut sim: ResMut<ParticleSimulator>) {
     let frames = time.delta_secs() * ROUTINE_FPS;
-    for g in &mut sim.generators {
+    advance_simulator(&mut sim, frames);
+}
+
+// .agents/skills/retail-observe/references/2026-10-02-level-up-linked-sparkle.md immediate emission and parent position addition.
+fn advance_simulator(sim: &mut ParticleSimulator, frames: f32) {
+    let parents: std::collections::HashSet<_> = sim
+        .generators
+        .iter()
+        .filter_map(|g| g.immediate_parent)
+        .collect();
+    if parents.is_empty() {
+        for g in &mut sim.generators {
+            advance_generator(g, frames);
+        }
+        return;
+    }
+    let mut births = std::collections::HashMap::<Entity, Vec<Vec3>>::new();
+    let mut pending = Vec::new();
+    for (index, g) in sim.generators.iter_mut().enumerate() {
+        let before = g.elements_emitted;
         advance_generator(g, frames);
+        if g.immediate_parent.is_some() {
+            pending.push(index);
+        } else if parents.contains(&g.entity) {
+            births.insert(
+                g.entity,
+                g.particles
+                    .iter()
+                    .skip(
+                        g.particles
+                            .len()
+                            .saturating_sub((g.elements_emitted - before) as usize),
+                    )
+                    .map(|p| p.pos)
+                    .collect(),
+            );
+        }
+    }
+    let entities: std::collections::HashSet<_> = sim.generators.iter().map(|g| g.entity).collect();
+    while !pending.is_empty() {
+        let before = pending.len();
+        pending.retain(|index| {
+            let g = &mut sim.generators[*index];
+            let parent = g.immediate_parent.unwrap();
+            if entities.contains(&parent) && !births.contains_key(&parent) {
+                return true;
+            }
+            let mut emitted = Vec::new();
+            if frames > 0.0 {
+                for position in births.get(&parent).into_iter().flatten() {
+                    for _ in 0..emission_count(g) {
+                        emit(g, g.def.max_life_frames);
+                        if let Some(particle) = g.particles.last_mut() {
+                            if g.def.parent_position_copy {
+                                particle.pos += *position;
+                            }
+                            emitted.push(particle.pos);
+                        }
+                    }
+                }
+            }
+            births.insert(g.entity, emitted);
+            false
+        });
+        if pending.len() == before {
+            break;
+        }
     }
 }
 
@@ -1463,6 +1590,7 @@ pub fn sync_particle_meshes(
 
     // (index, despawn-needed); indices ascending so the reverse sweep below can
     // swap_remove safely.
+    let parents: std::collections::HashSet<_> = sim.generators.iter().map(|g| g.entity).collect();
     let mut reap: Vec<(usize, bool)> = Vec::new();
     for (i, g) in sim.generators.iter_mut().enumerate() {
         // The mesh entity despawns with its actor (auto-run generators are
@@ -1565,8 +1693,11 @@ pub fn sync_particle_meshes(
         } else if trace_rebuilds {
             trace.gated += 1;
         }
-        let window_over =
-            g.stopped || (!g.auto_run && g.age_frames > g.emit_window_frames.max(1.0));
+        let window_over = if let Some(parent) = g.immediate_parent {
+            !parents.contains(&parent)
+        } else {
+            g.stopped || (!g.auto_run && g.age_frames > g.emit_window_frames.max(1.0))
+        };
         let done = window_over && g.particles.is_empty();
         if done {
             reap.push((i, true));
@@ -1744,7 +1875,7 @@ const MESH_KEY_COLOR_QUANTUM: f32 = 1.0 / 256.0;
 // Quantized snapshot of every dynamic input rebuild_mesh consumes (via particle_draw, plus the
 // billboard rotation and UV scroll it reads directly). Zero live particles rebuild to the same
 // hidden primitive whatever those inputs are, hence the input-free Empty variant.
-#[derive(PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 enum MeshKey {
     Empty,
     Live {
@@ -1767,7 +1898,7 @@ struct CameraView {
     pos: Vec3,
 }
 
-#[derive(PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 struct ParticleKey {
     world: [i32; 3],
     flipbook_frame: usize,
@@ -1924,7 +2055,7 @@ fn rebuild_mesh(g: &LiveGenerator, cam: CameraView, clock: &CelestialClock, mesh
         } else if g.orientation.is_some() {
             particle_rotation(p)
         } else {
-            cam.rot
+            cam.rot * particle_rotation(p)
         };
         // Billboard sprites are flat (z unused); a 3-D particle mesh — a fixed-orientation
         // one, or an axial camera billboard, which stays a world-oriented solid — keeps its
@@ -2269,6 +2400,7 @@ mod tests {
             parent_position_copy: false,
             parent_velocity: None,
             child_generator: None,
+            immediate_generator: None,
             oscillation_accel_z: None,
             oscillation_accel_x: None,
             oscillation_accel_y: None,
@@ -2312,6 +2444,7 @@ mod tests {
 
     fn live(def: ParticleGeneratorDef, window: f32) -> LiveGenerator {
         LiveGenerator {
+            immediate_parent: None,
             def,
             template: SpriteTemplate {
                 positions: vec![Vec3::ZERO; 3],
@@ -4030,6 +4163,98 @@ mod tests {
             Vec3::new(9.0, 0.0, 0.0),
             "no 0x11 follow: the spawn-time origin is untouched"
         );
+    }
+
+    #[test]
+    fn unlinked_screen_billboard_keeps_authored_rotation() {
+        const TOLERANCE: f32 = 1e-4;
+        let mut g = live(def(ROUTINE_FPS, ROUTINE_FPS, 1), 0.0);
+        g.def.init_rotation[2] = std::f32::consts::FRAC_PI_2;
+        emit(&mut g, ROUTINE_FPS);
+        assert!(g.immediate_parent.is_none());
+        let camera = view(Quat::from_rotation_y(std::f32::consts::FRAC_PI_4));
+        let (rotated, _) = rebuilt(&g, camera);
+        g.particles[0].rotation = Vec3::ZERO;
+        let (unrotated, _) = rebuilt(&g, camera);
+        let expected =
+            camera.rot * Quat::from_rotation_z(std::f32::consts::FRAC_PI_2) * camera.rot.inverse();
+        for (actual, original) in rotated.iter().zip(unrotated.iter()) {
+            assert!((*actual - expected * *original).length() < TOLERANCE);
+        }
+    }
+
+    #[test]
+    fn linked_multiple_births_keep_parent_insertion_order() {
+        const BIRTHS: u32 = 3;
+        let mut parent = live(def(ROUTINE_FPS, ROUTINE_FPS, BIRTHS), 0.0);
+        parent.entity = Entity::from_bits(1);
+        parent.def.position_variance = Some(ffxi_dat::particle_gen::PositionVariance {
+            radius_variance: 1.0,
+            base_radius: 1.0,
+            axis_scale: [1.0; 3],
+        });
+        let mut child = live(def(ROUTINE_FPS, ROUTINE_FPS, 1), 0.0);
+        child.entity = Entity::from_bits(2);
+        child.immediate_parent = Some(parent.entity);
+        child.def.parent_position_copy = true;
+        child.stopped = true;
+        let mut sim = ParticleSimulator {
+            generators: vec![child, parent],
+            ..default()
+        };
+        advance_simulator(&mut sim, 1.0);
+        assert_eq!(sim.generators[0].particles.len(), BIRTHS as usize);
+        assert_ne!(
+            sim.generators[1].particles[0].pos,
+            sim.generators[1].particles[1].pos
+        );
+        for (child, parent) in sim.generators[0]
+            .particles
+            .iter()
+            .zip(&sim.generators[1].particles)
+        {
+            assert_eq!(child.pos, parent.pos);
+        }
+    }
+
+    #[test]
+    fn immediate_linked_emission_copies_birth_position_once_and_keeps_its_rotation() {
+        const PARENT_POSITION: Vec3 = Vec3::new(11.0, 4.0, -7.0);
+        let mut parent = live(def(30.0, 100.0, 1), 0.0);
+        parent.origin = PARENT_POSITION;
+        parent.entity = Entity::from_bits(1);
+        let mut child = live(def(30.0, 100.0, 1), 0.0);
+        child.entity = Entity::from_bits(2);
+        child.immediate_parent = Some(parent.entity);
+        child.origin = parent.origin;
+        child.def.parent_position_copy = true;
+        child.def.init_rotation[2] = std::f32::consts::FRAC_PI_2;
+        child.stopped = true;
+        let mut sim = ParticleSimulator {
+            generators: vec![child, parent],
+            ..default()
+        };
+        advance_simulator(&mut sim, 0.0);
+        assert!(sim.generators.iter().all(|g| g.particles.is_empty()));
+        advance_simulator(&mut sim, 1.0);
+        assert_eq!(sim.generators[0].particles.len(), 1);
+        let child = &sim.generators[0];
+        assert_eq!(child.particles[0].pos, sim.generators[1].particles[0].pos);
+        assert_eq!(
+            particle_draw(child, &child.particles[0], &sim.clock).world,
+            PARENT_POSITION
+        );
+        assert_eq!(
+            child.particles[0].scale,
+            Vec2::from_array(child.def.init_scale[..2].try_into().unwrap())
+        );
+        assert_eq!(child.particles[0].rotation.z, std::f32::consts::FRAC_PI_2);
+        advance_simulator(&mut sim, 0.0);
+        advance_simulator(&mut sim, 1.0);
+        assert_eq!(sim.generators[0].elements_emitted, 1);
+        sim.generators.remove(1);
+        advance_simulator(&mut sim, 30.0);
+        assert!(sim.generators[0].particles.is_empty());
     }
 
     #[test]
@@ -5993,6 +6218,119 @@ mod tests {
             Vec3::ZERO
         );
     }
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn real_dat_level_up_linked_sparkle_emits_a_rotated_cross_and_bounds_cycles() {
+        use crate::scheduler_runtime::{parse_action_bytes, LEVEL_UP_EFFECT_DAT_ID};
+        const SOURCE: [u8; 4] = *b"g001";
+        const LINK: [u8; 4] = *b"g002";
+        const ACTOR_POSITION: Vec3 = Vec3::new(11.0, 4.0, -7.0);
+        let Some(root) = ffxi_dat::archive::open_test_install() else {
+            return;
+        };
+        let bytes = std::fs::read(
+            root.resolve(LEVEL_UP_EFFECT_DAT_ID)
+                .unwrap()
+                .path_under(&root),
+        )
+        .unwrap();
+        let (schedulers, mut assets, _) = parse_action_bytes(&bytes);
+        let stage = schedulers
+            .iter()
+            .flat_map(|s| &s.stages)
+            .find(|s| s.stage.kind == StageKind::Particle && s.stage.id == SOURCE)
+            .copied()
+            .unwrap();
+        let source = assets.particle_def(stage.stage.local_dir, &SOURCE).unwrap();
+        assert_eq!(source.immediate_generator, Some(LINK));
+        assert_eq!(source.child_generator, None);
+        let (dir, _) = assets
+            .particle_def_scoped(stage.stage.local_dir, &LINK)
+            .unwrap();
+        assets
+            .particle_defs_by_dir
+            .get_mut(&(dir, LINK))
+            .unwrap()
+            .immediate_generator = Some(SOURCE);
+        let mut app = App::new();
+        app.add_plugins(bevy::asset::AssetPlugin::default())
+            .init_asset::<Mesh>()
+            .init_asset::<Image>()
+            .init_asset::<FfxiParticleMaterial>()
+            .init_resource::<ParticleSimulator>()
+            .add_message::<SchedulerStageEvent>()
+            .add_systems(Update, spawn_particle_generators);
+        let actor = app
+            .world_mut()
+            .spawn((
+                Transform::from_translation(ACTOR_POSITION)
+                    .with_rotation(Quat::from_rotation_y(std::f32::consts::FRAC_PI_2)),
+                assets,
+            ))
+            .id();
+        app.world_mut().write_message(SchedulerStageEvent {
+            actor,
+            stage,
+            scheduler: *b"main",
+        });
+        app.update();
+        let mut sim = app.world_mut().resource_mut::<ParticleSimulator>();
+        assert_eq!(
+            sim.generators.len(),
+            2,
+            "cyclic links must not allocate forever"
+        );
+        let first_delta = sim.generators[0].def.frames_per_emission;
+        advance_simulator(&mut sim, first_delta);
+        let parent = &sim.generators[0];
+        let child = &sim.generators[1];
+        assert!(!parent.particles.is_empty());
+        assert_eq!(child.particles.len(), parent.particles.len());
+        assert_eq!(child.particles[0].pos, parent.particles[0].pos);
+        assert_eq!(child.origin, parent.origin);
+        assert!(
+            particle_draw(child, &child.particles[0], &sim.clock)
+                .world
+                .distance(ACTOR_POSITION)
+                < 1.0,
+            "the actor transform must not apply twice"
+        );
+        sim.generators[0].stopped = true;
+        advance_simulator(&mut sim, ROUTINE_FPS / 4.0);
+        let child = &sim.generators[1];
+        let mut mesh = empty_mesh();
+        rebuild_mesh(
+            child,
+            view(Quat::IDENTITY),
+            &CelestialClock::default(),
+            &mut mesh,
+        );
+        let positions = mesh
+            .attribute(Mesh::ATTRIBUTE_POSITION)
+            .unwrap()
+            .as_float3()
+            .unwrap();
+        let template = &child.template.positions;
+        let (a, b) = (0..template.len())
+            .flat_map(|a| (a + 1..template.len()).map(move |b| (a, b)))
+            .find(|&(a, b)| template[a].x == template[b].x && template[a].y != template[b].y)
+            .unwrap();
+        let edge = Vec3::from_array(positions[a]) - Vec3::from_array(positions[b]);
+        const AXIS_TOLERANCE: f32 = 0.001;
+        assert!(edge.x.abs() > 0.0);
+        assert!(
+            edge.y.abs() < edge.x.abs() * AXIS_TOLERANCE,
+            "the authored vertical edge rotates onto the horizontal camera axis: {edge:?}"
+        );
+        let entities = sim.drain_entities();
+        assert_eq!(
+            entities.len(),
+            2,
+            "session cleanup drains parent and linked mesh ownership"
+        );
+        assert!(sim.generators.is_empty());
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn real_dat_level_up_zero_window_emits_and_rises_in_bevy_space() {
