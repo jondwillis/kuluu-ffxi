@@ -468,6 +468,42 @@ async fn server_reply_contract() {
     }
 }
 
+async fn submap_reply_contract() {
+    const OP_SUBMAP: u8 = 0xA6;
+    const MAP_NUMBER: u32 = 400;
+    let mut program = vec![OP_SUBMAP, 0, OP_SUBMAP, 2];
+    operand(&mut program, WORK_GIL);
+    message(&mut program, 0);
+    program.push(OP_END);
+    let mut host = Host::new(
+        EventDat {
+            blocks: vec![block(program, vec![0])],
+        },
+        FARE,
+    )
+    .await;
+    assert_eq!(
+        host.dialog.pending_tag(),
+        Some(ffxi_event::PendingTag::SubMapNum)
+    );
+    let request = super::super::codec::build_subpacket_reqsubmapnum(0);
+    let request = framing::walk_sub_packets(&request).next().unwrap().unwrap();
+    assert_eq!(request.opcode, map::c2s::REQSUBMAPNUM);
+    let body = MAP_NUMBER.to_le_bytes();
+    let packet = framing::SubPacket {
+        opcode: map::s2c::REQSUBMAPNUM,
+        sequence: 0,
+        data: &body,
+    };
+    assert!(server_ack_matches(&mut host.dialog, &packet));
+    let step = host.step(Drive::ServerAck);
+    let Advance::Frame(frame) = step.advance else {
+        panic!("submap reply did not resume")
+    };
+    assert_eq!(frame.nums[0], MAP_NUMBER as i32);
+    assert!(!server_ack_matches(&mut host.dialog, &packet));
+}
+
 async fn abort_contract() {
     let mut replaced = Host::new(position_dat(false), FARE).await;
     replaced.begin(FARE).await;
@@ -729,6 +765,7 @@ async fn event_state_contract() {
     numeric_contract().await;
     acknowledgement_contract().await;
     server_reply_contract().await;
+    submap_reply_contract().await;
     abort_contract().await;
     action_event_gate_contract().await;
     item_stack_gate_contract().await;

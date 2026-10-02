@@ -546,7 +546,7 @@ impl DialogSession {
             self.liveness = None;
             return advance;
         }
-        let (Some(runner), Some(active)) = (self.runner.as_ref(), self.active.as_ref()) else {
+        let (Some(runner), Some(_)) = (self.runner.as_ref(), self.active.as_ref()) else {
             self.liveness = None;
             return advance;
         };
@@ -592,25 +592,6 @@ impl DialogSession {
             ffxi_event::Park::ServerAck => {
                 if since.elapsed() <= TAG_ACK_GRACE {
                     return advance;
-                }
-                // 0xA6: LSB's 0x0EB handler returns silently when the player
-                // is not npc-locked, so the answer never comes; answer the VM
-                // with the MapNum the locked case carries and let the script
-                // run on instead of stalling
-                // (vendor/server/src/map/packets/c2s/0x0eb_reqsubmapnum.cpp).
-                if runner
-                    .pending_tag()
-                    .is_some_and(|tag| matches!(tag, PendingTag::SubMapNum))
-                {
-                    tracing::debug!(
-                        event_id = active.event_id,
-                        unique_no = format!("0x{:08X}", active.unique_no),
-                        "0xA6 submap request unanswered; answering with MapNum 0"
-                    );
-                    return self.drive(|runner, strings| {
-                        runner.set_submap_num(0);
-                        runner.ack_server(strings)
-                    });
                 }
                 Some(StallReason::ServerDidNotAnswer)
             }
@@ -3648,64 +3629,64 @@ pub(crate) mod tests {
         assert!(session.active_end().is_none());
     }
 
-    /// A 0x43 tag with no s2c ack: past the tag grace the session cancels the
-    /// event with the error line; the 0xA6 submap tag is the only one answered
-    /// locally instead.
     #[test]
     fn unanswered_tag_stalls_and_cancels_with_the_error_line() {
         const NPC: u32 = 0x010E_6032;
         const EVENT: u16 = 9003;
         const ZONE: u16 = 248;
-        let block = ffxi_dat::event_dat::EventBlock {
-            actor: NPC,
-            event_ids: vec![EVENT],
-            event_offsets: vec![0],
-            references: vec![],
-            event_data: vec![0x43, 0x00, 0x43, 0x01, 0x21],
-        };
-        let mut session = DialogSession::new(None, "Test".into());
-        session.loaded_event_zone = Some(ZONE);
-        session.loaded_string_zone = Some(ZONE);
-        session.event_dat = Some(Arc::new(EventDat {
-            blocks: vec![block],
-        }));
-        session.strings = Some(StringDat::parse(&synth_dat(&[b"test"])).unwrap());
-        let trigger = EventTrigger {
-            event_zone: ZONE,
-            text_zone: ZONE,
-            unique_no: NPC,
-            act_index: 0,
-            event_id: EVENT,
-            params: vec![],
-            npc_name: None,
-        };
-        assert!(
-            matches!(session.begin(trigger), Begin::AwaitServerAck(_)),
-            "the send-tag parks on its s2c ack"
-        );
-        // First tick: records the parked tuple, still within the grace.
-        assert!(matches!(session.tick(0.5), Advance::Waiting));
-        // Age the observation past TAG_ACK_GRACE.
-        let liveness = session
-            .liveness
-            .as_mut()
-            .expect("the parked tick recorded the tuple");
-        liveness.3 =
-            std::time::Instant::now() - (TAG_ACK_GRACE + std::time::Duration::from_secs(1));
-        // The next tick: the event cancels itself.
-        let Advance::Ended {
-            end_para, error, ..
-        } = session.tick(0.5)
-        else {
-            panic!("the stalled event must end");
-        };
-        assert_eq!(end_para, ffxi_event::EVENT_CANCELLED_END_PARA);
-        let Some(line) = error else {
-            panic!("the stall must carry the cancel line");
-        };
-        assert!(line.contains("server did not answer"), "{line}");
-        assert!(line.ends_with("; cancelled."), "{line}");
-        assert!(session.active_end().is_none());
+        const OP_SUBMAP: u8 = 0xA6;
+        for program in [vec![0x43, 0x00, 0x43, 0x01, 0x21], vec![OP_SUBMAP, 0, 0x21]] {
+            let block = ffxi_dat::event_dat::EventBlock {
+                actor: NPC,
+                event_ids: vec![EVENT],
+                event_offsets: vec![0],
+                references: vec![],
+                event_data: program,
+            };
+            let mut session = DialogSession::new(None, "Test".into());
+            session.loaded_event_zone = Some(ZONE);
+            session.loaded_string_zone = Some(ZONE);
+            session.event_dat = Some(Arc::new(EventDat {
+                blocks: vec![block],
+            }));
+            session.strings = Some(StringDat::parse(&synth_dat(&[b"test"])).unwrap());
+            let trigger = EventTrigger {
+                event_zone: ZONE,
+                text_zone: ZONE,
+                unique_no: NPC,
+                act_index: 0,
+                event_id: EVENT,
+                params: vec![],
+                npc_name: None,
+            };
+            assert!(
+                matches!(session.begin(trigger), Begin::AwaitServerAck(_)),
+                "the send-tag parks on its s2c ack"
+            );
+            // First tick: records the parked tuple, still within the grace.
+            assert!(matches!(session.tick(0.5), Advance::Waiting));
+            // Age the observation past TAG_ACK_GRACE.
+            let liveness = session
+                .liveness
+                .as_mut()
+                .expect("the parked tick recorded the tuple");
+            liveness.3 =
+                std::time::Instant::now() - (TAG_ACK_GRACE + std::time::Duration::from_secs(1));
+            // The next tick: the event cancels itself.
+            let Advance::Ended {
+                end_para, error, ..
+            } = session.tick(0.5)
+            else {
+                panic!("the stalled event must end");
+            };
+            assert_eq!(end_para, ffxi_event::EVENT_CANCELLED_END_PARA);
+            let Some(line) = error else {
+                panic!("the stall must carry the cancel line");
+            };
+            assert!(line.contains("server did not answer"), "{line}");
+            assert!(line.ends_with("; cancelled."), "{line}");
+            assert!(session.active_end().is_none());
+        }
     }
 
     /// A displayed menu frame is never stale: a minute of ticks parked on it
