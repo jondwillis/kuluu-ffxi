@@ -46,6 +46,41 @@
           }
         ]
       }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$(git rev-parse --show-toplevel)/.agents/hooks/codex-project-hook.py\" PreToolUse",
+            "timeout": 30
+          }
+        ],
+        "matcher": "Bash"
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$(git rev-parse --show-toplevel)/.agents/hooks/codex-project-hook.py\" PostToolUse",
+            "timeout": 30
+          }
+        ],
+        "matcher": "Bash|Edit|Write|NotebookEdit|view_image"
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$(git rev-parse --show-toplevel)/.agents/hooks/codex-project-hook.py\" Stop",
+            "timeout": 30
+          }
+        ]
+      }
     ]
   }
 }

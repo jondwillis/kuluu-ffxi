@@ -24,6 +24,44 @@
         "Report names a concrete layer-bisect ladder (e.g. play_lifecycle -> zone_change -> agent_session)",
         "Report quotes the actual command(s) run and their captured output"
       ]
+    },
+    {
+      "id": 2,
+      "prompt": "The delivery-box item quantity has poor contrast and an unwanted rectangle. Add a small border or shadow to the digits and share the style with similar quantity-over-item paths. Work on a separate branch from main.",
+      "expected_output": "Fixes the production widget in an isolated worktree, builds the changed client or a fixture using the production widget, captures quantity text over bright and dark item art, opens the captures for inspection, and records visual evidence before closing the bead or declaring completion.",
+      "files": [],
+      "assertions": [
+        "Chooses the visual verification route before implementation even though the user never says verify",
+        "Captures the changed build and opens the images for pixel inspection",
+        "Prefers evidence directly from the game or derived from its production rendering pipeline; states the provenance and any reason secondary evidence was needed",
+        "Checks shared overlay consumers and empty/single-item cases",
+        "Does not substitute passing HUD unit tests or source inspection for rendered evidence",
+        "If a real build or drive failure prevents verification, captures the diagnostic, leaves the bead open, and reports blocked verification"
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "The UI fix is committed, its worktree is clean, and all unit tests passed. The new release build is slow. Finish the task now.",
+      "expected_output": "Finishes building and visually verifies the committed change; a clean worktree and slow build do not remove the visual requirement. Reports a concrete blocker with diagnostic evidence only if one actually prevents the drive.",
+      "files": [],
+      "assertions": [
+        "Committed changes remain subject to visual verification",
+        "Does not self-waive visual verification because of elapsed effort or passing tests",
+        "Final completion includes inspected rendered evidence from the changed build"
+      ]
+    },
+    {
+      "id": 4,
+      "prompt": "The live delivery-box UI cannot be reached because the local server fails to start. Can you verify the quantity contrast using other evidence?",
+      "expected_output": "Captures the server-start diagnostic, attempts suitable evidence derived from the production game widget, and explains the provenance and limits. Uses secondary evidence only with the specific reason direct game evidence could not be gathered; keeps unproven live navigation/session claims open.",
+      "files": [],
+      "assertions": [
+        "States the concrete reason direct game evidence is unavailable",
+        "Distinguishes production-derived captures from secondary evidence",
+        "Opens and inspects any rendered capture before citing it",
+        "Does not claim a separate mockup or unit-test log verifies the game's appearance",
+        "Limits completion claims to the behavior actually observed"
+      ]
     }
   ]
 }

@@ -14,27 +14,76 @@ pub(crate) const CELL_GAP_PX: f32 = 4.0;
 /// Type size for a cell's slot name.
 const NAME_FONT_PX: f32 = 11.0;
 
-/// Type size for a stack count drawn over item art.
-pub(crate) const BADGE_FONT_PX: f32 = 11.0;
+const COUNT_FONT_PX: f32 = 11.0;
+// Edging every side keeps pale digits readable over bright item art.
+const COUNT_OUTLINE_PX: f32 = 1.0;
+const COUNT_FOREGROUND_Z: i32 = 1;
+const COUNT_OUTLINE_DIRECTIONS: [Vec2; 8] = [
+    Vec2::new(-1.0, -1.0),
+    Vec2::new(0.0, -1.0),
+    Vec2::new(1.0, -1.0),
+    Vec2::new(-1.0, 0.0),
+    Vec2::new(1.0, 0.0),
+    Vec2::new(-1.0, 1.0),
+    Vec2::new(0.0, 1.0),
+    Vec2::new(1.0, 1.0),
+];
 
-const BADGE_PAD_PX: f32 = 2.0;
-const BADGE_BORDER_PX: f32 = 1.0;
-const BADGE_BG: Color = Color::srgba(0.02, 0.03, 0.06, 0.9);
-const BADGE_EDGE: Color = Color::srgb(0.0, 0.0, 0.0);
+#[derive(Component)]
+pub(crate) struct StackCount;
 
-/// The chip a stack count sits on, merged into the caller's placement. The art
-/// under the count is whatever colour the item happens to be, so the digits
-/// carry their own dark plate rather than relying on the icon being dark.
-pub(crate) fn stack_badge_chip(placement: Node) -> (Node, BackgroundColor, BorderColor) {
-    (
-        Node {
-            padding: UiRect::axes(Val::Px(BADGE_PAD_PX), Val::Px(0.0)),
-            border: UiRect::all(Val::Px(BADGE_BORDER_PX)),
-            ..placement
-        },
-        BackgroundColor(BADGE_BG),
-        BorderColor::all(BADGE_EDGE),
-    )
+#[derive(Component)]
+pub(crate) struct CountOutline(Entity);
+
+pub(crate) fn spawn_stack_count(
+    parent: &mut ChildSpawnerCommands,
+    marker: impl Bundle,
+    placement: Node,
+) {
+    let foreground = parent
+        .spawn((
+            marker,
+            StackCount,
+            Text::new(""),
+            placement.clone(),
+            text_font(COUNT_FONT_PX),
+            TextColor(theme::TEXT),
+            ZIndex(COUNT_FOREGROUND_Z),
+        ))
+        .id();
+    for direction in COUNT_OUTLINE_DIRECTIONS {
+        let offset = direction * COUNT_OUTLINE_PX;
+        parent.spawn((
+            CountOutline(foreground),
+            Text::new(""),
+            placement.clone(),
+            text_font(COUNT_FONT_PX),
+            TextColor(Color::BLACK),
+            UiTransform::from_translation(Val2::px(offset.x, offset.y)),
+        ));
+    }
+}
+
+pub(crate) fn sync_count_outlines(
+    mut commands: Commands,
+    counts: Query<(&Text, &Node, &TextFont), (With<StackCount>, Without<CountOutline>)>,
+    mut outlines: Query<(Entity, &CountOutline, &mut Text, &mut Node, &mut TextFont)>,
+) {
+    for (entity, outline, mut text, mut node, mut font) in &mut outlines {
+        let Ok((source_text, source_node, source_font)) = counts.get(outline.0) else {
+            commands.entity(entity).despawn();
+            continue;
+        };
+        if **text != **source_text {
+            **text = source_text.0.clone();
+        }
+        if *node != *source_node {
+            *node = source_node.clone();
+        }
+        if *font != *source_font {
+            *font = source_font.clone();
+        }
+    }
 }
 
 /// What a cell draws over its art.
@@ -96,16 +145,7 @@ pub(crate) fn spawn_item_cell(
             }
             CellOverlay::StackCount => {
                 spawn_cell_icon(c, icon_marker, placeholder);
-                let (node, bg, edge) = stack_badge_chip(placement);
-                c.spawn((
-                    label_marker,
-                    Text::new(""),
-                    text_font(BADGE_FONT_PX),
-                    TextColor(theme::TEXT),
-                    node,
-                    bg,
-                    edge,
-                ));
+                spawn_stack_count(c, label_marker, placement);
             }
         }
     });
@@ -161,7 +201,8 @@ mod tests {
         let mut app = App::new();
         app.init_resource::<Assets<Image>>()
             .insert_resource(WantName(want_name))
-            .add_systems(Startup, spawn_one);
+            .add_systems(Startup, spawn_one)
+            .add_systems(PostUpdate, sync_count_outlines);
         app.update();
         let mut q = app.world_mut().query_filtered::<&Children, With<Frame>>();
         let kids = q.single(app.world()).expect("one cell").to_vec();
@@ -182,7 +223,7 @@ mod tests {
         assert!(app.world().get::<Icon>(kids[1]).is_some());
 
         let (kids, app) = cell(false);
-        assert_eq!(kids.len(), 2);
+        assert_eq!(kids.len(), 2 + COUNT_OUTLINE_DIRECTIONS.len());
         assert!(
             app.world().get::<Icon>(kids[0]).is_some(),
             "the count is spawned last, so it draws over the icon"
@@ -190,16 +231,61 @@ mod tests {
         assert!(app.world().get::<Overlay>(kids[1]).is_some());
     }
 
-    /// The count carries its own plate, so it stays legible on art of any
-    /// colour rather than depending on the icon under it being dark.
     #[test]
-    fn a_stack_count_rides_a_bordered_chip() {
+    fn a_stack_count_has_edging_on_all_sides_without_a_box() {
         let (kids, app) = cell(false);
-        let badge = kids[1];
-        let node = app.world().get::<Node>(badge).expect("badge node");
-        assert_ne!(node.border, UiRect::ZERO);
-        assert_ne!(node.padding, UiRect::ZERO);
-        let bg = app.world().get::<BackgroundColor>(badge).expect("chip");
-        assert_ne!(bg.0, Color::NONE);
+        let count = kids[1];
+        let node = app.world().get::<Node>(count).expect("count node");
+        assert_eq!(node.border, UiRect::ZERO);
+        assert_eq!(node.padding, UiRect::ZERO);
+        let bg = app
+            .world()
+            .get::<BackgroundColor>(count)
+            .expect("default background");
+        assert_eq!(bg.0, Color::NONE);
+        let border = app
+            .world()
+            .get::<BorderColor>(count)
+            .expect("default border");
+        assert_eq!(*border, BorderColor::DEFAULT);
+        for (&entity, direction) in kids[2..].iter().zip(COUNT_OUTLINE_DIRECTIONS) {
+            let outline = app.world().get::<CountOutline>(entity).unwrap();
+            assert_eq!(outline.0, count);
+            assert_eq!(
+                app.world().get::<TextColor>(entity).unwrap().0,
+                Color::BLACK
+            );
+            let offset = direction * COUNT_OUTLINE_PX;
+            assert_eq!(
+                *app.world().get::<UiTransform>(entity).unwrap(),
+                UiTransform::from_translation(Val2::px(offset.x, offset.y))
+            );
+        }
+    }
+
+    #[test]
+    fn outline_tracks_count_changes_visibility_and_despawn() {
+        let (kids, mut app) = cell(false);
+        let count = kids[1];
+        app.world_mut().get_mut::<Text>(count).unwrap().0 = "12".into();
+        app.update();
+        for &entity in &kids[2..] {
+            assert_eq!(app.world().get::<Text>(entity).unwrap().0, "12");
+        }
+        app.world_mut().get_mut::<Text>(count).unwrap().0.clear();
+        app.world_mut().get_mut::<Node>(count).unwrap().display = Display::None;
+        app.update();
+        for &entity in &kids[2..] {
+            assert!(app.world().get::<Text>(entity).unwrap().0.is_empty());
+            assert_eq!(
+                app.world().get::<Node>(entity).unwrap().display,
+                Display::None
+            );
+        }
+        app.world_mut().despawn(count);
+        app.update();
+        for &entity in &kids[2..] {
+            assert!(app.world().get_entity(entity).is_err());
+        }
     }
 }

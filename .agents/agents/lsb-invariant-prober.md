@@ -13,6 +13,8 @@ You do not generate exhaustive coverage tests. You generate
 *invariant* tests — assertions that fail loudly the moment an
 unrelated edit weakens the LSB alignment.
 
+Use `.agents/skills/kuluu-review/SKILL.md` for evidence boundaries. Derive expected values independently from the pinned upstream source; a test mirroring the Rust implementation does not prove conformance. Keep client-behavior claims separate from LSB invariants.
+
 ## Operating context
 
 - `vendor/server/` is the authoritative LSB source.
@@ -44,7 +46,7 @@ For each transform `forward: A → B`:
 ```rust
 #[test]
 fn pure_<axis>_lands_at_<expected_slot_with_expected_sign>() {
-    // Citation: vendor/server/src/map/<file>:<line> — <one-liner>
+    // vendor/server/src/map/<file> <symbol>: <upstream reason>
     let v = <one-axis-only input>;
     let d = forward(v);
     assert_eq!(d, <exact LSB-derived output>);
@@ -79,7 +81,7 @@ For each decoder:
 ```rust
 #[test]
 fn <packet>_decodes_known_layout() {
-    // Citation: vendor/server/src/map/packets/.../<file>:<line>
+    // Citation: vendor/server/src/map/packets/s2c/<file> <packet symbol>
     let mut body = vec![0u8; <SIZE>];
     body[<offset>..<offset+width>].copy_from_slice(&<value>.to_le_bytes());
     let decoded = <Decoder>::decode(&body).unwrap();
@@ -116,7 +118,7 @@ If a Rust constant mirrors an LSB enum value:
 ```rust
 #[test]
 fn <name>_matches_lsb_enum() {
-    // Citation: vendor/server/src/map/enums/<file>.h:<line>
+    // Citation: vendor/server/src/map/enums/<file>.h <enum symbol>
     assert_eq!(<RUST_CONST>, <LSB_VALUE>);
 }
 ```
@@ -138,7 +140,7 @@ For each transition you care about:
 ```rust
 #[test]
 fn <event>_triggers_<state_change>() {
-    // Citation: vendor/server/src/map/<file>:<line> — server-side
+    // Citation: vendor/server/src/map/<file> <emitting symbol>: server-side
     // condition that emits the event we're reacting to
     let mut sm = <state_machine>::new();
     sm.observe(<event>);
@@ -165,7 +167,7 @@ Hardest category to test in isolation, but you can still pin the
 ```rust
 #[test]
 fn reconnect_preserves_udp_source_port() {
-    // Citation: vendor/server/src/map/map_networking.cpp:85 —
+    // Citation: vendor/server/src/map/map_networking.cpp <session lookup symbol>:
     // LSB matches sessions by (ip, port). Rebinding the socket
     // creates a new client port → LSB drops bootstraps.
     let local_before = client.local_addr();
