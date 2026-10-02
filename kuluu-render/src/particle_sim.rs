@@ -1016,8 +1016,8 @@ fn advance_generator(g: &mut LiveGenerator, frames: f32) {
             emit(g, life);
         }
     } else if !g.auto_run && g.emit_window_frames <= 0.0 {
-        // .agents/skills/retail-observe/references/2026-10-01-level-up-scheduled-emission.md zero-window DAT inference.
-        if !g.stopped && !g.emit_culled && g.age_frames <= frames {
+        // .agents/skills/retail-observe/references/2026-10-01-level-up-zero-time-emission.md first-positive-update rule.
+        if frames > 0.0 && !g.stopped && !g.emit_culled && g.age_frames <= frames {
             for _ in 0..emission_count(g) {
                 emit(g, g.def.max_life_frames);
             }
@@ -4030,6 +4030,29 @@ mod tests {
             Vec3::new(9.0, 0.0, 0.0),
             "no 0x11 follow: the spawn-time origin is untouched"
         );
+    }
+
+    #[test]
+    fn scheduled_zero_window_waits_for_positive_time_and_does_not_repeat_when_paused() {
+        const POSITIVE_TICK_FRAMES: f32 = 1.0;
+        const PAUSED_TICK_FRAMES: f32 = 0.0;
+        let mut g = live(def(ROUTINE_FPS, ROUTINE_FPS, 1), 0.0);
+        advance(&mut g, PAUSED_TICK_FRAMES);
+        advance(&mut g, PAUSED_TICK_FRAMES);
+        assert_eq!(g.elements_emitted, 0);
+        assert!(g.particles.is_empty());
+
+        advance(&mut g, POSITIVE_TICK_FRAMES);
+        assert_eq!(g.elements_emitted, 1);
+        assert_eq!(g.particles.len(), 1);
+        let age_before_pause = g.particles[0].age_frames;
+        advance(&mut g, PAUSED_TICK_FRAMES);
+        assert_eq!(g.elements_emitted, 1);
+        assert_eq!(g.particles[0].age_frames, age_before_pause);
+        advance(&mut g, POSITIVE_TICK_FRAMES);
+        assert_eq!(g.elements_emitted, 1);
+        assert_eq!(g.particles.len(), 1);
+        assert!(g.particles[0].age_frames > age_before_pause);
     }
 
     // The cast aura's own generators sit on dur=0 Particle stages (global-dir `ner1`: gn1s dur=0;
