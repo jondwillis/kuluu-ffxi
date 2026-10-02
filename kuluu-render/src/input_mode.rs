@@ -447,9 +447,19 @@ pub struct TargetActionState {
     pub chat_mode_idx: usize,
 
     pub abilities_group_idx: usize,
+
+    pub dismount_confirm: bool,
 }
 
 impl TargetActionState {
+    // FFXiMain.dll retail-2026-09 VA 0x10210ECB selects row 2; VA 0x10211398 accepts only row 1.
+    pub const DISMOUNT_NO_ROW: usize = 1;
+
+    pub fn confirm_dismount(&mut self) {
+        self.dismount_confirm = true;
+        self.cursor = Self::DISMOUNT_NO_ROW;
+    }
+
     pub fn open(ctx: crate::hud::action_model::TargetActionContext) -> Self {
         Self {
             cursor: 0,
@@ -457,6 +467,7 @@ impl TargetActionState {
             sub: None,
             chat_mode_idx: 0,
             abilities_group_idx: 0,
+            dismount_confirm: false,
         }
     }
 }
