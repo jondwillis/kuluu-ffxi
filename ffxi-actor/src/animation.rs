@@ -323,6 +323,7 @@ impl SkeletonAnimator {
             .unwrap_or(false);
 
         if self.current_animation.is_none() || transition_in_zero {
+            self.transition = None;
             self.current_animation = Some(ctx);
             return;
         }
@@ -775,6 +776,48 @@ mod tests {
         let frame_after = animator.current_animation.as_ref().unwrap().current_frame;
         assert_eq!(frame_before, frame_after);
         assert!(animator.transition.is_none());
+    }
+
+    #[test]
+    fn zero_in_replacement_renders_new_pose_during_an_outgoing_blend() {
+        const RAISED_TRANSLATION: f32 = 100.0;
+        let mut raised = anim("mw10", 3, 1.0);
+        for frame in raised.key_frame_sets.get_mut(&0).unwrap() {
+            frame.translation[0] = RAISED_TRANSLATION;
+        }
+        let looping = LoopParams {
+            loop_duration: None,
+            num_loops: None,
+            low_priority: false,
+        };
+        let mut animator = SkeletonAnimator::new(0);
+        animator.set_next_animation(
+            SkeletonAnimationContext::new(raised.clone(), looping, None),
+            None,
+        );
+        animator.set_next_animation(
+            SkeletonAnimationContext::new(anim("idl0", 3, 1.0), looping, None),
+            None,
+        );
+        animator.update(1.0);
+        assert!(animator.get_joint_transform(0).unwrap().translation[0] < RAISED_TRANSLATION);
+
+        raised.id = DatId::from_str("mw20");
+        let immediate = TransitionParams {
+            transition_in_time: 0.0,
+            ..Default::default()
+        };
+        animator.set_next_animation(
+            SkeletonAnimationContext::new(raised, looping, Some(immediate.clone())),
+            Some(&immediate),
+        );
+        for _ in 0..3 {
+            assert_eq!(
+                animator.get_joint_transform(0).unwrap().translation[0],
+                RAISED_TRANSLATION
+            );
+            animator.update(1.0);
+        }
     }
 
     #[test]
