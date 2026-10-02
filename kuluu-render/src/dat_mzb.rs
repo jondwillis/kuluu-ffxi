@@ -706,6 +706,25 @@ impl MzbCollisionGeometry {
     }
 }
 
+fn build_collision_geometry_at(
+    submeshes: &[MzbSubMesh],
+    instances: &[MzbInstance],
+    file_id: Option<u32>,
+    world_pos: Vec3,
+) -> MzbCollisionBlock {
+    let placed: Vec<MzbInstance> = instances
+        .iter()
+        .map(|instance| MzbInstance {
+            bevy_transform: Transform {
+                translation: instance.bevy_transform.translation + world_pos,
+                ..instance.bevy_transform
+            },
+            ..*instance
+        })
+        .collect();
+    build_collision_geometry(submeshes, &placed, file_id)
+}
+
 /// Bakes placed submeshes into the geometry the player grounds on. The client
 /// and the `zz-*` collision probes both go through here, so a probe can't
 /// disagree with what the game actually walks on.
@@ -2896,7 +2915,7 @@ fn spawn_mzb_overlay(
 
     collision_geometry.set_block(
         req.slot,
-        build_collision_geometry(submeshes, instances, Some(req.file_id)),
+        build_collision_geometry_at(submeshes, instances, Some(req.file_id), req.world_pos),
     );
 
     spawn_merged(
@@ -3555,6 +3574,107 @@ pub(crate) mod ground_tests {
         geom.set_block(ZONE_SLOT_MAIN, block);
 
         assert_eq!(geom.ground_nearest(Vec2::ZERO, 6.0), Some(2.0));
+    }
+
+    #[test]
+    fn collision_block_uses_the_render_parent_translation() {
+        const OFFSET: Vec3 = Vec3::new(40.0, 7.0, -30.0);
+        let (positions, indices) = floor_at(0.0);
+        let submeshes = [MzbSubMesh {
+            positions: positions.iter().map(|v| v.to_array()).collect(),
+            indices: indices.to_vec(),
+            tri_terrain: vec![0; 2],
+            tri_normal: vec![Vec3::Y.to_array(); 2],
+            tri_camera_transparent: vec![false; 2],
+            flags: 0,
+        }];
+        let instances = [MzbInstance {
+            submesh_idx: 0,
+            bevy_transform: Transform::IDENTITY,
+            water_height_bevy: None,
+            lighting: None,
+            sub_area_link: 0,
+        }];
+        for offset in [Vec3::ZERO, OFFSET] {
+            let geom = LoadedZoneGeom {
+                submeshes: Arc::new(vec![MzbSubMesh {
+                    positions: submeshes[0].positions.clone(),
+                    indices: submeshes[0].indices.clone(),
+                    tri_terrain: submeshes[0].tri_terrain.clone(),
+                    tri_normal: submeshes[0].tri_normal.clone(),
+                    tri_camera_transparent: submeshes[0].tri_camera_transparent.clone(),
+                    flags: submeshes[0].flags,
+                }]),
+                instances: Arc::new(vec![MzbInstance { ..instances[0] }]),
+                mmb_spawns: Err(String::new()),
+            };
+            let mut app = App::new();
+            app.add_plugins(bevy::transform::TransformPlugin)
+                .init_resource::<Assets<Mesh>>()
+                .init_resource::<Assets<StandardMaterial>>()
+                .init_resource::<MzbCollisionGeometry>()
+                .init_resource::<ZoneAreaMap>()
+                .init_resource::<ZoneChunkLightMap>()
+                .init_resource::<PendingWaterSpawns>()
+                .init_resource::<crate::sub_area_activation::SubAreaActivation>()
+                .add_message::<crate::snapshot::ToastEvent>()
+                .add_message::<crate::dat_mmb::LoadMmbRequest>()
+                .add_systems(Update, move |
+                    mut commands: Commands,
+                    mut meshes: ResMut<Assets<Mesh>>,
+                    mut materials: ResMut<Assets<StandardMaterial>>,
+                    mut toasts: MessageWriter<crate::snapshot::ToastEvent>,
+                    mut collision: ResMut<MzbCollisionGeometry>,
+                    mut areas: ResMut<ZoneAreaMap>,
+                    mut lights: ResMut<ZoneChunkLightMap>,
+                    mut mmb: MessageWriter<crate::dat_mmb::LoadMmbRequest>,
+                    mut water: ResMut<PendingWaterSpawns>,
+                    mut activation: ResMut<crate::sub_area_activation::SubAreaActivation>,
+                | {
+                    spawn_mzb_overlay(
+                        LoadMzbRequest {
+                            file_id: u32::MAX,
+                            chunk_idx: None,
+                            world_pos: offset,
+                            auto_loaded: false,
+                            slot: ZONE_SLOT_MAIN,
+                            active_sub_area: None,
+                        },
+                        &geom, &mut commands, &mut meshes, &mut materials, &mut toasts,
+                        &mut collision, &mut areas, &mut lights, &mut mmb, &mut water,
+                        &mut activation, (Visibility::Inherited, Visibility::Inherited), false,
+                    );
+                });
+            app.update();
+            let expected: Vec<_> = positions.iter().map(|p| *p + offset).collect();
+            let geometry = app.world().resource::<MzbCollisionGeometry>();
+            assert_eq!(geometry.block(ZONE_SLOT_MAIN).positions, expected);
+            assert_eq!(
+                geometry.ground_nearest(offset.xz(), offset.y),
+                Some(offset.y)
+            );
+            if offset != Vec3::ZERO {
+                assert_eq!(geometry.ground_nearest(Vec2::ZERO, offset.y), None);
+            }
+            let mut rendered = app
+                .world_mut()
+                .query_filtered::<(&Mesh3d, &GlobalTransform), With<MzbCollisionMesh>>();
+            let (handle, transform) = rendered.single(app.world()).unwrap();
+            let mesh = app
+                .world()
+                .resource::<Assets<Mesh>>()
+                .get(&handle.0)
+                .unwrap();
+            let world_positions: Vec<_> = mesh
+                .attribute(Mesh::ATTRIBUTE_POSITION)
+                .unwrap()
+                .as_float3()
+                .unwrap()
+                .iter()
+                .map(|p| transform.transform_point(Vec3::from_array(*p)))
+                .collect();
+            assert_eq!(world_positions, expected);
+        }
     }
 
     /// `tri_sub_area` fans out per *placed* triangle like `camera_skip`: one
