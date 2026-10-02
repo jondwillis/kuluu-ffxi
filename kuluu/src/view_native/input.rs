@@ -50,7 +50,6 @@ pub struct MoveEnvParams<'w, 's> {
     /// The self actor's knockback: its lock and the shove the walker owes it.
     pub self_knockback: ResMut<'w, kuluu_render::ffxi_actor_render::SelfKnockback>,
     pub cutscene: Res<'w, kuluu_render::cutscene::CutsceneMode>,
-    pub mzb_in_flight: Res<'w, kuluu_render::dat_mzb::LoadMzbInFlight>,
 }
 
 /// Rising-edge memory for the pad stick, standing in for `just_pressed` where
@@ -189,8 +188,6 @@ const ABOUT_FACE_SNAP_RAD: f32 = 2.0;
 /// each tick would re-aim both every time it crossed a heading unit.
 const LOCK_CAM_DAMP_RAD_PER_SEC: f32 = 12.0;
 const LOCK_BODY_DAMP_RAD_PER_SEC: f32 = 8.0;
-
-const DIALOG_FLOOR_SNAP_EPSILON: f32 = 1e-3;
 
 #[derive(Resource, Clone)]
 pub struct CommandTx(pub mpsc::Sender<AgentCommand>);
@@ -541,19 +538,6 @@ impl DialogWalk {
         };
         (position, speed)
     }
-}
-
-/// Lift the dialog-driven (CS) feet to the MZB floor when it sits above them
-/// (wire z grows down); a floor at or below the feet is left alone, since the
-/// script's height is authoritative there and a downward snap reads as a fall.
-fn ground_dialog_feet_wire_z(
-    collision: &kuluu_render::dat_mzb::MzbCollisionGeometry,
-    position: Vec3,
-) -> f32 {
-    collision
-        .ground_or_recover_wire_z(position.x, position.y, position.z)
-        .filter(|floor_z| *floor_z < position.z - DIALOG_FLOOR_SNAP_EPSILON)
-        .unwrap_or(position.z)
 }
 
 pub fn handle_input_system(
@@ -1041,25 +1025,7 @@ pub fn dispatch_movement_system(
                 .dialog_walk
                 .get_or_insert_with(|| DialogWalk::new(current));
             let (position, speed) = walk.advance(current, target, time.delta_secs());
-            let zone_ready = kuluu_render::snapshot::effective_zone_file_id(&state.snapshot)
-                .is_some_and(|file| env.collision.source_file_id() == Some(file))
-                && !(env
-                    .mzb_in_flight
-                    .pending_in_slot(kuluu_render::dat_mzb::ZONE_SLOT_SUB_AREA)
-                    && env
-                        .collision
-                        .ground_step(
-                            bevy::math::Vec2::new(position.x, -position.y),
-                            -position.z,
-                            kuluu_render::dat_mzb::MAX_GROUND_STEP_UP,
-                        )
-                        .is_none());
-            let grounded_z = if zone_ready {
-                ground_dialog_feet_wire_z(&env.collision, position)
-            } else {
-                position.z
-            };
-            prediction.pos = Vec3::new(position.x, position.y, grounded_z);
+            prediction.pos = position;
             **move_intent = kuluu_render::combat_stance::SelfMoveIntent {
                 moving: speed > f32::EPSILON,
                 forward: 1.0,
@@ -3063,43 +3029,6 @@ mod tests {
         let mut in_flight = LoadMzbInFlight::default();
         in_flight.tasks.insert((0, None, None), (Vec::new(), task));
         in_flight
-    }
-
-    /// The CS (dialog-driven) feet lift to the MZB floor when the scripted
-    /// height sits below it, and hold the scripted height when the floor is at
-    /// or below the feet (a downward snap would read as a fall the script did
-    /// not author).
-    #[test]
-    fn dialog_feet_lift_to_the_floor_when_the_scripted_height_sits_below_it() {
-        // Floor at bevy y = 10.0 (wire z = -10.0).
-        const FLOOR_BEVY_Y: f32 = 10.0;
-        let collision = slab_collision(FLOOR_BEVY_Y);
-
-        // Feet 0.2 yalms in the floor: wire z = -9.8 (bevy y = 9.8), within
-        // MAX_GROUND_STEP_UP of the floor, so ground_step resolves it.
-        let in_floor = Vec3::new(0.0, 0.0, -9.8);
-        let lifted = ground_dialog_feet_wire_z(&collision, in_floor);
-        assert!(
-            (lifted - (-FLOOR_BEVY_Y)).abs() < 1e-3,
-            "feet below the floor must lift to it, got {lifted}"
-        );
-
-        // Feet already on the floor: wire z = -10.0 (bevy y = 10.0).
-        let on_floor = Vec3::new(0.0, 0.0, -FLOOR_BEVY_Y);
-        let held = ground_dialog_feet_wire_z(&collision, on_floor);
-        assert!(
-            (held - on_floor.z).abs() < 1e-3,
-            "feet already on the floor must not re-snap, got {held}"
-        );
-
-        // Feet above the floor: wire z = -10.5 (bevy y = 10.5), floating. The
-        // floor is below the feet, so a downward snap is refused.
-        let above = Vec3::new(0.0, 0.0, -10.5);
-        let floating = ground_dialog_feet_wire_z(&collision, above);
-        assert!(
-            (floating - above.z).abs() < 1e-3,
-            "feet above the floor must not snap down, got {floating}"
-        );
     }
 
     /// The wedge repro: feet at wire z = 0 (bevy y = 0) with the only floor a
