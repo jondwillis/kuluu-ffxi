@@ -345,13 +345,23 @@ Progress is tracked honestly against retail in [beads](.beads/) — a git-backed
 issue tracker checked into the repo (`.beads/issues.jsonl`). Parity work carries
 the `roadmap` label, plus `vanilla`/`enhanced` and an area label
 (`hud`, `combat-action`, …); issue status (`open` / `in_progress` / `closed`) is
-the source of truth for what's done. The [open issues](https://github.com/jondwillis/kuluu-ffxi/issues)
-above are a generated projection of that backlog, published by
+the source of truth for what's done. Beads-backed [GitHub issues](https://github.com/jondwillis/kuluu-ffxi/issues)
+are generated projections of that backlog, published by
 [`scripts/beads-github-publish.py`](scripts/beads-github-publish.py) — so the
 live counts are not a hand-kept promise. Pick an
 [open issue](https://github.com/jondwillis/kuluu-ffxi/issues) and open a PR.
 
 ## Contributing
+
+You can file or link an ordinary [GitHub issue](https://github.com/jondwillis/kuluu-ffxi/issues),
+comment on an existing issue, or submit a fork PR.
+[Creating an issue requires read access when issues are enabled](https://docs.github.com/en/issues/tracking-your-work-with-issues/using-issues/creating-an-issue);
+contributors do not need Beads or permission to manage repository labels/issues.
+A maintainer records accepted work in the durable tracker and supplies any
+missing PR-linked issue projection. Generated issues retain discussion in
+comments; their title/body is maintained from Beads. The
+[sync skill](.agents/skills/beads-github-sync/SKILL.md) documents the maintainer's
+scoped publication process.
 
 Pick an open [issue](https://github.com/jondwillis/kuluu-ffxi/issues) and open a
 PR. The backlog lives in beads (`bd ready` in a clone, or browse the mirrored
