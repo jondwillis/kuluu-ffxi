@@ -3596,10 +3596,59 @@ pub(crate) mod ground_tests {
             sub_area_link: 0,
         }];
         for offset in [Vec3::ZERO, OFFSET] {
-            let block = build_collision_geometry_at(&submeshes, &instances, None, offset);
+            let geom = LoadedZoneGeom {
+                submeshes: Arc::new(vec![MzbSubMesh {
+                    positions: submeshes[0].positions.clone(),
+                    indices: submeshes[0].indices.clone(),
+                    tri_terrain: submeshes[0].tri_terrain.clone(),
+                    tri_normal: submeshes[0].tri_normal.clone(),
+                    tri_camera_transparent: submeshes[0].tri_camera_transparent.clone(),
+                    flags: submeshes[0].flags,
+                }]),
+                instances: Arc::new(vec![MzbInstance { ..instances[0] }]),
+                mmb_spawns: Err(String::new()),
+            };
+            let mut app = App::new();
+            app.add_plugins(bevy::transform::TransformPlugin)
+                .init_resource::<Assets<Mesh>>()
+                .init_resource::<Assets<StandardMaterial>>()
+                .init_resource::<MzbCollisionGeometry>()
+                .init_resource::<ZoneAreaMap>()
+                .init_resource::<ZoneChunkLightMap>()
+                .init_resource::<PendingWaterSpawns>()
+                .init_resource::<crate::sub_area_activation::SubAreaActivation>()
+                .add_message::<crate::snapshot::ToastEvent>()
+                .add_message::<crate::dat_mmb::LoadMmbRequest>()
+                .add_systems(Update, move |
+                    mut commands: Commands,
+                    mut meshes: ResMut<Assets<Mesh>>,
+                    mut materials: ResMut<Assets<StandardMaterial>>,
+                    mut toasts: MessageWriter<crate::snapshot::ToastEvent>,
+                    mut collision: ResMut<MzbCollisionGeometry>,
+                    mut areas: ResMut<ZoneAreaMap>,
+                    mut lights: ResMut<ZoneChunkLightMap>,
+                    mut mmb: MessageWriter<crate::dat_mmb::LoadMmbRequest>,
+                    mut water: ResMut<PendingWaterSpawns>,
+                    mut activation: ResMut<crate::sub_area_activation::SubAreaActivation>,
+                | {
+                    spawn_mzb_overlay(
+                        LoadMzbRequest {
+                            file_id: u32::MAX,
+                            chunk_idx: None,
+                            world_pos: offset,
+                            auto_loaded: false,
+                            slot: ZONE_SLOT_MAIN,
+                            active_sub_area: None,
+                        },
+                        &geom, &mut commands, &mut meshes, &mut materials, &mut toasts,
+                        &mut collision, &mut areas, &mut lights, &mut mmb, &mut water,
+                        &mut activation, (Visibility::Inherited, Visibility::Inherited), false,
+                    );
+                });
+            app.update();
             let expected: Vec<_> = positions.iter().map(|p| *p + offset).collect();
-            assert_eq!(block.positions, expected);
-            let geometry = MzbCollisionGeometry::from_block(block);
+            let geometry = app.world().resource::<MzbCollisionGeometry>();
+            assert_eq!(geometry.block(ZONE_SLOT_MAIN).positions, expected);
             assert_eq!(
                 geometry.ground_nearest(offset.xz(), offset.y),
                 Some(offset.y)
@@ -3607,6 +3656,24 @@ pub(crate) mod ground_tests {
             if offset != Vec3::ZERO {
                 assert_eq!(geometry.ground_nearest(Vec2::ZERO, offset.y), None);
             }
+            let mut rendered = app
+                .world_mut()
+                .query_filtered::<(&Mesh3d, &GlobalTransform), With<MzbCollisionMesh>>();
+            let (handle, transform) = rendered.single(app.world()).unwrap();
+            let mesh = app
+                .world()
+                .resource::<Assets<Mesh>>()
+                .get(&handle.0)
+                .unwrap();
+            let world_positions: Vec<_> = mesh
+                .attribute(Mesh::ATTRIBUTE_POSITION)
+                .unwrap()
+                .as_float3()
+                .unwrap()
+                .iter()
+                .map(|p| transform.transform_point(Vec3::from_array(*p)))
+                .collect();
+            assert_eq!(world_positions, expected);
         }
     }
 
