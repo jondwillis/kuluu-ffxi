@@ -137,6 +137,8 @@ pub enum MotionStages {
 pub struct ActiveScheduler {
     pub stages: Vec<TimedStage>,
 
+    pub target: Option<Entity>,
+
     pub elapsed: f32,
 
     pub cursor: usize,
@@ -161,6 +163,7 @@ impl ActiveScheduler {
         stages.sort_by_key(|t| t.frame);
         Self {
             stages,
+            target: None,
             elapsed: 0.0,
             cursor: 0,
             name: s.name,
@@ -205,6 +208,7 @@ impl ActiveScheduler {
         stages.sort_by_key(|t| t.frame);
         Some(Self {
             stages,
+            target: None,
             elapsed: 0.0,
             cursor: 0,
             name: first,
@@ -221,12 +225,18 @@ impl ActiveScheduler {
         stages.sort_by_key(|t| t.frame);
         Some(Self {
             stages,
+            target: None,
             elapsed: 0.0,
             cursor: 0,
             name: *name,
             cutscene_motion_actor: None,
             done_reported: false,
         })
+    }
+
+    pub fn with_target(mut self, target: Option<Entity>) -> Self {
+        self.target = target;
+        self
     }
 
     pub fn name(&self) -> [u8; 4] {
@@ -400,6 +410,8 @@ impl ActiveSchedulers {
 pub struct SchedulerStageEvent {
     pub actor: Entity,
 
+    pub target: Option<Entity>,
+
     pub stage: TimedStage,
 
     pub scheduler: [u8; 4],
@@ -437,6 +449,7 @@ pub fn tick_active_schedulers(
                 }
                 writer.write(SchedulerStageEvent {
                     actor: entity,
+                    target: sched.target,
                     stage: next,
                     scheduler: scheduler_name,
                 });
@@ -1238,7 +1251,7 @@ fn apply_action_dispatch(
             .map(ActiveScheduler::from_scheduler)
     });
     let Some(active) = active else { return };
-    enqueue_routine(commands, actor_entity, active);
+    enqueue_routine(commands, actor_entity, active.with_target(target_entity));
     commands
         .entity(actor_entity)
         .try_insert_if_new(parsed.assets.clone())
@@ -1305,7 +1318,12 @@ fn queue_routine_on_actor_assets(
     pending_inserts: &mut HashMap<Entity, Vec<ActiveScheduler>>,
     commands: &mut Commands,
 ) {
-    let fresh = queue_active_scheduler(actor_entity, active, q_scheds, pending_inserts);
+    let fresh = queue_active_scheduler(
+        actor_entity,
+        active.with_target(target_entity),
+        q_scheds,
+        pending_inserts,
+    );
     if fresh {
         commands
             .entity(actor_entity)
@@ -1764,15 +1782,7 @@ pub fn dispatch_sound_stages(
             continue;
         }
         if ev.stage.stage.raw_type == ffxi_dat::scheduler::PLAYER_ONLY_SOUND_OPCODE
-            && q_self
-                .get(
-                    q_target
-                        .get(ev.actor)
-                        .ok()
-                        .and_then(|t| t.0)
-                        .unwrap_or(ev.actor),
-                )
-                .is_err()
+            && ev.target.is_none_or(|target| q_self.get(target).is_err())
         {
             continue;
         }
@@ -2415,6 +2425,7 @@ pub fn dispatch_cutscene_motion(
                 };
                 active.cutscene_motion_actor = Some(actor);
                 let target_entity = tracked.by_id.get(&partner_id).copied();
+                active.target = target_entity;
                 if queue_active_scheduler(actor_entity, active, &mut q_scheds, &mut pending_inserts)
                 {
                     commands
@@ -2475,6 +2486,7 @@ pub fn dispatch_cutscene_motion(
                     (Some(mut active), _) => {
                         let target_entity = tracked.by_id.get(&target_id).copied();
                         active.cutscene_motion_actor = Some(actor);
+                        active.target = target_entity;
                         if queue_active_scheduler(
                             actor_entity,
                             active,
@@ -3025,7 +3037,11 @@ pub fn dispatch_cast_routine_started(
         let Some(active) = ActiveScheduler::effects_only(&lookup, &name) else {
             continue;
         };
-        enqueue_routine(&mut commands, actor_entity, active);
+        enqueue_routine(
+            &mut commands,
+            actor_entity,
+            active.with_target(target_id.and_then(|id| tracked.by_id.get(&id).copied())),
+        );
         commands
             .entity(actor_entity)
             .try_insert(CastRoutine {
@@ -3251,8 +3267,8 @@ pub fn dispatch_melee_action_started(
             continue;
         };
         let armed_by = active.name();
-        enqueue_routine(&mut commands, actor_entity, active);
         let victim = target_id.and_then(|id| tracked.by_id.get(&id).copied());
+        enqueue_routine(&mut commands, actor_entity, active.with_target(victim));
         let mut entity = commands.entity(actor_entity);
         entity.try_insert(ActionTarget(victim));
         match resolution {
@@ -3481,8 +3497,11 @@ fn run_routine_on(
         return;
     };
     match q_active.get_mut(entity) {
-        Ok(mut scheds) => scheds.push(active),
-        Err(_) => pending_inserts.entry(entity).or_default().push(active),
+        Ok(mut scheds) => scheds.push(active.with_target(flipped_target)),
+        Err(_) => pending_inserts
+            .entry(entity)
+            .or_default()
+            .push(active.with_target(flipped_target)),
     }
     // ActionTarget stays a single entity-level component: first writer wins, stripped
     // when the last routine finishes. Retail's per-sequence target context
@@ -3822,7 +3841,7 @@ pub fn dispatch_level_up(
             LEVEL_UP_EFFECT_DAT_ID,
             PendingActionDispatch::Routine {
                 actor_id: player_id,
-                target_id: 0,
+                target_id: player_id,
                 routine: *b"main",
                 duration: ffxi_event::SCHEDULER_DURATION_FROM_DAT,
                 cutscene_actor: None,
@@ -4167,6 +4186,7 @@ mod tests {
 
         app.world_mut().write_message(SchedulerStageEvent {
             actor: caster,
+            target: target_entity,
             stage: stage(0, kind, 0, stage_id),
             scheduler: *b"test",
         });
@@ -4176,14 +4196,154 @@ mod tests {
 
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
+    fn overlapping_player_only_sounds_keep_each_routines_target() {
+        const OWNER_SOUND: [u8; 4] = *b"ownr";
+        const TARGET_SOUND: [u8; 4] = *b"targ";
+        const GLOBAL_SOUND: [u8; 4] = *b"glob";
+        const OWNER_SE_ID: u32 = 555_001;
+        const TARGET_SE_ID: u32 = 555_002;
+        const GLOBAL_SE_ID: u32 = 555_003;
+        const GLOBAL_SOUND_OPCODE: u8 = 0x60;
+        for owner_is_self in [false, true] {
+            for owner_first in [false, true] {
+                let mut app = App::new();
+                app.init_resource::<Time>()
+                    .add_message::<SchedulerStageEvent>()
+                    .add_message::<CutsceneMotionDone>()
+                    .add_message::<crate::audio::SfxEvent>()
+                    .init_resource::<CapturedSfx>();
+                let target = app.world_mut().spawn_empty().id();
+                if !owner_is_self {
+                    app.world_mut().entity_mut(target).insert(IsSelf);
+                }
+                let mut assets = sep_assets(OWNER_SOUND, OWNER_SE_ID);
+                assets
+                    .seps
+                    .extend(sep_assets(TARGET_SOUND, TARGET_SE_ID).seps);
+                assets
+                    .seps
+                    .extend(sep_assets(GLOBAL_SOUND, GLOBAL_SE_ID).seps);
+                let owner =
+                    app.world_mut()
+                        .spawn((
+                            assets.clone(),
+                            ActiveSchedulers::one(ActiveScheduler::from_scheduler(
+                                &make_scheduler(*b"hold", Vec::new()),
+                            )),
+                            ActionTarget(Some(target)),
+                        ))
+                        .id();
+                if owner_is_self {
+                    app.world_mut().entity_mut(owner).insert(IsSelf);
+                }
+                let sound_stage = |id| {
+                    stage(
+                        0,
+                        StageKind::SoundNonPositional,
+                        ffxi_dat::scheduler::PLAYER_ONLY_SOUND_OPCODE,
+                        id,
+                    )
+                };
+                let mut queued = vec![
+                    (
+                        ActiveScheduler::from_scheduler(&make_scheduler(
+                            *b"atk0",
+                            vec![sound_stage(TARGET_SOUND)],
+                        )),
+                        Some(target),
+                    ),
+                    (
+                        ActiveScheduler::from_scheduler(&make_scheduler(
+                            *b"main",
+                            vec![
+                                sound_stage(OWNER_SOUND),
+                                stage(
+                                    0,
+                                    StageKind::SoundNonPositional,
+                                    GLOBAL_SOUND_OPCODE,
+                                    GLOBAL_SOUND,
+                                ),
+                            ],
+                        )),
+                        Some(owner),
+                    ),
+                ];
+                if owner_first {
+                    queued.reverse();
+                }
+                app.add_systems(
+                    Update,
+                    (
+                        move |mut commands: Commands, mut scheds: Query<&mut ActiveSchedulers>| {
+                            let mut pending = HashMap::new();
+                            for (active, target) in std::mem::take(&mut queued) {
+                                queue_routine_on_actor_assets(
+                                    &assets,
+                                    active,
+                                    owner,
+                                    target,
+                                    &mut scheds,
+                                    &mut pending,
+                                    &mut commands,
+                                );
+                            }
+                            flush_active_scheduler_inserts(
+                                &mut pending,
+                                &mut scheds,
+                                &mut commands,
+                            );
+                        },
+                        tick_active_schedulers,
+                        dispatch_sound_stages,
+                        capture_sfx,
+                    )
+                        .chain(),
+                );
+                app.update();
+                let mut heard: Vec<_> = app
+                    .world()
+                    .resource::<CapturedSfx>()
+                    .0
+                    .iter()
+                    .map(|s| s.se_id)
+                    .collect();
+                heard.sort_unstable();
+                let expected = if owner_is_self {
+                    OWNER_SE_ID
+                } else {
+                    TARGET_SE_ID
+                };
+                assert_eq!(heard, vec![expected, GLOBAL_SE_ID]);
+                assert_eq!(
+                    app.world().get::<ActionTarget>(owner).unwrap().0,
+                    Some(target)
+                );
+            }
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
     fn player_only_sound_uses_the_local_target_without_gating_global_sounds() {
         const STAGE_ID: [u8; 4] = *b"se01";
         const SE_ID: u32 = 4242;
         const GLOBAL_SOUND_OPCODE: u8 = 0x60;
-        for (raw_type, target_is_self, expected_count) in [
-            (ffxi_dat::scheduler::PLAYER_ONLY_SOUND_OPCODE, true, 1),
-            (ffxi_dat::scheduler::PLAYER_ONLY_SOUND_OPCODE, false, 0),
-            (GLOBAL_SOUND_OPCODE, false, 1),
+        for (raw_type, target_is_self, target_bound, expected_count) in [
+            (ffxi_dat::scheduler::PLAYER_ONLY_SOUND_OPCODE, true, true, 1),
+            (
+                ffxi_dat::scheduler::PLAYER_ONLY_SOUND_OPCODE,
+                false,
+                true,
+                0,
+            ),
+            (
+                ffxi_dat::scheduler::PLAYER_ONLY_SOUND_OPCODE,
+                true,
+                false,
+                0,
+            ),
+            (GLOBAL_SOUND_OPCODE, false, true, 1),
+            (GLOBAL_SOUND_OPCODE, false, false, 1),
         ] {
             let mut app = App::new();
             app.add_message::<SchedulerStageEvent>()
@@ -4204,6 +4364,7 @@ mod tests {
                 .id();
             app.world_mut().write_message(SchedulerStageEvent {
                 actor,
+                target: target_bound.then_some(target),
                 stage: stage(0, StageKind::SoundNonPositional, raw_type, STAGE_ID),
                 scheduler: *b"test",
             });
@@ -5032,7 +5193,7 @@ mod tests {
                     ..
                 } => {
                     assert_eq!(*actor_id, PLAYER);
-                    assert_eq!(*target_id, 0);
+                    assert_eq!(*target_id, PLAYER);
                     assert_eq!(routine, b"main");
                 }
                 _ => panic!("level-up defers a Routine dispatch"),
@@ -6115,6 +6276,7 @@ mod tests {
 
             app.world_mut().write_message(SchedulerStageEvent {
                 actor: parent,
+                target: None,
                 stage: TimedStage {
                     frame: 0,
                     stage: flinch.stage,

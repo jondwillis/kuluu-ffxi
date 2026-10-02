@@ -165,17 +165,18 @@ fn advance(
         let (schedulers, assets, _) = parse_action_bytes(&bytes);
         let active = ActiveScheduler::from_main(&schedulers, b"main").unwrap();
 
-        owner.0 = Some(
-            commands
-                .spawn((
-                    kuluu_render::components::IsSelf,
-                    Transform::default(),
-                    GlobalTransform::default(),
-                    assets,
-                    ActiveSchedulers::one(active),
-                ))
-                .id(),
-        );
+        let actor = commands
+            .spawn((
+                kuluu_render::components::IsSelf,
+                Transform::default(),
+                GlobalTransform::default(),
+                assets,
+            ))
+            .id();
+        commands
+            .entity(actor)
+            .insert(ActiveSchedulers::one(active.with_target(Some(actor))));
+        owner.0 = Some(actor);
     }
     if let (Some(target), Some(dir)) = (capture.target, capture.options.capture.as_ref()) {
         if let Some(effect_frame) = current_frame.checked_sub(EFFECT_START_FRAME) {

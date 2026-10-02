@@ -5855,6 +5855,7 @@ mod tests {
         app.world_mut()
             .write_message(crate::scheduler_runtime::SchedulerStageEvent {
                 actor: attacker,
+                target: Some(victim),
                 stage: particle_stage(gen_id),
                 scheduler: HIT_SPARK_DIR,
             });
@@ -6025,6 +6026,7 @@ mod tests {
         let actor = app.world_mut().spawn((Transform::default(), assets)).id();
         app.world_mut().write_message(SchedulerStageEvent {
             actor,
+            target: None,
             stage,
             scheduler: *b"main",
         });

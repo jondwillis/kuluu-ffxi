@@ -57,6 +57,30 @@ the frame-zero SEP and decodes nonzero installed audio. Both passed against
 the clean retail install. None of this proves server-trigger delivery or the
 full visual/mixing parity with a live retail client.
 
+## Scheduler receiver context
+
+The same `retail-2026-09` dump independently identifies caster and target
+references inside each scheduler task. RVA `0x57BF0` adds `0x34` to the task
+pointer and jumps to target getter RVA `0x3B700`. That getter reads the target
+pointer at attachment offset `0x10` (task `0x44`) and validates its link at
+attachment `0x20` (task `0x54`). An invalid link returns null, without a caster
+or owner fallback. Caster accessor RVA `0x57BE0` instead resolves attachment
+`0x0C` (task `0x40`). Target setter RVA `0x3B830`
+updates the independent target reference; caster setter is RVA `0x3B7B0`.
+
+Thus opcode `0x4A` tests its own task receiver, not another active routine's
+target on the same actor. Kuluu's entity-wide `ActionTarget` can be retained or
+overwritten while several routines run. A queue/tick/dispatch overlap guard
+reproduces incorrect audibility when that shared target is used for this gate.
+Carry the target in each active routine and emitted stage instead. Missing
+receivers suppress player-only sound, while opcode `0x60` remains ungated.
+
+Kuluu explicitly binds the level-up recipient as this effect's receiver. The
+demo and actor-local routines bind their actor explicitly too. These producer
+mappings preserve the intended self-effect; this trace has not independently
+identified retail's level-up task construction call site and must not be cited
+as a null-to-owner fallback rule.
+
 ## Repeatable demonstration
 
 The demo advances visible playback from elapsed time; offscreen capture retains
