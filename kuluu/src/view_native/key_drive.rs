@@ -87,12 +87,6 @@ impl KeyMsg {
             "f4" => (KeyCode::F4, Key::F4),
             "f5" => (KeyCode::F5, Key::F5),
             "f6" => (KeyCode::F6, Key::F6),
-            "f7" => (KeyCode::F7, Key::F7),
-            "f8" => (KeyCode::F8, Key::F8),
-            "f9" => (KeyCode::F9, Key::F9),
-            "f10" => (KeyCode::F10, Key::F10),
-            "f11" => (KeyCode::F11, Key::F11),
-            "f12" => (KeyCode::F12, Key::F12),
             "printscreen" | "prtsc" | "prtscn" => (KeyCode::PrintScreen, Key::PrintScreen),
             _ => return None,
         };
@@ -284,6 +278,105 @@ mod tests {
     use super::*;
 
     #[test]
+    fn injected_keys_reach_existing_control_handlers() {
+        use super::super::input::{handle_input_system, AutoRun, CommandTx, TabCycleStack};
+        use super::super::screenshot::ScreenshotRequest;
+        use kuluu_render::keybinds::Preset;
+        use kuluu_render::{
+            CameraMode, CameraTransition, ChaseCamera, CursorLockRequest, InputMode, LockOn,
+            SceneState, Target,
+        };
+
+        const SELF_ID: u32 = 0xE111_0001;
+        let cases = [
+            ("F1", Some(SELF_ID)),
+            ("F2", Some(SELF_ID + 1)),
+            ("F3", Some(SELF_ID + 2)),
+            ("F4", Some(SELF_ID + 3)),
+            ("F5", Some(SELF_ID + 4)),
+            ("F6", Some(SELF_ID + 5)),
+            ("PrintScreen", None),
+            ("prtsc", None),
+            ("prtscn", None),
+        ];
+        for preset in [Preset::Standard, Preset::Compact1, Preset::Compact2] {
+            for (name, expected_target) in cases {
+                let queue = Arc::new(Mutex::new(vec![KeyMsg::Press(name.to_owned())]));
+                let (tx, _rx) = tokio::sync::mpsc::channel(1);
+                let mut app = App::new();
+                app.add_plugins((MinimalPlugins, bevy::input::InputPlugin))
+                    .insert_resource(KeyDriveQueue(queue.clone()))
+                    .insert_resource(preset.bindings())
+                    .insert_resource(CommandTx(tx))
+                    .init_resource::<super::super::gamepad_input::PadPressed>()
+                    .init_resource::<SceneState>()
+                    .init_resource::<Target>()
+                    .init_resource::<InputMode>()
+                    .init_resource::<AutoRun>()
+                    .init_resource::<CameraMode>()
+                    .init_resource::<ChaseCamera>()
+                    .init_resource::<CursorLockRequest>()
+                    .init_resource::<LockOn>()
+                    .init_resource::<CameraTransition>()
+                    .init_resource::<TabCycleStack>()
+                    .init_resource::<kuluu_render::combat_stance::RestStance>()
+                    .init_resource::<kuluu_render::combat_stance::WalkMode>()
+                    .init_resource::<kuluu_render::hud_hide::HudHidden>()
+                    .add_message::<bevy::window::WindowCloseRequested>()
+                    .add_message::<ScreenshotRequest>()
+                    .add_systems(PreUpdate, key_drive_system)
+                    .add_systems(Update, handle_input_system);
+                app.world_mut().spawn(PrimaryWindow);
+                {
+                    let mut scene = app.world_mut().resource_mut::<SceneState>();
+                    scene.snapshot.self_char_id = Some(SELF_ID);
+                    scene.snapshot.party = (0..6)
+                        .map(|slot| kuluu_snapshot::PartyMember {
+                            id: SELF_ID + slot,
+                            act_index: 0,
+                            name: None,
+                            hp: 0,
+                            mp: 0,
+                            tp: 0,
+                            hp_pct: 0,
+                            mp_pct: 0,
+                            zone_no: 0,
+                            main_job: 0,
+                            main_job_lv: 0,
+                            sub_job: 0,
+                            sub_job_lv: 0,
+                            is_party_leader: false,
+                            is_alliance_leader: false,
+                            party_no: 0,
+                            in_mog_house: false,
+                        })
+                        .collect();
+                }
+                app.update();
+                app.update();
+                assert_eq!(app.world().resource::<Target>().id, expected_target);
+                assert_eq!(
+                    app.world().resource::<Messages<ScreenshotRequest>>().len(),
+                    usize::from(expected_target.is_none()),
+                );
+                app.world_mut()
+                    .resource_mut::<Messages<ScreenshotRequest>>()
+                    .clear();
+                queue.lock().unwrap().push(KeyMsg::Release(name.to_owned()));
+                app.update();
+                app.update();
+                let keys = app.world().resource::<ButtonInput<KeyCode>>();
+                assert!(!keys.pressed(KeyMsg::resolve(name).unwrap().0));
+                assert_eq!(app.world().resource::<Target>().id, expected_target);
+                assert!(app
+                    .world()
+                    .resource::<Messages<ScreenshotRequest>>()
+                    .is_empty());
+            }
+        }
+    }
+
+    #[test]
     fn tap_line_parses() {
         assert!(matches!(
             KeyMsg::from_json_line(r#"{"key":"Enter"}"#),
@@ -329,12 +422,6 @@ mod tests {
             ("F4", KeyCode::F4, Key::F4),
             ("F5", KeyCode::F5, Key::F5),
             ("F6", KeyCode::F6, Key::F6),
-            ("F7", KeyCode::F7, Key::F7),
-            ("F8", KeyCode::F8, Key::F8),
-            ("F9", KeyCode::F9, Key::F9),
-            ("F10", KeyCode::F10, Key::F10),
-            ("F11", KeyCode::F11, Key::F11),
-            ("F12", KeyCode::F12, Key::F12),
         ];
         for (name, physical, logical) in function_keys {
             assert_eq!(KeyMsg::resolve(name), Some((physical, logical)));
