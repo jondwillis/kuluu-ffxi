@@ -311,13 +311,12 @@ const LOADEVENTSCHEDULER2_DURATION_OFS: usize = 15;
 const MAGICSCHEDULOR_KEY_OFS: usize = 1;
 const MAGICSCHEDULOR_ACTOR1_OFS: usize = 3;
 const MAGICSCHEDULOR_ACTOR2_OFS: usize = 7;
-// 0x00C4: the 0x73 sub-handler with param1 = 1 — the case byte at +1, the key
-// work at +2 (`getworkofs(param1 + 1)`), actor1 at +3, actor2 at +8
-// (`eventgetcode2(7 + param1)`), and the advance is `11 + param1` = 12
-// (research/XiEvents/OpCodes/0x00C4.md, 0x0073.md).
+// FFXiMain.dll retail-2026-09 RVA 0xB4550 passes shift 1 to RVA 0xB4590;
+// actor lookups are shift+3 and shift+7, work is shift+1, width is shift+11.
+// .agents/skills/retail-observe/references/2026-10-01-c4-spell-operands.md
 const MAGIC_TWIN_CASE_OFS: usize = 1;
 const MAGIC_TWIN_KEY_OFS: usize = 2;
-const MAGIC_TWIN_ACTOR1_OFS: usize = 3;
+const MAGIC_TWIN_ACTOR1_OFS: usize = 4;
 const MAGIC_TWIN_ACTOR2_OFS: usize = 8;
 const MAGIC_TWIN_SIZE: usize = 12;
 // 0x007D: the work operand at +1 (research/XiEvents/OpCodes/0x007D.md).
@@ -1662,11 +1661,8 @@ impl EventVm {
                     }
                     self.advance(op);
                 }
-                // The 0x73 twin: the same spell cast, but the case byte at +1
-                // shifts the key to +2 and actor2 to +8 and widens the advance
-                // to 12. Cases 0/1/2 all run the `main` routine; a case past 2
-                // arms no cast (retail's empty switch fall-through) yet still
-                // advances the full width (research/XiEvents/OpCodes/0x00C4.md).
+                // Unsupported cases skip the declared width to avoid decoding operands as
+                // opcodes; this fallback is not retail's non-advancing unknown-case path.
                 OP_MAGIC_TWIN => {
                     let case = self.byte_at(MAGIC_TWIN_CASE_OFS);
                     let actor1 = ActorLookup(self.eventgetcode2(MAGIC_TWIN_ACTOR1_OFS));
@@ -4419,33 +4415,31 @@ mod tests {
         }
     }
 
-    /// 0xC4 is the 0x73 cast with a case byte: the key shifts to +2, actor2 to
-    /// +8, and the advance is 12 (11 + param1), not the 11 the table records.
-    /// The key's reference high byte doubles as actor1's low byte, so actor1 is
-    /// a server id whose low byte is 0x80.
     #[test]
     fn magic_twin_0xc4_casts_and_advances_twelve() {
         const ANIMATION: u32 = 497;
-        const ACTOR1: u32 = 0x0100_0080;
-        let mut data = vec![OP_MAGIC_TWIN, 0x00]; // case 0
-        data.extend_from_slice(&REF0); // key at +2 -> References[0]; high byte is actor1's low
-        data.extend_from_slice(&[0x00, 0x00, 0x01]); // actor1 0x0100_0080, low byte already written
-        data.push(0x00); // +7 padding
-        data.extend_from_slice(&ActorLookup::LOCAL_PLAYER.0.to_le_bytes()); // actor2 at +8
-        data.push(OP_END);
-        let mut e = vm(data, vec![ANIMATION]);
-        assert_eq!(e.step(), StepResult::Done);
-        assert_eq!(e.exec_pointer(), MAGIC_TWIN_SIZE, "0xC4 must advance 12");
-        assert_eq!(
-            e.take_cues(),
-            [EventCue::Scheduler {
-                dat_id: MAGIC_DAT_ID_BASE + ANIMATION,
-                actor1: ActorLookup(ACTOR1),
-                actor2: ActorLookup::LOCAL_PLAYER,
-                tag: MAGIC_ROUTINE_TAG,
-                duration: SCHEDULER_DURATION_FROM_DAT,
-            }]
-        );
+        const ACTOR1: u32 = 0x0100_0081;
+        for case in 0..=2 {
+            let mut data = vec![OP_MAGIC_TWIN, case];
+            data.extend_from_slice(&REF0);
+            data.extend_from_slice(&ACTOR1.to_le_bytes());
+            data.extend_from_slice(&ActorLookup::LOCAL_PLAYER.0.to_le_bytes());
+            data.push(OP_END);
+            let mut e = vm(data, vec![ANIMATION]);
+            assert_eq!(e.step(), StepResult::Done);
+            assert_eq!(e.exec_pointer(), MAGIC_TWIN_SIZE);
+            assert_eq!(
+                e.take_cues(),
+                [EventCue::Scheduler {
+                    dat_id: MAGIC_DAT_ID_BASE + ANIMATION,
+                    actor1: ActorLookup(ACTOR1),
+                    actor2: ActorLookup::LOCAL_PLAYER,
+                    tag: MAGIC_ROUTINE_TAG,
+                    duration: SCHEDULER_DURATION_FROM_DAT,
+                }],
+                "case {case}",
+            );
+        }
     }
 
     /// Without scene data, 0x32 arms the speed and 0x1F case 0 walks the event
@@ -4581,14 +4575,11 @@ mod tests {
         );
     }
 
-    /// A 0xC4 case past 2 arms no cast (retail's empty switch fall-through) yet
-    /// still advances the full 12-byte width.
     #[test]
     fn magic_twin_0xc4_case_past_two_casts_nothing() {
         let mut data = vec![OP_MAGIC_TWIN, 0x03]; // case 3
         data.extend_from_slice(&REF0);
-        data.extend_from_slice(&[0x00, 0x00, 0x01]);
-        data.push(0x00);
+        data.extend_from_slice(&ActorLookup::EVENT_ENTITY.0.to_le_bytes());
         data.extend_from_slice(&ActorLookup::LOCAL_PLAYER.0.to_le_bytes());
         data.push(OP_END);
         let mut e = vm(data, vec![497]);

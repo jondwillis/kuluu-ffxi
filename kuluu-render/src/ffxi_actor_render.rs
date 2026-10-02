@@ -1406,6 +1406,12 @@ impl FfxiRenderActor {
     /// next frame. A cutscene's cast pose (the gate guard's Signet arm-raise) is owned by the
     /// event, not by combat: when the event ends, the pose must not outlive it. The pose pass
     /// re-selects idle from the cleared `action` on its next run.
+    pub(crate) fn release_cutscene_owned_action(&mut self) {
+        if self.action.is_some_and(|action| action.cutscene_owned) {
+            self.clear_cutscene_action();
+        }
+    }
+
     pub fn clear_cutscene_action(&mut self) {
         self.action = None;
         self.action_clips.clear();
@@ -1542,6 +1548,18 @@ impl FfxiRenderActor {
             .map(|prefix| DatId::from_str(&format!("{prefix}?")))
     }
 
+    pub(crate) fn begin_scheduler_motion(
+        &mut self,
+        clip_id: DatId,
+        motion: CompletionMotion,
+        cutscene_owned: bool,
+    ) {
+        self.begin_completion_motion(clip_id, motion);
+        if let Some(action) = &mut self.action {
+            action.cutscene_owned = cutscene_owned;
+        }
+    }
+
     pub fn begin_completion_motion(&mut self, clip_id: DatId, motion: CompletionMotion) {
         // research/xim EffectRoutineInterpolatedEffects.kt SkeletonAnimationInstance animationDirs — a skill's body motion is
         // resolved against `listOf(localDir) + actor.getAllAnimationDirectories()`: the
@@ -1567,6 +1585,7 @@ impl FfxiRenderActor {
         let loop_total = len * num_loops.unwrap_or(1) as f32;
         self.action = Some(ActionPlayback {
             clip_id,
+            cutscene_owned: false,
             looping: num_loops.is_some(),
             remaining: loop_total.max(motion.duration_frames * 0.5).max(1.0),
             num_loops,
@@ -1675,6 +1694,7 @@ fn half_frames(v: u16) -> f32 {
 #[derive(Clone, Copy)]
 struct ActionPlayback {
     clip_id: DatId,
+    cutscene_owned: bool,
 
     looping: bool,
 
@@ -4885,6 +4905,7 @@ pub fn dispatch_action_overlay(
                     .flatten();
                 actor.action = Some(ActionPlayback {
                     clip_id,
+                    cutscene_owned: false,
                     looping,
                     remaining,
                     num_loops: None,
@@ -6949,6 +6970,7 @@ mod pose_resolution_tests {
         assert!(len > 0.0, "HumeM ships the wind-up clip");
         actor.action = Some(ActionPlayback {
             clip_id: wind_up,
+            cutscene_owned: false,
             looping: false,
             remaining: len,
             num_loops: None,
