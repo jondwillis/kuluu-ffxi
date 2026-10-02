@@ -6,8 +6,8 @@ use ffxi_dat::event_dat::EventBlock;
 
 use crate::cue::{
     dat_id_helper, event_motion_dat_id, scheduler_twin_base, tpc_motion_packages, ActorLookup,
-    EventCue, ExtSchedulerMotion, FourCc, EMOTE_ANIMATION_KEY, LOCAL_PLAYER_SCHEDULER_DAT_ID_BASE,
-    MAGIC_DAT_ID_BASE, MAGIC_ROUTINE_TAG, MUSIC_VOLUME_MAX, NO_ACTION_KEY, SCHEDULER_DAT_ID_BASE,
+    EventCue, ExtSchedulerMotion, FourCc, LOCAL_PLAYER_SCHEDULER_DAT_ID_BASE, MAGIC_DAT_ID_BASE,
+    MAGIC_ROUTINE_TAG, MUSIC_VOLUME_MAX, NO_ACTION_KEY, SCHEDULER_DAT_ID_BASE,
     SCHEDULER_DURATION_FROM_DAT, STATUS_EVENT_CHOCOBO, STATUS_EVENT_IDLE, STATUS_EVENT_MOUNT,
 };
 use crate::opcode_meta::{
@@ -321,15 +321,6 @@ const WAITLOADSCHEDULER_ACTOR1_OFS: usize = 3;
 const WAITLOADSCHEDULER_KEY_OFS: usize = 11;
 const MAPSCHEDULOR_KEY_OFS: usize = 9; // 0x002D, same layout as the WAIT family
 const MAPSCHEDULOR_ACTOR2_OFS: usize = 5; // 0x002D partner slot of that layout
-                                          // 0x006E EMOT: actor lookup at +1, the work value (emote id low byte, variant
-                                          // high byte) at +5 (research/XiEvents/OpCodes/0x006E.md).
-const EMOT_ACTOR_OFS: usize = 1;
-const EMOT_VALUE_OFS: usize = 5;
-// 0x0063 PLAYANIM: the event entity's emote from the work value at +1
-// (research/XiEvents/OpCodes/0x0063.md).
-const PLAYANIM_VALUE_OFS: usize = 1;
-// 0x0099 ANIMWAIT: the actor lookup at +1 (research/XiEvents/OpCodes/0x0099.md).
-const ANIMWAIT_ACTOR_OFS: usize = 1;
 const DEFCAMERA_CASE_OFS: usize = 1; // 0x0046
 const DEFCAMERA_CASE_UNLOCK: u8 = 0;
 const DEFCAMERA_CASE_LOCK: u8 = 1;
@@ -1460,52 +1451,7 @@ impl EventVm {
                     self.parked_on_action_hold = false;
                     self.exec_pointer += OPCODE_META[op as usize].size as usize;
                 }
-                // 0x6E EMOT: the work value's low byte is the emote id, its high
-                // byte the variant selector (research/XiEvents/OpCodes/0x006E.md).
-                // Arms the same-pass start so a 0x99 in this pass sees the
-                // animation running; the host's timed hold from the drained cue
-                // takes over from the bridge.
-                OP_EMOT => {
-                    let actor = ActorLookup(self.eventgetcode2(EMOT_ACTOR_OFS));
-                    let value = self.getworkofs(EMOT_VALUE_OFS, 0);
-                    self.pending_action_starts
-                        .push((self.resolve_hold_actor(actor), EMOTE_ANIMATION_KEY));
-                    self.cues.push(EventCue::Emote {
-                        actor,
-                        emote_id: (value & 0xFF) as u16,
-                        param: ((value >> 8) & 0xFF) as u16,
-                    });
-                    self.advance(op);
-                }
-                // 0x63 PLAYANIM: the event entity's emote from the same work slot
-                // (research/XiEvents/OpCodes/0x0063.md).
-                OP_PLAYANIM => {
-                    let value = self.getworkofs(PLAYANIM_VALUE_OFS, 0);
-                    self.pending_action_starts.push((
-                        self.resolve_hold_actor(ActorLookup::EVENT_ENTITY),
-                        EMOTE_ANIMATION_KEY,
-                    ));
-                    self.cues.push(EventCue::Emote {
-                        actor: ActorLookup::EVENT_ENTITY,
-                        emote_id: (value & 0xFF) as u16,
-                        param: ((value >> 8) & 0xFF) as u16,
-                    });
-                    self.advance(op);
-                }
-                // 0x99 ANIMWAIT: hold while the named entity's animation is
-                // playing (research/XiEvents/OpCodes/0x0099.md). The host arms
-                // the timed hold from the emote DAT's authored routine length;
-                // with nothing armed the wait falls through, retail's path when
-                // the entity is unresolved.
-                OP_ANIMWAIT => {
-                    let actor = ActorLookup(self.eventgetcode2(ANIMWAIT_ACTOR_OFS));
-                    if self.action_running(actor, EMOTE_ANIMATION_KEY) {
-                        self.parked_on_action_hold = true;
-                        return StepResult::Waiting;
-                    }
-                    self.parked_on_action_hold = false;
-                    self.exec_pointer += OPCODE_META[op as usize].size as usize;
-                }
+                OP_EMOT | OP_PLAYANIM | OP_ANIMWAIT => self.advance(op),
                 // XiEvent MAPSCHEDULOR (research/XiEvents/OpCodes/0x002D.md): start the
                 // zone-level routine `key`, waited on by 0x54. Kuluu resolves `key` out
                 // of the current zone's own model DAT (ffxi-dat
@@ -4316,60 +4262,17 @@ mod tests {
         assert!(e.take_cues().is_empty());
     }
 
-    /// 0x6E's work value splits into the emote id (low byte) and the variant
-    /// selector (high byte); the cue names the actor the lookup operand picks.
     #[test]
-    fn emot_opcode_emits_the_split_emote_cue() {
-        let mut operands = ActorLookup::LOCAL_PLAYER.0.to_le_bytes().to_vec();
-        operands.extend_from_slice(&REF0);
-        assert_eq!(
-            cues_of(OP_EMOT, &operands, vec![0x0201]),
-            [EventCue::Emote {
-                actor: ActorLookup::LOCAL_PLAYER,
-                emote_id: 1,
-                param: 2,
-            }]
-        );
-    }
-
-    /// 0x63 always emotes the event entity, reading the same work slot as 0x6E.
-    #[test]
-    fn playanim_opcode_emotes_the_event_entity() {
-        let operands = REF0.to_vec();
-        assert_eq!(
-            cues_of(OP_PLAYANIM, &operands, vec![0x0004]),
-            [EventCue::Emote {
-                actor: ActorLookup::EVENT_ENTITY,
-                emote_id: 4,
-                param: 0,
-            }]
-        );
-    }
-
-    /// A 0x99 in the same pass as its 0x6E parks on the same-pass start, the
-    /// way retail's IsMovingAction sees the just-set animation.
-    #[test]
-    fn animwait_parks_on_the_same_pass_emote() {
-        let mut data = vec![OP_EMOT];
-        data.extend_from_slice(&ActorLookup::LOCAL_PLAYER.0.to_le_bytes());
-        data.extend_from_slice(&REF0);
-        data.push(OP_ANIMWAIT);
-        data.extend_from_slice(&ActorLookup::LOCAL_PLAYER.0.to_le_bytes());
-        data.push(OP_END);
-        let mut e = vm(data, vec![7]);
-        assert_eq!(e.step(), StepResult::Waiting);
-    }
-
-    /// With no emote armed, a 0x99 falls through to the next opcode, retail's
-    /// unresolved-entity path.
-    #[test]
-    fn animwait_falls_through_with_no_armed_emote() {
-        let mut data = vec![OP_ANIMWAIT];
-        data.extend_from_slice(&ActorLookup::LOCAL_PLAYER.0.to_le_bytes());
-        data.push(OP_END);
-        let mut e = vm(data, vec![]);
-        assert_eq!(e.step(), StepResult::Done);
-        assert_eq!(e.exec_pointer(), 5);
+    fn unsupported_event_emotes_preserve_baseline_skip() {
+        for op in [OP_EMOT, OP_PLAYANIM, OP_ANIMWAIT] {
+            let size = OPCODE_META[op as usize].size as usize;
+            let mut data = vec![op];
+            data.resize(size, 0);
+            data.push(OP_END);
+            let mut event = vm(data, vec![]);
+            assert_eq!(event.step(), StepResult::Done);
+            assert!(event.take_cues().is_empty());
+        }
     }
 
     /// 0x2C's third operand is an ASCII action key, not a numeric id.

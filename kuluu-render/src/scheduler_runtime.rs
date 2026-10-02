@@ -3734,6 +3734,62 @@ pub fn dispatch_spell_effect_stages(
     }
 }
 
+pub const EMOTE_ROUTINES_PER_FILE: u16 = 8;
+
+const SALUTE_NATION_MAX: u16 = 2;
+
+fn em_routine(sub: u16) -> [u8; 4] {
+    [
+        b'e',
+        b'm',
+        b'0',
+        b'0' + (sub % EMOTE_ROUTINES_PER_FILE) as u8,
+    ]
+}
+
+/// Emote id → (emote-file offset from the FFXiMain.dll race base, `em0N`
+/// routine). Derived empirically from the retail HumeM emote DATs (dump:
+/// examples/zz-emote-probe.rs; each routine's Motion clip mnemonic names the
+/// emote — bow/poi/sl1-3/kne/lau/wee, den/nod/wav/wel/gla/che/clp, …) and
+/// pinned to XIM's only known points (Actor.kt onGatheringAttempt HELM: Logging=(5,0),
+/// Mining=(6,0), Harvesting=(7,0) — confirmed by the files' Japanese tool
+/// particles: ono0=axe, turu=pickaxe, kama=sickle). Notable non-uniformities
+/// the old id/8 hypothesis missed: Point/Bow are swapped in file 0, Salute
+/// occupies em02..em04 (one per nation, 0x05A Param = nation), and ids ≥ 6
+/// sit at (id+2)/8 only through id 37. Returns None when no body routine
+/// exists in the era DATs (face-only emotes, id gaps, unmapped job emotes).
+pub fn emote_routine(emote_id: u16, param: u16) -> Option<(u32, [u8; 4])> {
+    match emote_id {
+        0 => Some((0, *b"em01")),
+        1 => Some((0, *b"em00")),
+        2 => Some((0, em_routine(2 + param.min(SALUTE_NATION_MAX)))),
+        3 => Some((0, *b"em05")),
+        4 => Some((0, *b"em06")),
+        5 => Some((0, *b"em07")),
+        6..=37 => {
+            let shifted = emote_id + 2;
+            Some((
+                (shifted / EMOTE_ROUTINES_PER_FILE) as u32,
+                em_routine(shifted % EMOTE_ROUTINES_PER_FILE),
+            ))
+        }
+        // HELM (server-initiated): axe / pickaxe / sickle files.
+        40 => Some((5, *b"em00")),
+        41 => Some((6, *b"em00")),
+        42 => Some((7, *b"em00")),
+        // Hurray variants (xe0..xe6) are weapon-keyed; selection unmapped — em00 default.
+        43 => Some((8, *b"em00")),
+        44 => Some((11, *b"em00")),
+        // Dance1-4 (dc0..dc3).
+        65..=68 => Some((12, em_routine(emote_id - 65))),
+        // Bell-ring motion variants (rx/rs); note→variant selection unmapped.
+        73 => Some((10, *b"em00")),
+        // Aim variants (ye0..ye6) are ranged-weapon-keyed; selection unmapped — em00 default.
+        96 => Some((9, *b"em00")),
+        _ => None,
+    }
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 pub fn dispatch_entity_emoted(
     events: Res<crate::snapshot::EventLog>,
@@ -3778,8 +3834,7 @@ pub fn dispatch_entity_emoted(
         let Some(&actor_entity) = tracked.by_id.get(&actor_id) else {
             continue;
         };
-        let Some((file_offset, routine)) = ffxi_vocab::emote_anim::emote_routine(emote_id, param)
-        else {
+        let Some((file_offset, routine)) = emote_routine(emote_id, param) else {
             continue;
         };
         let race = q_look.get(actor_entity).ok().and_then(|l| look_race(&l.0));
@@ -3973,8 +4028,8 @@ impl Plugin for SchedulerRuntimePlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use emote_routine;
     use ffxi_dat::scheduler::{SchedulerStage, StageKind};
-    use ffxi_vocab::emote_anim::emote_routine;
 
     /// A look-at must send the actor's +X forward along the offset to its
     /// target, on the same basis every other heading in the renderer uses.
