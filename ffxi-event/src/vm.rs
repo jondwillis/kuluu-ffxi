@@ -379,13 +379,8 @@ const STOP_CLOCK_HOUR_OFS: usize = 1;
 const STOP_CLOCK_NO_HOUR: i32 = 255;
 /// 0x69's on/off flag byte (0 -> full volume, non-zero -> mute) and its
 /// sound-type mask at +2 (research/XiEvents/OpCodes/0x0069.md).
-const SET_SOUND_FLAG_OFS: usize = 1;
-const SET_SOUND_MASK_OFS: usize = 2;
 /// 0x6A's volume (work[1] * 0.001), fade frames (work[3]) and sound-type mask
 /// (work[5]) (research/XiEvents/OpCodes/0x006A.md).
-const CHANGE_SOUND_LEVEL_OFS: usize = 1;
-const CHANGE_SOUND_FADE_OFS: usize = 3;
-const CHANGE_SOUND_MASK_OFS: usize = 5;
 /// 0xA9's day operand: the clock jumps to Vana day `7 * work[1]` at 00:30
 /// (research/XiEvents/OpCodes/0x00A9.md).
 const SET_CLOCK_DATE_DAY_OFS: usize = 1;
@@ -400,10 +395,6 @@ const MAP_MARKER_X_OFS: usize = 5; // 0x008B
 const MAP_MARKER_Y_OFS: usize = 7; // 0x008B
 const MAP_MARKER_NAME_OFS: usize = 9; // 0x008B, 16 bytes
 const OPEN_MAP_ID_OFS: usize = 1; // 0x0089, 0x008D
-const MAP_ADD_MARK_ID_OFS: usize = 1; // 0x00B8
-const MAP_ADD_MARK_X_OFS: usize = 7; // 0x00B8
-const MAP_ADD_MARK_Y_OFS: usize = 9; // 0x00B8
-const MAP_ADD_MARK_NAME_OFS: usize = 11; // 0x00B8, 16 bytes
 const CHOCOBO_CASE_OFS: usize = 1; // 0x007E
 const CHOCOBO_TARGET_OFS: usize = 2;
 const CHOCOBO_MOUNT_ID_OFS: usize = 6;
@@ -1820,40 +1811,8 @@ impl EventVm {
                     });
                     self.advance(op);
                 }
-                // 0x8D opens the map with its authored sub-menu property, which
-                // the MapOpen carrier does not carry
-                // (research/XiEvents/OpCodes/0x008D.md).
-                OP_OPEN_MAP_PROPS => {
-                    self.cues.push(EventCue::MapOpen {
-                        map_id: self.getworkofs(OPEN_MAP_ID_OFS, 0),
-                        tutorial: false,
-                    });
-                    self.advance(op);
-                }
-                // 0xB8 adds a named marker to the map; with the map closed
-                // retail opens it data-level and closes it again, so the
-                // visible result is the marker itself
-                // (research/XiEvents/OpCodes/0x00B8.md).
-                OP_MAP_ADD_MARK => {
-                    let mut name = [0u8; 16];
-                    for (slot, byte) in name.iter_mut().enumerate() {
-                        *byte = self.byte_at(MAP_ADD_MARK_NAME_OFS + slot);
-                    }
-                    // Retail rewrites underscores to spaces before the rename
-                    // (research/XiEvents/OpCodes/0x00B8.md).
-                    for b in &mut name {
-                        if *b == b'_' {
-                            *b = b' ';
-                        }
-                    }
-                    self.cues.push(EventCue::MapMarker {
-                        map_id: self.getworkofs(MAP_ADD_MARK_ID_OFS, 0),
-                        x_milli: self.getworkofs(MAP_ADD_MARK_X_OFS, 0),
-                        y_milli: self.getworkofs(MAP_ADD_MARK_Y_OFS, 0),
-                        name,
-                    });
-                    self.advance(op);
-                }
+                OP_OPEN_MAP_PROPS => self.advance(op),
+                OP_MAP_ADD_MARK => self.advance(op),
                 OP_CLOSE_MAP => {
                     self.cues.push(EventCue::MapClose);
                     self.advance(op);
@@ -1929,32 +1888,7 @@ impl EventVm {
                 // 0x69 sets the named sound types to full volume or mutes them
                 // (the flag byte); 0x6A eases them to work[1] * 0.001 over
                 // work[3] frames (research/XiEvents/OpCodes/0x0069.md, 0x006A.md).
-                OP_SET_SOUND_VOLUME => {
-                    let mask = self.getworkofs(SET_SOUND_MASK_OFS, 0) as u8;
-                    let volume = if self.byte_at(SET_SOUND_FLAG_OFS) == 0 {
-                        MUSIC_VOLUME_MAX
-                    } else {
-                        0
-                    };
-                    self.cues.push(EventCue::SoundVolume {
-                        mask,
-                        volume,
-                        fade_frames: 0,
-                    });
-                    self.advance(op);
-                }
-                OP_CHANGE_SOUND_VOLUME => {
-                    let mask = self.getworkofs(CHANGE_SOUND_MASK_OFS, 0) as u8;
-                    let volume = (self.getworkofs(CHANGE_SOUND_LEVEL_OFS, 0).clamp(0, 1000)
-                        * MUSIC_VOLUME_MAX as i32
-                        / 1000) as u8;
-                    self.cues.push(EventCue::SoundVolume {
-                        mask,
-                        volume,
-                        fade_frames: self.getworkofs(CHANGE_SOUND_FADE_OFS, 0) as u16,
-                    });
-                    self.advance(op);
-                }
+                OP_SET_SOUND_VOLUME | OP_CHANGE_SOUND_VOLUME => self.advance(op),
                 // 0x4C/0x4D/0x4F write the event entity's StatusEvent: the door's
                 // open/close byte and the M1..M8 event-motion range
                 // (research/XiEvents/OpCodes/0x004C.md, 0x004D.md, 0x004F.md;
@@ -4762,46 +4696,6 @@ mod tests {
         );
     }
 
-    /// `OP_OPEN_MAP_PROPS`'s sub-menu property has no carrier field; the cue
-    /// carries the zone id only (research/XiEvents/OpCodes/0x008D.md).
-    #[test]
-    fn open_map_props_opcode_drops_its_property_operand() {
-        assert_eq!(
-            cues_of(OP_OPEN_MAP_PROPS, &[REF1, REF2].concat(), vec![0, 230, 5]),
-            [EventCue::MapOpen {
-                map_id: 230,
-                tutorial: false
-            }]
-        );
-    }
-
-    /// `OP_MAP_ADD_MARK` carries the marker's zone id and milli-unit position
-    /// in work slots, its sub-menu and index operands uncarried, and its
-    /// 16-byte name inline with the underscore rewrite
-    /// (research/XiEvents/OpCodes/0x00B8.md).
-    #[test]
-    fn map_add_mark_opcode_carries_position_and_rewritten_name() {
-        let mut ops = [REF1, REF2, REF3].concat();
-        ops.extend_from_slice(&[4, 0x80]);
-        ops.extend_from_slice(&[5, 0x80]);
-        let mut name = [0u8; 16];
-        name[..9].copy_from_slice(b"some_name");
-        ops.extend_from_slice(&name);
-        assert_eq!(
-            cues_of(
-                OP_MAP_ADD_MARK,
-                &ops,
-                vec![0, 230, 0, 3, (-10264i32) as u32, (-363i32) as u32]
-            ),
-            [EventCue::MapMarker {
-                map_id: 230,
-                x_milli: -10264,
-                y_milli: -363,
-                name: *b"some name\0\0\0\0\0\0\0",
-            }]
-        );
-    }
-
     #[test]
     fn close_map_opcode_emits_the_close_cue() {
         assert_eq!(cues_of(OP_CLOSE_MAP, &[], vec![]), [EventCue::MapClose]);
@@ -4956,54 +4850,26 @@ mod tests {
         );
     }
 
-    /// 0x69's flag byte selects full volume (0) or mute (nonzero); the mask
-    /// rides work slot 2 (research/XiEvents/OpCodes/0x0069.md).
     #[test]
-    fn set_sound_volume_opcode_toggles_the_named_channels() {
-        // [flag, mask-ref] with the mask in References[2].
-        let ops = [0x00, 0x02, 0x80];
-        assert_eq!(
-            cues_of(OP_SET_SOUND_VOLUME, &ops, vec![0, 0, 0x04]),
-            [EventCue::SoundVolume {
-                mask: 0x04,
-                volume: MUSIC_VOLUME_MAX,
-                fade_frames: 0
-            }]
-        );
-        let mute = [0x01, 0x02, 0x80];
-        assert_eq!(
-            cues_of(OP_SET_SOUND_VOLUME, &mute, vec![0, 0, 0x08]),
-            [EventCue::SoundVolume {
-                mask: 0x08,
-                volume: 0,
-                fade_frames: 0
-            }]
-        );
-    }
-
-    /// 0x6A scales work[1] by 0.001 onto the 0..=127 table, carries work[3]
-    /// as the fade and work[5] as the mask (research/XiEvents/OpCodes/0x006A.md).
-    #[test]
-    fn change_sound_volume_opcode_scales_the_level_and_carries_the_fade() {
-        // level -> refs[1], fade -> refs[3], mask -> refs[5].
-        let ops = [0x01u8, 0x80, 0x03, 0x80, 0x05, 0x80];
-        assert_eq!(
-            cues_of(OP_CHANGE_SOUND_VOLUME, &ops, vec![0, 500, 0, 60, 0, 0x04]),
-            [EventCue::SoundVolume {
-                mask: 0x04,
-                volume: 63,
-                fade_frames: 60
-            }]
-        );
-        // A level past 1000 saturates at the table top instead of wrapping.
-        assert_eq!(
-            cues_of(OP_CHANGE_SOUND_VOLUME, &ops, vec![0, 9999, 0, 0, 0, 0x01]),
-            [EventCue::SoundVolume {
-                mask: 0x01,
-                volume: MUSIC_VOLUME_MAX,
-                fade_frames: 0
-            }]
-        );
+    fn partial_presentation_opcodes_keep_baseline_skip_without_effects() {
+        for op in [
+            OP_SET_SOUND_VOLUME,
+            OP_CHANGE_SOUND_VOLUME,
+            OP_OPEN_MAP_PROPS,
+            OP_MAP_ADD_MARK,
+        ] {
+            let size = OPCODE_META[op as usize].size as usize;
+            let mut program = vec![op];
+            program.resize(size, 0);
+            program.push(OP_END);
+            let mut event = vm(program, vec![]);
+            assert_eq!(event.step(), StepResult::Done);
+            assert_eq!(event.exec_pointer(), size);
+            assert!(
+                event.take_cues().is_empty(),
+                "partial opcode {op:#x} emitted an effect"
+            );
+        }
     }
 
     /// `OP_DEFCAMERA` case 1 takes the camera, case 0 gives it back; case 2
