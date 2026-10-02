@@ -312,6 +312,12 @@ async fn chocobo_rental_npc_completes_server_handoff() {
         .await
         .expect("granting fixture the Chocobo License");
 
+    // vendor/server/scripts/globals/chocobo_riding_game.lua xi.chocoboGame.raceCheck.
+    fixture
+        .set_char_var("[ChocoGame]NextEntryTime", 1)
+        .await
+        .expect("disable time-dependent delivery offers for the rental fixture");
+
     fixture
         .prepare_warrior_at(FIXTURE_LEVEL, RENTER_POSITION)
         .await
