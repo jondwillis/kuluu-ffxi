@@ -215,6 +215,18 @@ run_harness() {
     echo "checks: harness — $settings must register exactly one Beads SessionStart hook" >&2
     bad=1
   fi
+  if ! python3 .agents/hooks/install-codex-project-hooks.py --check; then
+    bad=1
+  fi
+  if ! jq -e '
+      ([.hooks.PostToolUse[]? | select(.matcher == "Read") | .hooks[]? |
+          select(.command == "${CLAUDE_PROJECT_DIR}/.agents/hooks/inspect-evidence.sh")] | length == 1) and
+      ([.hooks.Stop[]?.hooks[]? |
+          select(.command == "${CLAUDE_PROJECT_DIR}/.agents/hooks/stop-dispatcher.sh")] | length == 1)
+    ' "$settings" >/dev/null 2>&1; then
+    echo "checks: harness - Claude visual inspection or verification stop hook missing" >&2
+    bad=1
+  fi
   if ! grep -q '<!-- BEGIN BEADS CODEX SETUP:' AGENTS.md \
     || ! grep -q '<!-- BEGIN BEADS INTEGRATION ' AGENTS.md; then
     echo "checks: harness — AGENTS.md is missing a Beads-managed Codex or AGENTS-aware section" >&2
@@ -314,6 +326,11 @@ run_harness() {
     bad=1
   elif ! check_output=$(bash "$hook_tests" 2>&1); then
     echo "checks: harness — session-edit attribution hooks are broken:" >&2
+    echo "$check_output" >&2
+    bad=1
+  fi
+  if ! check_output=$(python3 .agents/hooks/tests/runtime-verification.test.py 2>&1); then
+    echo "checks: harness - runtime verification gates are broken:" >&2
     echo "$check_output" >&2
     bad=1
   fi
