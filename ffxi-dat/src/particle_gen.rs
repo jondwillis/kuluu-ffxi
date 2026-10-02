@@ -697,13 +697,8 @@ pub struct ParticleGeneratorDef {
     // sec2 0x69 KeyFrameValueSetup (velocity dampener): the 0x27/0x28/0x29 track shape
     // bound to the element's velocity dampener (research/xim ParticleGeneratorParser.kt
     // sec2Handler 0x69; retail's keyframe pre-load pass references the same blocks as
-    // Keyframe resources). Parsed but not applied: the engine does not model the velocity
-    // dampener.
+    // Keyframe resources). Parsed but not applied.
     pub velocity_dampener_track: Option<[u8; 4]>,
-    // sec3 0x2C VelocityDampener: [dampen, unk] — velocity ×= dampeningFactor^dt, the
-    // factor coming from the sec2 0x69 track when present, else dampen (research/xim
-    // ParticleUpdaters.kt VelocityDampener). The engine does not model the velocity
-    // dampener, so parse-only.
     pub velocity_dampener: Option<[f32; 2]>,
     // sec3 0x26 VelocityRotator: three floats, the rotateAmount added to the velocity
     // rotation × (0.5 × dt) per frame (research/xim ParticleUpdaters.kt VelocityRotator —
