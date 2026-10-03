@@ -121,6 +121,13 @@ impl ParticleSimulator {
             })
     }
 
+    pub fn reset_test_lighting(&mut self) {
+        self.clock.lamp_halos_lift = LAMP_ALPHAMAP_LIFT_DEFAULT;
+        self.clock.lamp_halos_gain = LAMP_HALOS_GAIN_DEFAULT;
+        self.clock.lamp_halos_radius = LAMP_HALOS_RADIUS_DEFAULT;
+        self.clock.wash_alpha_lift = WASH_ALPHA_LIFT_DEFAULT;
+    }
+
     pub fn set_lamp_halos_lift(&mut self, lift: f32) {
         self.clock.lamp_halos_lift = lift.clamp(0.0, 1.0);
     }
@@ -324,7 +331,7 @@ pub const LAMP_ALPHAMAP_LIFT_DEFAULT: f32 = 0.12;
 pub const LAMP_HALOS_GAIN_DEFAULT: f32 = 1.0;
 pub const LAMP_HALOS_GAIN_MAX: f32 = 2.0;
 // Wall-wash slider seed (1.0 = authored alpha) and ceiling.
-pub const WASH_ALPHA_LIFT_DEFAULT: f32 = 0.18;
+pub const WASH_ALPHA_LIFT_DEFAULT: f32 = 1.0;
 pub const WASH_ALPHA_LIFT_MAX: f32 = 2.0;
 pub const LAMP_HALOS_RADIUS_DEFAULT: f32 = 1.0;
 pub const LAMP_HALOS_RADIUS_MAX: f32 = 4.0;
@@ -4391,22 +4398,30 @@ mod tests {
         draw.factor_rgb.extend(draw.factor_alpha)
     }
 
-    // Lamp halos (`lig*` sprite sheets) are LIGHTS: their drawn alpha is the lift knob times the
-    // ToD gate and must not carry the `enhanced-particle-alpha-20` boost — that enhancement is
-    // for hit-flash and other effect particles. Pins both sides so either half drifting fails a
-    // test whichever feature set hits it.
+    #[test]
+    fn default_mesh_alpha_preserves_authored_factor() {
+        use ffxi_dat::particle_gen::ParticleMeshKind;
+
+        for kind in [ParticleMeshKind::StaticMesh, ParticleMeshKind::WeightedMesh] {
+            let mut generator = live(def(60.0, 1.0, 1), 60.0);
+            generator.def.mesh_kind = kind;
+            advance(&mut generator, 2.0);
+            let factor = drawn_factor(&generator, &CelestialClock::default());
+            assert_eq!(
+                factor.w,
+                expected_factor_alpha(generator.def.init_color[TOD_ALPHA_CHANNEL]),
+                "{kind:?}"
+            );
+        }
+    }
+
     #[test]
     fn lamp_halo_alpha_bypasses_enhanced_particle_gain() {
         let mut g = live(def(60.0, 1.0, 1), 60.0);
         advance(&mut g, 2.0);
         assert!(!g.particles.is_empty(), "two frames emit");
 
-        // The wash-alpha slider multiplies authored alpha on the D3m path (this StaticMesh def
-        // rides it); pin a neutral lift so each assertion measures its own knob.
-        let clock = CelestialClock {
-            wash_alpha_lift: 1.0,
-            ..CelestialClock::default()
-        };
+        let clock = CelestialClock::default();
         let raw_alpha = g.def.init_color[3];
         let plain = drawn_factor(&g, &clock);
         assert_eq!(
