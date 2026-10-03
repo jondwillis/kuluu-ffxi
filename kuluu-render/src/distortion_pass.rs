@@ -166,7 +166,8 @@ struct DistortionPassGpu {
     /// layout shape) — same pattern as [`crate::nameplate_final_pass`].
     bgl_descriptor: BindGroupLayoutDescriptor,
     sampler: Sampler,
-    uniform_buffer: Buffer,
+    ghost_uniform: Buffer,
+    capture_uniform: Buffer,
     prev_texture: Option<Texture>,
     prev_view: Option<TextureView>,
     prev_key: Option<(u32, u32, TextureFormat)>,
@@ -181,17 +182,20 @@ impl DistortionPassGpu {
             min_filter: FilterMode::Linear,
             ..Default::default()
         });
-        let uniform_buffer = device.create_buffer(&BufferDescriptor {
-            label: Some("distortion_pass_uniforms"),
-            size: DISTORTION_UNIFORM_SIZE,
-            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
-            mapped_at_creation: true,
-        });
+        let make_uniform = |label| {
+            device.create_buffer(&BufferDescriptor {
+                label: Some(label),
+                size: DISTORTION_UNIFORM_SIZE,
+                usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        };
         Self {
             shader: asset_server.load(DISTORTION_SHADER_PATH),
             bgl_descriptor,
             sampler,
-            uniform_buffer,
+            ghost_uniform: make_uniform("distortion_ghost_uniform"),
+            capture_uniform: make_uniform("distortion_capture_uniform"),
             prev_texture: None,
             prev_view: None,
             prev_key: None,
@@ -241,7 +245,11 @@ fn distortion_pipeline_descriptor(
     RenderPipelineDescriptor {
         label: Some("distortion_pass".into()),
         layout: vec![bgl.clone()],
-        vertex: VertexState::default(),
+        vertex: VertexState {
+            shader: shader.clone(),
+            entry_point: Some("vs".into()),
+            ..Default::default()
+        },
         fragment: Some(FragmentState {
             shader: shader.clone(),
             entry_point: Some("fs".into()),
@@ -313,10 +321,9 @@ fn draw_distortion_pass(
 
     // First active frame after an inactive gap: prev holds stale content — capture only, so the
     // ghost starts from a clean slate instead of flashing old frames.
-    let first_frame = !*was_active;
-
     let format = target.main_texture_format();
     let size = target.main_texture().size();
+    let first_frame = !*was_active || gpu.prev_key != Some((size.width, size.height, format));
     gpu.ensure_prev(&device, size, format);
     let Some(prev_view) = &gpu.prev_view else {
         return;
@@ -341,7 +348,7 @@ fn draw_distortion_pass(
     // target. Both the offset and the ghost alpha scale by the sec2 0x2D envelope strength.
     if !first_frame {
         queue.write_buffer(
-            &gpu.uniform_buffer,
+            &gpu.ghost_uniform,
             0,
             &distortion_uniform_bytes(DistortionUniform {
                 offset: Vec2::new(data.haze_offset_x * data.strength, 0.0),
@@ -354,7 +361,7 @@ fn draw_distortion_pass(
             &bgl,
             &BindGroupEntries::sequential((
                 BufferBinding {
-                    buffer: &gpu.uniform_buffer,
+                    buffer: &gpu.ghost_uniform,
                     offset: 0,
                     size: None,
                 },
@@ -377,7 +384,7 @@ fn draw_distortion_pass(
 
     // Pass B: capture — copy the current target into prev for next frame's ghost.
     queue.write_buffer(
-        &gpu.uniform_buffer,
+        &gpu.capture_uniform,
         0,
         &distortion_uniform_bytes(DistortionUniform {
             offset: Vec2::ZERO,
@@ -390,7 +397,7 @@ fn draw_distortion_pass(
         &bgl,
         &BindGroupEntries::sequential((
             BufferBinding {
-                buffer: &gpu.uniform_buffer,
+                buffer: &gpu.capture_uniform,
                 offset: 0,
                 size: None,
             },
