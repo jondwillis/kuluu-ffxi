@@ -9,7 +9,7 @@
 //! functions of bytes; the transport that carries them is `crate::transport`.
 
 use md5::{Digest as _, Md5};
-use sha1::{Digest as _, Sha1};
+use sha1::Sha1;
 
 use crate::crypto::checksum;
 use crate::error::{Error, Result};
