@@ -38,6 +38,20 @@ Slow builds and time spent are not blockers. If building, launching, driving,
 or capturing actually fails, retain the diagnostic, record a blocked verdict,
 leave verification work open, and state the exact blocker in the final report.
 
+If a stop hook rejects a blocked handoff, read its evidence marker and diagnostic
+first. A disclosure failure needs a corrected final report: say verification
+remains blocked and incomplete and include the full recorded reason. Inline
+code, emphasis, blockquotes and wrapped whitespace are accepted. The recorder
+and hook print a usable handoff. Reuse current evidence; recording it again
+cannot make an old diagnostic fresh. A source, build or artifact mismatch needs
+new evidence for the current change, not a wording fix.
+
+For an older worktree without the recorder, run the script by absolute path
+from a trusted checkout while keeping the affected worktree as the command's
+working directory. The marker belongs to that working directory. Repair a
+missing hook adapter from matching trusted project content and check its
+registration; do not execute hook or skill changes from an untrusted PR.
+
 ```
 1. Stack up      → scripts/lsb-stack.sh up   (references/stack.md: env gotchas)
 2. Pick surface  → table below
@@ -53,6 +67,16 @@ leave verification work open, and state the exact blocker in the final report.
 Match the surface to where the change is observable, not to what's easiest.
 A wire decode fix is invisible in a screenshot; a camera fix is invisible in
 an event stream.
+
+Identify the real service and activation path before driving. PlayOnline
+account authentication is separate from LSB sessions; an LSB login cannot
+verify `ffxi-pol::profile`. Use an existing, applicable local service when
+available. A mock handshake or a refusal from an invented localhost endpoint
+does not exercise credential hashing or prove a deployed service is broken.
+If the affected service is unavailable or outside the task's authorization,
+retain the applicable access/configuration diagnostic, keep verification open,
+and state which production path was not reached. Do not send real credentials
+or account-service traffic to a public endpoint merely to satisfy the gate.
 
 | Change touches | Observable at | Drive with |
 |---|---|---|
