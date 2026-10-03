@@ -285,6 +285,36 @@ class VerificationGateTests(unittest.TestCase):
             self.assertEqual(result.stdout, "", result.stderr)
         self.assertIn("quantity.rs", verification.check(self.payload))
 
+    def test_codex_does_not_parse_a_python_heredoc_as_shell(self):
+        command = "python3 - <<'PY'\nprint('session\\'s edits')\nPY"
+        result = subprocess.run(command, shell=True, cwd=self.root, env=self.env,
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "session's edits\n")
+        payload = {**self.payload, "cwd": str(self.base), "tool_name": "Bash",
+                   "tool_input": {"command": command, "workdir": str(self.root)}}
+        for event in ("PreToolUse", "PostToolUse"):
+            result = subprocess.run([sys.executable, str(HOOKS / "codex-project-hook.py"), event],
+                                    input=json.dumps(payload), env=self.env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "", result.stderr)
+
+    def test_codex_command_prefix_preserves_cwd_before_heredoc(self):
+        spec = importlib.util.spec_from_file_location("adapter", HOOKS / "codex-project-hook.py")
+        adapter = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(adapter)
+        body = "python3 - <<'PY'\nprint('session\\'s edits')\nPY"
+        cases = [
+            (f"cd '{self.root}' && {body}", self.root),
+            (f"git -C '{self.root}' status\n{body}", self.root),
+            (f"git status\ncd '{self.root}'", self.base),
+            (f"git status <<'PY'\nprint('session\\'s edits')\nPY", self.base),
+        ]
+        for command, expected in cases:
+            with self.subTest(command=command):
+                payload = {"cwd": str(self.base), "tool_input": {"command": command}}
+                self.assertEqual(adapter.shell_cwd(payload), str(expected.resolve()))
+
     def test_non_runtime_edits_do_not_acquire_a_visual_gate(self):
         note = self.root / "README.md"
         note.write_text("contributor orientation\n")

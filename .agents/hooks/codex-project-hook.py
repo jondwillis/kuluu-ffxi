@@ -11,15 +11,24 @@ HERE = Path(__file__).resolve().parent
 def shell_cwd(payload):
     inputs = payload.get("tool_input", {})
     cwd = Path(inputs.get("workdir") or payload.get("cwd") or Path.cwd())
-    tokens = shlex.split(inputs.get("command", ""))
-    if tokens[:1] == ["cd"] and len(tokens) > 1:
-        candidate = Path(tokens[1])
+    boundary = "\n;&|<>"
+    tokens = shlex.shlex(inputs.get("command", ""), posix=True, punctuation_chars=boundary)
+    tokens.whitespace = " \t\r"
+    tokens.whitespace_split = True
+    command = tokens.get_token()
+    directory = None
+    if command == "cd":
+        directory = tokens.get_token()
+    elif command == "git":
+        while argument := tokens.get_token():
+            if all(char in boundary for char in argument):
+                break
+            if argument == "-C":
+                directory = tokens.get_token()
+                break
+    if directory and not all(char in boundary for char in directory):
+        candidate = Path(directory)
         cwd = candidate if candidate.is_absolute() else cwd / candidate
-    elif tokens[:1] == ["git"] and "-C" in tokens:
-        index = tokens.index("-C")
-        if index + 1 < len(tokens):
-            candidate = Path(tokens[index + 1])
-            cwd = candidate if candidate.is_absolute() else cwd / candidate
     return str(cwd.resolve())
 
 
