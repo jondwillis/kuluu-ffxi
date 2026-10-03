@@ -16,6 +16,7 @@ use kuluu_render::dat_mzb::{LastAutoLoadedZone, LoadMzbRequest, ZONE_SLOT_MAIN};
 use kuluu_render::ffxi_actor_render::{
     ActorSubject, FfxiActorMeshChild, FfxiRenderActor, FfxiRenderRoot, LoadActorRequest,
 };
+use kuluu_render::particle_sim::ParticleSimulator;
 use kuluu_render::scene::TrackedEntities;
 use kuluu_render::scheduler_runtime::{
     enqueue_routine, parse_action_bytes_reporting, stage_summary, ActionDatRoot, ActionTarget,
@@ -2623,6 +2624,20 @@ fn tear_down(
     let was_open = q_scoped.iter().next().is_some();
     // Drop the test zone and let mirror_backdrop_to_scene_state + auto-load bring the
     // default backdrop block back at its own offset; release any lamp-room clock hold too.
+    commands.queue(|world: &mut World| {
+        if world
+            .get_resource::<LampRoomActive>()
+            .is_some_and(|lamp| lamp.0)
+        {
+            if let Some(mut clock) = world.get_resource_mut::<kuluu_render::vana_time::VanaClock>()
+            {
+                clock.thaw();
+            }
+        }
+        if let Some(mut sim) = world.get_resource_mut::<ParticleSimulator>() {
+            sim.reset_test_lighting();
+        }
+    });
     commands.insert_resource(TestZoneActive(false));
     commands.insert_resource(LampRoomActive(false));
     commands.remove_resource::<kuluu_render::particle_sim::TestAlphaOverride>();
@@ -2723,8 +2738,29 @@ mod tests {
             .insert_resource(TestAlphaOverride([*b"g141", *b"g144"].into()))
             .add_systems(Update, tear_down_test_scene);
 
+        let mut sim = ParticleSimulator::default();
+        sim.set_lamp_halos_lift(0.0);
+        sim.set_lamp_halos_gain(0.0);
+        sim.set_lamp_halos_radius(0.0);
+        sim.set_wash_alpha_lift(0.0);
+        let mut clock = kuluu_render::vana_time::VanaClock::default();
+        clock.freeze_at_hour_minute(SG_LAMP_HOUR, 0);
+        app.insert_resource(sim)
+            .insert_resource(clock)
+            .insert_resource(LampRoomActive(true));
+
         app.update();
 
         assert!(!app.world().contains_resource::<TestAlphaOverride>());
+        assert!(!app
+            .world()
+            .resource::<kuluu_render::vana_time::VanaClock>()
+            .is_frozen());
+        let clock = app.world().resource::<ParticleSimulator>().clock();
+        let expected = kuluu_render::particle_sim::CelestialClock::default();
+        assert_eq!(clock.lamp_halos_lift, expected.lamp_halos_lift);
+        assert_eq!(clock.lamp_halos_gain, expected.lamp_halos_gain);
+        assert_eq!(clock.lamp_halos_radius, expected.lamp_halos_radius);
+        assert_eq!(clock.wash_alpha_lift, expected.wash_alpha_lift);
     }
 }

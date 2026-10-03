@@ -727,13 +727,15 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
 
     app.insert_resource(crate::marker_store::load_or_default());
 
+    #[cfg(feature = "debug-animation_room")]
+    app.add_plugins(animation_test_scene::AnimationTestScenePlugin);
+
     app.add_plugins((
         ViewerCorePlugin::<NativeSource>::default(),
         HudPlugin,
         MousePlugin,
         navmesh_overlay::NavmeshOverlayPlugin,
         launcher_backdrop::LauncherBackdropPlugin,
-        animation_test_scene::AnimationTestScenePlugin,
         zone_transition::ZoneTransitionOverlayPlugin,
     ))
     .insert_resource(ZoneNameResolver::new(kuluu_nav::zone_name))
