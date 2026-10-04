@@ -3858,6 +3858,8 @@ fn empty_mesh() -> Mesh {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod cleanup_capture;
     use ffxi_dat::particle_gen::ParticleGeneratorDef;
 
     fn def(life: f32, fpe: f32, ppe: u32) -> ParticleGeneratorDef {
