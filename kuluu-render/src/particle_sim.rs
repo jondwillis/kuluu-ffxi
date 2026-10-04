@@ -2449,9 +2449,15 @@ fn advance_generator(g: &mut LiveGenerator, frames: f32) {
             p.rel_vel = Vec3::ZERO;
             p.vel_rot = p.rotation;
         }
-        // sec3 0x2C VelocityDampener: velocity ×= factor^dt, the per-frame-sampled sec2 0x69
-        // track overriding the authored base (research/xim ParticleUpdaters.kt
-        // VelocityDampener getDampeningFactor).
+        if position_updater {
+            let step = if p.vel_rot == Vec3::ZERO {
+                p.vel
+            } else {
+                velocity_rotation(p.vel_rot, p.negate_rotation_y) * p.vel
+            };
+            p.pos += step * frames;
+        }
+        // .agents/skills/retail-observe/references/2026-10-01-level-up-keyframe-computation.md position and exponential damping.
         if let Some([dampen, _]) = g.def.velocity_dampener {
             let progress = (p.age_frames / p.life_frames).clamp(0.0, 1.0);
             let factor = g
@@ -2462,18 +2468,6 @@ fn advance_generator(g: &mut LiveGenerator, frames: f32) {
             let f = factor.powf(frames);
             p.vel *= f;
             p.rel_vel *= f;
-        }
-        if position_updater {
-            let step = if p.vel_rot == Vec3::ZERO {
-                p.vel
-            } else {
-                velocity_rotation(p.vel_rot, p.negate_rotation_y) * p.vel
-            };
-            p.pos += step * frames;
-        }
-        // FFXiMain.dll retail-2026-09 VA 0x1004C6CB: authored damping raised to renderer delta.
-        if let Some([damping, _]) = g.def.velocity_dampener {
-            p.vel *= damping.powf(frames);
         }
         // sec3 0x29/0x2A/0x2B OscillationApplier (X/Y/Z): after the base position step, add
         // the amplitude change over the tick per active axis (research/xim
@@ -5536,9 +5530,6 @@ mod tests {
         assert!((x_at(&g) - 2.5).abs() < 1e-6);
     }
 
-    // sec3 0x2C VelocityDampener: each frame the velocity is scaled by dampen^dt before the
-    // position step, so the displacement is a geometric series (research/xim
-    // ParticleUpdaters.kt VelocityDampener).
     #[test]
     fn velocity_dampener_decays_the_velocity() {
         let make = |dampen: Option<f32>| -> LiveGenerator {
@@ -5558,9 +5549,11 @@ mod tests {
         // No dampener: three unit steps.
         let plain = make(None);
         assert!((plain.particles[0].pos.x - 3.0).abs() < 1e-6);
-        // Dampen 0.5: the step halves each tick — 0.5 + 0.25 + 0.125.
         let damped = make(Some(0.5));
-        assert!((damped.particles[0].pos.x - 0.875).abs() < 1e-6);
+        const DAMPED_DISPLACEMENT: f32 = 1.0 + 0.5 + 0.25;
+        const DAMPED_VELOCITY: f32 = 0.125;
+        assert!((damped.particles[0].pos.x - DAMPED_DISPLACEMENT).abs() < 1e-6);
+        assert!((damped.particles[0].vel.x - DAMPED_VELOCITY).abs() < 1e-6);
     }
 
     // sec2 0x69 + sec3 0x44: the bound track overrides the authored base factor per frame —
@@ -8618,6 +8611,8 @@ mod tests {
             .init_asset::<FfxiParticleMaterial>()
             .init_resource::<ParticleSimulator>()
             .add_message::<SchedulerStageEvent>()
+            .add_message::<crate::scheduler_runtime::ParticleSpawnTrace>()
+            .add_message::<crate::audio::SfxEvent>()
             .add_systems(Update, spawn_particle_generators);
         let skeleton = retail_hume_m_skeleton().expect("installed HumeM skeleton is readable");
         let pose = ffxi_actor::skeleton_instance::pose_world(
@@ -8765,6 +8760,8 @@ mod tests {
             .init_asset::<FfxiParticleMaterial>()
             .init_resource::<ParticleSimulator>()
             .add_message::<SchedulerStageEvent>()
+            .add_message::<crate::scheduler_runtime::ParticleSpawnTrace>()
+            .add_message::<crate::audio::SfxEvent>()
             .add_systems(Update, spawn_particle_generators);
         let skeleton = retail_hume_m_skeleton().expect("installed HumeM skeleton is readable");
         let pose = ffxi_actor::skeleton_instance::pose_world(
