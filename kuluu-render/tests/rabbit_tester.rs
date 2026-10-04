@@ -927,11 +927,9 @@ fn s7c_parry_plays_gud_clip() {
     );
 }
 
-/// S7d: Hit with knockback level 2 runs the damage reaction AND `sway` alongside. The
-/// victim is fresh - no ActiveSchedulers yet - so both routines land in one same-batch insert;
-/// this pins the merge fix that kept the sway insert from overwriting the damage reaction.
+// .agents/skills/retail-observe/references/2026-10-04-melee-recoil-and-result-fields.md Authored sway is a separate resolution arm
 #[test]
-fn s7d_knockback_adds_sway_alongside_the_damage_reaction() {
+fn s7d_successful_hit_with_knockback_does_not_select_miss_sway() {
     let Some(rarab) = load_rarab() else { return };
     let mut app = build_app();
     spawn_actor(&mut app, RARAB_W, EntityKind::Mob, &rarab);
@@ -941,11 +939,16 @@ fn s7d_knockback_adds_sway_alongside_the_damage_reaction() {
     push_battle2(&mut app, RARAB_W, 1, Some(RARAB2_W), Some((0, 0, 0, 0, 2)));
 
     let (impact_at, _) = watch(&mut app, 45, |_i, w| {
-        routines(w, vic_parent).contains(b"damg") && routines(w, vic_parent).contains(b"sway")
+        let active = routines(w, vic_parent);
+        assert!(
+            !active.contains(b"sway"),
+            "successful-hit damage dispatch does not select the miss reaction"
+        );
+        active.contains(b"damg") || active.contains(b"damh")
     });
     assert!(
         impact_at.is_some_and(|f| f >= IMPACT_FRAME_MIN),
-        "kb>0 runs the damage reaction and sway together (F52)"
+        "successful hit with knockback retains the authored damage reaction at impact"
     );
 }
 
