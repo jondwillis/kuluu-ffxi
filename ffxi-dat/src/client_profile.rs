@@ -144,6 +144,30 @@ pub struct KnownClient {
     /// forward. A private server's pinned client is not, and patching it
     /// toward retail breaks it.
     pub retail: bool,
+    pub offhand_model_rule: Option<OffhandModelRule>,
+}
+
+// .agents/skills/retail-observe/references/2026-10-04-dam0-offhand-context.md Offhand appearance classification is build-scoped
+const OFFHAND_EXCLUDED_MODEL_RANGES: [(u16, u16); 4] =
+    [(0, 63), (117, 143), (471, 511), (640, 703)];
+const RETAIL_2026_OFFHAND_EXCLUDED_MODEL_RANGE: (u16, u16) = (1180, 1195);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OffhandModelRule {
+    Horizon2023,
+    Retail2026,
+}
+
+impl OffhandModelRule {
+    pub fn qualifies(self, model: u16) -> bool {
+        !OFFHAND_EXCLUDED_MODEL_RANGES
+            .iter()
+            .any(|&(first, last)| (first..=last).contains(&model))
+            && (self != Self::Retail2026
+                || !(RETAIL_2026_OFFHAND_EXCLUDED_MODEL_RANGE.0
+                    ..=RETAIL_2026_OFFHAND_EXCLUDED_MODEL_RANGE.1)
+                    .contains(&model))
+    }
 }
 
 pub const KNOWN_CLIENTS: &[KnownClient] = &[
@@ -158,6 +182,7 @@ pub const KNOWN_CLIENTS: &[KnownClient] = &[
         patch_version: Some("30230905_0"),
         item_layout: ItemBlockLayout::Legacy,
         retail: false,
+        offhand_model_rule: Some(OffhandModelRule::Horizon2023),
     },
     // FFXIFullSetup_US from gdl.square-enix.com (CDN Last-Modified 2019-05-10),
     // unpacked by ffxi-install (ffxi-install/src/lib.rs unpack_cab); the
@@ -169,6 +194,7 @@ pub const KNOWN_CLIENTS: &[KnownClient] = &[
         patch_version: None,
         item_layout: ItemBlockLayout::Legacy,
         retail: true,
+        offhand_model_rule: None,
     },
     // retail-2019-base patched to the server's 2026-09-04 release by the
     // PlayOnline patch client (ffxi-install/src/patch_client.rs), driven by
@@ -184,6 +210,7 @@ pub const KNOWN_CLIENTS: &[KnownClient] = &[
         patch_version: Some("30260904_1"),
         item_layout: ItemBlockLayout::Retail2026,
         retail: true,
+        offhand_model_rule: Some(OffhandModelRule::Retail2026),
     },
     // Square Enix retail PlayOnline install (polboot.exe + patch.txt, no
     // patch.cfg stamp): the developer's Phoenix bundle, measured in place.
@@ -194,6 +221,7 @@ pub const KNOWN_CLIENTS: &[KnownClient] = &[
         patch_version: None,
         item_layout: ItemBlockLayout::Legacy,
         retail: true,
+        offhand_model_rule: None,
     },
 ];
 
@@ -331,6 +359,23 @@ fn hash_file(path: &Path) -> Option<(String, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // .agents/skills/retail-observe/references/2026-10-04-dam0-offhand-context.md Offhand appearance classification is build-scoped
+    #[test]
+    fn known_offhand_rules_preserve_the_measured_build_difference() {
+        const OFFHAND_BUILD_DIFFERENCE_PINNED_MODEL: u16 = 1190;
+        for client in KNOWN_CLIENTS {
+            if let Some(rule) = client.offhand_model_rule {
+                assert_eq!(
+                    rule.qualifies(OFFHAND_BUILD_DIFFERENCE_PINNED_MODEL),
+                    !client.retail,
+                    "{} must retain its measured offhand rule",
+                    client.name
+                );
+                assert!(!rule.qualifies(0), "no offhand model must not qualify");
+            }
+        }
+    }
 
     fn encoded_ids(stride: usize, base: u32) -> Vec<u8> {
         let mut bytes = vec![0u8; stride * 2 + 4];

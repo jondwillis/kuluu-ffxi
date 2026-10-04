@@ -71,6 +71,23 @@ pub fn equipment_dat_id(dll: &MainDll, slot_index: u8, model_id: u16, race: u8) 
         .or_else(|| dll.equipment_model_index(race, slot_index, 0))
 }
 
+// .agents/skills/retail-observe/references/2026-10-04-dam0-offhand-context.md Offhand appearance classification is build-scoped
+pub fn offhand_model_id(dll: &MainDll, slot_id: u16, race: u8) -> Option<u16> {
+    if !PC_LOOK_RACES.contains(&race) {
+        return None;
+    }
+    let model = slot_id & EQUIP_SLOT_ID_MODEL_MASK;
+    if dll
+        .equipment_model_index(race, EQUIP_SLOT_SUB, model)
+        .is_some()
+    {
+        Some(model)
+    } else {
+        dll.equipment_model_index(race, EQUIP_SLOT_SUB, 0)
+            .map(|_| 0)
+    }
+}
+
 /// [`equipment_dat_id`] for a wire slot id: the slot number in the high nibble
 /// over a 12-bit model id (the shape s2c 0x00D / 0x051 carry per slot, the wire
 /// half of vendor/server/src/map/packets/s2c/0x051_grap_list.cpp). A bare model

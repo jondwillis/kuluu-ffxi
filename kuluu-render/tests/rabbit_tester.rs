@@ -587,7 +587,7 @@ fn s5_swing_impact_runs_authored_reaction_and_flinches_the_pc() {
     assert!(swing_at.is_some(), "attacker plays the at0? swing clip");
 
     let (impact_at, _) = watch(&mut app, 45, |_i, w| {
-        (routines(w, vic_parent).contains(b"damg") || routines(w, vic_parent).contains(b"damh"))
+        routines(w, vic_parent).contains(b"damg")
             && active_clip(w, vic_child).is_some_and(|c| c.starts_with("dfm"))
     });
     assert!(
@@ -609,7 +609,7 @@ fn s5b_mob_victim_normal_hit_runs_authored_reaction_and_flinches() {
     push_battle2(&mut app, RARAB_W, 1, Some(RARAB2_W), Some((0, 0, 0, 0, 0)));
 
     let (impact_at, _) = watch(&mut app, 45, |_i, w| {
-        (routines(w, vic_parent).contains(b"damg") || routines(w, vic_parent).contains(b"damh"))
+        routines(w, vic_parent).contains(b"damg")
             && active_clip(w, vic_child).is_some_and(|c| c.starts_with("dfi"))
     });
     assert!(
@@ -705,8 +705,7 @@ fn s6c_ordinary_crit_without_ldam_retains_authored_reaction() {
     push_battle2(&mut app, RARAB_W, 1, Some(NOLDA_W), Some((0, 0, 2, 3, 0)));
 
     let (impact_at, _) = watch(&mut app, 45, |_i, w| {
-        (routines(w, vic_parent).contains(b"damg") || routines(w, vic_parent).contains(b"damh"))
-            && !routines(w, vic_parent).contains(b"ldam")
+        routines(w, vic_parent).contains(b"damg") && !routines(w, vic_parent).contains(b"ldam")
     });
     assert!(
         impact_at.is_some_and(|f| f >= IMPACT_FRAME_MIN),
@@ -729,7 +728,7 @@ fn s6d_medium_hit_without_ldam_retains_authored_reaction() {
     push_battle2(&mut app, RARAB_W, 1, Some(NOLDA_W), Some((0, 0, 0, 2, 0)));
 
     let (impact_at, _) = watch(&mut app, 45, |_i, w| {
-        routines(w, vic_parent).contains(b"damg") || routines(w, vic_parent).contains(b"damh")
+        routines(w, vic_parent).contains(b"damg")
     });
     assert!(
         impact_at.is_some_and(|f| f >= IMPACT_FRAME_MIN),
@@ -1020,7 +1019,7 @@ fn s10_left_attack_without_bti0_falls_back_to_ati0() {
     };
     let mut app = build_app();
     spawn_actor(&mut app, RARAB_W, EntityKind::Mob, &rarab);
-    let (_, atk_child) = spawn_actor(&mut app, HUMEM_W, EntityKind::Pc, &humem);
+    let (atk_parent, atk_child) = spawn_actor(&mut app, HUMEM_W, EntityKind::Pc, &humem);
     step_n(&mut app, 10);
 
     push_battle2(&mut app, HUMEM_W, 1, Some(RARAB_W), Some((0, 1, 0, 0, 0)));
@@ -1031,6 +1030,14 @@ fn s10_left_attack_without_bti0_falls_back_to_ati0() {
     assert!(
         swing_at.is_some(),
         "HumeM ships no bti0 - LeftAttack falls back to ati0's at0? clip"
+    );
+    assert_eq!(
+        app.world()
+            .get::<kuluu_render::scheduler_runtime::PendingHitReaction>(atk_parent)
+            .expect("reaction remains pending before the swing impact")
+            .offhand_context,
+        Some(false),
+        "the resolved ati0 fallback must clear the offhand context despite the LeftAttack request"
     );
 }
 

@@ -3421,6 +3421,7 @@ pub struct PendingHitReaction {
     /// sends none for a basic attack, in which case dam0's sb00..sb09 blocks simply do not match.
     pub animation: u16,
     pub outcome: ffxi_proto::melee::ResultOutcome,
+    pub offhand_context: Option<bool>,
     /// The scheduler whose DamageCallback stage is allowed to fire this reaction. Every
     /// completion routine ends at its DamageCallback stage (a spell's `mdam` among them), so an
     /// unqualified pending reaction would be consumed by whichever routine reached its callback
@@ -3467,7 +3468,8 @@ pub const HIT_FIELD_RESOLUTION: u32 = 0x28;
 pub const HIT_FIELD_ANIMATION: u32 = 0x33;
 // .agents/skills/retail-observe/references/2026-10-04-melee-recoil-and-result-fields.md Result information and recoil inputs
 pub const HIT_FIELD_INFO: u32 = 0x2B;
-pub const HIT_FIELD_ACTOR_STATE: u32 = 0x3B;
+// .agents/skills/retail-observe/references/2026-10-04-dam0-offhand-context.md Supported rule
+pub const HIT_FIELD_OFFHAND_CONTEXT: u32 = 0x3B;
 pub const HIT_FIELD_ATTACKER_IS_PLAYER: u32 = 0x38;
 
 // Per-result fields a control-flow switch (ROM/0/0.DAT dam0/daml) can test, keyed by the selector
@@ -3477,6 +3479,7 @@ pub struct HitContext {
     pub animation: u32,
     pub info: u32,
     pub attacker_id: u32,
+    pub offhand_context: Option<bool>,
 }
 
 impl HitContext {
@@ -3486,6 +3489,7 @@ impl HitContext {
             animation: pending.animation as u32,
             info: pending.outcome.info as u32,
             attacker_id,
+            offhand_context: pending.offhand_context,
         }
     }
 
@@ -3494,6 +3498,7 @@ impl HitContext {
             HIT_FIELD_RESOLUTION => self.resolution,
             HIT_FIELD_ANIMATION => self.animation,
             HIT_FIELD_INFO => self.info,
+            HIT_FIELD_OFFHAND_CONTEXT => u32::from(self.offhand_context?),
             // .agents/skills/retail-observe/references/2026-10-04-melee-damage-dispatch.md Conditions selecting reactions
             HIT_FIELD_ATTACKER_IS_PLAYER => u32::from(self.attacker_id.to_be_bytes()[0] == 0),
             _ => return None,
@@ -3657,6 +3662,25 @@ pub fn swing_routine(animation: ffxi_proto::melee::AttackAnimation) -> Option<[u
     })
 }
 
+// .agents/skills/retail-observe/references/2026-10-04-dam0-offhand-context.md Supported rule
+#[cfg(not(target_arch = "wasm32"))]
+fn resolved_offhand_context(
+    routine: Option<[u8; 4]>,
+    look: Option<&kuluu_snapshot::EntityLook>,
+    root: Option<&ffxi_dat::DatRoot>,
+    dll: Option<&ffxi_dat::main_dll::MainDll>,
+) -> Option<bool> {
+    if routine.is_none_or(|name| name[0] != b'b') {
+        return Some(false);
+    }
+    let kuluu_snapshot::EntityLook::Equipped { race, sub, .. } = look? else {
+        return None;
+    };
+    let rule = root?.profile().known?.offhand_model_rule?;
+    let model = crate::look_resolver::offhand_model_id(dll?, *sub, *race)?;
+    Some(rule.qualifies(model))
+}
+
 // vendor/server/src/map/enums/four_cc.h — BasicAttack's FourCC is "atk0", the self-targeted
 // voice routine research/xim Actor.kt displayAutoAttack enqueues alongside the swing.
 #[cfg(not(target_arch = "wasm32"))]
@@ -3690,6 +3714,9 @@ pub fn dispatch_melee_action_started(
     tracked: Res<crate::scene::TrackedEntities>,
     q_children: Query<&Children>,
     q_render: Query<&crate::ffxi_actor_render::FfxiRenderActor>,
+    q_look: Query<&crate::components::LookComp>,
+    root: Res<ActionDatRoot>,
+    dll: Option<Res<ActionMainDll>>,
     global: Option<Res<GlobalEffectDir>>,
     mut pending_inserts: Local<HashMap<Entity, Vec<ActiveScheduler>>>,
     mut commands: Commands,
@@ -3754,6 +3781,12 @@ pub fn dispatch_melee_action_started(
             .filter(|r| lookup.get(r).is_some())
             .unwrap_or(*b"ati0");
         let merged = [MELEE_VOICE_ROUTINE, swing];
+        let offhand_context = resolved_offhand_context(
+            lookup.get(&swing).map(|routine| routine.name),
+            q_look.get(actor_entity).ok().map(|look| &look.0),
+            root.0.as_deref(),
+            dll.as_ref().and_then(|dll| dll.0.as_deref()),
+        );
         let Some(active) = ActiveScheduler::effects_only_merged(&lookup, &merged) else {
             tracing::debug!(target: "combat", "COMBAT_DROP actor={} merged-none swing={}",
                     actor_id,
@@ -3771,6 +3804,7 @@ pub fn dispatch_melee_action_started(
                     resolution,
                     animation: swing_animation,
                     outcome,
+                    offhand_context,
                     armed_by,
                 });
             }
@@ -3779,12 +3813,13 @@ pub fn dispatch_melee_action_started(
             }
         }
         if resolution.is_some() {
-            tracing::debug!(target: "combat", "COMBAT_ARM actor={} target={:?} outcome={:?} swing={} armed_by={}",
+            tracing::debug!(target: "combat", "COMBAT_ARM actor={} target={:?} outcome={:?} swing={} armed_by={} offhand={:?}",
                 actor_id,
                 victim,
                 outcome,
                 fourcc(swing),
-                fourcc(armed_by));
+                fourcc(armed_by),
+                offhand_context);
         }
         // Info bit 1 (Defeated): retail flips StatusServer on the same frame as the HP packet
         // (.agents/skills/retail-observe/references/2026-09-09-wormwatch-runtime.md "First non-burrow routines"),
@@ -4583,6 +4618,7 @@ pub fn animation_test_tick(
                 animation: 0,
                 info: u32::from(case.info_bits()),
                 attacker_id: self_id,
+                offhand_context: Some(false),
             };
             let report = fire_hit_reaction(
                 self_entity,
@@ -5783,6 +5819,7 @@ mod tests {
             resolution: ffxi_proto::melee::ActionResolution::Hit,
             animation: 0,
             outcome: ffxi_proto::melee::ResultOutcome::default(),
+            offhand_context: Some(false),
             armed_by: *b"atk0",
         };
         assert_eq!(pending.armed_by, *b"atk0");
@@ -5877,6 +5914,7 @@ mod tests {
             animation: 0,
             info: 0,
             attacker_id: 0,
+            offhand_context: Some(false),
         };
 
         assert_eq!(
@@ -5953,6 +5991,7 @@ mod tests {
                     animation: 0,
                     info: 1,
                     attacker_id: 0,
+                    offhand_context: Some(false),
                 },
                 UnknownFieldPolicy::Random
             ),
@@ -5967,6 +6006,7 @@ mod tests {
                     animation: 0,
                     info: 0,
                     attacker_id: 0,
+                    offhand_context: Some(false),
                 },
                 UnknownFieldPolicy::Random
             ),
@@ -5981,6 +6021,7 @@ mod tests {
                 animation: 0,
                 info: 0,
                 attacker_id: 0,
+                offhand_context: Some(false),
             },
             UnknownFieldPolicy::Random
         )
@@ -5988,7 +6029,7 @@ mod tests {
     }
 
     #[test]
-    fn real_dat_dam0_preserves_authored_arms_with_unresolved_actor_state() {
+    fn real_dat_dam0_selects_reaction_from_offhand_context() {
         let Some(root) = ffxi_dat::archive::open_test_install() else {
             return;
         };
@@ -6004,16 +6045,25 @@ mod tests {
         let lookup = RoutineLookup::new().with_dat(&schedulers);
 
         // .agents/skills/retail-observe/references/2026-10-04-melee-damage-dispatch.md Conditions selecting reactions
-        for info in [0, u32::from(ffxi_proto::melee::INFO_DEFEATED)] {
-            let ctx = HitContext {
-                resolution: 0,
-                animation: 0,
-                info,
-                attacker_id: 0,
-            };
-            assert_eq!(ctx.field(HIT_FIELD_ACTOR_STATE), None);
-            let selected = evaluate_switch(&lookup, b"dam0", &ctx, UnknownFieldPolicy::Random);
-            assert!(selected == vec![*b"damg"] || selected == vec![*b"damh"]);
+        let critical = u32::from(ffxi_proto::melee::INFO_CRITICAL_HIT);
+        let defeated = u32::from(ffxi_proto::melee::INFO_DEFEATED);
+        for offhand in [false, true] {
+            for info in [0, critical, defeated, critical | defeated] {
+                let ctx = HitContext {
+                    resolution: 0,
+                    animation: 0,
+                    info,
+                    attacker_id: 0,
+                    offhand_context: Some(offhand),
+                };
+                for policy in [UnknownFieldPolicy::Match, UnknownFieldPolicy::Random] {
+                    assert_eq!(
+                        evaluate_switch(&lookup, b"dam0", &ctx, policy),
+                        vec![if offhand { *b"damh" } else { *b"damg" }],
+                        "offhand={offhand} info={info}"
+                    );
+                }
+            }
         }
         // Miss/Guard/Parry/Block -> sway/gurd/pary/gur1.
         assert_eq!(
@@ -6025,6 +6075,7 @@ mod tests {
                     animation: 0,
                     info: 0,
                     attacker_id: 0,
+                    offhand_context: Some(false),
                 },
                 UnknownFieldPolicy::Random
             ),
@@ -6039,6 +6090,7 @@ mod tests {
                     animation: 0,
                     info: 0,
                     attacker_id: 0,
+                    offhand_context: Some(false),
                 },
                 UnknownFieldPolicy::Random
             ),
@@ -6053,6 +6105,7 @@ mod tests {
                     animation: 0,
                     info: 0,
                     attacker_id: 0,
+                    offhand_context: Some(false),
                 },
                 UnknownFieldPolicy::Random
             ),
@@ -6067,6 +6120,7 @@ mod tests {
                     animation: 0,
                     info: 0,
                     attacker_id: 0,
+                    offhand_context: Some(false),
                 },
                 UnknownFieldPolicy::Random
             ),
@@ -6080,10 +6134,11 @@ mod tests {
                 animation: 5,
                 info: 0,
                 attacker_id: 0,
+                offhand_context: Some(false),
             },
             UnknownFieldPolicy::Random,
         );
-        assert!(selected == vec![*b"sb04", *b"damg"] || selected == vec![*b"sb04", *b"damh"]);
+        assert_eq!(selected, vec![*b"sb04", *b"damg"]);
         // .agents/skills/retail-observe/references/2026-10-04-melee-damage-dispatch.md Conditions selecting reactions
         for (attacker_id, expected) in [
             (0, *b"hi14"),
@@ -6098,6 +6153,7 @@ mod tests {
                         animation: 0,
                         info: ffxi_proto::melee::INFO_CRITICAL_HIT.into(),
                         attacker_id,
+                        offhand_context: Some(false),
                     },
                     UnknownFieldPolicy::Match,
                 ),
@@ -6105,6 +6161,68 @@ mod tests {
                 "critical effect for attacker {attacker_id:#X}"
             );
         }
+    }
+
+    // .agents/skills/retail-observe/references/2026-10-04-dam0-offhand-context.md Supported rule
+    #[test]
+    fn real_install_offhand_context_uses_resolved_name_and_validated_look() {
+        const OFFHAND_PINNED_QUALIFYING_MODEL: u16 = 64;
+        const OFFHAND_PINNED_TAGGED_MODEL: u16 = 0x7040;
+        let Some(root) = ffxi_dat::archive::open_test_install() else {
+            return;
+        };
+        let dll = main_dll_for_root(root.root()).expect("installed equipment tables");
+        let race = *crate::look_resolver::PC_LOOK_RACES.start();
+        let look = |sub| kuluu_snapshot::EntityLook::Equipped {
+            face: 0,
+            race,
+            head: 0,
+            body: 0,
+            hands: 0,
+            legs: 0,
+            feet: 0,
+            main: 0,
+            sub,
+            ranged: 0,
+        };
+        let qualifying = look(OFFHAND_PINNED_TAGGED_MODEL);
+        assert_eq!(
+            crate::look_resolver::offhand_model_id(&dll, OFFHAND_PINNED_TAGGED_MODEL, race),
+            Some(OFFHAND_PINNED_QUALIFYING_MODEL)
+        );
+        assert_eq!(
+            resolved_offhand_context(Some(*b"bti0"), Some(&qualifying), Some(&root), Some(&dll)),
+            Some(true)
+        );
+        assert_eq!(
+            resolved_offhand_context(Some(*b"ati0"), Some(&qualifying), Some(&root), Some(&dll)),
+            Some(false)
+        );
+        assert_eq!(
+            resolved_offhand_context(None, Some(&qualifying), Some(&root), Some(&dll)),
+            Some(false)
+        );
+        assert_eq!(
+            resolved_offhand_context(Some(*b"bti0"), Some(&look(0)), Some(&root), Some(&dll)),
+            Some(false)
+        );
+        assert_eq!(
+            resolved_offhand_context(
+                Some(*b"bti0"),
+                Some(&look(u16::MAX)),
+                Some(&root),
+                Some(&dll)
+            ),
+            Some(false)
+        );
+        assert_eq!(
+            resolved_offhand_context(Some(*b"bti0"), None, Some(&root), Some(&dll)),
+            None
+        );
+        assert_eq!(
+            resolved_offhand_context(Some(*b"bti0"), Some(&qualifying), Some(&root), None),
+            None
+        );
     }
 
     // .agents/skills/retail-observe/references/2026-10-04-crtl-condition-grammar.md Required outcomes
@@ -6133,6 +6251,7 @@ mod tests {
                             animation: 0,
                             info,
                             attacker_id,
+                            offhand_context: Some(false),
                         },
                         policy,
                     );
