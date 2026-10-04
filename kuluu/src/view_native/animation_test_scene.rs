@@ -564,6 +564,7 @@ fn apply_test_unload(
     q_box: Query<(), With<TestSceneScoped>>,
     q_launch_cam: Query<Entity, With<super::launcher_ui::LauncherCamera>>,
     q_backdrop: Query<Entity, With<super::launcher_backdrop::BackdropScoped>>,
+    q_ui: Query<(Entity, Option<&ChildOf>), (With<Node>, Without<TestSceneScoped>)>,
     mut commands: Commands,
     mut log: ResMut<TestLog>,
     mut was_open: Local<bool>,
@@ -573,6 +574,7 @@ fn apply_test_unload(
         *was_open = false;
         return;
     }
+    set_launcher_ui_visibility(&mut commands, &q_ui, false);
     for e in q_launch_cam.iter() {
         commands.entity(e).try_despawn();
     }
@@ -2723,6 +2725,45 @@ fn tear_down_test_scene(
 mod tests {
     use super::*;
     use kuluu_render::particle_sim::TestAlphaOverride;
+
+    #[test]
+    fn room_keeps_rebuilt_launcher_ui_hidden() {
+        let mut app = App::new();
+        app.init_resource::<TestLog>()
+            .add_systems(Last, apply_test_unload);
+        let room = app
+            .world_mut()
+            .spawn((TestSceneScoped, Node::default(), Visibility::Inherited))
+            .id();
+        let original = app
+            .world_mut()
+            .spawn((Node::default(), Visibility::Hidden))
+            .id();
+        app.update();
+        app.world_mut().despawn(original);
+        let rebuilt = app
+            .world_mut()
+            .spawn((Node::default(), Visibility::Inherited))
+            .id();
+        app.update();
+        assert_eq!(
+            app.world().entity(rebuilt).get::<Visibility>(),
+            Some(&Visibility::Hidden)
+        );
+        assert_eq!(
+            app.world().entity(room).get::<Visibility>(),
+            Some(&Visibility::Inherited)
+        );
+        app.world_mut().despawn(room);
+        app.world_mut()
+            .entity_mut(rebuilt)
+            .insert(Visibility::Inherited);
+        app.update();
+        assert_eq!(
+            app.world().entity(rebuilt).get::<Visibility>(),
+            Some(&Visibility::Inherited)
+        );
+    }
 
     #[test]
     fn launcher_exit_removes_tester_alpha_override() {
