@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use bevy::app::{AppExit, ScheduleRunnerPlugin};
@@ -14,14 +15,19 @@ const SIZE: u32 = 512;
 const BASELINE_FRAME: u32 = 60;
 const ENABLE_FRAME: u32 = 90;
 const ACTIVE_FRAME: u32 = 120;
-const EXIT_FRAME: u32 = 150;
+const RESET_FRAME: u32 = 150;
+const RESET_CAPTURE_FRAME: u32 = 180;
+const EXIT_FRAME: u32 = 210;
 const HOLD_SECONDS: u64 = 60;
 const STEP_SECONDS: f64 = 1.0 / 60.0;
 const MARKER_OFFSET: f32 = 1.0;
 const CAMERA_DISTANCE: f32 = 6.0;
 
 #[derive(Resource)]
-struct CaptureTarget(Handle<Image>);
+struct CaptureTarget {
+    image: Handle<Image>,
+    directory: PathBuf,
+}
 
 #[derive(Component)]
 struct MovingMarker;
@@ -66,7 +72,15 @@ fn setup(
     image.texture_descriptor.usage =
         TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_SRC | TextureUsages::RENDER_ATTACHMENT;
     let target = images.add(image);
-    commands.insert_resource(CaptureTarget(target.clone()));
+    let directory = std::env::args_os()
+        .nth(1)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("kuluu-distortion-capture"));
+    std::fs::create_dir_all(&directory).expect("capture directory must be writable");
+    commands.insert_resource(CaptureTarget {
+        image: target.clone(),
+        directory,
+    });
     commands.spawn((
         Camera3d::default(),
         Camera {
@@ -120,15 +134,19 @@ fn capture(
         distortion.duration_secs = HOLD_SECONDS as f32;
         distortion.expires_at = Some(Instant::now() + Duration::from_secs(HOLD_SECONDS));
     }
+    if *frame == RESET_FRAME {
+        *distortion = ActiveDistortion::default();
+    }
     let filename = match *frame {
-        BASELINE_FRAME => Some("/private/tmp/distortion-baseline.png"),
-        ACTIVE_FRAME => Some("/private/tmp/distortion-active.png"),
+        BASELINE_FRAME => Some("distortion-baseline.png"),
+        ACTIVE_FRAME => Some("distortion-active.png"),
+        RESET_CAPTURE_FRAME => Some("distortion-after-reset.png"),
         _ => None,
     };
     if let Some(filename) = filename {
         commands
-            .spawn(Screenshot::image(target.0.clone()))
-            .observe(save_to_disk(filename));
+            .spawn(Screenshot::image(target.image.clone()))
+            .observe(save_to_disk(target.directory.join(filename)));
     }
     if *frame >= EXIT_FRAME && capturing.is_empty() {
         exit.write(AppExit::Success);

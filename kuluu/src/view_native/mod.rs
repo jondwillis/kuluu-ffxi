@@ -1004,6 +1004,7 @@ fn despawn_ingame_entities(
         ResMut<kuluu_render::elevators::ZoneElevators>,
         ResMut<kuluu_render::ffxi_actor_render::SelfKnockback>,
         ResMut<kuluu_render::scheduler_runtime::PendingKnockbacks>,
+        Option<ResMut<kuluu_render::distortion_pass::ActiveDistortion>>,
     ),
     mut last_zone: ResMut<LastAutoLoadedZone>,
     mut last_atmo: ResMut<LastAtmosphereZone>,
@@ -1042,6 +1043,9 @@ fn despawn_ingame_entities(
     *zone_geom.9 = kuluu_render::elevators::ZoneElevators::default();
     *zone_geom.10 = kuluu_render::ffxi_actor_render::SelfKnockback::default();
     *zone_geom.11 = kuluu_render::scheduler_runtime::PendingKnockbacks::default();
+    if let Some(distortion) = zone_geom.12.as_mut() {
+        **distortion = kuluu_render::distortion_pass::ActiveDistortion::default();
+    }
     last_zone.file_id = None;
     last_atmo.file_id = None;
 
@@ -1474,6 +1478,24 @@ mod zone_teardown_tests {
         world.init_resource::<kuluu_render::combat_stance::EntityMotion>();
         world.init_resource::<kuluu_render::combat_stance::AnimationBlends>();
         world
+    }
+
+    #[test]
+    fn teardown_discards_unexpired_distortion() {
+        use kuluu_render::distortion_pass::ActiveDistortion;
+        use std::time::{Duration, Instant};
+
+        let mut world = world_with_teardown_resources();
+        world.insert_resource(ActiveDistortion {
+            expires_at: Some(Instant::now() + Duration::from_secs(60)),
+            strength: 1.0,
+            ..Default::default()
+        });
+        world.run_system_once(despawn_ingame_entities).unwrap();
+
+        let distortion = world.resource::<ActiveDistortion>();
+        assert!(distortion.expires_at.is_none());
+        assert_eq!(distortion.strength, 0.0);
     }
 
     #[test]
