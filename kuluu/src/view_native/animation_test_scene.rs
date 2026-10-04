@@ -2568,6 +2568,11 @@ fn tear_down(
         if let Some(mut sim) = world.get_resource_mut::<ParticleSimulator>() {
             sim.reset_test_lighting();
         }
+        if let Some(mut distortion) =
+            world.get_resource_mut::<kuluu_render::distortion_pass::ActiveDistortion>()
+        {
+            *distortion = kuluu_render::distortion_pass::ActiveDistortion::default();
+        }
     });
     commands.insert_resource(TestZoneActive(false));
     commands.insert_resource(LampRoomActive(false));
@@ -2699,6 +2704,34 @@ mod tests {
             app.world().entity(rebuilt).get::<Visibility>(),
             Some(&Visibility::Inherited)
         );
+    }
+
+    #[test]
+    fn room_exit_discards_unexpired_distortion() {
+        use kuluu_render::distortion_pass::ActiveDistortion;
+        use std::time::{Duration, Instant};
+
+        let mut app = App::new();
+        app.init_resource::<TrackedEntities>()
+            .init_resource::<SceneState>()
+            .init_resource::<kuluu_render::graphics_settings::GraphicsSettings>()
+            .init_resource::<ShadowOverrides>()
+            .init_resource::<EnhanceRestore>()
+            .init_resource::<crate::graphics_store::GraphicsPersistSuspended>()
+            .init_resource::<Assets<Mesh>>()
+            .init_resource::<Assets<StandardMaterial>>()
+            .insert_resource(ActiveDistortion {
+                expires_at: Some(Instant::now() + Duration::from_secs(60)),
+                strength: 1.0,
+                ..Default::default()
+            })
+            .add_systems(Update, tear_down_test_scene);
+        app.world_mut().spawn(TestSceneScoped);
+        app.update();
+
+        let distortion = app.world().resource::<ActiveDistortion>();
+        assert!(distortion.expires_at.is_none());
+        assert_eq!(distortion.strength, 0.0);
     }
 
     #[test]
