@@ -18,7 +18,7 @@
 //! ordering/ranges, not exact frames.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bevy::prelude::*;
 
@@ -69,6 +69,8 @@ const WORM_W: u32 = 9_000_004;
 const NOLDA_W: u32 = 9_000_005;
 const BAT_W: u32 = 9_000_006;
 const WALKER_W: u32 = 9_000_007;
+
+const GLOBAL_EFFECT_LOAD_TIMEOUT: Duration = Duration::from_secs(10);
 
 // HumeM main-hand weapon model 0: the first band of the FFXiMain.dll equipment table row 1,
 // main-hand slot (`MainDll::equipment_model_index`), identical on horizonxi-2023 and retail-2026-09.
@@ -246,6 +248,23 @@ fn build_app() -> App {
         mob_claimed_other: Default::default(),
         invis_orb: Default::default(),
     });
+    let deadline = Instant::now() + GLOBAL_EFFECT_LOAD_TIMEOUT;
+    while !app.world().contains_resource::<GlobalEffectDir>() {
+        assert!(
+            Instant::now() < deadline,
+            "global effect directory did not load before the fixture readiness deadline"
+        );
+        step(&mut app);
+        std::thread::yield_now();
+    }
+    assert!(
+        app.world()
+            .resource::<GlobalEffectDir>()
+            .schedulers
+            .iter()
+            .any(|s| s.name == *b"dam0"),
+        "global effect directory must contain the authored melee dispatch routine dam0"
+    );
     app
 }
 
