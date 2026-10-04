@@ -13,7 +13,7 @@ use ffxi_dat::generator::Generator;
 use ffxi_dat::kind::ChunkKind;
 use ffxi_dat::scheduler::{
     is_control_flow_opcode, ModelVisibility, Scheduler, StageKind, TimedStage, CF_COMPARE_VALUE_OP,
-    CF_FIELD_SELECTOR_OP, CONTROL_FLOW_BLOCK_CLOSE, CONTROL_FLOW_BLOCK_OPEN,
+    CF_FIELD_SELECTOR_OP, CF_MASK_TEST_OP, CONTROL_FLOW_BLOCK_CLOSE, CONTROL_FLOW_BLOCK_OPEN,
     CONTROL_FLOW_BRANCH_FALSE, CONTROL_FLOW_BRANCH_TRUE, CONTROL_FLOW_CONDITION,
 };
 use ffxi_dat::sep::Sep;
@@ -3587,8 +3587,6 @@ impl HitContext {
         }
     }
 
-    /// The value a selector word names. Selectors that name no wire field (crtl's variant
-    /// picks) are client-side registers, not result fields.
     pub fn field(&self, selector: u32) -> Option<u32> {
         Some(match selector {
             HIT_FIELD_RESOLUTION => self.resolution,
@@ -3602,8 +3600,7 @@ impl HitContext {
     }
 }
 
-// How a switch test on an unknown (client-register) selector evaluates; only ROM/0/0.DAT crtl's
-// nested test names such selectors, and Match makes it take its first arm.
+// Unresolved actor-state selectors use the caller's fallback, not packet result information.
 pub enum UnknownFieldPolicy {
     Random,
     Match,
@@ -3641,6 +3638,7 @@ pub fn evaluate_switch(
     let mut frames: Vec<Frame> = Vec::new();
     let mut pending_field: Option<u32> = None;
     let mut pending_value: Option<Option<u32>> = None;
+    let mut pending_mask = false;
     let mut out = Vec::new();
 
     for t in &sched.stages {
@@ -3650,6 +3648,7 @@ pub fn evaluate_switch(
                     match cf.op {
                         CF_FIELD_SELECTOR_OP => pending_field = cf.operand,
                         CF_COMPARE_VALUE_OP => pending_value = Some(cf.operand),
+                        CF_MASK_TEST_OP => pending_mask = true,
                         _ => {} // terminator word
                     }
                 }
@@ -3660,7 +3659,9 @@ pub fn evaluate_switch(
             CONTROL_FLOW_BRANCH_TRUE => {
                 if let Some(field) = pending_field.take() {
                     let value = pending_value.take().flatten();
+                    let mask = std::mem::take(&mut pending_mask);
                     let matched = match (ctx.field(field), value) {
+                        (Some(x), Some(want)) if mask => x & want != 0,
                         (Some(x), Some(want)) => x == want,
                         (Some(x), None) => x != 0,
                         (None, _) => match unknown_fields {
@@ -4630,14 +4631,10 @@ pub struct AnimationTestState {
     pub levelup_pending: bool,
 }
 
-/// The melee resolutions //animationtest can loop; info_bits is what dam0's [`HIT_FIELD_INFO`] test sees.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum WeaponHitCase {
-    /// nhit — a plain hit (damg).
     Normal,
-    /// chit — a critical hit (damg + crtl spark).
     Critical,
-    /// dhit — the killing blow (damh); VFX only, no death latch.
     Death,
 }
 
@@ -4650,7 +4647,6 @@ impl WeaponHitCase {
         }
     }
 
-    /// The result.info bits dam0's [`HIT_FIELD_INFO`] test sees for this case.
     pub const fn info_bits(self) -> u8 {
         match self {
             Self::Normal => 0,
@@ -5955,8 +5951,6 @@ mod tests {
         assert!(evaluate_switch(&lookup, b"daml", &ctx(7), UnknownFieldPolicy::Random).is_empty());
     }
 
-    // A nested test with a bare-BlockOpen ELSE (dam0's Hit arm: info==1 -> damh, else damg):
-    // the inner case and its else are mutually exclusive, and both sit under the outer test.
     #[test]
     fn evaluate_switch_nested_test_with_else() {
         let mut stages = vec![cf_stage(0, CONTROL_FLOW_BLOCK_OPEN, None, None)];
@@ -6048,8 +6042,6 @@ mod tests {
         .is_empty());
     }
 
-    // Retail-byte guard (skips without an install): the real ROM/0/0.DAT `dam0` selects exactly
-    // the reaction its branch table names, and `crtl` lands on one of its two spark variants.
     #[test]
     fn real_dat_dam0_selects_reaction_from_offhand_context() {
         let Some(root) = ffxi_dat::archive::open_test_install() else {
