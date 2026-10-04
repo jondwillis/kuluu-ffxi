@@ -13,7 +13,7 @@ use ffxi_dat::generator::Generator;
 use ffxi_dat::kind::ChunkKind;
 use ffxi_dat::scheduler::{
     is_control_flow_opcode, ModelVisibility, Scheduler, StageKind, TimedStage, CF_COMPARE_VALUE_OP,
-    CF_FIELD_SELECTOR_OP, CONTROL_FLOW_BLOCK_CLOSE, CONTROL_FLOW_BLOCK_OPEN,
+    CF_FIELD_SELECTOR_OP, CF_MASK_TEST_OP, CONTROL_FLOW_BLOCK_CLOSE, CONTROL_FLOW_BLOCK_OPEN,
     CONTROL_FLOW_BRANCH_FALSE, CONTROL_FLOW_BRANCH_TRUE, CONTROL_FLOW_CONDITION,
 };
 use ffxi_dat::sep::Sep;
@@ -3559,7 +3559,9 @@ pub fn hit_reaction_routine(
 // ROM/0/0.DAT dam0/daml switch-test field selectors, as carried by CF_FIELD_SELECTOR_OP words.
 pub const HIT_FIELD_RESOLUTION: u32 = 0x28;
 pub const HIT_FIELD_ANIMATION: u32 = 0x33;
-pub const HIT_FIELD_INFO: u32 = 0x3B;
+// .agents/skills/retail-observe/references/2026-10-04-melee-recoil-and-result-fields.md Result information and recoil inputs
+pub const HIT_FIELD_INFO: u32 = 0x2B;
+pub const HIT_FIELD_ACTOR_STATE: u32 = 0x3B;
 pub const HIT_FIELD_ATTACKER_IS_PLAYER: u32 = 0x38;
 
 // Per-result fields a control-flow switch (ROM/0/0.DAT dam0/daml) can test, keyed by the selector
@@ -3581,8 +3583,6 @@ impl HitContext {
         }
     }
 
-    /// The value a selector word names. Selectors that name no wire field (crtl's variant
-    /// picks) are client-side registers, not result fields.
     pub fn field(&self, selector: u32) -> Option<u32> {
         Some(match selector {
             HIT_FIELD_RESOLUTION => self.resolution,
@@ -3595,8 +3595,7 @@ impl HitContext {
     }
 }
 
-// How a switch test on an unknown (client-register) selector evaluates; only ROM/0/0.DAT crtl's
-// nested test names such selectors, and Match makes it take its first arm.
+// Unresolved actor-state selectors use the caller's fallback, not packet result information.
 pub enum UnknownFieldPolicy {
     Random,
     Match,
@@ -3634,6 +3633,7 @@ pub fn evaluate_switch(
     let mut frames: Vec<Frame> = Vec::new();
     let mut pending_field: Option<u32> = None;
     let mut pending_value: Option<Option<u32>> = None;
+    let mut pending_mask = false;
     let mut out = Vec::new();
 
     for t in &sched.stages {
@@ -3643,6 +3643,7 @@ pub fn evaluate_switch(
                     match cf.op {
                         CF_FIELD_SELECTOR_OP => pending_field = cf.operand,
                         CF_COMPARE_VALUE_OP => pending_value = Some(cf.operand),
+                        CF_MASK_TEST_OP => pending_mask = true,
                         _ => {} // terminator word
                     }
                 }
@@ -3653,7 +3654,9 @@ pub fn evaluate_switch(
             CONTROL_FLOW_BRANCH_TRUE => {
                 if let Some(field) = pending_field.take() {
                     let value = pending_value.take().flatten();
+                    let mask = std::mem::take(&mut pending_mask);
                     let matched = match (ctx.field(field), value) {
+                        (Some(x), Some(want)) if mask => x & want != 0,
                         (Some(x), Some(want)) => x == want,
                         (Some(x), None) => x != 0,
                         (None, _) => match unknown_fields {
@@ -4593,14 +4596,10 @@ pub struct AnimationTestState {
     pub levelup_pending: bool,
 }
 
-/// The melee resolutions //animationtest can loop; info_bits is what dam0's [`HIT_FIELD_INFO`] test sees.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum WeaponHitCase {
-    /// nhit — a plain hit (damg).
     Normal,
-    /// chit — a critical hit (damg + crtl spark).
     Critical,
-    /// dhit — the killing blow (damh); VFX only, no death latch.
     Death,
 }
 
@@ -4613,7 +4612,6 @@ impl WeaponHitCase {
         }
     }
 
-    /// The result.info bits dam0's [`HIT_FIELD_INFO`] test sees for this case.
     pub const fn info_bits(self) -> u8 {
         match self {
             Self::Normal => 0,
@@ -5916,8 +5914,6 @@ mod tests {
         assert!(evaluate_switch(&lookup, b"daml", &ctx(7), UnknownFieldPolicy::Random).is_empty());
     }
 
-    // A nested test with a bare-BlockOpen ELSE (dam0's Hit arm: info==1 -> damh, else damg):
-    // the inner case and its else are mutually exclusive, and both sit under the outer test.
     #[test]
     fn evaluate_switch_nested_test_with_else() {
         let mut stages = vec![cf_stage(0, CONTROL_FLOW_BLOCK_OPEN, None, None)];
@@ -6006,10 +6002,8 @@ mod tests {
         .is_empty());
     }
 
-    // Retail-byte guard (skips without an install): the real ROM/0/0.DAT `dam0` selects exactly
-    // the reaction its branch table names, and `crtl` lands on one of its two spark variants.
     #[test]
-    fn real_dat_dam0_selects_the_retail_reaction() {
+    fn real_dat_dam0_preserves_authored_arms_with_unresolved_actor_state() {
         let Some(root) = ffxi_dat::archive::open_test_install() else {
             return;
         };
@@ -6024,36 +6018,18 @@ mod tests {
         let (schedulers, _assets, _report, _cameras) = parse_action_bytes_reporting(&bytes);
         let lookup = RoutineLookup::new().with_dat(&schedulers);
 
-        // Hit: the nested info test sees no Defeated bit -> damg.
-        assert_eq!(
-            evaluate_switch(
-                &lookup,
-                b"dam0",
-                &HitContext {
-                    resolution: 0,
-                    animation: 0,
-                    info: 0,
-                    attacker_id: 0,
-                },
-                UnknownFieldPolicy::Random
-            ),
-            vec![*b"damg"]
-        );
-        // The killing blow: info bit 1 (Defeated) -> damh.
-        assert_eq!(
-            evaluate_switch(
-                &lookup,
-                b"dam0",
-                &HitContext {
-                    resolution: 0,
-                    animation: 0,
-                    info: 1,
-                    attacker_id: 0,
-                },
-                UnknownFieldPolicy::Random
-            ),
-            vec![*b"damh"]
-        );
+        // .agents/skills/retail-observe/references/2026-10-04-melee-damage-dispatch.md Conditions selecting reactions
+        for info in [0, u32::from(ffxi_proto::melee::INFO_DEFEATED)] {
+            let ctx = HitContext {
+                resolution: 0,
+                animation: 0,
+                info,
+                attacker_id: 0,
+            };
+            assert_eq!(ctx.field(HIT_FIELD_ACTOR_STATE), None);
+            let selected = evaluate_switch(&lookup, b"dam0", &ctx, UnknownFieldPolicy::Random);
+            assert!(selected == vec![*b"damg"] || selected == vec![*b"damh"]);
+        }
         // Miss/Guard/Parry/Block -> sway/gurd/pary/gur1.
         assert_eq!(
             evaluate_switch(
@@ -6111,21 +6087,18 @@ mod tests {
             ),
             vec![*b"gur1"]
         );
-        // A swing-animation value (retail sends 1..=10) fires its sb block AND the Hit arm.
-        assert_eq!(
-            evaluate_switch(
-                &lookup,
-                b"dam0",
-                &HitContext {
-                    resolution: 0,
-                    animation: 5,
-                    info: 0,
-                    attacker_id: 0,
-                },
-                UnknownFieldPolicy::Random
-            ),
-            vec![*b"sb04", *b"damg"]
+        let selected = evaluate_switch(
+            &lookup,
+            b"dam0",
+            &HitContext {
+                resolution: 0,
+                animation: 5,
+                info: 0,
+                attacker_id: 0,
+            },
+            UnknownFieldPolicy::Random,
         );
+        assert!(selected == vec![*b"sb04", *b"damg"] || selected == vec![*b"sb04", *b"damh"]);
         // .agents/skills/retail-observe/references/2026-10-04-melee-damage-dispatch.md Conditions selecting reactions
         for (attacker_id, expected) in [
             (0, *b"hi14"),
@@ -6146,6 +6119,46 @@ mod tests {
                 vec![expected],
                 "critical effect for attacker {attacker_id:#X}"
             );
+        }
+    }
+
+    // .agents/skills/retail-observe/references/2026-10-04-crtl-condition-grammar.md Required outcomes
+    #[test]
+    fn real_dat_crtl_respects_critical_mask_for_both_attacker_classes() {
+        let Some(root) = ffxi_dat::archive::open_test_install() else {
+            return;
+        };
+        let location = root.resolve(GLOBAL_EFFECT_DIR_FILE_ID).expect("global DAT");
+        let bytes = std::fs::read(location.path_under(&root)).expect("global DAT bytes");
+        let (schedulers, _, _, _) = parse_action_bytes_reporting(&bytes);
+        let lookup = RoutineLookup::new().with_dat(&schedulers);
+        let critical = u32::from(ffxi_proto::melee::INFO_CRITICAL_HIT);
+        let defeated = u32::from(ffxi_proto::melee::INFO_DEFEATED);
+        for (attacker_id, expected) in [
+            (0, *b"hi14"),
+            (ffxi_dat::npc_names::compose_id(0, 1), *b"hi29"),
+        ] {
+            for info in [0, defeated, critical, critical | defeated] {
+                for policy in [UnknownFieldPolicy::Match, UnknownFieldPolicy::Random] {
+                    let actual = evaluate_switch(
+                        &lookup,
+                        b"crtl",
+                        &HitContext {
+                            resolution: 0,
+                            animation: 0,
+                            info,
+                            attacker_id,
+                        },
+                        policy,
+                    );
+                    let expected = if info & critical != 0 {
+                        vec![expected]
+                    } else {
+                        Vec::new()
+                    };
+                    assert_eq!(actual, expected, "attacker={attacker_id:#X} info={info}");
+                }
+            }
         }
     }
 

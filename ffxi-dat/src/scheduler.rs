@@ -293,9 +293,9 @@ pub struct SchedulerStage {
 // ROM/0/0.DAT dam0 switch-test word ops (LE u32s of the byte runs `1C 00 03 00` / `1C 00 01 00`).
 pub const CF_FIELD_SELECTOR_OP: u32 = 0x0003_001C;
 pub const CF_COMPARE_VALUE_OP: u32 = 0x0001_001C;
+// .agents/skills/retail-observe/references/2026-10-04-crtl-condition-grammar.md Authored rule
+pub const CF_MASK_TEST_OP: u32 = 0x11;
 
-// One condition word of a ROM/0/0.DAT dam0/daml/crtl switch test; `op` names the field selector
-// or compare value, any other op terminates the test.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ControlFlowArg {
     pub op: u32,

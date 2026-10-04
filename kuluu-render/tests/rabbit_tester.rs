@@ -556,12 +556,9 @@ fn s4_run_gait_selects_run_clip() {
     assert!(first.is_some(), "run gait selected run? within 1 s");
 }
 
-/// S5/S5b - swing impact hands off to the victim reaction AT the inlined DamageCallback
-/// frame. Rarab swings RightAttack at HumeM (Hit, dist=0, kb=0). Expect: at0? on the attacker from
-/// ~frame 1; at the inlined DamageCallback impact (~36 for ati0) HumeM runs `damg` (it ships no sdam of
-/// its own - the reaction table falls through to damg) and its flinch stage starts dfm? on the PC host.
+// .agents/skills/retail-observe/references/2026-10-04-melee-damage-dispatch.md Conditions selecting reactions
 #[test]
-fn s5_swing_impact_runs_damg_and_flinches_the_pc() {
+fn s5_swing_impact_runs_authored_reaction_and_flinches_the_pc() {
     let (Some(rarab), Some(humem)) = (load_rarab(), load_humem()) else {
         return;
     };
@@ -578,23 +575,19 @@ fn s5_swing_impact_runs_damg_and_flinches_the_pc() {
     assert!(swing_at.is_some(), "attacker plays the at0? swing clip");
 
     let (impact_at, _) = watch(&mut app, 45, |_i, w| {
-        routines(w, vic_parent).contains(b"damg")
+        (routines(w, vic_parent).contains(b"damg") || routines(w, vic_parent).contains(b"damh"))
             && active_clip(w, vic_child).is_some_and(|c| c.starts_with("dfm"))
     });
     assert!(
         impact_at.is_some_and(|f| f >= IMPACT_FRAME_MIN),
-        "victim reaction (damg + dfm? flinch) fired at the inlined-0x2B frame (~36), not on \
+        "authored victim reaction with dfm? flinch fired at the inlined-0x2B frame (~36), not on \
          packet arrival",
     );
 }
 
-/// S5b: same swing, victim = a second Rarab. Retail's dam0 branch table routes every non-crit
-/// Hit to damg/damh - both carry the 0x21 flinch stage (research/xim
-/// EffectRoutineInterpolatedEffects.kt), so the mob victim runs its own `damg` and flinches
-/// with dfi? on a normal hit. This is the "animations not playing" case: sdam-shipping models
-/// like Rarab must get a visible flinch on normal hits (sdam is sound-only).
+// .agents/skills/retail-observe/references/2026-10-04-melee-damage-dispatch.md Conditions selecting reactions
 #[test]
-fn s5b_mob_victim_normal_hit_runs_damg_and_flinches() {
+fn s5b_mob_victim_normal_hit_runs_authored_reaction_and_flinches() {
     let Some(rarab) = load_rarab() else { return };
     let mut app = build_app();
     let (_, atk_child) = spawn_actor(&mut app, RARAB_W, EntityKind::Mob, &rarab);
@@ -604,12 +597,12 @@ fn s5b_mob_victim_normal_hit_runs_damg_and_flinches() {
     push_battle2(&mut app, RARAB_W, 1, Some(RARAB2_W), Some((0, 0, 0, 0, 0)));
 
     let (impact_at, _) = watch(&mut app, 45, |_i, w| {
-        routines(w, vic_parent).contains(b"damg")
+        (routines(w, vic_parent).contains(b"damg") || routines(w, vic_parent).contains(b"damh"))
             && active_clip(w, vic_child).is_some_and(|c| c.starts_with("dfi"))
     });
     assert!(
         impact_at.is_some_and(|f| f >= IMPACT_FRAME_MIN),
-        "normal hit runs damg + dfi? flinch on the mob victim"
+        "normal hit runs an authored reaction with dfi? flinch on the mob victim"
     );
     assert!(active_clip(app.world(), atk_child).is_some());
 }
@@ -672,7 +665,7 @@ fn s6b_crit_flinches_the_mob_with_dfi() {
 /// install), so this fallback is reachable only on mob victims; S6 covers the PC side of the
 /// matrix.
 #[test]
-fn s6c_crit_without_ldam_falls_back_to_damg() {
+fn s6c_ordinary_crit_without_ldam_retains_authored_reaction() {
     let (Some(rarab), Some(nolda)) = (load_rarab(), load_nolda()) else {
         return;
     };
@@ -685,12 +678,12 @@ fn s6c_crit_without_ldam_falls_back_to_damg() {
     push_battle2(&mut app, RARAB_W, 1, Some(NOLDA_W), Some((0, 0, 2, 3, 0)));
 
     let (impact_at, _) = watch(&mut app, 45, |_i, w| {
-        routines(w, vic_parent).contains(b"damg") && !routines(w, vic_parent).contains(b"ldam")
+        (routines(w, vic_parent).contains(b"damg") || routines(w, vic_parent).contains(b"damh"))
+            && !routines(w, vic_parent).contains(b"ldam")
     });
     assert!(
         impact_at.is_some_and(|f| f >= IMPACT_FRAME_MIN),
-        "crit on a no-ldam victim runs the damg fallback at the impact frame, not an \
-         unresolvable ldam"
+        "ordinary crit retains an authored reaction at impact without ldam"
     );
     assert!(active_clip(app.world(), atk_child).is_some());
 }
@@ -698,7 +691,7 @@ fn s6c_crit_without_ldam_falls_back_to_damg() {
 /// S6d: same rig (no ldam anywhere), non-crit Medium hit still routes to damg - the crit guard
 /// must not leak into the None/Light/Medium cases.
 #[test]
-fn s6d_medium_hit_without_ldam_still_runs_damg() {
+fn s6d_medium_hit_without_ldam_retains_authored_reaction() {
     let (Some(rarab), Some(nolda)) = (load_rarab(), load_nolda()) else {
         return;
     };
@@ -711,12 +704,11 @@ fn s6d_medium_hit_without_ldam_still_runs_damg() {
     push_battle2(&mut app, RARAB_W, 1, Some(NOLDA_W), Some((0, 0, 0, 2, 0)));
 
     let (impact_at, _) = watch(&mut app, 45, |_i, w| {
-        routines(w, vic_parent).contains(b"damg")
+        routines(w, vic_parent).contains(b"damg") || routines(w, vic_parent).contains(b"damh")
     });
     assert!(
         impact_at.is_some_and(|f| f >= IMPACT_FRAME_MIN),
-        "non-crit hits on a no-ldam victim still run damg (the crit guard does not leak into \
-         dist 0/1/2)"
+        "non-critical hits retain an authored reaction at impact without ldam"
     );
 }
 
