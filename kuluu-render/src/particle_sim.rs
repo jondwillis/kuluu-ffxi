@@ -6273,14 +6273,14 @@ mod tests {
     #[test]
     fn linked_multiple_births_keep_parent_insertion_order() {
         const BIRTHS: u32 = 3;
-        let mut parent = live(def(ROUTINE_FPS, ROUTINE_FPS, BIRTHS), 0.0);
+        let mut parent = live(def(ROUTINE_FPS, ROUTINE_FPS, BIRTHS - 1), 0.0);
         parent.entity = Entity::from_bits(1);
         parent.def.position_variance = Some(ffxi_dat::particle_gen::PositionVariance {
             radius_variance: 1.0,
             base_radius: 1.0,
             axis_scale: [1.0; 3],
         });
-        let mut child = live(def(ROUTINE_FPS, ROUTINE_FPS, 1), 0.0);
+        let mut child = live(def(ROUTINE_FPS, ROUTINE_FPS, 0), 0.0);
         child.entity = Entity::from_bits(2);
         child.immediate_parent = Some(parent.entity);
         child.def.parent_position_copy = true;
@@ -6307,10 +6307,10 @@ mod tests {
     #[test]
     fn immediate_linked_emission_copies_birth_position_once_and_keeps_its_rotation() {
         const PARENT_POSITION: Vec3 = Vec3::new(11.0, 4.0, -7.0);
-        let mut parent = live(def(30.0, 100.0, 1), 0.0);
+        let mut parent = live(def(30.0, 100.0, 0), 0.0);
         parent.origin = PARENT_POSITION;
         parent.entity = Entity::from_bits(1);
-        let mut child = live(def(30.0, 100.0, 1), 0.0);
+        let mut child = live(def(30.0, 100.0, 0), 0.0);
         child.entity = Entity::from_bits(2);
         child.immediate_parent = Some(parent.entity);
         child.origin = parent.origin;
@@ -6348,7 +6348,7 @@ mod tests {
     fn scheduled_zero_window_waits_for_positive_time_and_does_not_repeat_when_paused() {
         const POSITIVE_TICK_FRAMES: f32 = 1.0;
         const PAUSED_TICK_FRAMES: f32 = 0.0;
-        let mut g = live(def(ROUTINE_FPS, ROUTINE_FPS, 1), 0.0);
+        let mut g = live(def(ROUTINE_FPS, ROUTINE_FPS, 0), 0.0);
         advance(&mut g, PAUSED_TICK_FRAMES);
         advance(&mut g, PAUSED_TICK_FRAMES);
         assert_eq!(g.elements_emitted, 0);
