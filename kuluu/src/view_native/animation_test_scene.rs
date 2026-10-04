@@ -14,14 +14,13 @@ use bevy::window::PrimaryWindow;
 use kuluu_render::components::{InGameEntity, WorldEntity};
 use kuluu_render::dat_mzb::{LastAutoLoadedZone, LoadMzbRequest, ZONE_SLOT_MAIN};
 use kuluu_render::ffxi_actor_render::{
-    ActorSubject, FfxiActorMeshChild, FfxiRenderActor, FfxiRenderRoot, LoadActorRequest,
+    ActorSubject, FfxiActorMeshChild, FfxiRenderRoot, LoadActorRequest,
 };
 use kuluu_render::particle_sim::ParticleSimulator;
 use kuluu_render::scene::TrackedEntities;
 use kuluu_render::scheduler_runtime::{
     enqueue_routine, parse_action_bytes_reporting, stage_summary, ActionDatRoot, ActionTarget,
     ActiveScheduler, GlobalEffectDir, ParticleSpawnTrace, RoutineLookup, VfxTrace,
-    LEVEL_UP_EFFECT_DAT_ID,
 };
 use kuluu_render::snapshot::{EventLog, SceneState};
 use kuluu_snapshot::EntityKind;
@@ -1519,7 +1518,6 @@ fn run_pending_case(
     mut log: ResMut<TestLog>,
     tracked: Res<TrackedEntities>,
     q_children: Query<&Children>,
-    q_render: Query<&FfxiRenderActor>,
     global: Option<Res<GlobalEffectDir>>,
     root: Res<ActionDatRoot>,
     mut worm_state: ResMut<WormState>,
@@ -1575,15 +1573,7 @@ fn run_pending_case(
             &mut commands,
             &mut hp,
         ),
-        Case::LevelUp => fire_level_up(
-            &root,
-            &tracked,
-            &q_children,
-            &q_render,
-            global.as_deref(),
-            &mut log,
-            &mut commands,
-        ),
+        Case::LevelUp => fire_level_up(&tracked, &mut log, &mut events),
         Case::Gen141 => fire_single_gen(
             &tracked,
             global.as_deref(),
@@ -1683,19 +1673,6 @@ fn run_pending_case(
     }
 
     lock.until = Some(Instant::now() + case_duration(case));
-}
-
-fn actor_routines(
-    entity: Entity,
-    q_children: &Query<&Children>,
-    q_render: &Query<&FfxiRenderActor>,
-) -> Option<std::collections::HashMap<ffxi_dat::datid::DatId, ffxi_dat::scheduler::Scheduler>> {
-    q_children
-        .get(entity)
-        .ok()?
-        .iter()
-        .find_map(|child| q_render.get(child).ok())
-        .map(|a| a.routines().clone())
 }
 
 // The button is the server: one BATTLE2-shaped ActionStarted into the EventLog. Production
@@ -1799,61 +1776,13 @@ fn respawn_worm(
     log_line(log, "worm respawned (visible again, hp 100)".into());
 }
 
-fn fire_level_up(
-    root: &ActionDatRoot,
-    tracked: &TrackedEntities,
-    q_children: &Query<&Children>,
-    q_render: &Query<&FfxiRenderActor>,
-    global: Option<&GlobalEffectDir>,
-    log: &mut TestLog,
-    commands: &mut Commands,
-) {
-    let Some(hume) = tracked.by_id.get(&HUME_ID).copied() else {
+fn fire_level_up(tracked: &TrackedEntities, log: &mut TestLog, events: &mut EventLog) {
+    if !tracked.by_id.contains_key(&HUME_ID) {
         log_line(log, "hume not loaded yet".into());
         return;
-    };
-    let Some(dat_root) = root.0.as_ref() else {
-        log_line(log, "no install wired".into());
-        return;
-    };
-    let Ok(loc) = dat_root.resolve(LEVEL_UP_EFFECT_DAT_ID) else {
-        log_line(
-            log,
-            format!("level-up effect DAT {LEVEL_UP_EFFECT_DAT_ID} not found in the install"),
-        );
-        return;
-    };
-    let Ok(bytes) = std::fs::read(loc.path_under(dat_root)) else {
-        log_line(log, "failed to read the level-up effect DAT".into());
-        return;
-    };
-    let (schedulers, _assets, _cameras) =
-        kuluu_render::scheduler_runtime::parse_action_bytes(&bytes);
-    log_line(
-        log,
-        format!(
-            "level-up effect DAT file {LEVEL_UP_EFFECT_DAT_ID}: {} routines",
-            schedulers.len()
-        ),
-    );
-    let hume_routines = actor_routines(hume, q_children, q_render);
-    let mut lookup = RoutineLookup::new().with_dat(&schedulers);
-    if let Some(r) = &hume_routines {
-        lookup = lookup.with_actor(r);
     }
-    if let Some(g) = global {
-        lookup = lookup.with_dat(&g.schedulers);
-    }
-    match ActiveScheduler::from_routine(&lookup, b"main") {
-        Some(active) => {
-            log_line(
-                log,
-                format!("lvup main on hume: {}", stage_summary(&active)),
-            );
-            enqueue_routine(commands, hume, active);
-        }
-        None => log_line(log, "lvup `main` UNRESOLVED".into()),
-    }
+    events.push(kuluu_snapshot::ViewerEvent::LevelUp { player_id: HUME_ID });
+    log_line(log, "level-up queued on hume".into());
 }
 
 // Tester-only: spawn a single named generator on the worm (as target) with its alpha forced to 1,
