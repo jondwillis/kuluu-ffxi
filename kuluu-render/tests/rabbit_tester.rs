@@ -51,10 +51,7 @@ const LIMB_MODEL_FILE: u32 = 101806;
 /// generators + sound, and `init` = Motion sp0? + dirt generators + sound: the full special-pose
 /// pair S12 drives through the pose pass.
 const WORM_FILE: u32 = 1724;
-/// ROM/172/67.DAT - one of exactly three retail models that ship `damg` without `ldam`
-/// (verified against the install: routines shot/damg/chit/cate/cast/pop0/init/corp/dead/setr/
-/// kil0/bom0/kil1/efon). The S6c/S6d victim: a crit on it must fall back to damg, and only
-/// when the global dir's ldam is out of reach.
+// ROM/172/67.DAT ships damg without ldam; absence is checked in the affected fixtures.
 const NOLDA_FILE: u32 = 52087;
 /// ROM/4/106.DAT - flying bat; its Info chunk carries movement byte 3 (Flying) and
 /// scale byte 85, so the live pipeline must load it at 85 percent with no wire stride scale.
@@ -424,23 +421,19 @@ fn push_battle2(
     0
 }
 
-/// Wait for the async global effect dir load (ROM/0/0.DAT) to land, then remove it so no lookup
-/// can rescue a routine from there. The poll system inserts exactly once and does not
-/// re-insert, so the removal holds for the rest of the scenario. Asserting ldam is present first keeps the
-/// S6c/S6d fallback honest: without this step the global dir's own ldam would satisfy the guard.
-fn drop_global_effect_dir(app: &mut App) {
-    for _ in 0..600 {
-        if app.world().contains_resource::<GlobalEffectDir>() {
-            break;
-        }
-        step(app);
-    }
-    let g = app.world().resource::<GlobalEffectDir>();
+fn remove_global_ldam(app: &mut App, victim: &LoadedActor) {
+    assert!(victim.all_routines().values().all(|s| s.name != *b"ldam"));
+    let mut g = app.world_mut().resource_mut::<GlobalEffectDir>();
     assert!(
         g.schedulers.iter().any(|s| s.name == *b"ldam"),
-        "ROM/0/0.DAT ships ldam (the fallback under test must be reachable without it)"
+        "global ldam must exist before the fixture removes it"
     );
-    app.world_mut().remove_resource::<GlobalEffectDir>();
+    g.schedulers.retain(|s| s.name != *b"ldam");
+    assert!(g.schedulers.iter().all(|s| s.name != *b"ldam"));
+    assert!(
+        g.schedulers.iter().any(|s| s.name == *b"dam0"),
+        "the fixture must preserve the authored melee dispatch routine"
+    );
 }
 
 /// Drive `window` updates after the event; return (first update index in [1..=window] where
@@ -678,14 +671,9 @@ fn s6b_ordinary_crit_flinches_the_mob_without_ldam() {
     assert!(active_clip(app.world(), atk_child).is_some());
 }
 
-/// S6c: crit on a victim whose DAT ships no `ldam` of its own (ROM/172/67.DAT), with the global
-/// effect dir removed so ROM/0/0.DAT's ldam cannot rescue it. The crit guard must fall back to
-/// the normal `damg` reaction instead of arming an unresolvable ldam, which would fall
-/// through to nothing. All eight retail PC skeletons ship their own ldam (verified against the
-/// install), so this fallback is reachable only on mob victims; S6 covers the PC side of the
-/// matrix.
+// .agents/skills/retail-observe/references/2026-10-04-melee-damage-dispatch.md Authored ordinary melee chain
 #[test]
-fn s6c_ordinary_crit_without_ldam_retains_authored_reaction() {
+fn s6c_ordinary_crit_without_ldam_still_runs_damg() {
     let (Some(rarab), Some(nolda)) = (load_rarab(), load_nolda()) else {
         return;
     };
@@ -693,7 +681,7 @@ fn s6c_ordinary_crit_without_ldam_retains_authored_reaction() {
     let (_, atk_child) = spawn_actor(&mut app, RARAB_W, EntityKind::Mob, &rarab);
     let (vic_parent, _) = spawn_actor(&mut app, NOLDA_W, EntityKind::Mob, &nolda);
     step_n(&mut app, 10);
-    drop_global_effect_dir(&mut app);
+    remove_global_ldam(&mut app, &nolda);
 
     push_battle2(&mut app, RARAB_W, 1, Some(NOLDA_W), Some((0, 0, 2, 3, 0)));
 
@@ -703,13 +691,12 @@ fn s6c_ordinary_crit_without_ldam_retains_authored_reaction() {
     });
     assert!(
         impact_at.is_some_and(|f| f >= IMPACT_FRAME_MIN),
-        "ordinary crit retains an authored reaction at impact without ldam"
+        "ordinary crit on a no-ldam victim runs authored damg at the impact frame, not an \
+         unresolvable ldam"
     );
     assert!(active_clip(app.world(), atk_child).is_some());
 }
 
-/// S6d: same rig (no ldam anywhere), non-crit Medium hit still routes to damg - the crit guard
-/// must not leak into the None/Light/Medium cases.
 #[test]
 fn s6d_medium_hit_without_ldam_retains_authored_reaction() {
     let (Some(rarab), Some(nolda)) = (load_rarab(), load_nolda()) else {
@@ -719,7 +706,7 @@ fn s6d_medium_hit_without_ldam_retains_authored_reaction() {
     spawn_actor(&mut app, RARAB_W, EntityKind::Mob, &rarab);
     let (vic_parent, _) = spawn_actor(&mut app, NOLDA_W, EntityKind::Mob, &nolda);
     step_n(&mut app, 10);
-    drop_global_effect_dir(&mut app);
+    remove_global_ldam(&mut app, &nolda);
 
     push_battle2(&mut app, RARAB_W, 1, Some(NOLDA_W), Some((0, 0, 0, 2, 0)));
 
