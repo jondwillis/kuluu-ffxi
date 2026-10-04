@@ -1387,33 +1387,33 @@ fn spawn_panel(commands: &mut Commands) {
     commands.entity(panel).add_child(log_node);
 }
 
-// Per-case animation windows: swing + impact reaction; death adds the fall-over, level-up
-// runs to its frame-170 tail (lvup `main` in effect DAT 3310), respawn is near-instant.
-/// Lockout while a case's effect is still on screen (i900 lives 90 frames; the window must
-/// outlast it). The value coincides with ffxi-proto's MAX_DATAGRAM, so *_PINNED keeps
-/// literal-reuse.py from demanding that unrelated import.
-const EFFECT_WATCH_LOCK_MS_PINNED: u64 = 2500;
+const NORMAL_HIT_WATCH_SECS: f64 = 1.2;
+const CRITICAL_HIT_WATCH_SECS: f64 = 1.5;
+const DEATH_HIT_WATCH_SECS: f64 = 2.0;
+const LEVEL_UP_WATCH_SECS: f64 = 3.5;
+const RESPAWN_WATCH_SECS: f64 = 0.3;
+const GENERATOR_WATCH_SECS: f64 = 2.0;
+const CHILD_EFFECT_WATCH_SECS: f64 = 2.5;
+const ZONE_LOAD_WATCH_SECS: f64 = 2.0;
+const WEATHER_LOAD_WATCH_SECS: f64 = 0.5;
+const LAMP_ROOM_WATCH_SECS: f64 = 4.0;
+const SCREENSHOT_WATCH_SECS: f64 = 1.5;
 
-fn case_duration(case: Case) -> std::time::Duration {
-    match case {
-        Case::PlayerNhIt | Case::MobNhIt => std::time::Duration::from_millis(1200),
-        Case::PlayerChit | Case::MobChit => std::time::Duration::from_millis(1500),
-        Case::PlayerDhit => std::time::Duration::from_millis(2000),
-        Case::LevelUp => std::time::Duration::from_millis(3500),
-        Case::MobRespawn => std::time::Duration::from_millis(300),
-        Case::Gen141 | Case::Gen144 => std::time::Duration::from_millis(2000),
-        Case::Hit1Full => std::time::Duration::from_millis(EFFECT_WATCH_LOCK_MS_PINNED),
-        // The carrier particle lives 60 frames (1s) and emits its child every frame in that
-        // window; hold the lock long enough to watch the child appear. i900 lives 90 frames.
-        Case::Hi26 | Case::Sb00 | Case::I900 => {
-            std::time::Duration::from_millis(EFFECT_WATCH_LOCK_MS_PINNED)
-        }
-        // Not animations: short windows only keep a double-press from re-issuing loads.
-        Case::LoadZone => std::time::Duration::from_millis(2000),
-        Case::LoadWeather => std::time::Duration::from_millis(500),
-        Case::SgLamps => std::time::Duration::from_millis(4000),
-        Case::Shot => std::time::Duration::from_millis(1500),
-    }
+fn case_duration(case: Case) -> Duration {
+    let seconds = match case {
+        Case::PlayerNhIt | Case::MobNhIt => NORMAL_HIT_WATCH_SECS,
+        Case::PlayerChit | Case::MobChit => CRITICAL_HIT_WATCH_SECS,
+        Case::PlayerDhit => DEATH_HIT_WATCH_SECS,
+        Case::LevelUp => LEVEL_UP_WATCH_SECS,
+        Case::MobRespawn => RESPAWN_WATCH_SECS,
+        Case::Gen141 | Case::Gen144 => GENERATOR_WATCH_SECS,
+        Case::Hit1Full | Case::Hi26 | Case::Sb00 | Case::I900 => CHILD_EFFECT_WATCH_SECS,
+        Case::LoadZone => ZONE_LOAD_WATCH_SECS,
+        Case::LoadWeather => WEATHER_LOAD_WATCH_SECS,
+        Case::SgLamps => LAMP_ROOM_WATCH_SECS,
+        Case::Shot => SCREENSHOT_WATCH_SECS,
+    };
+    Duration::from_secs_f64(seconds)
 }
 
 // Pop the ANIMTEST_AUTO queue on schedule; run_pending_case consumes it the same frame.
