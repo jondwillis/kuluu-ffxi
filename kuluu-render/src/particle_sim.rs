@@ -7325,11 +7325,6 @@ mod tests {
             .collect()
     }
 
-    // Read off the shipped f_ro DAT: the lunar halo sheet `kasa` is a DXT3 whose alpha is
-    // entirely the nibble 7/8 dithered-opaque pair (ffxi-dat/examples/dat-sky-alpha-histogram.rs
-    // on zone files 210/331), so the plain particle converter hands the GPU the stored 119/136
-    // per-texel stipple as-is and only the celestial converter undithers and expands it to the
-    // authored half-step. Skips without a retail install.
     #[test]
     fn zone_210_halo_sheet_is_dithered_and_only_the_celestial_converter_resolves_it() {
         const F_RO: u32 = 210;
@@ -7364,16 +7359,16 @@ mod tests {
         let sky = images.add(decoded_sky_texture_to_image(&tex));
 
         let plain_alpha = image_alpha(&images, &plain);
+        let lo = ffxi_dat::texture::ffxi_alpha_remap(DITHER_LO);
+        let hi = ffxi_dat::texture::ffxi_alpha_remap(DITHER_HI);
         assert!(
-            plain_alpha.contains(&DITHER_LO) && plain_alpha.contains(&DITHER_HI),
-            "the shared particle converter passes the stored stipple through as-is"
+            plain_alpha.contains(&lo) && plain_alpha.contains(&hi),
+            "the shared particle converter keeps the remapped stipple"
         );
 
         let sky_alpha = image_alpha(&images, &sky);
         let spread =
             sky_alpha.iter().max().expect("non-empty") - sky_alpha.iter().min().expect("non-empty");
-        // The celestial path still expands: the undithered mean 127.5 doubles to a 254/255 split.
-        let lo = ffxi_dat::texture::ffxi_alpha_remap(DITHER_LO);
         assert!(
             spread <= RESOLVED_RESIDUAL_MAX && *sky_alpha.iter().min().expect("non-empty") > lo,
             "the celestial converter left alpha spread {spread}"
