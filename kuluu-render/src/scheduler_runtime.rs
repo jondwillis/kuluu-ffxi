@@ -4810,6 +4810,7 @@ impl Plugin for SchedulerRuntimePlugin {
             // (kuluu/src/view_native/mod.rs), after resolve_camera.
             app.init_resource::<CutsceneCameraTasks>();
             app.init_resource::<ActionDatRoot>();
+            app.init_resource::<crate::graphics_settings::GraphicsSettings>();
             app.init_resource::<PendingKnockbacks>();
             app.init_resource::<crate::ffxi_actor_render::SelfKnockback>();
             app.add_systems(Startup, load_global_effect_dir);
