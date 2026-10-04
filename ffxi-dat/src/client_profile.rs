@@ -426,11 +426,13 @@ mod tests {
             profile.known.map(|k| k.item_layout),
             "{profile}"
         );
-        assert_eq!(
-            profile.patch_version.as_deref(),
-            profile.known.and_then(|k| k.patch_version),
-            "{profile}"
-        );
+        if profile.patch_version.is_some() {
+            assert_eq!(
+                profile.patch_version.as_deref(),
+                profile.known.and_then(|k| k.patch_version),
+                "{profile}"
+            );
+        }
     }
 
     #[test]

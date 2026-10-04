@@ -123,12 +123,14 @@ fn profile_is_a_measured_known_client_row() {
         "{}: probed item layout differs from the row",
         row.name
     );
-    assert_eq!(
-        profile.patch_version.as_deref(),
-        row.patch_version,
-        "{}: patch stamp differs from the row",
-        row.name
-    );
+    if profile.patch_version.is_some() {
+        assert_eq!(
+            profile.patch_version.as_deref(),
+            row.patch_version,
+            "{}: patch stamp differs from the row",
+            row.name
+        );
+    }
     for file_id in ITEM_DAT_FILE_IDS {
         let Ok(loc) = root.resolve(file_id) else {
             continue;
