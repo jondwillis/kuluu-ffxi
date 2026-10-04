@@ -1023,7 +1023,7 @@ fn s10_left_attack_without_bti0_falls_back_to_ati0() {
     };
     let mut app = build_app();
     spawn_actor(&mut app, RARAB_W, EntityKind::Mob, &rarab);
-    let (_, atk_child) = spawn_actor(&mut app, HUMEM_W, EntityKind::Pc, &humem);
+    let (atk_parent, atk_child) = spawn_actor(&mut app, HUMEM_W, EntityKind::Pc, &humem);
     step_n(&mut app, 10);
 
     push_battle2(&mut app, HUMEM_W, 1, Some(RARAB_W), Some((0, 1, 0, 0, 0)));
@@ -1034,6 +1034,14 @@ fn s10_left_attack_without_bti0_falls_back_to_ati0() {
     assert!(
         swing_at.is_some(),
         "HumeM ships no bti0 - LeftAttack falls back to ati0's at0? clip"
+    );
+    assert_eq!(
+        app.world()
+            .get::<kuluu_render::scheduler_runtime::PendingHitReaction>(atk_parent)
+            .expect("reaction remains pending before the swing impact")
+            .offhand_context,
+        Some(false),
+        "the resolved ati0 fallback must clear the offhand context despite the LeftAttack request"
     );
 }
 
