@@ -688,15 +688,11 @@ pub struct ParticleGeneratorDef {
     // Parsed but not applied until the child-generator runtime lands (the sec3 0x25/0x33
     // child updaters).
     pub child_generator: Option<[u8; 4]>,
+    pub immediate_generator: Option<[u8; 4]>,
 
     // sec2 0x6A — the third block of the child-generator family (see SEC2_OPCODE_CHILD_GENERATOR_3):
     // a per-particle child like `child_generator`.
     pub child_generator_3: Option<[u8; 4]>,
-
-    // sec2 0x3C OnceChildGeneratorSetup: [expectZero32, child generator DAT id] — the sibling
-    // emitted once at each particle's init (research/xim ParticleInitializers.kt
-    // OnceChildGeneratorSetup).
-    pub once_child_generator: Option<[u8; 4]>,
 
     // sec4 0x01 EmitChildHandler: [expectZero32, child generator DAT id] — the sibling emitted
     // once at each particle's expiry (research/xim ParticleExpirationHandlers.kt
@@ -1024,16 +1020,14 @@ const SEC2_OPCODE_WEIGHTED_MESH_WEIGHT_FIRST: u8 = 0x33;
 const SEC2_OPCODE_WEIGHTED_MESH_WEIGHT_LAST: u8 = 0x37;
 // research/xim ParticleGeneratorParser.kt sec2Handler — RandomVelocitySetup.
 const SEC2_OPCODE_RANDOM_VELOCITY: u8 = 0x31;
-// research/XIClient CYyGenerator.cpp ElemGenerate — 0x3C/0x44/0x53/0x6A share one case
-// (InitiateAllContainerSearch Generater): a sibling generator chunk bound by id. xim splits the
-// family into OnceChildGeneratorSetup (this opcode, emit once at init) and ChildGeneratorSetup.
-const SEC2_OPCODE_ONCE_CHILD_GENERATOR: u8 = 0x3C;
 const SEC2_OPCODE_INCREMENTAL_ROTATION: u8 = 0x3B;
 const SEC2_OPCODE_OSCILLATION_SETUP: u8 = 0x3D;
 const SEC2_OPCODE_OSCILLATION_ACCEL_X: u8 = 0x3E;
 const SEC2_OPCODE_OSCILLATION_ACCEL_Y: u8 = 0x3F;
 const SEC2_OPCODE_OSCILLATION_ACCEL_Z: u8 = 0x40;
 const SEC2_OPCODE_RELATIVE_VEL_VARIANCE: u8 = 0x41;
+// .agents/skills/retail-observe/references/2026-10-02-level-up-linked-sparkle.md native initializer dispatch.
+const SEC2_OPCODE_IMMEDIATE_GENERATOR: u8 = 0x3C;
 const SEC2_OPCODE_CHILD_GENERATOR: u8 = 0x44;
 const SEC2_OPCODE_PARENT_POSITION_COPY: u8 = 0x45;
 const SEC2_OPCODE_PARENT_VELOCITY: u8 = 0x46;
@@ -1360,8 +1354,8 @@ pub(crate) struct GeneratorSections {
     // Parsed but not applied until the child-generator runtime lands (the sec3 0x25/0x33
     // child updaters).
     pub(crate) child_generator: Option<[u8; 4]>,
+    pub(crate) immediate_generator: Option<[u8; 4]>,
     pub(crate) child_generator_3: Option<[u8; 4]>,
-    pub(crate) once_child_generator: Option<[u8; 4]>,
     pub(crate) child_emit_basic: bool,
     pub(crate) child_emit_full: bool,
     pub(crate) child_emit_billboard: bool,
@@ -1711,8 +1705,8 @@ impl ParticleGeneratorDef {
             parent_position_copy: s.parent_position_copy,
             parent_velocity: s.parent_velocity,
             child_generator: s.child_generator,
+            immediate_generator: s.immediate_generator,
             child_generator_3: s.child_generator_3,
-            once_child_generator: s.once_child_generator,
             emit_child_id: s.emit_child_id,
             child_emit_basic: s.child_emit_basic,
             child_emit_full: s.child_emit_full,
@@ -1902,9 +1896,9 @@ fn parse_sections(body: &[u8]) -> Result<Option<(GeneratorSections, Vec<DecodedB
     let mut parent_position_copy = false;
     let mut parent_velocity = None;
     let mut child_generator = None;
+    let mut immediate_generator = None;
     let mut child_generator_2 = None;
     let mut child_generator_3 = None;
-    let mut once_child_generator = None;
     let mut oscillation_accel_z = None;
     let mut oscillation_accel_x = None;
     let mut oscillation_accel_y = None;
@@ -2271,8 +2265,10 @@ fn parse_sections(body: &[u8]) -> Result<Option<(GeneratorSections, Vec<DecodedB
             SEC2_OPCODE_PARENT_VELOCITY if payload + 4 <= body.len() => {
                 parent_velocity = Some(f32_le(body, payload));
             }
-            // research/xim ParticleInitializers.kt ChildGeneratorSetup: the sibling
-            // generator emitted as a child of each particle.
+            // .agents/skills/retail-observe/references/2026-10-02-level-up-linked-sparkle.md native initializer dispatch.
+            SEC2_OPCODE_IMMEDIATE_GENERATOR if payload + 8 <= body.len() => {
+                immediate_generator = track_id(body, payload + 4);
+            }
             SEC2_OPCODE_CHILD_GENERATOR if payload + 8 <= body.len() => {
                 child_generator = track_id(body, payload + 4);
             }
@@ -2285,12 +2281,6 @@ fn parse_sections(body: &[u8]) -> Result<Option<(GeneratorSections, Vec<DecodedB
             // the shared child-generator family; xim maps it to ChildGeneratorSetup.
             SEC2_OPCODE_CHILD_GENERATOR_3 if payload + 8 <= body.len() => {
                 child_generator_3 = track_id(body, payload + 4);
-            }
-            // research/XIClient CYyGenerator.cpp ElemGenerate case 0x3C — the once-at-init
-            // member of the family (research/xim ParticleInitializers.kt
-            // OnceChildGeneratorSetup: expectZero32 then the child id).
-            SEC2_OPCODE_ONCE_CHILD_GENERATOR if payload + 8 <= body.len() => {
-                once_child_generator = track_id(body, payload + 4);
             }
             // research/xim ParticleInitializers.kt ParentRotateConfig: the marker that
             // makes a child particle copy its parent's rotation.
@@ -2844,8 +2834,8 @@ fn parse_sections(body: &[u8]) -> Result<Option<(GeneratorSections, Vec<DecodedB
             parent_position_copy,
             parent_velocity,
             child_generator,
+            immediate_generator,
             child_generator_3,
-            once_child_generator,
             child_emit_basic,
             child_emit_full,
             child_emit_billboard,
@@ -5045,21 +5035,24 @@ mod tests {
         assert_eq!(plain.child_generator_3, None);
     }
 
-    // 0x3C OnceChildGeneratorSetup: [expectZero32, child generator DAT id] (research/xim
-    // ParticleInitializers.kt OnceChildGeneratorSetup).
     #[test]
-    fn once_child_generator_reads_the_child_id() {
+    fn immediate_generator_reads_the_linked_id() {
         let setup = setup_with_link(LinkedDataKind::STATIC_MESH);
         let mut sec2 = setup.clone();
-        sec2.extend(op(0x3C, 3, &[0, 0, 0, 0, b'a', b'8', b'0', b'2']));
+        sec2.extend(op(
+            SEC2_OPCODE_IMMEDIATE_GENERATOR,
+            3,
+            &[0, 0, 0, 0, b'a', b'8', b'0', b'2'],
+        ));
         sec2.extend(op(OPCODE_END, 0, &[]));
         let body = build(&sec2, 1, 1);
         let def = ParticleGeneratorDef::parse(&body).unwrap().unwrap();
-        assert_eq!(def.once_child_generator, Some(*b"a802"));
+        assert_eq!(def.immediate_generator, Some(*b"a802"));
+        assert_eq!(def.child_generator, None);
         let plain = ParticleGeneratorDef::parse(&build(&setup, 1, 1))
             .unwrap()
             .unwrap();
-        assert_eq!(plain.once_child_generator, None);
+        assert_eq!(plain.immediate_generator, None);
     }
 
     // sec3 0x25/0x33/0x46 child-emission updaters: no-payload markers (research/xim

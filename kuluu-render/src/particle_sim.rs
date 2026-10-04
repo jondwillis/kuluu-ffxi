@@ -2062,7 +2062,6 @@ fn resolve_child_bindings(
         (def.child_generator, false, false),
         (def.child_generator_2, false, false),
         (def.child_generator_3, false, false),
-        (def.once_child_generator, true, false),
         (def.emit_child_id, false, true),
     ] {
         let Some(id) = id_opt else { continue };
@@ -3800,6 +3799,7 @@ mod tests {
             parent_position_copy: false,
             parent_velocity: None,
             child_generator: None,
+            immediate_generator: None,
             oscillation_accel_z: None,
             oscillation_accel_x: None,
             oscillation_accel_y: None,
@@ -3840,7 +3840,6 @@ mod tests {
             fixed_point_position_variance_2: None,
             child_generator_2: None,
             child_generator_3: None,
-            once_child_generator: None,
             emit_child_id: None,
             child_emit_basic: false,
             child_emit_full: false,
