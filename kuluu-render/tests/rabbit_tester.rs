@@ -614,10 +614,9 @@ fn s5b_mob_victim_normal_hit_runs_damg_and_flinches() {
     assert!(active_clip(app.world(), atk_child).is_some());
 }
 
-/// S6/S6b - crits: ldam + flinch, no sway at kb=0. S6: Hit with info=CriticalHit runs `ldam`
-/// on HumeM and its flinch stage starts dfm?; kb=0 adds no sway.
+// .agents/skills/retail-observe/references/2026-10-04-melee-damage-dispatch.md Routine actor roles
 #[test]
-fn s6_crit_runs_ldam_and_flinches_the_pc() {
+fn s6_ordinary_crit_flinches_the_pc_without_ldam() {
     let (Some(rarab), Some(humem)) = (load_rarab(), load_humem()) else {
         return;
     };
@@ -626,15 +625,26 @@ fn s6_crit_runs_ldam_and_flinches_the_pc() {
     let (vic_parent, vic_child) = spawn_actor(&mut app, HUMEM_W, EntityKind::Pc, &humem);
     step_n(&mut app, 10);
 
-    push_battle2(&mut app, RARAB_W, 1, Some(HUMEM_W), Some((0, 0, 2, 3, 0)));
+    push_battle2(
+        &mut app,
+        RARAB_W,
+        1,
+        Some(HUMEM_W),
+        Some((0, 0, ffxi_proto::melee::INFO_CRITICAL_HIT.into(), 3, 0)),
+    );
 
     let (impact_at, _) = watch(&mut app, 45, |_i, w| {
-        routines(w, vic_parent).contains(b"ldam")
+        let active = routines(w, vic_parent);
+        assert!(
+            !active.contains(b"ldam"),
+            "ordinary melee does not call ldam"
+        );
+        (active.contains(b"damg") || active.contains(b"damh"))
             && active_clip(w, vic_child).is_some_and(|c| c.starts_with("dfm"))
     });
     assert!(
         impact_at.is_some_and(|f| f >= IMPACT_FRAME_MIN),
-        "crit runs ldam + dfm? flinch at the impact frame"
+        "ordinary crit runs an authored damage routine and dfm? flinch at the impact frame"
     );
 
     let sway = routines(app.world(), vic_parent).contains(b"sway");
@@ -642,20 +652,30 @@ fn s6_crit_runs_ldam_and_flinches_the_pc() {
     assert!(active_clip(app.world(), atk_child).is_some());
 }
 
-/// S6b: same crit on a Rarab victim - ldam's flinch stage starts dfi? on the mob host. This is
-/// the "crits animations do not play" case from the field report.
+// .agents/skills/retail-observe/references/2026-10-04-melee-damage-dispatch.md Conditions selecting reactions
 #[test]
-fn s6b_crit_flinches_the_mob_with_dfi() {
+fn s6b_ordinary_crit_flinches_the_mob_without_ldam() {
     let Some(rarab) = load_rarab() else { return };
     let mut app = build_app();
     let (_, atk_child) = spawn_actor(&mut app, RARAB_W, EntityKind::Mob, &rarab);
     let (vic_parent, vic_child) = spawn_actor(&mut app, RARAB2_W, EntityKind::Mob, &rarab);
     step_n(&mut app, 10);
 
-    push_battle2(&mut app, RARAB_W, 1, Some(RARAB2_W), Some((0, 0, 2, 3, 0)));
+    push_battle2(
+        &mut app,
+        RARAB_W,
+        1,
+        Some(RARAB2_W),
+        Some((0, 0, ffxi_proto::melee::INFO_CRITICAL_HIT.into(), 3, 0)),
+    );
 
     let (impact_at, _) = watch(&mut app, 45, |_i, w| {
-        routines(w, vic_parent).contains(b"ldam")
+        let active = routines(w, vic_parent);
+        assert!(
+            !active.contains(b"ldam"),
+            "ordinary melee does not call ldam"
+        );
+        (active.contains(b"damg") || active.contains(b"damh"))
             && active_clip(w, vic_child).is_some_and(|c| c.starts_with("dfi"))
     });
     assert!(
