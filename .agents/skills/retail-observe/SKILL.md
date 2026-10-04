@@ -78,6 +78,14 @@ rule in the root `AGENTS.md`. Captures and binary dumps stay local.
 
 ## One command surface, any host
 
+Paths beginning `scripts/` in this skill and its references are relative to
+this skill's directory. From the repository root, run:
+
+```bash
+.agents/skills/retail-observe/scripts/observe.sh doctor
+.agents/skills/retail-observe/scripts/observe.sh targets
+```
+
 `scripts/observe.sh` (macOS, Linux) and `scripts/observe.ps1` (native Windows)
 implement the same verbs against different host mechanics. Run either with no
 arguments for the full table; the shape is:
