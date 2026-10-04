@@ -3466,6 +3466,7 @@ pub fn settle_dead_from_action(
 pub const HIT_FIELD_RESOLUTION: u32 = 0x28;
 pub const HIT_FIELD_ANIMATION: u32 = 0x33;
 pub const HIT_FIELD_INFO: u32 = 0x3B;
+pub const HIT_FIELD_ATTACKER_IS_PLAYER: u32 = 0x38;
 
 // Per-result fields a control-flow switch (ROM/0/0.DAT dam0/daml) can test, keyed by the selector
 // word its condition stages carry.
@@ -3473,14 +3474,16 @@ pub struct HitContext {
     pub resolution: u32,
     pub animation: u32,
     pub info: u32,
+    pub attacker_id: u32,
 }
 
 impl HitContext {
-    pub fn from_pending(pending: &PendingHitReaction) -> Self {
+    pub fn from_pending(pending: &PendingHitReaction, attacker_id: u32) -> Self {
         Self {
             resolution: pending.resolution.to_wire() as u32,
             animation: pending.animation as u32,
             info: pending.outcome.info as u32,
+            attacker_id,
         }
     }
 
@@ -3491,6 +3494,8 @@ impl HitContext {
             HIT_FIELD_RESOLUTION => self.resolution,
             HIT_FIELD_ANIMATION => self.animation,
             HIT_FIELD_INFO => self.info,
+            // .agents/skills/retail-observe/references/2026-10-04-melee-damage-dispatch.md Conditions selecting reactions
+            HIT_FIELD_ATTACKER_IS_PLAYER => u32::from(self.attacker_id.to_be_bytes()[0] == 0),
             _ => return None,
         })
     }
@@ -3937,7 +3942,7 @@ fn fire_hit_reaction(
 #[cfg(not(target_arch = "wasm32"))]
 pub fn dispatch_damage_callback_stages(
     mut events: MessageReader<SchedulerStageEvent>,
-    q_pending: Query<(&PendingHitReaction, &ActionTarget)>,
+    q_pending: Query<(&PendingHitReaction, &ActionTarget, &WorldEntity)>,
     q_children: Query<&Children>,
     q_render: Query<&crate::ffxi_actor_render::FfxiRenderActor>,
     q_dead_latch: Query<Option<&DeadFromAction>>,
@@ -3957,7 +3962,7 @@ pub fn dispatch_damage_callback_stages(
         {
             continue;
         }
-        let Ok((pending, target)) = q_pending.get(ev.actor) else {
+        let Ok((pending, target, world)) = q_pending.get(ev.actor) else {
             tracing::debug!(target: "combat", "COMBAT_CB actor={} sched={} no-pending",
                     ev.actor.index(),
                     fourcc(ev.scheduler));
@@ -3990,7 +3995,7 @@ pub fn dispatch_damage_callback_stages(
         fire_hit_reaction(
             ev.actor,
             victim,
-            &HitContext::from_pending(pending),
+            &HitContext::from_pending(pending, world.id),
             &q_children,
             &q_render,
             &mut q_active,
@@ -4583,6 +4588,7 @@ pub fn animation_test_tick(
                 resolution: 0,
                 animation: 0,
                 info: u32::from(case.info_bits()),
+                attacker_id: self_id,
             };
             let report = fire_hit_reaction(
                 self_entity,
@@ -5876,6 +5882,7 @@ mod tests {
             resolution,
             animation: 0,
             info: 0,
+            attacker_id: 0,
         };
 
         assert_eq!(
@@ -5952,7 +5959,8 @@ mod tests {
                 &HitContext {
                     resolution: 0,
                     animation: 0,
-                    info: 1
+                    info: 1,
+                    attacker_id: 0,
                 },
                 UnknownFieldPolicy::Random
             ),
@@ -5965,7 +5973,8 @@ mod tests {
                 &HitContext {
                     resolution: 0,
                     animation: 0,
-                    info: 0
+                    info: 0,
+                    attacker_id: 0,
                 },
                 UnknownFieldPolicy::Random
             ),
@@ -5978,7 +5987,8 @@ mod tests {
             &HitContext {
                 resolution: 1,
                 animation: 0,
-                info: 0
+                info: 0,
+                attacker_id: 0,
             },
             UnknownFieldPolicy::Random
         )
@@ -6011,7 +6021,8 @@ mod tests {
                 &HitContext {
                     resolution: 0,
                     animation: 0,
-                    info: 0
+                    info: 0,
+                    attacker_id: 0,
                 },
                 UnknownFieldPolicy::Random
             ),
@@ -6025,7 +6036,8 @@ mod tests {
                 &HitContext {
                     resolution: 0,
                     animation: 0,
-                    info: 1
+                    info: 1,
+                    attacker_id: 0,
                 },
                 UnknownFieldPolicy::Random
             ),
@@ -6039,7 +6051,8 @@ mod tests {
                 &HitContext {
                     resolution: 1,
                     animation: 0,
-                    info: 0
+                    info: 0,
+                    attacker_id: 0,
                 },
                 UnknownFieldPolicy::Random
             ),
@@ -6052,7 +6065,8 @@ mod tests {
                 &HitContext {
                     resolution: 2,
                     animation: 0,
-                    info: 0
+                    info: 0,
+                    attacker_id: 0,
                 },
                 UnknownFieldPolicy::Random
             ),
@@ -6065,7 +6079,8 @@ mod tests {
                 &HitContext {
                     resolution: 3,
                     animation: 0,
-                    info: 0
+                    info: 0,
+                    attacker_id: 0,
                 },
                 UnknownFieldPolicy::Random
             ),
@@ -6078,7 +6093,8 @@ mod tests {
                 &HitContext {
                     resolution: 4,
                     animation: 0,
-                    info: 0
+                    info: 0,
+                    attacker_id: 0,
                 },
                 UnknownFieldPolicy::Random
             ),
@@ -6092,28 +6108,34 @@ mod tests {
                 &HitContext {
                     resolution: 0,
                     animation: 5,
-                    info: 0
+                    info: 0,
+                    attacker_id: 0,
                 },
                 UnknownFieldPolicy::Random
             ),
             vec![*b"sb04", *b"damg"]
         );
-        // crtl's variant pick is a client register: with Match it must land on exactly one of
-        // the two spark routines.
-        let crit = evaluate_switch(
-            &lookup,
-            b"crtl",
-            &HitContext {
-                resolution: 0,
-                animation: 0,
-                info: 2,
-            },
-            UnknownFieldPolicy::Match,
-        );
-        assert!(
-            crit == vec![*b"hi14"] || crit == vec![*b"hi29"],
-            "crtl picked {crit:?}"
-        );
+        // .agents/skills/retail-observe/references/2026-10-04-melee-damage-dispatch.md Conditions selecting reactions
+        for (attacker_id, expected) in [
+            (0, *b"hi14"),
+            (ffxi_dat::npc_names::compose_id(0, 1), *b"hi29"),
+        ] {
+            assert_eq!(
+                evaluate_switch(
+                    &lookup,
+                    b"crtl",
+                    &HitContext {
+                        resolution: 0,
+                        animation: 0,
+                        info: ffxi_proto::melee::INFO_CRITICAL_HIT.into(),
+                        attacker_id,
+                    },
+                    UnknownFieldPolicy::Match,
+                ),
+                vec![expected],
+                "critical effect for attacker {attacker_id:#X}"
+            );
+        }
     }
 
     // effects_only_merged names the merged timeline after the first routine that resolved, which

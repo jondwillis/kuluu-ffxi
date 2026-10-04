@@ -128,7 +128,7 @@ fn env_camera_override() -> Option<(Vec3, Vec3)> {
     Some((Vec3::from_slice(&v[0..3]), Vec3::from_slice(&v[3..6])))
 }
 
-const WORM_ID: u32 = 1;
+const WORM_ID: u32 = 0x0100_0001;
 const HUME_ID: u32 = 2;
 
 /// The worm's `dead` fall-over hides the model after this long; respawn brings it back.
@@ -2724,6 +2724,13 @@ fn tear_down_test_scene(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn room_attacker_ids_cover_both_wire_classes() {
+        assert_eq!(WORM_ID, ffxi_dat::npc_names::compose_id(0, 1));
+        assert_ne!(WORM_ID.to_be_bytes()[0], 0);
+        assert_eq!(HUME_ID.to_be_bytes()[0], 0);
+    }
     use kuluu_render::particle_sim::TestAlphaOverride;
 
     #[test]
