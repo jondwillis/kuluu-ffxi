@@ -298,12 +298,24 @@ function run(argv) {
 }' "$client_pid"
 ```
 
-Select that process's main game window from the returned IDs and bounds.
+Wait for production scene readiness, then re-enumerate that PID's onscreen
+main game window. The initial winit window can change identity or geometry
+during startup. Require stable window ID and bounds across repeated snapshots
+before attaching the recorder. For the animation room, the production
+`[animationtest] drawn:` trace supplies scene readiness; two seconds of stable
+onscreen geometry recovered an attachment that otherwise returned exit 1
+without a movie. Readiness is a capture precondition, not visual verification.
 After checking `screencapture -h` for support, record a bounded window-only clip:
 
 ```bash
 screencapture -v -V 20 -l "$window_id" artifacts/verify/movement.mov
 ```
+
+Wait for the recorder's terminal result and verify that its nonempty artifact
+exists before inspecting frames. Retain a failed capture's exit status and
+output even when stderr is empty. Before any physical click, recheck the own
+window ID and bounds against the inspected capture; if they changed, refuse
+the stale coordinates and obtain a fresh capture and inspection.
 
 If it needs foreground capture, warn the user, raise/unminimize only that
 process, and restore the previous foreground PID afterward. Keep capture and
