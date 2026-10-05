@@ -2875,8 +2875,6 @@ mod tests {
     use super::test_support::*;
     use super::*;
 
-    /// The two non-visual LinkedDataType values (PointLight / Null): they reject the mesh.
-
     #[test]
     fn parses_particle_generator_header_and_setup() {
         let mut setup = setup_with_link(LinkedDataKind::STATIC_MESH);
