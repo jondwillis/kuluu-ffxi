@@ -21,13 +21,13 @@ use bevy::prelude::*;
 use bevy::render::render_resource::{
     binding_types::{sampler as smp_entry, texture_2d, uniform_buffer},
     BindGroupEntries, BindGroupLayoutDescriptor, BindGroupLayoutEntries, BlendComponent,
-    BlendFactor, BlendOperation, BlendState, Buffer, BufferBinding, BufferDescriptor, BufferUsages,
-    CachedRenderPipelineId, ColorTargetState, ColorWrites, Extent3d, FilterMode, FragmentState,
-    LoadOp, MultisampleState, Operations, PipelineCache, PrimitiveState, PrimitiveTopology,
-    RenderPassColorAttachment, RenderPassDescriptor, RenderPipelineDescriptor, Sampler,
-    SamplerBindingType, SamplerDescriptor, ShaderStages, ShaderType, StoreOp, Texture,
-    TextureDescriptor, TextureDimension, TextureFormat, TextureSampleType, TextureUsages,
-    TextureView, TextureViewDescriptor, VertexState,
+    BlendFactor, BlendOperation, BlendState, Buffer, BufferBinding, BufferDescriptor,
+    BufferInitDescriptor, BufferUsages, CachedRenderPipelineId, ColorTargetState, ColorWrites,
+    Extent3d, FilterMode, FragmentState, LoadOp, MultisampleState, Operations, PipelineCache,
+    PrimitiveState, PrimitiveTopology, RenderPassColorAttachment, RenderPassDescriptor,
+    RenderPipelineDescriptor, Sampler, SamplerBindingType, SamplerDescriptor, ShaderStages,
+    ShaderType, StoreOp, Texture, TextureDescriptor, TextureDimension, TextureFormat,
+    TextureSampleType, TextureUsages, TextureView, TextureViewDescriptor, VertexState,
 };
 use bevy::render::renderer::{RenderContext, RenderDevice, RenderQueue, ViewQuery};
 use bevy::render::view::{ExtractedView, ViewTarget};
@@ -132,6 +132,13 @@ const DISTORTION_SHADER_PATH: &str = "embedded://kuluu_render/distortion.wgsl";
 
 const DISTORTION_UNIFORM_SIZE: u64 = 16;
 
+/// The capture pass copies the current target unbiased and opaque.
+const CAPTURE_UNIFORM: DistortionUniform = DistortionUniform {
+    offset: Vec2::ZERO,
+    intensity: 1.0,
+    copy_mode: 1.0,
+};
+
 /// [offset.xy (8 B)][intensity f32 @ 8][copy_mode f32 @ 12] — the exact layout distortion.wgsl's
 /// PassUniform reads. Factored out so a unit test pins it.
 fn distortion_uniform_bytes(u: DistortionUniform) -> [u8; DISTORTION_UNIFORM_SIZE as usize] {
@@ -195,7 +202,11 @@ impl DistortionPassGpu {
             bgl_descriptor,
             sampler,
             ghost_uniform: make_uniform("distortion_ghost_uniform"),
-            capture_uniform: make_uniform("distortion_capture_uniform"),
+            capture_uniform: device.create_buffer_with_data(&BufferInitDescriptor {
+                label: Some("distortion_capture_uniform"),
+                contents: &distortion_uniform_bytes(CAPTURE_UNIFORM),
+                usage: BufferUsages::UNIFORM,
+            }),
             prev_texture: None,
             prev_view: None,
             prev_key: None,
@@ -383,15 +394,6 @@ fn draw_distortion_pass(
     }
 
     // Pass B: capture — copy the current target into prev for next frame's ghost.
-    queue.write_buffer(
-        &gpu.capture_uniform,
-        0,
-        &distortion_uniform_bytes(DistortionUniform {
-            offset: Vec2::ZERO,
-            intensity: 1.0,
-            copy_mode: 1.0,
-        }),
-    );
     let capture_bg = device.create_bind_group(
         "distortion_capture",
         &bgl,

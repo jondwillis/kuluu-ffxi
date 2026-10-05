@@ -50,6 +50,9 @@ const MOON_PHASE_OFFSET: u64 = (886u64 * 360 + 26) % MOON_CYCLE_VANA_DAYS;
 
 const LIGHT_DISTANCE: f32 = 200.0;
 
+// Margin under the `> 0.0` sun-up/moon-up tests so a SkyFxOverride-pinned body stays hidden.
+const SKY_FX_BELOW_HORIZON_ALTITUDE: f32 = -0.25;
+
 // research/XIClient Rendering/ShadowRenderer.cpp ShadowRenderer::Init — retail never lets a shadow rake:
 // whenever the light's elevation is shallower than ANGLE_PI_OVER_3 it rewrites the vertical
 // component to `-(sin(ANGLE_PI_OVER_3) * |xz|)` and renormalises, and :75-79 snaps a
@@ -654,7 +657,7 @@ pub fn sun_moon_system(
     // Box override: pin the sun under the horizon before any consumer reads it (the moon gets its
     // own clamp where its altitude is recomputed below).
     if sky_fx.as_ref().is_some_and(|ov| ov.sun) {
-        sky.sun_altitude = sky.sun_altitude.min(-0.25);
+        sky.sun_altitude = sky.sun_altitude.min(SKY_FX_BELOW_HORIZON_ALTITUDE);
     }
 
     let sun_up_now = sky.sun_altitude > 0.0;
@@ -769,7 +772,7 @@ pub fn sun_moon_system(
     let moon_altitude = moon_dir.y.asin();
     sky.moon_altitude = moon_altitude;
     if sky_fx.as_ref().is_some_and(|ov| ov.moon) {
-        sky.moon_altitude = sky.moon_altitude.min(-0.25);
+        sky.moon_altitude = sky.moon_altitude.min(SKY_FX_BELOW_HORIZON_ALTITUDE);
     }
     let moon_pos = moon_dir * LIGHT_DISTANCE;
     let (moon_color, moon_lux) = match dat {

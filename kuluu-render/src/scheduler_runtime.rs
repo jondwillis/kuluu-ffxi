@@ -82,8 +82,7 @@ pub const GLOBAL_EFFECT_DIR_FILE_ID: u32 = 0;
 
 // Install layouts whose VTABLE spreads the shared effect directories across ROM subdirectories
 // keep a second half of that tree at id 216 (ROM/1/0.DAT) — `syst/effe`, home of the campfire
-// flame sheets (`hi12`) zone generators link. Both halves load into one asset tier; an overlay
-// pack that shadows a file wholesale would otherwise delete every sheet only the base ships.
+// flame sheets (`hi12`) zone generators link. Both halves load into one asset tier.
 pub const GLOBAL_EFFECT_DIR_SECONDARY_FILE_ID: u32 = 216;
 
 // .agents/skills/retail-observe/references/2026-09-26-level-up-effect-dat.md
@@ -1141,45 +1140,81 @@ fn read_dat_bytes(root: Option<Arc<ffxi_dat::DatRoot>>, file_id: u32) -> Vec<u8>
     .unwrap_or_default()
 }
 
-/// One global-effect file's tiers in shadow order: the overlay-resolved copy first, then the
-/// base install's own copy when an overlay shadows it wholesale — a pack that replaces a whole
-/// DAT must not delete the sheets only the base ships. `primary` takes the schedulers (the
-/// secondary half is asset content for zone generators, not spell timelines).
+/// Reads one global-effect file into `assets`, earlier files winning name ties; `primary` also
+/// takes its schedulers (the secondary half is asset content for zone generators, not spell
+/// timelines). Returns the path read, or why the file could not be read.
 #[cfg(not(target_arch = "wasm32"))]
-fn read_global_effect_tiers(
-    root: &Option<Arc<ffxi_dat::DatRoot>>,
+fn read_global_effect_file(
+    root: &ffxi_dat::DatRoot,
     file_id: u32,
     primary: bool,
     schedulers: &mut Vec<Scheduler>,
     assets: &mut ActionAssets,
-) {
-    let Some(root) = root.as_ref() else { return };
-    let Ok(loc) = root.resolve(file_id) else {
-        return;
-    };
-    // This install layout has no overlay tiers: the base copy IS the only copy, and the
-    // dedupe below skips it as a duplicate of the primary path.
-    let overlay_path = loc.path_under(root);
-    for (path, overlay_copy) in [(overlay_path.clone(), true), (loc.path_under(root), false)] {
-        // The base copy is the same file when no overlay claims it.
-        if !overlay_copy && path == overlay_path {
-            continue;
-        }
-        let Ok(bytes) = std::fs::read(&path) else {
-            continue;
-        };
-        let (scheds, tier_assets, report, _cameras) = parse_action_bytes_reporting(&bytes);
-        if primary && overlay_copy {
-            schedulers.extend(scheds);
-        }
-        assets.extend_missing_from(&tier_assets);
-        report_effect_coverage(file_id, &report);
+) -> Result<std::path::PathBuf, String> {
+    let loc = root
+        .resolve(file_id)
+        .map_err(|e| format!("file id {file_id} does not resolve: {e}"))?;
+    let path = loc.path_under(root);
+    let bytes = std::fs::read(&path)
+        .map_err(|e| format!("file id {file_id} at {} is unreadable: {e}", path.display()))?;
+    let (scheds, file_assets, report, _cameras) = parse_action_bytes_reporting(&bytes);
+    if primary {
+        schedulers.extend(scheds);
     }
+    assets.extend_missing_from(&file_assets);
+    report_effect_coverage(file_id, &report);
+    Ok(path)
+}
+
+/// What the startup read of the global effect directory produced. `failure` says why the
+/// primary file supplied no schedulers; a `None` root is the host having no install, not a
+/// failure.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Default)]
+pub(crate) struct GlobalEffectDirLoad {
+    schedulers: Vec<Scheduler>,
+    assets: ActionAssets,
+    failure: Option<String>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+fn read_global_effect_dir(root: Option<&ffxi_dat::DatRoot>) -> GlobalEffectDirLoad {
+    let mut load = GlobalEffectDirLoad::default();
+    let Some(root) = root else { return load };
+    match read_global_effect_file(
+        root,
+        GLOBAL_EFFECT_DIR_FILE_ID,
+        true,
+        &mut load.schedulers,
+        &mut load.assets,
+    ) {
+        Err(reason) => load.failure = Some(reason),
+        Ok(path) if load.schedulers.is_empty() => {
+            load.failure = Some(format!("{} holds no schedulers", path.display()));
+        }
+        Ok(_) => {}
+    }
+    if let Err(reason) = read_global_effect_file(
+        root,
+        GLOBAL_EFFECT_DIR_SECONDARY_FILE_ID,
+        false,
+        &mut load.schedulers,
+        &mut load.assets,
+    ) {
+        tracing::debug!("secondary global effect file skipped: {reason}");
+    }
+    load
+}
+
+/// Present when the global effect directory failed to load: every spell effect falls back and
+/// melee hits play no `dam0`/`crtl` reaction.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Resource, Debug, Clone, PartialEq, Eq)]
+pub struct GlobalEffectDirFailure(pub String);
+
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Resource)]
-pub(crate) struct GlobalEffectDirTask(bevy::tasks::Task<(Vec<Scheduler>, ActionAssets)>);
+pub(crate) struct GlobalEffectDirTask(bevy::tasks::Task<GlobalEffectDirLoad>);
 
 // ROM/0/0.DAT is ~540 KB of ~1000 chunks including many Img decodes; parsing it on the render
 // thread reproduces the actor-load hitch, so it loads once off-thread and every lookup falls
@@ -1187,29 +1222,11 @@ pub(crate) struct GlobalEffectDirTask(bevy::tasks::Task<(Vec<Scheduler>, ActionA
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn load_global_effect_dir(root: Res<ActionDatRoot>, mut commands: Commands) {
     let root = root.0.clone();
-    let task = bevy::tasks::AsyncComputeTaskPool::get().spawn(async move {
-        // The global effect dir is spell effects, not cutscene camera routes
-        // (ffxi-dat/src/scheduler.rs StageKind::CameraRoute); the parse's camera value
-        // does not land here. Both halves of the shared tree load into one asset tier,
-        // earlier files winning name ties.
-        let mut schedulers: Vec<Scheduler> = Vec::new();
-        let mut assets = ActionAssets::default();
-        read_global_effect_tiers(
-            &root,
-            GLOBAL_EFFECT_DIR_FILE_ID,
-            true,
-            &mut schedulers,
-            &mut assets,
-        );
-        read_global_effect_tiers(
-            &root,
-            GLOBAL_EFFECT_DIR_SECONDARY_FILE_ID,
-            false,
-            &mut schedulers,
-            &mut assets,
-        );
-        (schedulers, assets)
-    });
+    // The global effect dir is spell effects, not cutscene camera routes
+    // (ffxi-dat/src/scheduler.rs StageKind::CameraRoute); the parse's camera value does not
+    // land here.
+    let task = bevy::tasks::AsyncComputeTaskPool::get()
+        .spawn(async move { read_global_effect_dir(root.as_deref()) });
     commands.insert_resource(GlobalEffectDirTask(task));
 }
 
@@ -1220,11 +1237,21 @@ pub(crate) fn poll_global_effect_dir(
 ) {
     use bevy::tasks::futures_lite::future;
     let Some(mut task) = task else { return };
-    let Some((schedulers, assets)) = future::block_on(future::poll_once(&mut task.0)) else {
+    let Some(load) = future::block_on(future::poll_once(&mut task.0)) else {
         return;
     };
     commands.remove_resource::<GlobalEffectDirTask>();
-    commands.insert_resource(GlobalEffectDir { schedulers, assets });
+    match load.failure {
+        Some(reason) => {
+            warn!("global effect directory unavailable, spell effects and melee hit reactions fall back: {reason}");
+            commands.insert_resource(GlobalEffectDirFailure(reason));
+        }
+        None => commands.remove_resource::<GlobalEffectDirFailure>(),
+    }
+    commands.insert_resource(GlobalEffectDir {
+        schedulers: load.schedulers,
+        assets: load.assets,
+    });
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -2494,6 +2521,7 @@ pub(crate) fn adopt_action_dat_root(
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn poll_action_main_dll(
     task: Option<ResMut<ActionMainDllTask>>,
+    root: Res<ActionDatRoot>,
     mut commands: Commands,
 ) {
     use bevy::tasks::futures_lite::future;
@@ -2501,8 +2529,38 @@ pub(crate) fn poll_action_main_dll(
     let Some(dll) = future::block_on(future::poll_once(&mut task.0)) else {
         return;
     };
+    if let Some(gap) = root
+        .0
+        .as_deref()
+        .and_then(|root| offhand_rule_gap(root.profile(), dll.is_some()))
+    {
+        warn!(target: "combat", "left-swing dam0 reaction (damh/damg) is picked at random: {gap}");
+    }
     commands.remove_resource::<ActionMainDllTask>();
     commands.insert_resource(ActionMainDll(dll));
+}
+
+// The install-level reasons resolved_offhand_context cannot classify a left swing
+// (.agents/skills/retail-observe/references/2026-10-04-dam0-offhand-context.md Offhand appearance
+// classification is build-scoped). A non-Equipped look is the ordinary mob/NPC path, not a gap.
+#[cfg(not(target_arch = "wasm32"))]
+fn offhand_rule_gap(
+    profile: &ffxi_dat::client_profile::ClientProfile,
+    dll_loaded: bool,
+) -> Option<String> {
+    let Some(client) = profile.known else {
+        return Some(format!(
+            "unrecognised client (FFXiMain.dll SHA-256 {})",
+            profile.ffximain_sha256.as_deref().unwrap_or("unavailable")
+        ));
+    };
+    if client.offhand_model_rule.is_none() {
+        return Some(format!(
+            "{} has no measured offhand model rule",
+            client.name
+        ));
+    }
+    (!dll_loaded).then(|| format!("{}: FFXiMain.dll did not load", client.name))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -3417,9 +3475,6 @@ pub fn dispatch_cast_routine_started(
 #[derive(Component, Debug, Clone, Copy)]
 pub struct PendingHitReaction {
     pub resolution: ffxi_proto::melee::ActionResolution,
-    /// The result's swing-animation bits (dam0's [`HIT_FIELD_ANIMATION`] selector); the server
-    /// sends none for a basic attack, in which case dam0's sb00..sb09 blocks simply do not match.
-    pub animation: u16,
     pub outcome: ffxi_proto::melee::ResultOutcome,
     pub offhand_context: Option<bool>,
     /// The scheduler whose DamageCallback stage is allowed to fire this reaction. Every
@@ -3465,7 +3520,11 @@ pub fn settle_dead_from_action(
 
 // ROM/0/0.DAT dam0/daml switch-test field selectors, as carried by CF_FIELD_SELECTOR_OP words.
 pub const HIT_FIELD_RESOLUTION: u32 = 0x28;
-pub const HIT_FIELD_ANIMATION: u32 = 0x33;
+// dam0's sb00..sb09 / cnt0 selector. No record establishes its client input, and the swing
+// animation is not it: a left swing reaches dam0 through HIT_FIELD_OFFHAND_CONTEXT. It reads as
+// HIT_FIELD_UNRESOLVED_VALUE so those blocks stay off instead of firing on the random fallback.
+pub const HIT_FIELD_DAM0_BLOCK_SELECTOR: u32 = 0x33;
+pub const HIT_FIELD_UNRESOLVED_VALUE: u32 = 0;
 // .agents/skills/retail-observe/references/2026-10-04-melee-recoil-and-result-fields.md Result information and recoil inputs
 pub const HIT_FIELD_INFO: u32 = 0x2B;
 // .agents/skills/retail-observe/references/2026-10-04-dam0-offhand-context.md Supported rule
@@ -3476,7 +3535,6 @@ pub const HIT_FIELD_ATTACKER_IS_PLAYER: u32 = 0x38;
 // word its condition stages carry.
 pub struct HitContext {
     pub resolution: u32,
-    pub animation: u32,
     pub info: u32,
     pub attacker_id: u32,
     pub offhand_context: Option<bool>,
@@ -3486,7 +3544,6 @@ impl HitContext {
     pub fn from_pending(pending: &PendingHitReaction, attacker_id: u32) -> Self {
         Self {
             resolution: pending.resolution.to_wire() as u32,
-            animation: pending.animation as u32,
             info: pending.outcome.info as u32,
             attacker_id,
             offhand_context: pending.offhand_context,
@@ -3496,7 +3553,7 @@ impl HitContext {
     pub fn field(&self, selector: u32) -> Option<u32> {
         Some(match selector {
             HIT_FIELD_RESOLUTION => self.resolution,
-            HIT_FIELD_ANIMATION => self.animation,
+            HIT_FIELD_DAM0_BLOCK_SELECTOR => HIT_FIELD_UNRESOLVED_VALUE,
             HIT_FIELD_INFO => self.info,
             HIT_FIELD_OFFHAND_CONTEXT => u32::from(self.offhand_context?),
             // .agents/skills/retail-observe/references/2026-10-04-melee-damage-dispatch.md Conditions selecting reactions
@@ -3507,6 +3564,7 @@ impl HitContext {
 }
 
 // Unresolved actor-state selectors use the caller's fallback, not packet result information.
+#[derive(Clone, Copy, Debug)]
 pub enum UnknownFieldPolicy {
     Random,
     Match,
@@ -3764,7 +3822,6 @@ pub fn dispatch_melee_action_started(
             lookup = lookup.with_dat(&g.schedulers);
         }
         let raw_result = result;
-        let swing_animation = raw_result.map(|(_, animation)| animation).unwrap_or(0);
         let result = raw_result.and_then(|(resolution, animation)| {
             Some((
                 ffxi_proto::melee::ActionResolution::from_wire(resolution)?,
@@ -3802,7 +3859,6 @@ pub fn dispatch_melee_action_started(
             Some(resolution) => {
                 entity.try_insert(PendingHitReaction {
                     resolution,
-                    animation: swing_animation,
                     outcome,
                     offhand_context,
                     armed_by,
@@ -3863,18 +3919,10 @@ fn latch_dead_from_action(
     }
 }
 
-// What fire_hit_reaction ran, for //animationtest's one-shot chat report.
-#[cfg(not(target_arch = "wasm32"))]
-struct HitReactionReport {
-    dam0: Vec<String>,
-    victim_stages: String,
-    crtl: Vec<String>,
-}
-
 // The frame the damage callback fires: run whatever ROM/0/0.DAT's `dam0` switch selects for this
 // result on the VICTIM with target = attacker (the victim's own damg shadows the global one and
 // links chit back onto the attacker, whose ef h sparks land on the victim again), plus crtl's
-// spark on the ATTACKER for a crit. //animationtest reuses it to loop a hit on the local player.
+// spark on the ATTACKER for a crit.
 #[cfg(not(target_arch = "wasm32"))]
 fn fire_hit_reaction(
     attacker: Entity,
@@ -3887,14 +3935,9 @@ fn fire_hit_reaction(
     global: Option<&GlobalEffectDir>,
     commands: &mut Commands,
     death_path_started: bool,
-) -> HitReactionReport {
-    let mut report = HitReactionReport {
-        dam0: Vec::new(),
-        victim_stages: String::new(),
-        crtl: Vec::new(),
-    };
+) {
     let Some(victim_routines) = actor_render_routines(victim, q_children, q_render) else {
-        return report;
+        return;
     };
     let mut lookup = RoutineLookup::new().with_actor(victim_routines);
     if let Some(g) = global {
@@ -3914,8 +3957,7 @@ fn fire_hit_reaction(
                     ctx.info,
                     fourcc(*routine),
                     lookup.get(routine).is_some());
-            report.dam0.push(fourcc(*routine));
-            if let Some(summary) = run_routine_on(
+            run_routine_on(
                 victim,
                 routine,
                 Some(attacker),
@@ -3925,12 +3967,7 @@ fn fire_hit_reaction(
                 pending_inserts,
                 global,
                 commands,
-            ) {
-                if !report.victim_stages.is_empty() {
-                    report.victim_stages.push_str("; ");
-                }
-                report.victim_stages.push_str(&summary);
-            }
+            );
         }
         if ctx.info & ffxi_proto::melee::INFO_DEFEATED as u32 != 0 {
             run_routine_on(
@@ -3953,7 +3990,6 @@ fn fire_hit_reaction(
         for routine in evaluate_switch(&lookup, b"crtl", ctx, UnknownFieldPolicy::Match) {
             tracing::debug!(target: "combat", "COMBAT_RX_CRIT attacker={} routine={}",
                     attacker.index(), fourcc(routine));
-            report.crtl.push(fourcc(routine));
             run_routine_on(
                 attacker,
                 &routine,
@@ -3967,7 +4003,6 @@ fn fire_hit_reaction(
             );
         }
     }
-    report
 }
 
 // research/xim EffectRoutineInstance.kt handleDamageCallbackRoutine — the 0x2B stage is where retail hands control
@@ -4148,8 +4183,8 @@ fn run_routine_on(
     Some(summary)
 }
 
-// The VFX-relevant stages of a resolved routine (animationtest's chat report and the standalone
-// animationtester box): particle generator names plus their sound/flinch companions.
+// The VFX-relevant stages of a resolved routine (the kuluu animation_test_scene box's trace):
+// particle generator names plus their sound/flinch companions.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn stage_summary(active: &ActiveScheduler) -> String {
     let mut parts = Vec::new();
@@ -4508,47 +4543,8 @@ pub fn dispatch_level_up(
     }
 }
 
-// //animationtest — the VFX verification harness. The weapon cases loop a real melee hit
-// reaction on the local player (self attacks self, routed through ROM/0/0.DAT's dam0 switch):
-// nhit = plain hit, chit = crit (+crtl spark), dhit = killing blow (damh, VFX only); `player
-// levelup` fires the level-up effect DAT once. The first fire of a case reports its path and
-// particles to chat; while a case is live, VfxTrace makes every step of the dispatch funnel log
-// at info! so a silent miss pins to its stage.
-#[derive(Resource, Default, Debug, Clone, Copy, PartialEq)]
-pub struct AnimationTestState {
-    /// The weapon hit case looping on the local player (nhit/chit/dhit), if any.
-    pub weapon_case: Option<WeaponHitCase>,
-    /// One-shot level-up effect pending dispatch (ROM/13/35.DAT `main`).
-    pub levelup_pending: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum WeaponHitCase {
-    Normal,
-    Critical,
-    Death,
-}
-
-impl WeaponHitCase {
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::Normal => "nhit",
-            Self::Critical => "chit",
-            Self::Death => "dhit",
-        }
-    }
-
-    pub const fn info_bits(self) -> u8 {
-        match self {
-            Self::Normal => 0,
-            Self::Critical => ffxi_proto::melee::INFO_CRITICAL_HIT,
-            Self::Death => ffxi_proto::melee::INFO_DEFEATED,
-        }
-    }
-}
-
-/// Armed while an animationtest case is live; the dispatch funnel logs at info! instead of
-/// staying silent on a miss. The tick disarms it once no case is pending.
+/// Armed while the kuluu animation_test_scene box runs; the dispatch funnel logs at info!
+/// instead of staying silent on a miss. The box inserts and clears it.
 #[derive(Resource, Default, Debug, Clone, Copy, PartialEq)]
 pub struct VfxTrace(pub bool);
 
@@ -4556,110 +4552,6 @@ pub struct VfxTrace(pub bool);
 // crate so the pre-server test box can show it in its on-screen panel next to stderr.
 #[derive(Message, Debug, Clone)]
 pub struct ParticleSpawnTrace(pub String);
-
-const ANIMATION_TEST_LOOP_INTERVAL_FRAMES: f32 = 60.0;
-// A one-shot's trace window: long enough to cover the load + dispatch + first burst.
-const ANIMATION_TEST_TRACE_SECS: f32 = 15.0;
-
-#[cfg(not(target_arch = "wasm32"))]
-pub fn animation_test_tick(
-    time: Res<Time>,
-    mut state: ResMut<crate::snapshot::SceneState>,
-    tracked: Res<crate::scene::TrackedEntities>,
-    mut test: ResMut<AnimationTestState>,
-    mut trace: ResMut<VfxTrace>,
-    mut cache: ResMut<ActionDatCache>,
-    q_children: Query<&Children>,
-    q_render: Query<&crate::ffxi_actor_render::FfxiRenderActor>,
-    mut q_active: Query<&mut ActiveSchedulers>,
-    global: Option<Res<GlobalEffectDir>>,
-    mut pending_inserts: Local<HashMap<Entity, Vec<ActiveScheduler>>>,
-    mut commands: Commands,
-    mut loop_elapsed: Local<f32>,
-    mut one_shot_secs: Local<Option<f32>>,
-    mut reported_case: Local<Option<WeaponHitCase>>,
-) {
-    let Some(self_id) = state.snapshot.self_char_id else {
-        return;
-    };
-
-    if test.levelup_pending {
-        *one_shot_secs = Some(0.0);
-        info!(
-            "animationtest: firing level-up effect (file {} `main`) on self 0x{self_id:08X}",
-            LEVEL_UP_EFFECT_DAT_ID,
-        );
-        cache.defer(
-            LEVEL_UP_EFFECT_DAT_ID,
-            PendingActionDispatch::Routine {
-                actor_id: self_id,
-                target_id: 0,
-                routine: *b"main",
-                duration: ffxi_event::SCHEDULER_DURATION_FROM_DAT,
-                cutscene_actor: None,
-            },
-        );
-        test.levelup_pending = false;
-    }
-
-    if let Some(case) = test.weapon_case {
-        *loop_elapsed += time.delta_secs() * ROUTINE_FPS;
-        if *loop_elapsed >= ANIMATION_TEST_LOOP_INTERVAL_FRAMES {
-            *loop_elapsed = 0.0;
-            let Some(self_entity) = tracked.by_id.get(&self_id).copied() else {
-                return;
-            };
-            info!(
-                "animationtest: firing {} on self 0x{self_id:08X}",
-                case.name()
-            );
-            let ctx = HitContext {
-                resolution: 0,
-                animation: 0,
-                info: u32::from(case.info_bits()),
-                attacker_id: self_id,
-                offhand_context: Some(false),
-            };
-            let report = fire_hit_reaction(
-                self_entity,
-                self_entity,
-                &ctx,
-                &q_children,
-                &q_render,
-                &mut q_active,
-                &mut pending_inserts,
-                global.as_deref(),
-                &mut commands,
-                false,
-            );
-            if reported_case.as_ref() != Some(&case) {
-                *reported_case = Some(case);
-                let chosen = if report.dam0.is_empty() {
-                    "(none)".to_string()
-                } else {
-                    report.dam0.join(", ")
-                };
-                let mut line = format!("//animationtest {} ON — dam0 → {}", case.name(), chosen);
-                if !report.victim_stages.is_empty() {
-                    line.push_str(&format!("; on self: {}", report.victim_stages));
-                }
-                for spark in &report.crtl {
-                    line.push_str(&format!("; crtl → {} (spark)", spark));
-                }
-                state.push_local_toast(crate::snapshot::system_chat_line(line));
-            }
-        }
-    }
-
-    // A one-shot's trace window closes on its own; a live loop keeps the trace armed.
-    if let Some(secs) = one_shot_secs.as_mut() {
-        *secs += time.delta_secs();
-        if *secs > ANIMATION_TEST_TRACE_SECS && test.weapon_case.is_none() {
-            *one_shot_secs = None;
-            trace.0 = false;
-        }
-    }
-}
 
 // NPC casters (lua sendEmote) and PCs whose emote DAT lacks the routine:
 // play the actor's own em0N clip when it has one; silent no-op
@@ -4714,7 +4606,6 @@ impl Plugin for SchedulerRuntimePlugin {
         {
             app.init_resource::<crate::particle_sim::ParticleSimulator>();
             app.init_resource::<ActionDatCache>();
-            app.init_resource::<AnimationTestState>();
             app.init_resource::<VfxTrace>();
             // The running cutscene camera route; the advance system
             // (advance_cutscene_camera_task) registers in kuluu's view native module
@@ -4745,7 +4636,6 @@ impl Plugin for SchedulerRuntimePlugin {
                     dispatch_melee_action_started,
                     dispatch_entity_emoted,
                     dispatch_level_up,
-                    animation_test_tick,
                     dispatch_cutscene_motion,
                     poll_action_dat_tasks,
                 )
@@ -5817,7 +5707,6 @@ mod tests {
     fn pending_hit_reaction_is_bound_to_the_scheduler_that_armed_it() {
         let pending = PendingHitReaction {
             resolution: ffxi_proto::melee::ActionResolution::Hit,
-            animation: 0,
             outcome: ffxi_proto::melee::ResultOutcome::default(),
             offhand_context: Some(false),
             armed_by: *b"atk0",
@@ -5911,7 +5800,6 @@ mod tests {
         let lookup = RoutineLookup::new().with_dat(&scheds);
         let ctx = |resolution: u32| HitContext {
             resolution,
-            animation: 0,
             info: 0,
             attacker_id: 0,
             offhand_context: Some(false),
@@ -5988,7 +5876,6 @@ mod tests {
                 b"dam0",
                 &HitContext {
                     resolution: 0,
-                    animation: 0,
                     info: 1,
                     attacker_id: 0,
                     offhand_context: Some(false),
@@ -6003,7 +5890,6 @@ mod tests {
                 b"dam0",
                 &HitContext {
                     resolution: 0,
-                    animation: 0,
                     info: 0,
                     attacker_id: 0,
                     offhand_context: Some(false),
@@ -6018,7 +5904,6 @@ mod tests {
             b"dam0",
             &HitContext {
                 resolution: 1,
-                animation: 0,
                 info: 0,
                 attacker_id: 0,
                 offhand_context: Some(false),
@@ -6028,19 +5913,357 @@ mod tests {
         .is_empty());
     }
 
+    const EQUALITY_TERMINATOR: u32 = 0x0C;
+
+    // One sibling case of a switch: [field, value, operator] BranchTrue, body open, call,
+    // close, endmark.
+    fn switch_case(field: u32, value: u32, operator: u32, call: [u8; 4]) -> Vec<TimedStage> {
+        vec![
+            cf_stage(
+                0,
+                CONTROL_FLOW_CONDITION,
+                Some(CF_FIELD_SELECTOR_OP),
+                Some(Some(field)),
+            ),
+            cf_stage(
+                0,
+                CONTROL_FLOW_CONDITION,
+                Some(CF_COMPARE_VALUE_OP),
+                Some(Some(value)),
+            ),
+            cf_stage(0, CONTROL_FLOW_CONDITION, Some(operator), None),
+            cf_stage(0, CONTROL_FLOW_BRANCH_TRUE, None, None),
+            cf_stage(0, CONTROL_FLOW_BLOCK_OPEN, None, None),
+            stage(0, StageKind::SubRoutine, 0x03, call),
+            cf_stage(0, CONTROL_FLOW_BLOCK_CLOSE, None, None),
+            cf_stage(0, CONTROL_FLOW_BRANCH_FALSE, None, None),
+        ]
+    }
+
+    fn wrapped_switch(name: [u8; 4], cases: Vec<Vec<TimedStage>>) -> Scheduler {
+        let mut stages = vec![cf_stage(0, CONTROL_FLOW_BLOCK_OPEN, None, None)];
+        stages.extend(cases.into_iter().flatten());
+        stages.push(cf_stage(0, CONTROL_FLOW_BLOCK_CLOSE, None, None));
+        make_scheduler(name, stages)
+    }
+
+    fn info_ctx(info: u32) -> HitContext {
+        HitContext {
+            resolution: 0,
+            info,
+            attacker_id: 0,
+            offhand_context: Some(false),
+        }
+    }
+
+    // .agents/skills/retail-observe/references/2026-10-04-melee-damage-dispatch.md Conditions selecting reactions
+    // crtl's gate is a mask test on result information; the equality case after it pins that the
+    // mask operator does not leak into the next test.
+    #[test]
+    fn evaluate_switch_mask_test_matches_any_set_bit() {
+        const MASKED: [u8; 4] = *b"msk0";
+        const EQUAL: [u8; 4] = *b"equ0";
+        let critical = u32::from(ffxi_proto::melee::INFO_CRITICAL_HIT);
+        let defeated = u32::from(ffxi_proto::melee::INFO_DEFEATED);
+        let scheds = vec![wrapped_switch(
+            *b"crtl",
+            vec![
+                switch_case(HIT_FIELD_INFO, critical, CF_MASK_TEST_OP, MASKED),
+                switch_case(HIT_FIELD_INFO, critical, EQUALITY_TERMINATOR, EQUAL),
+            ],
+        )];
+        let lookup = RoutineLookup::new().with_dat(&scheds);
+        for (info, expected) in [
+            (0, vec![]),
+            (defeated, vec![]),
+            (critical, vec![MASKED, EQUAL]),
+            (critical | defeated, vec![MASKED]),
+        ] {
+            for policy in [UnknownFieldPolicy::Match, UnknownFieldPolicy::Random] {
+                assert_eq!(
+                    evaluate_switch(&lookup, b"crtl", &info_ctx(info), policy),
+                    expected,
+                    "info={info:#X}"
+                );
+            }
+        }
+    }
+
+    // dam0's successful arm: selector 0x3B equal to one picks damh, else damg.
+    // .agents/skills/retail-observe/references/2026-10-04-melee-damage-dispatch.md Provenance
+    #[test]
+    fn evaluate_switch_offhand_selector_routes_damh_vs_damg() {
+        let mut stages = vec![
+            cf_stage(
+                0,
+                CONTROL_FLOW_CONDITION,
+                Some(CF_FIELD_SELECTOR_OP),
+                Some(Some(HIT_FIELD_OFFHAND_CONTEXT)),
+            ),
+            cf_stage(
+                0,
+                CONTROL_FLOW_CONDITION,
+                Some(CF_COMPARE_VALUE_OP),
+                Some(Some(u32::from(true))),
+            ),
+            cf_stage(0, CONTROL_FLOW_CONDITION, Some(EQUALITY_TERMINATOR), None),
+            cf_stage(0, CONTROL_FLOW_BRANCH_TRUE, None, None),
+            cf_stage(0, CONTROL_FLOW_BLOCK_OPEN, None, None),
+            stage(0, StageKind::SubRoutineOnTarget, 0x09, *b"damh"),
+            cf_stage(0, CONTROL_FLOW_BLOCK_CLOSE, None, None),
+            cf_stage(0, CONTROL_FLOW_BRANCH_FALSE, None, None),
+            cf_stage(0, CONTROL_FLOW_BLOCK_OPEN, None, None),
+            stage(0, StageKind::SubRoutineOnTarget, 0x09, *b"damg"),
+            cf_stage(0, CONTROL_FLOW_BLOCK_CLOSE, None, None),
+        ];
+        stages.insert(0, cf_stage(0, CONTROL_FLOW_BLOCK_OPEN, None, None));
+        stages.push(cf_stage(0, CONTROL_FLOW_BLOCK_CLOSE, None, None));
+        let scheds = vec![make_scheduler(*b"dam0", stages)];
+        let lookup = RoutineLookup::new().with_dat(&scheds);
+        let ctx = |offhand_context| HitContext {
+            resolution: 0,
+            info: 0,
+            attacker_id: 0,
+            offhand_context,
+        };
+        for policy in [UnknownFieldPolicy::Match, UnknownFieldPolicy::Random] {
+            assert_eq!(
+                evaluate_switch(&lookup, b"dam0", &ctx(Some(true)), policy),
+                vec![*b"damh"]
+            );
+            assert_eq!(
+                evaluate_switch(&lookup, b"dam0", &ctx(Some(false)), policy),
+                vec![*b"damg"]
+            );
+        }
+        assert_eq!(
+            evaluate_switch(&lookup, b"dam0", &ctx(None), UnknownFieldPolicy::Match),
+            vec![*b"damh"],
+            "an unclassified offhand context takes the caller's Match fallback"
+        );
+        let random = evaluate_switch(&lookup, b"dam0", &ctx(None), UnknownFieldPolicy::Random);
+        assert!(
+            random == vec![*b"damh"] || random == vec![*b"damg"],
+            "the Random fallback still picks exactly one arm: {random:?}"
+        );
+    }
+
+    // .agents/skills/retail-observe/references/2026-10-04-melee-damage-dispatch.md Conditions selecting reactions
+    #[test]
+    fn attacker_class_selector_reads_the_server_id_high_byte() {
+        let ctx = |attacker_id| HitContext {
+            resolution: 0,
+            info: 0,
+            attacker_id,
+            offhand_context: Some(false),
+        };
+        assert_eq!(ctx(0).field(HIT_FIELD_ATTACKER_IS_PLAYER), Some(1));
+        assert_eq!(
+            ctx(ffxi_dat::npc_names::compose_id(0, 1)).field(HIT_FIELD_ATTACKER_IS_PLAYER),
+            Some(0)
+        );
+    }
+
+    // No swing - a left swing or kick included - may open dam0's sbNN blocks, under either
+    // fallback: the selector has no established input.
+    #[test]
+    fn dam0_block_selector_never_opens_an_sb_block() {
+        let blocks: Vec<([u8; 4], u32)> = (1..=3)
+            .map(|value| ([b's', b'b', b'0', b'0' + value as u8 - 1], value))
+            .collect();
+        let scheds = vec![wrapped_switch(
+            *b"dam0",
+            blocks
+                .iter()
+                .map(|&(name, value)| {
+                    switch_case(
+                        HIT_FIELD_DAM0_BLOCK_SELECTOR,
+                        value,
+                        EQUALITY_TERMINATOR,
+                        name,
+                    )
+                })
+                .collect(),
+        )];
+        let lookup = RoutineLookup::new().with_dat(&scheds);
+        for offhand_context in [Some(true), Some(false), None] {
+            let ctx = HitContext {
+                resolution: 0,
+                info: 0,
+                attacker_id: 0,
+                offhand_context,
+            };
+            assert_eq!(
+                ctx.field(HIT_FIELD_DAM0_BLOCK_SELECTOR),
+                Some(HIT_FIELD_UNRESOLVED_VALUE)
+            );
+            assert!(evaluate_switch(&lookup, b"dam0", &ctx, UnknownFieldPolicy::Match).is_empty());
+            for _ in 0..64 {
+                assert!(
+                    evaluate_switch(&lookup, b"dam0", &ctx, UnknownFieldPolicy::Random).is_empty()
+                );
+            }
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn offhand_rule_gap_names_only_install_level_causes() {
+        use ffxi_dat::client_profile::{ClientProfile, KNOWN_CLIENTS};
+        let unknown = offhand_rule_gap(&ClientProfile::default(), true).expect("unknown client");
+        assert!(unknown.contains("unrecognised"), "{unknown}");
+        let profile = |row| ClientProfile {
+            known: Some(row),
+            ..ClientProfile::default()
+        };
+        let ruleless = KNOWN_CLIENTS
+            .iter()
+            .find(|c| c.offhand_model_rule.is_none())
+            .expect("a row without a measured offhand rule");
+        let gap = offhand_rule_gap(&profile(ruleless), true).expect("rule-less row");
+        assert!(gap.contains(ruleless.name), "{gap}");
+        let ruled = KNOWN_CLIENTS
+            .iter()
+            .find(|c| c.offhand_model_rule.is_some())
+            .expect("a row with a measured offhand rule");
+        assert_eq!(offhand_rule_gap(&profile(ruled), true), None);
+        let gap = offhand_rule_gap(&profile(ruled), false).expect("missing dll");
+        assert!(gap.contains(ruled.name), "{gap}");
+    }
+
+    // A minimal install: base VTABLE/FTABLE claiming file id 0 for ROM/0/0.DAT (ffxi-dat
+    // vtable.rs / ftable.rs layouts), removed on drop.
+    #[cfg(not(target_arch = "wasm32"))]
+    struct SynthInstall {
+        dir: std::path::PathBuf,
+        root: Arc<ffxi_dat::DatRoot>,
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    impl SynthInstall {
+        const FTABLE: &'static str = "FTABLE.DAT";
+
+        fn new(tag: &str, claims_global_dir: bool, global_dir: Option<&[u8]>) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "kuluu-render-{tag}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let base_rom = u8::from(claims_global_dir);
+            std::fs::write(
+                dir.join(ffxi_dat::install_detect::VTABLE_MARKER),
+                [base_rom],
+            )
+            .unwrap();
+            std::fs::write(dir.join(Self::FTABLE), 0u16.to_le_bytes()).unwrap();
+            if let Some(body) = global_dir {
+                let loc_dir = dir.join("ROM").join("0");
+                std::fs::create_dir_all(&loc_dir).unwrap();
+                std::fs::write(loc_dir.join("0.DAT"), body).unwrap();
+            }
+            let root = Arc::new(ffxi_dat::DatRoot::open(&dir).expect("synthetic install opens"));
+            Self { dir, root }
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    impl Drop for SynthInstall {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn global_effect_dir_reports_every_primary_failure() {
+        assert_eq!(read_global_effect_dir(None).failure, None);
+        for (tag, claims, body, reason) in [
+            ("unresolved", false, None, "does not resolve"),
+            ("unreadable", true, None, "is unreadable"),
+            ("empty", true, Some(&[][..]), "holds no schedulers"),
+        ] {
+            let install = SynthInstall::new(tag, claims, body);
+            let load = read_global_effect_dir(Some(install.root.as_ref()));
+            assert!(load.schedulers.is_empty(), "{tag}");
+            let failure = load
+                .failure
+                .unwrap_or_else(|| panic!("{tag} must be reported"));
+            assert!(failure.contains(reason), "{tag}: {failure}");
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn unreadable_global_effect_dir_leaves_a_failure_resource() {
+        const POLL_UPDATES: usize = 1000;
+        bevy::tasks::AsyncComputeTaskPool::get_or_init(Default::default);
+        let install = SynthInstall::new("failure-resource", true, None);
+        let mut app = App::new();
+        app.insert_resource(ActionDatRoot(Some(install.root.clone())))
+            .add_systems(Startup, load_global_effect_dir)
+            .add_systems(Update, poll_global_effect_dir);
+        for _ in 0..POLL_UPDATES {
+            app.update();
+            if app.world().contains_resource::<GlobalEffectDir>() {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(app.world().contains_resource::<GlobalEffectDir>());
+        let failure = app
+            .world()
+            .get_resource::<GlobalEffectDirFailure>()
+            .expect("the failed load stays observable");
+        assert!(failure.0.contains("is unreadable"), "{}", failure.0);
+    }
+
+    // .agents/skills/retail-observe/references/2026-10-04-dam0-offhand-context.md Offhand appearance classification is build-scoped
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn offhand_context_is_unclassified_on_an_unmeasured_install() {
+        let install = SynthInstall::new("ruleless", true, None);
+        assert!(install.root.profile().known.is_none());
+        let look = kuluu_snapshot::EntityLook::Equipped {
+            face: 0,
+            race: *crate::look_resolver::PC_LOOK_RACES.start(),
+            head: 0,
+            body: 0,
+            hands: 0,
+            legs: 0,
+            feet: 0,
+            main: 0,
+            sub: 0,
+            ranged: 0,
+        };
+        assert_eq!(
+            resolved_offhand_context(
+                Some(*b"bti0"),
+                Some(&look),
+                Some(install.root.as_ref()),
+                None
+            ),
+            None
+        );
+        assert_eq!(
+            resolved_offhand_context(
+                Some(*b"ati0"),
+                Some(&look),
+                Some(install.root.as_ref()),
+                None
+            ),
+            Some(false)
+        );
+    }
+
     #[test]
     fn real_dat_dam0_selects_reaction_from_offhand_context() {
         let Some(root) = ffxi_dat::archive::open_test_install() else {
             return;
         };
-        let loc = match root.resolve(GLOBAL_EFFECT_DIR_FILE_ID) {
-            Ok(l) => l,
-            Err(_) => return,
-        };
-        let bytes = match std::fs::read(loc.path_under(&root)) {
-            Ok(b) => b,
-            Err(_) => return,
-        };
+        let loc = root.resolve(GLOBAL_EFFECT_DIR_FILE_ID).expect("global DAT");
+        let bytes = std::fs::read(loc.path_under(&root)).expect("global DAT bytes");
         let (schedulers, _assets, _report, _cameras) = parse_action_bytes_reporting(&bytes);
         let lookup = RoutineLookup::new().with_dat(&schedulers);
 
@@ -6051,7 +6274,6 @@ mod tests {
             for info in [0, critical, defeated, critical | defeated] {
                 let ctx = HitContext {
                     resolution: 0,
-                    animation: 0,
                     info,
                     attacker_id: 0,
                     offhand_context: Some(offhand),
@@ -6072,7 +6294,6 @@ mod tests {
                 b"dam0",
                 &HitContext {
                     resolution: 1,
-                    animation: 0,
                     info: 0,
                     attacker_id: 0,
                     offhand_context: Some(false),
@@ -6087,7 +6308,6 @@ mod tests {
                 b"dam0",
                 &HitContext {
                     resolution: 2,
-                    animation: 0,
                     info: 0,
                     attacker_id: 0,
                     offhand_context: Some(false),
@@ -6102,7 +6322,6 @@ mod tests {
                 b"dam0",
                 &HitContext {
                     resolution: 3,
-                    animation: 0,
                     info: 0,
                     attacker_id: 0,
                     offhand_context: Some(false),
@@ -6117,7 +6336,6 @@ mod tests {
                 b"dam0",
                 &HitContext {
                     resolution: 4,
-                    animation: 0,
                     info: 0,
                     attacker_id: 0,
                     offhand_context: Some(false),
@@ -6126,19 +6344,6 @@ mod tests {
             ),
             vec![*b"gur1"]
         );
-        let selected = evaluate_switch(
-            &lookup,
-            b"dam0",
-            &HitContext {
-                resolution: 0,
-                animation: 5,
-                info: 0,
-                attacker_id: 0,
-                offhand_context: Some(false),
-            },
-            UnknownFieldPolicy::Random,
-        );
-        assert_eq!(selected, vec![*b"sb04", *b"damg"]);
         // .agents/skills/retail-observe/references/2026-10-04-melee-damage-dispatch.md Conditions selecting reactions
         for (attacker_id, expected) in [
             (0, *b"hi14"),
@@ -6150,7 +6355,6 @@ mod tests {
                     b"crtl",
                     &HitContext {
                         resolution: 0,
-                        animation: 0,
                         info: ffxi_proto::melee::INFO_CRITICAL_HIT.into(),
                         attacker_id,
                         offhand_context: Some(false),
@@ -6171,6 +6375,10 @@ mod tests {
         let Some(root) = ffxi_dat::archive::open_test_install() else {
             return;
         };
+        if let Some(gap) = offhand_rule_gap(root.profile(), true) {
+            eprintln!("SKIP (offhand rule): {}: {gap}", root.root().display());
+            return;
+        }
         let dll = main_dll_for_root(root.root()).expect("installed equipment tables");
         let race = *crate::look_resolver::PC_LOOK_RACES.start();
         let look = |sub| kuluu_snapshot::EntityLook::Equipped {
@@ -6248,7 +6456,6 @@ mod tests {
                         b"crtl",
                         &HitContext {
                             resolution: 0,
-                            animation: 0,
                             info,
                             attacker_id,
                             offhand_context: Some(false),

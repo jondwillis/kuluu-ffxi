@@ -1,7 +1,7 @@
-//! Gamepad vibration for particle generators that carry the sec2 0x82 / sec3 0x5F pair —
-//! retail's controller feedback on hits (research/xim ParticleInitializers.kt
-//! CameraShakeSetup, ParticleUpdaters.kt CameraShakeUpdater; xim labels the pair "camera
-//! shake", but retail shakes the pad, not the screen). The envelope track is PS2-rescaled
+//! Gamepad vibration for particle generators that carry the sec2 0x82 / sec3 0x5F pair
+//! (research/xim ParticleInitializers.kt CameraShakeSetup, ParticleUpdaters.kt
+//! CameraShakeUpdater). xim labels the pair "camera shake"; no retail observation record yet
+//! settles whether retail drives the pad or the screen from it. The envelope track is PS2-rescaled
 //! at spawn (ffxi-dat/src/particle_gen.rs ps2_float_rescale); intensity per frame is
 //! `envelope(progress) × falloff(camera distance)` sent through bevy's rumble pipeline —
 //! bevy_gilrs' PostUpdate handler turns the requests into gilrs force feedback.
@@ -14,6 +14,7 @@ use bevy::prelude::*;
 
 use crate::camera::OperatorCamera;
 use crate::graphics_settings::GraphicsSettings;
+use crate::scheduler_runtime::ROUTINE_FPS;
 use ffxi_dat::particle_gen::KeyFrameTrack;
 
 /// Full inside `near`, linear to zero at `far` — the camera-distance law both the sec3 0x5F
@@ -58,7 +59,7 @@ impl RumbleSource {
             near,
             far,
             started_at: Instant::now(),
-            duration_secs: (life_frames / 60.0).max(1.0 / 60.0),
+            duration_secs: (life_frames / ROUTINE_FPS).max(1.0 / ROUTINE_FPS),
             was_active: false,
         }
     }

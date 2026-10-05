@@ -427,6 +427,15 @@ fn routines(world: &bevy::prelude::World, parent: Entity) -> Vec<[u8; 4]> {
         .unwrap_or_default()
 }
 
+// .agents/skills/retail-observe/references/2026-10-04-melee-damage-dispatch.md Conditions selecting reactions
+const PC_ATTACKER_CRIT_SPARK: [u8; 4] = *b"hi14";
+const MOB_ATTACKER_CRIT_SPARK: [u8; 4] = *b"hi29";
+
+fn runs_crit_spark(world: &bevy::prelude::World, parent: Entity) -> bool {
+    let active = routines(world, parent);
+    active.contains(&PC_ATTACKER_CRIT_SPARK) || active.contains(&MOB_ATTACKER_CRIT_SPARK)
+}
+
 /// Push a BATTLE2 event and return the update index it was pushed after.
 fn push_battle2(
     app: &mut App,
@@ -575,18 +584,26 @@ fn s5_swing_impact_runs_authored_reaction_and_flinches_the_pc() {
         return;
     };
     let mut app = build_app();
-    let (_, atk_child) = spawn_actor(&mut app, RARAB_W, EntityKind::Mob, &rarab);
+    let (atk_parent, atk_child) = spawn_actor(&mut app, RARAB_W, EntityKind::Mob, &rarab);
     let (vic_parent, vic_child) = spawn_actor(&mut app, HUMEM_W, EntityKind::Pc, &humem);
     step_n(&mut app, 10);
 
     push_battle2(&mut app, RARAB_W, 1, Some(HUMEM_W), Some((0, 0, 0, 0, 0)));
 
+    let no_spark = |w: &bevy::prelude::World| {
+        assert!(
+            !runs_crit_spark(w, atk_parent) && !runs_crit_spark(w, vic_parent),
+            "a non-critical hit runs no crtl spark"
+        );
+    };
     let (swing_at, _) = watch(&mut app, 5, |i, w| {
+        no_spark(w);
         i >= 1 && active_clip(w, atk_child).is_some_and(|c| c.starts_with("at0"))
     });
     assert!(swing_at.is_some(), "attacker plays the at0? swing clip");
 
     let (impact_at, _) = watch(&mut app, 45, |_i, w| {
+        no_spark(w);
         routines(w, vic_parent).contains(b"damg")
             && active_clip(w, vic_child).is_some_and(|c| c.starts_with("dfm"))
     });
@@ -626,7 +643,7 @@ fn s6_ordinary_crit_flinches_the_pc_without_ldam() {
         return;
     };
     let mut app = build_app();
-    let (_, atk_child) = spawn_actor(&mut app, RARAB_W, EntityKind::Mob, &rarab);
+    let (atk_parent, atk_child) = spawn_actor(&mut app, RARAB_W, EntityKind::Mob, &rarab);
     let (vic_parent, vic_child) = spawn_actor(&mut app, HUMEM_W, EntityKind::Pc, &humem);
     step_n(&mut app, 10);
 
@@ -638,12 +655,24 @@ fn s6_ordinary_crit_flinches_the_pc_without_ldam() {
         Some((0, 0, ffxi_proto::melee::INFO_CRITICAL_HIT.into(), 3, 0)),
     );
 
-    let (impact_at, _) = watch(&mut app, 45, |_i, w| {
+    let mut spark_at = None;
+    let (impact_at, _) = watch(&mut app, 45, |i, w| {
         let active = routines(w, vic_parent);
         assert!(
             !active.contains(b"ldam"),
             "ordinary melee does not call ldam"
         );
+        assert!(
+            !runs_crit_spark(w, vic_parent),
+            "crtl runs on the attacker, not the victim"
+        );
+        assert!(
+            !routines(w, atk_parent).contains(&PC_ATTACKER_CRIT_SPARK),
+            "a mob attacker never selects the player spark"
+        );
+        if spark_at.is_none() && routines(w, atk_parent).contains(&MOB_ATTACKER_CRIT_SPARK) {
+            spark_at = Some(i);
+        }
         (active.contains(b"damg") || active.contains(b"damh"))
             && active_clip(w, vic_child).is_some_and(|c| c.starts_with("dfm"))
     });
@@ -651,10 +680,50 @@ fn s6_ordinary_crit_flinches_the_pc_without_ldam() {
         impact_at.is_some_and(|f| f >= IMPACT_FRAME_MIN),
         "ordinary crit runs an authored damage routine and dfm? flinch at the impact frame"
     );
+    assert!(
+        spark_at.is_some_and(|f| f >= IMPACT_FRAME_MIN),
+        "a mob attacker's crit runs the mob spark on the attacker at impact, got {spark_at:?}"
+    );
 
     let sway = routines(app.world(), vic_parent).contains(b"sway");
     assert!(!sway, "kb=0 adds no sway alongside the crit reaction");
     assert!(active_clip(app.world(), atk_child).is_some());
+}
+
+// .agents/skills/retail-observe/references/2026-10-04-melee-damage-dispatch.md Conditions selecting reactions
+#[test]
+fn s6e_pc_attacker_crit_runs_the_player_spark_on_the_attacker() {
+    let (Some(rarab), Some(humem)) = (load_rarab(), load_humem()) else {
+        return;
+    };
+    let mut app = build_app();
+    let (vic_parent, _) = spawn_actor(&mut app, RARAB_W, EntityKind::Mob, &rarab);
+    let (atk_parent, _) = spawn_actor(&mut app, HUMEM_W, EntityKind::Pc, &humem);
+    step_n(&mut app, 10);
+
+    push_battle2(
+        &mut app,
+        HUMEM_W,
+        1,
+        Some(RARAB_W),
+        Some((0, 0, ffxi_proto::melee::INFO_CRITICAL_HIT.into(), 3, 0)),
+    );
+
+    let (spark_at, _) = watch(&mut app, 50, |_i, w| {
+        assert!(
+            !runs_crit_spark(w, vic_parent),
+            "crtl runs on the attacker, not the victim"
+        );
+        assert!(
+            !routines(w, atk_parent).contains(&MOB_ATTACKER_CRIT_SPARK),
+            "a player attacker never selects the mob spark"
+        );
+        routines(w, atk_parent).contains(&PC_ATTACKER_CRIT_SPARK)
+    });
+    assert!(
+        spark_at.is_some_and(|f| f >= IMPACT_FRAME_MIN),
+        "a player attacker's crit runs the player spark on the attacker at impact, got {spark_at:?}"
+    );
 }
 
 // .agents/skills/retail-observe/references/2026-10-04-melee-damage-dispatch.md Conditions selecting reactions
@@ -1018,7 +1087,7 @@ fn s10_left_attack_without_bti0_falls_back_to_ati0() {
         return;
     };
     let mut app = build_app();
-    spawn_actor(&mut app, RARAB_W, EntityKind::Mob, &rarab);
+    let (vic_parent, _) = spawn_actor(&mut app, RARAB_W, EntityKind::Mob, &rarab);
     let (atk_parent, atk_child) = spawn_actor(&mut app, HUMEM_W, EntityKind::Pc, &humem);
     step_n(&mut app, 10);
 
@@ -1038,6 +1107,21 @@ fn s10_left_attack_without_bti0_falls_back_to_ati0() {
             .offhand_context,
         Some(false),
         "the resolved ati0 fallback must clear the offhand context despite the LeftAttack request"
+    );
+
+    // The left-swing context reaches dam0 only through its offhand selector; the swing must not
+    // open one of dam0's sbNN blocks on the victim.
+    let (reaction_at, _) = watch(&mut app, 45, |_i, w| {
+        let active = routines(w, vic_parent);
+        assert!(
+            !active.iter().any(|name| name.starts_with(b"sb")),
+            "a LeftAttack opens no dam0 sbNN block: {active:?}"
+        );
+        active.contains(b"damg")
+    });
+    assert!(
+        reaction_at.is_some(),
+        "the left swing still reaches dam0's successful arm"
     );
 }
 
