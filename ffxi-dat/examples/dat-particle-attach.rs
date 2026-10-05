@@ -4,8 +4,8 @@ use ffxi_dat::{
     chunk::walk,
     kind::ChunkKind,
     particle_gen::{
-        ParticleGeneratorDef, ATTACH_EID_LOW_MASK, ATTACH_EID_LOW_SHIFT, ATTACH_JOINT1_MASK,
-        ATTACH_JOINT1_SHIFT,
+        ParticleGeneratorDef, ATTACH_EID_LOW_MASK, ATTACH_EID_LOW_SHIFT,
+        ATTACH_TARGET_REFERENCE_MASK, ATTACH_TARGET_REFERENCE_SHIFT,
     },
     DatRoot,
 };
@@ -67,13 +67,21 @@ fn main() -> ExitCode {
             let extra = u16::from_le_bytes([c.data[2], c.data[3]]);
             let parsed = ParticleGeneratorDef::parse(c.data).ok().flatten();
             println!(
-                "  {name:<6} attach=0x{:04X} -> {:<24} j0={} j1={} extra=0x{extra:04X}",
+                "  {name:<6} attach=0x{:04X} -> {:<24} src={} tgt={} extra=0x{extra:04X}",
                 attach_flags,
                 attach_name(attach_flags),
                 (attach_flags & ATTACH_EID_LOW_MASK) >> ATTACH_EID_LOW_SHIFT,
-                (attach_flags & ATTACH_JOINT1_MASK) >> ATTACH_JOINT1_SHIFT,
+                (attach_flags & ATTACH_TARGET_REFERENCE_MASK) >> ATTACH_TARGET_REFERENCE_SHIFT,
             );
             if let Some(d) = parsed {
+                println!(
+                    "         mode={} src={} tgt={} pos_fit={} model_fit={}",
+                    d.attach_mode,
+                    d.attach_eid,
+                    d.attach_target_reference,
+                    d.attach_position_fit,
+                    d.attach_model_fit,
+                );
                 println!(
                     "         mesh={} kind={:?} blend={:?} color={:?} life={} bb={} auto={}",
                     String::from_utf8_lossy(&d.mesh_id).trim_end(),

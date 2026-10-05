@@ -197,18 +197,45 @@ impl AttachType {
     }
 }
 
-// research/XIClient Attachment.cpp MakeAttachMatrix — the attach word carries ONE EID index,
-// not two joint fields: bits 4-9 of attachFlags plus bit 18 (bit 2 of additionalAttachFlags)
-// as its top bit. The index resolves through the actor's locator table with special semantics
-// at 48..=53 (ground/nearest/floor/water) — EID_INDEX.h.
-const ATTACH_TYPE_MASK: u16 = 0x000F;
+// .agents/skills/retail-observe/references/2026-10-05-attached-effect-placement.md Inputs — the
+// u16 attachFlags (low half) and additionalAttachFlags (high half) form one attach word: the mode
+// in bits 0-3 plus bit 16, the source reference in bits 4-9 plus bit 18, the target reference in
+// bits 10-15, the position-fit nibble in bits 20-23 and the model-fit nibble in bits 24-27. The
+// references index the actor's locator table, with the selector semantics at 48..=60 resolved by
+// the placement code.
+const ATTACH_MODE_LOW_MASK: u16 = 0x000F;
 pub const ATTACH_EID_LOW_MASK: u16 = 0x03F0;
 pub const ATTACH_EID_LOW_SHIFT: u32 = 4;
-pub const ATTACH_JOINT1_MASK: u16 = 0xFC00;
-pub const ATTACH_JOINT1_SHIFT: u32 = 10;
-// Bit 18 of the combined attach word, i.e. bit 2 of additionalAttachFlags.
+pub const ATTACH_TARGET_REFERENCE_MASK: u16 = 0xFC00;
+pub const ATTACH_TARGET_REFERENCE_SHIFT: u32 = 10;
+const ADDITIONAL_ATTACH_MODE_HIGH_BIT: u16 = 0x0001;
+const ATTACH_MODE_HIGH_SHIFT: u32 = 4;
 const ADDITIONAL_ATTACH_EID_TOP_BIT: u16 = 0x0004;
-const ATTACH_SOURCE_ORIENTED: u16 = 0x0001;
+const ATTACH_EID_TOP_SHIFT: u32 = 6;
+const ADDITIONAL_ATTACH_POSITION_FIT_MASK: u16 = 0x00F0;
+const ADDITIONAL_ATTACH_POSITION_FIT_SHIFT: u32 = 4;
+const ADDITIONAL_ATTACH_MODEL_FIT_MASK: u16 = 0x0F00;
+const ADDITIONAL_ATTACH_MODEL_FIT_SHIFT: u32 = 8;
+
+/// The attach modes whose frame the record states
+/// (.agents/skills/retail-observe/references/2026-10-05-attached-effect-placement.md Attach
+/// frame): the mode selects which actor's reference point the frame translates to and whose yaw
+/// it turns by. `AttachType::from_flag` names the low nibble of the same number.
+pub mod attach_mode {
+    pub const UNATTACHED: u8 = 0;
+    /// Source reference on the caster, caster yaw.
+    pub const SOURCE: u8 = 1;
+    /// Target reference on the target, target yaw.
+    pub const TARGET: u8 = 2;
+    /// Two-point basis from the caster point to the target point.
+    pub const SOURCE_TO_TARGET: u8 = 3;
+    /// Target reference on the target, caster yaw.
+    pub const TARGET_WITH_SOURCE_YAW: u8 = 4;
+    /// Source reference on the caster, target yaw.
+    pub const SOURCE_WITH_TARGET_YAW: u8 = 5;
+    /// Two-point basis from the target point to the caster point.
+    pub const TARGET_TO_SOURCE: u8 = 6;
+}
 
 // research/xim ParticleInitializers.kt — the StandardParticleSetup renderStateFlags u16
 // sits directly after the billboard flags. Bit 0x1000 (`ignoreTextureAlpha`) is the same bit
@@ -464,11 +491,19 @@ pub struct ParticleGeneratorDef {
     pub auto_run: bool,
     pub batched: bool,
 
+    /// The low nibble of `attach_mode`, which is all the placement code reads for the modes
+    /// whose frame it does not build.
     pub attach_type: AttachType,
-    // research/XIClient Attachment.cpp MakeAttachMatrix — the single EID locator index
-    // (bits 4-9 + bit 18 of the attach word); see ATTACH_EID_LOW_MASK.
+    /// Bits 0-3 plus bit 16 of the attach word (`attach_mode::*`).
+    pub attach_mode: u8,
+    /// The source reference: bits 4-9 plus bit 18 of the attach word.
     pub attach_eid: u8,
-    pub attach_source_oriented: bool,
+    /// The target reference: bits 10-15 of the attach word.
+    pub attach_target_reference: u8,
+    /// The position-fit nibble (bits 20-23): which actor's size scales element positions.
+    pub attach_position_fit: u8,
+    /// The model-fit nibble (bits 24-27): which actor's size scales element sprites.
+    pub attach_model_fit: u8,
 
     pub init_scale: [f32; 3],
 
@@ -950,17 +985,27 @@ pub struct EmitCull {
     pub unlink_out_of_range: bool,
 }
 
-// research/xim ParticleGeneratorUpdaters.kt AssociationUpdater - the section-1 0x11
-// config word: bit 0 re-snaps the generator's associated position to the attach actor
-// every frame, bit 1 the associated facing. The high word is a follow-rate factor that
-// retail parses but its own handler ignores - ParticleGeneratorAttachment.kt
-// updateAssociatedPosition is a hard copy ("it's not supposed to be an instant update,
-// but most effects are so fast that it doesn't really matter").
+// .agents/skills/retail-observe/references/2026-10-05-attached-effect-placement.md Per-update
+// follow — the section-1 0x11 payload word: bit 0 blends the frame's translation toward the
+// freshly built attach matrix on every generator update, bit 1 its rotation, at
+// `factor / 255` per update (255 snaps).
+const ASSOCIATION_FOLLOW_POSITION_BIT: u32 = 0x1;
+const ASSOCIATION_FOLLOW_FACING_BIT: u32 = 0x2;
+const ASSOCIATION_FOLLOW_RATE_SHIFT: u32 = 2;
+pub const ASSOCIATION_FOLLOW_RATE_SNAP: u32 = 0xFF;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct AssociationFollow {
     pub follow_position: bool,
     pub follow_facing: bool,
     pub factor: u32,
+}
+
+impl AssociationFollow {
+    /// The fraction of the way the frame moves toward the rebuilt attach matrix per update.
+    pub fn rate(&self) -> f32 {
+        self.factor as f32 / ASSOCIATION_FOLLOW_RATE_SNAP as f32
+    }
 }
 
 impl EmitCull {
@@ -1111,8 +1156,11 @@ pub(crate) struct GeneratorSections {
     pub(crate) auto_run: bool,
     pub(crate) batched: bool,
     pub(crate) attach_type: AttachType,
+    pub(crate) attach_mode: u8,
     pub(crate) attach_eid: u8,
-    pub(crate) attach_source_oriented: bool,
+    pub(crate) attach_target_reference: u8,
+    pub(crate) attach_position_fit: u8,
+    pub(crate) attach_model_fit: u8,
     pub(crate) init_scale: [f32; 3],
     pub(crate) single_scale_variance: Option<f32>,
     pub(crate) scale_variance: Option<[f32; 3]>,
@@ -1282,8 +1330,11 @@ impl ParticleGeneratorDef {
             auto_run: s.auto_run,
             batched: s.batched,
             attach_type: s.attach_type,
+            attach_mode: s.attach_mode,
             attach_eid: s.attach_eid,
-            attach_source_oriented: s.attach_source_oriented,
+            attach_target_reference: s.attach_target_reference,
+            attach_position_fit: s.attach_position_fit,
+            attach_model_fit: s.attach_model_fit,
             init_scale: s.init_scale,
             single_scale_variance: s.single_scale_variance,
             scale_variance: s.scale_variance,
@@ -1422,11 +1473,21 @@ fn parse_sections(body: &[u8]) -> Result<Option<(GeneratorSections, Vec<DecodedB
 
     let attach_flags = u16_le(body, 0x00);
     let additional_attach = u16_le(body, 0x02);
-    let attach_type = AttachType::from_flag(attach_flags & ATTACH_TYPE_MASK).unwrap_or_default();
-    let attach_eid = (((attach_flags & ATTACH_EID_LOW_MASK) >> ATTACH_EID_LOW_SHIFT)
-        | ((additional_attach & ADDITIONAL_ATTACH_EID_TOP_BIT) >> 2) << 6)
+    let attach_type =
+        AttachType::from_flag(attach_flags & ATTACH_MODE_LOW_MASK).unwrap_or_default();
+    let attach_mode = ((attach_flags & ATTACH_MODE_LOW_MASK)
+        | ((additional_attach & ADDITIONAL_ATTACH_MODE_HIGH_BIT) << ATTACH_MODE_HIGH_SHIFT))
         as u8;
-    let attach_source_oriented = additional_attach & ATTACH_SOURCE_ORIENTED != 0;
+    let attach_eid = (((attach_flags & ATTACH_EID_LOW_MASK) >> ATTACH_EID_LOW_SHIFT)
+        | ((additional_attach & ADDITIONAL_ATTACH_EID_TOP_BIT)
+            >> ADDITIONAL_ATTACH_EID_TOP_BIT.trailing_zeros())
+            << ATTACH_EID_TOP_SHIFT) as u8;
+    let attach_target_reference =
+        ((attach_flags & ATTACH_TARGET_REFERENCE_MASK) >> ATTACH_TARGET_REFERENCE_SHIFT) as u8;
+    let attach_position_fit = ((additional_attach & ADDITIONAL_ATTACH_POSITION_FIT_MASK)
+        >> ADDITIONAL_ATTACH_POSITION_FIT_SHIFT) as u8;
+    let attach_model_fit = ((additional_attach & ADDITIONAL_ATTACH_MODEL_FIT_MASK)
+        >> ADDITIONAL_ATTACH_MODEL_FIT_SHIFT) as u8;
 
     let frames_per_emission = u16_le(body, 0x66) as f32 + 1.0;
     let emission_variance = u16_le(body, 0x64) as f32;
@@ -2329,14 +2390,13 @@ fn parse_sections(body: &[u8]) -> Result<Option<(GeneratorSections, Vec<DecodedB
                         unlink_out_of_range: u32_le(body, payload + 8) & 1 != 0,
                     });
                 }
-                // research/xim ParticleGeneratorUpdaters.kt AssociationUpdater read:
-                // followPosition(0x1), followFacing(0x2), followFactor(>>2).
                 SEC1_OPCODE_ASSOCIATION if payload + 4 <= body.len() => {
                     let cfg = u32_le(body, payload);
                     association = Some(AssociationFollow {
-                        follow_position: cfg & 1 != 0,
-                        follow_facing: cfg & 2 != 0,
-                        factor: cfg >> 2,
+                        follow_position: cfg & ASSOCIATION_FOLLOW_POSITION_BIT != 0,
+                        follow_facing: cfg & ASSOCIATION_FOLLOW_FACING_BIT != 0,
+                        factor: (cfg >> ASSOCIATION_FOLLOW_RATE_SHIFT)
+                            & ASSOCIATION_FOLLOW_RATE_SNAP,
                     });
                 }
                 _ => decoded = false,
@@ -2412,8 +2472,11 @@ fn parse_sections(body: &[u8]) -> Result<Option<(GeneratorSections, Vec<DecodedB
             auto_run,
             batched,
             attach_type,
+            attach_mode,
             attach_eid,
-            attach_source_oriented,
+            attach_target_reference,
+            attach_position_fit,
+            attach_model_fit,
             init_scale,
             single_scale_variance,
             scale_variance,
@@ -5320,83 +5383,198 @@ mod tests {
         assert!(def.is_singleton());
     }
 
-    // Pins the retail attach-word layout (Attachment.cpp MakeAttachMatrix) against the
-    // ground-truth word 0x5402 read out of Poison's effect DAT (file 3020): type in the low
-    // nibble, ONE EID index in bits 4-9 plus bit 18 — bits 10-15 are not an index.
+    // The attach word is two indices plus a mode and two fit nibbles
+    // (.agents/skills/retail-observe/references/2026-10-05-attached-effect-placement.md Inputs),
+    // pinned on the words the record reads out of the installed DATs.
     #[test]
-    fn attach_flags_carry_type_and_one_eid_index() {
+    fn attach_word_carries_mode_two_references_and_fit_nibbles() {
         let setup = setup_with_link(LinkedDataKind::STATIC_MESH);
+        let parse = |attach_flags: u16, additional: u16| {
+            ParticleGeneratorDef::parse(&build_attached(&setup, 1, 1, attach_flags, additional))
+                .unwrap()
+                .unwrap()
+        };
 
-        // 0x5402: type TargetActor, EID low bits 0; the word's bits 10-15 (21) are reserved.
-        let body = build_attached(&setup, 1, 1, 0x5402, ATTACH_SOURCE_ORIENTED);
-        let def = ParticleGeneratorDef::parse(&body).unwrap().unwrap();
-        assert_eq!(def.attach_type, AttachType::TargetActor);
-        assert_eq!(def.attach_eid, 0);
-        assert!(def.attach_source_oriented);
+        let level_up = parse(0x0011, 0x0000);
+        assert_eq!(level_up.attach_mode, attach_mode::SOURCE);
+        assert_eq!(level_up.attach_type, AttachType::SourceActor);
+        assert_eq!(level_up.attach_eid, 1);
+        assert_eq!(level_up.attach_target_reference, 0);
+        assert_eq!(
+            (level_up.attach_position_fit, level_up.attach_model_fit),
+            (0, 0)
+        );
 
-        let body = build_attached(&setup, 1, 1, 0x5402, 0);
-        let def = ParticleGeneratorDef::parse(&body).unwrap().unwrap();
-        assert!(!def.attach_source_oriented);
+        let poison = parse(0x5402, 0x0880);
+        assert_eq!(poison.attach_mode, attach_mode::TARGET);
+        assert_eq!(poison.attach_type, AttachType::TargetActor);
+        assert_eq!(poison.attach_eid, 0);
+        assert_eq!(poison.attach_target_reference, 21);
+        assert_eq!(
+            (poison.attach_position_fit, poison.attach_model_fit),
+            (8, 8)
+        );
 
-        // EID low bits in 4..10, type in the low nibble; bit 18 (additional word bit 2) is the top.
-        let body = build_attached(&setup, 1, 1, 0x0409 | (7 << ATTACH_EID_LOW_SHIFT), 0);
-        let def = ParticleGeneratorDef::parse(&body).unwrap().unwrap();
-        assert_eq!(def.attach_type, AttachType::SourceActorWeapon);
-        assert_eq!(def.attach_eid, 7);
+        let fits = parse(
+            0x0000,
+            (3 << ADDITIONAL_ATTACH_POSITION_FIT_SHIFT) | (5 << ADDITIONAL_ATTACH_MODEL_FIT_SHIFT),
+        );
+        assert_eq!((fits.attach_position_fit, fits.attach_model_fit), (3, 5));
 
-        let body = build_attached(
-            &setup,
-            1,
-            1,
+        let contact = parse(
+            u16::from(attach_mode::TARGET_WITH_SOURCE_YAW) | (49 << ATTACH_TARGET_REFERENCE_SHIFT),
+            0,
+        );
+        assert_eq!(contact.attach_mode, attach_mode::TARGET_WITH_SOURCE_YAW);
+        assert_eq!(contact.attach_target_reference, 49);
+        assert_eq!(contact.attach_eid, 0);
+
+        let weapon = parse(0x0409 | (7 << ATTACH_EID_LOW_SHIFT), 0);
+        assert_eq!(weapon.attach_type, AttachType::SourceActorWeapon);
+        assert_eq!(weapon.attach_mode, 9);
+        assert_eq!(weapon.attach_eid, 7);
+        let high = parse(
             0x0409 | (5 << ATTACH_EID_LOW_SHIFT),
             ADDITIONAL_ATTACH_EID_TOP_BIT,
         );
-        let def = ParticleGeneratorDef::parse(&body).unwrap().unwrap();
-        assert_eq!(def.attach_eid, 69);
+        assert_eq!(high.attach_eid, 69);
 
-        // 0x7 / 0x8 / 0xD are not AttachType flags; XIM warns and falls back to None.
+        let two_point = parse(
+            u16::from(attach_mode::TARGET),
+            ADDITIONAL_ATTACH_MODE_HIGH_BIT,
+        );
+        assert_eq!(two_point.attach_mode, 18);
+        assert_eq!(two_point.attach_type, AttachType::TargetActor);
+
         for unknown in [0x7u16, 0x8, 0xD] {
             assert_eq!(AttachType::from_flag(unknown), None);
-            let body = build_attached(&setup, 1, 1, unknown, 0);
-            let def = ParticleGeneratorDef::parse(&body).unwrap().unwrap();
+            let def = parse(unknown, 0);
             assert_eq!(def.attach_type, AttachType::None);
+            assert_eq!(u16::from(def.attach_mode), unknown);
         }
     }
 
-    // Real-DAT guard: every generator in Poison's completion-effect file attaches to the
-    // target actor with EID index 0 (the word's bits 10-15 read as a phantom 21; Attachment.cpp
-    // MakeAttachMatrix only takes bits 4-9 + bit 18), so the venom cloud lands on the victim's
-    // locator 0.
+    fn real_file(file_id: u32) -> Option<Vec<u8>> {
+        let root = crate::archive::open_test_install()?;
+        let Ok(loc) = root.resolve(file_id) else {
+            eprintln!("SKIP: file {file_id} is unresolvable in this install");
+            return None;
+        };
+        std::fs::read(loc.path_under(&root)).ok()
+    }
+
+    fn real_particle_defs(file_id: u32) -> Option<Vec<([u8; 4], [u8; 4], ParticleGeneratorDef)>> {
+        let bytes = real_file(file_id)?;
+        let tree = crate::chunk::walk_tree(&bytes);
+        let mut defs = Vec::new();
+        crate::resource_dir::collect_in_dir(
+            &tree,
+            [0; 4],
+            crate::kind::ChunkKind::Generator as u8,
+            &mut |dir, node| {
+                if let Ok(Some(def)) = ParticleGeneratorDef::parse(node.chunk.data) {
+                    defs.push((dir, node.chunk.name, def));
+                }
+            },
+        );
+        Some(defs)
+    }
+
+    // Real-DAT guard: Poison's completion-effect generators (file 3020) all carry mode 2 with
+    // target reference 21 — the venom cloud sits on the victim's reference 21, scaled by the
+    // victim's size wherever the fit nibbles are set.
     #[test]
-    fn real_dat_poison_generators_attach_to_target() {
+    fn real_dat_poison_generators_attach_to_the_targets_reference_21() {
         const POISON_EFFECT_FILE_ID: u32 = 3020;
-        let Some(root) = crate::archive::open_test_install() else {
+        let Some(defs) = real_particle_defs(POISON_EFFECT_FILE_ID) else {
             return;
         };
-        let Ok(loc) = root.resolve(POISON_EFFECT_FILE_ID) else {
-            return;
-        };
-        let Ok(bytes) = std::fs::read(loc.path_under(&root)) else {
-            return;
-        };
-        let mut seen = 0;
-        for c in crate::chunk::walk(&bytes).flatten() {
-            if crate::kind::ChunkKind::from_u8(c.kind) != Some(crate::kind::ChunkKind::Generator) {
-                continue;
-            }
-            let Ok(Some(def)) = ParticleGeneratorDef::parse(c.data) else {
-                continue;
-            };
-            seen += 1;
-            assert_eq!(
-                def.attach_type,
-                AttachType::TargetActor,
-                "generator {}",
-                String::from_utf8_lossy(&c.name)
+        assert!(
+            !defs.is_empty(),
+            "no particle generators parsed from file 3020"
+        );
+        for (_, name, def) in &defs {
+            let name = String::from_utf8_lossy(name);
+            assert_eq!(def.attach_type, AttachType::TargetActor, "{name}");
+            assert_eq!(def.attach_mode, attach_mode::TARGET, "{name}");
+            assert_eq!(def.attach_eid, 0, "{name}");
+            assert_eq!(def.attach_target_reference, 21, "{name}");
+            assert_eq!(def.attach_position_fit, def.attach_model_fit, "{name}");
+            assert!(
+                matches!(def.attach_position_fit, 0 | 8),
+                "{name} fit nibble {}",
+                def.attach_position_fit
             );
-            assert_eq!(def.attach_eid, 0);
         }
-        assert!(seen > 0, "no particle generators parsed from file 3020");
+    }
+
+    // ROM/0/0.DAT `hit1`: the melee hit sparks are target-side modes 2/2/4/2 carrying target
+    // reference 49, the ring selector nearest the attacker
+    // (.agents/skills/retail-observe/references/2026-10-05-attached-effect-placement.md Other
+    // attached effects).
+    #[test]
+    fn real_dat_hit_sparks_carry_target_reference_49() {
+        const GLOBAL_EFFECT_FILE_ID: u32 = 0;
+        const HIT_SPARK_DIR: [u8; 4] = *b"hit1";
+        const NEAREST_RING_TO_OTHER_ACTOR: u8 = 49;
+        let Some(defs) = real_particle_defs(GLOBAL_EFFECT_FILE_ID) else {
+            return;
+        };
+        let expected = [
+            (*b"g010", attach_mode::TARGET),
+            (*b"g011", attach_mode::TARGET),
+            (*b"g012", attach_mode::TARGET_WITH_SOURCE_YAW),
+            (*b"g013", attach_mode::TARGET),
+        ];
+        for (name, mode) in expected {
+            let (_, _, def) = defs
+                .iter()
+                .find(|(dir, n, _)| *dir == HIT_SPARK_DIR && *n == name)
+                .unwrap_or_else(|| panic!("hit1 defines {}", String::from_utf8_lossy(&name)));
+            let name = String::from_utf8_lossy(&name);
+            assert_eq!(def.attach_mode, mode, "{name}");
+            assert_eq!(def.attach_eid, 0, "{name}");
+            assert_eq!(
+                def.attach_target_reference, NEAREST_RING_TO_OTHER_ACTOR,
+                "{name}"
+            );
+            assert_eq!(
+                (def.attach_position_fit, def.attach_model_fit),
+                (0, 0),
+                "{name}"
+            );
+        }
+    }
+
+    // ROM/13/35.DAT, the level-up effect: the attached generators carry mode 1, source
+    // reference 1 and no fit; the lettering ghost `g004` is unattached
+    // (.agents/skills/retail-observe/references/2026-10-05-attached-effect-placement.md The
+    // level-up case).
+    #[test]
+    fn real_dat_level_up_generators_attach_to_the_casters_reference_1() {
+        const LEVEL_UP_EFFECT_PINNED_FILE_ID: u32 = 3310;
+        let Some(defs) = real_particle_defs(LEVEL_UP_EFFECT_PINNED_FILE_ID) else {
+            return;
+        };
+        let by_name = |name: &[u8; 4]| {
+            defs.iter()
+                .find(|(_, n, _)| n == name)
+                .map(|(_, _, def)| def)
+                .unwrap_or_else(|| panic!("3310 defines {}", String::from_utf8_lossy(name)))
+        };
+        for name in [b"g000", b"g001", b"g002"] {
+            let def = by_name(name);
+            let name = String::from_utf8_lossy(name);
+            assert_eq!(def.attach_mode, attach_mode::SOURCE, "{name}");
+            assert_eq!(def.attach_eid, 1, "{name}");
+            assert_eq!(def.attach_target_reference, 0, "{name}");
+            assert_eq!(
+                (def.attach_position_fit, def.attach_model_fit),
+                (0, 0),
+                "{name}"
+            );
+        }
+        assert_eq!(by_name(b"g004").attach_mode, attach_mode::UNATTACHED);
     }
 
     // kuluu-ln1q was filed on the premise that retail gates weat/<tag> activation on a predicate
