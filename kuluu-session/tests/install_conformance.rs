@@ -123,10 +123,6 @@ fn profile_is_a_measured_known_client_row() {
         "{}: probed item layout differs from the row",
         row.name
     );
-    // The stamp is checkable only when the install carries one: the
-    // patch.cfg stamp is the PlayOnline patch session's manifest
-    // (ffxi-install/src/manifest.rs MANIFEST_FILE); SE's own patcher
-    // stamps patch.txt, so a stamped-row install can lack it.
     if profile.patch_version.is_some() {
         assert_eq!(
             profile.patch_version.as_deref(),

@@ -175,6 +175,86 @@ class VerificationGateTests(unittest.TestCase):
         self.payload["last_assistant_message"] = "Visual verification is blocked. " + reason
         self.assertIsNone(verification.check(self.payload))
 
+    def blocked_profile(self):
+        self.edit()
+        log = self.root / "profile-failure.log"
+        log.write_text("Connection refused (os error 61)\n")
+        reason = "The profile endpoint 127.0.0.1:51220 refused the production TCP connection (os error 61)."
+        self.record("--verdict", "blocked", "--summary", reason, "--artifact", str(log))
+        return reason, log
+
+    def test_formatted_blocker_recovers_both_stop_adapters(self):
+        reason, _ = self.blocked_profile()
+        reports = [
+            reason.replace("127.0.0.1:51220", "`127.0.0.1:51220`"),
+            reason.replace("127.0.0.1:51220", "**127.0.0.1:51220**"),
+            reason.replace("127.0.0.1:51220", "*127.0.0.1:51220*"),
+            reason.replace("127.0.0.1:51220", "__127.0.0.1:51220__"),
+            reason.replace("production TCP", "production\n  TCP"),
+            "> " + reason,
+        ]
+        commands = [
+            [sys.executable, str(HOOKS / "codex-project-hook.py"), "Stop"],
+            ["bash", str(HOOKS / "stop-dispatcher.sh")],
+        ]
+        for report in reports:
+            self.payload["last_assistant_message"] = "Runtime verification remains blocked and incomplete.\n" + report
+            for command in commands:
+                with self.subTest(report=report, adapter=command[-1]):
+                    result = subprocess.run(command, input=json.dumps(self.payload), capture_output=True,
+                                            text=True, env=self.env)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertNotIn('"decision": "block"', result.stdout)
+
+    def test_blocked_recovery_prompt_contains_the_reason_and_marker(self):
+        reason, _ = self.blocked_profile()
+        recovery = verification.check(self.payload)
+        self.assertIn(reason, recovery)
+        self.assertIn(str(self.marker()), recovery)
+        self.payload["last_assistant_message"] = "Runtime verification remains blocked and incomplete. " + reason
+        self.assertIsNone(verification.check(self.payload))
+
+    def test_recorder_supplies_a_recoverable_blocked_handoff(self):
+        self.edit()
+        log = self.root / "profile-failure.log"
+        log.write_text("Connection refused\n")
+        result = self.record("--verdict", "blocked", "--summary", "The profile service is unavailable.",
+                             "--artifact", str(log))
+        handoff = next(line.removeprefix("Handoff: ") for line in result.stdout.splitlines()
+                       if line.startswith("Handoff: "))
+        self.payload["last_assistant_message"] = handoff
+        self.assertIsNone(verification.check(self.payload))
+
+    def test_blocked_disclosure_does_not_accept_omitted_or_different_reason(self):
+        reason, _ = self.blocked_profile()
+        for report in ["Runtime verification is blocked.",
+                       "Runtime verification is blocked. " + reason.replace("51220", "51221")]:
+            self.payload["last_assistant_message"] = report
+            self.assertIn("disclosed as incomplete", verification.check(self.payload))
+
+    def test_unblocked_is_not_a_blocked_status(self):
+        reason, _ = self.blocked_profile()
+        self.payload["last_assistant_message"] = "Runtime verification is unblocked. " + reason
+        self.assertIn("disclosed as incomplete", verification.check(self.payload))
+
+    def test_old_blocker_diagnostic_is_not_a_disclosure_failure(self):
+        self.edit()
+        log = self.root / "old-failure.log"
+        log.write_text("Connection refused\n")
+        os.utime(log, ns=(1, 1))
+        reason = "The profile service is unavailable."
+        self.record("--verdict", "blocked", "--summary", reason, "--artifact", str(log))
+        self.payload["last_assistant_message"] = "Runtime verification is blocked. " + reason
+        self.assertIn("no fresh blocker diagnostic", verification.check(self.payload))
+
+    def test_blocked_evidence_still_rejects_changed_artifact_or_source(self):
+        reason, log = self.blocked_profile()
+        self.payload["last_assistant_message"] = "Runtime verification is blocked. " + reason
+        log.write_text("different diagnostic\n")
+        self.assertIn("artifact missing or changed", verification.check(self.payload))
+        self.source.write_text("pub fn changed_after_blocker() {}\n")
+        self.assertIn("current source", verification.check(self.payload))
+
     def test_repeated_stop_remains_blocked_beyond_dispatcher_depth_limit(self):
         self.edit()
         self.payload["stop_hook_active"] = True
@@ -204,6 +284,36 @@ class VerificationGateTests(unittest.TestCase):
                                     input=json.dumps(payload), env=self.env, capture_output=True, text=True)
             self.assertEqual(result.stdout, "", result.stderr)
         self.assertIn("quantity.rs", verification.check(self.payload))
+
+    def test_codex_does_not_parse_a_python_heredoc_as_shell(self):
+        command = "python3 - <<'PY'\nprint('session\\'s edits')\nPY"
+        result = subprocess.run(command, shell=True, cwd=self.root, env=self.env,
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "session's edits\n")
+        payload = {**self.payload, "cwd": str(self.base), "tool_name": "Bash",
+                   "tool_input": {"command": command, "workdir": str(self.root)}}
+        for event in ("PreToolUse", "PostToolUse"):
+            result = subprocess.run([sys.executable, str(HOOKS / "codex-project-hook.py"), event],
+                                    input=json.dumps(payload), env=self.env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "", result.stderr)
+
+    def test_codex_command_prefix_preserves_cwd_before_heredoc(self):
+        spec = importlib.util.spec_from_file_location("adapter", HOOKS / "codex-project-hook.py")
+        adapter = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(adapter)
+        body = "python3 - <<'PY'\nprint('session\\'s edits')\nPY"
+        cases = [
+            (f"cd '{self.root}' && {body}", self.root),
+            (f"git -C '{self.root}' status\n{body}", self.root),
+            (f"git status\ncd '{self.root}'", self.base),
+            (f"git status <<'PY'\nprint('session\\'s edits')\nPY", self.base),
+        ]
+        for command, expected in cases:
+            with self.subTest(command=command):
+                payload = {"cwd": str(self.base), "tool_input": {"command": command}}
+                self.assertEqual(adapter.shell_cwd(payload), str(expected.resolve()))
 
     def test_non_runtime_edits_do_not_acquire_a_visual_gate(self):
         note = self.root / "README.md"

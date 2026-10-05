@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -166,6 +167,19 @@ def record(args):
     temporary.write_text(json.dumps(marker, indent=2) + "\n")
     temporary.replace(target)
     print(f"recorded {args.verdict} -> {target}")
+    if args.verdict == "blocked":
+        print(f"Handoff: Runtime verification remains blocked and incomplete. {args.summary}")
+
+
+def disclosure_text(message):
+    message = re.sub(r"(?m)^\s{0,3}>\s?", "", message)
+    message = re.sub(r"`+", "", message)
+    while True:
+        plain = re.sub(r"(?<!\w)(\*\*|__|\*|_)(?=\S)(.+?)(?<=\S)\1(?!\w)",
+                       lambda match: match[2], message, flags=re.DOTALL)
+        if plain == message:
+            return " ".join(plain.split())
+        message = plain
 
 
 def last_message(payload):
@@ -216,10 +230,19 @@ def evidence_error(root, edits, message):
             if not path.is_file() or not path.stat().st_size or digest(path) != artifact["hash"]:
                 return f"artifact missing or changed: {path}"
         if verdict == "blocked":
+            if not any(a["captured_at_ns"] >= latest for a in artifacts):
+                return "no fresh blocker diagnostic after the last edit; capture the actual failure and record blocked again"
             summary = marker.get("summary", "")
-            if summary and summary in message and "blocked" in message.lower() and any(a["captured_at_ns"] >= latest for a in artifacts):
+            reason = disclosure_text(summary)
+            report = disclosure_text(message)
+            if reason and reason in report and re.search(r"\bblocked\b", report, flags=re.IGNORECASE):
                 return None
-            return "blocked verification must be disclosed as incomplete with the recorded reason"
+            return ("blocked verification must be disclosed as incomplete with the recorded reason.\n"
+                    f"Evidence marker: {marker_path}\n"
+                    "Recover in the final handoff, keeping the bead open:\n"
+                    f"Runtime verification remains blocked and incomplete. {summary}\n"
+                    "Inline code, emphasis, blockquotes and wrapped whitespace are accepted; preserve the full reason. "
+                    "A disclosure failure needs a corrected report, not another drive or a refreshed marker.")
         if verdict != "pass":
             return f"verification verdict is {verdict!r}, not pass"
         required = {surface(Path(e["path"])) for e in edits}
