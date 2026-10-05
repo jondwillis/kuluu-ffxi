@@ -22,6 +22,7 @@ const MARKER_OFFSET: f32 = 1.0;
 const MARKER_RADIUS: f32 = 0.5;
 const CAMERA_DISTANCE: f32 = 6.0;
 const ONE_FRAME: f32 = 1.0;
+const SEEDED_GENERATORS: usize = 3;
 
 #[derive(Resource)]
 struct CaptureTarget {
@@ -94,7 +95,7 @@ fn setup(
         ];
         g.orientation = Some(Quat::IDENTITY);
         g.bound_radius = MARKER_RADIUS;
-        g.draw_path = D3mDrawPath::Untextured;
+        g.draw_path = D3mDrawPath::D3mUntextured;
         g.mesh = meshes.add(empty_mesh());
         let material = materials.add(FfxiParticleMaterial::for_def(
             &g.def,
@@ -123,6 +124,7 @@ fn setup(
         child: child.entity,
     });
     sim.generators = vec![expired, child, parent];
+    assert_eq!(sim.generators.len(), SEEDED_GENERATORS);
 }
 
 fn capture(
@@ -144,17 +146,18 @@ fn capture(
     if *frame == DESPAWN_FRAME {
         commands.entity(target.parent).despawn();
     }
-    let filename = match *frame {
-        BASELINE_FRAME => Some(BEFORE_FILE),
-        RETAINED_FRAME => Some(RETAINED_FILE),
-        REMOVED_FRAME => Some(REMOVED_FILE),
+    let expected = match *frame {
+        BASELINE_FRAME => Some((BEFORE_FILE, SEEDED_GENERATORS, true)),
+        RETAINED_FRAME => Some((RETAINED_FILE, SEEDED_GENERATORS - 1, true)),
+        REMOVED_FRAME => Some((REMOVED_FILE, 0, false)),
         _ => None,
     };
-    if let Some(filename) = filename {
-        println!(
-            "{filename}: generators={} child_alive={}",
-            sim.generators.len(),
-            sim.generators.iter().any(|g| g.entity == target.child)
+    if let Some((filename, generators, child_alive)) = expected {
+        assert_eq!(sim.generators.len(), generators, "{filename}");
+        assert_eq!(
+            sim.generators.iter().any(|g| g.entity == target.child),
+            child_alive,
+            "{filename}"
         );
         commands
             .spawn(Screenshot::image(target.image.clone()))
@@ -170,6 +173,9 @@ fn capture(
 fn captures_child_lifetime_through_production_rendering() {
     let output = PathBuf::from(std::env::var_os(CAPTURE_DIR_ENV).expect("set capture directory"));
     std::fs::create_dir_all(&output).unwrap();
+    for filename in [BEFORE_FILE, RETAINED_FILE, REMOVED_FILE] {
+        let _ = std::fs::remove_file(output.join(filename));
+    }
     App::new()
         .add_plugins(
             DefaultPlugins

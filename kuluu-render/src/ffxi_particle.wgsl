@@ -11,8 +11,9 @@
 // research/XIClient/src/XIClient/source/Resource/Derived/CMoD3m.cpp NonZeroTwoTSS — the
 // textured default: stage 0 MODULATE2X(CURRENT=D, TEXTURE=T) on both channels, stage 1
 // MODULATE2X(CURRENT, TFACTOR) rgb / MODULATE4X(CURRENT, TFACTOR) alpha. D is the doubled
-// upload colour (CMoD3m.cpp PrepDX: `2 * byte`, clamped at 0xFF), so in.color is already
-// min(1, 2*byte/255).
+// upload colour (CMoD3m.cpp PrepDX: `2 * byte`, clamped at 0xFF). in.color carries the D3m/sheet
+// byte/128 (ffxi_dat::d3m::VERTEX_COLOR_DIVISOR) unclamped, and fragment() saturates it to
+// reproduce that clamp.
 // NonZeroOneTSS — same with stage 0 alpha SELECTARG1(DIFFUSE): the texture alpha drops out.
 // ZeroOneTSS — untextured (CMoD3m.cpp Draw: `data[0x04] == 0` -> SetTexture(0, nullptr)):
 // single stage MODULATE2X(CURRENT=D, TFACTOR) rgb / MODULATE4X(DIFFUSE, TFACTOR) alpha.
@@ -66,10 +67,8 @@ const PATH_D3M_TEXTURED: f32 = 0.0;
 const PATH_D3M_UNTEXTURED: f32 = 1.0;
 const PATH_MMB_TEXTURED: f32 = 2.0;
 // Lamp halo alpha map: neutral light only — adds no authored colour, lifts the pixel
-// underneath along the sheet's alpha pattern. The brightness knob rides in.factor.rgb (1.0 =
-// white, as originally drawn); its ceiling mirrors LAMP_HALOS_GAIN_MAX (particle_sim.rs).
+// underneath along the sheet's alpha pattern.
 const PATH_LAMP_ALPHAMAP: f32 = 3.0;
-const LAMP_GAIN_CEILING: f32 = 2.0;
 
 // d3d8types.h D3DTOP_MODULATE2X / MODULATE4X — the per-stage gains of every table above.
 const STAGE_MODULATE_2X: f32 = 2.0;
@@ -205,18 +204,10 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     }
     var staged = stage1(stage0(d, texel, in.factor), d, in.factor);
     if (data.params.w == PATH_LAMP_ALPHAMAP) {
-        staged = vec4<f32>(
-            min(in.factor.rgb, vec3(LAMP_GAIN_CEILING)),
-            min(in.factor.a * texel.a, 1.0),
-        );
+        staged = vec4<f32>(in.factor.rgb, in.factor.a * texel.a);
     }
 
-    var core = clamp(staged, vec4<f32>(0.0), vec4<f32>(1.0));
-    if (data.params.w == PATH_LAMP_ALPHAMAP) {
-        // Over-white rgb survives on the lamp path so the brightness knob has headroom past 1.0;
-        // alpha still clamps before fog and the premultiply below.
-        core = vec4<f32>(clamp(staged.rgb, vec3(0.0), vec3(LAMP_GAIN_CEILING)), min(staged.a, 1.0));
-    }
+    let core = clamp(staged, vec4<f32>(0.0), vec4<f32>(1.0));
 
     let color = apply_element_fog(core, in.world_position.xyz, data.params.y);
 

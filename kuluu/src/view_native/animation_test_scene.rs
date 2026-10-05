@@ -2784,8 +2784,6 @@ mod tests {
 
         let mut sim = ParticleSimulator::default();
         sim.set_lamp_halos_lift(0.0);
-        sim.set_lamp_halos_gain(0.0);
-        sim.set_lamp_halos_radius(0.0);
         sim.set_wash_alpha_lift(0.0);
         let mut clock = kuluu_render::vana_time::VanaClock::default();
         clock.freeze_at_hour_minute(SG_LAMP_HOUR, 0);
@@ -2803,8 +2801,6 @@ mod tests {
         let clock = app.world().resource::<ParticleSimulator>().clock();
         let expected = kuluu_render::particle_sim::CelestialClock::default();
         assert_eq!(clock.lamp_halos_lift, expected.lamp_halos_lift);
-        assert_eq!(clock.lamp_halos_gain, expected.lamp_halos_gain);
-        assert_eq!(clock.lamp_halos_radius, expected.lamp_halos_radius);
         assert_eq!(clock.wash_alpha_lift, expected.wash_alpha_lift);
     }
 }

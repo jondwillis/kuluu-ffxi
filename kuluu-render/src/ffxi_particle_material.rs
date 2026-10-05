@@ -59,7 +59,7 @@ impl D3mDrawPath {
     fn selector(self) -> f32 {
         match self {
             Self::D3m => PATH_D3M_TEXTURED,
-            Self::Untextured => PATH_D3M_UNTEXTURED,
+            Self::D3mUntextured | Self::MmbUntextured => PATH_D3M_UNTEXTURED,
             Self::Mmb => PATH_MMB_TEXTURED,
         }
     }

@@ -22,6 +22,7 @@ const MARKER_OFFSET: f32 = 1.0;
 const MARKER_RADIUS: f32 = 0.5;
 const CAMERA_DISTANCE: f32 = 6.0;
 const ONE_FRAME: f32 = 1.0;
+const SEEDED_GENERATORS: usize = 2;
 
 #[derive(Resource)]
 struct CaptureTarget {
@@ -89,7 +90,7 @@ fn setup(
         ];
         g.orientation = Some(Quat::IDENTITY);
         g.bound_radius = MARKER_RADIUS;
-        g.draw_path = D3mDrawPath::Untextured;
+        g.draw_path = D3mDrawPath::D3mUntextured;
         g.mesh = meshes.add(empty_mesh());
         let material = materials.add(FfxiParticleMaterial::for_def(
             &g.def,
@@ -136,19 +137,17 @@ fn capture(
     if *frame == RESTORE_FRAME {
         off.0 = false;
     }
-    let filename = match *frame {
-        BASELINE_FRAME => Some(BEFORE_FILE),
-        HIDDEN_FRAME => Some(HIDDEN_FILE),
-        RESTORED_FRAME => Some(RESTORED_FILE),
+    let expected = match *frame {
+        BASELINE_FRAME => Some((BEFORE_FILE, false)),
+        HIDDEN_FRAME => Some((HIDDEN_FILE, true)),
+        RESTORED_FRAME => Some((RESTORED_FILE, false)),
         _ => None,
     };
-    if let Some(filename) = filename {
-        println!(
-            "{filename}: generators={} wash={:?} effect={:?}",
-            sim.generators.len(),
-            visibility.get(target.wash).unwrap(),
-            visibility.get(target.effect).unwrap()
-        );
+    if let Some((filename, wash_hidden)) = expected {
+        let hidden = |e: Entity| *visibility.get(e).unwrap() == Visibility::Hidden;
+        assert_eq!(sim.generators.len(), SEEDED_GENERATORS, "{filename}");
+        assert_eq!(hidden(target.wash), wash_hidden, "{filename}");
+        assert!(!hidden(target.effect), "{filename}: the effect never hides");
         commands
             .spawn(Screenshot::image(target.image.clone()))
             .observe(save_to_disk(target.output.join(filename)));
@@ -163,6 +162,9 @@ fn capture(
 fn captures_wall_wash_controls_through_production_rendering() {
     let output = PathBuf::from(std::env::var_os(CAPTURE_DIR_ENV).expect("set capture directory"));
     std::fs::create_dir_all(&output).unwrap();
+    for filename in [BEFORE_FILE, HIDDEN_FILE, RESTORED_FILE] {
+        let _ = std::fs::remove_file(output.join(filename));
+    }
     App::new()
         .add_plugins(
             DefaultPlugins

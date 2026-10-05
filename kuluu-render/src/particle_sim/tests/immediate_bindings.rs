@@ -16,6 +16,7 @@ const LINK_FACTOR: f32 = 0.75;
 const LIFE: f32 = ROUTINE_FPS * 4.0;
 const HALF_LIFE: f32 = LIFE / 2.0;
 const ONE_FRAME: f32 = 1.0;
+const SOURCE_AND_LINK: usize = 2;
 
 mod capture;
 
@@ -122,12 +123,23 @@ fn immediate_link_uses_its_own_tracks_and_child_bindings() {
     for bindings in [true, false] {
         let mut app = spawn(bindings);
         let mut sim = app.world_mut().resource_mut::<ParticleSimulator>();
-        assert_eq!(sim.generators.len(), 2);
+        assert_eq!(sim.generators.len(), SOURCE_AND_LINK);
+        assert!(
+            sim.generators[0]
+                .child_factories
+                .iter()
+                .all(|f| f.name != LINK),
+            "a sec2 0x3C link is one linked generator, not a per-particle child"
+        );
         advance_simulator(&mut sim, ONE_FRAME);
         let linked = &mut sim.generators[1];
         assert_eq!(linked.particles.len(), 1);
         linked.particles[0].age_frames = HALF_LIFE;
-        let expected = if bindings { LINK_END / 2.0 } else { Vec3::ZERO };
+        let expected = if bindings {
+            LINK_END * WORLD_PARTICLE_VEL_BASIS / 2.0
+        } else {
+            Vec3::ZERO
+        };
         assert_eq!(
             particle_draw(linked, &linked.particles[0], &CelestialClock::default()).world,
             expected,
@@ -139,5 +151,27 @@ fn immediate_link_uses_its_own_tracks_and_child_bindings() {
         let descendants: Vec<_> = linked.child_factories.iter().map(|f| f.name).collect();
         let expected_descendants = if bindings { vec![LINK_CHILD] } else { vec![] };
         assert_eq!(descendants, expected_descendants);
+    }
+}
+
+#[test]
+fn textureless_action_meshes_take_the_untextured_d3m_table() {
+    let app = spawn(true);
+    let sim = app.world().resource::<ParticleSimulator>();
+    assert_eq!(sim.generators.len(), SOURCE_AND_LINK);
+    for g in &sim.generators {
+        assert_eq!(
+            g.draw_path,
+            D3mDrawPath::D3mUntextured,
+            "{:?}",
+            g.def.mesh_id
+        );
+        assert!(!g.child_factories.is_empty());
+        for f in &g.child_factories {
+            let ChildPayload::Draw(child) = &f.payload else {
+                panic!("{:?} binds a drawable child", f.name);
+            };
+            assert_eq!(child.draw_path, D3mDrawPath::D3mUntextured, "{:?}", f.name);
+        }
     }
 }

@@ -75,7 +75,7 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
 }
 
 fn prepare(mut sim: ResMut<ParticleSimulator>, mut ready: Local<bool>) {
-    if *ready || sim.generators.len() != 2 {
+    if *ready || sim.generators.len() != SOURCE_AND_LINK {
         return;
     }
     advance_simulator(&mut sim, ONE_FRAME);
@@ -96,13 +96,14 @@ fn capture(
 ) {
     *frame += 1;
     if *frame == CAPTURE_FRAME {
+        assert_eq!(
+            sim.generators.len(),
+            SOURCE_AND_LINK,
+            "the source and its immediate link must both be live to capture"
+        );
         for g in &sim.generators {
-            println!(
-                "mesh {:?} color {:?} world {:?}",
-                g.def.mesh_id,
-                g.def.init_color,
-                particle_draw(g, &g.particles[0], &sim.clock).world
-            );
+            assert!(g.stopped, "prepare must have posed {:?}", g.def.mesh_id);
+            assert!(!g.particles.is_empty(), "{:?} drew nothing", g.def.mesh_id);
         }
         commands
             .spawn(Screenshot::image(target.image.clone()))
@@ -118,6 +119,7 @@ fn capture(
 fn captures_immediate_link_bindings_through_production_rendering() {
     let output = PathBuf::from(std::env::var_os(OUTPUT_ENV).expect("set capture directory"));
     std::fs::create_dir_all(&output).unwrap();
+    let _ = std::fs::remove_file(output.join(FILENAME));
     App::new()
         .add_plugins(
             DefaultPlugins
