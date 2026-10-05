@@ -514,6 +514,15 @@ struct LiveGenerator {
     /// The mesh entity's world rotation — the actor root's for actor-local generators, whose
     /// local frame is the actor's FFXI frame; identity otherwise.
     actor_rot: Quat,
+    /// The attach frame's rotation and fit vectors (`AttachFrame`); identity and ONE for every
+    /// generator kind but the routine-spawned ones.
+    frame_rot: Quat,
+    position_fit: Vec3,
+    model_fit: Vec3,
+    /// The sec2 0x01 setup position in the DAT frame, an element offset inside the attach frame
+    /// rather than an origin shift. Zero for the zone, weather, camera and auto-run kinds, whose
+    /// spawn sites fold it into the origin.
+    setup_position: Vec3,
     // The mesh entity's GlobalTransform at the last sync — identity for a world-space generator,
     // the actor root's for an actor-local one. Draw-distance falloff (sec3 0x2E) measures
     // camera-to-particle in true world space, so the particle's local-frame position passes
@@ -590,6 +599,10 @@ impl LiveGenerator {
             elements_emitted: 0,
             cam_view: Quat::IDENTITY,
             actor_rot: Quat::IDENTITY,
+            frame_rot: Quat::IDENTITY,
+            position_fit: Vec3::ONE,
+            model_fit: Vec3::ONE,
+            setup_position: Vec3::ZERO,
             entity_world: GlobalTransform::IDENTITY,
             parent: None,
             anchor: None,
@@ -599,6 +612,13 @@ impl LiveGenerator {
             pending_expiry_spawns: Vec::new(),
             built_key: MeshKey::Empty,
         }
+    }
+
+    fn place_in(&mut self, frame: &AttachFrame) {
+        self.origin = frame.translation;
+        self.frame_rot = frame.rotation;
+        self.position_fit = frame.position_fit;
+        self.model_fit = frame.model_fit;
     }
 }
 
@@ -715,10 +735,32 @@ struct Oscillation {
     prev_amplitude: [f32; 3],
 }
 
-// research/xim ParticleGeneratorAttachment.kt resolveExtendedJoints — a source joint naming
-// one of a mount's two footstep points is rewritten to reference 0 before it is ever resolved.
+// .agents/skills/retail-observe/references/2026-10-05-attached-effect-placement.md Reference
+// point — the aliases a reference index passes through before the locator table: 54/55 are the
+// hand locators and 56-60 the five extra weapon locators. 52/53 are the actor's last touch-floor
+// and water-surface points, which this client does not track, so they fall back to the root.
 const MOUNT_FOOTSTEP_JOINTS: std::ops::RangeInclusive<u8> = 52..=53;
 const MOUNT_FOOTSTEP_REFERENCE: usize = 0;
+const HAND_REFERENCE_ALIASES: std::ops::RangeInclusive<u8> = 54..=55;
+const EXTRA_WEAPON_REFERENCE_ALIASES: std::ops::RangeInclusive<u8> = 56..=60;
+const EXTRA_WEAPON_REFERENCE_FIRST: usize = 102;
+// Reference 51 selects the ring entry nearest the camera eye; 49 and 50 the one nearest the
+// other actor.
+const CAMERA_NEAREST_REFERENCE: u8 = 51;
+
+fn resolve_reference_alias(reference: u8) -> usize {
+    if MOUNT_FOOTSTEP_JOINTS.contains(&reference) {
+        MOUNT_FOOTSTEP_REFERENCE
+    } else if HAND_REFERENCE_ALIASES.contains(&reference) {
+        ffxi_dat::skel::standard_position::LEFT_HAND
+            + usize::from(reference - HAND_REFERENCE_ALIASES.start())
+    } else if EXTRA_WEAPON_REFERENCE_ALIASES.contains(&reference) {
+        EXTRA_WEAPON_REFERENCE_FIRST
+            + usize::from(reference - EXTRA_WEAPON_REFERENCE_ALIASES.start())
+    } else {
+        usize::from(reference)
+    }
+}
 
 // The mzb->bevy axis mapping (dat_mzb.rs to_bevy) for world-space particle math: FFXI's -Y up
 // becomes Bevy +Y up and Z mirrors, so a DAT velocity/spread authored in the FFXI frame lands
@@ -751,59 +793,43 @@ fn velocity_rotation(vel_rot: Vec3, negate_y: bool) -> Quat {
     Quat::from_euler(EulerRot::XYZ, -vel_rot.x, -y, -vel_rot.z)
 }
 
-// research/xim ParticleGeneratorAttachment.kt updateAssociatedPosition jointRefIdx,103,111,125 updateAssociatedPosition — an
-// actor-attached generator emits from the attach actor's position PLUS the position of the joint
-// reference the def names: attachedJoint0 for the source-side attach types, attachedJoint1 for the
-// target-side ones. The celestial and unattached types read neither. The field indexes the
-// skeleton's reference table (ffxi_dat::skel::JointReference), not its joint array.
-//
-// SourceActorWeapon reads neither here: resolveExtendedJoints (:284-303) rewrites its source joint
-// onto the PC hand/weapon references (31/33/35/55 -> 127, 32/34/54 -> 126, 36/37/56..60 -> 100..106)
-// and returns without ever running the nearest-joint selector, but ONLY when the actor carries a PC
-// model -- and FfxiRenderActor carries no PC-model flag to branch on. Resolving the raw field would
-// place a PC weapon trail on whatever else that reference happens to be filed as, so weapon
-// attachments keep the plain root origin until that flag exists.
-// research/XIClient Attachment.cpp MakeAttachMatrix — every attach type resolves the def's
-// single EID index (AttachmentInfo bits 4-9 + bit 18); the mount footstep indices are remapped
-// to reference 0 before resolution. A target-side attach carrying a plain index resolves it
-// through the nearest-ring selector instead: retail places those effects at the contact point,
-// the victim's ring locator nearest the attacker
-// (.agents/skills/retail-observe/references/2026-09-27-hit-effect-contact-point.md).
-fn attach_joint_reference(def: &ParticleGeneratorDef) -> Option<usize> {
-    use ffxi_dat::particle_gen::AttachType;
-    let reference = if MOUNT_FOOTSTEP_JOINTS.contains(&def.attach_eid) {
-        MOUNT_FOOTSTEP_REFERENCE
-    } else {
-        def.attach_eid as usize
-    };
-    match def.attach_type {
-        AttachType::SourceActor
-        | AttachType::SourceActorTargetFacing
-        | AttachType::SourceToTargetBasis
-        | AttachType::ZoneActorA
-        | AttachType::ZoneActorB
-        | AttachType::ZoneActorC => Some(reference),
-        AttachType::TargetActor
-        | AttachType::TargetActorSourceFacing
-        | AttachType::TargetToSourceBasis => {
-            if ffxi_actor::skeleton_instance::NEAREST_JOINT_REFERENCES.contains(&reference) {
-                Some(reference)
-            } else {
-                Some(*ffxi_actor::skeleton_instance::NEAREST_JOINT_REFERENCES.start())
-            }
-        }
-        AttachType::SourceActorWeapon | AttachType::None | AttachType::Sun | AttachType::Moon => {
-            None
-        }
+/// Everything the attach frame reads from the world: the attach actors' transforms and posed
+/// skeletons, and the operator camera for the eye-nearest selector.
+#[derive(bevy::ecs::system::SystemParam)]
+pub struct AttachQueries<'w, 's> {
+    xf: Query<'w, 's, &'static Transform>,
+    children: Query<'w, 's, &'static Children>,
+    render: Query<'w, 's, &'static FfxiRenderActor>,
+    cam: Query<'w, 's, &'static GlobalTransform, With<OperatorCamera>>,
+}
+
+impl AttachQueries<'_, '_> {
+    fn camera_eye(&self) -> Option<Vec3> {
+        self.cam.iter().next().map(|xf| xf.translation())
     }
 }
 
-/// The pose an attach actor was last drawn in, plus the transform carrying its pose frame (FFXI
-/// axes, -Y up) into Bevy world space.
+/// The pose an attach actor was last drawn in, the transform carrying its pose frame (FFXI
+/// axes, -Y up) into Bevy world space, and the facing and scale the pose was built under.
+#[derive(Clone, Copy)]
 struct AttachPose<'a> {
     pose: &'a [Mat4],
     skeleton: &'a ffxi_dat::skel::Skeleton,
     root: bevy::math::Affine3A,
+    facing_dir: f32,
+    scale: f32,
+}
+
+impl AttachPose<'_> {
+    // The actor's facing in Bevy space: the root's rotation stripped of the FFXI->Bevy basis,
+    // plus the facing the pose itself was composed under (a yaw about FFXI Y turns the other
+    // way once the basis flips that axis).
+    fn yaw(&self) -> Quat {
+        let (_, rotation, _) = self.root.to_scale_rotation_translation();
+        rotation
+            * crate::ffxi_actor_render::ffxi_to_bevy_basis().inverse()
+            * Quat::from_rotation_y(-self.facing_dir)
+    }
 }
 
 /// The entity a routine runs on and the actor root holding the posed skeleton are not the same
@@ -818,90 +844,300 @@ struct AttachPose<'a> {
 /// would strip the FFXI->Bevy basis off the pose-frame offset and bury the effect under the
 /// actor's feet, mirrored. The two local transforms are composed instead, so the basis comes
 /// from the root the pose is in.
-fn attach_pose<'a>(
-    entity: Entity,
-    q_children: &Query<&Children>,
-    q_xf: &Query<&Transform>,
-    q_render: &'a Query<&FfxiRenderActor>,
-) -> Option<AttachPose<'a>> {
-    let (actor, holder) = q_render
+fn attach_pose<'a>(entity: Entity, q: &'a AttachQueries<'_, '_>) -> Option<AttachPose<'a>> {
+    let (actor, holder) = q
+        .render
         .get(entity)
         .ok()
         .map(|actor| (actor, entity))
         .or_else(|| {
-            q_children
+            q.children
                 .get(entity)
                 .ok()?
                 .iter()
-                .find_map(|child| Some((q_render.get(child).ok()?, child)))
+                .find_map(|child| Some((q.render.get(child).ok()?, child)))
         })?;
-    let mut root = q_xf.get(entity).ok()?.compute_affine();
+    let mut root = q.xf.get(entity).ok()?.compute_affine();
     if holder != entity {
-        root *= q_xf.get(holder).ok()?.compute_affine();
+        root *= q.xf.get(holder).ok()?.compute_affine();
     }
     Some(AttachPose {
         pose: actor.world_pose(),
         skeleton: &actor.skeleton,
         root,
+        facing_dir: actor.facing_dir,
+        scale: actor.scale,
     })
 }
 
-// World-space delta from the attach actor's root to the joint the generator hangs off.
-// `other_world` is the other actor of the attachment, which is what a 49..51 nearest-joint
-// selector measures against (research/xim ParticleGeneratorAttachment.kt resolveNearestJointSnapshot
-// resolveNearestJointSnapshot).
-fn attach_joint_offset(
-    def: &ParticleGeneratorDef,
-    attach: Option<AttachPose<'_>>,
-    other_world: Option<Vec3>,
+/// One actor of an attachment: its feet in Bevy world space, its yaw, and the pose its
+/// reference points are read from (None for a door or a model still loading).
+#[derive(Clone, Copy)]
+struct AttachActor<'a> {
+    world: Vec3,
+    yaw: Quat,
+    pose: Option<AttachPose<'a>>,
+}
+
+fn attach_actor<'a>(entity: Entity, q: &'a AttachQueries<'_, '_>) -> Option<AttachActor<'a>> {
+    let xf = q.xf.get(entity).ok()?;
+    let pose = attach_pose(entity, q);
+    Some(AttachActor {
+        world: xf.translation,
+        yaw: pose.as_ref().map_or(xf.rotation, AttachPose::yaw),
+        pose,
+    })
+}
+
+// .agents/skills/retail-observe/references/2026-10-05-attached-effect-placement.md Reference
+// point: `point(i, A, B)` in Bevy world space. Reference 2 is the static nameplate rule (table
+// translation scaled by the model, no pose, no facing); every other index is the posed locator,
+// with 49/50 standing for the ring entry nearest the other actor (`other`) and 51 for the one
+// nearest the camera eye. An actor without a pose, or an index the table lacks, gives its feet.
+fn reference_point(
+    actor: &AttachActor<'_>,
+    reference: u8,
+    other: Option<Vec3>,
+    camera_eye: Option<Vec3>,
 ) -> Vec3 {
-    let (Some(reference), Some(attach)) = (attach_joint_reference(def), attach) else {
-        return Vec3::ZERO;
+    let Some(pose) = &actor.pose else {
+        return actor.world;
     };
-    let toward = other_world.map(|w| attach.root.inverse().transform_point3(w));
+    let reference = resolve_reference_alias(reference);
+    if reference == ffxi_dat::skel::standard_position::ABOVE_HEAD {
+        return ffxi_actor::skeleton_instance::nameplate_locator_offset(
+            pose.skeleton,
+            Vec3::splat(pose.scale),
+        )
+        .map(|offset| actor.world + crate::ffxi_actor_render::ffxi_to_bevy_basis() * offset)
+        .unwrap_or(actor.world);
+    }
+    let toward_world = if reference == usize::from(CAMERA_NEAREST_REFERENCE) {
+        camera_eye.or(other)
+    } else {
+        other
+    };
+    let toward = toward_world.map(|w| pose.root.inverse().transform_point3(w));
     ffxi_actor::skeleton_instance::attach_joint_position(
-        attach.pose,
-        attach.skeleton,
+        pose.pose,
+        pose.skeleton,
         reference,
         toward,
     )
-    .map(|local| attach.root.transform_vector3(local))
-    .unwrap_or(Vec3::ZERO)
+    .map(|local| pose.root.transform_point3(local))
+    .unwrap_or(actor.world)
 }
 
-// The world origin a generator emits from: the attach actor's root plus the joint the def
-// hangs off (research/xim ParticleGeneratorAttachment.kt updateAssociatedPosition). The spawn
-// path computes it once; `track_attached_origins` recomputes it every frame for the defs that
-// carry the 0x11 follow.
-fn attached_origin(
+/// The frame an actor-attached generator's elements are placed in:
+/// `world = translation + rotation * (local x position_fit)`, `local` being the DAT-frame
+/// element position through the FFXI->Bevy basis.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct AttachFrame {
+    translation: Vec3,
+    rotation: Quat,
+    position_fit: Vec3,
+    model_fit: Vec3,
+}
+
+impl AttachFrame {
+    fn at(translation: Vec3) -> Self {
+        AttachFrame {
+            translation,
+            rotation: Quat::IDENTITY,
+            position_fit: Vec3::ONE,
+            model_fit: Vec3::ONE,
+        }
+    }
+
+    fn point(&self, local_dat: Vec3) -> Vec3 {
+        self.translation
+            + self.rotation * (local_dat * WORLD_PARTICLE_VEL_BASIS * self.position_fit)
+    }
+}
+
+// .agents/skills/retail-observe/references/2026-10-05-attached-effect-placement.md Scale — a fit
+// nibble of 1-4 sizes by the caster, 5-8 by the target; its low two bits pick the axes, none
+// meaning uniform by the larger of width and height. Width is the box x extent times the actor
+// scale over 1.7, height the y extent over 1.9, from the skeleton's first bounding box. The
+// record's per-generator factor has no located DAT field, so it keeps its unset value of 1,
+// under which the fit is the raw scale.
+const FIT_CASTER_NIBBLES: std::ops::RangeInclusive<u8> = 1..=4;
+const FIT_TARGET_NIBBLES: std::ops::RangeInclusive<u8> = 5..=8;
+const FIT_AXES_MASK: u8 = 0b11;
+const FIT_HORIZONTAL_BIT: u8 = 0b01;
+const FIT_VERTICAL_BIT: u8 = 0b10;
+const FIT_WIDTH_DIVISOR: f32 = 1.7;
+const FIT_HEIGHT_DIVISOR: f32 = 1.9;
+
+struct FitScales {
+    width: f32,
+    height: f32,
+}
+
+fn actor_fit_scales(actor: &AttachActor<'_>) -> FitScales {
+    let unscaled = FitScales {
+        width: 1.0,
+        height: 1.0,
+    };
+    let Some(pose) = &actor.pose else {
+        return unscaled;
+    };
+    let Some(b) = pose.skeleton.bounding_boxes.first() else {
+        return unscaled;
+    };
+    FitScales {
+        width: (b.x_max - b.x_min).abs() * pose.scale / FIT_WIDTH_DIVISOR,
+        height: (b.y_max - b.y_min).abs() * pose.scale / FIT_HEIGHT_DIVISOR,
+    }
+}
+
+fn fit_vector(nibble: u8, caster: &AttachActor<'_>, target: &AttachActor<'_>) -> Vec3 {
+    let actor = if FIT_CASTER_NIBBLES.contains(&nibble) {
+        caster
+    } else if FIT_TARGET_NIBBLES.contains(&nibble) {
+        target
+    } else {
+        return Vec3::ONE;
+    };
+    let FitScales { width, height } = actor_fit_scales(actor);
+    let axes = nibble & FIT_AXES_MASK;
+    if axes == 0 {
+        return Vec3::splat(width.max(height));
+    }
+    let horizontal = if axes & FIT_HORIZONTAL_BIT != 0 {
+        width
+    } else {
+        1.0
+    };
+    let vertical = if axes & FIT_VERTICAL_BIT != 0 {
+        height
+    } else {
+        1.0
+    };
+    Vec3::new(horizontal, vertical, horizontal)
+}
+
+// The two-point basis: X along `span`, pitch and yaw taken from it and no roll, so Z stays
+// horizontal. A zero span has no direction and leaves the frame unturned.
+fn two_point_rotation(span: Vec3) -> Quat {
+    let Some(x) = span.try_normalize() else {
+        return Quat::IDENTITY;
+    };
+    let z = x.cross(Vec3::Y).try_normalize().unwrap_or(Vec3::Z);
+    let y = z.cross(x);
+    Quat::from_mat3(&Mat3::from_cols(x, y, z))
+}
+
+// The placement the legacy attach type gave the modes whose frame the record leaves open
+// (9-12 and 16-31): the caster's source reference, or for a target-side type the target's ring
+// entry nearest the caster unless the source reference is itself a selector; the weapon,
+// celestial and unattached types sit at the caster's feet.
+fn legacy_attach_point(
+    def: &ParticleGeneratorDef,
+    caster: &AttachActor<'_>,
+    target: &AttachActor<'_>,
+    camera_eye: Option<Vec3>,
+) -> Vec3 {
+    use ffxi_dat::particle_gen::AttachType;
+    match def.attach_type {
+        AttachType::TargetActor
+        | AttachType::TargetActorSourceFacing
+        | AttachType::TargetToSourceBasis => {
+            let selectors = ffxi_actor::skeleton_instance::NEAREST_JOINT_REFERENCES;
+            let reference = if selectors.contains(&usize::from(def.attach_eid)) {
+                def.attach_eid
+            } else {
+                *selectors.start() as u8
+            };
+            reference_point(target, reference, Some(caster.world), camera_eye)
+        }
+        AttachType::SourceActor
+        | AttachType::SourceActorTargetFacing
+        | AttachType::SourceToTargetBasis
+        | AttachType::ZoneActorA
+        | AttachType::ZoneActorB
+        | AttachType::ZoneActorC => {
+            reference_point(caster, def.attach_eid, Some(target.world), camera_eye)
+        }
+        AttachType::SourceActorWeapon | AttachType::None | AttachType::Sun | AttachType::Moon => {
+            caster.world
+        }
+    }
+}
+
+// .agents/skills/retail-observe/references/2026-10-05-attached-effect-placement.md Attach frame.
+// Modes 1/5 translate to the caster's source reference, 2/4 to the target's target reference,
+// turned by the caster's (1, 4) or the target's (2, 5) yaw; 3/6 span the two points, the span
+// length replacing the X position fit. An untracked target stands in as the caster so a routine
+// never loses its effect; the record's identity frame for a missing actor is not reproduced.
+fn attach_frame(
     def: &ParticleGeneratorDef,
     owner: Entity,
     target: Option<Entity>,
-    q_xf: &Query<&Transform>,
-    q_children: &Query<&Children>,
-    q_render: &Query<&FfxiRenderActor>,
-) -> Option<Vec3> {
-    let origin_entity =
-        crate::scheduler_runtime::particle_origin_entity(def.attach_type, owner, target);
-    let origin_xf = q_xf.get(origin_entity).ok()?;
-    // research/xim SkeletonInstance.kt getStandardJointExtended has no source-vs-target
-    // guard: it always walks the ring and keeps the reference nearest the other actor. On a
-    // self-targeted action both sides ARE the same actor, and the winner is the ring point
-    // nearest the actor's own origin — torso height, which is the whole point of this bead.
-    // Only an attachment with no second actor at all falls back to the root.
-    let other_world = if origin_entity == owner {
-        target
+    q: &AttachQueries<'_, '_>,
+) -> Option<AttachFrame> {
+    use ffxi_dat::particle_gen::attach_mode as mode;
+    let camera_eye = q.camera_eye();
+    let caster = attach_actor(owner, q)?;
+    let target = target
+        .filter(|t| *t != owner)
+        .and_then(|t| attach_actor(t, q))
+        .unwrap_or(caster);
+    let source_point = || reference_point(&caster, def.attach_eid, Some(target.world), camera_eye);
+    let target_point = || {
+        reference_point(
+            &target,
+            def.attach_target_reference,
+            Some(caster.world),
+            camera_eye,
+        )
+    };
+    let (translation, rotation, span) = match def.attach_mode {
+        mode::SOURCE => (source_point(), caster.yaw, None),
+        mode::SOURCE_WITH_TARGET_YAW => (source_point(), target.yaw, None),
+        mode::TARGET => (target_point(), target.yaw, None),
+        mode::TARGET_WITH_SOURCE_YAW => (target_point(), caster.yaw, None),
+        mode::SOURCE_TO_TARGET | mode::TARGET_TO_SOURCE => {
+            let (start, end) = if def.attach_mode == mode::SOURCE_TO_TARGET {
+                (source_point(), target_point())
+            } else {
+                (target_point(), source_point())
+            };
+            let span = end - start;
+            (start, two_point_rotation(span), Some(span.length()))
+        }
+        _ => (
+            legacy_attach_point(def, &caster, &target, camera_eye),
+            Quat::IDENTITY,
+            None,
+        ),
+    };
+    let (mut position_fit, model_fit) = if def.attach_mode == mode::UNATTACHED {
+        (Vec3::ONE, Vec3::ONE)
     } else {
-        Some(owner)
+        (
+            fit_vector(def.attach_position_fit, &caster, &target),
+            fit_vector(def.attach_model_fit, &caster, &target),
+        )
+    };
+    if let Some(distance) = span {
+        position_fit.x = distance;
     }
-    .and_then(|e| q_xf.get(e).ok())
-    .map(|xf| xf.translation);
-    let joint_offset = attach_joint_offset(
-        def,
-        attach_pose(origin_entity, q_children, q_xf, q_render),
-        other_world,
-    );
-    Some(origin_xf.translation + joint_offset + Vec3::Y * def.base_position[1])
+    Some(AttachFrame {
+        translation,
+        rotation,
+        position_fit,
+        model_fit,
+    })
+}
+
+// The per-tick share of a per-update follow rate; a snap stays a snap at any frame time.
+fn follow_blend(rate: f32, frames: f32) -> f32 {
+    if rate >= 1.0 {
+        1.0
+    } else {
+        1.0 - (1.0 - rate.max(0.0)).powf(frames)
+    }
 }
 
 /// Spawns the live generator entities for the scheduler's particle stages.
@@ -999,9 +1235,7 @@ pub fn spawn_particle_generators(
     mut events: MessageReader<SchedulerStageEvent>,
     q_actors: Query<(&Transform, Option<&ActionAssets>)>,
     q_action_target: Query<&crate::scheduler_runtime::ActionTarget>,
-    q_xf: Query<&Transform>,
-    q_children: Query<&Children>,
-    q_render: Query<&FfxiRenderActor>,
+    attach: AttachQueries,
     global: Option<Res<GlobalEffectDir>>,
     alpha_override: Option<Res<TestAlphaOverride>>,
     trace: Option<Res<crate::scheduler_runtime::VfxTrace>>,
@@ -1021,10 +1255,11 @@ pub fn spawn_particle_generators(
         let Ok((actor_xf, local_assets)) = q_actors.get(ev.actor) else {
             continue;
         };
-        let actor_assets = q_children
+        let actor_assets = attach
+            .children
             .get(ev.actor)
             .ok()
-            .and_then(|c| c.iter().find_map(|child| q_render.get(child).ok()))
+            .and_then(|c| c.iter().find_map(|child| attach.render.get(child).ok()))
             .map(|a| a.action_assets());
         let local_dir = ev.stage.stage.local_dir;
         let Some(assets) = assets_holding(
@@ -1053,7 +1288,7 @@ pub fn spawn_particle_generators(
                         .ok()
                         .and_then(|t| t.0)
                         .unwrap_or(ev.actor);
-                    match q_xf.get(origin) {
+                    match attach.xf.get(origin) {
                         Ok(xf) => {
                             play_generator_sound(
                                 se_id,
@@ -1156,8 +1391,9 @@ pub fn spawn_particle_generators(
                 continue;
             };
             let target = q_action_target.get(ev.actor).ok().and_then(|t| t.0);
-            let origin = attached_origin(&def, ev.actor, target, &q_xf, &q_children, &q_render)
-                .unwrap_or(actor_xf.translation + Vec3::Y * def.base_position[1]);
+            let frame = attach_frame(&def, ev.actor, target, &attach)
+                .unwrap_or(AttachFrame::at(actor_xf.translation));
+            let origin = frame.point(Vec3::from_array(def.base_position));
             arm_rumble_effect(
                 envelope.clone(),
                 near,
@@ -1199,8 +1435,9 @@ pub fn spawn_particle_generators(
             continue;
         };
         let target = q_action_target.get(ev.actor).ok().and_then(|t| t.0);
-        let origin = attached_origin(&def, ev.actor, target, &q_xf, &q_children, &q_render)
-            .unwrap_or(actor_xf.translation + Vec3::Y * def.base_position[1]);
+        let frame = attach_frame(&def, ev.actor, target, &attach)
+            .unwrap_or(AttachFrame::at(actor_xf.translation));
+        let origin = frame.translation;
         let draw_path = d3m_draw_path(&tex);
         let mat = mats.add(FfxiParticleMaterial::for_def(
             &def,
@@ -1259,7 +1496,7 @@ pub fn spawn_particle_generators(
 
         // A zero-duration stage (hit1's g01x) emits exactly the primed first burst — the
         // flash — and stops; its particles live out their own max_life.
-        sim.generators.push(LiveGenerator {
+        let mut generator = LiveGenerator {
             emit_window_frames: ev.stage.stage.duration_frames as f32,
             origin_routine: Some(RoutineOrigin {
                 owner: ev.actor,
@@ -1267,6 +1504,7 @@ pub fn spawn_particle_generators(
                 routine: ev.scheduler,
             }),
             child_factories,
+            setup_position: Vec3::from_array(def.base_position),
             ..LiveGenerator::new(
                 def,
                 GeneratorTracks::resolve(&def, assets, None),
@@ -1277,7 +1515,9 @@ pub fn spawn_particle_generators(
                 entity,
                 origin,
             )
-        });
+        };
+        generator.place_in(&frame);
+        sim.generators.push(generator);
 
         let mut chain = vec![(def_dir, ev.stage.stage.id)];
         let mut linked_dir = def_dir;
@@ -1308,6 +1548,7 @@ pub fn spawn_particle_generators(
             linked.immediate_parent = Some(parent.entity);
             linked.def = linked_def;
             linked.origin = parent.origin;
+            linked.setup_position = Vec3::from_array(linked_def.base_position);
             // .agents/skills/retail-observe/references/2026-10-04-immediate-generator-bindings.md Supported rule.
             linked.tracks = GeneratorTracks::resolve(&linked_def, assets, None);
             linked.child_factories = resolve_child_factories(
@@ -1556,35 +1797,35 @@ pub fn stop_generators_for_despawned_owners(
     sim.stop_generators_of_dead_owners(|e| q_alive.get(e).is_ok());
 }
 
-// 0x11 AssociationUpdater: retail re-snaps the associated position to the attach actor's
-// position plus joint every frame (research/xim ParticleGeneratorAttachment.kt
-// updateAssociatedPosition - a hard copy; the follow-rate factor is parsed but unused
-// there). The spawn path computes the origin once, so without this a cast aura or hit
-// flash keeps emitting from where the actor stood when the stage fired.
+// .agents/skills/retail-observe/references/2026-10-05-attached-effect-placement.md Per-update
+// follow — a generator carrying updater 0x11 rebuilds its attach frame every update and blends
+// the stored frame toward it: bit 0 the translation, bit 1 the rotation, at the authored rate.
+// The level-up word is translation-only at a snap, so the origin tracks the posed reference
+// while the rotation stays the activation yaw. The spawn path builds the frame once, so without
+// this a cast aura or hit flash keeps emitting from where the actor stood when the stage fired.
 //
 // Only scheduled generators track: auto-run zone generators are parented to their
 // actor root and ride along, and the camera/celestial origins have their own
 // per-frame setters.
 pub fn track_attached_origins(
-    q_xf: Query<&Transform>,
-    q_children: Query<&Children>,
-    q_render: Query<&FfxiRenderActor>,
+    attach: AttachQueries,
     q_action_target: Query<&crate::scheduler_runtime::ActionTarget>,
+    time: Res<Time>,
     mut sim: ResMut<ParticleSimulator>,
 ) {
     use ffxi_dat::particle_gen::AttachType;
+    let frames = time.delta_secs() * ROUTINE_FPS;
     for g in &mut sim.generators {
         let Some(origin_routine) = g.origin_routine else {
             continue;
         };
-        if !g
+        let Some(follow) = g
             .def
             .association
-            .as_ref()
-            .is_some_and(|a| a.follow_position)
-        {
+            .filter(|a| a.follow_position || a.follow_facing)
+        else {
             continue;
-        }
+        };
         // xim's AttachType.None branch updates nothing; Sun/Moon ride
         // `set_celestial_origins` instead.
         match g.def.attach_type {
@@ -1595,15 +1836,15 @@ pub fn track_attached_origins(
             .get(origin_routine.owner)
             .ok()
             .and_then(|t| t.0);
-        if let Some(origin) = attached_origin(
-            &g.def,
-            origin_routine.owner,
-            target,
-            &q_xf,
-            &q_children,
-            &q_render,
-        ) {
-            g.origin = origin;
+        let Some(frame) = attach_frame(&g.def, origin_routine.owner, target, &attach) else {
+            continue;
+        };
+        let blend = follow_blend(follow.rate(), frames);
+        if follow.follow_position {
+            g.origin = g.origin.lerp(frame.translation, blend);
+        }
+        if follow.follow_facing {
+            g.frame_rot = g.frame_rot.slerp(frame.rotation, blend);
         }
     }
 }
@@ -1873,7 +2114,17 @@ fn instantiate_child_generators(
         anchor: Option<AnchorState>,
         factory_idx: usize,
         window: f32,
+        // The parent's attachment context, which a child inherits
+        // (.agents/skills/retail-observe/references/2026-10-05-attached-effect-placement.md
+        // Per-update follow).
+        frame: AttachFrame,
     }
+    let inherited_frame = |g: &LiveGenerator, translation: Vec3| AttachFrame {
+        translation,
+        rotation: g.frame_rot,
+        position_fit: g.position_fit,
+        model_fit: g.model_fit,
+    };
     let mut reqs: Vec<SpawnReq> = Vec::new();
     for (gi, g) in sim.generators.iter().enumerate() {
         for &(pos, fidx) in &g.pending_expiry_spawns {
@@ -1887,6 +2138,7 @@ fn instantiate_child_generators(
                     // research/xim ParticleExpirationHandlers.kt EmitChildHandler — one burst at
                     // expiry, never again (nothing re-emits the child afterwards).
                     window: 0.0,
+                    frame: inherited_frame(g, pos),
                 });
             }
         }
@@ -1911,6 +2163,7 @@ fn instantiate_child_generators(
                         anchor: Some(anchor),
                         factory_idx: fidx,
                         window,
+                        frame: inherited_frame(g, anchor.pos),
                     });
                 }
             }
@@ -2004,7 +2257,7 @@ fn instantiate_child_generators(
                     ))
                     .id();
                 let new_idx = sim.generators.len();
-                sim.generators.push(LiveGenerator {
+                let mut child = LiveGenerator {
                     emit_window_frames: r.window,
                     parent: r.owner,
                     anchor: r.anchor,
@@ -2019,7 +2272,9 @@ fn instantiate_child_generators(
                         entity,
                         r.pos,
                     )
-                });
+                };
+                child.place_in(&r.frame);
+                sim.generators.push(child);
                 if let Some((ogi, pid)) = r.owner {
                     if let Some(p) = sim
                         .generators
@@ -2503,13 +2758,13 @@ fn emit(g: &mut LiveGenerator, life_frames: f32) {
         let tilt = sp.tilt + (next_unit(&mut g.emit_rng) * 2.0 - 1.0) * sp.tilt_variance;
         let offset = Vec3::from_array(sp.offset(u, azimuth, tilt));
         pos_local += if sp.camera_oriented {
-            g.actor_rot.inverse() * g.cam_view * offset
+            (g.actor_rot * g.frame_rot).inverse() * g.cam_view * offset
         } else {
             offset
         };
     }
     g.elements_emitted += 1;
-    let mut pos = pos_local * g.vel_basis;
+    let mut pos = (g.setup_position + pos_local) * g.vel_basis;
     // 0x03 VelocityVarianceSetup: a uniform [-v, v] draw per axis on top of the 0x02 base
     // (research/xim ParticleInitializers.kt VelocityVarianceSetup — the shipped blocks all
     // sit after their 0x02, so base-plus-variance is the authored order).
@@ -2686,7 +2941,7 @@ fn emit(g: &mut LiveGenerator, life_frames: f32) {
     let mut vel_world = vel * g.vel_basis;
     if let Some(a) = g.anchor {
         if g.def.parent_position_copy {
-            pos = a.pos - g.origin;
+            pos = frame_local(g, a.pos);
         }
         if let Some(mult) = g.def.parent_velocity {
             vel_world += a.vel * mult;
@@ -3119,8 +3374,7 @@ fn expected_factor_alpha(raw: f32) -> f32 {
 }
 
 fn track_position(g: &LiveGenerator, p: &Particle, progress: f32) -> Vec3 {
-    let origin = particle_origin(g, p);
-    let mut world = origin + p.pos;
+    let mut local = p.pos;
     for (axis, track) in [
         &g.tracks.position_x,
         &g.tracks.position_y,
@@ -3131,11 +3385,22 @@ fn track_position(g: &LiveGenerator, p: &Particle, progress: f32) -> Vec3 {
     {
         if let Some(t) = track {
             let basis = g.vel_basis[axis];
-            world[axis] =
-                origin[axis] + basis * t.sample_from(progress, Some(p.spawn_pos[axis] * basis));
+            local[axis] = basis * t.sample_from(progress, Some(p.spawn_pos[axis] * basis));
         }
     }
-    world
+    particle_origin(g, p) + g.frame_rot * (local * g.position_fit)
+}
+
+// The inverse of `track_position`'s placement for a world point; an axis whose fit collapsed to
+// zero has no inverse and is left unscaled.
+fn frame_local(g: &LiveGenerator, world: Vec3) -> Vec3 {
+    let local = g.frame_rot.inverse() * (world - g.origin);
+    let unfit = |value: f32, fit: f32| if fit == 0.0 { value } else { value / fit };
+    Vec3::new(
+        unfit(local.x, g.position_fit.x),
+        unfit(local.y, g.position_fit.y),
+        unfit(local.z, g.position_fit.z),
+    )
 }
 
 fn particle_origin(g: &LiveGenerator, p: &Particle) -> Vec3 {
@@ -3288,9 +3553,11 @@ fn generator_bounds(
     };
     let mut lo = Vec3::splat(f32::INFINITY);
     let mut hi = Vec3::splat(f32::NEG_INFINITY);
+    let model_fit = g.model_fit.abs().max_element();
     for p in &g.particles {
         let draw = particle_draw(g, p, clock);
-        let r = g.bound_radius * draw.scale.x.abs().max(draw.scale.y.abs()).max(sz.abs());
+        let r =
+            g.bound_radius * draw.scale.x.abs().max(draw.scale.y.abs()).max(sz.abs()) * model_fit;
         lo = lo.min(draw.world - r);
         hi = hi.max(draw.world + r);
     }
@@ -3385,7 +3652,7 @@ fn rebuild_mesh(g: &LiveGenerator, cam: CameraView, clock: &CelestialClock, mesh
         } else if g.orientation.is_some() {
             particle_rotation(p)
         } else if movement_bb {
-            let mut vel_dat = p.vel * g.vel_basis;
+            let mut vel_dat = (g.frame_rot * p.vel) * g.vel_basis;
             if g.def.billboard == ParticleBillboard::MovementHorizontal {
                 vel_dat.y = 0.0;
             }
@@ -3407,6 +3674,10 @@ fn rebuild_mesh(g: &LiveGenerator, cam: CameraView, clock: &CelestialClock, mesh
         // instead of standing up above the emitter. Actor-local generators integrate in the
         // actor frame, whose parent transform already carries the dat_mzb.rs to_bevy basis.
         let world_basis = (g.orientation.is_some() || axial || movement_bb) && !g.actor_local;
+        // .agents/skills/retail-observe/references/2026-10-05-attached-effect-placement.md
+        // Element placement and billboard: only a non-billboard element takes the frame's
+        // rotation; a screen billboard reads the frame through its world point alone.
+        let turned_by_frame = g.orientation.is_some() && !g.actor_local;
         // A screen billboard's template is DAT-frame geometry too (Y down: the campfire flame
         // `hi12` rises toward negative y). An actor-local generator inherits the FFXI->Bevy basis
         // from its parent transform; a world-space one folds it into the template before the
@@ -3415,7 +3686,8 @@ fn rebuild_mesh(g: &LiveGenerator, cam: CameraView, clock: &CelestialClock, mesh
         let screen_basis = g.orientation.is_none() && !axial && !movement_bb && !g.actor_local;
         let base = positions.len() as u32;
         for ((tp, uv), vertex) in tpl.positions.iter().zip(&tpl.uvs).zip(&tpl.colors) {
-            let local = Vec3::new(tp.x * draw.scale.x, tp.y * draw.scale.y, tp.z * sz);
+            let local =
+                Vec3::new(tp.x * draw.scale.x, tp.y * draw.scale.y, tp.z * sz) * g.model_fit;
             let local = if screen_basis {
                 local * g.vel_basis
             } else {
@@ -3424,6 +3696,11 @@ fn rebuild_mesh(g: &LiveGenerator, cam: CameraView, clock: &CelestialClock, mesh
             let oriented = rot * local;
             let oriented = if world_basis {
                 oriented * g.vel_basis
+            } else {
+                oriented
+            };
+            let oriented = if turned_by_frame {
+                g.frame_rot * oriented
             } else {
                 oriented
             };
@@ -3913,6 +4190,10 @@ mod tests {
             elements_emitted: 0,
             cam_view: Quat::IDENTITY,
             actor_rot: Quat::IDENTITY,
+            frame_rot: Quat::IDENTITY,
+            position_fit: Vec3::ONE,
+            model_fit: Vec3::ONE,
+            setup_position: Vec3::ZERO,
             entity_world: GlobalTransform::IDENTITY,
             parent: None,
             anchor: None,
@@ -6210,12 +6491,13 @@ mod tests {
         let mut sim = ParticleSimulator::default();
         sim.generators.push(g);
         world.insert_resource(sim);
+        world.insert_resource(Time::<()>::default());
 
         world.run_system_once(track_attached_origins).unwrap();
         assert_eq!(
             world.resource::<ParticleSimulator>().generators[0].origin,
-            Vec3::new(0.0, 0.5, 0.0),
-            "the origin snaps to the actor's position plus base height"
+            Vec3::ZERO,
+            "the origin snaps to the actor's reference point"
         );
 
         *world.get_mut::<Transform>(owner).unwrap() =
@@ -6223,7 +6505,7 @@ mod tests {
         world.run_system_once(track_attached_origins).unwrap();
         assert_eq!(
             world.resource::<ParticleSimulator>().generators[0].origin,
-            Vec3::new(3.0, 0.5, -4.0),
+            Vec3::new(3.0, 0.0, -4.0),
             "and keeps tracking as the actor moves"
         );
     }
@@ -6253,6 +6535,7 @@ mod tests {
         let mut sim = ParticleSimulator::default();
         sim.generators.push(g);
         world.insert_resource(sim);
+        world.insert_resource(Time::<()>::default());
 
         world.run_system_once(track_attached_origins).unwrap();
         assert_eq!(
@@ -8038,60 +8321,26 @@ mod tests {
         }
     }
 
-    // research/XIClient Attachment.cpp MakeAttachMatrix — every actor attach type resolves the
-    // def's single EID index; the celestial/unattached ones read none.
+    // .agents/skills/retail-observe/references/2026-10-05-attached-effect-placement.md Reference
+    // point: 54/55 are the hand locators, 56-60 the extra weapon locators, 52/53 fall back to
+    // the root here, and every other index is itself.
     #[test]
-    fn attach_joint_reference_reads_the_single_eid_index() {
-        use ffxi_dat::particle_gen::AttachType;
-        let mut d = def(1.0, 1.0, 1);
-        d.attach_eid = 49;
-
-        for attach in [
-            AttachType::SourceActor,
-            AttachType::SourceActorTargetFacing,
-            AttachType::SourceToTargetBasis,
-            AttachType::ZoneActorA,
-            AttachType::ZoneActorB,
-            AttachType::ZoneActorC,
-            AttachType::TargetActor,
-            AttachType::TargetActorSourceFacing,
-            AttachType::TargetToSourceBasis,
-        ] {
-            d.attach_type = attach;
-            assert_eq!(attach_joint_reference(&d), Some(49), "{attach:?}");
+    fn reference_aliases_remap_the_hand_weapon_and_footstep_indices() {
+        use ffxi_dat::skel::standard_position::{LEFT_HAND, RIGHT_HAND};
+        assert_eq!(resolve_reference_alias(54), LEFT_HAND);
+        assert_eq!(resolve_reference_alias(55), RIGHT_HAND);
+        for (alias, locator) in (56u8..=60).zip(102usize..=106) {
+            assert_eq!(resolve_reference_alias(alias), locator, "alias {alias}");
         }
-        for attach in [
-            AttachType::None,
-            AttachType::Sun,
-            AttachType::Moon,
-            AttachType::SourceActorWeapon,
-        ] {
-            d.attach_type = attach;
-            assert_eq!(attach_joint_reference(&d), None, "{attach:?}");
+        for footstep in MOUNT_FOOTSTEP_JOINTS {
+            assert_eq!(resolve_reference_alias(footstep), MOUNT_FOOTSTEP_REFERENCE);
         }
-    }
-
-    // research/xim ParticleGeneratorAttachment.kt resolveExtendedJoints — a mount's two footstep joints are rewritten
-    // to reference 0 before resolution, and :284-303 takes SourceActorWeapon out of the joint path
-    // entirely (its remap is PC-model-gated upstream and we carry no PC-model flag).
-    #[test]
-    fn attach_joint_reference_rewrites_the_joints_retail_rewrites() {
-        use ffxi_dat::particle_gen::AttachType;
-        let mut d = def(1.0, 1.0, 1);
-        d.attach_type = AttachType::SourceActor;
-        for joint in MOUNT_FOOTSTEP_JOINTS {
-            d.attach_eid = joint;
+        for plain in [0u8, 1, 2, 21, 48, 49, 50, 51, 61, 127] {
             assert_eq!(
-                attach_joint_reference(&d),
-                Some(MOUNT_FOOTSTEP_REFERENCE),
-                "footstep joint {joint}"
+                resolve_reference_alias(plain),
+                usize::from(plain),
+                "{plain}"
             );
-        }
-
-        d.attach_type = AttachType::SourceActorWeapon;
-        for joint in [31u8, 32, 33, 34, 35, 36, 37, 54, 55, 56, 57, 58, 59, 60] {
-            d.attach_eid = joint;
-            assert_eq!(attach_joint_reference(&d), None, "weapon joint {joint}");
         }
     }
 
@@ -8110,19 +8359,20 @@ mod tests {
     }
 
     // ROM/0/0.DAT as shipped (scheduler_runtime.rs parse_action_bytes,
-    // GLOBAL_EFFECT_DIR_FILE_ID): the melee hit sparks the `chit` chain reaches. Pinned against
-    // Attachment.cpp MakeAttachMatrix's index formula: every one of them carries EID 0, and the
-    // word's bits 10-15 (which read as a phantom "joint 49") are not part of the index.
+    // GLOBAL_EFFECT_DIR_FILE_ID): the melee hit sparks the `chit` chain reaches, target-side
+    // modes carrying target reference 49
+    // (.agents/skills/retail-observe/references/2026-10-05-attached-effect-placement.md Other
+    // attached effects).
     const HIT_SPARK_DIR: [u8; 4] = *b"hit1";
-    const HIT_SPARK_EID_INDEX: u8 = 0;
-    const HIT_SPARK_GENERATORS: [([u8; 4], ffxi_dat::particle_gen::AttachType); 4] = [
-        (*b"g010", ffxi_dat::particle_gen::AttachType::TargetActor),
-        (*b"g011", ffxi_dat::particle_gen::AttachType::TargetActor),
+    const HIT_SPARK_SOURCE_REFERENCE: u8 = 0;
+    const HIT_SPARK_GENERATORS: [([u8; 4], u8); 4] = [
+        (*b"g010", ffxi_dat::particle_gen::attach_mode::TARGET),
+        (*b"g011", ffxi_dat::particle_gen::attach_mode::TARGET),
         (
             *b"g012",
-            ffxi_dat::particle_gen::AttachType::TargetActorSourceFacing,
+            ffxi_dat::particle_gen::attach_mode::TARGET_WITH_SOURCE_YAW,
         ),
-        (*b"g013", ffxi_dat::particle_gen::AttachType::TargetActor),
+        (*b"g013", ffxi_dat::particle_gen::attach_mode::TARGET),
     ];
 
     fn retail_global_effect_assets() -> Option<crate::scheduler_runtime::ActionAssets> {
@@ -8294,33 +8544,31 @@ mod tests {
         )
     }
 
-    // Pinned against the install: every `hit1` spark generator attaches to the TARGET actor
-    // with EID index 0 (Attachment.cpp MakeAttachMatrix formula). Placement resolves that plain
-    // index through the nearest-ring selector — retail puts the flash at the contact point, not
-    // the victim's root
+    // Pinned against the install: every `hit1` spark generator is a target-side mode whose
+    // target reference is the 49 selector, which is what puts the flash at the contact point
+    // rather than the victim's root
     // (.agents/skills/retail-observe/references/2026-09-27-hit-effect-contact-point.md).
     #[test]
-    fn real_dat_hit_sparks_carry_the_retail_eid_index() {
+    fn real_dat_hit_sparks_carry_the_target_reference_selector() {
         let Some(defs) = retail_hit_spark_defs() else {
             return;
         };
-        for ((name, def), (_, attach)) in defs.iter().zip(HIT_SPARK_GENERATORS) {
+        for ((name, def), (_, mode)) in defs.iter().zip(HIT_SPARK_GENERATORS) {
             let name = String::from_utf8_lossy(name).to_string();
-            assert_eq!(def.attach_type, attach, "{name}");
-            assert_eq!(def.attach_eid, HIT_SPARK_EID_INDEX, "{name}");
+            assert_eq!(def.attach_mode, mode, "{name}");
+            assert_eq!(def.attach_eid, HIT_SPARK_SOURCE_REFERENCE, "{name}");
             assert_eq!(
-                attach_joint_reference(def),
-                Some(*ffxi_actor::skeleton_instance::NEAREST_JOINT_REFERENCES.start()),
-                "{name} resolves through the nearest-ring selector"
+                usize::from(def.attach_target_reference),
+                *ffxi_actor::skeleton_instance::NEAREST_JOINT_REFERENCES.start(),
+                "{name} attaches through the nearest-ring selector"
             );
             assert_eq!(def.base_position, [0.0; 3], "{name}");
         }
     }
 
-    // The plain EID index resolves through the nearest-ring selector toward the attacker: the
-    // offset is a ring locator at torso height on the struck side, at every victim facing and
-    // attacker bearing
-    // (.agents/skills/retail-observe/references/2026-09-27-hit-effect-contact-point.md).
+    // The target reference 49 resolves to the ring entry nearest the attacker: the offset is a
+    // ring locator at torso height on the struck side, at every victim facing and attacker
+    // bearing (.agents/skills/retail-observe/references/2026-09-27-hit-effect-contact-point.md).
     #[test]
     fn real_dat_hit_spark_offset_is_the_contact_point() {
         let (Some(skeleton), Some(defs)) = (retail_hume_m_skeleton(), retail_hit_spark_defs())
@@ -8337,27 +8585,32 @@ mod tests {
         const ATTACKER_REACH: f32 = 3.0;
 
         for victim_facing in [0.0, 1.0, 2.5, -2.0] {
+            let yaw = Quat::from_rotation_y(victim_facing);
             let root = Transform {
                 translation: VICTIM_WORLD,
-                rotation: Quat::from_rotation_y(victim_facing)
-                    * crate::ffxi_actor_render::ffxi_to_bevy_basis(),
+                rotation: yaw * crate::ffxi_actor_render::ffxi_to_bevy_basis(),
                 scale: Vec3::ONE,
             }
             .compute_affine();
+            let victim = AttachActor {
+                world: VICTIM_WORLD,
+                yaw,
+                pose: Some(AttachPose {
+                    pose: &pose,
+                    skeleton: &skeleton,
+                    root,
+                    facing_dir: 0.0,
+                    scale: 1.0,
+                }),
+            };
             for bearing in 0..8 {
                 let a = bearing as f32 * std::f32::consts::TAU / 8.0;
                 let toward = Vec3::new(a.cos(), 0.0, a.sin());
                 let attacker = VICTIM_WORLD + toward * ATTACKER_REACH;
                 for (name, def) in &defs {
-                    let offset = attach_joint_offset(
-                        def,
-                        Some(AttachPose {
-                            pose: &pose,
-                            skeleton: &skeleton,
-                            root,
-                        }),
-                        Some(attacker),
-                    );
+                    let offset =
+                        reference_point(&victim, def.attach_target_reference, Some(attacker), None)
+                            - VICTIM_WORLD;
                     let name = String::from_utf8_lossy(name).to_string();
                     assert!(
                         offset.y.abs() > 0.5,
@@ -8545,9 +8798,9 @@ mod tests {
 
     /// With no second actor the selector has nothing to measure against, and with no posed
     /// skeleton (a door, or a model still loading) there is no joint at all: both must fall
-    /// back to the plain root origin rather than throwing the effect somewhere arbitrary.
+    /// back to the actor's feet rather than throwing the effect somewhere arbitrary.
     #[test]
-    fn attach_joint_offset_falls_back_to_the_root() {
+    fn reference_point_without_a_pose_or_a_second_actor_falls_back_to_the_feet() {
         let Some(skeleton) = retail_hume_m_skeleton() else {
             return;
         };
@@ -8557,23 +8810,29 @@ mod tests {
             ffxi_actor::skeleton_instance::RootTransform::identity(),
             &[],
         );
-        let mut d = def(1.0, 1.0, 1);
-        d.attach_type = ffxi_dat::particle_gen::AttachType::TargetActor;
-        d.attach_eid = *ffxi_actor::skeleton_instance::NEAREST_JOINT_REFERENCES.start() as u8;
-
-        assert_eq!(attach_joint_offset(&d, None, Some(Vec3::X)), Vec3::ZERO);
+        const FEET: Vec3 = Vec3::new(2.0, 1.0, -5.0);
+        let selector = *ffxi_actor::skeleton_instance::NEAREST_JOINT_REFERENCES.start() as u8;
+        let unposed = AttachActor {
+            world: FEET,
+            yaw: Quat::IDENTITY,
+            pose: None,
+        };
         assert_eq!(
-            attach_joint_offset(
-                &d,
-                Some(AttachPose {
-                    pose: &pose,
-                    skeleton: &skeleton,
-                    root: bevy::math::Affine3A::IDENTITY,
-                }),
-                None,
-            ),
-            Vec3::ZERO
+            reference_point(&unposed, selector, Some(Vec3::X), None),
+            FEET
         );
+        let posed = AttachActor {
+            world: FEET,
+            yaw: Quat::IDENTITY,
+            pose: Some(AttachPose {
+                pose: &pose,
+                skeleton: &skeleton,
+                root: bevy::math::Affine3A::from_translation(FEET),
+                facing_dir: 0.0,
+                scale: 1.0,
+            }),
+        };
+        assert_eq!(reference_point(&posed, selector, None, None), FEET);
     }
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
@@ -8627,19 +8886,12 @@ mod tests {
             &[],
         );
         let turn = Quat::from_rotation_y(std::f32::consts::FRAC_PI_2);
-        let joint = attach_joint_reference(&source)
-            .and_then(|reference| {
-                ffxi_actor::skeleton_instance::attach_joint_position(
-                    &pose,
-                    &skeleton,
-                    reference,
-                    Some(Vec3::ZERO),
-                )
-            })
-            .unwrap_or(Vec3::ZERO);
-        let expected_origin = ACTOR_POSITION
-            + turn * crate::ffxi_actor_render::ffxi_to_bevy_basis() * joint
-            + Vec3::Y * source.base_position[1];
+        assert_eq!(usize::from(source.attach_eid), HUME_M_WAIST_REFERENCE);
+        let expected_origin = placed(
+            ACTOR_POSITION,
+            turn,
+            skeleton_reference_point(&skeleton, &pose, HUME_M_WAIST_REFERENCE),
+        );
         let actor = spawn_posed_actor(&mut app, &skeleton, &pose, ACTOR_POSITION);
         app.world_mut().entity_mut(actor).insert((
             Transform::from_translation(ACTOR_POSITION).with_rotation(turn),
@@ -8673,7 +8925,7 @@ mod tests {
         assert!(
             particle_draw(child, &child.particles[0], &sim.clock)
                 .world
-                .distance(expected_origin + parent.particles[0].pos)
+                .distance(expected_origin + turn * parent.particles[0].pos)
                 < AXIS_TOLERANCE,
             "the actor transform must not apply twice"
         );
@@ -8779,18 +9031,12 @@ mod tests {
         let def = assets
             .particle_def(stage.stage.local_dir, &stage.stage.id)
             .unwrap();
-        let reference =
-            attach_joint_reference(def).expect("the authored lettering has an attachment");
-        let joint = ffxi_actor::skeleton_instance::attach_joint_position(
-            &pose,
-            &skeleton,
-            reference,
-            Some(Vec3::ZERO),
-        )
-        .expect("the authored lettering source joint exists");
-        let expected_origin = ACTOR_WORLD
-            + crate::ffxi_actor_render::ffxi_to_bevy_basis() * joint
-            + Vec3::Y * def.base_position[1];
+        assert_eq!(usize::from(def.attach_eid), HUME_M_WAIST_REFERENCE);
+        let expected_origin = placed(
+            ACTOR_WORLD,
+            Quat::IDENTITY,
+            skeleton_reference_point(&skeleton, &pose, HUME_M_WAIST_REFERENCE),
+        );
         let actor = spawn_posed_actor(&mut app, &skeleton, &pose, ACTOR_WORLD);
         app.world_mut().entity_mut(actor).insert(assets);
         app.world_mut().write_message(SchedulerStageEvent {
@@ -8848,6 +9094,869 @@ mod tests {
             g.particles.is_empty(),
             "zero-window burst expires without respawning"
         );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    const SYNTHETIC_GENERATOR: [u8; 4] = *b"gsyn";
+    #[cfg(not(target_arch = "wasm32"))]
+    const SYNTHETIC_MESH: [u8; 4] = *b"msyn";
+    // A two-joint stand-in for a playable skeleton, in FFXI axes (Y down): reference 1 is the
+    // waist joint 1.05 above the feet and 0.1 to +x, reference 2 the nameplate 2.0 up, 13-20 a
+    // ring at 1.1 up, 21 a chest point 1.24 up, 49-51 the unplaced selectors; the one bounding
+    // box spans 3.4 x 2.85 so the fit scales are 2.0 wide and 1.5 tall.
+    const SYNTHETIC_WAIST_JOINT: Vec3 = Vec3::new(0.1, -1.05, 0.0);
+    const SYNTHETIC_NAMEPLATE_OFFSET: Vec3 = Vec3::new(0.0, -2.0, 0.0);
+    const SYNTHETIC_CHEST_OFFSET: Vec3 = Vec3::new(0.0, -1.24, 0.0);
+    const SYNTHETIC_CHEST_REFERENCE: usize = 21;
+    const SYNTHETIC_LEFT_HAND_OFFSET: Vec3 = Vec3::new(0.4, -0.9, 0.0);
+    const SYNTHETIC_LEFT_HAND_ALIAS: u8 = 54;
+    const SYNTHETIC_RING_HEIGHT: f32 = -1.1;
+    const SYNTHETIC_RING_RADIUS: f32 = 0.3;
+    const SYNTHETIC_BOX_WIDTH: f32 = 3.4;
+    const SYNTHETIC_BOX_HEIGHT: f32 = 2.85;
+    const SYNTHETIC_REFERENCE_TABLE_LEN: usize = 128;
+
+    fn synthetic_skeleton() -> ffxi_dat::skel::Skeleton {
+        use ffxi_dat::skel::{BoundingBox, Joint, JointReference, Skeleton};
+        let identity = [0.0, 0.0, 0.0, 1.0];
+        let joints = vec![
+            Joint {
+                rotation: identity,
+                translation: [0.0; 3],
+                parent: None,
+            },
+            Joint {
+                rotation: identity,
+                translation: SYNTHETIC_WAIST_JOINT.to_array(),
+                parent: Some(0),
+            },
+        ];
+        let at_root = |offset: Vec3| JointReference {
+            index: 0,
+            unk_v0: [0.0; 3],
+            position_offset: offset.to_array(),
+        };
+        let mut references: Vec<JointReference> = (0..SYNTHETIC_REFERENCE_TABLE_LEN)
+            .map(|_| at_root(Vec3::ZERO))
+            .collect();
+        references[1] = JointReference {
+            index: 1,
+            unk_v0: [0.0; 3],
+            position_offset: [0.0; 3],
+        };
+        references[ffxi_dat::skel::standard_position::ABOVE_HEAD] =
+            at_root(SYNTHETIC_NAMEPLATE_OFFSET);
+        references[SYNTHETIC_CHEST_REFERENCE] = at_root(SYNTHETIC_CHEST_OFFSET);
+        references[ffxi_dat::skel::standard_position::LEFT_HAND] =
+            at_root(SYNTHETIC_LEFT_HAND_OFFSET);
+        let ring = ffxi_actor::skeleton_instance::RING_JOINT_REFERENCES;
+        let ring_len = ring.clone().count() as f32;
+        for (k, reference) in ring.enumerate() {
+            let a = k as f32 * std::f32::consts::TAU / ring_len;
+            references[reference] = at_root(Vec3::new(
+                a.cos() * SYNTHETIC_RING_RADIUS,
+                SYNTHETIC_RING_HEIGHT,
+                a.sin() * SYNTHETIC_RING_RADIUS,
+            ));
+        }
+        Skeleton {
+            id: ffxi_dat::datid::DatId::from_str("synt"),
+            joints,
+            references,
+            bounding_boxes: vec![BoundingBox {
+                y_max: 0.0,
+                y_min: -SYNTHETIC_BOX_HEIGHT,
+                x_max: SYNTHETIC_BOX_WIDTH / 2.0,
+                x_min: -SYNTHETIC_BOX_WIDTH / 2.0,
+                z_max: 0.5,
+                z_min: -0.5,
+            }],
+        }
+    }
+
+    fn synthetic_pose(skeleton: &ffxi_dat::skel::Skeleton) -> Vec<Mat4> {
+        ffxi_actor::skeleton_instance::pose_world(
+            skeleton,
+            |_| None,
+            ffxi_actor::skeleton_instance::RootTransform::identity(),
+            &[],
+        )
+    }
+
+    // Where the record's reference point lands in Bevy space for an actor standing at `world`
+    // turned by `yaw`: the FFXI-frame offset through the FFXI->Bevy basis, then the yaw.
+    fn placed(world: Vec3, yaw: Quat, offset_ffxi: Vec3) -> Vec3 {
+        world + yaw * (crate::ffxi_actor_render::ffxi_to_bevy_basis() * offset_ffxi)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn synthetic_assets(
+        def: ParticleGeneratorDef,
+        id: [u8; 4],
+    ) -> crate::scheduler_runtime::ActionAssets {
+        let mut assets = crate::scheduler_runtime::ActionAssets::default();
+        assets.d3ms.insert(
+            def.mesh_id,
+            ffxi_dat::d3m::D3m {
+                name: def.mesh_id,
+                num_triangles: 1,
+                texture_name: [0; 16],
+                vertices: [Vec3::NEG_X, Vec3::X, Vec3::Y]
+                    .into_iter()
+                    .map(|pos| ffxi_dat::d3m::D3mVertex {
+                        pos: pos.to_array(),
+                        normal: Vec3::Z.to_array(),
+                        color: Vec4::ONE.to_array(),
+                        uv: Vec2::ZERO.to_array(),
+                    })
+                    .collect(),
+            },
+        );
+        assets.particle_defs.insert(id, def);
+        assets
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn synthetic_attached_def() -> ParticleGeneratorDef {
+        let mut d = def(ROUTINE_FPS, ROUTINE_FPS, 0);
+        d.mesh_id = SYNTHETIC_MESH;
+        d.base_position = [0.0; 3];
+        d.init_velocity = [0.0; 3];
+        d
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn particle_app() -> App {
+        let mut app = App::new();
+        app.add_plugins(bevy::asset::AssetPlugin::default())
+            .init_asset::<Mesh>()
+            .init_asset::<Image>()
+            .init_asset::<FfxiParticleMaterial>()
+            .init_resource::<ParticleSimulator>()
+            .add_message::<SchedulerStageEvent>()
+            .add_message::<crate::scheduler_runtime::ParticleSpawnTrace>()
+            .add_message::<crate::audio::SfxEvent>()
+            .add_systems(Update, spawn_particle_generators);
+        app
+    }
+
+    // A posed synthetic actor whose wire entity stands at `world` facing `yaw`, the way the live
+    // path parents the actor root (basis only) under the heading-carrying wire entity.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn spawn_turned_actor(
+        app: &mut App,
+        skeleton: &ffxi_dat::skel::Skeleton,
+        pose: &[Mat4],
+        world: Vec3,
+        yaw: Quat,
+    ) -> Entity {
+        let wire = spawn_posed_actor(app, skeleton, pose, world);
+        app.world_mut()
+            .entity_mut(wire)
+            .insert(Transform::from_translation(world).with_rotation(yaw));
+        wire
+    }
+
+    // Fires one particle stage of `def` from `caster` at `target` and returns the simulator
+    // after the frame that spawns it.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn fire_synthetic_stage(
+        app: &mut App,
+        def: ParticleGeneratorDef,
+        caster: Entity,
+        target: Entity,
+    ) {
+        app.world_mut().entity_mut(caster).insert((
+            synthetic_assets(def, SYNTHETIC_GENERATOR),
+            crate::scheduler_runtime::ActionTarget(Some(target)),
+        ));
+        app.world_mut().write_message(SchedulerStageEvent {
+            actor: caster,
+            target: Some(target),
+            stage: particle_stage(SYNTHETIC_GENERATOR),
+            scheduler: SYNTHETIC_GENERATOR,
+            cutscene_motion: false,
+            scheduler_instance: None,
+        });
+        app.update();
+    }
+
+    const FRAME_TOLERANCE: f32 = 1e-4;
+
+    // .agents/skills/retail-observe/references/2026-10-05-attached-effect-placement.md Element
+    // placement and billboard: the setup position is a DAT-frame offset in the attach frame, so
+    // a negative DAT y rises above the reference point and the whole offset turns with the
+    // caster's yaw.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn authored_setup_position_lands_in_the_casters_attach_frame() {
+        const SETUP_POSITION: Vec3 = Vec3::new(0.5, -0.3, 0.0);
+        const CASTER_WORLD: Vec3 = Vec3::new(4.0, 1.0, -2.0);
+        let yaw = Quat::from_rotation_y(std::f32::consts::FRAC_PI_2);
+        let skeleton = synthetic_skeleton();
+        let pose = synthetic_pose(&skeleton);
+        let mut d = synthetic_attached_def();
+        d.attach_mode = ffxi_dat::particle_gen::attach_mode::SOURCE;
+        d.attach_type = ffxi_dat::particle_gen::AttachType::SourceActor;
+        d.attach_eid = 1;
+        d.base_position = SETUP_POSITION.to_array();
+        let mut app = particle_app();
+        let caster = spawn_turned_actor(&mut app, &skeleton, &pose, CASTER_WORLD, yaw);
+        fire_synthetic_stage(&mut app, d, caster, caster);
+        let mut sim = app.world_mut().resource_mut::<ParticleSimulator>();
+        let clock = sim.clock;
+        let g = &mut sim.generators[0];
+        advance_generator(g, 1.0);
+        let element = particle_draw(g, &g.particles[0], &clock).world;
+        let waist = placed(CASTER_WORLD, yaw, SYNTHETIC_WAIST_JOINT);
+        let expected = placed(waist, yaw, SETUP_POSITION);
+        assert!(
+            element.distance(expected) < FRAME_TOLERANCE,
+            "element {element:?} must sit at {expected:?}: 0.3 above the waist and 0.5 along the caster's x"
+        );
+    }
+
+    // .agents/skills/retail-observe/references/2026-10-05-attached-effect-placement.md Attach
+    // frame: a target-side mode resolves the TARGET reference (bits 10-15) on the target actor,
+    // a plain index attaching to that reference rather than to the nearest-ring selector.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn target_side_mode_attaches_to_the_dats_target_reference() {
+        const CASTER_WORLD: Vec3 = Vec3::new(0.0, 0.0, 0.0);
+        const TARGET_WORLD: Vec3 = Vec3::new(5.0, 0.0, 3.0);
+        let target_yaw = Quat::from_rotation_y(-1.2);
+        let skeleton = synthetic_skeleton();
+        let pose = synthetic_pose(&skeleton);
+        let mut d = synthetic_attached_def();
+        d.attach_mode = ffxi_dat::particle_gen::attach_mode::TARGET;
+        d.attach_type = ffxi_dat::particle_gen::AttachType::TargetActor;
+        d.attach_eid = 0;
+        d.attach_target_reference = SYNTHETIC_CHEST_REFERENCE as u8;
+        let mut app = particle_app();
+        let caster = spawn_turned_actor(&mut app, &skeleton, &pose, CASTER_WORLD, Quat::IDENTITY);
+        let target = spawn_turned_actor(&mut app, &skeleton, &pose, TARGET_WORLD, target_yaw);
+        fire_synthetic_stage(&mut app, d, caster, target);
+        let sim = app.world().resource::<ParticleSimulator>();
+        let expected = placed(TARGET_WORLD, target_yaw, SYNTHETIC_CHEST_OFFSET);
+        assert!(
+            sim.generators[0].origin.distance(expected) < FRAME_TOLERANCE,
+            "origin {:?} must be the target's reference 21 at {expected:?}",
+            sim.generators[0].origin
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn level_up_dat() -> Option<Vec<u8>> {
+        let root = ffxi_dat::archive::open_test_install()?;
+        let loc = root
+            .resolve(crate::scheduler_runtime::LEVEL_UP_EFFECT_DAT_ID)
+            .ok()?;
+        std::fs::read(loc.path_under(&root)).ok()
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn level_up_stage(
+        schedulers: &[ffxi_dat::scheduler::Scheduler],
+        id: [u8; 4],
+    ) -> ffxi_dat::scheduler::TimedStage {
+        schedulers
+            .iter()
+            .flat_map(|s| &s.stages)
+            .find(|s| s.stage.kind == StageKind::Particle && s.stage.id == id)
+            .copied()
+            .unwrap_or_else(|| {
+                panic!(
+                    "the level-up DAT schedules {}",
+                    String::from_utf8_lossy(&id)
+                )
+            })
+    }
+
+    // .agents/skills/retail-observe/references/2026-10-05-attached-effect-placement.md Reference
+    // point: for the playable skeletons reference 1 is the waist joint, Hume M's joint 25 at
+    // 1.05 above the feet in bind pose.
+    const HUME_M_WAIST_REFERENCE: usize = 1;
+    const HUME_M_WAIST_JOINT: usize = 25;
+    const HUME_M_WAIST_HEIGHT: f32 = 1.05;
+
+    // A reference point from the skeleton alone: the posed joint the table entry names, read in
+    // FFXI axes where height above the feet is -y.
+    fn skeleton_reference_point(
+        skeleton: &ffxi_dat::skel::Skeleton,
+        pose: &[Mat4],
+        reference: usize,
+    ) -> Vec3 {
+        let entry = &skeleton.references[reference];
+        pose[entry.index].transform_point3(Vec3::from_array(entry.position_offset))
+    }
+
+    // .agents/skills/retail-observe/references/2026-10-05-attached-effect-placement.md The
+    // level-up case: the lettering's origin is the caster's posed reference 1 (Hume M joint 25,
+    // 1.05 above the feet) and the sparkle generator's setup position puts its elements 0.3
+    // above that point, with no height, nameplate or race offset.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn real_dat_level_up_places_the_lettering_at_the_waist_and_the_sparkles_above_it() {
+        use crate::scheduler_runtime::parse_action_bytes;
+        const LETTERING: [u8; 4] = *b"g000";
+        const SPARKLE: [u8; 4] = *b"g001";
+        const SPARKLE_RAISE: f32 = 0.3;
+        const ACTOR_WORLD: Vec3 = Vec3::new(7.0, 2.0, -3.0);
+        let Some(bytes) = level_up_dat() else {
+            eprintln!("SKIP: level-up DAT test needs a registered install");
+            return;
+        };
+        let (schedulers, mut assets, _) = parse_action_bytes(&bytes);
+        let lettering_stage = level_up_stage(&schedulers, LETTERING);
+        let sparkle_stage = level_up_stage(&schedulers, SPARKLE);
+        let (sparkle_dir, _) = assets
+            .particle_def_scoped(sparkle_stage.stage.local_dir, &SPARKLE)
+            .unwrap();
+        {
+            let sparkle = assets
+                .particle_defs_by_dir
+                .get_mut(&(sparkle_dir, SPARKLE))
+                .unwrap();
+            assert!(
+                (sparkle.base_position[1] + SPARKLE_RAISE).abs() < FRAME_TOLERANCE,
+                "the DAT authors the sparkle setup position 0.3 up: {:?}",
+                sparkle.base_position
+            );
+            // The authored spread scatters each element; only the setup position is under test.
+            sparkle.spherical_full = None;
+            sparkle.position_variance = None;
+        }
+        let skeleton = retail_hume_m_skeleton().expect("installed HumeM skeleton is readable");
+        let pose = synthetic_pose(&skeleton);
+        assert_eq!(
+            skeleton.references[HUME_M_WAIST_REFERENCE].index,
+            HUME_M_WAIST_JOINT
+        );
+        let waist_ffxi = skeleton_reference_point(&skeleton, &pose, HUME_M_WAIST_REFERENCE);
+        assert!(
+            (-waist_ffxi.y - HUME_M_WAIST_HEIGHT).abs() < 0.02,
+            "Hume M reference 1 sits 1.05 above the feet in bind pose: {waist_ffxi:?}"
+        );
+        let waist = placed(ACTOR_WORLD, Quat::IDENTITY, waist_ffxi);
+
+        let mut app = particle_app();
+        let actor = spawn_posed_actor(&mut app, &skeleton, &pose, ACTOR_WORLD);
+        app.world_mut().entity_mut(actor).insert(assets);
+        for stage in [lettering_stage, sparkle_stage] {
+            app.world_mut().write_message(SchedulerStageEvent {
+                actor,
+                target: None,
+                stage,
+                scheduler: *b"main",
+                cutscene_motion: false,
+                scheduler_instance: None,
+            });
+        }
+        app.update();
+        let mut sim = app.world_mut().resource_mut::<ParticleSimulator>();
+        let clock = sim.clock;
+        let lettering = sim
+            .generators
+            .iter()
+            .find(|g| g.origin_routine.is_some_and(|r| r.gen_id == LETTERING))
+            .expect("the lettering generator spawned");
+        assert!(
+            lettering.origin.distance(waist) < FRAME_TOLERANCE,
+            "lettering origin {:?} must be the posed waist {waist:?}",
+            lettering.origin
+        );
+        let sparkle = sim
+            .generators
+            .iter_mut()
+            .find(|g| g.origin_routine.is_some_and(|r| r.gen_id == SPARKLE))
+            .expect("the sparkle generator spawned");
+        advance_generator(sparkle, 1.0);
+        let element = particle_draw(sparkle, &sparkle.particles[0], &clock).world;
+        let raise = element - waist;
+        assert!(
+            raise.distance(Vec3::Y * SPARKLE_RAISE) < FRAME_TOLERANCE,
+            "sparkle element {element:?} sits {raise:?} from the waist; the record puts it 0.3 above"
+        );
+    }
+
+    // .agents/skills/retail-observe/references/2026-10-05-attached-effect-placement.md The
+    // level-up case: velocity 0.031 up per update damped by 0.924 per update rises about 0.4,
+    // most of it within 40 updates.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn real_dat_level_up_lettering_rises_to_the_record_height_after_40_updates() {
+        use crate::scheduler_runtime::parse_action_bytes;
+        const LETTERING: [u8; 4] = *b"g000";
+        const UPDATES: usize = 40;
+        const RISE_AFTER_UPDATES: f32 = 0.4;
+        const RISE_TOLERANCE: f32 = 0.02;
+        let Some(bytes) = level_up_dat() else {
+            eprintln!("SKIP: level-up DAT test needs a registered install");
+            return;
+        };
+        let (schedulers, assets, _) = parse_action_bytes(&bytes);
+        let stage = level_up_stage(&schedulers, LETTERING);
+        let def = *assets
+            .particle_def(stage.stage.local_dir, &LETTERING)
+            .unwrap();
+        let mut g = live_scheduled(def, 0.0, &assets);
+        g.emit_accum = def.frames_per_emission;
+        advance_generator(&mut g, 1.0);
+        assert_eq!(g.particles.len(), 1);
+        let clock = CelestialClock::default();
+        let spawn = particle_draw(&g, &g.particles[0], &clock).world;
+        for _ in 0..UPDATES {
+            advance_generator(&mut g, 1.0);
+        }
+        let rise = particle_draw(&g, &g.particles[0], &clock).world - spawn;
+        assert!(
+            (rise.y - RISE_AFTER_UPDATES).abs() < RISE_TOLERANCE && rise.x == 0.0 && rise.z == 0.0,
+            "the lettering rose {rise:?} after {UPDATES} updates; the record says about 0.4 straight up"
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    struct TwoActors {
+        app: App,
+        caster: Entity,
+        target: Entity,
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    const CASTER_WORLD: Vec3 = Vec3::new(4.0, 1.0, -2.0);
+    #[cfg(not(target_arch = "wasm32"))]
+    const TARGET_WORLD: Vec3 = Vec3::new(9.0, 1.0, 1.0);
+    #[cfg(not(target_arch = "wasm32"))]
+    const CASTER_FACING: f32 = 0.7;
+    #[cfg(not(target_arch = "wasm32"))]
+    const TARGET_FACING: f32 = -1.2;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn two_posed_actors(skeleton: &ffxi_dat::skel::Skeleton) -> TwoActors {
+        let pose = synthetic_pose(skeleton);
+        let mut app = particle_app();
+        let caster = spawn_turned_actor(
+            &mut app,
+            skeleton,
+            &pose,
+            CASTER_WORLD,
+            Quat::from_rotation_y(CASTER_FACING),
+        );
+        let target = spawn_turned_actor(
+            &mut app,
+            skeleton,
+            &pose,
+            TARGET_WORLD,
+            Quat::from_rotation_y(TARGET_FACING),
+        );
+        TwoActors {
+            app,
+            caster,
+            target,
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn spawned_frame(app: &App) -> (Vec3, Quat, Vec3, Vec3) {
+        let g = &app.world().resource::<ParticleSimulator>().generators[0];
+        (g.origin, g.frame_rot, g.position_fit, g.model_fit)
+    }
+
+    fn same_rotation(a: Quat, b: Quat) -> bool {
+        a.angle_between(b) < FRAME_TOLERANCE
+    }
+
+    // .agents/skills/retail-observe/references/2026-10-05-attached-effect-placement.md Attach
+    // frame, modes 1/2/4/5: the translation is the stated actor's reference point and the
+    // rotation the stated actor's yaw, with 54 reaching the hand locator through its alias.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn single_point_modes_take_the_stated_actors_point_and_yaw() {
+        use ffxi_dat::particle_gen::attach_mode as mode;
+        let skeleton = synthetic_skeleton();
+        let caster_yaw = Quat::from_rotation_y(CASTER_FACING);
+        let target_yaw = Quat::from_rotation_y(TARGET_FACING);
+        let caster_waist = placed(CASTER_WORLD, caster_yaw, SYNTHETIC_WAIST_JOINT);
+        let caster_hand = placed(CASTER_WORLD, caster_yaw, SYNTHETIC_LEFT_HAND_OFFSET);
+        let target_chest = placed(TARGET_WORLD, target_yaw, SYNTHETIC_CHEST_OFFSET);
+        let cases = [
+            (mode::SOURCE, 1, caster_waist, caster_yaw),
+            (
+                mode::SOURCE,
+                SYNTHETIC_LEFT_HAND_ALIAS,
+                caster_hand,
+                caster_yaw,
+            ),
+            (mode::SOURCE_WITH_TARGET_YAW, 1, caster_waist, target_yaw),
+            (mode::TARGET, 1, target_chest, target_yaw),
+            (mode::TARGET_WITH_SOURCE_YAW, 1, target_chest, caster_yaw),
+        ];
+        for (attach_mode, source_reference, point, yaw) in cases {
+            let mut d = synthetic_attached_def();
+            d.attach_mode = attach_mode;
+            d.attach_type =
+                ffxi_dat::particle_gen::AttachType::from_flag(u16::from(attach_mode)).unwrap();
+            d.attach_eid = source_reference;
+            d.attach_target_reference = SYNTHETIC_CHEST_REFERENCE as u8;
+            let mut scene = two_posed_actors(&skeleton);
+            fire_synthetic_stage(&mut scene.app, d, scene.caster, scene.target);
+            let (origin, rotation, position_fit, model_fit) = spawned_frame(&scene.app);
+            assert!(
+                origin.distance(point) < FRAME_TOLERANCE,
+                "mode {attach_mode} ref {source_reference}: origin {origin:?}, expected {point:?}"
+            );
+            assert!(
+                same_rotation(rotation, yaw),
+                "mode {attach_mode}: rotation {rotation:?}, expected {yaw:?}"
+            );
+            assert_eq!((position_fit, model_fit), (Vec3::ONE, Vec3::ONE));
+        }
+    }
+
+    // .agents/skills/retail-observe/references/2026-10-05-attached-effect-placement.md Attach
+    // frame, modes 3/6: X runs from the start point to the end point with the span length as
+    // the X position fit, so an element authored at x = 1 lands on the far point; the frame
+    // keeps no roll, so up stays up along a level span.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn two_point_modes_span_the_caster_and_target_points() {
+        use ffxi_dat::particle_gen::attach_mode as mode;
+        let skeleton = synthetic_skeleton();
+        let caster_chest = placed(
+            CASTER_WORLD,
+            Quat::from_rotation_y(CASTER_FACING),
+            SYNTHETIC_CHEST_OFFSET,
+        );
+        let target_chest = placed(
+            TARGET_WORLD,
+            Quat::from_rotation_y(TARGET_FACING),
+            SYNTHETIC_CHEST_OFFSET,
+        );
+        for (attach_mode, start, end) in [
+            (mode::SOURCE_TO_TARGET, caster_chest, target_chest),
+            (mode::TARGET_TO_SOURCE, target_chest, caster_chest),
+        ] {
+            let mut d = synthetic_attached_def();
+            d.attach_mode = attach_mode;
+            d.attach_type =
+                ffxi_dat::particle_gen::AttachType::from_flag(u16::from(attach_mode)).unwrap();
+            d.attach_eid = SYNTHETIC_CHEST_REFERENCE as u8;
+            d.attach_target_reference = SYNTHETIC_CHEST_REFERENCE as u8;
+            d.base_position = Vec3::X.to_array();
+            let mut scene = two_posed_actors(&skeleton);
+            fire_synthetic_stage(&mut scene.app, d, scene.caster, scene.target);
+            let (origin, rotation, position_fit, _) = spawned_frame(&scene.app);
+            assert!(
+                origin.distance(start) < FRAME_TOLERANCE,
+                "mode {attach_mode}"
+            );
+            assert!(
+                (position_fit.x - start.distance(end)).abs() < FRAME_TOLERANCE,
+                "mode {attach_mode}: the span length replaces the X fit: {position_fit:?}"
+            );
+            assert!((rotation * Vec3::Y).distance(Vec3::Y) < FRAME_TOLERANCE);
+            assert!(
+                (rotation * Vec3::X).distance((end - start).normalize()) < FRAME_TOLERANCE,
+                "mode {attach_mode}: X must run from {start:?} to {end:?}"
+            );
+            let mut sim = scene.app.world_mut().resource_mut::<ParticleSimulator>();
+            let clock = sim.clock;
+            let g = &mut sim.generators[0];
+            advance_generator(g, 1.0);
+            let element = particle_draw(g, &g.particles[0], &clock).world;
+            assert!(
+                element.distance(end) < FRAME_TOLERANCE,
+                "mode {attach_mode}: element {element:?} must sit on the far point {end:?}"
+            );
+        }
+    }
+
+    // .agents/skills/retail-observe/references/2026-10-05-attached-effect-placement.md Scale:
+    // the nibble selects the caster (1-4) or the target (5-8) and the axes its low two bits
+    // name; the scales come from the skeleton's first bounding box times the actor scale.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn fit_nibbles_scale_positions_and_sprites_by_the_selected_actors_box() {
+        use ffxi_dat::particle_gen::attach_mode as mode;
+        const TARGET_SCALE: f32 = 2.0;
+        const SETUP_POSITION: Vec3 = Vec3::new(1.0, -1.0, 1.0);
+        let skeleton = synthetic_skeleton();
+        let caster_width = SYNTHETIC_BOX_WIDTH / FIT_WIDTH_DIVISOR;
+        let caster_height = SYNTHETIC_BOX_HEIGHT / FIT_HEIGHT_DIVISOR;
+        let target_width = caster_width * TARGET_SCALE;
+        let target_height = caster_height * TARGET_SCALE;
+        let cases = [
+            (1u8, Vec3::new(caster_width, 1.0, caster_width)),
+            (2, Vec3::new(1.0, caster_height, 1.0)),
+            (3, Vec3::new(caster_width, caster_height, caster_width)),
+            (4, Vec3::splat(caster_width.max(caster_height))),
+            (5, Vec3::new(target_width, 1.0, target_width)),
+            (6, Vec3::new(1.0, target_height, 1.0)),
+            (8, Vec3::splat(target_width.max(target_height))),
+        ];
+        let caster_yaw = Quat::from_rotation_y(CASTER_FACING);
+        let waist = placed(CASTER_WORLD, caster_yaw, SYNTHETIC_WAIST_JOINT);
+        for (nibble, fit) in cases {
+            let mut d = synthetic_attached_def();
+            d.attach_mode = mode::SOURCE;
+            d.attach_eid = 1;
+            d.attach_position_fit = nibble;
+            d.attach_model_fit = nibble;
+            d.base_position = SETUP_POSITION.to_array();
+            let mut scene = two_posed_actors(&skeleton);
+            let holder = scene.app.world().get::<Children>(scene.target).unwrap()[0];
+            scene
+                .app
+                .world_mut()
+                .get_mut::<FfxiRenderActor>(holder)
+                .unwrap()
+                .scale = TARGET_SCALE;
+            fire_synthetic_stage(&mut scene.app, d, scene.caster, scene.target);
+            let (_, _, position_fit, model_fit) = spawned_frame(&scene.app);
+            assert!(
+                position_fit.distance(fit) < FRAME_TOLERANCE
+                    && model_fit.distance(fit) < FRAME_TOLERANCE,
+                "nibble {nibble}: fits {position_fit:?} / {model_fit:?}, expected {fit:?}"
+            );
+            let mut sim = scene.app.world_mut().resource_mut::<ParticleSimulator>();
+            let clock = sim.clock;
+            let g = &mut sim.generators[0];
+            advance_generator(g, 1.0);
+            let element = particle_draw(g, &g.particles[0], &clock).world;
+            let expected = waist
+                + caster_yaw
+                    * (crate::ffxi_actor_render::ffxi_to_bevy_basis() * SETUP_POSITION * fit);
+            assert!(
+                element.distance(expected) < FRAME_TOLERANCE,
+                "nibble {nibble}: element {element:?}, expected {expected:?}"
+            );
+        }
+    }
+
+    // A screen billboard's sprite grows by the model fit along its own axes.
+    #[test]
+    fn model_fit_scales_the_sprite_quad() {
+        let mut g = live(def(ROUTINE_FPS, ROUTINE_FPS, 0), 0.0);
+        g.vel_basis = WORLD_PARTICLE_VEL_BASIS;
+        g.model_fit = Vec3::new(4.0, 1.0, 4.0);
+        g.template.positions = vec![Vec3::NEG_X, Vec3::X, Vec3::Y];
+        emit(&mut g, ROUTINE_FPS);
+        g.particles[0].pos = Vec3::ZERO;
+        let (positions, _) = rebuilt(&g, view(Quat::IDENTITY));
+        let sx = g.def.init_scale[0] * g.model_fit.x;
+        let sy = g.def.init_scale[1] * g.model_fit.y;
+        let expected = [
+            Vec3::new(-sx, 0.0, 0.0),
+            Vec3::new(sx, 0.0, 0.0),
+            Vec3::new(0.0, -sy, 0.0),
+        ];
+        for (vertex, expected) in positions.iter().zip(expected) {
+            assert!(
+                vertex.distance(expected) < FRAME_TOLERANCE,
+                "{positions:?} vs {expected:?}"
+            );
+        }
+    }
+
+    // .agents/skills/retail-observe/references/2026-10-05-attached-effect-placement.md Scale:
+    // the installed Hume M skeleton gives width 0.82 and height 1.00 at scale 1.
+    #[test]
+    fn real_dat_hume_m_fit_scales_match_the_record() {
+        const HUME_M_WIDTH_SCALE: f32 = 0.82;
+        const HUME_M_HEIGHT_SCALE: f32 = 1.00;
+        const SCALE_TOLERANCE: f32 = 0.01;
+        let Some(skeleton) = retail_hume_m_skeleton() else {
+            return;
+        };
+        let pose = synthetic_pose(&skeleton);
+        let actor = AttachActor {
+            world: Vec3::ZERO,
+            yaw: Quat::IDENTITY,
+            pose: Some(AttachPose {
+                pose: &pose,
+                skeleton: &skeleton,
+                root: bevy::math::Affine3A::IDENTITY,
+                facing_dir: 0.0,
+                scale: 1.0,
+            }),
+        };
+        let FitScales { width, height } = actor_fit_scales(&actor);
+        assert!(
+            (width - HUME_M_WIDTH_SCALE).abs() < SCALE_TOLERANCE
+                && (height - HUME_M_HEIGHT_SCALE).abs() < SCALE_TOLERANCE,
+            "Hume M fit scales {width:.3} x {height:.3}"
+        );
+    }
+
+    // .agents/skills/retail-observe/references/2026-10-05-attached-effect-placement.md
+    // Per-update follow: a translation-only snap moves the origin to the rebuilt reference
+    // point and leaves the rotation at the activation yaw; the facing bit turns it too.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn follow_snaps_the_origin_and_turns_only_with_the_facing_bit() {
+        use bevy::ecs::system::RunSystemOnce;
+        use ffxi_dat::particle_gen::attach_mode as mode;
+        const MOVED_WORLD: Vec3 = Vec3::new(-3.0, 1.0, 6.0);
+        const MOVED_FACING: f32 = 2.4;
+        let skeleton = synthetic_skeleton();
+        let activation_yaw = Quat::from_rotation_y(CASTER_FACING);
+        let moved_yaw = Quat::from_rotation_y(MOVED_FACING);
+        for follow_facing in [false, true] {
+            let mut d = synthetic_attached_def();
+            d.attach_mode = mode::SOURCE;
+            d.attach_eid = 1;
+            d.association = Some(ffxi_dat::particle_gen::AssociationFollow {
+                follow_position: true,
+                follow_facing,
+                factor: ffxi_dat::particle_gen::ASSOCIATION_FOLLOW_RATE_SNAP,
+            });
+            let mut scene = two_posed_actors(&skeleton);
+            scene.app.world_mut().insert_resource(Time::<()>::default());
+            fire_synthetic_stage(&mut scene.app, d, scene.caster, scene.target);
+            scene
+                .app
+                .world_mut()
+                .entity_mut(scene.caster)
+                .insert(Transform::from_translation(MOVED_WORLD).with_rotation(moved_yaw));
+            scene
+                .app
+                .world_mut()
+                .run_system_once(track_attached_origins)
+                .unwrap();
+            let (origin, rotation, _, _) = spawned_frame(&scene.app);
+            let expected = placed(MOVED_WORLD, moved_yaw, SYNTHETIC_WAIST_JOINT);
+            assert!(
+                origin.distance(expected) < FRAME_TOLERANCE,
+                "facing {follow_facing}: origin {origin:?} must snap to {expected:?}"
+            );
+            let expected_yaw = if follow_facing {
+                moved_yaw
+            } else {
+                activation_yaw
+            };
+            assert!(
+                same_rotation(rotation, expected_yaw),
+                "facing {follow_facing}: rotation {rotation:?}, expected {expected_yaw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn follow_blend_snaps_at_full_rate_and_compounds_a_partial_rate_per_update() {
+        const HALF_RATE: f32 = 0.5;
+        assert_eq!(follow_blend(1.0, 0.0), 1.0);
+        assert_eq!(follow_blend(1.0, 0.3), 1.0);
+        assert_eq!(follow_blend(HALF_RATE, 0.0), 0.0);
+        assert!((follow_blend(HALF_RATE, 1.0) - HALF_RATE).abs() < FRAME_TOLERANCE);
+        assert!((follow_blend(HALF_RATE, 2.0) - 0.75).abs() < FRAME_TOLERANCE);
+    }
+
+    // .agents/skills/retail-observe/references/2026-10-05-attached-effect-placement.md Reference
+    // point: 51 is the ring entry nearest the camera eye; without a camera it falls back to the
+    // entry nearest the other actor.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn camera_nearest_reference_picks_the_ring_entry_toward_the_eye() {
+        use ffxi_dat::particle_gen::attach_mode as mode;
+        const ACTOR_WORLD: Vec3 = Vec3::new(0.0, 0.0, 0.0);
+        const OTHER_WORLD: Vec3 = Vec3::new(0.0, 0.0, 10.0);
+        const EYE: Vec3 = Vec3::new(10.0, 1.0, 0.0);
+        let skeleton = synthetic_skeleton();
+        let pose = synthetic_pose(&skeleton);
+        let ring_toward_eye = placed(
+            ACTOR_WORLD,
+            Quat::IDENTITY,
+            Vec3::new(SYNTHETIC_RING_RADIUS, SYNTHETIC_RING_HEIGHT, 0.0),
+        );
+        let ring_toward_other = placed(
+            ACTOR_WORLD,
+            Quat::IDENTITY,
+            Vec3::new(0.0, SYNTHETIC_RING_HEIGHT, -SYNTHETIC_RING_RADIUS),
+        );
+        for (with_camera, expected) in [(true, ring_toward_eye), (false, ring_toward_other)] {
+            let mut d = synthetic_attached_def();
+            d.attach_mode = mode::SOURCE;
+            d.attach_eid = CAMERA_NEAREST_REFERENCE;
+            let mut app = particle_app();
+            let caster =
+                spawn_turned_actor(&mut app, &skeleton, &pose, ACTOR_WORLD, Quat::IDENTITY);
+            let other = spawn_turned_actor(&mut app, &skeleton, &pose, OTHER_WORLD, Quat::IDENTITY);
+            if with_camera {
+                app.world_mut()
+                    .spawn((OperatorCamera, GlobalTransform::from_translation(EYE)));
+            }
+            fire_synthetic_stage(&mut app, d, caster, other);
+            let (origin, _, _, _) = spawned_frame(&app);
+            assert!(
+                origin.distance(expected) < FRAME_TOLERANCE,
+                "camera {with_camera}: origin {origin:?}, expected {expected:?}"
+            );
+        }
+    }
+
+    // .agents/skills/retail-observe/references/2026-10-05-attached-effect-placement.md Element
+    // placement and billboard: the frame's rotation turns a fixed-orientation element and never
+    // a screen billboard, which reads the frame through its world point alone.
+    #[test]
+    fn frame_rotation_turns_fixed_elements_but_not_screen_billboards() {
+        let turn = Quat::from_rotation_y(std::f32::consts::FRAC_PI_2);
+        let offsets = |orientation: Option<Quat>, frame_rot: Quat| {
+            let mut g = live(def(ROUTINE_FPS, ROUTINE_FPS, 0), 0.0);
+            g.vel_basis = WORLD_PARTICLE_VEL_BASIS;
+            g.orientation = orientation;
+            g.frame_rot = frame_rot;
+            g.template.positions = vec![Vec3::NEG_X, Vec3::X, Vec3::Y];
+            emit(&mut g, ROUTINE_FPS);
+            g.particles[0].pos = Vec3::ZERO;
+            rebuilt(&g, view(Quat::IDENTITY)).0
+        };
+        let billboard_plain = offsets(None, Quat::IDENTITY);
+        let billboard_turned = offsets(None, turn);
+        for (a, b) in billboard_plain.iter().zip(&billboard_turned) {
+            assert!(
+                a.distance(*b) < FRAME_TOLERANCE,
+                "a screen billboard ignores the frame rotation: {a:?} vs {b:?}"
+            );
+        }
+        let fixed_plain = offsets(Some(Quat::IDENTITY), Quat::IDENTITY);
+        let fixed_turned = offsets(Some(Quat::IDENTITY), turn);
+        for (a, b) in fixed_plain.iter().zip(&fixed_turned) {
+            assert!(
+                (turn * *a).distance(*b) < FRAME_TOLERANCE,
+                "a fixed-orientation element turns with the frame: {a:?} vs {b:?}"
+            );
+        }
+    }
+
+    // A mode the record leaves open keeps the single-point placement its legacy attach type
+    // gave it: here mode 18 (bit 16 plus type 2) still lands on the target's ring entry
+    // nearest the caster, unturned.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn modes_outside_the_record_keep_the_legacy_single_point_placement() {
+        const LEGACY_TWO_POINT_MODE: u8 = 18;
+        let skeleton = synthetic_skeleton();
+        let mut d = synthetic_attached_def();
+        d.attach_mode = LEGACY_TWO_POINT_MODE;
+        d.attach_type = ffxi_dat::particle_gen::AttachType::TargetActor;
+        d.attach_eid = 0;
+        d.attach_target_reference = SYNTHETIC_CHEST_REFERENCE as u8;
+        let mut scene = two_posed_actors(&skeleton);
+        fire_synthetic_stage(&mut scene.app, d, scene.caster, scene.target);
+        let (origin, rotation, _, _) = spawned_frame(&scene.app);
+        let toward_caster = (CASTER_WORLD - TARGET_WORLD).normalize();
+        let offset = origin - TARGET_WORLD;
+        assert!(
+            (offset.y + SYNTHETIC_RING_HEIGHT).abs() < FRAME_TOLERANCE,
+            "legacy placement is a ring entry: {offset:?}"
+        );
+        assert!(
+            Vec3::new(offset.x, 0.0, offset.z)
+                .normalize()
+                .dot(toward_caster)
+                > 0.5
+        );
+        assert_eq!(rotation, Quat::IDENTITY);
     }
 
     fn child_factory(on_expiry: bool) -> ChildFactory {

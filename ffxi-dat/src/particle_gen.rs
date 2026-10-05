@@ -5463,7 +5463,9 @@ mod tests {
         std::fs::read(loc.path_under(&root)).ok()
     }
 
-    fn real_particle_defs(file_id: u32) -> Option<Vec<([u8; 4], [u8; 4], ParticleGeneratorDef)>> {
+    type ScopedDef = ([u8; 4], [u8; 4], ParticleGeneratorDef);
+
+    fn real_particle_defs(file_id: u32) -> Option<Vec<ScopedDef>> {
         let bytes = real_file(file_id)?;
         let tree = crate::chunk::walk_tree(&bytes);
         let mut defs = Vec::new();
