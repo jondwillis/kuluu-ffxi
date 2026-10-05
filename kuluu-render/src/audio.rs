@@ -719,7 +719,7 @@ pub fn sfx_mix_volume(ev: &SfxEvent, listener: Option<Vec3>) -> f32 {
     let attenuation = match (ev.emitter, listener) {
         (Some(emitter), Some(listener)) => match ev.range {
             // Authored ranges ride the retail Calc3D law; unauthored cues keep the client
-            // point-source model so zone beds and UI-anchored emitters mix as before.
+            // point-source model for zone beds and UI-anchored emitters.
             Some((near, far)) => {
                 sfx_attenuation_calc3d(listener, emitter, near, far, ev.vertical_weight)
             }

@@ -782,7 +782,7 @@ fn activate_test_scene(
     // alive: sync_entities_system despawns any tracked wire missing from the snapshot.
     // Heading is the system's orientation source of truth (sync re-derives the wire quat from
     // it on respawn), so both the spawn transform and the heading agree. Both skeletons face
-    // local +X at identity (live-checked), so opposite headings square them onto each other:
+    // local +X at identity, so opposite headings square them onto each other:
     // worm 0 faces +X toward the Hume, Hume 128 faces -X back.
     // Both are engaged so they stand in battle stance with weapons out, not rest pose.
     let actor_base = env_actor_pos().unwrap_or(Vec3::ZERO);
@@ -1133,7 +1133,7 @@ fn spawn_panel(commands: &mut Commands) {
                     padding: UiRect::axes(Val::Px(8.0), Val::Px(4.0)),
                     // Fixed-height panel + default flex_shrink=1 let a long log crush every
                     // row toward its content-min; the slider track's min is zero, so it vanished
-                    // first (user repro: shadows-checkbox click). Controls never shrink.
+                    // first. Controls never shrink.
                     flex_shrink: 0.0,
                     ..default()
                 },
@@ -2595,7 +2595,7 @@ fn tear_down(
     ));
     for e in q_scoped.iter() {
         // try_despawn: despawn() is recursive, so a parent earlier in the query may have
-        // already freed this entity (same fix as launcher_backdrop's teardown).
+        // already freed this entity.
         commands.entity(e).try_despawn();
     }
     set_launcher_ui_visibility(commands, q_ui, true);

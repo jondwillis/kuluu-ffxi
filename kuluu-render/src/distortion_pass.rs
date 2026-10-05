@@ -72,8 +72,8 @@ impl ActiveDistortion {
     }
 }
 
-/// Ghost alpha at full envelope strength — the authored k143 peak (PS2-rescaled ~0.95) lands
-/// just under this, so a constant-strength generator looks like the old fixed value.
+/// Ghost alpha at full envelope strength; the authored k143 peak (PS2-rescaled ~0.95) lands
+/// just under it.
 const GHOST_BASE_INTENSITY: f32 = 0.25;
 
 /// Main-world Update: advance the envelope while a distortion generator is alive. The render
