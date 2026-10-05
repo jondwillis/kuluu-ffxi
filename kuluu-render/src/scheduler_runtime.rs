@@ -5786,7 +5786,12 @@ mod tests {
                 Some(CF_COMPARE_VALUE_OP),
                 Some(Some(value)),
             ));
-            stages.push(cf_stage(0, CONTROL_FLOW_CONDITION, Some(0x0C), None));
+            stages.push(cf_stage(
+                0,
+                CONTROL_FLOW_CONDITION,
+                Some(EQUALITY_TERMINATOR),
+                None,
+            ));
             stages.push(cf_stage(0, CONTROL_FLOW_BRANCH_TRUE, None, None));
             stages.push(cf_stage(0, CONTROL_FLOW_BLOCK_OPEN, None, None));
             stages.push(stage(0, StageKind::SubRoutineOnTarget, 0x09, name));
@@ -5840,7 +5845,12 @@ mod tests {
             Some(CF_COMPARE_VALUE_OP),
             Some(Some(0)), // resolution == Hit
         ));
-        stages.push(cf_stage(0, CONTROL_FLOW_CONDITION, Some(0x0C), None));
+        stages.push(cf_stage(
+            0,
+            CONTROL_FLOW_CONDITION,
+            Some(EQUALITY_TERMINATOR),
+            None,
+        ));
         stages.push(cf_stage(0, CONTROL_FLOW_BRANCH_TRUE, None, None));
         stages.push(cf_stage(0, CONTROL_FLOW_BLOCK_OPEN, None, None));
         stages.push(cf_stage(
@@ -5855,7 +5865,12 @@ mod tests {
             Some(CF_COMPARE_VALUE_OP),
             Some(Some(1)), // info == Defeated
         ));
-        stages.push(cf_stage(0, CONTROL_FLOW_CONDITION, Some(0x0C), None));
+        stages.push(cf_stage(
+            0,
+            CONTROL_FLOW_CONDITION,
+            Some(EQUALITY_TERMINATOR),
+            None,
+        ));
         stages.push(cf_stage(0, CONTROL_FLOW_BRANCH_TRUE, None, None));
         stages.push(cf_stage(0, CONTROL_FLOW_BLOCK_OPEN, None, None));
         stages.push(stage(0, StageKind::SubRoutineOnTarget, 0x09, *b"damh"));
@@ -5989,8 +6004,7 @@ mod tests {
         }
     }
 
-    // dam0's successful arm: selector 0x3B equal to one picks damh, else damg.
-    // .agents/skills/retail-observe/references/2026-10-04-melee-damage-dispatch.md Provenance
+    // .agents/skills/retail-observe/references/2026-10-04-melee-damage-dispatch.md Conditions selecting reactions
     #[test]
     fn evaluate_switch_offhand_selector_routes_damh_vs_damg() {
         let mut stages = vec![
