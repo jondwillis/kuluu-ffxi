@@ -291,15 +291,15 @@ pub(crate) fn is_lamp_halo_def(def: &ParticleGeneratorDef) -> bool {
         && def.init_color[TOD_ALPHA_CHANNEL] <= LAMP_HALO_INIT_ALPHA_MAX
 }
 
-/// Wall-wash volumes — the soft light shafts retail draws around tunnel mouths and lantern
-/// clusters (verified against the real client): additive StaticMesh `ligh` generators. In South
-/// Gustaberg that is the ghu* sheet pair plus the li*/li0x families sharing one "ligh" volume
-// mesh — the generator name isn't on the def, only its drawn mesh, so kind is the discriminator.
+const WALL_WASH_MESH_ID: [u8; 4] = *b"ligh";
+
 pub(crate) fn is_wall_wash_def(def: &ParticleGeneratorDef) -> bool {
-    matches!(
-        def.mesh_kind,
-        ParticleMeshKind::StaticMesh | ParticleMeshKind::WeightedMesh
-    )
+    def.mesh_id == WALL_WASH_MESH_ID
+        && def.blend == ffxi_dat::particle_gen::ParticleBlend::Additive
+        && matches!(
+            def.mesh_kind,
+            ParticleMeshKind::StaticMesh | ParticleMeshKind::WeightedMesh
+        )
 }
 
 /// The AnimationTest box's lamps kill switch (panel checkbox): while set, the tick hides every
@@ -3847,6 +3847,7 @@ mod tests {
     use super::*;
 
     mod cleanup_capture;
+    mod wall_wash_capture;
     use ffxi_dat::particle_gen::ParticleGeneratorDef;
 
     fn def(life: f32, fpe: f32, ppe: u32) -> ParticleGeneratorDef {
@@ -4402,6 +4403,77 @@ mod tests {
                 expected_factor_alpha(generator.def.init_color[TOD_ALPHA_CHANNEL]),
                 "{kind:?}"
             );
+        }
+    }
+
+    #[test]
+    fn wall_wash_controls_preserve_unrelated_effects() {
+        use ffxi_dat::particle_gen::ParticleBlend;
+
+        const ONE_FRAME: f32 = 1.0;
+        let mut world = child_test_world(ParticleSimulator::default());
+        let mut cases = Vec::new();
+        for kind in [ParticleMeshKind::StaticMesh, ParticleMeshKind::WeightedMesh] {
+            for mesh in [WALL_WASH_MESH_ID, *b"gr  "] {
+                for blend in [ParticleBlend::Additive, ParticleBlend::Blend] {
+                    let mut definition = def(f32::INFINITY, ROUTINE_FPS, 0);
+                    definition.mesh_kind = kind;
+                    definition.mesh_id = mesh;
+                    definition.blend = blend;
+                    let mut g = live(definition, f32::INFINITY);
+                    prime(&mut g);
+                    advance_generator(&mut g, ONE_FRAME);
+                    g.stopped = true;
+                    g.entity = world
+                        .spawn((
+                            Mesh3d(Handle::default()),
+                            GlobalTransform::IDENTITY,
+                            Visibility::Inherited,
+                        ))
+                        .id();
+                    cases.push((
+                        g.entity,
+                        mesh == WALL_WASH_MESH_ID && blend == ParticleBlend::Additive,
+                    ));
+                    world.resource_mut::<ParticleSimulator>().generators.push(g);
+                }
+            }
+        }
+        let mut schedule = Schedule::default();
+        schedule.add_systems((tick_particle_simulator, sync_particle_meshes).chain());
+        world.insert_resource(WallWashOff(true));
+        schedule.run(&mut world);
+        for &(entity, wash) in &cases {
+            assert_eq!(
+                world.get::<HaloSuppressed>(entity).is_some(),
+                wash,
+                "{entity:?}"
+            );
+            assert_eq!(
+                *world.get::<Visibility>(entity).unwrap(),
+                if wash {
+                    Visibility::Hidden
+                } else {
+                    Visibility::Inherited
+                }
+            );
+        }
+        world.resource_mut::<WallWashOff>().0 = false;
+        schedule.run(&mut world);
+        for &(entity, _) in &cases {
+            assert!(world.get::<HaloSuppressed>(entity).is_none());
+            assert_eq!(
+                *world.get::<Visibility>(entity).unwrap(),
+                Visibility::Inherited
+            );
+        }
+        let sim = world.resource::<ParticleSimulator>();
+        let mut clock = sim.clock;
+        clock.wash_alpha_lift = 0.0;
+        for (g, &(_, wash)) in sim.generators.iter().zip(&cases) {
+            let baseline = drawn_factor(g, &sim.clock).w;
+            assert!(baseline > 0.0);
+            assert_eq!(drawn_factor(g, &clock).w, if wash { 0.0 } else { baseline });
         }
     }
 
