@@ -22,6 +22,10 @@ name = "kuluu"
 path = "src/main.rs"
 
 [[example]]
+name = "room-no-install"
+required-features = ["native-window", "debug-animation_room"]
+
+[[example]]
 # Headless replay of the single-authority walker over real MZB geometry
 # (plan §4). Needs the viewer feature: the walker lives in `view_native`.
 name = "zz-field-walk"
