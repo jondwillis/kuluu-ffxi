@@ -12,8 +12,42 @@ establish complete updater arithmetic, coordinate conversion, emission timing,
 attachment transforms or presentation parity. An explicit script-redirection
 opcode is a separate operation and is outside this conclusion.
 
-## Binary evidence
+## Script ownership
 
+When a particle's initializer script reaches opcode `0x3C`, the generator
+that instruction links to resets its emission countdown and runs its normal
+emission update with the newborn parent element as context. Each element the
+linked generator creates is initialized from the linked generator's own
+initializer script, not the parent's.
+
+The initializers bound by that script are therefore the linked generator's:
+position tracks `0x21/0x22/0x23`, damping factor `0x69` and child generator
+`0x44` are instructions in the selected generator's initializer script.
+
+Each element is later updated from the updater script of the generator that
+created it, reading the bound data that element's own initializers recorded.
+Position updaters `0x0F/0x10/0x11` and damping updater `0x44` take their track
+or value from that element-local binding by the updater instruction's
+bound-data index. The Y/Z position updaters write the element's position from
+the evaluated bound track, and the damping updater writes the sampled value
+into the initialized damping binding. Nothing on the immediate-dispatch path
+substitutes the parent generator's script for the linked generator's.
+
+## Kuluu reproduction boundary
+
+The regression drives `spawn_particle_generators` with distinct, synthetic
+parent and linked definitions through `ActionAssets`, then exercises production
+emission, draw-position evaluation and damping. At half lifetime, the old
+linked path produces the parent's position `(-3, -4, -5)` instead of the
+linked definition's `(1, 2, 3)`. It also retains parent child factories.
+These are controlled valid-resource inputs, not an assertion that the same
+parameter combination occurs in every shipped effect. Runtime captures of
+this synthetic scene can verify the correction's rendered consequence;
+they cannot verify a live session or the complete retail effect.
+
+## Provenance
+
+Addresses below are RVAs and VAs in the `retail-2026-09` build.
 Input is the registered retail install's original `FFXiMain.dll`, SHA-256
 `f2245d1c9d06e02c36624942483913f5120c0d40777fc1bb8703c6f4bda823e4`.
 The independently decoded text has SHA-256
@@ -50,17 +84,5 @@ The community map used for identification was
 (`ElemGenerate`, `ElemIdle`), together with
 `research/XIClient/src/XIClient/source/World/Generator/Effects/CMoElem.cpp`
 (`Idle`). Capstone decoded the original-build instructions independently.
-The local raw evidence is
+The raw capture was a non-durable local log outside the tree,
 `/private/tmp/kuluu-immediate-bindings-retail-contract.log`.
-
-## Kuluu reproduction boundary
-
-The regression drives `spawn_particle_generators` with distinct, synthetic
-parent and linked definitions through `ActionAssets`, then exercises production
-emission, draw-position evaluation and damping. At half lifetime, the old
-linked path produces the parent's position `(-3, -4, -5)` instead of the
-linked definition's `(1, 2, 3)`. It also retains parent child factories.
-These are controlled valid-resource inputs, not an assertion that the same
-parameter combination occurs in every shipped effect. Runtime captures of
-this synthetic scene can verify the correction's rendered consequence;
-they cannot verify a live session or the complete retail effect.
