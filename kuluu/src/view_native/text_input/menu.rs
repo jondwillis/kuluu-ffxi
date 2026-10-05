@@ -408,11 +408,11 @@ fn handle_retail_plus_row(
 ) -> bool {
     #[cfg(feature = "enhanced-job-display")]
     use kuluu_render::hud::menu::RETAIL_JOB_DISPLAY;
+    #[cfg(feature = "enhanced-ignore-knockback-self")]
+    use kuluu_render::hud::menu::RETAIL_KNOCKBACK;
     #[cfg(feature = "enhanced-mob-hp-under")]
     use kuluu_render::hud::menu::RETAIL_MOB_HP_UNDER;
-    use kuluu_render::hud::menu::{
-        DEBUG_RETAIL_LABEL, DEBUG_RETAIL_SEPARATOR, RETAIL_DLSS_MENU, RETAIL_KNOCKBACK,
-    };
+    use kuluu_render::hud::menu::{DEBUG_RETAIL_LABEL, DEBUG_RETAIL_SEPARATOR, RETAIL_DLSS_MENU};
     match label {
         DEBUG_RETAIL_SEPARATOR | DEBUG_RETAIL_LABEL => true,
         RETAIL_DLSS_MENU => {
@@ -462,6 +462,7 @@ fn handle_retail_plus_row(
             );
             true
         }
+        #[cfg(feature = "enhanced-ignore-knockback-self")]
         RETAIL_KNOCKBACK => {
             // [on] reports the feature live: knockback applied (the default).
             graphics.ignore_knockback_self = !graphics.ignore_knockback_self;
@@ -479,6 +480,30 @@ fn handle_retail_plus_row(
             true
         }
         _ => false,
+    }
+}
+
+const FORCE_18_HOUR: u32 = 18;
+
+// The row shares VanaClock's one hold with cutscene ClockHold cues, so turning it off releases
+// only its own hold; an authored hold at another time stays put.
+fn clock_held_at_force_18(clock: &kuluu_render::vana_time::VanaClock) -> bool {
+    let mut forced = *clock;
+    forced.freeze_at_hour_minute(FORCE_18_HOUR, 0);
+    clock.is_frozen() && forced.earth_unix_now() == clock.earth_unix_now()
+}
+
+/// Re-applies the Force_18:00 hold after a cutscene end, zone change or disconnect thawed the
+/// shared clock while the row is still on.
+pub(crate) fn hold_force_18_clock(
+    hud_panels: Res<kuluu_render::hud::HudPanels>,
+    clock: Option<ResMut<kuluu_render::vana_time::VanaClock>>,
+) {
+    let Some(mut clock) = clock else {
+        return;
+    };
+    if hud_panels.force_18 && !clock.is_frozen() {
+        clock.freeze_at_hour_minute(FORCE_18_HOUR, 0);
     }
 }
 
@@ -551,12 +576,10 @@ fn toggle_debug_panel(
             !hud_panels.fog_off
         }
         DEBUG_FORCE_18 => {
-            // Edge-triggered: freezing is sticky until thaw, so only act on the
-            // flip (same shape as the weather/fog gates).
             hud_panels.force_18 = !hud_panels.force_18;
             if hud_panels.force_18 {
-                vana_clock.freeze_at_hour_minute(18, 0);
-            } else {
+                vana_clock.freeze_at_hour_minute(FORCE_18_HOUR, 0);
+            } else if clock_held_at_force_18(vana_clock) {
                 vana_clock.thaw();
             }
             hud_panels.force_18
@@ -1371,6 +1394,57 @@ mod menu_dispatch_tests {
                 }
             }
         }
+    }
+
+    fn flip_force_18(
+        clock: &mut kuluu_render::vana_time::VanaClock,
+        panels: &mut kuluu_render::hud::HudPanels,
+    ) {
+        toggle_debug_panel(
+            kuluu_render::hud::menu::DEBUG_FORCE_18,
+            panels,
+            &mut Default::default(),
+            &mut Default::default(),
+            clock,
+            Default::default(),
+            &mut SceneState::default(),
+        );
+    }
+
+    fn held_hour(clock: &kuluu_render::vana_time::VanaClock) -> u64 {
+        kuluu_render::vana_time::vana_hour(clock.earth_unix_secs_now())
+    }
+
+    #[test]
+    fn force_18_comes_back_after_a_zone_change_thaw() {
+        use bevy::ecs::system::RunSystemOnce;
+        let mut world = bevy::ecs::world::World::new();
+        world.insert_resource(kuluu_render::hud::HudPanels {
+            force_18: true,
+            ..Default::default()
+        });
+        world.insert_resource(kuluu_render::vana_time::VanaClock::anchored_at_hour(12.0));
+        world.run_system_once(hold_force_18_clock).unwrap();
+        let clock = world.resource::<kuluu_render::vana_time::VanaClock>();
+        assert!(clock.is_frozen());
+        assert_eq!(held_hour(clock), u64::from(FORCE_18_HOUR));
+    }
+
+    #[test]
+    fn force_18_off_releases_only_its_own_hold() {
+        let mut panels = kuluu_render::hud::HudPanels::default();
+        let mut clock = kuluu_render::vana_time::VanaClock::anchored_at_hour(12.0);
+        flip_force_18(&mut clock, &mut panels);
+        assert_eq!(held_hour(&clock), u64::from(FORCE_18_HOUR));
+        flip_force_18(&mut clock, &mut panels);
+        assert!(!clock.is_frozen());
+
+        flip_force_18(&mut clock, &mut panels);
+        clock.thaw();
+        clock.freeze();
+        flip_force_18(&mut clock, &mut panels);
+        assert!(clock.is_frozen(), "an authored hold outlives the debug row");
+        assert_ne!(held_hour(&clock), u64::from(FORCE_18_HOUR));
     }
 
     #[test]

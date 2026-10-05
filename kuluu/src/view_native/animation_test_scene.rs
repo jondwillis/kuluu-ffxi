@@ -40,7 +40,7 @@ const WEST_RONFAURE_MZB_FILE_ID: u32 = 200;
 
 // LSB zone id for South Gustaberg (the Bastok tunnel entrance). DAT file 207 carries both the
 // tunnel MZB and the `ligh` lamp dir — li00..li11 fixtures, lt00..lt11 halos, ghu1/ghu2 — all gated
-// by the tkaa time-of-day track (dat-lamp-glow-probe: ROM/0/124.DAT).
+// by the tkaa time-of-day track (ROM/0/124.DAT).
 const SOUTH_GUSTABERG_ZONE_ID: u16 = 107;
 const SOUTH_GUSTABERG_MZB_FILE_ID: u32 = 207;
 
@@ -68,64 +68,100 @@ const LAMP_SLIDER_KNOB_W: f32 = 10.0;
 // -(-238.241, 49.754, -139.944).
 const WR_ENTRY_OFFSET: Vec3 = Vec3::new(238.241, -49.754, 139.944);
 
+const ZONE_ID_ENV: &str = "ANIMTEST_ZONE_ID";
+const MZB_FILE_ID_ENV: &str = "ANIMTEST_MZB_FILE_ID";
+const WORLD_POS_ENV: &str = "ANIMTEST_WORLD_POS";
+
+fn warn_env(var: &str, value: &str, reason: &str) {
+    eprintln!("[animationtest] ignoring {var}={value}: {reason}");
+}
+
+// Unset is silent; a set value that cannot be used is reported, because these variables frame
+// evidence captures and a silent fallback would capture the wrong scene.
+fn env_set(var: &str) -> Option<String> {
+    match std::env::var(var) {
+        Ok(v) => Some(v),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(v)) => {
+            warn_env(var, &v.to_string_lossy(), "not valid unicode");
+            None
+        }
+    }
+}
+
+fn env_parse<T: std::str::FromStr>(var: &str) -> Option<T>
+where
+    T::Err: std::fmt::Display,
+{
+    let raw = env_set(var)?;
+    match raw.trim().parse() {
+        Ok(v) => Some(v),
+        Err(e) => {
+            warn_env(var, &raw, &e.to_string());
+            None
+        }
+    }
+}
+
+fn parse_f32s<const N: usize>(raw: &str) -> Result<[f32; N], String> {
+    let values = raw
+        .split(',')
+        .map(|t| t.trim().parse::<f32>())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    <[f32; N]>::try_from(values)
+        .map_err(|v| format!("expected {N} comma-separated numbers, got {}", v.len()))
+}
+
+fn env_f32s<const N: usize>(var: &str) -> Option<[f32; N]> {
+    let raw = env_set(var)?;
+    parse_f32s(&raw)
+        .map_err(|reason| warn_env(var, &raw, &reason))
+        .ok()
+}
+
 // ANIMTEST_ZONE_ID / ANIMTEST_MZB_FILE_ID / ANIMTEST_WORLD_POS ("x,y,z") override the LoadZone
 // case so external captures can frame any zone — South Gustaberg's tunnel lamps load at world_pos
 // ZERO, where zone geometry lands at absolute mzb_to_bevy(native) coordinates.
 fn env_zone_override() -> Option<(u16, u32, Vec3)> {
-    let zone_id: u16 = std::env::var("ANIMTEST_ZONE_ID").ok()?.parse().ok()?;
-    let mzb_file: u32 = std::env::var("ANIMTEST_MZB_FILE_ID").ok()?.parse().ok()?;
-    let world_pos = match std::env::var("ANIMTEST_WORLD_POS") {
-        Ok(s) => s
-            .split(',')
-            .map(|t| t.trim().parse::<f32>())
-            .collect::<Result<Vec<_>, _>>()
-            .ok()?
-            .into_iter()
-            .take(3)
-            .chain(std::iter::repeat(0.0))
-            .take(3)
-            .collect::<Vec<_>>(),
-        Err(_) => Vec3::ZERO.to_array().to_vec(),
-    };
-    if world_pos.len() != 3 {
+    let zone_set = std::env::var_os(ZONE_ID_ENV).is_some();
+    let mzb_set = std::env::var_os(MZB_FILE_ID_ENV).is_some();
+    if zone_set != mzb_set {
+        eprintln!(
+            "[animationtest] ignoring the zone override: {ZONE_ID_ENV} and {MZB_FILE_ID_ENV} must be set together"
+        );
         return None;
     }
-    Some((zone_id, mzb_file, Vec3::from_slice(&world_pos)))
+    let zone_id: u16 = env_parse(ZONE_ID_ENV)?;
+    let mzb_file: u32 = env_parse(MZB_FILE_ID_ENV)?;
+    let world_pos = if std::env::var_os(WORLD_POS_ENV).is_some() {
+        Vec3::from_array(env_f32s::<3>(WORLD_POS_ENV)?)
+    } else {
+        Vec3::ZERO
+    };
+    Some((zone_id, mzb_file, world_pos))
 }
 
 // ANIMTEST_HOUR pins VanaClock to a fixed game hour on LoadZone (night/midday captures).
 fn env_hour_override() -> Option<f32> {
-    std::env::var("ANIMTEST_HOUR").ok()?.trim().parse().ok()
+    env_parse("ANIMTEST_HOUR")
 }
 
 // ANIMTEST_ACTOR_POS="x,y,z" re-bases the worm/hume pair (worm at base-1x, hume at base+1x)
 // so an actor can stand under a zone lamp for lighting captures.
 fn env_actor_pos() -> Option<Vec3> {
-    let v: Vec<f32> = std::env::var("ANIMTEST_ACTOR_POS")
-        .ok()?
-        .split(',')
-        .map(|t| t.trim().parse())
-        .collect::<Result<Vec<_>, _>>()
-        .ok()?;
-    if v.len() != 3 {
-        return None;
-    }
-    Some(Vec3::from_slice(&v))
+    env_f32s::<3>("ANIMTEST_ACTOR_POS").map(Vec3::from_array)
 }
 
 // ANIMTEST_CAM="px,py,pz,tx,ty,tz" overrides the box camera's position and look-at target.
 fn env_camera_override() -> Option<(Vec3, Vec3)> {
-    let v: Vec<f32> = std::env::var("ANIMTEST_CAM")
-        .ok()?
-        .split(',')
-        .map(|t| t.trim().parse::<f32>())
-        .collect::<Result<Vec<_>, _>>()
-        .ok()?;
-    if v.len() != 6 {
-        return None;
-    }
-    Some((Vec3::from_slice(&v[0..3]), Vec3::from_slice(&v[3..6])))
+    let v = env_f32s::<6>("ANIMTEST_CAM")?;
+    let (pos, target) = v.split_at(v.len() / 2);
+    Some((Vec3::from_slice(pos), Vec3::from_slice(target)))
 }
+
+const WORM_OFFSET: Vec3 = Vec3::new(-1.0, 0.0, 0.0);
+const HUME_OFFSET: Vec3 = Vec3::new(1.0, 0.0, 0.0);
 
 const WORM_ID: u32 = 0x0100_0001;
 const HUME_ID: u32 = 2;
@@ -147,7 +183,7 @@ fn log_line(log: &mut TestLog, msg: String) {
     }
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum Case {
     PlayerNhIt,
     PlayerChit,
@@ -169,6 +205,54 @@ enum Case {
 }
 
 impl Case {
+    const ALL: [Case; 17] = [
+        Self::PlayerNhIt,
+        Self::PlayerChit,
+        Self::PlayerDhit,
+        Self::MobNhIt,
+        Self::MobChit,
+        Self::MobRespawn,
+        Self::LevelUp,
+        Self::Gen141,
+        Self::Gen144,
+        Self::Hit1Full,
+        Self::Hi26,
+        Self::Sb00,
+        Self::I900,
+        Self::LoadZone,
+        Self::LoadWeather,
+        Self::SgLamps,
+        Self::Shot,
+    ];
+
+    fn auto_name(self) -> &'static str {
+        match self {
+            Self::PlayerNhIt => "nhit",
+            Self::PlayerChit => "chit",
+            Self::PlayerDhit => "dhit",
+            Self::MobNhIt => "mobnhit",
+            Self::MobChit => "mobchit",
+            Self::MobRespawn => "respawn",
+            Self::LevelUp => "levelup",
+            Self::Gen141 => "g141",
+            Self::Gen144 => "g144",
+            Self::Hit1Full => "hit1full",
+            Self::Hi26 => "hi26",
+            Self::Sb00 => "sb00",
+            Self::I900 => "i900",
+            Self::LoadZone => "zone",
+            Self::LoadWeather => "weather",
+            Self::SgLamps => "sglamps",
+            // ANIMTEST_SHOT_PATH names the PNG; Bevy reads back the render target, so this works
+            // with KULUU_WINDOW_HIDDEN=1 where no window capture can reach.
+            Self::Shot => "shot",
+        }
+    }
+
+    fn on_panel(self) -> bool {
+        !matches!(self, Self::Shot)
+    }
+
     fn label(self) -> &'static str {
         match self {
             Self::PlayerNhIt => "player normal hit",
@@ -263,6 +347,20 @@ struct DrawnCheck {
 #[derive(Component)]
 pub(crate) struct TestSceneScoped;
 
+/// The sun, moon and fog the room's own setup_world call spawns. They carry InGameEntity, which
+/// only OnExit(InGame) sweeps, so the room takes them down itself; they stay out of
+/// TestSceneScoped so the backdrop sweep still hides them.
+#[derive(Component)]
+struct RoomWorldScoped;
+
+/// Set on the backdrop entities zone_backdrop_visibility hid, so it restores only those.
+#[derive(Component)]
+struct HiddenByTestBox;
+
+/// The GlobalAmbientLight from before the room opened; tear_down puts it back.
+#[derive(Resource)]
+struct AmbientBeforeRoom(Option<bevy::light::GlobalAmbientLight>);
+
 /// Set by the launcher's AnimationTest titlebar button (gated on the
 /// `debug-animation_room` feature); consumed by handle_toggle.
 #[derive(Resource, Default)]
@@ -280,41 +378,32 @@ struct AutoFire {
 }
 
 fn case_from_name(s: &str) -> Option<Case> {
-    Some(match s {
-        "nhit" => Case::PlayerNhIt,
-        "chit" => Case::PlayerChit,
-        "dhit" => Case::PlayerDhit,
-        "mobnhit" => Case::MobNhIt,
-        "mobchit" => Case::MobChit,
-        "respawn" => Case::MobRespawn,
-        "levelup" => Case::LevelUp,
-        "g141" => Case::Gen141,
-        "g144" => Case::Gen144,
-        "hit1full" => Case::Hit1Full,
-        "hi26" => Case::Hi26,
-        "sb00" => Case::Sb00,
-        "i900" => Case::I900,
-        "zone" => Case::LoadZone,
-        "weather" => Case::LoadWeather,
-        "sglamps" => Case::SgLamps,
-        // ANIMTEST_SHOT_PATH names the PNG; Bevy reads back the render target, so this works
-        // with KULUU_WINDOW_HIDDEN=1 where no window capture can reach.
-        "shot" => Case::Shot,
-        _ => return None,
-    })
+    Case::ALL.into_iter().find(|c| c.auto_name() == s)
+}
+
+fn parse_auto_cases(raw: &str) -> Vec<Case> {
+    let mut cases = Vec::new();
+    for name in raw.split(',').map(str::trim) {
+        match case_from_name(name) {
+            Some(case) => cases.push(case),
+            None => warn_env("ANIMTEST_AUTO", raw, &format!("unknown case {name:?}")),
+        }
+    }
+    if cases.is_empty() {
+        warn_env("ANIMTEST_AUTO", raw, "no case names recognised");
+    }
+    cases
 }
 
 // True while a real zone block is loaded into the box: zone_backdrop_visibility exists to
-// hide the launcher backdrop's own geometry and would swallow the test zone too.
+// hide the launcher backdrop's own geometry and would swallow the test zone too, and the test
+// floor hides under it.
 #[derive(Resource, Default)]
 struct TestZoneActive(bool);
 
 /// The flat test floor; hidden once a real zone loads under it (standalone tester parity).
 #[derive(Component)]
 struct TestFloor;
-
-#[derive(Resource, Default)]
-struct FloorHidden(bool);
 
 /// One-shot screenshot request the box fires through the production Screenshot path (GPU
 /// readback of the render target — valid while the window is buried).
@@ -326,22 +415,11 @@ struct PendingShot(Option<std::path::PathBuf>);
 #[derive(Resource, Default)]
 struct LampRoomActive(bool);
 
-// Hand-rolled lantern-alpha slider — bevy_ui 0.19 ships no Slider widget. The track carries a
-// Button so its Interaction tracks the whole mouse-hold (same mechanism as the case buttons), and
-// drive_lamp_alpha_slider maps the held cursor through ComputedNode::normalize_point, which is the
-// same physical-pixel space bevy_ui's own focus pass hit-tests in.
-// While set, the occlusion raycast stands down so the lamp room can be lit without
-// raycast-zeroed bindings. Seeded on (rays suppressed) by the lamp-room case; with no panel
-// control here it stays as seeded until teardown resets it.
-#[derive(Resource, Default)]
-pub struct LampRaysOff(pub bool);
-
 // The Enhanced half of the user's graphics settings (`dynamic_lights` = Lamps + Shadows makes each
 // DAT lamp a real Bevy PointLight with cube shadow maps and flicker; volumetric fog scatters over
 // the whole frame), neither of which exists in retail. Neither belongs under a lamp capture, so
 // this checkbox (and the lamp-room seed) suppresses them and restores exactly what it replaced on
-// un-suppress or teardown. `persist_graphics_on_change` rewrites graphics.json at both edges like
-// any menu change would; the value ends up back where it started.
+// un-suppress or teardown. GraphicsPersistSuspended keeps the suppressed values off disk.
 #[derive(Resource, Default)]
 pub struct ShadowsOff(pub bool);
 
@@ -361,6 +439,8 @@ enum SkyFxField {
 }
 
 impl SkyFxField {
+    const ALL: [SkyFxField; 4] = [Self::Sun, Self::Moon, Self::Fog, Self::Stars];
+
     fn label(self) -> &'static str {
         match self {
             Self::Sun => "sun",
@@ -407,12 +487,6 @@ struct WallGlowCheckbox;
 #[derive(Resource, Default)]
 struct ShadowOverrides(Option<ShadowSnapshot>);
 
-/// The user's own Dynamic Lights value, stashed the first time the box flips enhance mode —
-/// teardown hands it back so closing the box never rewrites a setting the box was never told
-/// to change.
-#[derive(Resource, Default)]
-struct EnhanceRestore(Option<kuluu_render::graphics_settings::DynamicLights>);
-
 #[derive(Clone)]
 struct ShadowSnapshot {
     dynamic_lights: kuluu_render::graphics_settings::DynamicLights,
@@ -420,6 +494,10 @@ struct ShadowSnapshot {
     volumetric_fog: Option<bevy::light::VolumetricFog>,
 }
 
+// Hand-rolled lantern-alpha slider, styled like the rest of the panel. The track carries a Button
+// so its Interaction tracks the whole mouse-hold (same mechanism as the case buttons), and
+// drive_lamp_alpha_slider maps the held cursor through ComputedNode::normalize_point, which is the
+// same physical-pixel space bevy_ui's own focus pass hit-tests in.
 #[derive(Component)]
 struct LampSliderTrack;
 #[derive(Component)]
@@ -444,8 +522,6 @@ struct ZoneLoadParams<'w> {
     load_tx: MessageWriter<'w, LoadMzbRequest>,
     last_zone: ResMut<'w, LastAutoLoadedZone>,
     backdrop_zone: ResMut<'w, super::launcher_backdrop::LauncherBackdropZone>,
-    floor_hidden: ResMut<'w, FloorHidden>,
-    lamp_rays: ResMut<'w, LampRaysOff>,
     sky_fx: ResMut<'w, kuluu_render::sun_moon::SkyFxOverride>,
     lamps_off: ResMut<'w, kuluu_render::particle_sim::LampHalosOff>,
     wall_glow_off: ResMut<'w, kuluu_render::particle_sim::WallWashOff>,
@@ -465,7 +541,6 @@ pub struct AnimationTestScenePlugin;
 impl Plugin for AnimationTestScenePlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<TestLog>()
-            .init_resource::<LampRaysOff>()
             .init_resource::<DrawnCheck>()
             .init_resource::<PendingCase>()
             .init_resource::<WormState>()
@@ -473,23 +548,19 @@ impl Plugin for AnimationTestScenePlugin {
             .init_resource::<CaseLock>()
             .init_resource::<PendingToggle>()
             .init_resource::<TestZoneActive>()
-            .init_resource::<FloorHidden>()
             .init_resource::<PendingShot>()
             .init_resource::<ShadowsOff>()
             .init_resource::<ShadowOverrides>()
             .init_resource::<kuluu_render::sun_moon::SkyFxOverride>()
             .init_resource::<kuluu_render::particle_sim::LampHalosOff>()
             .init_resource::<kuluu_render::particle_sim::WallWashOff>()
-            .init_resource::<kuluu_render::zone_point_lights::ZoneLampLightsOff>()
-            .init_resource::<EnhanceRestore>()
-            .init_resource::<LampRoomActive>();
+            .init_resource::<LampRoomActive>()
+            .init_resource::<crate::graphics_store::GraphicsPersistSuspended>();
         // ANIMTEST_AUTO=nhit,chit,... — fire the named cases on a fixed clock with no input
         // (standalone tester parity); opening the box too, so the whole run is hands-free.
-        let auto_cases: Vec<Case> = std::env::var("ANIMTEST_AUTO")
-            .unwrap_or_default()
-            .split(',')
-            .filter_map(|s| case_from_name(s.trim()))
-            .collect();
+        let auto_cases = env_set("ANIMTEST_AUTO")
+            .map(|raw| parse_auto_cases(&raw))
+            .unwrap_or_default();
         if !auto_cases.is_empty() {
             eprintln!(
                 "[animationtest] ANIMTEST_AUTO: {}",
@@ -556,8 +627,8 @@ impl Plugin for AnimationTestScenePlugin {
 }
 
 // The box owns the screen while it is up: unload (not just hide) the launcher render camera and
-// the backdrop so nothing loaded sits behind the test scene; tear_down restores both. Level-
-//triggered (runs in Last, after the frame's command flush) because the box's own spawn is
+// the backdrop so nothing loaded sits behind the test scene; closing the box restores both.
+// Level-triggered (runs in Last, after the frame's command flush) because the box's own spawn is
 // deferred — Update-side systems can't see it on its opening frame.
 fn apply_test_unload(
     q_box: Query<(), With<TestSceneScoped>>,
@@ -578,7 +649,7 @@ fn apply_test_unload(
         commands.entity(e).try_despawn();
     }
     // Idempotent once unloaded: empty scoped query, remove_resource is a silent no-op.
-    super::launcher_backdrop::unload_for_test(&mut commands, &q_backdrop);
+    super::launcher_backdrop::despawn_backdrop_core(&mut commands, &q_backdrop);
     if !*was_open {
         log_line(&mut log, "launcher + backdrop unloaded".into());
     }
@@ -611,9 +682,6 @@ fn handle_toggle(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    moon_materials: ResMut<Assets<kuluu_render::moon_material::MoonMaterial>>,
-    images: ResMut<Assets<Image>>,
-    settings: Res<kuluu_render::graphics_settings::GraphicsSettings>,
     mut load_tx: MessageWriter<LoadActorRequest>,
     mut tracked: ResMut<TrackedEntities>,
     mut scene: ResMut<SceneState>,
@@ -635,10 +703,8 @@ fn handle_toggle(
             &mut scene,
             &mut meshes,
             &mut materials,
+            true,
         );
-        // The dispatch funnel's info! traces (routine resolution, particle defs/meshes) are
-        // gated on this; the box is where they earn their keep.
-        commands.insert_resource(VfxTrace(false));
         log_line(&mut log, "scene down".into());
         return;
     }
@@ -656,7 +722,15 @@ fn handle_toggle(
     drawn_check.parts_ok = true;
     hp.hume = TEST_MAX_HP;
     hp.worm = TEST_MAX_HP;
+    // The dispatch funnel's info! traces (routine resolution, particle defs/meshes) are gated on
+    // this; the box is where they earn their keep. tear_down disarms it on every close path.
     commands.insert_resource(VfxTrace(true));
+    commands.queue(|world: &mut World| {
+        let prev = world
+            .get_resource::<bevy::light::GlobalAmbientLight>()
+            .cloned();
+        world.insert_resource(AmbientBeforeRoom(prev));
+    });
     activate_test_scene(
         &mut commands,
         &mut meshes,
@@ -673,18 +747,30 @@ fn handle_toggle(
     // restores it.
     set_launcher_ui_visibility(&mut commands, &q_ui, false);
 
-    // Last: it consumes the owned params. poll_load_actor_tasks parks tasks without EntityMesh,
-    // and the Update chain that resource unlocks (sync_entities_system & co.) reads the world
-    // resources setup_world inserts on InGame entry — so run it here: real orb meshes/materials
-    // for the wire placeholders, no defaults.
-    kuluu_render::setup_world(
-        commands,
-        meshes,
-        materials,
-        moon_materials,
-        images,
-        settings,
-    );
+    // poll_load_actor_tasks parks tasks without EntityMesh, and the Update chain that resource
+    // unlocks (sync_entities_system & co.) reads the world resources setup_world inserts on
+    // InGame entry — so run it here: real orb meshes/materials for the wire placeholders.
+    commands.queue(run_room_world_setup);
+}
+
+fn run_room_world_setup(world: &mut World) {
+    use bevy::ecs::system::RunSystemOnce;
+    let before: std::collections::HashSet<Entity> = world
+        .query_filtered::<Entity, With<InGameEntity>>()
+        .iter(world)
+        .collect();
+    if let Err(e) = world.run_system_once(kuluu_render::setup_world) {
+        eprintln!("[animationtest] setup_world failed: {e}");
+        return;
+    }
+    let spawned: Vec<Entity> = world
+        .query_filtered::<Entity, With<InGameEntity>>()
+        .iter(world)
+        .filter(|e| !before.contains(e))
+        .collect();
+    for e in spawned {
+        world.entity_mut(e).insert(RoomWorldScoped);
+    }
 }
 
 fn handle_close_press(
@@ -712,6 +798,7 @@ fn handle_close_press(
         &mut scene,
         &mut meshes,
         &mut materials,
+        true,
     );
     log_line(&mut log, "scene down".into());
 }
@@ -767,7 +854,6 @@ fn activate_test_scene(
     });
     // +Y normal: a +Z plane is a vertical wall at z=0 that hides everything behind it.
     let plane: Mesh = Plane3d::new(Vec3::Y, Vec2::splat(40.0)).into();
-    commands.insert_resource(FloorHidden(false));
     commands.spawn((
         TestSceneScoped,
         TestFloor,
@@ -792,7 +878,7 @@ fn activate_test_scene(
         scene,
         WORM_ID,
         EntityKind::Mob,
-        actor_base + Vec3::new(-1.0, 0.0, 0.0),
+        actor_base + WORM_OFFSET,
         0,
         ffxi_proto::decode::animation::ATTACK,
         HUME_ID,
@@ -803,7 +889,7 @@ fn activate_test_scene(
         scene,
         HUME_ID,
         EntityKind::Pc,
-        actor_base + Vec3::new(1.0, 0.0, 0.0),
+        actor_base + HUME_OFFSET,
         128,
         ffxi_proto::decode::animation::ATTACK,
         WORM_ID,
@@ -1107,24 +1193,7 @@ fn spawn_panel(commands: &mut Commands) {
         ))
         .id();
 
-    for case in [
-        Case::PlayerNhIt,
-        Case::PlayerChit,
-        Case::PlayerDhit,
-        Case::MobNhIt,
-        Case::MobChit,
-        Case::MobRespawn,
-        Case::LevelUp,
-        Case::Gen141,
-        Case::Gen144,
-        Case::Hit1Full,
-        Case::Hi26,
-        Case::Sb00,
-        Case::I900,
-        Case::LoadZone,
-        Case::LoadWeather,
-        Case::SgLamps,
-    ] {
+    for case in Case::ALL.into_iter().filter(|c| c.on_panel()) {
         let button = commands
             .spawn((
                 TestSceneScoped,
@@ -1574,25 +1643,21 @@ fn run_pending_case(
             &mut hp,
         ),
         Case::LevelUp => fire_level_up(&tracked, &mut log, &mut events),
-        Case::Gen141 => fire_single_gen(
+        Case::Gen141 => fire_single_gen(&tracked, *b"g141", &mut log, &mut commands),
+        Case::Gen144 => fire_single_gen(&tracked, *b"g144", &mut log, &mut commands),
+        Case::Hit1Full => fire_named_routine(
             &tracked,
             global.as_deref(),
-            *b"g141",
+            b"hit1",
+            &[*b"g141", *b"g144"],
             &mut log,
             &mut commands,
         ),
-        Case::Gen144 => fire_single_gen(
-            &tracked,
-            global.as_deref(),
-            *b"g144",
-            &mut log,
-            &mut commands,
-        ),
-        Case::Hit1Full => fire_hit1_full(&tracked, global.as_deref(), &mut log, &mut commands),
         Case::Hi26 => fire_named_routine(
             &tracked,
             global.as_deref(),
             b"hi26",
+            &[],
             &mut log,
             &mut commands,
         ),
@@ -1600,52 +1665,31 @@ fn run_pending_case(
             &tracked,
             global.as_deref(),
             b"sb00",
+            &[],
             &mut log,
             &mut commands,
         ),
         Case::I900 => fire_zone_i900(&tracked, root.0.clone(), &mut log, &mut commands),
-        Case::SgLamps => {
-            // Item one of the lamp-room setup: lantern rays off (the panel checkbox shows checked).
-            *zone.lamp_rays = LampRaysOff(true);
-            load_sg_lamp_room(&mut zone, &mut scene, &mut log, &mut commands);
-        }
+        Case::SgLamps => load_sg_lamp_room(&mut zone, &mut scene, &mut log, &mut commands),
         Case::LoadZone => {
             let (zone_id, mzb_file, world_pos) = env_zone_override().unwrap_or((
                 WEST_RONFAURE_ZONE_ID,
                 WEST_RONFAURE_MZB_FILE_ID,
                 WR_ENTRY_OFFSET,
             ));
-            if zone.last_zone.file_id == Some(mzb_file) {
-                log_line(&mut log, "zone: already loaded".into());
-            } else {
-                // Drive the zone through the backdrop resource so
-                // mirror_backdrop_to_scene_state keeps snapshot.zone_id in agreement. The
-                // snapshot write is atomic with the pre-stamp: auto_load_zone_geometry_system
-                // compares effective_zone_file_id(snapshot) against LastAutoLoadedZone, and a
-                // frame gap between the two re-issues the block at a ZERO offset (which would
-                // stand us 50+ units off the terrain).
-                *zone.backdrop_zone = super::launcher_backdrop::LauncherBackdropZone(zone_id);
-                scene.snapshot.zone_id = Some(zone_id);
-                zone.last_zone.file_id = Some(mzb_file);
-                zone.load_tx.write(LoadMzbRequest {
-                    file_id: mzb_file,
-                    chunk_idx: None,
-                    world_pos,
-                    auto_loaded: true,
-                    slot: ZONE_SLOT_MAIN,
-                    active_sub_area: None,
-                });
+            if load_test_zone(&mut zone, &mut scene, zone_id, mzb_file, world_pos) {
                 log_line(
                     &mut log,
                     format!("zone: id {zone_id} (mzb {mzb_file}) loading at offset {world_pos:?}"),
                 );
+            } else {
+                log_line(&mut log, "zone: already loaded".into());
             }
             if let Some(hour) = env_hour_override() {
                 commands
                     .insert_resource(kuluu_render::vana_time::VanaClock::anchored_at_hour(hour));
                 log_line(&mut log, format!("clock: pinned to hour {hour}"));
             }
-            zone.floor_hidden.0 = true;
             commands.insert_resource(TestZoneActive(true));
         }
         Case::LoadWeather => {
@@ -1785,56 +1829,83 @@ fn fire_level_up(tracked: &TrackedEntities, log: &mut TestLog, events: &mut Even
     log_line(log, "level-up queued on hume".into());
 }
 
+// Production semantics: the effect runs on the victim with ActionTarget = attacker, so
+// target-facing generators place off the Hume like a real hit instead of at the worm's feet.
+// insert (not try_insert), even with no Hume: a stale target from an earlier case must not win
+// first-writer.
+fn arm_worm(
+    tracked: &TrackedEntities,
+    log: &mut TestLog,
+    commands: &mut Commands,
+) -> Option<(Entity, Option<Entity>)> {
+    let Some(worm) = tracked.by_id.get(&WORM_ID).copied() else {
+        log_line(log, "worm not loaded yet".into());
+        return None;
+    };
+    let hume = tracked.by_id.get(&HUME_ID).copied();
+    commands.entity(worm).insert(ActionTarget(hume));
+    Some((worm, hume))
+}
+
+const SPAWN_GENERATOR_RAW_TYPE: u8 = 0x02;
+
+// A one-stage synthetic Particle routine, the shape a DAT routine stage naming `id` would have.
+fn synth_particle_stage(
+    id: [u8; 4],
+    duration_frames: u16,
+    local_dir: [u8; 4],
+) -> ffxi_dat::scheduler::Scheduler {
+    ffxi_dat::scheduler::Scheduler {
+        name: *b"tst1",
+        stages: vec![ffxi_dat::scheduler::TimedStage {
+            frame: 0,
+            stage: ffxi_dat::scheduler::SchedulerStage {
+                kind: ffxi_dat::scheduler::StageKind::Particle,
+                raw_type: SPAWN_GENERATOR_RAW_TYPE,
+                stage_words: ffxi_dat::scheduler::SYNTHESIZED_STAGE_WORDS,
+                delay_frames: 0,
+                duration_frames,
+                id,
+                max_loops: 0,
+                transition_in: 0,
+                transition_out: 0,
+                model_transform: None,
+                follow_points: None,
+                screen_color: None,
+                actor_fade: None,
+                idle_transition_time: None,
+                flinch_duration: None,
+                model_visibility: None,
+                spell_effect: None,
+                random_group: None,
+                sound_range: None,
+                control_flow: None,
+                local_dir,
+            },
+        }],
+    }
+}
+
 // Tester-only: spawn a single named generator on the worm (as target) with its alpha forced to 1,
 // so an a=0 additive flash can be seen in isolation. The def is resolved from the global effect
 // dir at spawn time (spawn_particle_generators), independent of this synthetic one-stage routine.
 fn fire_single_gen(
     tracked: &TrackedEntities,
-    _global: Option<&GlobalEffectDir>,
     gen: [u8; 4],
     log: &mut TestLog,
     commands: &mut Commands,
 ) {
-    let Some(worm) = tracked.by_id.get(&WORM_ID).copied() else {
-        log_line(log, "worm not loaded yet".into());
+    let Some((worm, _)) = arm_worm(tracked, log, commands) else {
         return;
     };
-    // Same production semantics as fire_named_routine: the generator sits where it does in
-    // hi14/hit1 — on the victim with target = attacker. insert (not try_insert): a stale
-    // target from an earlier case must not win first-writer.
-    if let Some(hume) = tracked.by_id.get(&HUME_ID).copied() {
-        commands.entity(worm).insert(ActionTarget(Some(hume)));
-    }
-    let stage = ffxi_dat::scheduler::SchedulerStage {
-        kind: ffxi_dat::scheduler::StageKind::Particle,
-        raw_type: 0x02, // SpawnGenerator
-        stage_words: ffxi_dat::scheduler::SYNTHESIZED_STAGE_WORDS,
-        delay_frames: 0,
-        duration_frames: 0, // one burst; the particle lives out its own max_life
-        id: gen,
-        max_loops: 0,
-        transition_in: 0,
-        transition_out: 0,
-        model_transform: None,
-        follow_points: None,
-        screen_color: None,
-        actor_fade: None,
-        idle_transition_time: None,
-        flinch_duration: None,
-        model_visibility: None,
-        spell_effect: None,
-        random_group: None,
-        sound_range: None,
-        control_flow: None,
-        local_dir: ffxi_dat::scheduler::NO_LOCAL_DIR,
-    };
-    let sched = ffxi_dat::scheduler::Scheduler {
-        name: *b"tst1",
-        stages: vec![ffxi_dat::scheduler::TimedStage { frame: 0, stage }],
-    };
-    let scheds = [sched];
+    // Zero duration: one burst; the particle lives out its own max_life.
+    let scheds = [synth_particle_stage(
+        gen,
+        0,
+        ffxi_dat::scheduler::NO_LOCAL_DIR,
+    )];
     let lookup = RoutineLookup::new().with_dat(&scheds);
-    match ActiveScheduler::from_routine(&lookup, b"tst1") {
+    match ActiveScheduler::from_routine(&lookup, &scheds[0].name) {
         Some(active) => {
             commands.insert_resource(kuluu_render::particle_sim::TestAlphaOverride(
                 std::collections::HashSet::from([gen]),
@@ -1853,88 +1924,47 @@ fn fire_single_gen(
     }
 }
 
-// Tester-only: play the full ROM/0/0.DAT hit1 routine on the worm (as target) with g141/g144's
-// alpha forced to 1 so their a=0 additive flashes are visible alongside the rest of the chain.
-fn fire_hit1_full(
-    tracked: &TrackedEntities,
-    global: Option<&GlobalEffectDir>,
-    log: &mut TestLog,
-    commands: &mut Commands,
-) {
-    let Some(worm) = tracked.by_id.get(&WORM_ID).copied() else {
-        log_line(log, "worm not loaded yet".into());
-        return;
-    };
-    // Production semantics: hit1 runs on the victim with target = attacker (see
-    // fire_named_routine); insert so a stale target from an earlier case cannot win.
-    if let Some(hume) = tracked.by_id.get(&HUME_ID).copied() {
-        commands.entity(worm).insert(ActionTarget(Some(hume)));
-    }
-    let Some(g) = global else {
-        log_line(log, "no global effect dir wired".into());
-        return;
-    };
-    let lookup = RoutineLookup::new().with_dat(&g.schedulers);
-    match ActiveScheduler::from_routine(&lookup, b"hit1") {
-        Some(active) => {
-            commands.insert_resource(kuluu_render::particle_sim::TestAlphaOverride(
-                std::collections::HashSet::from([*b"g141", *b"g144"]),
-            ));
-            log_line(
-                log,
-                format!(
-                    "hit1 full on worm (g141/g144 alpha 1): {}",
-                    stage_summary(&active)
-                ),
-            );
-            enqueue_routine(commands, worm, active);
-        }
-        None => log_line(log, "hit1 UNRESOLVED in the global effect dir".into()),
-    }
-}
-
-// Tester-only: play a named ROM/0/0.DAT routine on the worm (as target), no alpha override.
+// Tester-only: play a named ROM/0/0.DAT routine on the worm (as target). Generators named in
+// `alpha` have their alpha forced to 1 so a=0 additive flashes show alongside the rest of the
+// chain; an empty list leaves any override untouched.
 fn fire_named_routine(
     tracked: &TrackedEntities,
     global: Option<&GlobalEffectDir>,
     routine: &[u8; 4],
+    alpha: &[[u8; 4]],
     log: &mut TestLog,
     commands: &mut Commands,
 ) {
-    let Some(worm) = tracked.by_id.get(&WORM_ID).copied() else {
-        log_line(log, "worm not loaded yet".into());
+    let Some((worm, _)) = arm_worm(tracked, log, commands) else {
         return;
     };
-    // Production semantics: the routine runs on the victim with ActionTarget = attacker, so
-    // target-facing generators place off the Hume like a real hit instead of at the worm's feet.
-    // insert (not try_insert): a stale target from an earlier case must not win first-writer.
-    if let Some(hume) = tracked.by_id.get(&HUME_ID).copied() {
-        commands.entity(worm).insert(ActionTarget(Some(hume)));
-    }
     let Some(g) = global else {
         log_line(log, "no global effect dir wired".into());
         return;
     };
     let lookup = RoutineLookup::new().with_dat(&g.schedulers);
+    let name = String::from_utf8_lossy(routine);
     match ActiveScheduler::from_routine(&lookup, routine) {
         Some(active) => {
-            log_line(
-                log,
-                format!(
-                    "{} on worm: {}",
-                    String::from_utf8_lossy(routine),
-                    stage_summary(&active)
-                ),
-            );
+            if alpha.is_empty() {
+                log_line(log, format!("{name} on worm: {}", stage_summary(&active)));
+            } else {
+                commands.insert_resource(kuluu_render::particle_sim::TestAlphaOverride(
+                    alpha.iter().copied().collect(),
+                ));
+                let forced: Vec<_> = alpha.iter().map(|a| String::from_utf8_lossy(a)).collect();
+                log_line(
+                    log,
+                    format!(
+                        "{name} on worm ({} alpha 1): {}",
+                        forced.join("/"),
+                        stage_summary(&active)
+                    ),
+                );
+            }
             enqueue_routine(commands, worm, active);
         }
-        None => log_line(
-            log,
-            format!(
-                "{} UNRESOLVED in the global effect dir",
-                String::from_utf8_lossy(routine)
-            ),
-        ),
+        None => log_line(log, format!("{name} UNRESOLVED in the global effect dir")),
     }
 }
 
@@ -1949,12 +1979,9 @@ fn fire_zone_i900(
     log: &mut TestLog,
     commands: &mut Commands,
 ) {
-    let Some(worm) = tracked.by_id.get(&WORM_ID).copied() else {
-        log_line(log, "worm not loaded yet".into());
+    let Some((_, hume)) = arm_worm(tracked, log, commands) else {
         return;
     };
-    let hume = tracked.by_id.get(&HUME_ID).copied();
-    commands.entity(worm).insert(ActionTarget(hume));
     let Some(root) = dat_root else {
         log_line(log, "no DAT root wired".into());
         return;
@@ -1976,43 +2003,15 @@ fn fire_zone_i900(
     let (_schedulers, assets, _report, _cameras) = parse_action_bytes_reporting(&bytes);
     // i900's authored life (90 frames in the DAT) is the stage window.
     const I900_LIFE_FRAMES: u16 = 90;
-    let routine = ffxi_dat::scheduler::Scheduler {
-        name: *b"tst1",
-        stages: vec![ffxi_dat::scheduler::TimedStage {
-            frame: 0,
-            stage: ffxi_dat::scheduler::SchedulerStage {
-                kind: ffxi_dat::scheduler::StageKind::Particle,
-                raw_type: 0x02,
-                stage_words: ffxi_dat::scheduler::SYNTHESIZED_STAGE_WORDS,
-                delay_frames: 0,
-                duration_frames: I900_LIFE_FRAMES,
-                id: *b"i900",
-                max_loops: 0,
-                transition_in: 0,
-                transition_out: 0,
-                model_transform: None,
-                follow_points: None,
-                screen_color: None,
-                actor_fade: None,
-                idle_transition_time: None,
-                flinch_duration: None,
-                model_visibility: None,
-                spell_effect: None,
-                random_group: None,
-                sound_range: None,
-                control_flow: None,
-                local_dir: *b"fefs",
-            },
-        }],
-    };
+    let routine = synth_particle_stage(*b"i900", I900_LIFE_FRAMES, *b"fefs");
     let active = ActiveScheduler::from_scheduler(&routine);
-    // The worm stands at its spawn point; the proxy shares that spot so the effect lands on it.
-    const WORM_SPAWN_POS: Vec3 = Vec3::new(-1.0, 0.0, 0.0);
+    // The proxy shares the worm's spawn point so the effect lands on it.
+    let worm_pos = env_actor_pos().unwrap_or(Vec3::ZERO) + WORM_OFFSET;
     let proxy = commands
         .spawn((
             TestSceneScoped,
-            Transform::from_translation(WORM_SPAWN_POS),
-            GlobalTransform::from_translation(WORM_SPAWN_POS),
+            Transform::from_translation(worm_pos),
+            GlobalTransform::from_translation(worm_pos),
             ActionTarget(hume),
             assets,
         ))
@@ -2048,7 +2047,7 @@ fn worm_death_watch(
     worm_state.dead_at = None;
 }
 
-fn apply_floor_hidden(flag: Res<FloorHidden>, mut q: Query<&mut Visibility, With<TestFloor>>) {
+fn apply_floor_hidden(flag: Res<TestZoneActive>, mut q: Query<&mut Visibility, With<TestFloor>>) {
     if !flag.is_changed() {
         return;
     }
@@ -2061,10 +2060,37 @@ fn apply_floor_hidden(flag: Res<FloorHidden>, mut q: Query<&mut Visibility, With
     }
 }
 
-// Loads the South Gustaberg tunnel through the same atomic write set as LoadZone (backdrop,
-// snapshot and LastAutoLoadedZone pre-stamp in one frame, or auto-load re-issues the block at a
-// wrong offset) but always at world_pos ZERO: SG's zone-static lamp placements are authored in
-// absolute native coordinates, and every lamp capture is framed against that absolute space. The
+// The zone is driven through the backdrop resource so mirror_backdrop_to_scene_state keeps
+// snapshot.zone_id in agreement, and every write lands in the same frame:
+// auto_load_zone_geometry_system compares effective_zone_file_id(snapshot) against
+// LastAutoLoadedZone, and a frame gap between the two re-issues the block at a ZERO offset
+// (which would stand the actors 50+ units off the terrain). False when the block is already up.
+fn load_test_zone(
+    zone: &mut ZoneLoadParams,
+    scene: &mut SceneState,
+    zone_id: u16,
+    mzb_file: u32,
+    world_pos: Vec3,
+) -> bool {
+    if zone.last_zone.file_id == Some(mzb_file) {
+        return false;
+    }
+    *zone.backdrop_zone = super::launcher_backdrop::LauncherBackdropZone(zone_id);
+    scene.snapshot.zone_id = Some(zone_id);
+    zone.last_zone.file_id = Some(mzb_file);
+    zone.load_tx.write(LoadMzbRequest {
+        file_id: mzb_file,
+        chunk_idx: None,
+        world_pos,
+        auto_loaded: true,
+        slot: ZONE_SLOT_MAIN,
+        active_sub_area: None,
+    });
+    true
+}
+
+// Always at world_pos ZERO: SG's zone-static lamp placements are authored in absolute native
+// coordinates, and every lamp capture is framed against that absolute space. The
 // ZoneParticlesPlugin then spawns ligh/'s li*/lt* generators itself from effective_zone_file_id.
 fn load_sg_lamp_room(
     zone: &mut ZoneLoadParams,
@@ -2073,7 +2099,13 @@ fn load_sg_lamp_room(
     commands: &mut Commands,
 ) {
     commands.insert_resource(LampRoomActive(true));
-    if zone.last_zone.file_id == Some(SOUTH_GUSTABERG_MZB_FILE_ID) {
+    if !load_test_zone(
+        zone,
+        scene,
+        SOUTH_GUSTABERG_ZONE_ID,
+        SOUTH_GUSTABERG_MZB_FILE_ID,
+        Vec3::ZERO,
+    ) {
         log_line(
             &mut *log,
             format!(
@@ -2083,32 +2115,8 @@ fn load_sg_lamp_room(
         );
         return;
     }
-    *zone.backdrop_zone = super::launcher_backdrop::LauncherBackdropZone(SOUTH_GUSTABERG_ZONE_ID);
-    scene.snapshot.zone_id = Some(SOUTH_GUSTABERG_ZONE_ID);
-    zone.last_zone.file_id = Some(SOUTH_GUSTABERG_MZB_FILE_ID);
-    zone.load_tx.write(LoadMzbRequest {
-        file_id: SOUTH_GUSTABERG_MZB_FILE_ID,
-        chunk_idx: None,
-        world_pos: Vec3::ZERO,
-        auto_loaded: true,
-        slot: ZONE_SLOT_MAIN,
-        active_sub_area: None,
-    });
-    zone.floor_hidden.0 = true;
     commands.insert_resource(TestZoneActive(true));
-    // Lamp work wants the authored look: suppress the occlusion raycast unless a capture asks
-    // for it (ANIMTEST_LAMP_RAYS_ON=1 keeps the BVH zeroing running for before/after shots).
-    if std::env::var("ANIMTEST_LAMP_RAYS_ON").is_ok() {
-        zone.lamp_rays.0 = false;
-        log_line(&mut *log, "lamp rays: ON (ANIMTEST_LAMP_RAYS_ON)".into());
-    } else {
-        zone.lamp_rays.0 = true;
-        log_line(
-            &mut *log,
-            "lamp rays: seeded off (authored bindings; checkbox re-enables the raycast)".into(),
-        );
-    }
-    // Same reasoning for the user's own Enhanced dynamic-lights/VF settings: lamp captures want
+    // The user's own Enhanced dynamic-lights/VF settings stay out of lamp captures, which want
     // authored lighting only. ANIMTEST_LAMP_SHADOWS_ON=1 skips the suppression.
     if std::env::var("ANIMTEST_LAMP_SHADOWS_ON").is_ok() {
         log_line(&mut *log, "shadows: ON (ANIMTEST_LAMP_SHADOWS_ON)".into());
@@ -2125,16 +2133,12 @@ fn load_sg_lamp_room(
     if let Ok(list) = std::env::var("ANIMTEST_SKY_OFF") {
         let mut hit: Vec<&'static str> = Vec::new();
         for name in list.split(',').map(|s| s.trim().to_ascii_lowercase()) {
-            let field = match name.as_str() {
-                "sun" => Some(SkyFxField::Sun),
-                "moon" => Some(SkyFxField::Moon),
-                "fog" => Some(SkyFxField::Fog),
-                "stars" => Some(SkyFxField::Stars),
-                _ => None,
-            };
-            if let Some(field) = field {
-                *field.set(&mut zone.sky_fx) = true;
-                hit.push(field.label());
+            match SkyFxField::ALL.into_iter().find(|f| f.label() == name) {
+                Some(field) => {
+                    *field.set(&mut zone.sky_fx) = true;
+                    hit.push(field.label());
+                }
+                None => warn_env("ANIMTEST_SKY_OFF", &list, &format!("unknown field {name}")),
             }
         }
         log_line(&mut *log, format!("sky fx seeded off: {}", hit.join(", ")));
@@ -2198,10 +2202,7 @@ fn arm_lamp_room(
             ),
         );
     }
-    if let Some(v) = std::env::var("ANIMTEST_LAMP_ALPHA")
-        .ok()
-        .and_then(|s| s.trim().parse::<f32>().ok())
-    {
+    if let Some(v) = env_parse::<f32>("ANIMTEST_LAMP_ALPHA") {
         sim.set_lamp_halos_lift(v);
         log_line(&mut log, format!("lantern alpha scripted to {v:.3}"));
     }
@@ -2391,7 +2392,6 @@ fn sync_shadow_override(
     shadows: Res<ShadowsOff>,
     mut settings: ResMut<kuluu_render::graphics_settings::GraphicsSettings>,
     mut saved: ResMut<ShadowOverrides>,
-    restore: Res<EnhanceRestore>,
     mut commands: Commands,
     mut persist_gate: ResMut<crate::graphics_store::GraphicsPersistSuspended>,
     cam_q: Query<
@@ -2415,9 +2415,8 @@ fn sync_shadow_override(
         camera,
         live_fog,
     );
-    // The override (and the restore's write-back of the user's own values) stay off-disk; same
-    // for a live enhance-mode flip, which teardown hands back the same way.
-    persist_gate.0 = saved.0.is_some() || restore.0.is_some();
+    // The override (and the restore's write-back of the user's own values) stay off-disk.
+    persist_gate.0 = saved.0.is_some();
 }
 
 fn drive_lamp_alpha_slider(
@@ -2491,12 +2490,19 @@ fn drive_wash_alpha_slider(
 // The launcher backdrop mirrors a live zone into the same world space; its meshes carry
 // InGameEntity and would show through around the test floor. While the box is up, hide every
 // InGameEntity not under it — effect particles are children of the test actors, so they stay.
-// Restores visibility on teardown.
+// Only what this sweep hid is restored, once, when it stands down: other systems own the
+// visibility of everything else (sun/moon discs, MMB LOD chunks, collision-mode geometry).
 fn zone_backdrop_visibility(
+    mut commands: Commands,
     q_scoped: Query<Entity, With<TestSceneScoped>>,
     test_zone: Res<TestZoneActive>,
     mut q_vis: Query<
-        (&mut Visibility, Option<&ChildOf>),
+        (
+            Entity,
+            &mut Visibility,
+            Option<&ChildOf>,
+            Has<HiddenByTestBox>,
+        ),
         (With<InGameEntity>, Without<TestSceneScoped>),
     >,
     q_anc: Query<(Option<&ChildOf>, Has<TestSceneScoped>)>,
@@ -2504,30 +2510,46 @@ fn zone_backdrop_visibility(
     // A user-loaded zone block is InGameEntity too; the sweep only exists for the backdrop's
     // own geometry, so it stands down while one is active.
     let active = q_scoped.iter().next().is_some() && !test_zone.0;
-    for (mut vis, parent) in &mut q_vis {
-        if active {
-            if matches!(*vis, Visibility::Hidden) {
-                continue;
+    for (entity, mut vis, parent, hidden_by_box) in &mut q_vis {
+        if !active {
+            if hidden_by_box {
+                *vis = Visibility::Inherited;
+                commands.entity(entity).remove::<HiddenByTestBox>();
             }
-            let mut under_test = false;
-            let mut cur = parent.map(|p| p.parent());
-            while let Some(p) = cur {
-                let (next, scoped) = match q_anc.get(p) {
-                    Ok(v) => v,
-                    Err(_) => break,
-                };
-                if scoped {
-                    under_test = true;
-                    break;
-                }
-                cur = next.map(|n| n.parent());
-            }
-            if !under_test {
-                *vis = Visibility::Hidden;
-            }
-        } else if matches!(*vis, Visibility::Hidden) {
-            *vis = Visibility::default();
+            continue;
         }
+        if matches!(*vis, Visibility::Hidden) {
+            continue;
+        }
+        let mut under_test = false;
+        let mut cur = parent.map(|p| p.parent());
+        while let Some(p) = cur {
+            let (next, scoped) = match q_anc.get(p) {
+                Ok(v) => v,
+                Err(_) => break,
+            };
+            if scoped {
+                under_test = true;
+                break;
+            }
+            cur = next.map(|n| n.parent());
+        }
+        if !under_test {
+            *vis = Visibility::Hidden;
+            commands.entity(entity).insert(HiddenByTestBox);
+        }
+    }
+}
+
+fn restore_box_hidden(world: &mut World) {
+    let hidden: Vec<Entity> = world
+        .query_filtered::<Entity, With<HiddenByTestBox>>()
+        .iter(world)
+        .collect();
+    for e in hidden {
+        let mut entity = world.entity_mut(e);
+        entity.remove::<HiddenByTestBox>();
+        entity.insert(Visibility::Inherited);
     }
 }
 
@@ -2542,6 +2564,10 @@ fn sync_log_text(log: Res<TestLog>, mut node: Query<&mut Text, With<LogText>>) {
     }
 }
 
+// `restore_launcher` respawns the launcher camera and backdrop the open unloaded. Only the
+// in-Launcher close paths pass true: on phase exit the launcher's own OnExit despawns have
+// already run their queries, so a respawn there would leak both cameras and the backdrop light
+// into the session, and OnEnter(Launcher) spawns fresh ones on re-entry anyway.
 fn tear_down(
     commands: &mut Commands,
     q_scoped: &Query<Entity, With<TestSceneScoped>>,
@@ -2550,6 +2576,7 @@ fn tear_down(
     scene: &mut SceneState,
     meshes: &mut ResMut<Assets<Mesh>>,
     materials: &mut ResMut<Assets<StandardMaterial>>,
+    restore_launcher: bool,
 ) {
     // Restore-gate: phase exit runs this with no box ever up; only a real open unloads things.
     let was_open = q_scoped.iter().next().is_some();
@@ -2573,7 +2600,21 @@ fn tear_down(
         {
             *distortion = kuluu_render::distortion_pass::ActiveDistortion::default();
         }
+        restore_box_hidden(world);
+        let room_world: Vec<Entity> = world
+            .query_filtered::<Entity, With<RoomWorldScoped>>()
+            .iter(world)
+            .collect();
+        for e in room_world {
+            // A recursive despawn earlier in the list may already have freed this one.
+            let _ = world.try_despawn(e);
+        }
+        if let Some(AmbientBeforeRoom(Some(ambient))) = world.remove_resource::<AmbientBeforeRoom>()
+        {
+            world.insert_resource(ambient);
+        }
     });
+    commands.insert_resource(VfxTrace(false));
     commands.insert_resource(TestZoneActive(false));
     commands.insert_resource(LampRoomActive(false));
     commands.remove_resource::<kuluu_render::particle_sim::TestAlphaOverride>();
@@ -2587,9 +2628,6 @@ fn tear_down(
     commands.insert_resource(kuluu_render::sun_moon::SkyFxOverride::default());
     commands.insert_resource(kuluu_render::particle_sim::LampHalosOff(false));
     commands.insert_resource(kuluu_render::particle_sim::WallWashOff(false));
-    commands.insert_resource(kuluu_render::zone_point_lights::ZoneLampLightsOff(false));
-    // A stale rays-off toggle must not follow the app into a real session.
-    commands.insert_resource(LampRaysOff(false));
     commands.insert_resource(super::launcher_backdrop::LauncherBackdropZone(
         super::launcher_backdrop::DEFAULT_BACKDROP_ZONE,
     ));
@@ -2599,11 +2637,15 @@ fn tear_down(
         commands.entity(e).try_despawn();
     }
     set_launcher_ui_visibility(commands, q_ui, true);
-    // Restore what the open unloaded: launcher render camera + backdrop entities. Zone state
-    // was left standing, so the standing zone block is already in place for the mirror.
     if was_open {
+        // The launcher has no weather of its own; LoadWeather's value must not outlive the box.
+        scene.snapshot.weather = None;
+    }
+    // Zone state was left standing on open, so the standing zone block is already in place for
+    // the mirror; only the render camera and backdrop entities come back.
+    if was_open && restore_launcher {
         super::launcher_ui::spawn_launcher_camera_core(&mut *commands);
-        super::launcher_backdrop::restore_for_test(commands, &mut *meshes, &mut *materials);
+        super::launcher_backdrop::spawn_backdrop_core(commands, &mut *meshes, &mut *materials);
     }
     tracked.by_id.remove(&WORM_ID);
     tracked.by_id.remove(&HUME_ID);
@@ -2621,7 +2663,6 @@ fn tear_down_test_scene(
     mut scene: ResMut<SceneState>,
     mut graphics_settings: ResMut<kuluu_render::graphics_settings::GraphicsSettings>,
     mut overrides: ResMut<ShadowOverrides>,
-    mut restore: ResMut<EnhanceRestore>,
     mut persist_gate: ResMut<crate::graphics_store::GraphicsPersistSuspended>,
     cam_q: Query<Entity, With<kuluu_render::camera::OperatorCamera>>,
     mut meshes: ResMut<Assets<Mesh>>,
@@ -2639,10 +2680,6 @@ fn tear_down_test_scene(
         camera,
         None,
     );
-    // Hand the user's own Dynamic Lights value back if the box flipped it.
-    if let Some(prev) = restore.0.take() {
-        graphics_settings.dynamic_lights = prev;
-    }
     persist_gate.0 = false;
     tear_down(
         &mut commands,
@@ -2652,6 +2689,7 @@ fn tear_down_test_scene(
         &mut scene,
         &mut meshes,
         &mut materials,
+        false,
     );
 }
 
@@ -2695,9 +2733,190 @@ mod tests {
 
     #[test]
     fn room_attacker_ids_cover_both_wire_classes() {
+        use kuluu_render::scheduler_runtime::{HitContext, HIT_FIELD_ATTACKER_IS_PLAYER};
+        let attacker_is_player = |attacker_id| {
+            HitContext {
+                resolution: 0,
+                info: 0,
+                attacker_id,
+                offhand_context: None,
+            }
+            .field(HIT_FIELD_ATTACKER_IS_PLAYER)
+        };
         assert_eq!(WORM_ID, ffxi_dat::npc_names::compose_id(0, 1));
-        assert_ne!(WORM_ID.to_be_bytes()[0], 0);
-        assert_eq!(HUME_ID.to_be_bytes()[0], 0);
+        assert_eq!(attacker_is_player(HUME_ID), Some(1));
+        assert_eq!(attacker_is_player(WORM_ID), Some(0));
+    }
+
+    #[test]
+    fn auto_names_round_trip_every_case() {
+        for (i, case) in Case::ALL.into_iter().enumerate() {
+            assert_eq!(case_from_name(case.auto_name()), Some(case));
+            assert!(
+                !Case::ALL[..i].contains(&case),
+                "{} listed twice",
+                case.label()
+            );
+        }
+        assert!(!Case::Shot.on_panel());
+    }
+
+    #[test]
+    fn auto_case_list_drops_unknown_names() {
+        let raw = [Case::PlayerNhIt.auto_name(), "nope", Case::Shot.auto_name()].join(",");
+        assert_eq!(parse_auto_cases(&raw), vec![Case::PlayerNhIt, Case::Shot]);
+        assert!(parse_auto_cases("nope").is_empty());
+    }
+
+    #[test]
+    fn f32_lists_need_their_exact_arity() {
+        assert_eq!(parse_f32s::<3>("1, 2,3"), Ok([1.0, 2.0, 3.0]));
+        assert!(parse_f32s::<3>("1,2").is_err());
+        assert!(parse_f32s::<3>("1,2,3,4").is_err());
+        assert!(parse_f32s::<3>("1,x,3").is_err());
+    }
+
+    fn teardown_app() -> App {
+        let mut app = App::new();
+        app.init_resource::<TrackedEntities>()
+            .init_resource::<SceneState>()
+            .init_resource::<kuluu_render::graphics_settings::GraphicsSettings>()
+            .init_resource::<ShadowOverrides>()
+            .init_resource::<crate::graphics_store::GraphicsPersistSuspended>()
+            .init_resource::<Assets<Mesh>>()
+            .init_resource::<Assets<StandardMaterial>>()
+            .init_resource::<TestLog>();
+        app
+    }
+
+    fn count<F: bevy::ecs::query::QueryFilter>(app: &mut App) -> usize {
+        app.world_mut()
+            .query_filtered::<Entity, F>()
+            .iter(app.world())
+            .count()
+    }
+
+    #[test]
+    fn launcher_exit_with_the_room_open_restores_no_launcher_entities() {
+        let mut app = teardown_app();
+        app.add_systems(Update, tear_down_test_scene);
+        app.world_mut().spawn(TestSceneScoped);
+        app.update();
+        assert_eq!(
+            count::<With<super::super::launcher_ui::LauncherCamera>>(&mut app),
+            0
+        );
+        assert_eq!(
+            count::<With<super::super::launcher_backdrop::BackdropScoped>>(&mut app),
+            0
+        );
+        assert_eq!(count::<With<TestSceneScoped>>(&mut app), 0);
+    }
+
+    fn close_app() -> App {
+        let mut app = teardown_app();
+        app.add_systems(Update, handle_close_press);
+        app.world_mut()
+            .spawn((CloseBox, bevy::ui::widget::Button, Interaction::Pressed));
+        app
+    }
+
+    #[test]
+    fn closing_the_room_restores_the_launcher_and_disarms_tracing() {
+        let mut app = close_app();
+        app.insert_resource(VfxTrace(true));
+        app.world_mut().spawn(TestSceneScoped);
+        app.world_mut()
+            .resource_mut::<SceneState>()
+            .snapshot
+            .weather = Some(kuluu_snapshot::Weather::Clouds);
+        app.update();
+        assert!(!app.world().resource::<VfxTrace>().0);
+        assert!(app
+            .world()
+            .resource::<SceneState>()
+            .snapshot
+            .weather
+            .is_none());
+        assert_eq!(
+            count::<With<super::super::launcher_ui::LauncherCamera>>(&mut app),
+            1
+        );
+        assert!(count::<With<super::super::launcher_backdrop::BackdropScoped>>(&mut app) > 0);
+    }
+
+    #[test]
+    fn closing_the_room_takes_down_its_world_and_ambient() {
+        let mut app = close_app();
+        app.init_resource::<Assets<kuluu_render::moon_material::MoonMaterial>>()
+            .init_resource::<Assets<Image>>();
+        let launcher_ambient = bevy::light::GlobalAmbientLight::default();
+        for _ in 0..2 {
+            app.world_mut().spawn(TestSceneScoped);
+            app.world_mut()
+                .insert_resource(AmbientBeforeRoom(Some(launcher_ambient.clone())));
+            run_room_world_setup(app.world_mut());
+            assert!(count::<With<kuluu_render::sun_moon::IsSun>>(&mut app) > 0);
+            app.update();
+            assert_eq!(count::<With<kuluu_render::sun_moon::IsSun>>(&mut app), 0);
+            assert_eq!(count::<With<bevy::light::FogVolume>>(&mut app), 0);
+            assert_eq!(
+                app.world()
+                    .resource::<bevy::light::GlobalAmbientLight>()
+                    .brightness,
+                launcher_ambient.brightness
+            );
+        }
+    }
+
+    fn sweep_app() -> App {
+        let mut app = App::new();
+        app.init_resource::<TestZoneActive>()
+            .add_systems(Update, zone_backdrop_visibility);
+        app
+    }
+
+    #[test]
+    fn backdrop_sweep_leaves_hidden_it_did_not_hide() {
+        let mut app = sweep_app();
+        let hidden = app
+            .world_mut()
+            .spawn((InGameEntity, Visibility::Hidden))
+            .id();
+        app.update();
+        assert_eq!(
+            app.world().entity(hidden).get::<Visibility>(),
+            Some(&Visibility::Hidden)
+        );
+    }
+
+    #[test]
+    fn backdrop_sweep_restores_what_it_hid_once_the_room_closes() {
+        let mut app = sweep_app();
+        let backdrop = app
+            .world_mut()
+            .spawn((InGameEntity, Visibility::Inherited))
+            .id();
+        let room = app.world_mut().spawn(TestSceneScoped).id();
+        app.update();
+        assert_eq!(
+            app.world().entity(backdrop).get::<Visibility>(),
+            Some(&Visibility::Hidden)
+        );
+        app.world_mut().despawn(room);
+        app.update();
+        assert_eq!(
+            app.world().entity(backdrop).get::<Visibility>(),
+            Some(&Visibility::Inherited)
+        );
+        app.world_mut()
+            .entity_mut(backdrop)
+            .insert(Visibility::Hidden);
+        app.update();
+        assert_eq!(
+            app.world().entity(backdrop).get::<Visibility>(),
+            Some(&Visibility::Hidden)
+        );
     }
     use kuluu_render::particle_sim::TestAlphaOverride;
 
@@ -2750,7 +2969,6 @@ mod tests {
             .init_resource::<SceneState>()
             .init_resource::<kuluu_render::graphics_settings::GraphicsSettings>()
             .init_resource::<ShadowOverrides>()
-            .init_resource::<EnhanceRestore>()
             .init_resource::<crate::graphics_store::GraphicsPersistSuspended>()
             .init_resource::<Assets<Mesh>>()
             .init_resource::<Assets<StandardMaterial>>()
@@ -2775,7 +2993,6 @@ mod tests {
             .init_resource::<SceneState>()
             .init_resource::<kuluu_render::graphics_settings::GraphicsSettings>()
             .init_resource::<ShadowOverrides>()
-            .init_resource::<EnhanceRestore>()
             .init_resource::<crate::graphics_store::GraphicsPersistSuspended>()
             .init_resource::<Assets<Mesh>>()
             .init_resource::<Assets<StandardMaterial>>()

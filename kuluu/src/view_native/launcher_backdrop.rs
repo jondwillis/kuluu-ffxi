@@ -194,14 +194,7 @@ pub(crate) fn spawn_backdrop_core(
 }
 
 fn despawn_backdrop_camera(mut commands: Commands, q: Query<Entity, With<BackdropScoped>>) {
-    for e in q.iter() {
-        // try_despawn: despawn() is recursive, so a parent earlier in the query may have
-        // already freed this entity; bare despawn() floods the bevy_ecs error handler with
-        // "Entity despawned" WARNs at login (same fix as despawn_ingame_entities).
-        commands.entity(e).try_despawn();
-    }
-
-    commands.remove_resource::<BackdropFadeMaterial>();
+    despawn_backdrop_core(&mut commands, &q);
 }
 
 // The AnimationTest box owns the world while open (its teardown restores the default zone), so
@@ -209,8 +202,12 @@ fn despawn_backdrop_camera(mut commands: Commands, q: Query<Entity, With<Backdro
 fn mirror_backdrop_to_scene_state(
     zone: Res<LauncherBackdropZone>,
     mut scene: ResMut<SceneState>,
-    q_box: Query<(), With<super::animation_test_scene::TestSceneScoped>>,
+    #[cfg(feature = "debug-animation_room")] q_box: Query<
+        (),
+        With<super::animation_test_scene::TestSceneScoped>,
+    >,
 ) {
+    #[cfg(feature = "debug-animation_room")]
     if q_box.iter().next().is_some() {
         return;
     }
@@ -221,28 +218,22 @@ fn mirror_backdrop_to_scene_state(
     scene.snapshot.zone_id = desired;
 }
 
-// The render-side backdrop goes down while the test box is open (its order-0 window camera
-// collides with the box's operator marker). Zone state stays untouched: clearing the snapshot
-// would trip the auto-load teardown (despawn + MMB queue clear) mid-session and case loads
-// depend on that bookkeeping; hiding the standing zone block is the test scene's own sweep.
-pub(crate) fn unload_for_test(
+// Also the AnimationTest box's unload: the render-side backdrop goes down while the box is open
+// (its order-0 window camera collides with the box's operator marker). Zone state stays
+// untouched: clearing the snapshot would trip the auto-load teardown (despawn + MMB queue clear)
+// mid-session and case loads depend on that bookkeeping; hiding the standing zone block is the
+// test scene's own sweep.
+pub(crate) fn despawn_backdrop_core(
     commands: &mut Commands,
     q_scoped: &Query<Entity, With<BackdropScoped>>,
 ) {
     for e in q_scoped.iter() {
+        // try_despawn: despawn() is recursive, so a parent earlier in the query may have
+        // already freed this entity; bare despawn() floods the bevy_ecs error handler with
+        // "Entity despawned" WARNs at login (same fix as despawn_ingame_entities).
         commands.entity(e).try_despawn();
     }
     commands.remove_resource::<BackdropFadeMaterial>();
-}
-
-/// AnimationTest close: camera/light/fade-quad come back. Zone state was never touched on open,
-/// so nothing else needs restoring.
-pub(crate) fn restore_for_test(
-    commands: &mut Commands,
-    meshes: &mut Assets<Mesh>,
-    materials: &mut Assets<StandardMaterial>,
-) {
-    spawn_backdrop_core(commands, meshes, materials);
 }
 
 fn update_backdrop_from_selection(

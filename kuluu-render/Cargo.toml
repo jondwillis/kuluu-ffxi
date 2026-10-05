@@ -70,6 +70,12 @@ enhanced-shutdown-counter = []
 # row does not exist.
 enhanced-engage-move-lock-off = []
 
+# Enhanced (non-retail): the player character ignores knockback travel (the
+# flinch, facing and movement lock still play). Retail knocks players back;
+# without this feature a persisted `ignore_knockback_self` can never take effect,
+# and the Debug -> Retail+ Knockback row does not exist.
+enhanced-ignore-knockback-self = []
+
 # DEV-ONLY: renders the "Debug" entry (and its Retail+ section) on page 2 of
 # the Command menu. Shipped release builds never enable this, so retail parity
 # holds by construction; dev/test builds pass `--features debug-menu` explicitly.

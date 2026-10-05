@@ -122,13 +122,20 @@ fn commands() -> impl Iterator<Item = &'static Command> {
     COMMANDS.iter().flat_map(|(_, cmds)| cmds.iter())
 }
 
+const NPC_TARGET_KINDS: [kuluu_snapshot::EntityKind; 3] = [
+    kuluu_snapshot::EntityKind::Npc,
+    kuluu_snapshot::EntityKind::Mob,
+    kuluu_snapshot::EntityKind::Pet,
+];
+
 fn cycle_npc(c: &SlashCtx, reverse: bool) -> SlashOutcome {
-    let kinds = [
-        kuluu_snapshot::EntityKind::Npc,
-        kuluu_snapshot::EntityKind::Mob,
-        kuluu_snapshot::EntityKind::Pet,
-    ];
-    match cycle_kind_filtered(c.entities, c.self_pos, c.current_target, &kinds, reverse) {
+    match cycle_kind_filtered(
+        c.entities,
+        c.self_pos,
+        c.current_target,
+        &NPC_TARGET_KINDS,
+        reverse,
+    ) {
         Some(id) => SlashOutcome::SetTarget(Some(id)),
         None => SlashOutcome::SystemMessage(format!("/{}: no NPC nearby", c.cmd)),
     }
@@ -138,36 +145,30 @@ fn cycle_npc(c: &SlashCtx, reverse: bool) -> SlashOutcome {
 fn target_by_name(c: &SlashCtx) -> SlashOutcome {
     let name = c.rest.trim();
     if name.is_empty() {
-        return SlashOutcome::SystemMessage("//targetname: usage: //targetname <name>".into());
+        return SlashOutcome::SystemMessage(format!(
+            "{EXTENSION_PREFIX}{cmd}: usage: {EXTENSION_PREFIX}{cmd} <name>",
+            cmd = c.cmd
+        ));
     }
-    let kinds = [
-        kuluu_snapshot::EntityKind::Npc,
-        kuluu_snapshot::EntityKind::Mob,
-        kuluu_snapshot::EntityKind::Pet,
-    ];
     let needle = name.to_ascii_lowercase();
-    let mut matches: Vec<&WireEntity> = c
+    // Stable areas name several actors alike (two "Chocobo"s at the stables);
+    // the nearest is the one the player is standing in front of.
+    let nearest = c
         .entities
         .iter()
         .filter(|e| {
-            kinds.contains(&e.kind)
+            NPC_TARGET_KINDS.contains(&e.kind)
                 && e.name
                     .as_deref()
-                    .map(|n| n.to_ascii_lowercase() == needle)
-                    .unwrap_or(false)
+                    .is_some_and(|n| n.to_ascii_lowercase() == needle)
         })
-        .collect();
-    if matches.is_empty() {
-        return SlashOutcome::SystemMessage(format!("//targetname: no {name} in sight"));
+        .min_by(|a, b| sq_dist(a.pos, c.self_pos).total_cmp(&sq_dist(b.pos, c.self_pos)));
+    match nearest {
+        Some(e) => SlashOutcome::SetTarget(Some(e.id)),
+        None => {
+            SlashOutcome::SystemMessage(format!("{EXTENSION_PREFIX}{}: no {name} in sight", c.cmd))
+        }
     }
-    // Stable areas name several actors alike (two "Chocobo"s at the stables);
-    // the nearest is the one the player is standing in front of.
-    matches.sort_by(|a, b| {
-        let da = sq_dist(a.pos, c.self_pos);
-        let db = sq_dist(b.pos, c.self_pos);
-        da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
-    });
-    SlashOutcome::SetTarget(Some(matches[0].id))
 }
 
 fn unknown_command(cmd: &str) -> SlashOutcome {

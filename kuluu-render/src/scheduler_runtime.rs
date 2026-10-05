@@ -2354,6 +2354,11 @@ pub fn dispatch_knockback_stages(
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+fn self_knockback_travels(settings: &crate::graphics_settings::GraphicsSettings) -> bool {
+    !(cfg!(feature = "enhanced-ignore-knockback-self") && settings.ignore_knockback_self)
+}
+
 /// Integrates every running knockback on the routine clock and hands the
 /// self actor's shove and lock to the walker (KnockBackInstance updateEffect
 /// adds the velocity after the movement-lock zeroing; here the walker adds
@@ -2376,7 +2381,7 @@ pub fn tick_knockbacks(
         if Some(actor.world_id) == self_id {
             // Retail+ Ignore_knockback_self: the flinch, facing and movement lock
             // still play; only the travel is dropped.
-            if !settings.ignore_knockback_self {
+            if self_knockback_travels(&settings) {
                 self_kb.pending += shove;
             }
             self_active |= actor.knockback_active();
@@ -4705,6 +4710,22 @@ mod tests {
     use super::*;
     use emote_routine;
     use ffxi_dat::scheduler::{SchedulerStage, StageKind};
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn persisted_ignore_knockback_self_follows_its_feature() {
+        let settings = crate::graphics_settings::GraphicsSettings {
+            ignore_knockback_self: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            self_knockback_travels(&settings),
+            !cfg!(feature = "enhanced-ignore-knockback-self")
+        );
+        assert!(self_knockback_travels(
+            &crate::graphics_settings::GraphicsSettings::default()
+        ));
+    }
 
     /// A look-at must send the actor's +X forward along the offset to its
     /// target, on the same basis every other heading in the renderer uses.

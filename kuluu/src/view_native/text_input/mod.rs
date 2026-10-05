@@ -38,6 +38,7 @@ pub use shop::{shop_mode_sync_system, shop_mouse_activate_system};
 mod map_screen;
 
 mod menu;
+pub(crate) use menu::hold_force_18_clock;
 use menu::{confirm_menu_at_cursor, handle_menu_key};
 
 mod slash_apply;

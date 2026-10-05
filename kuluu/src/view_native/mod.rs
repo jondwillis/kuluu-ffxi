@@ -1,3 +1,4 @@
+#[cfg(feature = "debug-animation_room")]
 pub mod animation_test_scene;
 mod app_icon;
 pub mod auto_target;
@@ -418,10 +419,9 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
             // whatever the user is doing instead of yanking them out of a
             // full-screen app.
             focused: !unfocused,
-            // KULUU_WINDOW_HIDDEN=1 — verification runs: no visible window, not even a
-            // taskbar entry; rendering continues on the hidden surface and the logs carry
-            // the evidence.
-            visible: std::env::var_os("KULUU_WINDOW_HIDDEN").is_none(),
+            // KULUU_WINDOW_HIDDEN=1 — verification runs: created hidden so nothing flashes on a
+            // monitor or takes focus before park_hidden_window_offscreen moves it offscreen.
+            visible: !window_hidden_requested(),
             ..default()
         }),
         ..default()
@@ -682,6 +682,14 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
         )
             .run_if(in_state(AppPhase::InGame)),
     );
+    app.add_systems(
+        Update,
+        (
+            discard_distortion_on_zone_change,
+            text_input::hold_force_18_clock.after(kuluu_render::cutscene::drain_cutscene_clock),
+        )
+            .run_if(in_state(AppPhase::InGame)),
+    );
 
     app.add_systems(
         OnExit(AppPhase::InGame),
@@ -721,10 +729,6 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
     app.insert_resource(crate::graphics_store::GraphicsStateRes {
         store: graphics_store_obj,
     });
-    // The AnimationTest box's shadow suppression reads/writes this gate every Launcher frame;
-    // it must exist before the first Update, not only while the box is open.
-    app.init_resource::<crate::graphics_store::GraphicsPersistSuspended>();
-
     app.insert_resource(crate::marker_store::load_or_default());
 
     #[cfg(feature = "debug-animation_room")]
@@ -976,6 +980,27 @@ fn classify_disconnect_reason(reason: &str) -> DisconnectKind {
         DisconnectKind::Shutdown
     } else {
         DisconnectKind::Forced
+    }
+}
+
+// A zone change keeps AppPhase::InGame, so despawn_ingame_entities never runs there. The
+// generator that armed the distortion leaves with the old zone's actors, so the smear goes too.
+fn discard_distortion_on_zone_change(
+    events: Res<EventLog>,
+    mut cursor: Local<u64>,
+    distortion: Option<ResMut<kuluu_render::distortion_pass::ActiveDistortion>>,
+) {
+    let total = events.pushed_total;
+    let first_global = total.saturating_sub(events.recent.len() as u64);
+    let zone_changed = ((*cursor).max(first_global)..total).any(|g| {
+        matches!(
+            events.recent[(g - first_global) as usize],
+            kuluu_snapshot::ViewerEvent::ZoneChanged { .. }
+        )
+    });
+    *cursor = total;
+    if let (true, Some(mut distortion)) = (zone_changed, distortion) {
+        *distortion = kuluu_render::distortion_pass::ActiveDistortion::default();
     }
 }
 
@@ -1497,6 +1522,37 @@ mod zone_teardown_tests {
     }
 
     #[test]
+    fn zone_change_discards_unexpired_distortion() {
+        use kuluu_render::distortion_pass::ActiveDistortion;
+        use std::time::{Duration, Instant};
+
+        let mut world = World::new();
+        world.init_resource::<super::EventLog>();
+        world.insert_resource(ActiveDistortion {
+            expires_at: Some(Instant::now() + Duration::from_secs(60)),
+            strength: 1.0,
+            ..Default::default()
+        });
+        world
+            .run_system_once(super::discard_distortion_on_zone_change)
+            .unwrap();
+        assert!(world.resource::<ActiveDistortion>().expires_at.is_some());
+
+        world
+            .resource_mut::<super::EventLog>()
+            .push(kuluu_snapshot::ViewerEvent::ZoneChanged {
+                from: None,
+                to: Default::default(),
+            });
+        world
+            .run_system_once(super::discard_distortion_on_zone_change)
+            .unwrap();
+        let distortion = world.resource::<ActiveDistortion>();
+        assert!(distortion.expires_at.is_none());
+        assert_eq!(distortion.strength, 0.0);
+    }
+
+    #[test]
     fn teardown_discards_unconsumed_knockback() {
         use kuluu_render::ffxi_actor_render::SelfKnockback;
         use kuluu_render::scheduler_runtime::{collect_knockback_hits, PendingKnockbacks};
@@ -1757,11 +1813,17 @@ pub(crate) struct SessionEventTx(
 // scripts/cap-window.ps1 parks and captures from the same spot; keep them in step.
 const HIDDEN_WINDOW_PARK: i32 = -32_000;
 
+const WINDOW_HIDDEN_ENV: &str = "KULUU_WINDOW_HIDDEN";
+
+fn window_hidden_requested() -> bool {
+    std::env::var_os(WINDOW_HIDDEN_ENV).is_some()
+}
+
 /// KULUU_WINDOW_HIDDEN=1 — move the primary window past every monitor and show it without
 /// activation (see the registration comment for why a buried HWND captures nothing). Bevy
 /// applies these field changes to the winit window on its own clock, so no OS call here.
 fn park_hidden_window_offscreen(mut q_win: Query<&mut Window, With<bevy::window::PrimaryWindow>>) {
-    if std::env::var_os("KULUU_WINDOW_HIDDEN").is_none() {
+    if !window_hidden_requested() {
         return;
     }
     if let Ok(mut win) = q_win.single_mut() {

@@ -341,7 +341,9 @@ pub const RETAIL_MOB_HP_UNDER: &str = "Mob HP Under";
 pub const RETAIL_JOB_DISPLAY: &str = "Job Display";
 /// Debug dev row: [on] = the player character takes knockback displacement
 /// (the retail behavior, the default); off drops the travel only — flinch,
-/// facing and the movement lock still play.
+/// facing and the movement lock still play. The row exists only with
+/// `enhanced-ignore-knockback-self`.
+#[cfg(feature = "enhanced-ignore-knockback-self")]
 pub const RETAIL_KNOCKBACK: &str = "Knockback";
 
 const DEBUG_ENTRIES: &[&str] = &[
@@ -373,6 +375,7 @@ const DEBUG_ENTRIES: &[&str] = &[
     RETAIL_MOB_HP_UNDER,
     #[cfg(feature = "enhanced-job-display")]
     RETAIL_JOB_DISPLAY,
+    #[cfg(feature = "enhanced-ignore-knockback-self")]
     RETAIL_KNOCKBACK,
 ];
 
@@ -1524,6 +1527,7 @@ fn format_row_body(
                         if settings.job_display { "on" } else { "off" }
                     );
                 }
+                #[cfg(feature = "enhanced-ignore-knockback-self")]
                 if label == RETAIL_KNOCKBACK {
                     return format!(
                         "{label:<14}[{}]",

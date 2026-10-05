@@ -679,7 +679,9 @@ pub struct GraphicsSettings {
 
     /// Retail+ gate: the player character ignores knockback displacement (the push and the
     /// flinch ride on, only the travel is dropped). OFF by default — retail knocks players back.
-    /// Persisted here so the choice sticks across runs.
+    /// The `enhanced-ignore-knockback-self` feature is its compile-time half: without it this
+    /// field has no effect (the row doesn't exist either). Persisted here so the choice sticks
+    /// across runs.
     #[serde(default)]
     pub ignore_knockback_self: bool,
 
