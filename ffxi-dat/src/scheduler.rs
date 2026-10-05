@@ -119,6 +119,9 @@ const SOUND_EMITTER_PAYLOAD_LEN: usize = SOUND_NEAR_OFFSET + 4;
 const KNOCKBACK_ANIMATION_DURATION_OFFSET: usize = ID_OFFSET + 4;
 const KNOCKBACK_DURATION_PAYLOAD_LEN: usize = KNOCKBACK_ANIMATION_DURATION_OFFSET + 4;
 
+const CONTROL_FLOW_OPERAND_OFFSET: usize = ID_OFFSET + 4;
+const CONTROL_FLOW_OPERAND_PAYLOAD_LEN: usize = CONTROL_FLOW_OPERAND_OFFSET + 4;
+
 // A stage addresses a slot of the group `mzb::underscore_at_groups` builds, so the bound is
 // that builder's rather than a second reading of the same retail array.
 pub const MODEL_TRANSFORM_SUBCHUNK_SLOTS: u32 =
@@ -738,10 +741,12 @@ impl Scheduler {
                     )
                 });
                 // Switch-test words are payload, not a DatId.
-                let control_flow = (raw_type == CONTROL_FLOW_CONDITION).then(|| ControlFlowArg {
-                    op: read_u32(ID_OFFSET),
-                    operand: (stage_bytes >= 16).then(|| read_u32(ID_OFFSET + 4)),
-                });
+                let control_flow =
+                    (raw_type == CONTROL_FLOW_CONDITION && has_id).then(|| ControlFlowArg {
+                        op: read_u32(ID_OFFSET),
+                        operand: (stage_bytes >= CONTROL_FLOW_OPERAND_PAYLOAD_LEN)
+                            .then(|| read_u32(CONTROL_FLOW_OPERAND_OFFSET)),
+                    });
                 let flinch_duration = match kind {
                     StageKind::FlinchOnCaster | StageKind::FlinchOnTarget
                         if stage_bytes >= FLINCH_PAYLOAD_LEN =>
@@ -2217,6 +2222,22 @@ mod tests {
         let s = Scheduler::parse(*b"daml", &body).unwrap();
         assert!(s.has_control_flow());
         assert_eq!(s.stages[1].stage.kind, StageKind::SubRoutineOnTarget);
+    }
+
+    #[test]
+    fn short_control_flow_condition_at_end_of_body_carries_no_op() {
+        let mut body = vec![0u8; SCHEDULER_HEADER_LEN];
+        body.extend(timed_stage_bytes(
+            CONTROL_FLOW_CONDITION,
+            ARGLESS_STAGE_WORDS,
+            0,
+            0,
+        ));
+
+        let s = Scheduler::parse(*b"dam0", &body).unwrap();
+        assert_eq!(s.stages[0].stage.raw_type, CONTROL_FLOW_CONDITION);
+        assert_eq!(s.stages[0].stage.control_flow, None);
+        assert_eq!(s.stages[0].stage.id, NO_STAGE_ID);
     }
 
     // research/xim EffectRoutineParser.kt parseSection2 — ControlFlowBlock is built with `delay = 0`.

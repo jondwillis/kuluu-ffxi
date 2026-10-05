@@ -377,6 +377,51 @@ mod tests {
         }
     }
 
+    // .agents/skills/retail-observe/references/2026-10-04-dam0-offhand-context.md Offhand appearance classification is build-scoped
+    const OFFHAND_EXCLUDED_MODEL_RANGES_PINNED: [(u16, u16); 4] =
+        [(0, 63), (117, 143), (471, 511), (640, 703)];
+    const RETAIL_2026_OFFHAND_EXCLUDED_MODEL_RANGE_PINNED: (u16, u16) = (1180, 1195);
+    const OFFHAND_MODEL_RULES: [OffhandModelRule; 2] =
+        [OffhandModelRule::Horizon2023, OffhandModelRule::Retail2026];
+
+    #[test]
+    fn offhand_excluded_ranges_match_the_record() {
+        assert_eq!(
+            OFFHAND_EXCLUDED_MODEL_RANGES,
+            OFFHAND_EXCLUDED_MODEL_RANGES_PINNED
+        );
+        assert_eq!(
+            RETAIL_2026_OFFHAND_EXCLUDED_MODEL_RANGE,
+            RETAIL_2026_OFFHAND_EXCLUDED_MODEL_RANGE_PINNED
+        );
+    }
+
+    #[test]
+    fn shared_offhand_ranges_exclude_both_ends_and_nothing_beside_them() {
+        for rule in OFFHAND_MODEL_RULES {
+            for (first, last) in OFFHAND_EXCLUDED_MODEL_RANGES_PINNED {
+                if let Some(before) = first.checked_sub(1) {
+                    assert!(rule.qualifies(before), "{rule:?} {before}");
+                }
+                assert!(!rule.qualifies(first), "{rule:?} {first}");
+                assert!(!rule.qualifies(last), "{rule:?} {last}");
+                assert!(rule.qualifies(last + 1), "{rule:?} {}", last + 1);
+            }
+        }
+    }
+
+    #[test]
+    fn retail_2026_range_diverges_only_inside_its_bounds() {
+        let (first, last) = RETAIL_2026_OFFHAND_EXCLUDED_MODEL_RANGE_PINNED;
+        for model in [first - 1, first, last, last + 1] {
+            assert!(OffhandModelRule::Horizon2023.qualifies(model), "{model}");
+        }
+        assert!(OffhandModelRule::Retail2026.qualifies(first - 1));
+        assert!(!OffhandModelRule::Retail2026.qualifies(first));
+        assert!(!OffhandModelRule::Retail2026.qualifies(last));
+        assert!(OffhandModelRule::Retail2026.qualifies(last + 1));
+    }
+
     fn encoded_ids(stride: usize, base: u32) -> Vec<u8> {
         let mut bytes = vec![0u8; stride * 2 + 4];
         for (block, id) in [(0usize, base), (1, base + 1)] {

@@ -115,9 +115,13 @@ impl LinkedDataKind {
     pub const STATIC_MESH: u8 = 0x0B;
     pub const SPRITE_SHEET: u8 = 0x0E;
     pub const WEIGHTED_MESH: u8 = 0x1D;
+    // research/xim ParticleGeneratorSettings.kt LinkedDataType: a screen-space distortion
+    // (haze/smear) element, not a mesh particle.
     pub const DISTORTION: u8 = 0x22;
     pub const RING_MESH: u8 = 0x24;
     pub const LENS_FLARE: u8 = 0x39;
+    // research/XIClient/src/XIClient/include/Resource/ResourceType.h `Sep = 61`, dispatched at
+    // CYyGenerator.cpp HandleOne (`case Sep: elem = new CYySoundElem()`).
     pub const AUDIO: u8 = 0x3D;
     pub const POINT_LIGHT: u8 = 0x47;
     pub const NULL_PARTICLE: u8 = 0x57;
@@ -137,13 +141,6 @@ impl LinkedDataKind {
             Self::NULL_PARTICLE => Some(Self::Null),
             _ => None,
         }
-    }
-
-    /// Kinds that own a dedicated def parser and decline the mesh path cleanly (no lookup, no
-    /// warning): sound and distortion chunks are claimed by SoundGeneratorDef /
-    /// DistortionGeneratorDef.
-    pub fn is_deferred(&self) -> bool {
-        matches!(self, Self::Audio | Self::Distortion)
     }
 }
 
@@ -626,7 +623,7 @@ pub struct ParticleGeneratorDef {
     // fraction rather than the particle's life progress. This is how retail authors the
     // sun's dawn/noon/dusk ramp and the moon's daytime fade — 0x3F multiplies alpha, the
     // other three assign their channel.
-    // research/xim ParticleGeneratorParser.kt sec2Handler,431-434
+    // research/xim ParticleGeneratorParser.kt sec2Handler
     pub tod_color_tracks: [Option<[u8; 4]>; TOD_COLOR_CHANNELS],
     pub tod_color_driven: [bool; TOD_COLOR_CHANNELS],
 
@@ -672,21 +669,17 @@ pub struct ParticleGeneratorDef {
 
     // sec2 0x45 ParentPositionCopyConfig: a no-payload marker — the particle's associated
     // position copies its parent's (research/xim ParticleInitializers.kt
-    // ParentPositionCopyConfig; apply is a no-op without a parent). Parsed but not applied
-    // until the child-generator path lands (the sec2 0x44 ChildGeneratorSetup).
+    // ParentPositionCopyConfig; apply is a no-op without a parent).
     pub parent_position_copy: bool,
 
     // sec2 0x46 ParentVelocityConfig: one float, the multiplier on the parent's total
     // velocity copied into the child's velocity transform (research/xim
     // ParticleInitializers.kt ParentVelocityConfig; apply is a no-op without a parent).
-    // Parsed but not applied until the child-generator path lands.
     pub parent_velocity: Option<f32>,
 
     // sec2 0x44 ChildGeneratorSetup: [expectZero32, child generator DAT id] — the sibling
     // generator chunk emitted as a child of each particle of this one (research/xim
     // ParticleInitializers.kt ChildGeneratorSetup; the sec2 0x53 block is the same shape).
-    // Parsed but not applied until the child-generator runtime lands (the sec3 0x25/0x33
-    // child updaters).
     pub child_generator: Option<[u8; 4]>,
     pub immediate_generator: Option<[u8; 4]>,
 
@@ -713,16 +706,13 @@ pub struct ParticleGeneratorDef {
     // sec2 0x40 OscillationAccelerationSetup (Z): [acceleration, accelerationVariance]; the
     // particle's Z oscillation acceleration is acceleration + variance × one [−1, 1) draw
     // (research/xim ParticleInitializers.kt OscillationAccelerationSetup — RandHelper rand()
-    // in [−1, 1)). Parsed but not applied until the section-3 applier lands.
+    // in [−1, 1)).
     pub oscillation_accel_z: Option<[f32; 2]>,
     // sec2 0x3E OscillationAccelerationSetup (X): the X-axis twin of 0x40
-    // (research/xim ParticleInitializers.kt OscillationAccelerationSetup). Parsed but not
-    // applied until the section-3 applier lands.
+    // (research/xim ParticleInitializers.kt OscillationAccelerationSetup).
     pub oscillation_accel_x: Option<[f32; 2]>,
     // sec2 0x3F OscillationAccelerationSetup (Y): the Y-axis twin of 0x40 (research/xim
-    // ParticleInitializers.kt OscillationAccelerationSetup). Present in 30 shipped generators
-    // though absent from the launch log. Parsed but not applied until the section-3 applier
-    // lands.
+    // ParticleInitializers.kt OscillationAccelerationSetup). Present in 30 shipped generators.
     pub oscillation_accel_y: Option<[f32; 2]>,
 
     // sec3 0x29 OscillationApplier (X): [rate-divisor, base-offset, unused-in-xim] — the
@@ -806,27 +796,25 @@ pub struct ParticleGeneratorDef {
     // sec2 0x32 HazeOffsetInitializer: two floats, of which xim applies only the second,
     // as particle.hazeOffset.x — a draw-time x translate the haze/distortion shader pass
     // offsets the previous-frame transform by (research/xim ParticleInitializers.kt
-    // HazeOffsetInitializer; GLDrawer.kt previousFrameTransform). Parsed but not applied:
-    // the engine has no haze/distortion pass yet; the sec3 0x24 ProgressValueUpdater
-    // animates the same value over life.
+    // HazeOffsetInitializer; GLDrawer.kt previousFrameTransform). Unused on the mesh-particle
+    // path; a 0x22 Distortion generator carries it as DistortionGeneratorDef::haze_offset_x,
+    // which kuluu-render/src/distortion_pass.rs applies. The sec3 0x24 ProgressValueUpdater
+    // that animates the same value over life is not applied.
     pub haze_offset_x: Option<f32>,
 
     // sec2 0x47 ParentRotateConfig: a no-payload marker — the child particle copies its
     // parent's rotation (research/xim ParticleInitializers.kt ParentRotateConfig; apply is
-    // a no-op without a parent). Parsed but not applied until the child-generator path
-    // lands (the sec2 0x44 ChildGeneratorSetup).
+    // a no-op without a parent).
     pub parent_rotate: bool,
 
     // sec2 0x48 ParentColorConfig: a no-payload marker — the child particle copies its
     // parent's color (research/xim ParticleInitializers.kt ParentColorConfig; apply is a
-    // no-op without a parent). Parsed but not applied until the child-generator path
-    // lands (the sec2 0x44 ChildGeneratorSetup).
+    // no-op without a parent).
     pub parent_color: bool,
 
     // sec2 0x49 ParentScaleConfig: a no-payload marker — the child particle copies its
     // parent's scale (research/xim ParticleInitializers.kt ParentScaleConfig; apply is a
-    // no-op without a parent). Parsed but not applied until the child-generator path
-    // lands (the sec2 0x44 ChildGeneratorSetup).
+    // no-op without a parent).
     pub parent_scale: bool,
 
     // sec2 0x69 KeyFrameValueSetup (velocity dampener): the 0x27/0x28/0x29 track shape
@@ -872,9 +860,7 @@ pub struct ParticleGeneratorDef {
 
     // sec2 0x53 ChildGeneratorSetup: [expectZero32, child generator DAT id] — xim maps
     // both 0x44 and 0x53 to the same class (research/xim ParticleGeneratorParser.kt
-    // sec2Handler); a second slot so a generator carrying both keeps both ids. Parsed
-    // but not applied until the child-generator runtime lands (the sec3 0x25/0x33 child
-    // updaters).
+    // sec2Handler); a second slot so a generator carrying both keeps both ids.
     pub child_generator_2: Option<[u8; 4]>,
 
     // sec2 0x5B KeyFrameValueSetup (specular rotation.z): the 0x27/0x28/0x29 track shape
@@ -893,8 +879,7 @@ pub struct ParticleGeneratorDef {
     // sec2 0x79 ParentRotateConfig: a no-payload marker — xim maps 0x79 to the same
     // class as 0x47 (research/xim ParticleGeneratorParser.kt sec2Handler, comment
     // "How does it differ from 0x47?"); a second slot so a generator carrying both
-    // keeps both. Parsed but not applied until the child-generator path lands (the
-    // sec2 0x44 ChildGeneratorSetup).
+    // keeps both. Parsed but not applied: the child path copies rotation on the 0x47 slot only.
     pub parent_rotate_2: bool,
 
     // sec2 0x56 BatchingSetup: one expectZero32 word — xim's apply sets the particle's
@@ -906,8 +891,8 @@ pub struct ParticleGeneratorDef {
 
     // sec2 0x4A ParentTexCoordConfig: a no-payload marker — a child particle copies the
     // parent's tex-coord translate (research/xim ParticleInitializers.kt
-    // ParentTexCoordConfig). A no-op without a parent, so parsed but not applied until the
-    // child-generator path lands (as for the 0x45 marker).
+    // ParentTexCoordConfig). Parsed but not applied: the child path does not copy the
+    // parent's tex-coord translate.
     pub parent_tex_coord: bool,
 
     // sec2 0x54 PointListPositionSetup: [in-mem ptr, keyframe DAT id, expect zero, in-mem
@@ -1047,9 +1032,6 @@ const SEC2_OPCODE_SPECULAR_ROT_Z_TRACK: u8 = 0x5B;
 const SEC2_OPCODE_SPECULAR_COLOR_G_TRACK: u8 = 0x5D;
 const SEC2_OPCODE_SPECULAR_COLOR_A_TRACK: u8 = 0x5F;
 const SEC2_OPCODE_REVERSE_DISPLACEMENT: u8 = 0x67;
-// research/XIClient CYyGenerator.cpp ElemGenerate case 0x6A — the third block of the
-// child-generator family (see SEC2_OPCODE_ONCE_CHILD_GENERATOR); xim maps it to
-// ChildGeneratorSetup.
 const SEC2_OPCODE_VELOCITY_DAMPENER_TRACK: u8 = 0x69;
 const SEC2_OPCODE_CHILD_GENERATOR_3: u8 = 0x6A;
 const SEC2_OPCODE_PROJECTION_BIAS: u8 = 0x72;
@@ -1105,484 +1087,135 @@ const SEC4_OFFSET: usize = 0x7C;
 const SEC4_OPCODE_RELIFE: u8 = 0x05;
 const SEC4_OPCODE_EMIT_CHILD: u8 = 0x01;
 
-/// Everything one section walk decodes from a generator chunk body, before any kind-specific
-/// consumer runs: the field set of [`ParticleGeneratorDef`] plus the claim byte and the
-/// sound/distortion-only values. The three def parsers map out of this; none re-walks the
-/// sections (research/xim ParticleGeneratorParser.kt — one parser per chunk, kind selects
-/// consumers).
+/// Everything one section walk decodes from a generator chunk body: the field set of
+/// [`ParticleGeneratorDef`], which documents each shared field, plus the claim byte and the
+/// sound-only values. Each def parser maps its view out of one walk (research/xim
+/// ParticleGeneratorParser.kt — one parser per chunk, kind selects consumers).
 #[derive(Debug)]
 pub(crate) struct GeneratorSections {
     pub(crate) frames_per_emission: f32,
     pub(crate) particles_per_emission: u32,
     pub(crate) emission_variance: f32,
-
     pub(crate) mesh_id: [u8; 4],
     pub(crate) mesh_kind: ParticleMeshKind,
     pub(crate) base_position: [f32; 3],
     pub(crate) max_life_frames: f32,
     pub(crate) camera_billboard: bool,
     pub(crate) billboard: ParticleBillboard,
-    // `base_position` is an offset from the camera rather than a world placement. Two independent
-    // flags express it: the billboard word's followCamera bit and the render-state's
-    // cameraAttachedBasePosition bit (La Theine's rain uses the first for the `~1ra` curtain and
-    // the second for the `rai2` mist puff). They place differently — followCamera pins the
-    // generator to the camera position outright, cameraAttachedBasePosition rotates the offset
-    // by the view matrix (research/xim Particle.kt updateAssociatedPosition) — so both are kept alongside the
-    // union.
     pub(crate) camera_relative: bool,
     pub(crate) follow_camera: bool,
     pub(crate) camera_attached_base: bool,
-    // The spawn spread applied to every emitted particle; None puts them all on one point.
     pub(crate) position_variance: Option<PositionVariance>,
-
-    // sec2 0x1F SphericalPositionVarianceFull: the spherical spawn spread whose azimuth is a
-    // random draw or one of the generator's evenly spaced steps (CYyGenerator.cpp
-    // CYyGenerator::ElemGenerate case 0x1F — the stepped azimuth indexes the generator's
-    // element counter; the camera flag maps the ring into the camera's frame).
     pub(crate) spherical_full: Option<SphericalPositionVarianceFull>,
-
     pub(crate) continuous: bool,
     pub(crate) auto_run: bool,
     pub(crate) batched: bool,
-
     pub(crate) attach_type: AttachType,
-    // research/XIClient Attachment.cpp MakeAttachMatrix — the single EID locator index
-    // (bits 4-9 + bit 18 of the attach word); see ATTACH_EID_LOW_MASK.
     pub(crate) attach_eid: u8,
     pub(crate) attach_source_oriented: bool,
-
     pub(crate) init_scale: [f32; 3],
-
-    // sec2 0x11 SingleScaleVarianceInitializer: one ufrand(payload) draw shared by every scale
-    // axis, per particle (research/xim ParticleInitializers.kt — scale += posRand(v);
-    // CYyGenerator.cpp CYyGenerator::ElemGenerate case 0x11 — a single ufrand added to x, y, z).
     pub(crate) single_scale_variance: Option<f32>,
-    // sec2 0x10 ScaleVarianceInitializer: three floats, the per-axis ufrand bound added to the
-    // 0x0F base scale per particle (CYyGenerator.cpp CYyGenerator::ElemGenerate case 0x10 —
-    // field_EC.x/y/z += ufrand(payload); research/xim ParticleInitializers.kt
-    // ScaleVarianceInitializer — scale += variance * posRand(1f) per axis).
     pub(crate) scale_variance: Option<[f32; 3]>,
     pub(crate) init_color: [f32; 4],
-    // sec2 0x17 ColorVarianceSetup: four bytes (R,G,B,A) / 255 — the per-channel bound of the
-    // upward color draw added to the 0x16 base per particle (research/xim
-    // ParticleInitializers.kt ColorVarianceSetup — color.rgba[i] += (byte/255) * posRand(1f),
-    // one [0, 1) draw per channel; the retail decompile's ElemGenerate has no 0x17 case, so
-    // xim's mapping is the available evidence).
     pub(crate) color_variance: Option<[f32; 4]>,
-    // sec2 0x19 ColorTransformSetup: four i16s (r,g,b,a) written to the element's allocation
-    // slot at emit (research/xim ParticleInitializers.kt ColorTransformSetup). The retail
-    // decompile's ElemGenerate has no 0x19 case, so xim's mapping is the available evidence;
-    // every shipped alpha channel is 0.
     pub(crate) color_transform: Option<[i16; 4]>,
-    // sec2 0x1A ColorTransformVariance: four i16s — each emitted element's transform gains
-    // round(posRand(1) × variance) per channel on top of the 0x19 base (research/xim
-    // ParticleInitializers.kt ColorTransformVariance).
     pub(crate) color_transform_variance: Option<[i16; 4]>,
-    // sec3 0x0B ColorTransformApplier: no payload — arms the per-frame application of the
-    // transform to the element's colour (research/xim ParticleUpdaters.kt
-    // ColorTransformApplier).
     pub(crate) color_transform_applier: bool,
-    // sec3 0x0C ColorTransformModifier: four i16s [r, g, b, a] — the per-frame rate on the
-    // sec2 0x19 color transform over the particle's life (research/xim
-    // ParticleUpdaters.kt ColorTransformModifier — colorTransform += floor(modifier ×
-    // frames/30) per frame).
     pub(crate) color_transform_modifier: Option<[i16; 4]>,
     pub(crate) init_velocity: [f32; 3],
-    // sec2 0x03 VelocityVarianceSetup (position): the per-axis bound of the uniform random
-    // velocity added to the 0x02 base per particle (research/xim ParticleInitializers.kt
-    // VelocityVarianceSetup — the allocationOffset binds it to the position transform).
     pub(crate) velocity_variance: Option<[f32; 3]>,
-    // sec2 0x08 RelativeVelocitySetup: the magnitude of the per-particle velocity added along
-    // the spawn offset's direction (research/xim ParticleInitializers.kt RelativeVelocitySetup —
-    // direction = normalize of the initial position relative to the spawn point; research/XIClient
-    // CYyGenerator.cpp CYyGenerator::ElemGenerate case 0x08 normalizes field_54 minus the
-    // position captured at element spawn, i.e. the offsets the earlier blocks added).
     pub(crate) relative_velocity: Option<f32>,
-    // sec2 0x41 RelativeVelocityVarianceSetup: the bound of the uniform random magnitude added
-    // to the 0x08 relative velocity along the spawn offset's direction per particle
-    // (research/xim ParticleInitializers.kt RelativeVelocityVarianceSetup; the retail
-    // decompile's CYyGenerator.cpp CYyGenerator::ElemGenerate case 0x41 scales the normalized
-    // spawn offset by frand of this value and adds it to the same allocation vector as 0x08).
     pub(crate) relative_velocity_variance: Option<f32>,
-    // sec2 0x67 ReverseDisplacementSetup: the block's presence arms the spawn-at-endpoint
-    // behavior; its single float payload is never read by the effect
-    // (research/xim ParticleInitializers.kt ReverseDisplacementSetup — the read float is
-    // stored but unused in apply; the retail decompile's ElemGenerate has no 0x67 case,
-    // so xim's mapping is the available evidence).
     pub(crate) reverse_displacement: Option<f32>,
-    // sec3 0x02 PositionUpdater: a no-payload marker — retail's ElemIdle case 0x02 adds the
-    // element's total velocity × dt to its position, and only while the block is present
-    // (research/xim ParticleUpdaters.kt PositionUpdater; CYyGenerator.cpp
-    // CYyGenerator::ElemIdle case 0x02). A generator that carries a base velocity without
-    // the block is not position-stepped by retail, so the flag gates the engine's velocity
-    // integration.
     pub(crate) position_updater: bool,
-    // sec2 0x0A RotationVarianceInitializer: the per-axis bound of the uniform random rotation
-    // added to the 0x09 base per particle (research/xim ParticleInitializers.kt
-    // RotationVarianceInitializer — the retail decompile's ElemGenerate default is
-    // XICLIENT_CODE_MISSING, so xim's mapping is the available evidence).
     pub(crate) rotation_variance: Option<[f32; 3]>,
     pub(crate) init_rotation: [f32; 3],
-    // sec2 0x3B IncrementalRotationApplier: the per-axis increment added to the 0x09 base
-    // rotation, scaled by one plus the particles emitted before this one (research/xim
-    // ParticleInitializers.kt IncrementalRotationApplier — rotation += incr × (1 +
-    // totalParticlesEmitted); its apply also arms the render-time rotation-y negation, even
-    // for an all-zero payload. The retail decompile's ElemGenerate has no 0x3B case, so xim
-    // is the available evidence.
     pub(crate) incremental_rotation: Option<[f32; 3]>,
     pub(crate) blend: ParticleBlend,
-    // The raw BlendFuncInitializer p0 (retail `field_16C & 0xFF`), kept alongside the collapsed
-    // `blend` because the TEXTUREFACTOR-alpha promotion is keyed on byte 0x44 exactly.
-    // research/XIClient/src/XIClient/source/Resource/Derived/CMoD3m.cpp CMoD3m::Draw
     pub(crate) blend_byte: u8,
-
-    // Selects the D3m texture-stage table: set = NonZeroOneTSS (texture alpha ignored,
-    // alpha = 4*D.a*F.a), clear = NonZeroTwoTSS (alpha = 8*D.a*T.a*F.a).
-    // research/XIClient/src/XIClient/source/Resource/Derived/CMoD3m.cpp ZeroOneTSS
     pub(crate) ignore_texture_alpha: bool,
-
-    // Clear = the element fogs toward the area's fog colour like terrain (CMoElem.cpp
-    // CMoElem::PrepDX); the weat/ sky layers past the fog range set the bit.
     pub(crate) fog_enabled: bool,
-
     pub(crate) draw_priority: DrawPriority,
-    // CYyGenerator.cpp CYyGenerator::ElemGenerate opcode 0x30 — the element's `field_128`
-    // sort-key offset (research/xim Particle.kt `projectionBias`).
     pub(crate) sort_offset: f32,
-    // sec2 0x72 ProjectionBiasInitializer: two floats. param0 is the same `field_128` 0x30
-    // writes (the ordering-table key via CMoElem.cpp CMoElem::CheckSomethingWasTrue ->
-    // OT->Insert), so it lands in `sort_offset`; param1 is the attached SkeletalMeshActor
-    // depth-scale factor (CYyGenerator.cpp CYyGenerator::ElemGenerate case 0x72 —
-    // field_128 *= (GetDepthScale() - 1) * (param1 != 0 ? param1 : 1) + 1), which the engine
-    // does not reproduce (no actor depth scale) and xim ignores (research/xim
-    // ParticleInitializers.kt ProjectionBiasInitializer — only param0 reaches the draw bias).
     pub(crate) projection_bias: Option<[f32; 2]>,
-    // CMoElem.cpp CMoElem::PrepDX — D3DRS_ZWRITEENABLE for the element.
     pub(crate) depth_write: bool,
-
-    // Per-particle keyframe tracks referenced by DAT-id (resolved against the action's 0x19 chunks).
     pub(crate) position_x_track: Option<[u8; 4]>,
     pub(crate) position_y_track: Option<[u8; 4]>,
     pub(crate) position_z_track: Option<[u8; 4]>,
     pub(crate) weighted_mesh_weight_tracks: [Option<[u8; 4]>; WEIGHTED_MESH_WEIGHTS],
     pub(crate) scale_x_track: Option<[u8; 4]>,
     pub(crate) scale_y_track: Option<[u8; 4]>,
-    // sec2 0x29 KeyFrameValueSetup (scale.z): retail captures field_EC.z, the element's
-    // scale z, as the track's initial value (CYyGenerator.cpp CYyGenerator::ElemGenerate
-    // case 0x29 — same shape as 0x27/0x28). Parsed but not applied: the engine's 2D sprite
-    // has no z axis (as for the 0x10/0x11 z bound).
     pub(crate) scale_z_track: Option<[u8; 4]>,
     pub(crate) alpha_track: Option<[u8; 4]>,
-    // sec2 0x2A KeyFrameValueSetup (color.r): a keyframe track on the element's red channel
-    // (research/xim ParticleGeneratorParser.kt — 0x2A/0x2B/0x2C are the Color.r/g/b
-    // KeyFrameValueSetup; retail's keyframe pre-load pass references the same blocks as
-    // Keyframe resources). Parsed but not applied: the engine sets the particle's rgb at
-    // spawn from the 0x16 base / 0x17 variance and has no per-frame rgb track path.
     pub(crate) color_r_track: Option<[u8; 4]>,
-    // sec2 0x2B KeyFrameValueSetup (color.g): the green-channel twin of 0x2A
-    // (research/xim ParticleGeneratorParser.kt). Parsed but not applied, as for 0x2A.
     pub(crate) color_g_track: Option<[u8; 4]>,
-    // sec2 0x2C KeyFrameValueSetup (color.b): the blue-channel twin of 0x2A
-    // (research/xim ParticleGeneratorParser.kt). Parsed but not applied, as for 0x2A.
     pub(crate) color_b_track: Option<[u8; 4]>,
-
-    // research/xim ParticleUpdaters.kt DayOfWeekColorUpdater (0x4E, 8xRGBA) and
-    // MoonPhaseColorUpdater (0x4F, 12xRGBA): indexed by day-of-week / moon-phase frame and
-    // applied as a 2x modulate (Particle.kt getColor). RGBA in 0..=1.
     pub(crate) day_of_week_color: Option<[[f32; 4]; DAYS_OF_WEEK]>,
     pub(crate) moon_phase_color: Option<[[f32; 4]; MOON_PHASES]>,
-
-    // The time-of-day color curves: initializer 0x60..0x63 name a keyframe track per RGBA
-    // channel, and section-3 ClockValueUpdater 0x3C..0x3F sample it at the Vana'diel day
-    // fraction rather than the particle's life progress. This is how retail authors the
-    // sun's dawn/noon/dusk ramp and the moon's daytime fade — 0x3F multiplies alpha, the
-    // other three assign their channel.
-    // research/xim ParticleGeneratorParser.kt sec2Handler,431-434
     pub(crate) tod_color_tracks: [Option<[u8; 4]>; TOD_COLOR_CHANNELS],
     pub(crate) tod_color_driven: [bool; TOD_COLOR_CHANNELS],
     pub(crate) tod_volume_track: Option<[u8; 4]>,
-
-    // research/xim ParticleGeneratorParser.kt sec3Handler MoonPhaseSpriteSheetUpdater (0x45): the
-    // sprite-sheet frame is the current moon phase, not the particle's life progress.
     pub(crate) moon_phase_sprite: bool,
-
-    // research/xim ParticleUpdaters.kt section-3 updaters (offset at body[0x78], same
-    // sectionHeader+offset-0x10 convention as the setup section). TextureCoordinateUpdater
-    // 0x27/0x28 carry the per-frame UV-translate velocity that scrolls the sprite/sheet
-    // texture (cascade/moat water). VelocityAccelerator 0x03/0x06/0x09 read a Vector3f at
-    // payload+0 and target their own transform allocation. [0,0]/None = static.
     pub(crate) uv_scroll: [f32; 2],
     pub(crate) accel: Option<[f32; 3]>,
     pub(crate) rotation_accel: Option<[f32; 3]>,
     pub(crate) scale_accel: Option<[f32; 3]>,
-
-    // Section 1 (body[0x70]) generator-level updater 0x0A, research/xim
-    // ParticleGeneratorParser.kt sec1Handler GeneratorCullUpdater.
     pub(crate) emit_cull: Option<EmitCull>,
-
-    // Section 1 generator-level updater 0x11, research/xim ParticleGeneratorParser.kt
-    // sec1Handler AssociationUpdater.
     pub(crate) association: Option<AssociationFollow>,
-
-    // sec2 0x8E FootMarkEffectSetup (research/xim ParticleInitializers.kt): a no-payload marker.
-    // The particle snaps to the actor's position + joint and facing on the spawn frame, then
-    // stops following the generator (research/xim Particle.kt updateAssociatedPosition /
-    // updateAssociatedFacing footMarkEffect branches).
     pub(crate) foot_mark: bool,
-
-    // sec2 0x3D OscillationSetup: a no-payload marker allocating the particle's oscillation
-    // state (research/xim ParticleInitializers.kt OscillationSetup — NoDataParticleInitializer,
-    // apply is particle.allocate(allocationOffset, OscillationParams())); the 0x3E/0x3F/0x40
-    // acceleration setups write it and the section-3 0x29/0x2A/0x2B appliers integrate it.
     pub(crate) oscillation: bool,
-
-    // sec2 0x45 ParentPositionCopyConfig: a no-payload marker — the particle's associated
-    // position copies its parent's (research/xim ParticleInitializers.kt
-    // ParentPositionCopyConfig; apply is a no-op without a parent). Parsed but not applied
-    // until the child-generator path lands (the sec2 0x44 ChildGeneratorSetup).
     pub(crate) parent_position_copy: bool,
-
-    // sec2 0x46 ParentVelocityConfig: one float, the multiplier on the parent's total
-    // velocity copied into the child's velocity transform (research/xim
-    // ParticleInitializers.kt ParentVelocityConfig; apply is a no-op without a parent).
-    // Parsed but not applied until the child-generator path lands.
     pub(crate) parent_velocity: Option<f32>,
-
-    // sec2 0x44 ChildGeneratorSetup: [expectZero32, child generator DAT id] — the sibling
-    // generator chunk emitted as a child of each particle of this one (research/xim
-    // ParticleInitializers.kt ChildGeneratorSetup; the sec2 0x53 block is the same shape).
-    // Parsed but not applied until the child-generator runtime lands (the sec3 0x25/0x33
-    // child updaters).
     pub(crate) child_generator: Option<[u8; 4]>,
     pub(crate) immediate_generator: Option<[u8; 4]>,
     pub(crate) child_generator_3: Option<[u8; 4]>,
     pub(crate) child_emit_basic: bool,
     pub(crate) child_emit_full: bool,
     pub(crate) child_emit_billboard: bool,
-
-    // sec2 0x40 OscillationAccelerationSetup (Z): [acceleration, accelerationVariance]; the
-    // particle's Z oscillation acceleration is acceleration + variance × one [−1, 1) draw
-    // (research/xim ParticleInitializers.kt OscillationAccelerationSetup — RandHelper rand()
-    // in [−1, 1)). Parsed but not applied until the section-3 applier lands.
     pub(crate) oscillation_accel_z: Option<[f32; 2]>,
-    // sec2 0x3E OscillationAccelerationSetup (X): the X-axis twin of 0x40
-    // (research/xim ParticleInitializers.kt OscillationAccelerationSetup). Parsed but not
-    // applied until the section-3 applier lands.
     pub(crate) oscillation_accel_x: Option<[f32; 2]>,
-    // sec2 0x3F OscillationAccelerationSetup (Y): the Y-axis twin of 0x40 (research/xim
-    // ParticleInitializers.kt OscillationAccelerationSetup). Present in 30 shipped generators
-    // though absent from the launch log. Parsed but not applied until the section-3 applier
-    // lands.
     pub(crate) oscillation_accel_y: Option<[f32; 2]>,
-
-    // sec3 0x29 OscillationApplier (X): [rate-divisor, base-offset, unused-in-xim] — the
-    // integrator for the 0x3E acceleration: oscillationRate = 180f / payload0, baseOffset =
-    // payload1, payload2 has no effect (research/xim ParticleUpdaters.kt OscillationApplier).
-    // The acceleration is parsed but never moves a particle without it.
     pub(crate) oscillation_applier_x: Option<[f32; 3]>,
-    // sec3 0x2B OscillationApplier (Z): the Z-axis twin of 0x29 (research/xim
-    // ParticleUpdaters.kt OscillationApplier), the integrator for the 0x40 acceleration.
     pub(crate) oscillation_applier_z: Option<[f32; 3]>,
-    // sec3 0x2A OscillationApplier (Y): the Y-axis twin of 0x29 (research/xim
-    // ParticleUpdaters.kt OscillationApplier), the integrator for the 0x3F acceleration.
     pub(crate) oscillation_applier_y: Option<[f32; 3]>,
-
-    // sec2 0x0B RotationVelocitySetup: radians per 60 Hz frame, stored on the element
-    // (CYyGenerator.cpp CYyGenerator::ElemGenerate case 0x0B). It only turns the particle when the
-    // sec3 0x05 RotationUpdater integrates it (CYyGenerator.cpp CYyGenerator::ElemIdle case 0x05;
-    // research/xim ParticleGeneratorParser.kt sec3Handler RotationUpdater), so read [`Self::spin`].
     pub(crate) rotation_velocity: Option<[f32; 3]>,
-
-    // sec2 0x0C VelocityVarianceSetup (rotation): per-particle uniform [-v, v] draw added to each
-    // axis of the 0x0B spin rate (research/xim ParticleInitializers.kt — the allocationOffset
-    // binds it to the rotation transform; CYyGenerator.cpp CYyGenerator::ElemGenerate shares one
-    // frand-add body across 0x03/0x0C/0x13).
     pub(crate) rotation_velocity_variance: Option<[f32; 3]>,
     pub(crate) rotation_updater: bool,
-
-    // sec2 0x12 ScaleVelocitySetup: scale units per 60 Hz frame on each axis. Retail's
-    // ElemGenerate shares the 0x0B/0x12 case (a 12-byte memcpy into the scale transform's
-    // velocity at the allocation offset); only the sec3 0x08 ScaleUpdater integrates it
-    // (research/xim ParticleUpdaters.kt — scale += velocity × elapsedFrames), so read
-    // [`Self::scale_rate`].
     pub(crate) scale_velocity: Option<[f32; 3]>,
     pub(crate) scale_updater: bool,
-
-    // sec2 0x13 VelocityVarianceSetup (scale): a per-particle uniform [-v, v] draw added to
-    // each axis of the 0x12 scale velocity (research/xim ParticleInitializers.kt
-    // VelocityVarianceSetup — the allocationOffset binds it to the scale transform; retail's
-    // shared 0x03/0x0C/0x13 case adds frand(bounds) to the transform's velocity).
     pub(crate) scale_velocity_variance: Option<[f32; 3]>,
-
-    // Section 4 (body[0x7C]) opcode 0x05, CYyGenerator.cpp CYyGenerator::ElemDie case 5 — an expiring
-    // element gets its life reset instead of dying, keeping its position, rotation and UV state.
-    // Every idle Home Point layer authors it; without it the crystal would snap back to its
-    // spawn rotation every 120 frames.
     pub(crate) relife_on_expiry: bool,
-
-    // CYyGenerator.cpp CYyGenerator::HandleOne 0x01000000 — the element renders through
-    // CMoD3mSpecularElem, whose draw the XIClient decompile leaves as missing code; the sec2 0x55
-    // record is kept alongside so the reconstruction has its inputs.
     pub(crate) specular_element: bool,
     pub(crate) specular: Option<SpecularParams>,
-    // sec2 0x5A KeyFrameValueSetup (specular rotation.y): a keyframe track on the specular
-    // element's rotation y (research/xim ParticleGeneratorParser.kt — 0x59/0x5A/0x5B are the
-    // Specular Rotation x/y/z KeyFrameValueSetup; retail's keyframe pre-load pass references
-    // the same blocks as Keyframe resources). Parsed but not applied: the engine does not
-    // model the specular element's rotation (the 0x55 record is kept for reconstruction
-    // inputs only).
     pub(crate) specular_rot_y_track: Option<[u8; 4]>,
-    // sec2 0x82 CameraShakeSetup: [expectZero32, keyframe track id, unk0 u32, unk1 f32,
-    // unk2 u32] — the keyframe DAT id the section-3 0x5F updater samples at the particle's
-    // progress (research/xim ParticleInitializers.kt CameraShakeSetup). xim labels this pair
-    // "camera shake"; retail applies it as gamepad vibration, and kuluu-render/src/rumble.rs
-    // update_rumble_system drives bevy's rumble pipeline from the track.
     pub(crate) rumble_track: Option<[u8; 4]>,
-    // sec3 0x5F CameraShakeUpdater: near, far, and — only in the 4-word form — shakeFactor
-    // (research/xim ParticleUpdaters.kt CameraShakeUpdater — the opCodeSize == 4 branch).
-    // Rumble intensity falloff by camera-to-particle distance: full inside `near`, zero
-    // beyond `far` (kuluu-render/src/rumble.rs update_rumble_system).
     pub(crate) rumble_falloff: Option<[f32; 3]>,
     pub(crate) draw_distance_near: Option<f32>,
     pub(crate) draw_distance_far: Option<f32>,
-
-    // sec2 0x32 HazeOffsetInitializer: two floats, of which xim applies only the second,
-    // as particle.hazeOffset.x — a draw-time x translate the haze/distortion shader pass
-    // offsets the previous-frame transform by (research/xim ParticleInitializers.kt
-    // HazeOffsetInitializer; GLDrawer.kt previousFrameTransform). Parsed but not applied:
-    // the engine has no haze/distortion pass yet; the sec3 0x24 ProgressValueUpdater
-    // animates the same value over life.
     pub(crate) haze_offset_x: Option<f32>,
-
-    // sec2 0x47 ParentRotateConfig: a no-payload marker — the child particle copies its
-    // parent's rotation (research/xim ParticleInitializers.kt ParentRotateConfig; apply is
-    // a no-op without a parent). Parsed but not applied until the child-generator path
-    // lands (the sec2 0x44 ChildGeneratorSetup).
     pub(crate) parent_rotate: bool,
-
-    // sec2 0x48 ParentColorConfig: a no-payload marker — the child particle copies its
-    // parent's color (research/xim ParticleInitializers.kt ParentColorConfig; apply is a
-    // no-op without a parent). Parsed but not applied until the child-generator path
-    // lands (the sec2 0x44 ChildGeneratorSetup).
     pub(crate) parent_color: bool,
-
-    // sec2 0x49 ParentScaleConfig: a no-payload marker — the child particle copies its
-    // parent's scale (research/xim ParticleInitializers.kt ParentScaleConfig; apply is a
-    // no-op without a parent). Parsed but not applied until the child-generator path
-    // lands (the sec2 0x44 ChildGeneratorSetup).
     pub(crate) parent_scale: bool,
-
-    // sec2 0x69 KeyFrameValueSetup (velocity dampener): the 0x27/0x28/0x29 track shape
-    // bound to the element's velocity dampener, sampled per frame by the sec3 0x44
-    // applier and overriding the 0x2C base factor (research/xim
-    // ParticleGeneratorParser.kt sec2Handler 0x69; retail's keyframe pre-load pass
-    // references the same blocks as Keyframe resources).
     pub(crate) velocity_dampener_track: Option<[u8; 4]>,
-    // sec3 0x44 ProgressValueUpdater (dampening factor): no payload — arms the per-frame
-    // sampling of the sec2 0x69 track into VelocityDampener's factor (research/xim
-    // ParticleGeneratorParser.kt sec3Handler).
     pub(crate) dampening_factor_applier: bool,
-    // sec3 0x2C VelocityDampener: [dampen, unk] — velocity ×= dampeningFactor^dt, the
-    // factor coming from the sec2 0x69 track when present, else dampen (research/xim
-    // ParticleUpdaters.kt VelocityDampener).
     pub(crate) velocity_dampener: Option<[f32; 2]>,
-    // sec3 0x26 VelocityRotator: three floats, the rotateAmount added to the velocity
-    // rotation × (0.5 × dt) per frame (research/xim ParticleUpdaters.kt VelocityRotator —
-    // the actor-space axis swap and the 0.5 factor are kept as named consts in
-    // particle_sim.rs, flagged for retail verification).
     pub(crate) velocity_rotator: Option<[f32; 3]>,
-    // sec3 0x2F VelocityRotationUpdater: no payload — collapses all velocity into +x and
-    // copies the particle rotation into the velocity rotation (research/xim
-    // ParticleUpdaters.kt VelocityRotationUpdater).
     pub(crate) velocity_rotation_updater: bool,
-    // sec2 0x31 RandomVelocitySetup: one float bound; each emitted element's base velocity
-    // is replaced by value × rand() on all three axes — the relative-velocity portion is a
-    // separate transform and survives (research/xim ParticleInitializers.kt
-    // RandomVelocitySetup).
     pub(crate) random_velocity: Option<f32>,
-
-    // sec2 0x4E FixedPointPositionVarianceSetup: [expectZero32, point list DAT id,
-    // expect32(0, 1)] — the point list whose points cycle as per-emitted-particle
-    // position offsets (research/xim ParticleInitializers.kt
-    // FixedPointPositionVarianceSetup). Retail's sec2 walk handles neither 0x4E nor 0x4F
-    // (research/XIClient CYyGenerator.cpp ElemGenerate), so the id is kept for
-    // reconstruction only.
     pub(crate) fixed_point_position_variance: Option<[u8; 4]>,
-    // sec2 0x4F: the twin of 0x4E — xim maps both opcodes to the same class
-    // (research/xim ParticleGeneratorParser.kt sec2Handler); a second slot so a
-    // generator carrying both keeps both ids.
     pub(crate) fixed_point_position_variance_2: Option<[u8; 4]>,
-
-    // sec2 0x53 ChildGeneratorSetup: [expectZero32, child generator DAT id] — xim maps
-    // both 0x44 and 0x53 to the same class (research/xim ParticleGeneratorParser.kt
-    // sec2Handler); a second slot so a generator carrying both keeps both ids. Parsed
-    // but not applied until the child-generator runtime lands (the sec3 0x25/0x33 child
-    // updaters).
     pub(crate) child_generator_2: Option<[u8; 4]>,
-
-    // sec2 0x5B KeyFrameValueSetup (specular rotation.z): the 0x27/0x28/0x29 track shape
-    // bound to the specular element's rotation z (research/xim ParticleGeneratorParser.kt
-    // — 0x59/0x5A/0x5B are the Specular Rotation x/y/z KeyFrameValueSetup). Parsed but
-    // not applied: the engine does not model the specular element's rotation.
     pub(crate) specular_rot_z_track: Option<[u8; 4]>,
-
-    // sec2 0x5F KeyFrameValueSetup (specular color.a): the 0x27/0x28/0x29 track shape
-    // bound to the specular element's color alpha (research/xim
-    // ParticleGeneratorParser.kt — 0x5C..0x5F are the Specular Color r/g/b/a
-    // KeyFrameValueSetup). Parsed but not applied: the engine does not model the
-    // specular element's color.
     pub(crate) specular_color_a_track: Option<[u8; 4]>,
-
-    // sec2 0x79 ParentRotateConfig: a no-payload marker — xim maps 0x79 to the same
-    // class as 0x47 (research/xim ParticleGeneratorParser.kt sec2Handler, comment
-    // "How does it differ from 0x47?"); a second slot so a generator carrying both
-    // keeps both. Parsed but not applied until the child-generator path lands (the
-    // sec2 0x44 ChildGeneratorSetup).
     pub(crate) parent_rotate_2: bool,
-
-    // sec2 0x56 BatchingSetup: one expectZero32 word — xim's apply sets the particle's
-    // batched flag, which skips movement-orientation (research/xim ParticleInitializers.kt
-    // BatchingSetup; Particle.kt applyMovementOrientation). Kept separate from `batched`:
-    // retail's generator walk has no 0x56 case (research/XIClient CYyGenerator.cpp), so the
-    // block does not arm the GEN_FLAG_BATCHED flag's CheckFlag29 behavior — parsed only.
     pub(crate) batching_setup: bool,
-
-    // sec2 0x4A ParentTexCoordConfig: a no-payload marker — a child particle copies the
-    // parent's tex-coord translate (research/xim ParticleInitializers.kt
-    // ParentTexCoordConfig). A no-op without a parent, so parsed but not applied until the
-    // child-generator path lands (as for the 0x45 marker).
     pub(crate) parent_tex_coord: bool,
-
-    // sec2 0x54 PointListPositionSetup: [in-mem ptr, keyframe DAT id, expect zero, in-mem
-    // ptr, point list DAT id] — the spline a particle follows, the keyframe id remapping
-    // its progress and zero when the raw progress drives it (research/xim
-    // ParticleInitializers.kt PointListPositionSetup; retail's ElemGenerate case 0x54
-    // offsets the first emitted elem by the spline's start point, a shared allocation slot
-    // zeroing the delta for later elems). Parsed but not applied until the sec3 0x34
-    // PointListPositionUpdater lands.
     pub(crate) point_list_position: Option<([u8; 4], [u8; 4])>,
-
-    // sec2 0x51 KeyFrameValueSetup (velocity.y): the 0x27/0x28/0x29 track shape bound to
-    // the element's velocity y (research/xim ParticleGeneratorParser.kt sec2Handler —
-    // 0x50/0x51/0x52 are the Velocity x/y/z KeyFrameValueSetup). Parsed but not applied:
-    // the engine does not model a per-frame velocity track.
     pub(crate) velocity_y_track: Option<[u8; 4]>,
-
-    // sec2 0x59 KeyFrameValueSetup (specular rot.x): the 0x27/0x28/0x29 track shape bound
-    // to the specular element's rotation x (research/xim ParticleGeneratorParser.kt —
-    // 0x59/0x5A/0x5B are the Specular Rotation x/y/z KeyFrameValueSetup). Parsed but not
-    // applied: the engine does not model the specular element's rotation.
     pub(crate) specular_rot_x_track: Option<[u8; 4]>,
-
-    // sec2 0x5D KeyFrameValueSetup (specular color.g): the 0x27/0x28/0x29 track shape
-    // bound to the specular element's color green (research/xim
-    // ParticleGeneratorParser.kt — 0x5C..0x5F are the Specular Color r/g/b/a
-    // KeyFrameValueSetup). Parsed but not applied: the engine does not model the
-    // specular element's color.
     pub(crate) specular_color_g_track: Option<[u8; 4]>,
     /// The raw StandardParticleSetup kind byte — which def parser claims this chunk.
     pub(crate) kind_byte: u8,
-    /// sec4 0x01 EmitChildHandler's child generator id (research/xim ParticleExpirationHandlers.kt).
     #[allow(dead_code)]
     pub(crate) emit_child_id: Option<[u8; 4]>,
     /// sec2 0x4C audio range — the sound consumer's near/far.
@@ -2892,10 +2525,7 @@ fn parse_sections(body: &[u8]) -> Result<Option<(GeneratorSections, Vec<DecodedB
     )))
 }
 
-// research/XIClient/src/XIClient/include/Resource/ResourceType.h `Sep = 61`, dispatched
-// at CYyGenerator.cpp HandleOne (`modelType` = the same setup byte payload+29 the particle kinds
-// come from) and :193 (`case Sep: elem = new CYySoundElem()`).
-pub(crate) const LINKED_DATA_SOUND: u8 = 0x3D;
+pub(crate) const LINKED_DATA_SOUND: u8 = LinkedDataKind::AUDIO;
 
 // research/XIClient/src/XIClient/source/World/Generator/CYyGenerator.cpp CYyGenerator::ElemGenerate 0x4Cu —
 // initializer 0x4C is the sound elem's setup: `s_far = fpos[1]`, `s_near = fpos[2]`, and
@@ -2963,7 +2593,7 @@ impl SoundGeneratorDef {
         let Some((sections, blocks)) = parse_sections(body)? else {
             return Ok(None);
         };
-        if sections.kind_byte != LINKED_DATA_SOUND {
+        if sections.kind_byte != LinkedDataKind::AUDIO {
             return Ok(None);
         }
         flush_blocks(sink, &blocks);
@@ -2997,10 +2627,6 @@ impl SoundGeneratorDef {
         self.continuous || self.max_life_frames == 0.0
     }
 }
-
-// research/xim ParticleGeneratorSettings.kt LinkedDataType — 0x22 is a screen-space distortion
-// (haze/smear) element, not a mesh particle. [`ParticleGeneratorDef::parse`] rejects the same chunks.
-pub const LINKED_DATA_DISTORTION: u8 = 0x22;
 
 /// A 0x05 Generator whose setup links a 0x22 `Distortion` — a screen-space haze/smear element
 /// rather than a particle. [`ParticleGeneratorDef::parse`] rejects the same chunks, so the two
@@ -3043,7 +2669,7 @@ impl DistortionGeneratorDef {
         let Some((sections, blocks)) = parse_sections(body)? else {
             return Ok(None);
         };
-        if sections.kind_byte != LINKED_DATA_DISTORTION {
+        if sections.kind_byte != LinkedDataKind::DISTORTION {
             return Ok(None);
         }
         flush_blocks(sink, &blocks);
@@ -3250,8 +2876,6 @@ mod tests {
     use super::*;
 
     /// The two non-visual LinkedDataType values (PointLight / Null): they reject the mesh.
-    const LINKED_DATA_POINT_LIGHT: u8 = 0x47;
-    const LINKED_DATA_NULL_PARTICLE: u8 = 0x57;
 
     #[test]
     fn parses_particle_generator_header_and_setup() {
@@ -3560,11 +3184,11 @@ mod tests {
 
     #[test]
     fn non_particle_setup_is_none() {
-        let setup = setup_with_link(LINKED_DATA_POINT_LIGHT);
+        let setup = setup_with_link(LinkedDataKind::POINT_LIGHT);
         let body = build(&setup, 1, 1);
         assert!(ParticleGeneratorDef::parse(&body).unwrap().is_none());
 
-        let setup = setup_with_link(LINKED_DATA_NULL_PARTICLE);
+        let setup = setup_with_link(LinkedDataKind::NULL_PARTICLE);
         let body = build(&setup, 1, 1);
         assert!(ParticleGeneratorDef::parse(&body).unwrap().is_none());
     }
@@ -4251,7 +3875,7 @@ mod tests {
     // the shipped river sound authors 'kota'.
     #[test]
     fn tod_volume_track_reads_the_keyframe_id() {
-        let mut setup = setup_with_link(LINKED_DATA_SOUND);
+        let mut setup = setup_with_link(LinkedDataKind::AUDIO);
         setup[4 + 8..4 + 12].copy_from_slice(b"5008");
         let mut payload = [0u8; 12];
         payload[4..8].copy_from_slice(b"kota");
@@ -4266,7 +3890,7 @@ mod tests {
         );
 
         let plain = SoundGeneratorDef::parse(&build(
-            &setup_with_link(LINKED_DATA_SOUND),
+            &setup_with_link(LinkedDataKind::AUDIO),
             30,
             GEN_FLAG_AUTO_RUN,
         ))
@@ -5722,7 +5346,6 @@ mod tests {
         assert_eq!(def.attach_type, AttachType::SourceActorWeapon);
         assert_eq!(def.attach_eid, 7);
 
-        // Bit 18 lifts the index past the low six bits: 0x40 in the additional word is bit 2.
         let body = build_attached(
             &setup,
             1,
@@ -5889,7 +5512,7 @@ mod tests {
     // silent everywhere instead of loud everywhere inside far.
     #[test]
     fn sound_setup_reads_far_then_near_and_ignores_the_third_word() {
-        let mut setup = setup_with_link(LINKED_DATA_SOUND);
+        let mut setup = setup_with_link(LinkedDataKind::AUDIO);
         setup[4 + 8..4 + 12].copy_from_slice(b"2024");
         setup[4 + 16..4 + 20].copy_from_slice(&(-293.5f32).to_le_bytes());
         let mut p = Vec::new();
@@ -5917,7 +5540,7 @@ mod tests {
     // the shipped kaw3/skw3 river emitters reference a rail no zone DAT in scope defines.
     #[test]
     fn sound_path_ref_reads_the_rail_name_and_ignores_the_trailing_words() {
-        let mut setup = setup_with_link(LINKED_DATA_SOUND);
+        let mut setup = setup_with_link(LinkedDataKind::AUDIO);
         setup[4 + 8..4 + 12].copy_from_slice(b"5009");
         let mut p = Vec::new();
         p.extend_from_slice(b"kaw3");

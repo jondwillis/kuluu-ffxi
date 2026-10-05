@@ -22,6 +22,7 @@ pub fn extract_se_schedule(bytes: &[u8]) -> Vec<TimedSe> {
     let mut seps: HashMap<[u8; 4], Sep> = HashMap::new();
     let mut generators: HashMap<[u8; 4], Generator> = HashMap::new();
     let mut schedulers: Vec<Scheduler> = Vec::new();
+    let mut sound_defs: HashMap<[u8; 4], SoundGeneratorDef> = HashMap::new();
     for c in walk(bytes) {
         let Ok(c) = c else { continue };
         match ChunkKind::from_u8(c.kind) {
@@ -34,6 +35,9 @@ pub fn extract_se_schedule(bytes: &[u8]) -> Vec<TimedSe> {
                 if let Ok(Some(g)) = Generator::parse(c.name, c.data) {
                     generators.insert(c.name, g);
                 }
+                if let Ok(Some(d)) = SoundGeneratorDef::parse(c.data) {
+                    sound_defs.insert(c.name, d);
+                }
             }
             Some(ChunkKind::Scheduler) => {
                 if let Ok(s) = Scheduler::parse(c.name, c.data) {
@@ -41,16 +45,6 @@ pub fn extract_se_schedule(bytes: &[u8]) -> Vec<TimedSe> {
                 }
             }
             _ => {}
-        }
-    }
-
-    let mut sound_defs: HashMap<[u8; 4], SoundGeneratorDef> = HashMap::new();
-    for c in walk(bytes) {
-        let Ok(c) = c else { continue };
-        if ChunkKind::from_u8(c.kind) == Some(ChunkKind::Generator) {
-            if let Ok(Some(d)) = SoundGeneratorDef::parse(c.data) {
-                sound_defs.insert(c.name, d);
-            }
         }
     }
 
