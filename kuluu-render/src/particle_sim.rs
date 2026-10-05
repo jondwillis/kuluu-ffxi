@@ -1313,6 +1313,23 @@ pub fn spawn_particle_generators(
             linked.origin = parent.origin;
             linked.scale_x = resolve(linked_def.scale_x_track);
             linked.scale_y = resolve(linked_def.scale_y_track);
+            // .agents/skills/retail-observe/references/2026-10-04-immediate-generator-bindings.md script ownership.
+            linked.position_x = resolve(linked_def.position_x_track);
+            linked.position_y = resolve(linked_def.position_y_track);
+            linked.position_z = resolve(linked_def.position_z_track);
+            linked.dampening_factor = if linked_def.dampening_factor_applier {
+                resolve(linked_def.velocity_dampener_track)
+            } else {
+                None
+            };
+            linked.child_factories = resolve_child_factories(
+                &linked_def,
+                assets,
+                global.as_ref().map(|g| &g.assets),
+                dir,
+                &mut images,
+                &mut mats,
+            );
             linked.alpha = resolve(linked_def.alpha_track);
             linked.tod_color = resolve_tod_tracks(&linked_def, assets);
             linked.solid_mesh = is_solid_mesh(&template);
@@ -3847,6 +3864,8 @@ mod tests {
     use super::*;
 
     mod cleanup_capture;
+    #[cfg(not(target_arch = "wasm32"))]
+    mod immediate_bindings;
     mod wall_wash_capture;
     use ffxi_dat::particle_gen::ParticleGeneratorDef;
 
