@@ -643,6 +643,14 @@ fn handle_toggle(
         return;
     }
 
+    let Some(dat_root) = actor_root.0.as_ref() else {
+        log_line(
+            &mut log,
+            "no retail install wired - pick one in Settings first".into(),
+        );
+        return;
+    };
+
     drawn_check.hume_done = false;
     drawn_check.worm_done = false;
     drawn_check.parts_ok = true;
@@ -656,7 +664,7 @@ fn handle_toggle(
         &mut load_tx,
         &mut tracked,
         &mut scene,
-        &actor_root,
+        dat_root,
         &mut log,
         &mut drawn_check,
     );
@@ -715,18 +723,10 @@ fn activate_test_scene(
     load_tx: &mut MessageWriter<LoadActorRequest>,
     tracked: &mut TrackedEntities,
     scene: &mut SceneState,
-    actor_root: &ActionDatRoot,
+    dat_root: &ffxi_dat::DatRoot,
     log: &mut TestLog,
     check: &mut DrawnCheck,
 ) {
-    let Some(dat_root) = actor_root.0.as_ref() else {
-        log_line(
-            log,
-            "no retail install wired - pick one in Settings first".into(),
-        );
-        return;
-    };
-
     // Camera + light + ground. The camera clears its own color so the launcher backdrop zone
     // does not show around the test floor.
     commands.spawn((
@@ -2749,6 +2749,40 @@ mod tests {
     use kuluu_render::particle_sim::{
         ParticleSimulator, TestAlphaOverride, LAMP_ALPHAMAP_LIFT_DEFAULT, WASH_ALPHA_LIFT_DEFAULT,
     };
+
+    #[test]
+    fn room_without_install_preserves_launcher() {
+        let mut app = App::new();
+        app.insert_resource(PendingToggle(true))
+            .init_resource::<DrawnCheck>()
+            .init_resource::<Assets<Mesh>>()
+            .init_resource::<Assets<StandardMaterial>>()
+            .init_resource::<Assets<kuluu_render::moon_material::MoonMaterial>>()
+            .init_resource::<Assets<Image>>()
+            .init_resource::<kuluu_render::graphics_settings::GraphicsSettings>()
+            .add_message::<LoadActorRequest>()
+            .init_resource::<TrackedEntities>()
+            .init_resource::<SceneState>()
+            .insert_resource(ActionDatRoot(None))
+            .init_resource::<TestLog>()
+            .init_resource::<TestHp>()
+            .add_systems(Update, handle_toggle);
+        let launcher = app
+            .world_mut()
+            .spawn((Node::default(), Visibility::Inherited))
+            .id();
+        app.update();
+
+        assert_eq!(
+            app.world().entity(launcher).get::<Visibility>(),
+            Some(&Visibility::Inherited)
+        );
+        assert!(!app.world().contains_resource::<VfxTrace>());
+        assert!(!app
+            .world()
+            .contains_resource::<kuluu_render::scene::EntityMesh>());
+        assert!(app.world().resource::<TrackedEntities>().by_id.is_empty());
+    }
 
     #[test]
     fn room_keeps_rebuilt_launcher_ui_hidden() {
