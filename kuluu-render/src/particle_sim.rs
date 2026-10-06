@@ -2758,7 +2758,10 @@ fn emit(g: &mut LiveGenerator, life_frames: f32) {
         let tilt = sp.tilt + (next_unit(&mut g.emit_rng) * 2.0 - 1.0) * sp.tilt_variance;
         let offset = Vec3::from_array(sp.offset(u, azimuth, tilt));
         pos_local += if sp.camera_oriented {
-            (g.actor_rot * g.frame_rot).inverse() * g.cam_view * offset
+            dat_frame_rotation(g.frame_rot.inverse(), g.vel_basis)
+                * g.actor_rot.inverse()
+                * g.cam_view
+                * offset
         } else {
             offset
         };
@@ -3389,6 +3392,12 @@ fn track_position(g: &LiveGenerator, p: &Particle, progress: f32) -> Vec3 {
         }
     }
     particle_origin(g, p) + g.frame_rot * (local * g.position_fit)
+}
+
+// A Bevy-space rotation re-expressed in the DAT frame a `vel_basis` sign flip maps from.
+fn dat_frame_rotation(rotation: Quat, vel_basis: Vec3) -> Quat {
+    let flip = Mat3::from_diagonal(vel_basis);
+    Quat::from_mat3(&(flip * Mat3::from_quat(rotation) * flip))
 }
 
 // The inverse of `track_position`'s placement for a world point; an axis whose fit collapsed to
@@ -5037,6 +5046,48 @@ mod tests {
             oriented[0].1 > 0.0 && oriented[1].1 < 0.0,
             "the ring spans the z axis"
         );
+    }
+
+    // The camera flag lays the ring out against the camera in the world, so the attach frame's
+    // rotation, which every other element offset passes through, must not turn it.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn camera_oriented_ring_ignores_the_attach_frame_rotation() {
+        const RING_STEPS: u32 = 2;
+        let ring = |frame_rot: Quat| {
+            let mut d = def(ROUTINE_FPS, 1.0, RING_STEPS);
+            d.init_velocity = [0.0; 3];
+            d.spherical_full = Some(ffxi_dat::particle_gen::SphericalPositionVarianceFull {
+                radius_variance: 0.0,
+                base_radius: 1.0,
+                axis_scale: [1.0; 3],
+                rotation_z: 0.0,
+                rotation_y: 0.0,
+                tilt: 0.0,
+                tilt_variance: 0.0,
+                camera_oriented: true,
+                azimuth_steps: RING_STEPS,
+            });
+            let mut g = live(d, f32::MAX);
+            g.vel_basis = WORLD_PARTICLE_VEL_BASIS;
+            g.frame_rot = frame_rot;
+            g.cam_view = Quat::from_axis_angle(Vec3::Y, std::f32::consts::FRAC_PI_2);
+            advance(&mut g, 1.0);
+            let clock = CelestialClock::default();
+            g.particles
+                .iter()
+                .map(|p| particle_draw(&g, p, &clock).world)
+                .collect::<Vec<_>>()
+        };
+        let unturned = ring(Quat::IDENTITY);
+        let turned = ring(Quat::from_rotation_y(CASTER_FACING));
+        assert!(!unturned.is_empty());
+        for (a, b) in unturned.iter().zip(&turned) {
+            assert!(
+                a.distance(*b) < FRAME_TOLERANCE,
+                "the camera ring must not turn with the frame: {unturned:?} vs {turned:?}"
+            );
+        }
     }
 
     // ffxi_particle.wgsl runs retail's fixed-function tables per stage with D3D8 saturation
@@ -8728,10 +8779,10 @@ mod tests {
     }
 
     /// The whole wiring, driven through the real system rather than through
-    /// `attach_joint_offset` alone: the actor root carrying the pose is a CHILD of the wire
+    /// `reference_point` alone: the actor root carrying the pose is a CHILD of the wire
     /// entity the stage fires on and PostUpdate has propagated nothing on the frame it is
-    /// inserted, so the child descent, the local-transform composition and the
-    /// `+ joint_offset` at the spawn site all have to hold for the spark to land at the
+    /// inserted, so the child descent, the local-transform composition and the attach frame's
+    /// translation at the spawn site all have to hold for the spark to land at the
     /// contact point — the victim's ring locator nearest the attacker
     /// (.agents/skills/retail-observe/references/2026-09-27-hit-effect-contact-point.md).
     #[cfg(not(target_arch = "wasm32"))]
