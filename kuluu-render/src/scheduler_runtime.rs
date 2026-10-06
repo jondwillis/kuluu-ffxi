@@ -47,23 +47,6 @@ const POST_FINISH_TTL_SECS: f32 = 2.0;
 #[derive(Component, Debug, Clone, Copy, Default)]
 pub struct ActionTarget(pub Option<Entity>);
 
-// research/xim ParticleGeneratorAttachment.kt updateAssociatedPosition — Target*/TargetToSourceBasis read the
-// primary target's position, every other attach type the source actor's. `None` falls back to
-// the caster so an untracked target never drops the routine.
-pub fn particle_origin_entity(
-    attach: ffxi_dat::particle_gen::AttachType,
-    caster: Entity,
-    target: Option<Entity>,
-) -> Entity {
-    use ffxi_dat::particle_gen::AttachType;
-    match attach {
-        AttachType::TargetActor
-        | AttachType::TargetActorSourceFacing
-        | AttachType::TargetToSourceBasis => target.unwrap_or(caster),
-        _ => caster,
-    }
-}
-
 // ffxi-dat/src/action.rs::resolve_stage_to_se yields `on_caster` straight from the stage kind:
 // a 0x0A/0x53 SoundOnCaster emits at the source actor, a 0x0B SoundOnTarget at the primary
 // target. `None` falls back to the caster so an untracked target never silences the SE.
@@ -4809,45 +4792,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn particle_origin_entity_routes_by_attach_type() {
-        use ffxi_dat::particle_gen::AttachType;
-        let caster = Entity::from_raw_u32(1).unwrap();
-        let target = Entity::from_raw_u32(2).unwrap();
-
-        for attach in [
-            AttachType::None,
-            AttachType::SourceActor,
-            AttachType::SourceActorWeapon,
-            AttachType::SourceActorTargetFacing,
-            AttachType::SourceToTargetBasis,
-            AttachType::Sun,
-        ] {
-            assert_eq!(
-                particle_origin_entity(attach, caster, Some(target)),
-                caster,
-                "{attach:?}"
-            );
-        }
-
-        for attach in [
-            AttachType::TargetActor,
-            AttachType::TargetActorSourceFacing,
-            AttachType::TargetToSourceBasis,
-        ] {
-            assert_eq!(
-                particle_origin_entity(attach, caster, Some(target)),
-                target,
-                "{attach:?}"
-            );
-            assert_eq!(
-                particle_origin_entity(attach, caster, None),
-                caster,
-                "{attach:?} falls back to the caster when the target is untracked"
-            );
-        }
-    }
-
     // A 0x0B SoundOnTarget is the victim's impact, a 0x53 SoundOnCaster the attacker's whoosh;
     // resolve_stage_to_se hands the flag over and the dispatcher must mix them from different
     // world positions.
@@ -8028,8 +7972,7 @@ mod tests {
             "expected duplicate `g010` generators across directories, found {g010_dirs}"
         );
 
-        let attacker = Entity::from_raw_u32(1).unwrap();
-        let victim = Entity::from_raw_u32(2).unwrap();
+        use ffxi_dat::particle_gen::attach_mode;
         for (local_dir, id) in &sparks {
             assert_eq!(
                 local_dir, b"hit1",
@@ -8038,9 +7981,11 @@ mod tests {
             let def = global_assets
                 .particle_def(*local_dir, id)
                 .unwrap_or_else(|| panic!("global dir defines {}", String::from_utf8_lossy(id)));
-            assert_eq!(
-                particle_origin_entity(def.attach_type, attacker, Some(victim)),
-                victim,
+            assert!(
+                matches!(
+                    def.attach_mode,
+                    attach_mode::TARGET | attach_mode::TARGET_WITH_SOURCE_YAW
+                ),
                 "{} spawns on the victim, not the swinger",
                 String::from_utf8_lossy(id)
             );
