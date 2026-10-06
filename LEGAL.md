@@ -42,7 +42,7 @@ their own licenses. The full map:
 | `ffxi-dat` | `zone_settings.sql` | [LandSandBoat/server][lsb] | GPL-3.0 |
 | `ffxi-dat` | `ROMFileMappings.xml` | [Windower/POLUtils][pol] | Apache-2.0 |
 | `kuluu-nav` | `zonelines.sql` | [LandSandBoat/server][lsb] | GPL-3.0 |
-| `ffxi-audio` | `track_names.json` | [voliathon/AltanaListener][al] | (no declared license — see §6) |
+| `ffxi-audio` | `track_names.json` (vendored snapshot — see §6) | [voliathon/AltanaListener][al] | (no declared license — see §6) |
 
 `ffxi-nav-recast` additionally fetches navmesh data from
 [LandSandBoat/xiNavmeshes][xinav] (GPL-2.0) **on demand at runtime**; that data
@@ -108,7 +108,12 @@ conservative with both:
   a constant at build time. These are short factual/descriptive labels for
   in-game tracks, not creative content or game assets, and the source is
   attributed here and in the generated file. AltanaListener's own README
-  likewise disclaims containing any Square Enix copyrighted material.
+  likewise disclaims containing any Square Enix copyrighted material. The
+  upstream repository was archived on 2026-08-27 and later went private, so
+  its one build-time input is now committed under `vendor/AltanaListener/` at
+  the frozen pin (v1.0.4, commit `055fc2a26d4f0f8ef8bbb9b5f341f3bc232950c6`,
+  file SHA-256 `072e090debe265242d906544ced0c00e853f485da73be48e1722cca47c173639`);
+  attribution and the conservative stance above are unchanged.
 
 If you are a rights-holder for either project and would prefer a different
 arrangement, please reach out (see §8) and we will adjust or remove the

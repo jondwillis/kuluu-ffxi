@@ -684,11 +684,7 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
     );
     app.add_systems(
         Update,
-        (
-            discard_distortion_on_zone_change,
-            text_input::hold_force_18_clock.after(kuluu_render::cutscene::drain_cutscene_clock),
-        )
-            .run_if(in_state(AppPhase::InGame)),
+        discard_distortion_on_zone_change.run_if(in_state(AppPhase::InGame)),
     );
 
     app.add_systems(
@@ -731,6 +727,8 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
     });
     app.insert_resource(crate::marker_store::load_or_default());
 
+    // The room's systems and resources must stay out of a default build entirely: an unregistered
+    // plugin is inert, but registering it puts tester state into every session.
     #[cfg(feature = "debug-animation_room")]
     app.add_plugins(animation_test_scene::AnimationTestScenePlugin);
 

@@ -50,7 +50,9 @@ cargo run -p kuluu --no-default-features -- play --headless  # JSON event-stream
 Use `.agents/skills/verify/SKILL.md` to choose the evidence surface. Session-only
 checks can use headless MCP or raw stdio. The pre-server animation room requires
 an explicit `debug-animation_room` build; capture and inspect its visible result
-using the GUI verification guidance.
+using the GUI verification guidance. On Windows a `KULUU_WINDOW_HIDDEN=1` window is
+parked offscreen (presented, but nothing appears on the desktop); hosts that cannot
+present offscreen escalate per `.agents/skills/verify/references/drive-headless.md`.
 
 `kuluu install list|which|use|path|link|get|update` manages the registry of named installs in the user data dir (`ffxi_dat::install`: `installs/NAME`, a one-line `default` file naming the one that loads, `FFXI_DAT_PATH` as the only override). Agents that need an install's files ask `kuluu install path NAME` rather than assuming a directory; `kuluu install list` shows each install's KNOWN_CLIENTS row. The checkout holds no game files.
 

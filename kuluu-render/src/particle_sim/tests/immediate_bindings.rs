@@ -111,8 +111,6 @@ fn spawn(link_bindings: bool) -> App {
         target: Some(actor),
         stage: particle_stage(SOURCE),
         scheduler: SOURCE,
-        cutscene_motion: false,
-        scheduler_instance: None,
     });
     app.update();
     app

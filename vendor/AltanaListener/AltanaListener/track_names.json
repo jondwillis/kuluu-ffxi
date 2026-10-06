@@ -1,0 +1,1117 @@
+{
+  "sound_music101.bgw": {
+    "TrackName": "Battle Theme",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music102.bgw": {
+    "TrackName": "Battle in the Dungeon",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music103.bgw": {
+    "TrackName": "Battle Theme #2 (Party)",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music104.bgw": {
+    "TrackName": "Yughott Groto",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music025.bgw": {
+    "TrackName": "The Voracious Resurgence",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music026.bgw": {
+    "TrackName": "The Devoured",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music027.bgw": {
+    "TrackName": "Enroaching Perils",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music028.bgw": {
+    "TrackName": "The Destiny Destroyers",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music033.bgw": {
+    "TrackName": "Valhalla",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music105.bgw": {
+    "TrackName": "Mhaura",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music106.bgw": {
+    "TrackName": "Voyager",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music107.bgw": {
+    "TrackName": "The Kingdom of San d'Oria",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music108.bgw": {
+    "TrackName": "Vana'diel March",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music109.bgw": {
+    "TrackName": "Ronfaure",
+    "TrackAuthor": "Nobuo Uematsu",
+    "IsFavorite": false
+  },
+  "sound_music110.bgw": {
+    "TrackName": "The Grand Duchy of Jeuno",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music111.bgw": {
+    "TrackName": "Blackout (When you die)",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music112.bgw": {
+    "TrackName": "Selbina",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music113.bgw": {
+    "TrackName": "Sarutabaruta",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music114.bgw": {
+    "TrackName": "Batallia Downs",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music115.bgw": {
+    "TrackName": "Battle in the Dungeon #2",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music116.bgw": {
+    "TrackName": "Gustaberg",
+    "TrackAuthor": "Kumi Tanioka",
+    "IsFavorite": false
+  },
+  "sound_music117.bgw": {
+    "TrackName": "Ru'Lude Gardens",
+    "TrackAuthor": "Kumi Tanioka",
+    "IsFavorite": false
+  },
+  "sound_music118.bgw": {
+    "TrackName": "Rolanberry Fields",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music119.bgw": {
+    "TrackName": "Awakening",
+    "TrackAuthor": "Kumi Tanioka",
+    "IsFavorite": false
+  },
+  "sound_music120.bgw": {
+    "TrackName": "Vana'diel March #2",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music121.bgw": {
+    "TrackName": "Shadow Lord",
+    "TrackAuthor": "Kumi Tanioka",
+    "IsFavorite": false
+  },
+  "sound_music122.bgw": {
+    "TrackName": "One Last Time",
+    "TrackAuthor": "Nobuo Uematsu",
+    "IsFavorite": false
+  },
+  "sound_music123.bgw": {
+    "TrackName": "Hopelessness",
+    "TrackAuthor": "Nobuo Uematsu",
+    "IsFavorite": false
+  },
+  "sound5_music249.bgw": {
+    "TrackName": "Run Maggot, Run!",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound5_music250.bgw": {
+    "TrackName": "Under a Clouded Moon",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound5_music251.bgw": {
+    "TrackName": "Autumn Footfalls",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound5_music252.bgw": {
+    "TrackName": "Flowers on the Battlefield",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound5_music253.bgw": {
+    "TrackName": "Echoes of a Zephyr",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound5_music254.bgw": {
+    "TrackName": "Griffons Never Die",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music900.bgw": {
+    "TrackName": "Distant Worlds w/ Vocals",
+    "TrackAuthor": "Nobuo Uematsu",
+    "IsFavorite": false
+  },
+  "sound_music129.bgw": {
+    "TrackName": "Hook, Line, and Sinker",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music130.bgw": {
+    "TrackName": "Tarutaru Female (Character Creation)",
+    "TrackAuthor": "Kumi Tanioka",
+    "IsFavorite": false
+  },
+  "sound_music131.bgw": {
+    "TrackName": "Elvaan Female (Character Creation)",
+    "TrackAuthor": "Kumi Tanioka",
+    "IsFavorite": false
+  },
+  "sound_music132.bgw": {
+    "TrackName": "Elvaan Male (Character Creation)",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music133.bgw": {
+    "TrackName": "Hume Male (Character Creation)",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound2_music134.bgw": {
+    "TrackName": "Yuhtunga Jungle",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound2_music135.bgw": {
+    "TrackName": "Kazham",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music136.bgw": {
+    "TrackName": "The Big One (Fishing)",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music137.bgw": {
+    "TrackName": "A Realm of Emptiness",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound4_music138.bgw": {
+    "TrackName": "Mercenaries' Delight",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound4_music139.bgw": {
+    "TrackName": "Delve",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound5_music140.bgw": {
+    "TrackName": "Wings of the Goddess",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music029.bgw": {
+    "TrackName": "Devils' Delight",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music030.bgw": {
+    "TrackName": "Sojourner",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music031.bgw": {
+    "TrackName": "Black Stars Rise",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music032.bgw": {
+    "TrackName": "All Smiles",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music034.bgw": {
+    "TrackName": "We Are Vana'diel",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound4_music034.bgw": {
+    "TrackName": "We Are Vana'diel",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music035.bgw": {
+    "TrackName": "Goddessspeed",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music036.bgw": {
+    "TrackName": "Good Fortune",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music037.bgw": {
+    "TrackName": "All-Consuming Chaos",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music038.bgw": {
+    "TrackName": "Your Choice",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music040.bgw": {
+    "TrackName": "Cloister of Time and Souls",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music041.bgw": {
+    "TrackName": "Royal Wanderlust",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music042.bgw": {
+    "TrackName": "Snowdrift Waltz",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music043.bgw": {
+    "TrackName": "Troubled Shadows",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music044.bgw": {
+    "TrackName": "Where Lords Rule Not",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music045.bgw": {
+    "TrackName": "Summers Lost",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music046.bgw": {
+    "TrackName": "Goddess Divine",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound6_music047.bgw": {
+    "TrackName": "Echoes of Creation",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound6_music048.bgw": {
+    "TrackName": "Main Theme",
+    "TrackAuthor": "Nobuo Uematsu",
+    "IsFavorite": false
+  },
+  "sound6_music049.bgw": {
+    "TrackName": "Luck of the Mog",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound6_music050.bgw": {
+    "TrackName": "Feast of the Ladies",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music051.bgw": {
+    "TrackName": "Abyssea - Scarlet Skies, Shadowed Plains",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music053.bgw": {
+    "TrackName": "Shinryu",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music052.bgw": {
+    "TrackName": "Melodies Errant",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music054.bgw": {
+    "TrackName": "Everlasting Bonds",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music055.bgw": {
+    "TrackName": "Provenance Watcher",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music056.bgw": {
+    "TrackName": "Where it All Begins",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound9_music057.bgw": {
+    "TrackName": "Steel Sings, Blades Dance",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound9_music058.bgw": {
+    "TrackName": "A New Direction",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound9_music059.bgw": {
+    "TrackName": "The Pioneers",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound9_music060.bgw": {
+    "TrackName": "Into Lands Primeval - Ulbuka",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound9_music061.bgw": {
+    "TrackName": "Water's Umbral Knell",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound9_music062.bgw": {
+    "TrackName": "Keepers of the Wild",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound9_music063.bgw": {
+    "TrackName": "The Sacred City of Adoulin",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound9_music064.bgw": {
+    "TrackName": "Breaking Ground",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound9_music065.bgw": {
+    "TrackName": "Hades",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound9_music066.bgw": {
+    "TrackName": "Arciela",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound9_music067.bgw": {
+    "TrackName": "Mog Resort",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music068.bgw": {
+    "TrackName": "World Away",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound9_music068.bgw": {
+    "TrackName": "World Away",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music069.bgw": {
+    "TrackName": "Distant Worlds (Nanaa Mihgo's version)",
+    "TrackAuthor": "Nobuo Uematsu",
+    "IsFavorite": false
+  },
+  "sound_music070.bgw": {
+    "TrackName": "Monstrosity",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music071.bgw": {
+    "TrackName": "The Pioneers (Nanaa Mihgo's version)",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music072.bgw": {
+    "TrackName": "The Serpentine Labyrinth",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music073.bgw": {
+    "TrackName": "The Divine",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music074.bgw": {
+    "TrackName": "Clouds Over Ulbuka",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music075.bgw": {
+    "TrackName": "The Price",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music076.bgw": {
+    "TrackName": "Forever Today",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music077.bgw": {
+    "TrackName": "Distant Worlds (Instrumental)",
+    "TrackAuthor": "Nobuo Uematsu",
+    "IsFavorite": false
+  },
+  "sound_music078.bgw": {
+    "TrackName": "Forever Today (Instrumental)",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music079.bgw": {
+    "TrackName": "Iroha",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music080.bgw": {
+    "TrackName": "The Boundless Black",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music081.bgw": {
+    "TrackName": "Isle of the Gods",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music082.bgw": {
+    "TrackName": "Wail of the Void",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music083.bgw": {
+    "TrackName": "Rhapsodies of Vana'diel",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music084.bgw": {
+    "TrackName": "Full Speed Ahead!",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music085.bgw": {
+    "TrackName": "Times Grow Tense",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music086.bgw": {
+    "TrackName": "Shadow Lord (Record Keeper Remix)",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music087.bgw": {
+    "TrackName": "For a Friend",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music088.bgw": {
+    "TrackName": "Between Dreams and Reality",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music089.bgw": {
+    "TrackName": "Disjoined One",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music090.bgw": {
+    "TrackName": "Winds of Change",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music124.bgw": {
+    "TrackName": "Recollection",
+    "TrackAuthor": "Nobuo Uematsu",
+    "IsFavorite": false
+  },
+  "sound_music125.bgw": {
+    "TrackName": "Tough Battle",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music126.bgw": {
+    "TrackName": "Mog House",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music127.bgw": {
+    "TrackName": "Anxiety",
+    "TrackAuthor": "Nobuo Uematsu",
+    "IsFavorite": false
+  },
+  "sound_music128.bgw": {
+    "TrackName": "Airship",
+    "TrackAuthor": "Nobuo Uematsu",
+    "IsFavorite": false
+  },
+  "sound5_music141.bgw": {
+    "TrackName": "The Cosmic Wheel",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound4_music142.bgw": {
+    "TrackName": "Fated Strife -Besieged-",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound4_music143.bgw": {
+    "TrackName": "Hellriders",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound4_music144.bgw": {
+    "TrackName": "Rapid Onslaught -Assault-",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound5_music145.bgw": {
+    "TrackName": "Encampment Dreams",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound4_music146.bgw": {
+    "TrackName": "The Colosseum",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound4_music147.bgw": {
+    "TrackName": "Eastward Bound...",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound4_music148.bgw": {
+    "TrackName": "Forbidden Seal",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound4_music149.bgw": {
+    "TrackName": "Jeweled Boughs",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound4_music150.bgw": {
+    "TrackName": "Ululations from Beyond",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music151.bgw": {
+    "TrackName": "The Federation of Windurst",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music152.bgw": {
+    "TrackName": "The Republic of Bastok",
+    "TrackAuthor": "Kumi Tanioka",
+    "IsFavorite": false
+  },
+  "sound_music153.bgw": {
+    "TrackName": "Prelude",
+    "TrackAuthor": "Nobuo Uematsu",
+    "IsFavorite": false
+  },
+  "sound_music154.bgw": {
+    "TrackName": "Metalworks",
+    "TrackAuthor": "Kumi Tanioka",
+    "IsFavorite": false
+  },
+  "sound_music155.bgw": {
+    "TrackName": "Castle Zvahl",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music156.bgw": {
+    "TrackName": "Chateau d'Oraguille",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music157.bgw": {
+    "TrackName": "Fury",
+    "TrackAuthor": "Kumi Tanioka",
+    "IsFavorite": false
+  },
+  "sound_music158.bgw": {
+    "TrackName": "Sauromugue Champaign",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music159.bgw": {
+    "TrackName": "Sorrow",
+    "TrackAuthor": "Nobuo Uematsu",
+    "IsFavorite": false
+  },
+  "sound_music160.bgw": {
+    "TrackName": "Repression (Memoro de la Stono)",
+    "TrackAuthor": "Nobuo Uematsu",
+    "IsFavorite": false
+  },
+  "sound_music161.bgw": {
+    "TrackName": "Despair (Memoro de la Stono)",
+    "TrackAuthor": "Nobuo Uematsu",
+    "IsFavorite": false
+  },
+  "sound_music162.bgw": {
+    "TrackName": "Heavens Tower",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music163.bgw": {
+    "TrackName": "Sometime, Somewhere",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music164.bgw": {
+    "TrackName": "Xarcabard",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music165.bgw": {
+    "TrackName": "Galka (Character Creation)",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music166.bgw": {
+    "TrackName": "Mithra (Character Creation)",
+    "TrackAuthor": "Kumi Tanioka",
+    "IsFavorite": false
+  },
+  "sound_music167.bgw": {
+    "TrackName": "Tarutaru Male (Character Creation)",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music168.bgw": {
+    "TrackName": "Hume Female (Character Creation)",
+    "TrackAuthor": "Kumi Tanioka",
+    "IsFavorite": false
+  },
+  "sound_music169.bgw": {
+    "TrackName": "Regeneracy",
+    "TrackAuthor": "Kumi Tanioka",
+    "IsFavorite": false
+  },
+  "sound_music170.bgw": {
+    "TrackName": "Buccaneers",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound2_music171.bgw": {
+    "TrackName": "Altepa Desert",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound4_music172.bgw": {
+    "TrackName": "Black Coffin",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound4_music173.bgw": {
+    "TrackName": "Illusions in the Mist",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound4_music174.bgw": {
+    "TrackName": "Whispers of the Gods",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound4_music175.bgw": {
+    "TrackName": "Bandits' Market",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound4_music176.bgw": {
+    "TrackName": "Circuit de Chocobo",
+    "TrackAuthor": "Nobuo Uematsu",
+    "IsFavorite": false
+  },
+  "sound4_music177.bgw": {
+    "TrackName": "Run Chocobo, Run!",
+    "TrackAuthor": "Nobuo Uematsu",
+    "IsFavorite": false
+  },
+  "sound4_music178.bgw": {
+    "TrackName": "Bustle of the Capital",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound4_music179.bgw": {
+    "TrackName": "Vana'diel March #4",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound5_music180.bgw": {
+    "TrackName": "Thunder of the March",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound2_music181.bgw": {
+    "TrackName": "Dash de Chocobo - Low Quality",
+    "TrackAuthor": "Nobuo Uematsu",
+    "IsFavorite": false
+  },
+  "sound5_music181.bgw": {
+    "TrackName": "Griffons Never Die",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound5_music182.bgw": {
+    "TrackName": "Stargazing",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound4_music183.bgw": {
+    "TrackName": "A Puppet's Slumber",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound4_music184.bgw": {
+    "TrackName": "Eternal Gravestone",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound4_music185.bgw": {
+    "TrackName": "Ever-Turning Wheels",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound4_music186.bgw": {
+    "TrackName": "Iron Colossus",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound4_music187.bgw": {
+    "TrackName": "Ragnarok",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music188.bgw": {
+    "TrackName": "Choc-a-bye Baby",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music189.bgw": {
+    "TrackName": "An Invisible Crown",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound2_music190.bgw": {
+    "TrackName": "The Sanctuary of Zi'Tah",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound2_music191.bgw": {
+    "TrackName": "Battle Theme #3",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound2_music192.bgw": {
+    "TrackName": "Battle in the Dungeon #3",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound2_music193.bgw": {
+    "TrackName": "Tough Battle #2",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound2_music194.bgw": {
+    "TrackName": "Bloody Promises",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound2_music195.bgw": {
+    "TrackName": "Belief",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound2_music196.bgw": {
+    "TrackName": "Fighters of the Crystal",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound2_music197.bgw": {
+    "TrackName": "To the Heavens",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound2_music198.bgw": {
+    "TrackName": "Eald'narche",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound2_music199.bgw": {
+    "TrackName": "Grav'iton",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound2_music200.bgw": {
+    "TrackName": "Hidden Truths",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound2_music201.bgw": {
+    "TrackName": "End Theme",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound2_music202.bgw": {
+    "TrackName": "Moongate (Memoro de la Stono)",
+    "TrackAuthor": "Nobuo Uematsu",
+    "IsFavorite": false
+  },
+  "sound2_music203.bgw": {
+    "TrackName": "Ancient Verse of Uggalepih",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound2_music204.bgw": {
+    "TrackName": "Ancient Verse of Ro'Maeve",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound2_music205.bgw": {
+    "TrackName": "Ancient Verse of Altepa",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound2_music206.bgw": {
+    "TrackName": "Revenant Maiden",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound2_music207.bgw": {
+    "TrackName": "Ve'Lugannon Palace",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound2_music208.bgw": {
+    "TrackName": "Rabao",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound2_music209.bgw": {
+    "TrackName": "Norg",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound2_music210.bgw": {
+    "TrackName": "Tu'Lia",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound2_music211.bgw": {
+    "TrackName": "Ro'Maeve",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound2_music212.bgw": {
+    "TrackName": "Dash de Chocobo",
+    "TrackAuthor": "Nobuo Uematsu",
+    "IsFavorite": false
+  },
+  "sound2_music213.bgw": {
+    "TrackName": "Hall of the Gods",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound2_music214.bgw": {
+    "TrackName": "Eternal Oath",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound5_music215.bgw": {
+    "TrackName": "Clash of Standards",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound5_music216.bgw": {
+    "TrackName": "On this Blade",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound5_music217.bgw": {
+    "TrackName": "Kindred Cry",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound3_music218.bgw": {
+    "TrackName": "Depths of the Soul",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound3_music219.bgw": {
+    "TrackName": "Onslaught",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound3_music220.bgw": {
+    "TrackName": "Turmoil",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound3_music221.bgw": {
+    "TrackName": "Moblin Menagerie - Movalpolos",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound3_music222.bgw": {
+    "TrackName": "Faded Memories - Promyvion",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound3_music223.bgw": {
+    "TrackName": "Conflict: March of the Hero",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound3_music224.bgw": {
+    "TrackName": "Dusk and Dawn",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound3_music225.bgw": {
+    "TrackName": "Words Unspoken - Pso'Xja",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound3_music226.bgw": {
+    "TrackName": "Conflict: You Want to Live Forever?",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound_music227.bgw": {
+    "TrackName": "Sunbreeze Shuffle",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound3_music228.bgw": {
+    "TrackName": "Gates of Paradise - The Garden of Ru'Hmet",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound3_music229.bgw": {
+    "TrackName": "Currents of Time",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound3_music230.bgw": {
+    "TrackName": "A New Horizon - Tavnazian Archipelago",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound3_music231.bgw": {
+    "TrackName": "Celestial Thunder",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound3_music232.bgw": {
+    "TrackName": "The Ruler of the Skies",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound3_music233.bgw": {
+    "TrackName": "The Celestial Capital - Al'Taieu",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound3_music234.bgw": {
+    "TrackName": "Happily Ever After",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound3_music235.bgw": {
+    "TrackName": "First Ode: Nocturne of the Gods",
+    "TrackAuthor": "Nobuo Uematsu",
+    "IsFavorite": false
+  },
+  "sound3_music236.bgw": {
+    "TrackName": "Fourth Ode: Clouded Dawn",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound3_music237.bgw": {
+    "TrackName": "Third Ode: Memoria de la Stona",
+    "TrackAuthor": "Nobuo Uematsu",
+    "IsFavorite": false
+  },
+  "sound3_music238.bgw": {
+    "TrackName": "A New Morning",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound3_music239.bgw": {
+    "TrackName": "Jeuno -Starlight Celebration-",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound3_music240.bgw": {
+    "TrackName": "Second Ode: Distant Promises",
+    "TrackAuthor": "Nobuo Uematsu",
+    "IsFavorite": false
+  },
+  "sound3_music241.bgw": {
+    "TrackName": "Fifth Ode: A Time for Prayer",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound3_music242.bgw": {
+    "TrackName": "Unity",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound3_music243.bgw": {
+    "TrackName": "Grav'iton",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound3_music244.bgw": {
+    "TrackName": "Revenant Maiden",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound3_music245.bgw": {
+    "TrackName": "The Forgotten City - Tavnazian Safehold",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound5_music246.bgw": {
+    "TrackName": "March of the Allied Forces",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound5_music247.bgw": {
+    "TrackName": "Roar of the Battle Drums",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  },
+  "sound5_music248.bgw": {
+    "TrackName": "Young Griffons in Flight",
+    "TrackAuthor": "Naoshi Mizuta",
+    "IsFavorite": false
+  }
+}

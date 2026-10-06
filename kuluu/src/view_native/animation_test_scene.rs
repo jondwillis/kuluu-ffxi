@@ -16,7 +16,6 @@ use kuluu_render::dat_mzb::{LastAutoLoadedZone, LoadMzbRequest, ZONE_SLOT_MAIN};
 use kuluu_render::ffxi_actor_render::{
     ActorSubject, FfxiActorMeshChild, FfxiRenderRoot, LoadActorRequest,
 };
-use kuluu_render::particle_sim::ParticleSimulator;
 use kuluu_render::scene::TrackedEntities;
 use kuluu_render::scheduler_runtime::{
     enqueue_routine, parse_action_bytes_reporting, stage_summary, ActionDatRoot, ActionTarget,
@@ -2181,10 +2180,17 @@ fn arm_lamp_room(
         return;
     }
     if !lamp.0 {
-        clock.thaw();
+        // Release only the room's own hold; an authored or debug hold stays.
+        if clock.hold_origin() == Some(kuluu_render::vana_time::ClockHoldOrigin::AnimationRoom) {
+            clock.thaw();
+        }
         return;
     }
-    clock.freeze_at_hour_minute(SG_LAMP_HOUR, 0);
+    clock.freeze_at_hour_minute(
+        SG_LAMP_HOUR,
+        0,
+        kuluu_render::vana_time::ClockHoldOrigin::AnimationRoom,
+    );
     log_line(
         &mut log,
         format!("clock: frozen at {:02}:00 (tkaa gate on)", SG_LAMP_HOUR),
@@ -2581,20 +2587,8 @@ fn tear_down(
     // Restore-gate: phase exit runs this with no box ever up; only a real open unloads things.
     let was_open = q_scoped.iter().next().is_some();
     // Drop the test zone and let mirror_backdrop_to_scene_state + auto-load bring the
-    // default backdrop block back at its own offset; release any lamp-room clock hold too.
+    // default backdrop block back at its own offset.
     commands.queue(|world: &mut World| {
-        if world
-            .get_resource::<LampRoomActive>()
-            .is_some_and(|lamp| lamp.0)
-        {
-            if let Some(mut clock) = world.get_resource_mut::<kuluu_render::vana_time::VanaClock>()
-            {
-                clock.thaw();
-            }
-        }
-        if let Some(mut sim) = world.get_resource_mut::<ParticleSimulator>() {
-            sim.reset_test_lighting();
-        }
         if let Some(mut distortion) =
             world.get_resource_mut::<kuluu_render::distortion_pass::ActiveDistortion>()
         {
@@ -2616,7 +2610,32 @@ fn tear_down(
     });
     commands.insert_resource(VfxTrace(false));
     commands.insert_resource(TestZoneActive(false));
+    // The lamp-room clock hold is normally released by `arm_lamp_room` reacting to this flag, but a
+    // phase exit stops Update before that edge is observed, so hand the clock and the slider values
+    // back here rather than depending on one more Launcher frame.
+    commands.queue(|world: &mut World| {
+        if world
+            .get_resource::<LampRoomActive>()
+            .is_some_and(|lamp| lamp.0)
+        {
+            if let Some(mut clock) = world.get_resource_mut::<kuluu_render::vana_time::VanaClock>()
+            {
+                if clock.hold_origin()
+                    == Some(kuluu_render::vana_time::ClockHoldOrigin::AnimationRoom)
+                {
+                    clock.thaw();
+                }
+            }
+        }
+        if let Some(mut sim) =
+            world.get_resource_mut::<kuluu_render::particle_sim::ParticleSimulator>()
+        {
+            sim.reset_test_lighting();
+        }
+    });
     commands.insert_resource(LampRoomActive(false));
+    // Generator alpha forced for an a=0 additive flash is tester state: once the box is gone every
+    // generator reads authored alpha again.
     commands.remove_resource::<kuluu_render::particle_sim::TestAlphaOverride>();
 
     // Resetting shadows to "on" makes `sync_shadow_override` restore whatever the suppression
@@ -2696,6 +2715,9 @@ fn tear_down_test_scene(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kuluu_render::particle_sim::{
+        ParticleSimulator, TestAlphaOverride, LAMP_ALPHAMAP_LIFT_DEFAULT, WASH_ALPHA_LIFT_DEFAULT,
+    };
 
     #[test]
     fn room_without_install_preserves_launcher() {
@@ -2918,7 +2940,6 @@ mod tests {
             Some(&Visibility::Hidden)
         );
     }
-    use kuluu_render::particle_sim::TestAlphaOverride;
 
     #[test]
     fn room_keeps_rebuilt_launcher_ui_hidden() {
@@ -2986,8 +3007,21 @@ mod tests {
         assert_eq!(distortion.strength, 0.0);
     }
 
+    // Everything the box borrows from production has to come back on launcher exit: the alpha kill
+    // switch removed, the game clock thawed even though `arm_lamp_room` never sees the flag flip, and
+    // both lighting sliders at their authored values.
     #[test]
-    fn launcher_exit_removes_tester_alpha_override() {
+    fn launcher_exit_returns_everything_the_box_borrowed() {
+        let mut sim = ParticleSimulator::default();
+        sim.set_lamp_halos_lift(0.0);
+        sim.set_wash_alpha_lift(0.0);
+        let mut clock = kuluu_render::vana_time::VanaClock::default();
+        clock.freeze_at_hour_minute(
+            SG_LAMP_HOUR,
+            0,
+            kuluu_render::vana_time::ClockHoldOrigin::AnimationRoom,
+        );
+
         let mut app = App::new();
         app.init_resource::<TrackedEntities>()
             .init_resource::<SceneState>()
@@ -2996,28 +3030,23 @@ mod tests {
             .init_resource::<crate::graphics_store::GraphicsPersistSuspended>()
             .init_resource::<Assets<Mesh>>()
             .init_resource::<Assets<StandardMaterial>>()
+            .insert_resource(sim)
+            .insert_resource(clock)
+            .insert_resource(LampRoomActive(true))
             .insert_resource(TestAlphaOverride([*b"g141", *b"g144"].into()))
             .add_systems(Update, tear_down_test_scene);
-
-        let mut sim = ParticleSimulator::default();
-        sim.set_lamp_halos_lift(0.0);
-        sim.set_wash_alpha_lift(0.0);
-        let mut clock = kuluu_render::vana_time::VanaClock::default();
-        clock.freeze_at_hour_minute(SG_LAMP_HOUR, 0);
-        app.insert_resource(sim)
-            .insert_resource(clock)
-            .insert_resource(LampRoomActive(true));
 
         app.update();
 
         assert!(!app.world().contains_resource::<TestAlphaOverride>());
-        assert!(!app
-            .world()
-            .resource::<kuluu_render::vana_time::VanaClock>()
-            .is_frozen());
-        let clock = app.world().resource::<ParticleSimulator>().clock();
-        let expected = kuluu_render::particle_sim::CelestialClock::default();
-        assert_eq!(clock.lamp_halos_lift, expected.lamp_halos_lift);
-        assert_eq!(clock.wash_alpha_lift, expected.wash_alpha_lift);
+        assert!(
+            !app.world()
+                .resource::<kuluu_render::vana_time::VanaClock>()
+                .is_frozen(),
+            "the lamp-room clock hold outlived the box"
+        );
+        let sim = app.world().resource::<ParticleSimulator>();
+        assert_eq!(sim.lamp_halos_lift(), LAMP_ALPHAMAP_LIFT_DEFAULT);
+        assert_eq!(sim.wash_alpha_lift(), WASH_ALPHA_LIFT_DEFAULT);
     }
 }

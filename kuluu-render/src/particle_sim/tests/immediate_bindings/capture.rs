@@ -64,8 +64,6 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
             target: Some(actor),
             stage: particle_stage(SOURCE),
             scheduler: SOURCE,
-            cutscene_motion: false,
-            scheduler_instance: None,
         });
     });
     commands.insert_resource(Target {

@@ -30,8 +30,28 @@ fn main() {
             .unwrap_or_else(|| "missing".into())
     );
     println!(
-        "patch version:   {}",
-        profile.patch_version.as_deref().unwrap_or("unknown")
+        "patch stamp:     {} ({} {})",
+        profile
+            .patch_version
+            .as_deref()
+            .unwrap_or("none on this tree"),
+        ffxi_dat::client_profile::PATCH_CFG,
+        if profile.patch_cfg_present {
+            "present"
+        } else {
+            "absent"
+        },
+    );
+    println!(
+        "content ledger:  {}",
+        match profile.content_ledger {
+            Some(ledger) => format!(
+                "{} entries in {}",
+                ledger.entries,
+                ledger.source.file_name()
+            ),
+            None => "none".into(),
+        }
     );
     println!(
         "item layout:     {}",

@@ -13,7 +13,83 @@ const ITEM_LAYOUT_PROBE_FILE_ID: u32 = crate::item_dat::ITEM_DAT_GENERAL;
 /// as a `YYYYMMDD_n`-style stamp (`3` prefixed; e.g. `30230905_0` is the
 /// 2023-09-05 update) at the start of a line, so the largest stamp is the
 /// version this install was last patched to.
-const PATCH_CFG: &str = "patch.cfg";
+pub const PATCH_CFG: &str = "patch.cfg";
+
+/// PlayOnline's per-file content ledger, which SE's installer keeps and ours does not write. One
+/// `<checksum>:<size>:<path>` line per tracked file, closed by a bare `::`. Its 22-character checksum
+/// is an encoding this tree has not reversed, so the ledger is read for presence only.
+pub const PATCH_LEDGER_FILE: &str = "patch.txt";
+
+/// The same ledger frozen when the base image was installed. Measured on a retail-2026-09 tree: its
+/// 61,601 entries all appear in [`PATCH_LEDGER_FILE`] with identical checksum and size, which
+/// carries 1,828 more - hence probe prefers the patch ledger.
+pub const BASE_LEDGER_FILE: &str = "file.txt";
+
+/// Which content ledger an install carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContentLedger {
+    PatchTxt,
+    FileTxt,
+}
+
+impl ContentLedger {
+    pub const fn file_name(self) -> &'static str {
+        match self {
+            Self::PatchTxt => PATCH_LEDGER_FILE,
+            Self::FileTxt => BASE_LEDGER_FILE,
+        }
+    }
+}
+
+/// A content ledger read off disk: which file it came from and how many entries it lists. Patching
+/// an install adds entries, so callers assert the source, never an exact count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContentLedgerProbed {
+    pub source: ContentLedger,
+    pub entries: u32,
+}
+
+impl ContentLedgerProbed {
+    /// The install's content ledger, preferring the patch ledger. `None` when it carries neither.
+    pub fn probe(root: &Path) -> Option<Self> {
+        let read = |name: &'static str, source| {
+            let text = std::fs::read_to_string(root.join(name)).ok()?;
+            Some(Self {
+                source,
+                entries: count_ledger_entries(&text),
+            })
+        };
+        read(PATCH_LEDGER_FILE, ContentLedger::PatchTxt)
+            .or_else(|| read(BASE_LEDGER_FILE, ContentLedger::FileTxt))
+    }
+}
+
+/// How many ledger entries a file lists. Blank lines and the bare `::` terminator are not
+/// entries; SE writes these files with CRLF, so trailing whitespace is trimmed before matching.
+fn count_ledger_entries(ledger: &str) -> u32 {
+    ledger
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| {
+            let Some((checksum, rest)) = line.split_once(':') else {
+                return false;
+            };
+            let Some((size, path)) = rest.split_once(':') else {
+                return false;
+            };
+            !checksum.is_empty() && !path.is_empty() && size.parse::<u64>().is_ok()
+        })
+        .count() as u32
+}
+
+/// What the install a [`KnownClient`] row was measured on carries for SE's content ledger.
+/// `Unmeasured` is reserved for builds whose tree nobody has examined here; it asserts nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LedgerExpectation {
+    Unmeasured,
+    Absent,
+    Present(ContentLedger),
+}
 
 /// Per-byte obfuscation shared by every item DAT. POLUtils
 /// Wiki/FFXIDATFileEncryption.wiki: a fixed rotate for item data.
@@ -137,8 +213,16 @@ pub struct KnownClient {
     /// its code can be pinned.
     pub unpacked_text: Option<UnpackedText>,
     /// `None` when the install carries no `patch.cfg` stamp: SE's base image
-    /// ships without one, and a POL-patched install can lack it too.
+    /// ships without one, and a POL-patched install can lack it too. A tree SE patched itself
+    /// records its history in [`PATCH_LEDGER_FILE`], which holds no stamp at all (measured on
+    /// retail-2026-09: 63,428 ledger lines, zero `YYYYMMDD_n` tokens), so a stamped row can still
+    /// probe to `None` without that being a parse failure.
     pub patch_version: Option<&'static str>,
+    /// What the install this row was measured on carries for content ledgers. Stamp presence is
+    /// not part of a build's identity here: an SE-installed tree and one patched by our own tool
+    /// share one [`Self::ffximain_sha256`] and differ only in which of `patch.cfg` / `patch.txt`
+    /// they own.
+    pub ledger: LedgerExpectation,
     pub item_layout: ItemBlockLayout,
     /// Square Enix's own lineage, which the PlayOnline patch server can bring
     /// forward. A private server's pinned client is not, and patching it
@@ -180,6 +264,7 @@ pub const KNOWN_CLIENTS: &[KnownClient] = &[
             pol1_stub_rva: 0x00BA_B4B0,
         }),
         patch_version: Some("30230905_0"),
+        ledger: LedgerExpectation::Unmeasured,
         item_layout: ItemBlockLayout::Legacy,
         retail: false,
         offhand_model_rule: Some(OffhandModelRule::Horizon2023),
@@ -192,6 +277,7 @@ pub const KNOWN_CLIENTS: &[KnownClient] = &[
         ffximain_sha256: "3da0a1e0dc897294880c0a4bf9ea0e9c580786b2d05698290e588c761a802835",
         unpacked_text: None,
         patch_version: None,
+        ledger: LedgerExpectation::Unmeasured,
         item_layout: ItemBlockLayout::Legacy,
         retail: true,
         offhand_model_rule: None,
@@ -208,6 +294,9 @@ pub const KNOWN_CLIENTS: &[KnownClient] = &[
             pol1_stub_rva: 0x00BE_4A50,
         }),
         patch_version: Some("30260904_1"),
+        // Measured in place on an SE-installed retail-2026-09 tree (patch.txt, 63,428 entries, no
+        // patch.cfg), so the stamp above describes this build's other lineage.
+        ledger: LedgerExpectation::Present(ContentLedger::PatchTxt),
         item_layout: ItemBlockLayout::Retail2026,
         retail: true,
         offhand_model_rule: Some(OffhandModelRule::Retail2026),
@@ -219,6 +308,7 @@ pub const KNOWN_CLIENTS: &[KnownClient] = &[
         ffximain_sha256: "6f8844eb7f0380f30a3db2fc3c435e1145f5c450bdd0999133cc75c516ec3c3b",
         unpacked_text: None,
         patch_version: None,
+        ledger: LedgerExpectation::Unmeasured,
         item_layout: ItemBlockLayout::Legacy,
         retail: true,
         offhand_model_rule: None,
@@ -234,6 +324,11 @@ pub struct ClientProfile {
     pub ffximain_sha256: Option<String>,
     pub ffximain_len: Option<u64>,
     pub patch_version: Option<String>,
+    /// Whether the install carries `patch.cfg`, which is what makes a stamp knowable at all.
+    pub patch_cfg_present: bool,
+    /// SE's per-file content ledger if the install has one. For an SE-installed tree, which owns
+    /// no `patch.cfg`, this is the only on-disk identity fact beyond the DLL hash.
+    pub content_ledger: Option<ContentLedgerProbed>,
     pub item_layout: Option<ItemBlockLayout>,
 }
 
@@ -265,9 +360,9 @@ fn is_patch_stamp(tok: &str) -> bool {
 }
 
 impl ClientProfile {
-    /// For a caller holding only an install path — the installer and launcher
+    /// For a caller holding only an install path - the installer and launcher
     /// run before any VTABLE/FTABLE is loaded, and on a tree that may still be
-    /// unpacking — so the layout probe reads the era ROM path of the
+    /// unpacking - so the layout probe reads the era ROM path of the
     /// general-item DAT rather than resolving its file id.
     pub fn probe(root: &Path) -> ClientProfile {
         Self::probe_with(
@@ -278,7 +373,7 @@ impl ClientProfile {
 
     /// Overlay-aware: [`crate::DatRoot::open`] calls this once its tables are
     /// loaded, so the layout is read from whichever file the install places the
-    /// general-item DAT at — the same file [`crate::item_dat`] parses.
+    /// general-item DAT at - the same file [`crate::item_dat`] parses.
     pub fn probe_in(root: &crate::DatRoot) -> ClientProfile {
         match root.resolve(ITEM_LAYOUT_PROBE_FILE_ID) {
             Ok(loc) => Self::probe_with(root.root(), &loc.path_under(root)),
@@ -298,11 +393,15 @@ impl ClientProfile {
         let item_layout =
             ItemBlockLayout::probe_file(item_layout_dat).or(known.map(|k| k.item_layout));
         let patch_version = patch_version_at(root);
+        let patch_cfg_present = root.join(PATCH_CFG).is_file();
+        let content_ledger = ContentLedgerProbed::probe(root);
         ClientProfile {
             known,
             ffximain_sha256,
             ffximain_len,
             patch_version,
+            patch_cfg_present,
+            content_ledger,
             item_layout,
         }
     }
@@ -326,7 +425,17 @@ impl fmt::Display for ClientProfile {
         }
         match &self.patch_version {
             Some(v) => write!(f, " patch={v}")?,
-            None => write!(f, " patch=unknown")?,
+            None if self.patch_cfg_present => write!(f, " patch=cfg-unreadable")?,
+            None => write!(f, " patch=none")?,
+        }
+        match self.content_ledger {
+            Some(ledger) => write!(
+                f,
+                " ledger={}({})",
+                ledger.source.file_name(),
+                ledger.entries
+            )?,
+            None => write!(f, " ledger=none")?,
         }
         match self.item_layout {
             Some(layout) => write!(f, " items={}", layout.name()),
@@ -469,6 +578,23 @@ mod tests {
     }
 
     #[test]
+    fn ledger_entries_ignore_crlf_blanks_and_the_terminator() {
+        let ledger = "zE@hAtxgipi@VtcqejniQt:631040:ROM/32/13.DAT\r\n\
+                      u_95SatcqHHiXE5UZ81zIt:2901584:FFXiMain.dll\r\n\
+                      \r\n::";
+        assert_eq!(count_ledger_entries(ledger), 2);
+        assert_eq!(count_ledger_entries(""), 0);
+    }
+
+    #[test]
+    fn a_ledger_line_is_never_read_as_a_patch_stamp() {
+        assert_eq!(
+            latest_patch_version("zE@hAtxgipi@VtcqejniQt:631040:ROM/32/13.DAT"),
+            None
+        );
+    }
+
+    #[test]
     fn latest_patch_version_is_the_largest_leading_stamp() {
         let cfg =
             "file patch.txt {\n30020917_0 1 2 3 x\n30230905_0 1 2 3 y\n30230801_1 1 2 3 z\n}\n\
@@ -516,12 +642,34 @@ mod tests {
             profile.known.map(|k| k.item_layout),
             "{profile}"
         );
-        if profile.patch_version.is_some() {
+        // Absent `patch.cfg` means the install keeps its history in the ledger and knows no stamp;
+        // present, a failed read is the scanner regression this catches.
+        if profile.patch_cfg_present {
             assert_eq!(
                 profile.patch_version.as_deref(),
                 profile.known.and_then(|k| k.patch_version),
                 "{profile}"
             );
+        } else {
+            assert_eq!(
+                profile.patch_version, None,
+                "stamp with no patch.cfg: {profile}"
+            );
+        }
+        match profile.known.map(|k| k.ledger) {
+            None | Some(LedgerExpectation::Unmeasured) => {}
+            Some(LedgerExpectation::Absent) => assert!(
+                profile.content_ledger.is_none(),
+                "row says no ledger, probed {:?}: {profile}",
+                profile.content_ledger
+            ),
+            Some(LedgerExpectation::Present(expected)) => {
+                let ledger = profile.content_ledger.unwrap_or_else(|| {
+                    panic!("expected a {} ledger: {profile}", expected.file_name())
+                });
+                assert_eq!(ledger.source, expected, "{profile}");
+                assert_ne!(ledger.entries, 0, "{profile}");
+            }
         }
     }
 

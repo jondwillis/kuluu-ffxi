@@ -20,6 +20,12 @@
 # distinct steps for per-stage pass/fail reporting while still sharing flags.
 set -euo pipefail
 
+# python3 reads text files with the OS default encoding, which on Windows is
+# an ANSI code page: one em dash in a README and every Python-backed gate
+# aborts mid-read with UnicodeDecodeError. UTF-8 mode makes the gates behave
+# identically on all platforms; Linux/macOS runners are already UTF-8.
+export PYTHONUTF8=1
+
 # GUI git clients (Fork, Tower, GitKraken…) run hooks with a stripped PATH that
 # omits ~/.cargo/bin, so `cargo` isn't found. Pull in rustup's env when it's
 # missing. No-op on CI / interactive shells, where cargo is already on PATH.

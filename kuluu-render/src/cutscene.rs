@@ -21,7 +21,7 @@ use kuluu_snapshot::{CutsceneActor, CutsceneCue, ViewerEvent};
 use crate::hud_hide::{HudHidden, HudHideExempt};
 use crate::scheduler_runtime::ROUTINE_FPS;
 use crate::snapshot::EventLog;
-use crate::vana_time::VanaClock;
+use crate::vana_time::{ClockHoldOrigin, VanaClock};
 
 /// The screen colour that leaves the scene alone, in
 /// [`ffxi_dat::scheduler::ScreenColor::tint`] units.
@@ -507,11 +507,20 @@ pub fn drain_cutscene_clock(
                 } => match *day_from_epoch {
                     Some(day) => {
                         let hour = hour.unwrap_or(0);
-                        clock.freeze_at_day_hour_minute(day, hour, *minute as u32);
+                        clock.freeze_at_day_hour_minute(
+                            day,
+                            hour,
+                            *minute as u32,
+                            ClockHoldOrigin::Cutscene,
+                        );
                     }
                     None => match *hour {
-                        Some(hour) => clock.freeze_at_hour_minute(hour, *minute as u32),
-                        None => clock.freeze(),
+                        Some(hour) => clock.freeze_at_hour_minute(
+                            hour,
+                            *minute as u32,
+                            ClockHoldOrigin::Cutscene,
+                        ),
+                        None => clock.freeze(ClockHoldOrigin::Cutscene),
                     },
                 },
                 CutsceneCue::ClockHold { stop: false, .. } => clock.thaw(),
@@ -969,6 +978,54 @@ mod tests {
         );
     }
 
+    /// The debug row's indicator follows hold ownership through this drain in
+    /// both directions.
+    #[test]
+    fn a_debug_hold_survives_until_the_drain_replaces_or_releases_it() {
+        let mut app = clock_app();
+        push(&mut app, clock_hold(true, Some(8)));
+        step(&mut app, 1.0);
+
+        app.world_mut()
+            .resource_mut::<VanaClock>()
+            .freeze_at_hour_minute(18, 0, ClockHoldOrigin::DebugRow);
+        assert!(app.world().resource::<VanaClock>().debug_hold_active());
+
+        push(&mut app, clock_hold(true, Some(9)));
+        step(&mut app, 1.0);
+        let clock = app.world().resource::<VanaClock>();
+        assert!(clock.is_frozen(), "the authored replacement keeps the hold");
+        assert_eq!(clock.hold_origin(), Some(ClockHoldOrigin::Cutscene));
+        assert!(!clock.debug_hold_active(), "row off under an authored hour");
+
+        push(&mut app, clock_hold(false, None));
+        step(&mut app, 1.0);
+        let clock = app.world().resource::<VanaClock>();
+        assert!(!clock.is_frozen());
+        assert_eq!(clock.hold_origin(), None);
+
+        for boundary in [
+            ViewerEvent::CutsceneEnded,
+            ViewerEvent::ZoneChanged {
+                from: Some(1),
+                to: 2,
+            },
+            ViewerEvent::Disconnected {
+                reason: "test".into(),
+            },
+        ] {
+            app.world_mut()
+                .resource_mut::<VanaClock>()
+                .freeze_at_hour_minute(18, 0, ClockHoldOrigin::DebugRow);
+            assert!(app.world().resource::<VanaClock>().debug_hold_active());
+            push(&mut app, boundary);
+            step(&mut app, 1.0);
+            let clock = app.world().resource::<VanaClock>();
+            assert!(!clock.is_frozen(), "boundary released the hold: {clock:?}");
+            assert!(!clock.debug_hold_active());
+        }
+    }
+
     #[test]
     fn a_session_exit_releases_a_still_held_clock() {
         let mut app = clock_app();
@@ -991,12 +1048,12 @@ mod tests {
     #[test]
     fn freeze_at_hour_minute_lands_on_the_authored_hour_and_minute() {
         let mut clock = VanaClock::default();
-        clock.freeze_at_hour_minute(8, 0);
+        clock.freeze_at_hour_minute(8, 0, ClockHoldOrigin::Cutscene);
         assert_eq!(
             crate::vana_time::format_vana_time(clock.earth_unix_secs_now()),
             "8:00"
         );
-        clock.freeze_at_hour_minute(8, 30);
+        clock.freeze_at_hour_minute(8, 30, ClockHoldOrigin::Cutscene);
         assert_eq!(
             crate::vana_time::format_vana_time(clock.earth_unix_secs_now()),
             "8:30"
@@ -1008,7 +1065,7 @@ mod tests {
     #[test]
     fn freeze_at_day_hour_minute_lands_on_the_authored_vana_day() {
         let mut clock = VanaClock::default();
-        clock.freeze_at_day_hour_minute(14, 0, 30);
+        clock.freeze_at_day_hour_minute(14, 0, 30, ClockHoldOrigin::Cutscene);
         assert_eq!(
             crate::vana_time::format_vana_time(clock.earth_unix_secs_now()),
             "0:30"

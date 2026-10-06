@@ -124,7 +124,7 @@ Nightly Rust is required; `rust-toolchain.toml` pins it.
 
 ```bash
 git clone https://github.com/jondwillis/kuluu-ffxi && cd kuluu-ffxi
-git submodule update --init --depth 1 vendor/server vendor/POLUtils vendor/AltanaListener
+git submodule update --init --depth 1 vendor/server vendor/POLUtils
 cargo run -p kuluu -- play
 ```
 

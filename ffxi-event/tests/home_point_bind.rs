@@ -18,6 +18,15 @@ const SET_HOMEPOINT_LABEL: &str = "Set this as your home point.";
 const CONFIRM_YES: u32 = 0;
 const CONFIRM_NO: u32 = 1;
 const MENU_ROWS: u32 = 4;
+
+// The two measured client lineages choreograph event 8700 differently (both drive the same
+// wire script; the DAT presentation diverged):
+// - horizonxi-2023: opens with the four-row "What will you do?" menu; row SET_HOMEPOINT_ROW
+//   carries SET_HOMEPOINT_LABEL, and bind fires only on that row followed by the Yes confirm.
+// - PhoenixXI retail-2026-09 (measured on this install): opens straight on the ["Yes.",
+//   "No."] confirm - no intro menu - so picking Yes is itself the confirmed set-home-point,
+//   and there is no later menu for it to veto through.
+const CONFIRM_MENU: [&str; 2] = ["Yes.", "No."];
 const MAX_STEPS: usize = 40;
 
 fn load() -> Option<(EventDat, StringDat)> {
@@ -111,20 +120,43 @@ fn set_home_point_plays_bind_on_the_crystal_and_nothing_else_does() {
     let Some((dat, strings)) = load() else {
         return;
     };
+    // Shape probe: does this lineage put a row menu in front of the confirm?
+    let (_, probe) = drive(&dat, &strings, CONFIRM_YES, CONFIRM_NO);
+    assert!(
+        !probe.is_empty(),
+        "event 8700 must present at least one menu"
+    );
+    let compressed = probe[0] == CONFIRM_MENU;
+
     let mut firing = Vec::new();
     for first in 0..MENU_ROWS {
         for later in [CONFIRM_YES, CONFIRM_NO] {
             let (cues, menus) = drive(&dat, &strings, first, later);
-            if bind_on_event_entity(&cues) {
-                firing.push((first, later));
+            if !bind_on_event_entity(&cues) {
+                continue;
+            }
+            firing.push((first, later));
+            if compressed {
+                assert_eq!(menus[0], CONFIRM_MENU, "PhoenixXI opens on the confirm");
+                assert_eq!(first, CONFIRM_YES, "only an accepted confirm may bind");
+            } else {
                 assert_eq!(menus[0][SET_HOMEPOINT_ROW as usize], SET_HOMEPOINT_LABEL);
-                assert_eq!(menus[1], ["Yes.", "No."]);
+                assert_eq!(menus[1], CONFIRM_MENU);
             }
         }
     }
-    assert_eq!(
-        firing,
-        [(SET_HOMEPOINT_ROW, CONFIRM_YES)],
-        "bind plays once, on a confirmed set-home-point"
-    );
+    if compressed {
+        // No menu follows the confirm, so both `later` answers reach the same bound crystal.
+        assert_eq!(
+            firing,
+            [(CONFIRM_YES, CONFIRM_YES), (CONFIRM_YES, CONFIRM_NO)],
+            "bind plays only from an accepted confirm"
+        );
+    } else {
+        assert_eq!(
+            firing,
+            [(SET_HOMEPOINT_ROW, CONFIRM_YES)],
+            "bind plays once, on a confirmed set-home-point"
+        );
+    }
 }

@@ -598,11 +598,10 @@ cmd_writer_plausible() {
     return $?
   fi
   if [[ "$cmd" =~ ${SESSION_EDITS_CMD_START_RE}rmcm([[:space:]]|$) ]]; then
-    local t abs prefix root_phys
-    # The payload's root may be in drive-letter form (C:/...) while `pwd -P`
-    # reports MSYS physical form (/...); normalize root into the same form as
-    # `abs` so the prefix match below cannot miss on the form alone.
-    root_phys=$(cd "$root" && pwd -P) || return 1
+    local t abs prefix phys_root
+    # Operands below resolve through pwd -P; compare the root in the same form,
+    # or a symlinked temp dir (Git Bash maps /tmp via AppData) never matches.
+    phys_root=$(cd "$root" 2>/dev/null && pwd -P) || phys_root="$root"
     set -f
     # shellcheck disable=SC2086
     for t in $cmd; do
@@ -620,12 +619,12 @@ cmd_writer_plausible() {
       else
         abs="$(cd "$(dirname "$abs")" && pwd -P)/$(basename "$abs")"
       fi
-      case "$abs" in "$root_phys"|"$root_phys"/*) ;; *) continue ;; esac
+      case "$abs" in "$phys_root"|"$phys_root"/*) ;; *) continue ;; esac
       if [ -d "$abs" ]; then
-        [ "$abs" = "$root_phys" ] && return 0
-        prefix="${abs#"$root_phys"/}"
+        [ "$abs" = "$phys_root" ] && return 0
+        prefix="${abs#"$phys_root"/}"
         case "$p" in "$prefix"/*) return 0 ;; esac
-      elif [ "$abs" = "$root_phys/$p" ]; then
+      elif [ "$abs" = "$phys_root/$p" ]; then
         return 0
       fi
     done

@@ -1056,7 +1056,7 @@ const SEC2_OPCODE_OSCILLATION_ACCEL_X: u8 = 0x3E;
 const SEC2_OPCODE_OSCILLATION_ACCEL_Y: u8 = 0x3F;
 const SEC2_OPCODE_OSCILLATION_ACCEL_Z: u8 = 0x40;
 const SEC2_OPCODE_RELATIVE_VEL_VARIANCE: u8 = 0x41;
-// .agents/skills/retail-observe/references/2026-10-02-level-up-linked-sparkle.md native initializer dispatch.
+// .agents/skills/retail-observe/references/2026-10-02-level-up-linked-sparkle.md Native immediate emission.
 const SEC2_OPCODE_IMMEDIATE_GENERATOR: u8 = 0x3C;
 const SEC2_OPCODE_CHILD_GENERATOR: u8 = 0x44;
 const SEC2_OPCODE_PARENT_POSITION_COPY: u8 = 0x45;
@@ -1959,7 +1959,7 @@ fn parse_sections(body: &[u8]) -> Result<Option<(GeneratorSections, Vec<DecodedB
             SEC2_OPCODE_PARENT_VELOCITY if payload + 4 <= body.len() => {
                 parent_velocity = Some(f32_le(body, payload));
             }
-            // .agents/skills/retail-observe/references/2026-10-02-level-up-linked-sparkle.md native initializer dispatch.
+            // .agents/skills/retail-observe/references/2026-10-02-level-up-linked-sparkle.md Native immediate emission.
             SEC2_OPCODE_IMMEDIATE_GENERATOR if payload + 8 <= body.len() => {
                 immediate_generator = track_id(body, payload + 4);
             }

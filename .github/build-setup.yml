@@ -22,7 +22,7 @@
 # unless this runs. --depth 1: build.rs reads files, never history.
 - name: Initialise build submodules
   shell: bash
-  run: git submodule update --init --depth 1 vendor/server vendor/AltanaListener vendor/POLUtils
+  run: git submodule update --init --depth 1 vendor/server vendor/POLUtils
 
 # The Bevy/wgpu/Recast artifacts are large; reclaim the big preinstalled
 # toolchains the Rust build never touches so `ld` doesn't SIGBUS on a full disk.

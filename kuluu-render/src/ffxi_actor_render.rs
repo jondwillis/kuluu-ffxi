@@ -1403,33 +1403,6 @@ impl FfxiRenderActor {
         self.action.as_ref().map(|a| &a.clip_id)
     }
 
-    /// Drop the completion motion a cutscene cast started so the pose falls back to idle on the
-    /// next frame. A cutscene's cast pose (the gate guard's Signet arm-raise) is owned by the
-    /// event, not by combat: when the event ends, the pose must not outlive it. The pose pass
-    /// re-selects idle from the cleared `action` on its next run.
-    pub(crate) fn release_cutscene_owned_action(&mut self) {
-        self.event_idle = None;
-        if self.action.is_some_and(|action| action.cutscene_owned) {
-            self.clear_cutscene_action();
-        }
-    }
-
-    // FFXiMain.dll retail-2026-09 RVA 0xB71E0 / 0xB7070 stop the actor's
-    // current action before assigning the operand as its default motion.
-    pub(crate) fn stop_current_action(&mut self, idle: Option<[u8; 4]>) -> Option<u64> {
-        let owner = self.action.and_then(|action| action.scheduler_instance);
-        self.clear_cutscene_action();
-        self.event_idle = idle.map(|id| DatId::from_name(&id));
-        self.current_clip = None;
-        owner
-    }
-
-    pub(crate) fn release_event_idle(&mut self) {
-        if self.event_idle.take().is_some() && self.action.is_none() {
-            self.current_clip = None;
-        }
-    }
-
     pub fn clear_cutscene_action(&mut self) {
         self.event_idle = None;
         self.action = None;
@@ -1571,20 +1544,6 @@ impl FfxiRenderActor {
             .map(|prefix| DatId::from_str(&format!("{prefix}?")))
     }
 
-    pub(crate) fn begin_scheduler_motion(
-        &mut self,
-        clip_id: DatId,
-        motion: CompletionMotion,
-        cutscene_owned: bool,
-        scheduler_instance: Option<u64>,
-    ) {
-        self.begin_completion_motion(clip_id, motion);
-        if let Some(action) = &mut self.action {
-            action.cutscene_owned = cutscene_owned;
-            action.scheduler_instance = scheduler_instance;
-        }
-    }
-
     pub fn begin_completion_motion(&mut self, clip_id: DatId, motion: CompletionMotion) {
         // research/xim EffectRoutineInterpolatedEffects.kt SkeletonAnimationInstance animationDirs — a skill's body motion is
         // resolved against `listOf(localDir) + actor.getAllAnimationDirectories()`: the
@@ -1606,8 +1565,6 @@ impl FfxiRenderActor {
         let loop_total = len * num_loops.unwrap_or(1) as f32;
         self.action = Some(ActionPlayback {
             clip_id,
-            cutscene_owned: false,
-            scheduler_instance: None,
             looping: num_loops.is_some(),
             remaining: loop_total.max(motion.duration_frames * 0.5).max(1.0),
             num_loops,
@@ -1716,8 +1673,6 @@ fn half_frames(v: u16) -> f32 {
 #[derive(Clone, Copy)]
 struct ActionPlayback {
     clip_id: DatId,
-    cutscene_owned: bool,
-    scheduler_instance: Option<u64>,
 
     looping: bool,
 
@@ -4801,8 +4756,6 @@ pub fn dispatch_action_overlay(
                     .flatten();
                 actor.action = Some(ActionPlayback {
                     clip_id,
-                    cutscene_owned: false,
-                    scheduler_instance: None,
                     looping,
                     remaining,
                     num_loops: None,
@@ -6871,8 +6824,6 @@ mod pose_resolution_tests {
         assert!(len > 0.0, "HumeM ships the wind-up clip");
         actor.action = Some(ActionPlayback {
             clip_id: wind_up,
-            cutscene_owned: false,
-            scheduler_instance: None,
             looping: false,
             remaining: len,
             num_loops: None,
@@ -7496,13 +7447,16 @@ mod pose_resolution_tests {
         );
     }
 
+    // The runtime releases a finished routine queue per ACTOR (scheduler_runtime's
+    // stop path calls clear_cutscene_action on the render child), so held-motion
+    // ownership does not need per-motion tracking: this pins that clearing drops
+    // the held cast and the pose pass falls back to idle.
     #[test]
-    fn releasing_event_idle_preserves_a_later_ordinary_motion() {
+    fn clearing_the_held_scheduler_motion_falls_back_to_idle() {
         let Some(loaded) = load_hume_m() else { return };
         const CAST: [u8; 4] = *b"mw2?";
         let mut actor = make_render_actor(&loaded, 0, Vec::new(), 1, 0.0, 1.0);
-        actor.stop_current_action(Some(*b"idl?"));
-        actor.begin_scheduler_motion(
+        actor.begin_completion_motion(
             DatId::from_name(&CAST),
             CompletionMotion {
                 local_clips: &[],
@@ -7511,54 +7465,58 @@ mod pose_resolution_tests {
                 transition_in: HalfFrames::ZERO,
                 transition_out: HalfFrames::ZERO,
             },
-            false,
-            None,
         );
         advance_actor_pose_standalone_locked(&mut actor, 10.0, true);
-        let clip = actor.current_clip;
-        let frame = actor.last_frame;
-        actor.release_event_idle();
-        actor.release_cutscene_owned_action();
         assert!(actor.has_action());
-        assert_eq!(actor.current_clip, clip);
-        advance_actor_pose_standalone_locked(&mut actor, 1.0, true);
-        assert_eq!(actor.last_frame, frame + 1.0);
-    }
-
-    #[test]
-    fn explicit_event_release_removes_held_cast_from_pose_coordinator() {
-        let Some(loaded) = load_hume_m() else { return };
-        const CAST: [u8; 4] = *b"mw2?";
-        const IDLE: [u8; 4] = *b"idl?";
-        for stop in [false, true] {
-            let mut actor = make_render_actor(&loaded, 0, Vec::new(), 1, 0.0, 1.0);
-            actor.begin_scheduler_motion(
-                DatId::from_name(&CAST),
-                CompletionMotion {
-                    local_clips: &[],
-                    duration_frames: 600.0,
-                    max_loops: 2,
-                    transition_in: HalfFrames::ZERO,
-                    transition_out: HalfFrames::ZERO,
-                },
-                true,
-                None,
-            );
-            advance_actor_pose_standalone_locked(&mut actor, 30.0, true);
-            assert!(actor
+        actor.clear_cutscene_action();
+        assert!(!actor.has_action());
+        advance_actor_pose_standalone_locked(&mut actor, 1.0, false);
+        assert!(
+            actor
                 .coordinator
                 .animations
                 .iter()
                 .flatten()
-                .any(|slot| slot.current_animation.as_ref().is_some_and(|c| c
-                    .animation
-                    .id
-                    .parameterized_match(&DatId::from_name(&CAST)))));
-            if stop {
-                actor.stop_current_action(Some(IDLE));
-            } else {
-                actor.release_cutscene_owned_action();
+                .all(|slot| slot
+                    .current_animation
+                    .as_ref()
+                    .is_none_or(|c| !c.animation.id.parameterized_match(&DatId::from_name(&CAST)))),
+            "cleared cast must not survive a pose pass"
+        );
+    }
+
+    // The runtime's stop path (scheduler_runtime) clears the held motion on the render
+    // actor when its routine queue dies; either release route must hand the skeleton
+    // back to the idle pose set rather than leaving the cast keyed.
+    #[test]
+    fn released_held_cast_leaves_the_pose_coordinator() {
+        let Some(loaded) = load_hume_m() else { return };
+        const CAST: [u8; 4] = *b"mw2?";
+        for fresh_actor in [false, true] {
+            let mut actor = make_render_actor(&loaded, 0, Vec::new(), 1, 0.0, 1.0);
+            if !fresh_actor {
+                actor.begin_completion_motion(
+                    DatId::from_name(&CAST),
+                    CompletionMotion {
+                        local_clips: &[],
+                        duration_frames: 600.0,
+                        max_loops: 2,
+                        transition_in: HalfFrames::ZERO,
+                        transition_out: HalfFrames::ZERO,
+                    },
+                );
             }
+            advance_actor_pose_standalone_locked(&mut actor, 30.0, true);
+            if fresh_actor {
+                let still_held = actor.coordinator.animations.iter().flatten().any(|slot| {
+                    slot.current_animation.as_ref().is_some_and(|c| {
+                        c.animation.id.parameterized_match(&DatId::from_name(&CAST))
+                    })
+                });
+                assert!(!still_held, "idle actor never held the cast");
+                continue;
+            }
+            actor.clear_cutscene_action();
             advance_actor_pose_standalone_locked(&mut actor, 1.0, false);
             assert!(
                 actor

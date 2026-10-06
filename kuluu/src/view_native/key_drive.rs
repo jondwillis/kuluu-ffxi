@@ -85,6 +85,9 @@ impl KeyMsg {
             "down" => (KeyCode::ArrowDown, Key::ArrowDown),
             "left" => (KeyCode::ArrowLeft, Key::ArrowLeft),
             "right" => (KeyCode::ArrowRight, Key::ArrowRight),
+            // F-keys and PrintScreen: the headless drive's reach into
+            // keybind-only actions (screenshot = Action::Screenshot on
+            // PrintScreen in the default preset).
             "f1" => (KeyCode::F1, Key::F1),
             "f2" => (KeyCode::F2, Key::F2),
             "f3" => (KeyCode::F3, Key::F3),

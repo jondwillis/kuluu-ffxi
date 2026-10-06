@@ -129,13 +129,28 @@ pub fn format_vana_time(earth_unix_secs: u64) -> String {
     format!("{v_hour}:{v_minute:02}")
 }
 
+// Who last froze the clock. Stored and cleared together with `frozen_at_earth_unix`
+// inside this module only, so a consumer that must attribute a hold (the debug menu's
+// forced-time row) can derive from the clock itself instead of tracking it alongside.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ClockHoldOrigin {
+    /// An authored `ClockHold` cue through the cutscene drain
+    /// (research/XiEvents/OpCodes/0x0077.md SetHour/SetMinute, 0x00A9.md).
+    Cutscene,
+    /// The animation test room's held lamp-scene hour.
+    AnimationRoom,
+    /// Debug menu row pinning the clock for lighting checks (hud "Force_18:00").
+    DebugRow,
+}
+
 #[derive(Resource, Default, Debug, Clone, Copy)]
 pub struct VanaClock {
     anchor_earth_unix: Option<u64>,
 
     anchor_instant: Option<Instant>,
-    /// Fixed instant every reader sees while a cutscene holds the game clock; cleared by [`Self::thaw`].
+    /// Fixed instant every reader sees while the game clock is held; cleared by [`Self::thaw`].
     frozen_at_earth_unix: Option<f64>,
+    hold_origin: Option<ClockHoldOrigin>,
 }
 
 impl VanaClock {
@@ -147,14 +162,27 @@ impl VanaClock {
         self.frozen_at_earth_unix.is_some()
     }
 
+    /// Who holds the clock while [`Self::is_frozen`].
+    pub fn hold_origin(&self) -> Option<ClockHoldOrigin> {
+        self.hold_origin
+    }
+
+    /// The derived state of the debug menu's forced-time row: on exactly while
+    /// a debug-row hold is current, so any event that replaces or releases the
+    /// hold turns the row off without a parallel flag.
+    pub fn debug_hold_active(&self) -> bool {
+        matches!(self.hold_origin, Some(ClockHoldOrigin::DebugRow))
+    }
+
     /// Hold every reader at the current instant until [`Self::thaw`].
-    pub fn freeze(&mut self) {
-        self.frozen_at_earth_unix = Some(self.earth_unix_now());
+    pub fn freeze(&mut self, origin: ClockHoldOrigin) {
+        let now = self.earth_unix_now();
+        self.freeze_at_earth_unix(now, origin);
     }
 
     /// Hold every reader at Vana'diel hour `hour`, minute `minute`, on the day
     /// they are in now (research/XiEvents/OpCodes/0x0077.md SetHour/SetMinute).
-    pub fn freeze_at_hour_minute(&mut self, hour: u32, minute: u32) {
+    pub fn freeze_at_hour_minute(&mut self, hour: u32, minute: u32, origin: ClockHoldOrigin) {
         let since_epoch = (self.earth_unix_now() - EARTH_EPOCH_UNIX as f64).max(0.0);
         let day_index = (since_epoch / EARTH_SECS_PER_VANA_DAY as f64).floor();
         self.freeze_at_earth_unix(
@@ -162,28 +190,38 @@ impl VanaClock {
                 + day_index * EARTH_SECS_PER_VANA_DAY as f64
                 + hour.rem_euclid(24) as f64 * EARTH_SECS_PER_VANA_HOUR as f64
                 + minute as f64 * EARTH_SECS_PER_VANA_HOUR as f64 / 60.0,
+            origin,
         );
     }
 
     /// Hold every reader at Vana'diel day `day_from_epoch` (0-based from the
     /// calendar epoch) at hour `hour`, minute `minute`
     /// (research/XiEvents/OpCodes/0x00A9.md).
-    pub fn freeze_at_day_hour_minute(&mut self, day_from_epoch: u32, hour: u32, minute: u32) {
+    pub fn freeze_at_day_hour_minute(
+        &mut self,
+        day_from_epoch: u32,
+        hour: u32,
+        minute: u32,
+        origin: ClockHoldOrigin,
+    ) {
         self.freeze_at_earth_unix(
             EARTH_EPOCH_UNIX as f64
                 + day_from_epoch as f64 * EARTH_SECS_PER_VANA_DAY as f64
                 + hour.rem_euclid(24) as f64 * EARTH_SECS_PER_VANA_HOUR as f64
                 + minute as f64 * EARTH_SECS_PER_VANA_HOUR as f64 / 60.0,
+            origin,
         );
     }
 
-    fn freeze_at_earth_unix(&mut self, earth_unix: f64) {
+    fn freeze_at_earth_unix(&mut self, earth_unix: f64, origin: ClockHoldOrigin) {
         self.frozen_at_earth_unix = Some(earth_unix);
+        self.hold_origin = Some(origin);
     }
 
     /// Release the hold so readers resume from the live clock (research/XiEvents/OpCodes/0x0078.md EnableGameTimer).
     pub fn thaw(&mut self) {
         self.frozen_at_earth_unix = None;
+        self.hold_origin = None;
     }
 
     pub fn earth_unix_now(&self) -> f64 {

@@ -1118,7 +1118,7 @@ fn spawn_launcher_camera(mut commands: Commands) {
 }
 
 // The AnimationTest box unloads the launcher camera while open and re-spawns it on close;
-// both sides build the camera here so they stay identical.
+// this is the shared one-line core so both sides build an identical camera.
 pub(crate) fn spawn_launcher_camera_core(commands: &mut Commands) {
     commands.spawn((Camera2d, LauncherCamera));
 }

@@ -84,11 +84,6 @@ impl ParticleSimulator {
         self.clock = clock;
     }
 
-    pub fn reset_test_lighting(&mut self) {
-        self.clock.lamp_halos_lift = LAMP_ALPHAMAP_LIFT_DEFAULT;
-        self.clock.wash_alpha_lift = WASH_ALPHA_LIFT_DEFAULT;
-    }
-
     pub fn set_lamp_halos_lift(&mut self, lift: f32) {
         self.clock.lamp_halos_lift = lift.clamp(0.0, 1.0);
     }
@@ -97,6 +92,22 @@ impl ParticleSimulator {
     /// (1.0 = exactly as authored).
     pub fn set_wash_alpha_lift(&mut self, lift: f32) {
         self.clock.wash_alpha_lift = lift.clamp(0.0, WASH_ALPHA_LIFT_MAX);
+    }
+
+    // The animation-room sliders read and reset these through the simulator; the
+    // room's teardown restores the shipped defaults so a tester visit cannot leak a
+    // lighting change into a session.
+    pub fn reset_test_lighting(&mut self) {
+        self.clock.lamp_halos_lift = LAMP_ALPHAMAP_LIFT_DEFAULT;
+        self.clock.wash_alpha_lift = WASH_ALPHA_LIFT_DEFAULT;
+    }
+
+    pub fn lamp_halos_lift(&self) -> f32 {
+        self.clock.lamp_halos_lift
+    }
+
+    pub fn wash_alpha_lift(&self) -> f32 {
+        self.clock.wash_alpha_lift
     }
 
     /// The Vana'diel day fraction the time-of-day tracks sample at (the zone lighting's clock —
@@ -286,7 +297,9 @@ pub struct HaloSuppressed;
 // lighting it.
 // pub: the AnimationTest box seeds its lantern-alpha slider from this default.
 pub const LAMP_ALPHAMAP_LIFT_DEFAULT: f32 = 0.12;
-// Wall-wash slider seed (1.0 = authored alpha) and ceiling.
+// Wall-wash slider seed (1.0 = authored alpha) and ceiling. The seed has to be
+// the identity multiplier: it scales authored wash alpha, so any other default
+// dims every wall wash in a normal session rather than only inside the tester.
 pub const WASH_ALPHA_LIFT_DEFAULT: f32 = 1.0;
 pub const WASH_ALPHA_LIFT_MAX: f32 = 2.0;
 // The DAT ships no flicker keyframes, so each halo's phase in the shared `lamp_flicker` wave is
@@ -589,6 +602,9 @@ impl LiveGenerator {
             orientation: None,
             actor_local: false,
             tex_translate: Vec2::ZERO,
+            // World-space origin, so DAT velocities integrate through the mzb->bevy basis:
+            // retail steps elements in FFXI space (CYyGenerator.cpp ElemIdle case 0x02) and
+            // the attach matrix carries them to world at draw time.
             vel_basis: WORLD_PARTICLE_VEL_BASIS,
             origin_routine: None,
             stopped: false,
@@ -1880,6 +1896,7 @@ pub fn tick_particle_simulator(
     // Advance the shared flicker wave before any draw factor samples it this frame.
     sim.clock.lamp_flicker_phase += time.delta_secs();
     let frames = time.delta_secs() * ROUTINE_FPS;
+    // research/xim Particle.kt update — children read the parent's state before anything ages.
     let orphans = anchor_children(&mut sim);
     advance_simulator(&mut sim, frames);
     remove_dead_generators(&mut sim, &mut commands, orphans);
@@ -3667,6 +3684,10 @@ fn rebuild_mesh(g: &LiveGenerator, cam: CameraView, clock: &CelestialClock, mesh
             }
             movement_orientation(vel_dat) * particle_rotation(p)
         } else {
+            // A screen billboard re-faces the camera every frame and keeps the element's full Euler in
+            // the view basis (research/xim GLDrawer.kt drawXimParticle XYZ branch). hit1's g010 authors
+            // a ±π z-variance, so its burst fans out into retail's starburst; without it every particle
+            // of a burst lies along the same line.
             cam.rot * particle_rotation(p)
         };
         // Billboard sprites are flat (z unused); a 3-D particle mesh — a fixed-orientation
@@ -4234,9 +4255,6 @@ mod tests {
         g
     }
 
-    // 0x1E ParticleDampen: emission stops and the already-live particles are force-expired
-    // at once (research/xim EffectRoutineInstance.kt handleParticleEffectDampen), unlike
-    // StopParticle which lets them play out.
     #[test]
     fn authored_velocity_damping_applies_after_position_with_fractional_delta() {
         const DAMPING_PER_FRAME: f32 = 0.25;
@@ -4259,6 +4277,9 @@ mod tests {
         assert_eq!(g.particles[0].vel, Vec3::X * DAMPING_PER_FRAME);
     }
 
+    // 0x1E ParticleDampen: emission stops and the already-live particles are force-expired
+    // at once (research/xim EffectRoutineInstance.kt handleParticleEffectDampen), unlike
+    // StopParticle which lets them play out.
     #[test]
     fn dampen_generator_stops_emission_and_clears_live_particles() {
         let owner = Entity::from_raw_u32(1).unwrap();
@@ -4600,6 +4621,8 @@ mod tests {
         draw.factor_rgb.extend(draw.factor_alpha)
     }
 
+    // Outside the tester, mesh particles must draw at their authored alpha: no slider
+    // multiplier rides the default state.
     #[test]
     fn default_mesh_alpha_preserves_authored_factor() {
         use ffxi_dat::particle_gen::ParticleMeshKind;
@@ -4688,6 +4711,10 @@ mod tests {
         }
     }
 
+    // Lamp halos (`lig*` sprite sheets) are LIGHTS: their drawn alpha is the lift knob times the
+    // ToD gate and must not carry the `enhanced-particle-alpha-20` boost — that enhancement is
+    // for hit-flash and other effect particles. Pins both sides so either half drifting fails a
+    // test whichever feature set hits it.
     #[test]
     fn lamp_halo_alpha_bypasses_enhanced_particle_gain() {
         let mut g = live(def(60.0, 1.0, 1), 60.0);
@@ -7669,6 +7696,11 @@ mod tests {
             .collect()
     }
 
+    // Read off the shipped f_ro DAT: the lunar halo sheet `kasa` is a DXT3 whose alpha is
+    // entirely the nibble 7/8 dithered-opaque pair (ffxi-dat/examples/dat-sky-alpha-histogram.rs
+    // on zone files 210/331). The plain particle converter only applies the shared alpha remap;
+    // only the celestial converter undithers and expands it to the authored half-step. Skips
+    // without a retail install.
     #[test]
     fn zone_210_halo_sheet_is_dithered_and_only_the_celestial_converter_resolves_it() {
         const F_RO: u32 = 210;
@@ -7702,17 +7734,25 @@ mod tests {
         let plain = images.add(decoded_texture_to_image(&tex));
         let sky = images.add(decoded_sky_texture_to_image(&tex));
 
-        let plain_alpha = image_alpha(&images, &plain);
-        let lo = ffxi_dat::texture::ffxi_alpha_remap(DITHER_LO);
-        let hi = ffxi_dat::texture::ffxi_alpha_remap(DITHER_HI);
-        assert!(
-            plain_alpha.contains(&lo) && plain_alpha.contains(&hi),
-            "the shared particle converter keeps the remapped stipple"
+        // The plain D3M path never undithers, but it does apply the shared alpha
+        // remap (dat_d3m::convert): each stored nibble lands on its remapped value
+        // and nothing between them.
+        let mut plain_alpha: Vec<u8> = image_alpha(&images, &plain);
+        plain_alpha.sort_unstable();
+        plain_alpha.dedup();
+        let remapped_lo = ffxi_dat::texture::ffxi_alpha_remap(DITHER_LO);
+        let remapped_hi = ffxi_dat::texture::ffxi_alpha_remap(DITHER_HI);
+        assert_eq!(
+            plain_alpha,
+            [remapped_lo, remapped_hi].to_vec(),
+            "the shared converter applies the alpha remap to both nibbles and no undither"
         );
 
         let sky_alpha = image_alpha(&images, &sky);
         let spread =
             sky_alpha.iter().max().expect("non-empty") - sky_alpha.iter().min().expect("non-empty");
+        // The celestial path still expands: the undithered mean 127.5 doubles to a 254/255 split.
+        let lo = ffxi_dat::texture::ffxi_alpha_remap(DITHER_LO);
         assert!(
             spread <= RESOLVED_RESIDUAL_MAX && *sky_alpha.iter().min().expect("non-empty") > lo,
             "the celestial converter left alpha spread {spread}"
@@ -8764,11 +8804,9 @@ mod tests {
         app.world_mut()
             .write_message(crate::scheduler_runtime::SchedulerStageEvent {
                 actor: attacker,
-                target: Some(victim),
+                target: None,
                 stage: particle_stage(gen_id),
                 scheduler: HIT_SPARK_DIR,
-                cutscene_motion: false,
-                scheduler_instance: None,
             });
         app.update();
         app.world()
@@ -8954,8 +8992,6 @@ mod tests {
             target: Some(actor),
             stage,
             scheduler: *b"main",
-            cutscene_motion: false,
-            scheduler_instance: None,
         });
         app.update();
         let mut sim = app.world_mut().resource_mut::<ParticleSimulator>();
@@ -9095,8 +9131,6 @@ mod tests {
             target: None,
             stage,
             scheduler: *b"main",
-            cutscene_motion: false,
-            scheduler_instance: None,
         });
         app.update();
         let mut sim = app.world_mut().resource_mut::<ParticleSimulator>();
@@ -9326,8 +9360,6 @@ mod tests {
             target: Some(target),
             stage: particle_stage(SYNTHETIC_GENERATOR),
             scheduler: SYNTHETIC_GENERATOR,
-            cutscene_motion: false,
-            scheduler_instance: None,
         });
         app.update();
     }
@@ -9499,8 +9531,6 @@ mod tests {
                 target: None,
                 stage,
                 scheduler: *b"main",
-                cutscene_motion: false,
-                scheduler_instance: None,
             });
         }
         app.update();

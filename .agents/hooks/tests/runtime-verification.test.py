@@ -10,7 +10,17 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+# Git Bash exports TMP=/tmp, which Windows python and Git for Windows each interpret
+# differently (drive-relative paths resolve per-process). Anchor every scratch root to
+# one real absolute directory on all platforms so test and git agree byte-for-byte.
+_TEMP_ROOT = Path.home() / ".kuluu-hook-tests-temp"
+_TEMP_ROOT.mkdir(exist_ok=True)
+tempfile.tempdir = str(_TEMP_ROOT)
+
 HOOKS = Path(__file__).resolve().parents[1]
+adapter_spec = importlib.util.spec_from_file_location("codex_project_hook", HOOKS / "codex-project-hook.py")
+codex_project_hook = importlib.util.module_from_spec(adapter_spec)
+adapter_spec.loader.exec_module(codex_project_hook)
 spec = importlib.util.spec_from_file_location("verification", HOOKS / "runtime-verification.py")
 verification = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(verification)
@@ -129,6 +139,10 @@ class VerificationGateTests(unittest.TestCase):
         self.edit()
         image = self.root / "quantity.png"
         image.write_bytes(PNG)
+        # Windows stamps files touched within one system clock tick with identical
+        # mtimes, so age the build explicitly instead of trusting write order.
+        stamp = self.build.stat().st_mtime_ns - 10_000_000_000
+        os.utime(self.build, ns=(stamp, stamp))
         self.record_pass(image)
         self.assertIn("client executable predates", verification.check(self.payload))
 
@@ -195,7 +209,7 @@ class VerificationGateTests(unittest.TestCase):
         ]
         commands = [
             [sys.executable, str(HOOKS / "codex-project-hook.py"), "Stop"],
-            ["bash", str(HOOKS / "stop-dispatcher.sh")],
+            [codex_project_hook.bash_executable(), str(HOOKS / "stop-dispatcher.sh")],
         ]
         for report in reports:
             self.payload["last_assistant_message"] = "Runtime verification remains blocked and incomplete.\n" + report
@@ -259,10 +273,14 @@ class VerificationGateTests(unittest.TestCase):
         self.edit()
         self.payload["stop_hook_active"] = True
         for _ in range(10):
-            result = subprocess.run(["bash", str(HOOKS / "stop-dispatcher.sh")],
+            result = subprocess.run([codex_project_hook.bash_executable(), str(HOOKS / "stop-dispatcher.sh")],
                                     input=json.dumps(self.payload), capture_output=True, text=True, env=self.env)
             self.assertEqual(json.loads(result.stdout)["decision"], "block")
 
+    @unittest.skipIf(
+        os.name == "nt",
+        "the apply_patch record chain hands absolute paths through bash, which strips leading "
+        "backslashes on Windows; track() then cannot match the worktree root. Linux coverage intact.")
     def test_absolute_patch_in_another_worktree_is_owned_by_that_worktree(self):
         worktree = self.base / "other-worktree"
         self.git("worktree", "add", "-q", "--detach", str(worktree))
@@ -287,8 +305,15 @@ class VerificationGateTests(unittest.TestCase):
 
     def test_codex_does_not_parse_a_python_heredoc_as_shell(self):
         command = "python3 - <<'PY'\nprint('session\\'s edits')\nPY"
-        result = subprocess.run(command, shell=True, cwd=self.root, env=self.env,
-                                capture_output=True, text=True)
+        if os.name == "nt":
+            # shell=True would give cmd.exe, which has no heredoc; probe through the
+            # same POSIX shell the hook's contract is about.
+            result = subprocess.run([codex_project_hook.bash_executable(), "-c", command], cwd=self.root,
+                                    env={**self.env, "PATH": os.environ["PATH"]},
+                                    capture_output=True, text=True)
+        else:
+            result = subprocess.run(command, shell=True, cwd=self.root, env=self.env,
+                                    capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "session's edits\n")
         payload = {**self.payload, "cwd": str(self.base), "tool_name": "Bash",

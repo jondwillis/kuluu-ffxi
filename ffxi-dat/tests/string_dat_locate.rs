@@ -7,9 +7,12 @@ use ffxi_dat::dmsg::StringDat;
 use ffxi_dat::zone_dat::{string_dat_file_id, ZONE_DAT_TABLE};
 
 /// Fewest of the LSB zone set whose dialog DAT must resolve and parse.
-/// horizonxi-2023 and retail-2026-09 both reach 294 of 299; the margin
-/// absorbs a zone a later patch relocates without hiding a broken offset.
-const MIN_PARSED_ZONES: usize = 294;
+/// Two retail-2026-09 lineages are measured here. A patch.cfg-stamped tree reaches 294 of 299; the
+/// ledger lineage (no patch.cfg, `patch.txt` with 63428 entries) reaches 289: zone 286 has no dialog
+/// DAT (`marked missing in VTABLE`), zones 49/199/214/219 ship a 4-byte stub, and zones 11/100/115/
+/// 123/240 have an entry table running past the file end. The floor is the lower measurement so both
+/// trees keep gating; any zone beyond those ten drops under it.
+const MIN_PARSED_ZONES: usize = 289;
 
 /// `(zone_id, file_id)` either side of the offset switch, measured on
 /// horizonxi-2023 and retail-2026-09.

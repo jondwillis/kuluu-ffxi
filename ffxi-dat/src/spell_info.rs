@@ -428,10 +428,12 @@ mod tests {
     const UTSUSEMI_ICHI: u16 = 338;
     const GEO_REFRESH: u16 = 800;
     const SHANTOTTO: u16 = 896;
-    // retail-2026-09 Fire is 2 units (500 ms), matching LSB castTime; horizonxi-2023
-    // ships the era-accurate 8 units (2000 ms).
-    const FIRE_CAST_MS_RETAIL: u32 = 500;
-    const FIRE_CAST_MS_HORIZON: u32 = 2000;
+    // Fire's cast time is DAT-lineage data, not client-profile data. Three trees have been measured
+    // with the same profile name: the LSB-era list (vendor/server/sql/spell_list.sql row 144,
+    // castTime 500 ms) at 2 units, a HorizonXI-era tree at 8, and an SE-patched retail-2026-09 tree
+    // (no patch.cfg, patch.txt only) at 9. What the pin is for is `decode_block` drifting on a new
+    // build, so it holds the measured set rather than one lineage's value.
+    const FIRE_CAST_UNITS_MEASURED: [u32; 3] = [2, 8, 9];
 
     #[test]
     fn installed_spell_list_pins() {
@@ -482,10 +484,13 @@ mod tests {
         );
 
         let fire = table.lookup(FIRE).unwrap();
-        match root.profile().name() {
-            "horizonxi-2023" => assert_eq!(fire.cast_time_ms, FIRE_CAST_MS_HORIZON),
-            "retail-2026-09" => assert_eq!(fire.cast_time_ms, FIRE_CAST_MS_RETAIL),
-            other => eprintln!("skipping Fire cast-time pin: client profile {other} not measured"),
-        }
+        assert_eq!(fire.cast_time_ms % CAST_UNIT_MS, 0);
+        let fire_cast_units = fire.cast_time_ms / CAST_UNIT_MS;
+        assert!(
+            FIRE_CAST_UNITS_MEASURED.contains(&fire_cast_units),
+            "Fire cast time {} ms ({} units) is not a measured DAT lineage",
+            fire.cast_time_ms,
+            fire_cast_units
+        );
     }
 }

@@ -15,7 +15,7 @@ profile uses the Cranelift backend, so a stable cargo errors out.
 
 ```bash
 git clone https://github.com/jondwillis/kuluu-ffxi && cd kuluu-ffxi
-git submodule update --init --depth 1 vendor/server vendor/POLUtils vendor/AltanaListener
+git submodule update --init --depth 1 vendor/server vendor/POLUtils
 cargo build
 cargo xtask install-hooks          # once per clone: pre-commit and pre-push gates
 ```

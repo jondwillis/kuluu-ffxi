@@ -1241,6 +1241,7 @@ pub fn update_main_menu(
     settings: Res<GraphicsSettings>,
     panels: Res<crate::hud::HudPanels>,
     net_status: Res<crate::hud::network_status::NetStatusVisible>,
+    vana_clock: Option<Res<crate::vana_time::VanaClock>>,
     #[cfg(not(target_arch = "wasm32"))] audio_mute: Res<crate::audio::AudioMuteState>,
 
     scene: Res<crate::snapshot::SceneState>,
@@ -1315,6 +1316,9 @@ pub fn update_main_menu(
     let (total, viewport_start) =
         resolve_viewport(view.kind, view.cursor, &dynamic, settings.dlss_supported);
     let window = visible_window(view.kind, total);
+    let clock_debug_hold = vana_clock
+        .as_ref()
+        .is_some_and(|clock| clock.debug_hold_active());
 
     for (row, mut row_node, mut text, mut color, mut bg) in row_q.iter_mut() {
         let list_idx = viewport_start + row.slot;
@@ -1347,6 +1351,7 @@ pub fn update_main_menu(
             &panels,
             net_status.0,
             sound_on,
+            clock_debug_hold,
             master_pct,
             &scene.snapshot,
         );
@@ -1480,6 +1485,7 @@ fn format_row_body(
     panels: &crate::hud::HudPanels,
     net_status_on: bool,
     sound_on: bool,
+    clock_debug_hold: bool,
     master_pct: i32,
     snapshot: &kuluu_snapshot::SceneSnapshot,
 ) -> String {
@@ -1538,7 +1544,8 @@ fn format_row_body(
                         }
                     );
                 }
-                let on = debug_panel_state(label, panels, net_status_on, sound_on);
+                let on =
+                    debug_panel_state(label, panels, net_status_on, sound_on, clock_debug_hold);
                 format!("{label:<14}[{}]", if on { "on" } else { "off" })
             }
         }
@@ -1561,6 +1568,7 @@ pub fn debug_panel_state(
     panels: &crate::hud::HudPanels,
     net_status_on: bool,
     sound_on: bool,
+    clock_debug_hold: bool,
 ) -> bool {
     match label {
         DEBUG_PERF => panels.perf,
@@ -1572,7 +1580,7 @@ pub fn debug_panel_state(
         DEBUG_AUTO_ENTER_CS => panels.auto_enter_cs,
         DEBUG_WEATHER => !panels.weather_off,
         DEBUG_FOG => !panels.fog_off,
-        DEBUG_FORCE_18 => panels.force_18,
+        DEBUG_FORCE_18 => clock_debug_hold,
         DEBUG_ENTITY_LIST => panels.entity_list,
         DEBUG_NET_STATUS => net_status_on,
         DEBUG_SOUND => sound_on,
@@ -2150,17 +2158,50 @@ mod tests {
             noclip: true,
             ..Default::default()
         };
-        assert!(debug_panel_state(DEBUG_PERF, &panels, false, false));
+        assert!(debug_panel_state(DEBUG_PERF, &panels, false, false, false));
         assert!(!debug_panel_state(
             DEBUG_TARGET_CYCLE,
             &panels,
             false,
+            false,
             false
         ));
-        assert!(debug_panel_state(DEBUG_MESH, &panels, false, false));
-        assert!(debug_panel_state(DEBUG_NOCLIP, &panels, false, false));
-        assert!(debug_panel_state(DEBUG_NET_STATUS, &panels, true, false));
-        assert!(!debug_panel_state(DEBUG_NET_STATUS, &panels, false, false));
+        assert!(debug_panel_state(DEBUG_MESH, &panels, false, false, false));
+        assert!(debug_panel_state(
+            DEBUG_NOCLIP,
+            &panels,
+            false,
+            false,
+            false
+        ));
+        assert!(debug_panel_state(
+            DEBUG_NET_STATUS,
+            &panels,
+            true,
+            false,
+            false
+        ));
+        assert!(!debug_panel_state(
+            DEBUG_NET_STATUS,
+            &panels,
+            false,
+            false,
+            false
+        ));
+        assert!(debug_panel_state(
+            DEBUG_FORCE_18,
+            &panels,
+            false,
+            false,
+            true
+        ));
+        assert!(!debug_panel_state(
+            DEBUG_FORCE_18,
+            &panels,
+            false,
+            false,
+            false
+        ));
 
         for label in DEBUG_ENTRIES {
             assert_eq!(

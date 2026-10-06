@@ -96,7 +96,20 @@ write alone does not establish a rendered result.
 
 `KULUU_WINDOW_HIDDEN=1` parks a native window offscreen; its capture applicability
 must be established on the tested platform. Do not substitute an offscreen or
-black frame for the GUI guide's inspected evidence. Use the documented local
-throwaway account for live dev sessions; real account credentials come from the
+black frame for the GUI guide's inspected evidence.
+
+Windows is the tested offscreen path: the parked window is presented at
+-32000,-32000, so nothing reaches the desktop and the swapchain keeps producing
+frames. Capture it with `scripts/cap-window.ps1 kuluu <out.png>` (PrintWindow,
+client area only; it takes the first `kuluu` process with a window, so use it
+only when your client is the sole one) or the `printscreen` key over
+`FFXI_KEY_DRIVE`, which writes `screenshot-N.png` to the working directory. A
+capture counts only if it shows content: an all-black or flat-color frame gets
+one retake, and a second failure means presentation stalled. Hosts that cannot
+present offscreen (macOS occlusion stops drawing; X11/Wayland without a
+compositor) use a warned visible window per the GUI guide. Session-only
+`--headless` runs are never pixel evidence.
+
+Use the documented local throwaway account for live dev sessions; real account credentials come from the
 user's local environment. Track each launched process and socket, disconnect its
 session, and stop only that owned PID during cleanup.

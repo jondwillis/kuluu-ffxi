@@ -90,7 +90,7 @@ runs:
       shell: bash
       # --depth 1: the build.rs scripts read files, never git history, so a
       # shallow clone of the (large) LSB server repo is enough and much faster.
-      run: git submodule update --init --depth 1 vendor/server vendor/AltanaListener vendor/POLUtils
+      run: git submodule update --init --depth 1 vendor/server vendor/POLUtils
 
     # Mirrors docker/Dockerfile.linux-build. macOS runners already ship clang /
     # cmake / pkg-config via Xcode, so this step is Linux-only.

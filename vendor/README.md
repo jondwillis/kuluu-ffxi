@@ -14,13 +14,12 @@ regenerate it (the
 | --- | --- | --- |
 | `server/` | [LandSandBoat/server](https://github.com/LandSandBoat/server) | SQL, headers, lua and YAML: blowfish subkeys, zlib tables, message/effect/job/spell/item names, zone text ids, login settings |
 | `POLUtils/` | [Windower/POLUtils](https://github.com/Windower/POLUtils) | `ROMFileMappings.xml`: ROM file mappings and zone-DAT id formulas |
-| `AltanaListener/` | [voliathon/AltanaListener](https://github.com/voliathon/AltanaListener) | `track_names.json`: BGM track names |
 | `DLSS/` | [NVIDIA/DLSS](https://github.com/NVIDIA/DLSS) | Optional. `update = none`; only `cargo xtask dlss` initializes it |
 
-Initialize the three the build needs, shallowly:
+Initialize the two the build needs, shallowly:
 
 ```bash
-git submodule update --init --depth 1 vendor/server vendor/POLUtils vendor/AltanaListener
+git submodule update --init --depth 1 vendor/server vendor/POLUtils
 ```
 
 `--depth 1` works only while the pinned commit is still reachable from its
@@ -47,9 +46,13 @@ row. Read a pin's date with `git -C vendor/<name> log -1 --format=%cs`.
   follow the client's zone formula through VTABLE/FTABLE, map selection uses
   the installed DLL's zone-map records, and autotranslate item and key-item
   names come from the installed DATs with the LSB dictionary as fallback.
-- **AltanaListener.** `track_names.json` is hand-curated, not client-derived,
-  so it has no build to match. The upstream repository is archived and the pin
-  stays frozen at v1.0.4.
+- **AltanaListener (no submodule).** `track_names.json` is hand-curated, not
+  client-derived, so it has no build to match. Upstream archived the repo on
+  2026-08-27 in favour of vekien/xi-model-viewer and it later went private,
+  so the submodule could not be cloned; its one build input is committed as
+  regular content at the frozen pin (v1.0.4, commit
+  `055fc2a26d4f0f8ef8bbb9b5f341f3bc232950c6`). Updating it means replacing
+  the file.
 
 ## Vendored crates
 

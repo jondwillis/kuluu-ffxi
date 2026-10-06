@@ -1,11 +1,27 @@
 #!/usr/bin/env python3
 import json
+import os
 from pathlib import Path
+import shutil
 import shlex
 import subprocess
 import sys
 
 HERE = Path(__file__).resolve().parent
+
+
+def bash_executable():
+    # On Windows a bare "bash" on PATH is often the WSL launcher, which cannot see
+    # native paths; Git for Windows ships its bash next to the git we already rely on.
+    if os.name != "nt":
+        return "bash"
+    git = shutil.which("git")
+    if git:
+        install = Path(git).resolve().parents[1]
+        for candidate in (install / "bin" / "bash.exe", install / "usr" / "bin" / "bash.exe"):
+            if candidate.is_file():
+                return str(candidate)
+    return shutil.which("bash") or "bash"
 
 
 def shell_cwd(payload):
@@ -54,7 +70,7 @@ def main():
         script = HERE / "session-edits-record.sh"
     if not script:
         return 0
-    result = subprocess.run(["bash", str(script)], input=json.dumps(payload), text=True, capture_output=True)
+    result = subprocess.run([bash_executable(), script], input=json.dumps(payload), text=True, capture_output=True)
     if result.returncode:
         reason = result.stdout.strip() or result.stderr.strip() or "Runtime verification hook failed. Repair the hook before completing changes."
         print(json.dumps({"decision": "block", "reason": reason}))
