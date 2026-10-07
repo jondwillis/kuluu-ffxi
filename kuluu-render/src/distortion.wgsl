@@ -41,7 +41,7 @@ fn fs(in: VsOut) -> @location(0) vec4f {
         discard;
     }
     let res = textureDimensions(scene, 0i);
-    let uv = (in.pos.xy + vec2f(0.5, 0.5)) / vec2f(f32(res.x), f32(res.y));
+    let uv = in.pos.xy / vec2f(f32(res.x), f32(res.y));
     let ndc = uv * vec2f(2.0, -2.0) + vec2f(-1.0, 1.0);
     if (ndc.x < u_field.rect_min.x || ndc.x > u_field.rect_max.x
         || ndc.y < u_field.rect_min.y || ndc.y > u_field.rect_max.y) {
