@@ -94,7 +94,7 @@ pub struct EventLog {
     pub pushed_total: u64,
 }
 
-const EVENT_LOG_CAP: usize = 64;
+pub const EVENT_LOG_CAP: usize = 64;
 
 impl EventLog {
     /// The ring's entries paired with their `pushed_total`-based global index. Two consumers that each

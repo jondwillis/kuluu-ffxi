@@ -12,7 +12,7 @@ use bevy::prelude::*;
 use bevy::tasks::futures_lite::future;
 use bevy::tasks::{AsyncComputeTaskPool, Task};
 
-use crate::look_at_gates::{self as look_at_gates, advance_look_at_locks, LookAtLockTask};
+use crate::look_at_gates::{self as look_at_gates, LookAtLockTask};
 use ffxi_actor::actor_state::{self, ActorAnimInputs, RestKind};
 use ffxi_actor::animation::{
     BonePoseScratch, LoopParams, SkeletonAnimationCoordinator, TransitionParams,
@@ -5506,14 +5506,15 @@ pub fn tick_live_ffxi_actors(
 
             // Retail aims nothing until both look-at gates pass: the wire status byte alone can drop the
             // target, and a live 0x89 LockLookAt task does the same from an action (crate::look_at_gates).
-            let look_at_suppressed = !look_at_gates::look_at_allowed(actor.wire_animation)
-                || advance_look_at_locks(
-                    &mut actor.look_at_tasks,
-                    lock_look_at_intervals
-                        .get(&world_id)
-                        .map_or(&[][..], Vec::as_slice),
-                    Vec2::new(actor_global.translation().x, actor_global.translation().z),
-                );
+            let wire_animation = actor.wire_animation;
+            let look_at_suppressed = look_at_gates::advance_look_at_suppression(
+                &mut actor.look_at_tasks,
+                lock_look_at_intervals
+                    .get(&world_id)
+                    .map_or(&[][..], Vec::as_slice),
+                Vec2::new(actor_global.translation().x, actor_global.translation().z),
+                wire_animation,
+            );
 
             let look_target_id = if is_self {
                 self_target_id
