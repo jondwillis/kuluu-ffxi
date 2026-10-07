@@ -41,8 +41,8 @@ fn fs(in: VsOut) -> @location(0) vec4f {
         discard;
     }
     let res = textureDimensions(scene, 0i);
-    let uv = (in.pos.xy + vec2f(0.5, 0.5)) / vec2f(f32(res.x), f32(res.y));
-    let ndc = uv * 2.0 - 1.0;
+    let uv = in.pos.xy / vec2f(f32(res.x), f32(res.y));
+    let ndc = uv * vec2f(2.0, -2.0) + vec2f(-1.0, 1.0);
     if (ndc.x < u_field.rect_min.x || ndc.x > u_field.rect_max.x
         || ndc.y < u_field.rect_min.y || ndc.y > u_field.rect_max.y) {
         discard;
@@ -50,7 +50,7 @@ fn fs(in: VsOut) -> @location(0) vec4f {
 
     let half = max((u_field.rect_max - u_field.rect_min) * 0.5, vec2f(1e-4));
     let q = (ndc - (u_field.rect_min + u_field.rect_max) * 0.5) / half; // [-1,1] over the quad
-    let map_uv = clamp(q * 0.5 + 0.5, vec2f(0.0), vec2f(1.0));
+    let map_uv = clamp(q * vec2f(0.5, -0.5) + 0.5, vec2f(0.0), vec2f(1.0));
 
     let texel_x = 1.0 / f32(textureDimensions(haze_map, 0i).x);
     let m = textureSampleLevel(haze_map, map_sampler, map_uv, 0.0).a;
