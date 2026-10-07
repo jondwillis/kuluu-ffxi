@@ -76,6 +76,15 @@ question is already answered before spending either.
 Record new durable findings here as dated observation records, per the routing
 rule in the root `AGENTS.md`. Captures and binary dumps stay local.
 
+A record states what retail does in interop terms: DAT fields, wire fields,
+on-screen effect, timing. When the finding came from the binary, every address,
+decompiler name, instruction stream, vtable slot and in-memory field offset goes
+under a `## Provenance` heading at the end and nowhere else;
+`scripts/checks.sh records` fails a new or modified record that leaks such
+detail into a spec section, and `RECORDS_DIFF=tree` lists the older records
+still to restructure. The implementation is written from the spec sections in a
+later session, with the disassembly closed.
+
 ## One command surface, any host
 
 Paths beginning `scripts/` in this skill and its references are relative to

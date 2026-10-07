@@ -69,6 +69,11 @@ if ! scripts/checks.sh literals; then
   exit 1
 fi
 
+if ! scripts/checks.sh records; then
+  echo "pre-push: ✗ records — an observation record carries binary detail outside its Provenance section; see .agents/skills/retail-observe/SKILL.md (or 'git push --no-verify' to bypass)" >&2
+  exit 1
+fi
+
 if ! scripts/checks.sh fmt; then
   echo "pre-push: ✗ formatting — run 'cargo fmt --all' (or 'git push --no-verify' to bypass)" >&2
   exit 1

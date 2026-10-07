@@ -19,6 +19,11 @@ fi
 
 README_DIFF=staged scripts/checks.sh readme
 
+if ! RECORDS_DIFF=staged scripts/checks.sh records; then
+  echo "pre-commit: ✗ records — an observation record carries binary detail outside its Provenance section; see .agents/skills/retail-observe/SKILL.md (or 'git commit --no-verify' to bypass)" >&2
+  exit 1
+fi
+
 contract_paths=$(git diff --cached --name-only -- ffxi-event ffxi-proto ffxi-dat ffxi-vocab kuluu-session kuluu-render kuluu-snapshot kuluu scripts/checks.sh .githooks)
 if [[ -n "$contract_paths" ]]; then
   scripts/checks.sh contracts

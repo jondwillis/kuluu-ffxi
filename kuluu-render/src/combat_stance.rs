@@ -821,6 +821,17 @@ pub fn track_entity_motion_system(
     }
 }
 
+/// Who advances an entity between POS updates, which decides the band's distance budget.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mover {
+    /// Mobs, pets and NPCs: LSB walks them one StepTo step per AI tick.
+    Server,
+
+    /// PCs: the server relays the owner's own position reports, so the distance covered follows
+    /// the wire speed byte as a rate, not StepTo.
+    Client,
+}
+
 /// Which snap band a POS update fell into (see `EntityPrediction::SNAP_*_RATIO`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SnapBand {
@@ -912,6 +923,12 @@ pub struct PredictSample {
     /// before any interval has been measured.
     sample_intervals: [f32; EntityPrediction::JITTER_HISTORY_SAMPLES],
 
+    /// Snap-band interval ring, capped at STALE_INTERVAL; observe() does not reseed it on a stale
+    /// gap, so the reports that resume a run after idle are measured against the gap.
+    span_intervals: [f32; EntityPrediction::JITTER_HISTORY_SAMPLES],
+
+    mover: Mover,
+
     /// Seconds elapsed in the current arrival segment since its update was consumed. The tween
     /// reaches `server_pos` exactly when this hits `segment_duration`; the segment is also what
     /// holds the moving flag up on target across a late packet.
@@ -948,8 +965,9 @@ pub struct PredictSample {
 }
 
 impl PredictSample {
-    fn seed(server_pos: Vec3, heading: u8, speed: u8, speed_base: u8) -> Self {
+    fn seed(server_pos: Vec3, heading: u8, speed: u8, speed_base: u8, mover: Mover) -> Self {
         PredictSample {
+            mover,
             rendered_pos: server_pos,
             server_pos,
             target_heading: heading,
@@ -963,6 +981,7 @@ impl PredictSample {
             // a tick plus headroom before any real interval has been measured.
             sample_intervals: [EntityPrediction::TICK_SECS;
                 EntityPrediction::JITTER_HISTORY_SAMPLES],
+            span_intervals: [EntityPrediction::TICK_SECS; EntityPrediction::JITTER_HISTORY_SAMPLES],
             segment_elapsed: 0.0,
             segment_duration: EntityPrediction::TICK_SECS * EntityPrediction::INTERVAL_HEADROOM,
             last_interval: 0.0,
@@ -1103,16 +1122,33 @@ impl EntityPrediction {
     /// headroom: staleness is a timing event, not a distance event, so the
     /// position still tweens.
     pub fn observe(&mut self, id: u32, server_pos: Vec3, heading: u8, speed: u8, speed_base: u8) {
+        self.observe_moved_by(id, server_pos, heading, speed, speed_base, Mover::Server);
+    }
+
+    pub fn observe_moved_by(
+        &mut self,
+        id: u32,
+        server_pos: Vec3,
+        heading: u8,
+        speed: u8,
+        speed_base: u8,
+        mover: Mover,
+    ) {
         match self.by_id.get_mut(&id) {
             None => {
                 self.by_id.insert(
                     id,
-                    PredictSample::seed(server_pos, heading, speed, speed_base),
+                    PredictSample::seed(server_pos, heading, speed, speed_base, mover),
                 );
             }
             Some(e) => {
                 let moved_sq = e.server_pos.distance_squared(server_pos);
                 if moved_sq > Self::SAMPLE_EPSILON_SQ {
+                    if e.sample_age > 0.0 {
+                        e.span_intervals.rotate_left(1);
+                        e.span_intervals[Self::JITTER_HISTORY_SAMPLES - 1] =
+                            e.sample_age.min(Self::STALE_INTERVAL);
+                    }
                     if e.sample_age > 0.0 && e.sample_age <= Self::STALE_INTERVAL {
                         let interval = e.sample_age.clamp(Self::MIN_INTERVAL, Self::MAX_INTERVAL);
                         e.sample_intervals.rotate_left(1);
@@ -1228,11 +1264,20 @@ fn advance_prediction(s: &mut PredictSample, dt: f32, record_outcome: bool) -> (
         // (idle past STALE_INTERVAL) resets the cadence ring in observe() instead of snapping --
         // staleness is a timing event, and the position still tweens. The Normal edge carries a
         // float-boundary epsilon so one-step ticks do not split across it.
+        // A PC report covers 0.3-1.3 s at its speed-byte rate, which outruns one StepTo step.
+        // Max-of-ring absorbs arrival jitter; the STALE_INTERVAL cap keeps long teleports popping.
+        let rate_yps = match s.mover {
+            Mover::Server => step / EntityPrediction::TICK_SECS,
+            Mover::Client => kuluu_snapshot::speed::move_speed_yps(s.packet_speed, false),
+        };
+        let spanned_secs = s.span_intervals.iter().copied().fold(0.0, f32::max);
+        let spanned_step = rate_yps * spanned_secs.max(EntityPrediction::TICK_SECS);
         let jump = s.wire_jump_sq.sqrt();
-        let band = if jump > EntityPrediction::SNAP_STRETCH_RATIO * step {
+        let band = if jump > EntityPrediction::SNAP_STRETCH_RATIO * spanned_step {
             SnapBand::Pop
         } else if jump
-            > (EntityPrediction::SNAP_NORMAL_RATIO + EntityPrediction::SNAP_NORMAL_EPS_RATIO) * step
+            > (EntityPrediction::SNAP_NORMAL_RATIO + EntityPrediction::SNAP_NORMAL_EPS_RATIO)
+                * spanned_step
         {
             SnapBand::Stretch
         } else {
@@ -1709,7 +1754,7 @@ mod tests {
     /// running (clock already zeroed by seed), and wire_jump_sq holds what this update moved in
     /// XZ (Y excluded: it must not inflate the band's jump).
     fn chase_sample(server: Vec3, rendered: Vec3, age: f32, speed_byte: u8) -> PredictSample {
-        let mut s = PredictSample::seed(rendered, 0, speed_byte, speed_byte);
+        let mut s = PredictSample::seed(rendered, 0, speed_byte, speed_byte, Mover::Server);
         s.segment_started = true;
         let dxw = server.x - rendered.x;
         let dzw = server.z - rendered.z;
@@ -1729,7 +1774,7 @@ mod tests {
         speed_byte: u8,
         base_byte: u8,
     ) -> PredictSample {
-        let mut s = PredictSample::seed(rendered, 0, speed_byte, base_byte);
+        let mut s = PredictSample::seed(rendered, 0, speed_byte, base_byte, Mover::Server);
         s.segment_started = true;
         let dxw = server.x - rendered.x;
         let dzw = server.z - rendered.z;
@@ -2272,7 +2317,7 @@ mod tests {
 
     #[test]
     fn prediction_heading_eases_toward_the_target() {
-        let mut s = PredictSample::seed(Vec3::ZERO, 0, 40, 40);
+        let mut s = PredictSample::seed(Vec3::ZERO, 0, 40, 40, Mover::Server);
         let start = s.rendered_heading_rad;
         s.target_heading = 16;
         let target = heading_to_rad(16);
@@ -2445,7 +2490,7 @@ mod tests {
     #[test]
     fn prediction_static_actor_does_not_drift() {
         let anchor = Vec3::new(3.0, 1.0, 2.0);
-        let mut s = PredictSample::seed(anchor, 64, 0, 0);
+        let mut s = PredictSample::seed(anchor, 64, 0, 0, Mover::Server);
         for _ in 0..60 {
             advance_prediction(&mut s, 1.0 / 30.0, true);
         }
@@ -2590,6 +2635,127 @@ mod tests {
                 previous = position.x;
             }
             elapsed += frames as f32 * FRAME_SECS;
+        }
+    }
+
+    #[test]
+    fn remote_pc_sparse_reports_tween_instead_of_popping() {
+        const FRAME_SECS: f32 = 1.0 / 60.0;
+        const RUN_SPEED: f32 = 4.8;
+        const MAX_SPEED_MULTIPLIER: f32 = 2.0;
+        const BASE_BYTE: u8 = 50;
+        const REPORT_FRAMES: [usize; 8] = [45, 42, 51, 45, 78, 39, 45, 48];
+        let mut prediction = EntityPrediction::default();
+        prediction.observe_moved_by(7, Vec3::ZERO, 0, BASE_BYTE, BASE_BYTE, Mover::Client);
+        let mut confirmed = 0.0;
+        let mut previous = 0.0;
+        for frames in REPORT_FRAMES {
+            confirmed += frames as f32 * FRAME_SECS * RUN_SPEED;
+            for frame in 0..frames {
+                if frame == frames - 1 {
+                    prediction.observe_moved_by(
+                        7,
+                        Vec3::X * confirmed,
+                        0,
+                        BASE_BYTE,
+                        BASE_BYTE,
+                        Mover::Client,
+                    );
+                }
+                let sample = prediction.by_id.get_mut(&7).unwrap();
+                let (position, _) = advance_prediction(sample, FRAME_SECS, true);
+                if let Some(u) = sample.last_update {
+                    assert_ne!(u.band, SnapBand::Pop, "a running PC report popped");
+                }
+                assert!(
+                    position.x - previous <= RUN_SPEED * FRAME_SECS * MAX_SPEED_MULTIPLIER,
+                    "leap of {} yalms in one frame",
+                    position.x - previous
+                );
+                previous = position.x;
+            }
+        }
+    }
+
+    #[test]
+    fn remote_pc_run_resuming_after_idle_does_not_pop() {
+        const FRAME_SECS: f32 = 1.0 / 60.0;
+        const BASE_BYTE: u8 = 50;
+        const IDLE_FRAMES: usize = 705;
+        const BURST_FRAMES: usize = 24;
+        const FIRST_REPORT: f32 = 1.22;
+        const FULL_REPORT: f32 = 3.6;
+        let mut prediction = EntityPrediction::default();
+        prediction.observe_moved_by(7, Vec3::ZERO, 0, BASE_BYTE, BASE_BYTE, Mover::Client);
+        let mut confirmed = 0.0;
+        for (frames, report) in [(IDLE_FRAMES, FIRST_REPORT), (BURST_FRAMES, FULL_REPORT)] {
+            let sample = prediction.by_id.get_mut(&7).unwrap();
+            for _ in 0..frames {
+                advance_prediction(sample, FRAME_SECS, true);
+            }
+            confirmed += report;
+            prediction.observe_moved_by(
+                7,
+                Vec3::X * confirmed,
+                0,
+                BASE_BYTE,
+                BASE_BYTE,
+                Mover::Client,
+            );
+            let sample = prediction.by_id.get_mut(&7).unwrap();
+            advance_prediction(sample, FRAME_SECS, true);
+            assert_ne!(
+                sample.last_update.unwrap().band,
+                SnapBand::Pop,
+                "a {report} yalm report resuming a run popped"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_pc_captured_tick_cadence_rides_its_speed_byte_rate() {
+        const FRAME_SECS: f32 = 1.0 / 60.0;
+        const SPEED_BYTE: u8 = 44;
+        const BASE_BYTE: u8 = 40;
+        const MAX_SPEED_MULTIPLIER: f32 = 2.0;
+        const CAPTURED: [(usize, f32); 10] = [
+            (19, 1.21),
+            (24, 2.58),
+            (24, 1.22),
+            (24, 2.42),
+            (28, 1.21),
+            (21, 2.42),
+            (27, 1.21),
+            (24, 2.43),
+            (24, 1.22),
+            (24, 2.43),
+        ];
+        let rate = kuluu_snapshot::speed::move_speed_yps(SPEED_BYTE, false);
+        let mut prediction = EntityPrediction::default();
+        prediction.observe_moved_by(7, Vec3::ZERO, 0, SPEED_BYTE, BASE_BYTE, Mover::Client);
+        let mut confirmed = 0.0;
+        let mut previous = 0.0;
+        for (frames, report) in CAPTURED {
+            for frame in 0..frames {
+                if frame == frames - 1 {
+                    confirmed += report;
+                    prediction.observe_moved_by(
+                        7,
+                        Vec3::X * confirmed,
+                        0,
+                        SPEED_BYTE,
+                        BASE_BYTE,
+                        Mover::Client,
+                    );
+                }
+                let sample = prediction.by_id.get_mut(&7).unwrap();
+                let (position, _) = advance_prediction(sample, FRAME_SECS, true);
+                if let Some(u) = sample.last_update {
+                    assert_ne!(u.band, SnapBand::Pop, "a {report} yalm report popped");
+                }
+                assert!(position.x - previous <= rate * FRAME_SECS * MAX_SPEED_MULTIPLIER);
+                previous = position.x;
+            }
         }
     }
 

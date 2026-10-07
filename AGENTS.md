@@ -11,10 +11,11 @@ Kuluu is a faithful, open-source FINAL FANTASY XI **client** rebuilt in Rust + B
 `scripts/checks.sh` is the **single source of truth** for check *commands* — the `pre-push` hook and CI both call it, so a given stage runs byte-identical flags in each. They select **different stages**, though, so a green hook is not a green CI: `test` and `enhanced` are CI-only, and `wasm` runs in the hook only when the push touches its build graph. Prefer it over spelling out cargo flags:
 
 ```bash
-scripts/checks.sh harness readme comments literals fmt contracts wasm install clippy # what the pre-push hook runs
-scripts/checks.sh harness readme comments literals fmt clippy test enhanced wasm # the full CI gate
+scripts/checks.sh harness readme comments literals records fmt contracts wasm install clippy # what the pre-push hook runs
+scripts/checks.sh harness readme comments literals records fmt clippy test enhanced wasm # the full CI gate
 COMMENTS_DIFF=staged scripts/checks.sh comments # what pre-commit runs on the staged hunks
 LITERALS_DIFF=staged scripts/checks.sh literals # pre-commit: no re-typed const values, tests included
+RECORDS_DIFF=staged scripts/checks.sh records # pre-commit: observation records keep binary detail under Provenance
 cargo fmt --all                         # autofix formatting
 ```
 
@@ -164,6 +165,41 @@ or access failure prevents verification, capture the diagnostic, keep the bead
 open, and report verification as blocked. Build duration or effort already spent
 is not a reason to skip the drive. Waiving visual verification requires the
 user's explicit opt-out for that change.
+
+### Parity is black-box; the binary settles ambiguities, it is not a port source
+
+"100% vanilla" means observable equivalence: same inputs, same pixels, same
+timing, same packets. It never means reproducing retail's internal layout.
+Kuluu is an independently written client that interoperates with retail's file
+formats, its wire protocol and a user-supplied install. Reverse engineering for
+interoperability is the project's entire legal footing, and it holds only while
+the code is written from behavior and formats rather than transcribed from the
+disassembly. Development here is largely agent-driven, so the rule lives in the
+gates and the skills, not in anyone's memory:
+
+- **Specs are written in interop terms.** A finding from the binary is recorded
+  as inputs, outputs, predicates and observable state over DAT fields, wire
+  fields and on-screen effect. Addresses, decompiler names, register sequences,
+  vtable slots and in-memory field offsets are provenance, not spec: in an
+  observation record they live under a `## Provenance` heading and nowhere
+  else. `scripts/checks.sh records` (`scripts/record-provenance.py`) hard-fails
+  a record added or modified since the merge-base that leaks binary detail into
+  a spec section (staged records at pre-commit); `RECORDS_DIFF=tree` lists the
+  historical debt, which is paid when a record is next touched. An internal
+  mechanic the spec cannot tie to an observable (a mirror field, a transient
+  re-set, a slot ordering) is not implemented.
+- **Reader and writer are separate.** The session that opens the disassembly
+  writes the record and stops. The implementation is written in a later session
+  from the record's spec sections, with the disassembly closed. Implementing
+  from the Provenance section is transcription, not independent work.
+- **Retail text is read, never typed.** A string retail stores in a DAT is
+  loaded from the install at runtime, never written into source.
+- **Unlicensed references are read for ideas only.** XIClient and lotus-ffxi
+  are all-rights-reserved: no transcribed names, struct layouts or control
+  flow; a citation says what was corroborated, not what was ported.
+- **Code that reads the retail binary stays minimal.** Runtime reads of
+  `FFXiMain.dll` are limited to its `.data` lookup tables. Inflating the packed
+  code section is a dev-side verification tool and never ships in the client.
 
 ### Build-time vendor scrape (no hand-maintained tables)
 

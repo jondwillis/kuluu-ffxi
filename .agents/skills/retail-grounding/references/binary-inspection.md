@@ -56,6 +56,15 @@ those, or the DLL SHA-256 (twelve hex digits or more) when it is not, and say
 whether each address is an RVA or a VA. `scripts/checks.sh comments` enforces
 this scoping on any comment carrying an FFXiMain.dll address.
 
+In the observation record, all of that goes under a `## Provenance` heading.
+The sections above it state the rule in interop terms only: what retail does
+over DAT fields, wire fields and the screen, never where in the image it does
+it. `scripts/checks.sh records` hard-fails a record that carries an address,
+decompiler name, register sequence, vtable slot or `+0x` field offset outside
+that section. The implementer reads the spec sections in a separate session;
+the Provenance section exists so the finding can be re-checked on another
+build, not so it can be ported.
+
 The unpack recipe is proven on both `KNOWN_CLIENTS` rows: `research/xi-tools`
 `uv run xi dll ffximain unpack` (or an independent LZSS decoder bounded to
 `.text` `VirtualSize`) produces the raw `.text` dump, whose first byte is VA

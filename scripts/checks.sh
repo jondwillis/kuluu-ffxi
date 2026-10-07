@@ -7,9 +7,10 @@
 # the *exact* fmt/clippy invocation CI will, and vice versa.
 #
 # Usage: scripts/checks.sh <stage>...
-#   stage ∈ {harness, readme, comments, fmt, clippy, style, contracts, install, test, enhanced, build, wasm, doc, sweep}
+#   stage ∈ {harness, readme, comments, literals, records, fmt, clippy, style, contracts, install, test, enhanced, build, wasm, doc, sweep}
 #   scripts/checks.sh harness comments fmt contracts clippy  # pre-push default
 #   COMMENTS_DIFF=staged scripts/checks.sh comments  # pre-commit (staged hunks)
+#   RECORDS_DIFF=staged scripts/checks.sh records    # pre-commit (staged observation records)
 #   scripts/checks.sh harness fmt clippy test # the CI gate (ci.yml runs these)
 #   scripts/checks.sh enhanced                # the opt-in feature family (CI)
 #   scripts/checks.sh install                 # DAT conformance per client install on disk (pre-push when DAT code moved; skips without assets)
@@ -561,6 +562,41 @@ run_literals() {
   esac
 }
 
+run_records() {
+  # Observation records under .agents/skills/retail-observe/references/ keep
+  # binary-level detail (addresses, decompiler names, instruction streams,
+  # vtable slots, in-memory offsets) under a `## Provenance` heading only, so
+  # the spec sections stay in interop terms and the implementation is written
+  # from them rather than from the disassembly. Scoped like literals:
+  #   RECORDS_DIFF=staged    records staged for commit (pre-commit)
+  #   RECORDS_DIFF=tree      every record (the debt list)
+  #   default                records changed since the merge-base with origin/main
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "checks: records - skipped (no python3)"
+    return 0
+  fi
+  if ! python3 scripts/record-provenance.py --self-test; then
+    echo "checks: records - self-test failed: the binary-detail detector cannot fire" >&2
+    return 1
+  fi
+  local dir=.agents/skills/retail-observe/references files base
+  case "${RECORDS_DIFF:-}" in
+    staged) files=$(git diff --cached --name-only --diff-filter=AM -- "$dir/*.md") ;;
+    tree) files=$(git ls-files -- "$dir/*.md") ;;
+    *)
+      base=${COMMENTS_BASE:-$(git merge-base HEAD origin/main 2>/dev/null || true)}
+      if [ -z "$base" ]; then
+        echo "checks: records - skipped (no merge-base with origin/main)"
+        return 0
+      fi
+      files=$(git diff --name-only --diff-filter=AM "$base" -- "$dir/*.md") ;;
+  esac
+  files=$(printf '%s\n' "$files" | sed '/^$/d')
+  [ -z "$files" ] && return 0
+  # shellcheck disable=SC2086
+  python3 scripts/record-provenance.py $files
+}
+
 run_contracts() {
   # Two entry points because the ferry/bootstrap contracts block on their own
   # current-thread runtime and must run outside an active tokio context; both
@@ -804,6 +840,7 @@ for stage in "$@"; do
     style)  echo "checks: style";  run_style ;;
     comments) echo "checks: comments"; run_comments ;;
     literals) echo "checks: literals"; run_literals ;;
+    records) echo "checks: records"; run_records ;;
     harness) echo "checks: harness"; run_harness ;;
     contracts) echo "checks: contracts"; run_contracts ;;
     install) echo "checks: install"; run_install ;;
