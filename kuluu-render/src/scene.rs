@@ -427,12 +427,18 @@ pub fn sync_entities_system(
                 EntityKind::Mob | EntityKind::Pc | EntityKind::Pet | EntityKind::Npc
             )
         {
-            prediction.observe(
+            let mover = if wire.kind == EntityKind::Pc {
+                crate::combat_stance::Mover::Client
+            } else {
+                crate::combat_stance::Mover::Server
+            };
+            prediction.observe_moved_by(
                 wire.id,
                 world_pos,
                 wire.heading,
                 wire.speed,
                 wire.speed_base,
+                mover,
             );
         }
 

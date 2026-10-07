@@ -74,6 +74,15 @@ the boundary. Read authored values from DATs at runtime; use
 measured model examples into hand-maintained constants. Keep explicitly chosen
 enhancements distinct from the vanilla baseline without expanding their scope.
 
+A binary-derived rule reaches code only through its observation record. The
+session that reads the binary writes the record, stating the rule in interop
+terms (DAT fields, wire fields, on-screen effect) and keeping every address,
+offset, decompiler name and instruction stream under its `## Provenance`
+heading, then stops. A later session implements from the spec sections with the
+disassembly closed. `scripts/checks.sh records` fails a record that leaks binary
+detail elsewhere. An internal mechanic the spec cannot tie to an observable is
+not implemented; parity is black-box.
+
 Validate the distinction that motivated the change, not just the new helper's
 arithmetic: vary a model, pose, scale, missing-resource state or branch that
 would make the old hypothesis fail. For observable client changes, use

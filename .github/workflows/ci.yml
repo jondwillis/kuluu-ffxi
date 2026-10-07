@@ -49,6 +49,7 @@ jobs:
       - run: scripts/checks.sh readme
       - run: scripts/checks.sh comments
       - run: scripts/checks.sh literals
+      - run: scripts/checks.sh records
       # No toolchain step on purpose: the workspace manifest needs the pinned nightly
       # (unstable codegen-backend), so stable cargo cannot parse Cargo.toml. Like every other
       # job here, rustup installs the channel from rust-toolchain.toml.
