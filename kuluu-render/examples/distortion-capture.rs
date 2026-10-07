@@ -24,6 +24,7 @@ const HOLD_SECONDS: u64 = 60;
 const STEP_SECONDS: f64 = 1.0 / 60.0;
 const MARKER_OFFSET: f32 = 1.0;
 const CAMERA_DISTANCE: f32 = 6.0;
+const FIELD_HALF_EXTENT: f32 = 0.7;
 
 #[derive(Resource)]
 struct CaptureTarget {
@@ -146,8 +147,8 @@ fn capture(
             }
         }
         distortion.push(LiveField {
-            center: Vec3::ZERO,
-            half_extent: Vec2::new(2.0, 2.0),
+            center: Vec3::Y,
+            half_extent: Vec2::splat(FIELD_HALF_EXTENT),
             haze_offset_x: 0.1,
             started_at: Instant::now(),
             duration_secs: HOLD_SECONDS as f32,
