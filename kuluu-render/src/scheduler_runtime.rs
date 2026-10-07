@@ -1,4 +1,8 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use crate::look_at_gates::LookAtLockInterval;
+
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::Arc;
 
@@ -35,6 +39,11 @@ use kuluu_snapshot::{CutsceneCue, ExtSchedulerMotion};
 // durations count whole frames of this clock; DAT transition fields (CompletionMotion's HalfFrames)
 // count half-frames, so a stored V plays as V/2 whole frames at ROUTINE_FPS.
 pub const ROUTINE_FPS: f32 = 60.0;
+static NEXT_ROUTINE_INSTANCE: AtomicU64 = AtomicU64::new(1);
+
+fn next_routine_instance() -> u64 {
+    NEXT_ROUTINE_INSTANCE.fetch_add(1, Ordering::Relaxed)
+}
 
 // research/xim poc/ActorManager.kt updateAll — `elapsedFrames / 2f` into updateAnimation.
 pub const SKELETON_FRAME_DIVISOR: f32 = 2.0;
@@ -136,6 +145,7 @@ pub enum MotionStages {
 // frame clock.
 #[derive(Debug, Clone)]
 pub struct ActiveScheduler {
+    instance_id: u64,
     pub stages: Vec<TimedStage>,
 
     /// The routine's wire target (spell/victim/cutscene partner the actor acted on),
@@ -166,6 +176,7 @@ impl ActiveScheduler {
         let mut stages = s.stages.clone();
         stages.sort_by_key(|t| t.frame);
         Self {
+            instance_id: 0,
             stages,
             elapsed: 0.0,
             cursor: 0,
@@ -211,6 +222,7 @@ impl ActiveScheduler {
         }
         stages.sort_by_key(|t| t.frame);
         Some(Self {
+            instance_id: 0,
             stages,
             elapsed: 0.0,
             cursor: 0,
@@ -228,6 +240,7 @@ impl ActiveScheduler {
         flatten_routine(lookup, name, 0, motion, &mut path, &mut stages);
         stages.sort_by_key(|t| t.frame);
         Some(Self {
+            instance_id: 0,
             stages,
             elapsed: 0.0,
             cursor: 0,
@@ -352,7 +365,8 @@ pub struct ActiveSchedulers {
 }
 
 impl ActiveSchedulers {
-    pub fn one(active: ActiveScheduler) -> Self {
+    pub fn one(mut active: ActiveScheduler) -> Self {
+        active.instance_id = next_routine_instance();
         Self {
             routines: vec![active],
         }
@@ -362,12 +376,16 @@ impl ActiveSchedulers {
     /// an entity with no ActiveSchedulers yet (see `run_routine_on`'s pending-insert buffer):
     /// one component holding every routine instead of N deferred inserts where the last would
     /// have overwritten the rest.
-    pub fn many(entries: Vec<ActiveScheduler>) -> Self {
+    pub fn many(mut entries: Vec<ActiveScheduler>) -> Self {
+        for active in &mut entries {
+            active.instance_id = next_routine_instance();
+        }
         Self { routines: entries }
     }
 
     /// Enqueue a routine alongside the running ones instead of replacing them.
-    pub fn push(&mut self, active: ActiveScheduler) {
+    pub fn push(&mut self, mut active: ActiveScheduler) {
+        active.instance_id = next_routine_instance();
         self.routines.push(active);
     }
 
@@ -383,6 +401,31 @@ impl ActiveSchedulers {
         self.routines
             .iter()
             .flat_map(|r| r.lock_look_at_intervals_at(r.current_frame()))
+            .collect()
+    }
+
+    pub fn lock_look_at_tasks_now(&self) -> Vec<LookAtLockInterval> {
+        self.routines
+            .iter()
+            .flat_map(|routine| {
+                let frame = routine.current_frame();
+                routine
+                    .stages
+                    .iter()
+                    .enumerate()
+                    .filter_map(move |(stage_index, timed)| {
+                        let end_frame = timed.frame + u32::from(timed.stage.duration_frames);
+                        (timed.stage.kind == StageKind::LockLookAt
+                            && timed.frame <= frame
+                            && frame < end_frame)
+                            .then_some(LookAtLockInterval {
+                                routine_instance: routine.instance_id,
+                                stage_index,
+                                fire_frame: timed.frame,
+                                end_frame,
+                            })
+                    })
+            })
             .collect()
     }
 
@@ -6196,6 +6239,78 @@ mod tests {
             r.elapsed = 6.0 / ROUTINE_FPS;
         }
         assert_eq!(probe.lock_look_at_intervals_now(), vec![(6, 30)]);
+    }
+
+    #[test]
+    fn overlapping_look_locks_keep_instance_identity_after_retirement() {
+        use crate::look_at_gates::{advance_look_at_locks, LOCK_WATCHDOG_DISTANCE_YALMS};
+        const END_FRAME: u16 = 600;
+        let mut lock = stage(0, StageKind::LockLookAt, 0, *b"lock");
+        lock.stage.duration_frames = END_FRAME;
+        let active = ActiveScheduler::from_scheduler(&make_scheduler(*b"lock", vec![lock]));
+        let mut scheds = ActiveSchedulers::one(active.clone());
+        let mut tasks = Vec::new();
+        assert!(advance_look_at_locks(
+            &mut tasks,
+            &scheds.lock_look_at_tasks_now(),
+            Vec2::ZERO
+        ));
+        assert!(!advance_look_at_locks(
+            &mut tasks,
+            &scheds.lock_look_at_tasks_now(),
+            Vec2::X * LOCK_WATCHDOG_DISTANCE_YALMS
+        ));
+        scheds.push(active.clone());
+        let open = scheds.lock_look_at_tasks_now();
+        assert_ne!(open[0].routine_instance, open[1].routine_instance);
+        assert!(advance_look_at_locks(&mut tasks, &open, Vec2::ZERO));
+        assert_eq!(tasks.len(), 2);
+        let survivor = open[1];
+        scheds.routines.remove(0);
+        assert_eq!(scheds.lock_look_at_tasks_now(), vec![survivor]);
+        assert!(advance_look_at_locks(
+            &mut tasks,
+            &scheds.lock_look_at_tasks_now(),
+            Vec2::ZERO
+        ));
+        assert_eq!(tasks.len(), 1);
+        scheds.routines.clear();
+        assert!(!advance_look_at_locks(
+            &mut tasks,
+            &scheds.lock_look_at_tasks_now(),
+            Vec2::ZERO
+        ));
+        assert!(tasks.is_empty());
+        scheds.push(active);
+        assert_ne!(
+            scheds.lock_look_at_tasks_now()[0].routine_instance,
+            survivor.routine_instance
+        );
+        assert!(advance_look_at_locks(
+            &mut tasks,
+            &scheds.lock_look_at_tasks_now(),
+            Vec2::ZERO
+        ));
+    }
+
+    #[test]
+    fn same_frame_look_locks_keep_distinct_stage_identity() {
+        const END_FRAME: u16 = 600;
+        let mut lock = stage(0, StageKind::LockLookAt, 0, *b"lock");
+        lock.stage.duration_frames = END_FRAME;
+        let active = ActiveScheduler::from_scheduler(&make_scheduler(*b"lock", vec![lock, lock]));
+        let scheds = ActiveSchedulers::one(active);
+        let open = scheds.lock_look_at_tasks_now();
+        assert_eq!(open.len(), 2);
+        assert_eq!(open[0].routine_instance, open[1].routine_instance);
+        assert_ne!(open[0].stage_index, open[1].stage_index);
+        let mut tasks = Vec::new();
+        assert!(crate::look_at_gates::advance_look_at_locks(
+            &mut tasks,
+            &open,
+            Vec2::ZERO
+        ));
+        assert_eq!(tasks.len(), 2);
     }
 
     // 0x2E is the movement twin of 0x59: same interval rules, a different lock. The 0x2E

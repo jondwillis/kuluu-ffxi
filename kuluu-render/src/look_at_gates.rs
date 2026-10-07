@@ -123,24 +123,28 @@ pub fn look_at_target_record_allows(look: Option<&kuluu_snapshot::EntityLook>) -
 /// middle component.
 pub const LOCK_WATCHDOG_DISTANCE_YALMS: f32 = 1.0;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LookAtLockInterval {
+    pub routine_instance: u64,
+    pub stage_index: usize,
+    pub fire_frame: u32,
+    pub end_frame: u32,
+}
+
 /// A running `0x89` LockLookAt task. Retail keeps one per fired stage — each takes its own anchor in its
 /// constructor (`FFXiMain.dll retail-2026-09`: RVA 0x5F4BC / RVA 0x5F4D2) and ends on its own duration or
 /// watchdog, so overlapping intervals are tracked separately instead of merged into one window.
 #[derive(Debug, Clone, Copy)]
 pub struct LookAtLockTask {
-    /// The stage's fire frame in its routine clock: the identity that keeps a task that ended early
-    /// from being re-spawned by the interval still covering it.
-    pub fire_frame: u32,
-    pub end_frame: u32,
+    interval: LookAtLockInterval,
     anchor_xz: Vec2,
     released_early: bool,
 }
 
 impl LookAtLockTask {
-    fn fired_at(fire_frame: u32, end_frame: u32, actor_xz: Vec2) -> Self {
+    fn fired_at(interval: LookAtLockInterval, actor_xz: Vec2) -> Self {
         Self {
-            fire_frame,
-            end_frame,
+            interval,
             anchor_xz: actor_xz,
             released_early: false,
         }
@@ -151,26 +155,15 @@ impl LookAtLockTask {
     }
 }
 
-/// One tick of every live LockLookAt task against the intervals `(fire frame, end frame)` the running
-/// routines currently cover: drop tasks whose interval has run out (that is retail's teardown clearing
-/// the actor flag), adopt newly-covered intervals anchored at `actor_xz`, release any task the actor has
-/// walked [`LOCK_WATCHDOG_DISTANCE_YALMS`] away from horizontally, and report whether suppression remains.
 pub fn advance_look_at_locks(
     tasks: &mut Vec<LookAtLockTask>,
-    open_intervals: &[(u32, u32)],
+    open_intervals: &[LookAtLockInterval],
     actor_xz: Vec2,
 ) -> bool {
-    tasks.retain(|task| {
-        open_intervals
-            .iter()
-            .any(|(fire, end)| *fire == task.fire_frame && *end == task.end_frame)
-    });
-    for &(fire, end) in open_intervals {
-        if !tasks
-            .iter()
-            .any(|task| task.fire_frame == fire && task.end_frame == end)
-        {
-            tasks.push(LookAtLockTask::fired_at(fire, end, actor_xz));
+    tasks.retain(|task| open_intervals.contains(&task.interval));
+    for &interval in open_intervals {
+        if !tasks.iter().any(|task| task.interval == interval) {
+            tasks.push(LookAtLockTask::fired_at(interval, actor_xz));
         }
     }
     for task in tasks.iter_mut() {
@@ -184,7 +177,7 @@ pub fn advance_look_at_locks(
 
 pub fn advance_look_at_suppression(
     tasks: &mut Vec<LookAtLockTask>,
-    open_intervals: &[(u32, u32)],
+    open_intervals: &[LookAtLockInterval],
     actor_xz: Vec2,
     wire_animation: u8,
 ) -> bool {
@@ -196,10 +189,22 @@ pub fn advance_look_at_suppression(
 mod look_at_gate_tests {
     use super::*;
 
+    fn test_intervals(frames: &[(u32, u32)]) -> Vec<LookAtLockInterval> {
+        frames
+            .iter()
+            .map(|&(fire_frame, end_frame)| LookAtLockInterval {
+                routine_instance: 0,
+                stage_index: fire_frame as usize,
+                fire_frame,
+                end_frame,
+            })
+            .collect()
+    }
+
     #[test]
     fn status_suppression_keeps_task_anchors_and_watchdogs_live() {
         const LOCK_END_FRAME: u32 = 600;
-        let interval = [(0, LOCK_END_FRAME)];
+        let interval = test_intervals(&[(0, LOCK_END_FRAME)]);
         let mut tasks = Vec::new();
         assert!(advance_look_at_suppression(
             &mut tasks,
@@ -332,7 +337,7 @@ mod look_at_gate_tests {
     fn an_open_interval_suppresses_until_its_end_frame() {
         let mut tasks = Vec::new();
         let here = Vec2::ZERO;
-        let interval = [(10, 30)];
+        let interval = test_intervals(&[(10, 30)]);
         assert!(advance_look_at_locks(&mut tasks, &interval, here));
         assert!(tasks.iter().any(LookAtLockTask::suppressing));
 
@@ -343,7 +348,7 @@ mod look_at_gate_tests {
     #[test]
     fn walking_a_yalm_gives_the_target_back_and_stays_given() {
         let mut tasks = Vec::new();
-        let interval = [(0, 600)];
+        let interval = test_intervals(&[(0, 600)]);
         assert!(advance_look_at_locks(&mut tasks, &interval, Vec2::ZERO));
 
         let walked = Vec2::new(1.0, 0.4);
@@ -361,7 +366,7 @@ mod look_at_gate_tests {
     #[test]
     fn the_watchdog_is_per_axis() {
         let mut tasks = Vec::new();
-        let interval = [(0, 600)];
+        let interval = test_intervals(&[(0, 600)]);
         advance_look_at_locks(&mut tasks, &interval, Vec2::ZERO);
         let drift = Vec2::new(
             LOCK_WATCHDOG_DISTANCE_YALMS * 0.9,
@@ -373,12 +378,12 @@ mod look_at_gate_tests {
     #[test]
     fn overlapping_stages_end_independently() {
         let mut tasks = Vec::new();
-        let intervals = [(0, 600), (5, 8)];
+        let intervals = test_intervals(&[(0, 600), (5, 8)]);
         advance_look_at_locks(&mut tasks, &intervals, Vec2::ZERO);
         assert_eq!(tasks.len(), 2);
 
         // The short one is gone; the longer one still suppresses.
-        let only_long = [(0, 600)];
+        let only_long = test_intervals(&[(0, 600)]);
         assert!(advance_look_at_locks(&mut tasks, &only_long, Vec2::ZERO));
         assert_eq!(tasks.len(), 1);
 
