@@ -182,9 +182,53 @@ pub fn advance_look_at_locks(
     tasks.iter().any(LookAtLockTask::suppressing)
 }
 
+pub fn advance_look_at_suppression(
+    tasks: &mut Vec<LookAtLockTask>,
+    open_intervals: &[(u32, u32)],
+    actor_xz: Vec2,
+    wire_animation: u8,
+) -> bool {
+    let lock_suppressed = advance_look_at_locks(tasks, open_intervals, actor_xz);
+    !look_at_allowed(wire_animation) || lock_suppressed
+}
+
 #[cfg(test)]
 mod look_at_gate_tests {
     use super::*;
+
+    #[test]
+    fn status_suppression_keeps_task_anchors_and_watchdogs_live() {
+        const LOCK_END_FRAME: u32 = 600;
+        let interval = [(0, LOCK_END_FRAME)];
+        let mut tasks = Vec::new();
+        assert!(advance_look_at_suppression(
+            &mut tasks,
+            &interval,
+            Vec2::ZERO,
+            animation::ATTACK,
+        ));
+        assert_eq!(tasks.len(), 1);
+        assert!(advance_look_at_suppression(
+            &mut tasks,
+            &interval,
+            Vec2::X * LOCK_WATCHDOG_DISTANCE_YALMS,
+            animation::ATTACK,
+        ));
+        assert!(!tasks[0].suppressing());
+        assert!(!advance_look_at_suppression(
+            &mut tasks,
+            &interval,
+            Vec2::ZERO,
+            animation::NONE,
+        ));
+        assert!(advance_look_at_suppression(
+            &mut tasks,
+            &[],
+            Vec2::ZERO,
+            animation::ATTACK,
+        ));
+        assert!(tasks.is_empty());
+    }
 
     #[test]
     fn standing_actors_look_at_their_target() {
