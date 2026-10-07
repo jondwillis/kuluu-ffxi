@@ -729,11 +729,6 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
     #[cfg(feature = "debug-animation_room")]
     app.add_plugins(animation_test_scene::AnimationTestScenePlugin);
 
-    // The room's systems and resources must stay out of a default build entirely: an unregistered
-    // plugin is inert, but registering it puts tester state into every session.
-    #[cfg(feature = "debug-animation_room")]
-    app.add_plugins(animation_test_scene::AnimationTestScenePlugin);
-
     app.add_plugins((
         ViewerCorePlugin::<NativeSource>::default(),
         HudPlugin,
