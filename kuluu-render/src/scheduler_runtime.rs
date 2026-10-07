@@ -12,6 +12,7 @@ use crate::rotation_drives::{
 };
 #[cfg(not(target_arch = "wasm32"))]
 use crate::scene::BakedActor;
+use crate::snapshot::EVENT_LOG_CAP;
 use bevy::prelude::*;
 use ffxi_actor::actor_state;
 use ffxi_dat::generator::Generator;
@@ -4310,10 +4311,6 @@ pub struct MeleeTravel {
     answered: std::collections::VecDeque<(u64, actor_state::Direction)>,
 }
 
-/// Starts older than this have fallen behind the other consumer's cursor; keeping more would only
-/// hide a consumer that stopped draining.
-const MELEE_TRAVEL_MEMO_MAX_EVENTS: usize = 32;
-
 impl MeleeTravel {
     /// The travel bucket for one melee start: classified on first sight and replayed thereafter, so
     /// `swing_routine_for` cannot be handed two different answers for the same swing.
@@ -4331,7 +4328,7 @@ impl MeleeTravel {
         }
         let direction = classify();
         self.answered.push_back((event_index, direction));
-        while self.answered.len() > MELEE_TRAVEL_MEMO_MAX_EVENTS {
+        while self.answered.len() > EVENT_LOG_CAP {
             self.answered.pop_front();
         }
         direction
@@ -8814,6 +8811,42 @@ mod tests {
             Direction::Left,
             "a different start classifies on its own samples"
         );
+    }
+
+    #[test]
+    fn retained_melee_batches_replay_without_reclassifying() {
+        use crate::snapshot::EventLog;
+        use ffxi_actor::actor_state::Direction;
+
+        let mut events = EventLog::default();
+        let mut memo = MeleeTravel::default();
+        for _ in 0..2 {
+            for _ in 0..EVENT_LOG_CAP {
+                events.push(kuluu_snapshot::ViewerEvent::ActionStarted {
+                    actor_id: 1,
+                    action_id: 0,
+                    action_kind: ffxi_proto::melee::CATEGORY_BASIC_ATTACK,
+                    target_id: None,
+                    result: None,
+                    animation: None,
+                    outcome: None,
+                });
+            }
+            assert_eq!(events.recent.len(), EVENT_LOG_CAP);
+            for (event_index, _) in events.recent_with_index() {
+                assert_eq!(
+                    memo.for_event(event_index, || Direction::Right),
+                    Direction::Right
+                );
+            }
+            for (event_index, _) in events.recent_with_index() {
+                assert_eq!(
+                    memo.for_event(event_index, || panic!("retained melee start reclassified")),
+                    Direction::Right,
+                );
+            }
+            assert_eq!(memo.answered.len(), EVENT_LOG_CAP);
+        }
     }
 
     /// The swings the race weapon-motion DAT actually ships, and which clip each one names: those
