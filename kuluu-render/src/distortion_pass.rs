@@ -178,10 +178,10 @@ fn field_rect(world_from_view: Mat4, clip: Mat4, center: Vec3, half: Vec2) -> Op
             max = max.max(n);
         }
     }
-    // Intersect the projected extent with the NDC box; nothing surviving means no pixels to bend.
-    let min = Vec2::new(min.x.max(-1.0), min.y.max(-1.0));
-    let max = Vec2::new(max.x.min(1.0), max.y.min(1.0));
-    if max.x - min.x <= 0.0 || max.y - min.y <= 0.0 {
+    // Preserve the original footprint so viewport clipping crops its texture.
+    let visible_min = Vec2::new(min.x.max(-1.0), min.y.max(-1.0));
+    let visible_max = Vec2::new(max.x.min(1.0), max.y.min(1.0));
+    if visible_max.x - visible_min.x <= 0.0 || visible_max.y - visible_min.y <= 0.0 {
         return None;
     }
     Some((min, max))
@@ -679,6 +679,18 @@ mod tests {
         assert!(min.y < 0.0 && max.y > 0.0);
         // Smaller than the half-frustum at that depth: it must not fill the screen.
         assert!(max.x < 1.0);
+    }
+
+    #[test]
+    fn partially_clipped_field_preserves_footprint_coordinates() {
+        let center = Vec3::X;
+        let half = Vec2::ONE;
+        let (min, max) = field_rect(Mat4::IDENTITY, Mat4::IDENTITY, center, half)
+            .expect("a partly visible footprint must project");
+        assert_eq!(min.x, center.x - half.x);
+        assert_eq!(max.x, center.x + half.x);
+        let viewport_edge_u = (1.0 - min.x) / (max.x - min.x);
+        assert_eq!(viewport_edge_u, 0.5);
     }
 
     #[test]
