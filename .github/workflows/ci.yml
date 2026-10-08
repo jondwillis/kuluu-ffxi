@@ -46,6 +46,7 @@ jobs:
           # The literals stage diffs against the merge-base with origin/main.
           fetch-depth: 0
       - run: scripts/checks.sh harness
+      - run: scripts/checks.sh release
       - run: scripts/checks.sh readme
       - run: scripts/checks.sh comments
       - run: scripts/checks.sh literals

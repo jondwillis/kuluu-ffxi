@@ -37,6 +37,7 @@ use kuluu_render::weather::ZoneDirectionalLighting;
 #[derive(Resource, Clone)]
 struct P {
     file_id: u32,
+    benchmark_json: Option<String>,
     out: String,
     cy: f32,
     cap: u32,
@@ -95,6 +96,7 @@ fn main() {
     let a: Vec<String> = env::args().collect();
     let mut p = P {
         file_id: 216,
+        benchmark_json: None,
         out: "/tmp/zone_fix.png".into(),
         cy: 250.0,
         cap: 200,
@@ -124,6 +126,10 @@ fn main() {
     let mut i = 1;
     while i < a.len() {
         match a[i].as_str() {
+            "--benchmark-json" => {
+                p.benchmark_json = Some(a[i + 1].clone());
+                i += 2;
+            }
             "--file" => {
                 p.file_id = a[i + 1].parse().unwrap();
                 i += 2;
@@ -707,6 +713,21 @@ fn drain_toasts(mut rx: MessageReader<ToastEvent>) {
         eprintln!("[toast] {}", t.line.text);
     }
 }
+const BENCHMARK_WARMUP_FRAMES: usize = 240;
+const BENCHMARK_SAMPLE_FRAMES: usize = 600;
+const MILLISECONDS_PER_SECOND: f64 = 1000.0;
+const CAPTURE_SETTLE_FRAMES: u32 = 5;
+const BENCHMARK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+
+#[derive(Default)]
+struct BenchmarkSamples {
+    started: Option<std::time::Instant>,
+    previous: Option<std::time::Instant>,
+    warmup: usize,
+    intervals_ms: Vec<f64>,
+    completed: bool,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cap(
     mut c: Commands,
@@ -722,6 +743,9 @@ fn cap(
     draw: Res<DrawDistance>,
     placements: Query<&Visibility, With<kuluu_render::dat_mzb::ZoneMeshLod>>,
     mut frame_secs: Local<f32>,
+    mut benchmark: Local<BenchmarkSamples>,
+    mut capture_frame: Local<Option<u32>>,
+    loading: (Res<MmbLoadInFlight>, Res<LoadMzbInFlight>),
 ) {
     f.0 += 1;
     *frame_secs += time.delta_secs();
@@ -742,13 +766,64 @@ fn cap(
         );
         *frame_secs = 0.0;
     }
-    if !s.0 && f.0 >= p.cap {
+    if let Some(path) = &p.benchmark_json {
+        let now = std::time::Instant::now();
+        let started = *benchmark.started.get_or_insert(now);
+        assert!(
+            now.duration_since(started) < BENCHMARK_TIMEOUT,
+            "benchmark timed out"
+        );
+        let ready = queue.pending.is_empty()
+            && water.specs.is_empty()
+            && loading.0.tasks.is_empty()
+            && loading.1.tasks.is_empty()
+            && !placements.is_empty();
+        if !ready && !benchmark.completed {
+            benchmark.warmup = 0;
+            benchmark.previous = None;
+            benchmark.intervals_ms.clear();
+        } else if !benchmark.completed {
+            if benchmark.warmup < BENCHMARK_WARMUP_FRAMES {
+                benchmark.warmup += 1;
+            } else if let Some(previous) = benchmark.previous {
+                benchmark
+                    .intervals_ms
+                    .push(now.duration_since(previous).as_secs_f64() * MILLISECONDS_PER_SECOND);
+            }
+            benchmark.previous = Some(now);
+            if benchmark.intervals_ms.len() == BENCHMARK_SAMPLE_FRAMES {
+                let report = serde_json::json!({
+                    "schema": 1,
+                    "metric": "application_update_interval_ms",
+                    "qualification": "advisory_pipeline_readiness_not_observed",
+                    "file_id": p.file_id,
+                    "warmup_frames": BENCHMARK_WARMUP_FRAMES,
+                    "samples_ms": benchmark.intervals_ms,
+                    "placements": placements.iter().count(),
+                    "arguments": std::env::args().collect::<Vec<_>>(),
+                });
+                std::fs::write(path, serde_json::to_vec_pretty(&report).unwrap())
+                    .expect("write benchmark samples");
+                benchmark.completed = true;
+            }
+        }
+    }
+    let capture_ready = if p.benchmark_json.is_some() {
+        benchmark.completed
+    } else {
+        f.0 >= p.cap
+    };
+    if !s.0 && capture_ready {
         c.spawn(Screenshot::image(target.0.clone()))
             .observe(save_to_disk(p.out.clone()));
         s.0 = true;
+        *capture_frame = Some(f.0);
         eprintln!("captured -> {}", p.out);
     }
-    if s.0 && q.is_empty() && f.0 >= p.cap + 5 {
+    if s.0
+        && q.is_empty()
+        && capture_frame.is_some_and(|frame| f.0 >= frame + CAPTURE_SETTLE_FRAMES)
+    {
         e.write(AppExit::Success);
     }
 }

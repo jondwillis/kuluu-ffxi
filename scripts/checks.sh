@@ -60,6 +60,11 @@ if [ "${CARGO_GUARD:-1}" = "1" ] && [ -x "$GUARD" ]; then
   cargo() { "$GUARD" "$@"; }
 fi
 
+run_release() {
+  python3 scripts/release-candidate.test.py
+  python3 scripts/release-preflight.test.py
+}
+
 run_readme() {
   python3 scripts/check-readme.test.py
   if [[ "${README_DIFF:-tree}" == "staged" ]]; then
@@ -828,12 +833,13 @@ run_doc() {
 }
 
 if [[ $# -eq 0 ]]; then
-  echo "checks: no stage given (expected one or more of: fmt clippy style harness readme comments contracts install test enhanced build wasm doc sweep)" >&2
+  echo "checks: no stage given (expected one or more of: fmt clippy style harness release readme comments contracts install test enhanced build wasm doc sweep)" >&2
   exit 2
 fi
 
 for stage in "$@"; do
   case "$stage" in
+    release) echo "checks: release"; run_release ;;
     readme) echo "checks: readme"; run_readme ;;
     fmt)    echo "checks: fmt";    run_fmt ;;
     clippy) echo "checks: clippy"; run_clippy ;;

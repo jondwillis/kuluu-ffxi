@@ -80,12 +80,15 @@ build legs (linux / linux-arm / macos / windows / windows-arm / wasm) →
 `publish`. The arm legs build natively on GitHub's hosted `ubuntu-24.04-arm`
 and `windows-11-arm` runners (free for public repos) — no cross toolchain.
 
-**Rehearse workflow changes before burning a release on them.** A new or
-edited build leg can be dry-run without publishing: branch, add `if: false` to
-the `publish` job, `gh workflow run release.yml --ref <branch> -f
-tag=vX.Y.Z-armtest` (the setup validator admits suffixed tags), watch the
-legs, delete the branch. Cheaper than the delete-tag/fix/re-push recovery loop,
-and it caught the windows-arm Cranelift failure before v0.5.1 shipped.
+**Rehearse workflow changes before publishing.** Dispatch `release.yml` on the
+reviewed branch with `tag=vX.Y.Z-rehearsal` and `publish=false`. An unused tag
+is permitted only for rehearsal; an existing tag must resolve to the workflow
+commit. The workflow runs CI, builds all platforms, and uploads `release-bundle`
+with `SHA256SUMS`; it does not create a tag or release. Download that bundle,
+check the manifest, and exercise its binaries. Manual publishing requires
+`publish=true` and an existing tag at the workflow commit. The normal main
+version-bump caller explicitly opts into publishing. Bind rehearsal evidence
+to its workflow SHA and artifact hashes.
 
 **Both Windows legs set `RUSTFLAGS: -C target-feature=+crt-static`.** Rust's
 MSVC targets link the C runtime dynamically by default, so without it the exe
@@ -228,3 +231,37 @@ and unreadable. If the user wants a human changelog, group
 what changed in the game — not by crate or by commit order. Lead with the theme
 of the release, then sections like combat, rendering, HUD, audio, input. A
 reader should learn what's different when they log in, not which files moved.
+
+
+## Scheduled shadow assessment
+
+Run `python3 scripts/release-preflight.py --state <persistent-ledger.json>`.
+Wednesday in America/Los_Angeles selects feature assessment; other days select
+hotfix assessment. The script reads current GitHub main and stable identities.
+For new inputs, inspect the complete local Git range; GitHub compare can truncate
+its file list. Use isolated worktrees and targets. Classify actual changes,
+dependencies, gameplay impact and evidence. Select hotfixes from the stable tag
+when main contains unfinished features; uncertain dependencies are a hold.
+Prepare player-facing notes and an evidence-linked decision card.
+
+Record an assessment JSON with the returned `key`, `decision` (`hold`, `prepared`,
+or `no-eligible-fixes`), a nonempty `summary`, evidence paths and coverage gaps.
+After completing the assessment, rerun with `--ack <key> --decision <decision>
+--evidence <assessment.json>`. The script rejects changed candidate inputs.
+Interrupted assessments must not be acknowledged. `no-change` and `unchanged`
+permit quiet exits only when tracked blockers and validation inputs are unchanged.
+Feed a stable validation-input JSON through `--signals` on both calls so new
+evidence reopens holds; do not include timestamps that change every run.
+
+Shadow mode never authorizes publication. Do not push, tag, merge, dispatch a
+publishing run or post announcements without applicable user authority. A prepared
+candidate still requires approval bound to its commit and artifacts. Missing
+runtime, platform or performance evidence is a hold. Archive integrity, example
+captures and skipped live tests do not prove gameplay. Major versions and elevated
+risk stay behind a human decision.
+
+The offline zone example's `--benchmark-json` emits advisory application-update
+intervals, not GPU time or a qualified performance gate. Compare baseline and
+candidate on the same host/settings, retain raw samples and inspected captures,
+and calibrate noise before setting thresholds. Keep Screen Sharing disconnected
+throughout mini runs; display topology changes can terminate the window.
