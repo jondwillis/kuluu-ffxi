@@ -170,6 +170,8 @@ pub fn resolve_camera(
     };
 
     if !chase.synced_initial {
+        *smoothed_effective = None;
+        *leash_state = LeashState::default();
         chase.yaw = yaw_for_heading(scene_state.snapshot.self_pos.heading);
         chase.synced_initial = true;
     }
@@ -515,6 +517,151 @@ mod tests {
                     (app.world().get::<Transform>(camera).unwrap().translation - eye).length()
                         < EPSILON
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn same_zone_camera_respawn_discards_old_resolver_state() {
+        use crate::view_native::{input, AppPhase};
+        use bevy::state::app::StatesPlugin;
+        use bevy::time::TimeUpdateStrategy;
+        use kuluu_render::camera::{reset_camera_follow, spawn_camera, AnchorFollow};
+        use kuluu_render::components::{InGameEntity, WorldEntity};
+        const ZONE: u16 = 100;
+        const TARGET_ID: u32 = 77;
+        const TICK_HZ: f64 = 60.0;
+        const EPSILON: f32 = 0.0001;
+        const MANUAL_STEP: f32 = 0.04;
+        const SHORT_HOLD: usize = 90;
+        const LEASH_YALMS: f32 = 1.0;
+        const LAUNCHER_HOLD: usize = 10;
+        const SETTLE_FRAMES: usize = 60;
+        const TURN_FRAMES: usize = 30;
+        for spring in [false, true] {
+            for lock_history in [false, true] {
+                let mut app = App::new();
+                app.add_plugins((MinimalPlugins, StatesPlugin))
+                    .insert_resource(TimeUpdateStrategy::ManualDuration(
+                        std::time::Duration::from_secs_f64(1.0 / TICK_HZ),
+                    ))
+                    .init_state::<AppPhase>()
+                    .insert_resource(kuluu_render::GraphicsSettings {
+                        camera_spring: spring,
+                        camera_leash_yalms: LEASH_YALMS,
+                        volumetric_fog: false,
+                        ..default()
+                    })
+                    .insert_resource(CameraMode::Chase)
+                    .init_resource::<SceneState>()
+                    .init_resource::<ZoneCollisionBvh>()
+                    .init_resource::<AnchorFollow>()
+                    .init_resource::<kuluu_render::camera::CameraStepSmoothing>()
+                    .init_resource::<kuluu_render::cutscene::CutsceneMode>()
+                    .init_resource::<kuluu_render::lock_on::LockOn>()
+                    .init_resource::<kuluu_render::Target>()
+                    .init_resource::<kuluu_render::combat_stance::RestStance>()
+                    .init_resource::<input::AutoRun>()
+                    .add_systems(OnEnter(AppPhase::InGame), spawn_camera)
+                    .add_systems(
+                        OnExit(AppPhase::InGame),
+                        (
+                            |mut commands: Commands,
+                             entities: Query<Entity, With<InGameEntity>>,
+                             mut scene: ResMut<SceneState>,
+                             mut bvh: ResMut<ZoneCollisionBvh>| {
+                                for entity in &entities {
+                                    commands.entity(entity).try_despawn();
+                                }
+                                *scene = SceneState::default();
+                                *bvh = ZoneCollisionBvh::default();
+                            },
+                            reset_camera_follow,
+                        )
+                            .chain(),
+                    )
+                    .add_systems(
+                        Update,
+                        (
+                            input::reset_interaction_flags_on_zone_change,
+                            resolve_camera,
+                        )
+                            .chain()
+                            .run_if(in_state(AppPhase::InGame)),
+                    );
+                app.world_mut()
+                    .resource_mut::<SceneState>()
+                    .snapshot
+                    .zone_id = Some(ZONE);
+                app.world_mut()
+                    .spawn((InGameEntity, IsSelf, Transform::default()));
+                app.world_mut().spawn((
+                    InGameEntity,
+                    WorldEntity {
+                        id: TARGET_ID,
+                        act_index: 0,
+                        kind: kuluu_snapshot::EntityKind::Mob,
+                    },
+                    Transform::from_xyz(3.0, 0.0, 4.0),
+                ));
+                app.world_mut()
+                    .resource_mut::<NextState<AppPhase>>()
+                    .set(AppPhase::InGame);
+                app.update();
+                let mut camera_query = app
+                    .world_mut()
+                    .query_filtered::<(Entity, &Transform), With<OperatorCamera>>();
+                let (old_camera, transform) = camera_query.single(app.world()).unwrap();
+                let initial_eye = transform.translation;
+                app.world_mut().resource_mut::<ChaseCamera>().distance = ChaseCamera::DIST_MIN;
+                for _ in 0..SHORT_HOLD {
+                    app.update();
+                }
+                for _ in 0..TURN_FRAMES {
+                    app.world_mut().resource_mut::<ChaseCamera>().yaw += MANUAL_STEP;
+                    app.update();
+                }
+                if lock_history {
+                    app.world_mut()
+                        .resource_mut::<kuluu_render::lock_on::LockOn>()
+                        .target_id = Some(TARGET_ID);
+                    for _ in 0..TURN_FRAMES {
+                        app.update();
+                    }
+                    app.world_mut()
+                        .resource_mut::<kuluu_render::lock_on::LockOn>()
+                        .target_id = None;
+                    for _ in 0..LAUNCHER_HOLD {
+                        app.update();
+                    }
+                }
+                app.world_mut()
+                    .resource_mut::<NextState<AppPhase>>()
+                    .set(AppPhase::Launcher);
+                app.update();
+                assert!(app.world().get_entity(old_camera).is_err());
+                for _ in 0..LAUNCHER_HOLD {
+                    app.update();
+                }
+                app.world_mut()
+                    .resource_mut::<SceneState>()
+                    .snapshot
+                    .zone_id = Some(ZONE);
+                app.world_mut()
+                    .spawn((InGameEntity, IsSelf, Transform::default()));
+                app.world_mut()
+                    .resource_mut::<NextState<AppPhase>>()
+                    .set(AppPhase::InGame);
+                app.update();
+                let (new_camera, transform) = camera_query.single(app.world()).unwrap();
+                assert_ne!(new_camera, old_camera);
+                assert!((transform.translation - initial_eye).length() < EPSILON,
+                    "spring={spring}, lock_history={lock_history}, initial={initial_eye:?}, reentry={:?}", transform.translation);
+                for _ in 0..SETTLE_FRAMES {
+                    app.update();
+                }
+                let (_, transform) = camera_query.single(app.world()).unwrap();
+                assert!((transform.translation - initial_eye).length() < EPSILON);
             }
         }
     }
