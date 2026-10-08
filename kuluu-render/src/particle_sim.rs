@@ -1,5 +1,5 @@
 use std::sync::OnceLock;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use bevy::asset::RenderAssetUsages;
 use bevy::mesh::{Indices, PrimitiveTopology};
@@ -440,6 +440,10 @@ enum ChildPayload {
         haze_offset_x: f32,
         life_frames: f32,
         envelope: Option<ffxi_dat::particle_gen::KeyFrameTrack>,
+        // Footprint (quad × init_scale) and the linked texture bytes, resolved once at factory
+        // time. None = unresolved def data; the child then arms nothing but keeps running.
+        half_extent: Option<Vec2>,
+        map: Option<std::sync::Arc<crate::distortion_pass::DistortionMap>>,
     },
     Rumble {
         envelope: ffxi_dat::particle_gen::KeyFrameTrack,
@@ -1186,21 +1190,114 @@ fn rescale_track(
     }
 }
 
-fn arm_distortion_effect(
-    haze_offset_x: f32,
-    life_frames: f32,
+// The element's linked texture + quad template — the same tier chain every element uses to
+// bind mesh and texture together (effect dir first, then global; qualified name, local-only
+// name, truncated id last).
+fn distortion_field_parts<'a>(
+    assets: &'a ActionAssets,
+    global: Option<&'a ActionAssets>,
+    local_dir: [u8; 4],
+    view: &ffxi_dat::particle_gen::ParticleGeneratorDef,
+) -> Option<(SpriteTemplate, &'a ffxi_dat::texture::DecodedTexture)> {
+    let tiers = [Some(assets), global];
+    match view.mesh_kind {
+        ParticleMeshKind::StaticMesh | ParticleMeshKind::WeightedMesh => {
+            let d3m = tiers
+                .into_iter()
+                .flatten()
+                .find_map(|a| a.d3m(local_dir, &view.mesh_id))?;
+            let template = sprite_template(d3m)?;
+            let (namespace, local) = d3m.texture_name_tokens();
+            let tex = [Some(assets), global].into_iter().flatten().find_map(|a| {
+                let by_name = (!local.is_empty()).then(|| {
+                    a.images_by_qualified_name
+                        .get(&(namespace.clone(), local.clone()))
+                        .or_else(|| a.images_by_name.get(&local))
+                });
+                by_name
+                    .flatten()
+                    .or_else(|| a.images.get(&d3m.texture_dat_id()))
+            })?;
+            Some((template, tex))
+        }
+        ParticleMeshKind::SpriteSheet => {
+            let ss = tiers
+                .into_iter()
+                .flatten()
+                .find_map(|a| a.sprite_sheet(local_dir, &view.mesh_id))?;
+            let template = sprite_sheet_templates(ss).into_iter().next()?;
+            let tex = [Some(assets), global].into_iter().flatten().find_map(|a| {
+                a.images_by_qualified_name
+                    .get(&(ss.category.clone(), ss.id.clone()))
+                    .or_else(|| a.images_by_name.get(&ss.id))
+            })?;
+            Some((template, tex))
+        }
+    }
+}
+
+// The linked texture as the field's footprint map. Particle alpha is authored at half scale,
+// like every other FFXI decoded-texture consumer (ffxi_dat::texture::ffxi_alpha_remap).
+fn distortion_map(
+    tex: &ffxi_dat::texture::DecodedTexture,
+) -> std::sync::Arc<crate::distortion_pass::DistortionMap> {
+    let mut rgba = tex.rgba.clone();
+    for px in rgba.chunks_exact_mut(4) {
+        px[3] = ffxi_dat::texture::ffxi_alpha_remap(px[3]);
+    }
+    std::sync::Arc::new(crate::distortion_pass::DistortionMap::new(
+        tex.width, tex.height, rgba,
+    ))
+}
+
+// Footprint half-size: quad template extent × authored init_scale. A zero result means the
+// def carries no usable footprint — no field draws; nothing here guesses one.
+fn field_half_extent(template: &SpriteTemplate, init_scale: [f32; 3]) -> Option<Vec2> {
+    let mut hx = 0.0_f32;
+    let mut hy = 0.0_f32;
+    for p in &template.positions {
+        hx = hx.max(p.x.abs());
+        hy = hy.max(p.y.abs());
+    }
+    if hx <= 0.0 || hy <= 0.0 || init_scale[0] == 0.0 || init_scale[1] == 0.0 {
+        return None;
+    }
+    Some(Vec2::new(
+        hx * init_scale[0].abs(),
+        hy * init_scale[1].abs(),
+    ))
+}
+
+// Anchor a live haze field at its attach-frame origin (the hit site). The footprint is the
+// linked texture quad drawn at authored scale, and that same texture's alpha says where inside
+// it the bend acts (kuluu-render/src/distortion_pass.rs).
+fn push_distortion_field(
+    dist: &ffxi_dat::particle_gen::DistortionGeneratorDef,
+    assets: &ActionAssets,
+    global: Option<&ActionAssets>,
+    local_dir: [u8; 4],
+    origin: Vec3,
     envelope: Option<ffxi_dat::particle_gen::KeyFrameTrack>,
-    commands: &mut Commands,
-) {
-    let life_secs = life_frames / ROUTINE_FPS;
-    commands.insert_resource(crate::distortion_pass::ActiveDistortion {
-        haze_offset_x,
-        expires_at: Some(Instant::now() + Duration::from_secs_f32(life_secs)),
-        envelope,
+    distortion: &mut crate::distortion_pass::ActiveDistortion,
+) -> bool {
+    let Some((template, tex)) =
+        distortion_field_parts(assets, global, local_dir, &dist.generator_view)
+    else {
+        return false;
+    };
+    let Some(half_extent) = field_half_extent(&template, dist.generator_view.init_scale) else {
+        return false;
+    };
+    distortion.push(crate::distortion_pass::LiveField {
+        center: origin,
+        half_extent,
+        haze_offset_x: dist.haze_offset_x,
         started_at: Instant::now(),
-        duration_secs: life_secs,
-        strength: 1.0,
+        duration_secs: dist.max_life_frames / ROUTINE_FPS,
+        envelope,
+        map: distortion_map(tex),
     });
+    true
 }
 
 // Retail sets the unattached flag exactly when the attach code is 0.
@@ -1261,6 +1358,7 @@ pub fn spawn_particle_generators(
     mut mats: ResMut<Assets<FfxiParticleMaterial>>,
     mut images: ResMut<Assets<Image>>,
     mut sim: ResMut<ParticleSimulator>,
+    mut distortion: ResMut<crate::distortion_pass::ActiveDistortion>,
     mut commands: Commands,
 ) {
     let tracing = trace.is_some_and(|t| t.0);
@@ -1348,20 +1446,30 @@ pub fn spawn_particle_generators(
                     };
                     let life_secs = dist.max_life_frames / ROUTINE_FPS;
                     let envelope_pts = envelope.as_ref().map(|t| t.points.len()).unwrap_or(0);
-                    arm_distortion_effect(
-                        dist.haze_offset_x,
-                        dist.max_life_frames,
-                        envelope.clone(),
-                        &mut commands,
+                    // The field anchors at its attach-frame origin — the hit site, same
+                    // convention as the sound and rumble cues in this chain.
+                    let target_ent = q_action_target.get(ev.actor).ok().and_then(|t| t.0);
+                    let origin = attach_frame(&dist.generator_view, ev.actor, target_ent, &attach)
+                        .map(|f| f.point(Vec3::from_array(dist.generator_view.base_position)))
+                        .unwrap_or(actor_xf.translation);
+                    let armed = push_distortion_field(
+                        dist,
+                        dist_assets,
+                        global.as_ref().map(|g| &g.assets),
+                        local_dir,
+                        origin,
+                        envelope,
+                        &mut distortion,
                     );
                     if tracing {
                         info!(
-                            "animationtest trace: particle stage {} [{}] — DISTORTION armed haze_x={:.3} life {:.1}s envelope={} pts",
+                            "animationtest trace: particle stage {} [{}] — DISTORTION field haze_x={:.3} life {:.1}s envelope={} pts{}",
                             String::from_utf8_lossy(&ev.stage.stage.id),
                             String::from_utf8_lossy(&local_dir),
                             dist.haze_offset_x,
                             life_secs,
                             envelope_pts,
+                            if armed { "" } else { " — NOT ARMED: linked texture/footprint unresolved" },
                         );
                     }
                 } else if tracing {
@@ -1876,6 +1984,7 @@ pub fn tick_particle_simulator(
     wall_washes: Option<Res<WallWashOff>>,
     mut trace_writer: MessageWriter<crate::scheduler_runtime::ParticleSpawnTrace>,
     mut sfx_writer: MessageWriter<crate::audio::SfxEvent>,
+    mut distortion: ResMut<crate::distortion_pass::ActiveDistortion>,
 ) {
     // Box kill switches, applied as a per-entity marker diff (live both ways): glow billboards
     // hide while the box's lamps row is set; wash volumes hide when their box row is unchecked.
@@ -1907,6 +2016,7 @@ pub fn tick_particle_simulator(
         trace.is_some_and(|t| t.0),
         &mut trace_writer,
         &mut sfx_writer,
+        &mut distortion,
     );
 }
 
@@ -2120,6 +2230,7 @@ fn instantiate_child_generators(
     tracing: bool,
     trace_writer: &mut MessageWriter<crate::scheduler_runtime::ParticleSpawnTrace>,
     sfx_writer: &mut MessageWriter<crate::audio::SfxEvent>,
+    distortion: &mut crate::distortion_pass::ActiveDistortion,
 ) {
     struct SpawnReq {
         // The generator that holds child_factories[factory_idx].
@@ -2226,18 +2337,39 @@ fn instantiate_child_generators(
                 haze_offset_x,
                 life_frames,
                 envelope,
+                half_extent,
+                map,
             } => {
+                let armed = match (half_extent, map) {
+                    (Some(half), Some(map)) => {
+                        distortion.push(crate::distortion_pass::LiveField {
+                            center: r.pos,
+                            half_extent: *half,
+                            haze_offset_x: *haze_offset_x,
+                            started_at: Instant::now(),
+                            duration_secs: *life_frames / ROUTINE_FPS,
+                            envelope: envelope.clone(),
+                            map: map.clone(),
+                        });
+                        true
+                    }
+                    _ => false,
+                };
                 if tracing {
                     let line = format!(
-                        "child {} — DISTORTION armed haze_x={:.3} life {:.1}s",
+                        "child {} — DISTORTION field haze_x={:.3} life {:.1}s{}",
                         String::from_utf8_lossy(&f.name),
                         *haze_offset_x,
-                        *life_frames / ROUTINE_FPS
+                        *life_frames / ROUTINE_FPS,
+                        if armed {
+                            ""
+                        } else {
+                            " — NOT ARMED: linked texture/footprint unresolved"
+                        },
                     );
                     info!("animationtest trace: {line}");
                     trace_writer.write(crate::scheduler_runtime::ParticleSpawnTrace(line));
                 }
-                arm_distortion_effect(*haze_offset_x, *life_frames, envelope.clone(), commands);
             }
             ChildPayload::Rumble {
                 envelope,
@@ -2380,6 +2512,12 @@ fn resolve_child_bindings(
                 if let Ok(envelope) =
                     authored_envelope(assets, global, dist.envelope_track, id, def_dir)
                 {
+                    let parts =
+                        distortion_field_parts(assets, global, def_dir, &dist.generator_view);
+                    let half_extent = parts
+                        .as_ref()
+                        .and_then(|(t, _)| field_half_extent(t, dist.generator_view.init_scale));
+                    let map = parts.map(|(_, tex)| distortion_map(tex));
                     out.push(ChildFactory {
                         name: id,
                         on_expiry,
@@ -2387,6 +2525,8 @@ fn resolve_child_bindings(
                             haze_offset_x: dist.haze_offset_x,
                             life_frames: dist.max_life_frames,
                             envelope,
+                            half_extent,
+                            map,
                         },
                         children: Vec::new(),
                     });
@@ -4048,6 +4188,8 @@ fn empty_mesh() -> Mesh {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Tests use Duration directly; non-test code does not import it at the file root.
+    use std::time::Duration;
 
     mod cleanup_capture;
     #[cfg(not(target_arch = "wasm32"))]
@@ -4436,6 +4578,7 @@ mod tests {
         let mut sim = ParticleSimulator::default();
         sim.generators.push(g);
         world.insert_resource(sim);
+        world.insert_resource(crate::distortion_pass::ActiveDistortion::default());
 
         world.run_system_once(sync_particle_meshes).unwrap();
         assert!(
@@ -4504,6 +4647,7 @@ mod tests {
         let mut sim = ParticleSimulator::default();
         sim.generators.push(g);
         world.insert_resource(sim);
+        world.insert_resource(crate::distortion_pass::ActiveDistortion::default());
         (world, mesh, entity)
     }
 
@@ -4816,7 +4960,9 @@ mod tests {
         // tick reads the Dynamic Lights setting (Default = Vanilla, texture path).
         world.insert_resource(crate::graphics_settings::GraphicsSettings::default());
         world.insert_resource(Assets::<Mesh>::default());
+        world.insert_resource(crate::distortion_pass::ActiveDistortion::default());
         world.insert_resource(sim);
+        world.insert_resource(crate::distortion_pass::ActiveDistortion::default());
         world.run_system_once(tick_particle_simulator).unwrap();
 
         let sim = world.resource::<ParticleSimulator>();
@@ -6569,6 +6715,7 @@ mod tests {
         let mut sim = ParticleSimulator::default();
         sim.generators.push(g);
         world.insert_resource(sim);
+        world.insert_resource(crate::distortion_pass::ActiveDistortion::default());
         world.insert_resource(Time::<()>::default());
 
         world.run_system_once(track_attached_origins).unwrap();
@@ -6613,6 +6760,7 @@ mod tests {
         let mut sim = ParticleSimulator::default();
         sim.generators.push(g);
         world.insert_resource(sim);
+        world.insert_resource(crate::distortion_pass::ActiveDistortion::default());
         world.insert_resource(Time::<()>::default());
 
         world.run_system_once(track_attached_origins).unwrap();
@@ -8787,6 +8935,7 @@ mod tests {
             .init_asset::<Image>()
             .init_asset::<FfxiParticleMaterial>()
             .init_resource::<ParticleSimulator>()
+            .init_resource::<crate::distortion_pass::ActiveDistortion>()
             .add_message::<crate::scheduler_runtime::SchedulerStageEvent>()
             .add_message::<crate::scheduler_runtime::ParticleSpawnTrace>()
             .add_message::<crate::audio::SfxEvent>()
@@ -8963,6 +9112,7 @@ mod tests {
             .init_asset::<Image>()
             .init_asset::<FfxiParticleMaterial>()
             .init_resource::<ParticleSimulator>()
+            .init_resource::<crate::distortion_pass::ActiveDistortion>()
             .add_message::<SchedulerStageEvent>()
             .add_message::<crate::scheduler_runtime::ParticleSpawnTrace>()
             .add_message::<crate::audio::SfxEvent>()
@@ -9103,6 +9253,7 @@ mod tests {
             .init_asset::<Image>()
             .init_asset::<FfxiParticleMaterial>()
             .init_resource::<ParticleSimulator>()
+            .init_resource::<crate::distortion_pass::ActiveDistortion>()
             .add_message::<SchedulerStageEvent>()
             .add_message::<crate::scheduler_runtime::ParticleSpawnTrace>()
             .add_message::<crate::audio::SfxEvent>()
@@ -9318,6 +9469,7 @@ mod tests {
             .init_asset::<Image>()
             .init_asset::<FfxiParticleMaterial>()
             .init_resource::<ParticleSimulator>()
+            .init_resource::<crate::distortion_pass::ActiveDistortion>()
             .add_message::<SchedulerStageEvent>()
             .add_message::<crate::scheduler_runtime::ParticleSpawnTrace>()
             .add_message::<crate::audio::SfxEvent>()
@@ -10085,7 +10237,9 @@ mod tests {
         // tick reads the Dynamic Lights setting for its enhance-mode suppression (Default =
         // Vanilla, so these tests exercise the retail texture path).
         world.insert_resource(crate::graphics_settings::GraphicsSettings::default());
+        world.insert_resource(crate::distortion_pass::ActiveDistortion::default());
         world.insert_resource(sim);
+        world.insert_resource(crate::distortion_pass::ActiveDistortion::default());
         world
     }
 
@@ -10380,6 +10534,10 @@ mod tests {
                 haze_offset_x: 0.02,
                 life_frames: 60.0,
                 envelope: None,
+                half_extent: Some(Vec2::ONE),
+                map: Some(std::sync::Arc::new(
+                    crate::distortion_pass::DistortionMap::new(1, 1, vec![0, 0, 0, 255]),
+                )),
             },
             children: Vec::new(),
         });
@@ -10388,8 +10546,14 @@ mod tests {
         let mut world = child_test_world(sim);
         tick_world(&mut world, ONE_FRAME_SECS); // parent emits; the child arms on instantiation
 
+        // The primed first tick emits ppe+1 = 2 parent particles; each particle arms its own
+        // field at its own position.
         let dist = world.resource::<crate::distortion_pass::ActiveDistortion>();
-        assert_eq!(dist.haze_offset_x, 0.02);
+        assert_eq!(dist.fields.len(), 2);
+        for f in &dist.fields {
+            assert_eq!(f.haze_offset_x, 0.02);
+            assert_eq!(f.half_extent, Vec2::ONE);
+        }
     }
 
     // A sound child writes the same SfxEvent a 0x02 stage naming that generator would.

@@ -2710,11 +2710,16 @@ pub struct DistortionGeneratorDef {
     pub haze_offset_x: f32,
 
     /// sec2 0x2D KeyFrameValueSetup — the strength/alpha envelope over life (g142 binds k143:
-    /// 0 -> 0.48 hold -> 0.01). The screen-space pass scales its haze by this curve; a PS2
-    /// half-scale value like 0.502 is full strength.
+    /// 0 -> 0.48 hold -> 0.01). The field pass scales its haze by this curve; a PS2 half-scale
+    /// value like 0.502 is full strength.
     pub envelope_track: Option<[u8; 4]>,
 
     pub attach_type: AttachType,
+
+    /// The same sections read as a mesh generator, so a haze field resolves its linked texture,
+    /// billboard size and attachment point through the identical pipeline every other element
+    /// uses — the field's footprint is that quad drawn at its authored scale.
+    pub generator_view: ParticleGeneratorDef,
 }
 
 impl DistortionGeneratorDef {
@@ -2750,6 +2755,7 @@ impl DistortionGeneratorDef {
             haze_offset_x: s.haze_offset_x.unwrap_or(0.0),
             envelope_track: s.alpha_track,
             attach_type: s.attach_type,
+            generator_view: ParticleGeneratorDef::from_sections(s),
         }
     }
 

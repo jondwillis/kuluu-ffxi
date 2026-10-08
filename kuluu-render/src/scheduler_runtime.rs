@@ -4636,6 +4636,10 @@ impl Plugin for SchedulerRuntimePlugin {
         #[cfg(not(target_arch = "wasm32"))]
         {
             app.init_resource::<crate::particle_sim::ParticleSimulator>();
+            // spawn_particle_generators and tick_particle_simulator hold this as `ResMut`, so every
+            // app that schedules them owns it: a haze field is armed while the generator runs, not by
+            // a lazy command. The render world gets its own copy from DistortionPassPlugin.
+            app.init_resource::<crate::distortion_pass::ActiveDistortion>();
             app.init_resource::<ActionDatCache>();
             app.init_resource::<VfxTrace>();
             // The running cutscene camera route; the advance system

@@ -982,7 +982,7 @@ fn classify_disconnect_reason(reason: &str) -> DisconnectKind {
 }
 
 // A zone change keeps AppPhase::InGame, so despawn_ingame_entities never runs there. The
-// generator that armed the distortion leaves with the old zone's actors, so the smear goes too.
+// generators that anchored haze fields leave with the old zone's actors, so the fields go too.
 fn discard_distortion_on_zone_change(
     events: Res<EventLog>,
     mut cursor: Local<u64>,
@@ -1501,40 +1501,50 @@ mod zone_teardown_tests {
         world
     }
 
+    fn live_field_fixture() -> kuluu_render::distortion_pass::LiveField {
+        use std::sync::Arc;
+        use std::time::Instant;
+        kuluu_render::distortion_pass::LiveField {
+            center: Vec3::ZERO,
+            half_extent: Vec2::ONE,
+            haze_offset_x: 0.02,
+            started_at: Instant::now(),
+            duration_secs: 60.0,
+            envelope: None,
+            map: Arc::new(kuluu_render::distortion_pass::DistortionMap::new(
+                1,
+                1,
+                vec![0, 0, 0, 255],
+            )),
+        }
+    }
+
     #[test]
     fn teardown_discards_unexpired_distortion() {
         use kuluu_render::distortion_pass::ActiveDistortion;
-        use std::time::{Duration, Instant};
 
         let mut world = world_with_teardown_resources();
-        world.insert_resource(ActiveDistortion {
-            expires_at: Some(Instant::now() + Duration::from_secs(60)),
-            strength: 1.0,
-            ..Default::default()
-        });
+        let mut distortion = ActiveDistortion::default();
+        distortion.push(live_field_fixture());
+        world.insert_resource(distortion);
         world.run_system_once(despawn_ingame_entities).unwrap();
 
-        let distortion = world.resource::<ActiveDistortion>();
-        assert!(distortion.expires_at.is_none());
-        assert_eq!(distortion.strength, 0.0);
+        assert!(world.resource::<ActiveDistortion>().fields.is_empty());
     }
 
     #[test]
     fn zone_change_discards_unexpired_distortion() {
         use kuluu_render::distortion_pass::ActiveDistortion;
-        use std::time::{Duration, Instant};
 
         let mut world = World::new();
         world.init_resource::<super::EventLog>();
-        world.insert_resource(ActiveDistortion {
-            expires_at: Some(Instant::now() + Duration::from_secs(60)),
-            strength: 1.0,
-            ..Default::default()
-        });
+        let mut distortion = ActiveDistortion::default();
+        distortion.push(live_field_fixture());
+        world.insert_resource(distortion);
         world
             .run_system_once(super::discard_distortion_on_zone_change)
             .unwrap();
-        assert!(world.resource::<ActiveDistortion>().expires_at.is_some());
+        assert_eq!(world.resource::<ActiveDistortion>().fields.len(), 1);
 
         world
             .resource_mut::<super::EventLog>()
@@ -1545,9 +1555,7 @@ mod zone_teardown_tests {
         world
             .run_system_once(super::discard_distortion_on_zone_change)
             .unwrap();
-        let distortion = world.resource::<ActiveDistortion>();
-        assert!(distortion.expires_at.is_none());
-        assert_eq!(distortion.strength, 0.0);
+        assert!(world.resource::<ActiveDistortion>().fields.is_empty());
     }
 
     #[test]

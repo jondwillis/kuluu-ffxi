@@ -180,6 +180,7 @@ fn captures_wall_wash_controls_through_production_rendering() {
         )))
         .add_plugins(crate::ffxi_particle_material::FfxiParticleMaterialPlugin)
         .init_resource::<ParticleSimulator>()
+        .init_resource::<crate::distortion_pass::ActiveDistortion>()
         .init_resource::<WallWashOff>()
         .init_resource::<crate::graphics_settings::GraphicsSettings>()
         .add_message::<crate::audio::SfxEvent>()

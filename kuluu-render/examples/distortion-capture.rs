@@ -9,7 +9,9 @@ use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat, T
 use bevy::render::view::screenshot::{save_to_disk, Capturing, Screenshot};
 use bevy::winit::WinitPlugin;
 use kuluu_render::camera::OperatorCamera;
-use kuluu_render::distortion_pass::{ActiveDistortion, DistortionPassPlugin};
+use kuluu_render::distortion_pass::{
+    ActiveDistortion, DistortionMap, DistortionPassPlugin, LiveField,
+};
 
 const SIZE: u32 = 512;
 const BASELINE_FRAME: u32 = 60;
@@ -22,6 +24,7 @@ const HOLD_SECONDS: u64 = 60;
 const STEP_SECONDS: f64 = 1.0 / 60.0;
 const MARKER_OFFSET: f32 = 1.0;
 const CAMERA_DISTANCE: f32 = 6.0;
+const FIELD_HALF_EXTENT: f32 = 0.7;
 
 #[derive(Resource)]
 struct CaptureTarget {
@@ -130,9 +133,28 @@ fn capture(
         };
     }
     if *frame == ENABLE_FRAME {
-        distortion.started_at = Instant::now();
-        distortion.duration_secs = HOLD_SECONDS as f32;
-        distortion.expires_at = Some(Instant::now() + Duration::from_secs(HOLD_SECONDS));
+        // A soft disc stands in for the linked texture a real 0x22 def resolves from the DAT.
+        const R: u32 = 64;
+        let mut rgba = vec![0u8; (R * R * 4) as usize];
+        for y in 0..R {
+            for x in 0..R {
+                let d = ((x as f32 - R as f32 / 2.0).powi(2) + (y as f32 - R as f32 / 2.0).powi(2))
+                    .sqrt()
+                    / (R as f32 / 2.0);
+                let a = ((1.0 - d) * 255.0).clamp(0.0, 255.0) as u8;
+                let i = ((y * R + x) as usize) * 4;
+                rgba[i..i + 4].copy_from_slice(&[255, 255, 255, a]);
+            }
+        }
+        distortion.push(LiveField {
+            center: Vec3::Y,
+            half_extent: Vec2::splat(FIELD_HALF_EXTENT),
+            haze_offset_x: 0.1,
+            started_at: Instant::now(),
+            duration_secs: HOLD_SECONDS as f32,
+            envelope: None,
+            map: std::sync::Arc::new(DistortionMap::new(R, R, rgba)),
+        });
     }
     if *frame == RESET_FRAME {
         *distortion = ActiveDistortion::default();

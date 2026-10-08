@@ -1,43 +1,69 @@
-// Screen-space distortion (haze/smear) pass — retail's 0x22 Distortion element. It samples the
-// previous frame's processed output with a horizontal bias so motion leaves a directional ghost,
-// composited over the current frame at low alpha (research/xim GLDrawer.kt hazeSwitch +
-// XimParticleShader.kt frag_hazePosition; the 75/25 current/previous blend is approximated here by
-// sampling last frame's buffer directly).
-struct PassUniform {
-    offset: vec2<f32>,   // x = sec2 0x32 horizontalOffset, y = unused
-    intensity: f32,      // ghost alpha (retail forces ~0.25)
-    copy_mode: f32,      // >0.5 => pure capture (output the sampled texel at full alpha)
+// One haze field from a 0x22 `Distortion` generator element. The field never draws pixels of
+// its own: inside the footprint (the linked texture quad drawn at authored scale) it reads this
+// frame's scene at a horizontally shifted position and writes the shifted sample back, so there
+// is no second image of anything — displacement only, where the haze texture says so.
+
+struct FieldUniform {
+    rect_min: vec2f, // field footprint as a screen-space NDC rect
+    rect_max: vec2f,
+    haze: f32,       // sec2 0x32 HazeOffsetInitializer authored horizontal offset
+    env: f32,        // sec2 0x2D KeyFrameValueSetup envelope sampled at this frame
 };
 
-@group(0) @binding(0) var<uniform> u: PassUniform;
-@group(0) @binding(1) var src_tex: texture_2d<f32>;
-@group(0) @binding(2) var src_sampler: sampler;
+@group(0) @binding(0) var<uniform> u_field: FieldUniform;
+// Same-frame scene (a copy taken before any field wrote), filterable.
+@group(0) @binding(1) var scene: texture_2d<f32>;
+@group(0) @binding(2) var scene_sampler: sampler;
+// The element's own linked texture, RGBA alpha = where inside the footprint haze acts.
+@group(1) @binding(0) var haze_map: texture_2d<f32>;
+@group(1) @binding(1) var map_sampler: sampler;
 
 struct VsOut {
-    @builtin(position) pos: vec4<f32>,
-    @location(0) uv: vec2<f32>,
+    @builtin(position) pos: vec4f,
 };
 
-// Full-screen triangle in clip space (covers the viewport with three verts, no index buffer).
+const TRIANGLE: array<vec2f, 3> = array<vec2f, 3>(
+    vec2f(-1.0, -1.0),
+    vec2f(3.0, -1.0),
+    vec2f(-1.0, 3.0),
+);
+
 @vertex
 fn vs(@builtin(vertex_index) vi: u32) -> VsOut {
-    let p = array<vec2<f32>, 3>(
-        vec2(-1.0, -3.0),
-        vec2(-1.0, 1.0),
-        vec2(3.0, 1.0),
-    );
     var out: VsOut;
-    out.pos = vec4<f32>(p[vi], 0.0, 1.0);
-    out.uv = p[vi] * vec2(0.5, -0.5) + vec2(0.5);
+    out.pos = vec4f(TRIANGLE[vi], 0.0, 1.0);
     return out;
 }
 
 @fragment
-fn fs(in: VsOut) -> @location(0) vec4<f32> {
-    let uv = in.uv + u.offset;
-    let c = textureSample(src_tex, src_sampler, clamp(uv, vec2(0.0), vec2(1.0)));
-    if (u.copy_mode > 0.5) {
-        return vec4<f32>(c.rgb, 1.0);
+fn fs(in: VsOut) -> @location(0) vec4f {
+    if (u_field.env <= 0.0) {
+        discard;
     }
-    return vec4<f32>(c.rgb, c.a * u.intensity);
+    let res = textureDimensions(scene, 0i);
+    let uv = in.pos.xy / vec2f(f32(res.x), f32(res.y));
+    let ndc = uv * vec2f(2.0, -2.0) + vec2f(-1.0, 1.0);
+    if (ndc.x < u_field.rect_min.x || ndc.x > u_field.rect_max.x
+        || ndc.y < u_field.rect_min.y || ndc.y > u_field.rect_max.y) {
+        discard;
+    }
+
+    let half = max((u_field.rect_max - u_field.rect_min) * 0.5, vec2f(1e-4));
+    let q = (ndc - (u_field.rect_min + u_field.rect_max) * 0.5) / half; // [-1,1] over the quad
+    let map_uv = clamp(q * vec2f(0.5, -0.5) + 0.5, vec2f(0.0), vec2f(1.0));
+
+    let texel_x = 1.0 / f32(textureDimensions(haze_map, 0i).x);
+    let m = textureSampleLevel(haze_map, map_sampler, map_uv, 0.0).a;
+    if (m <= 0.0) {
+        discard; // outside the texture's silhouette: the pixel was and stays untouched
+    }
+
+    // Displacement follows the map alpha's horizontal gradient — bend at the edges of whatever
+    // the texture paints, zero across flat regions, so a shift can never read as a copy.
+    let g = textureSampleLevel(haze_map, map_sampler, map_uv + vec2f(texel_x, 0.0), 0.0).a
+          - textureSampleLevel(haze_map, map_sampler, map_uv - vec2f(texel_x, 0.0), 0.0).a;
+    let dx = u_field.haze * u_field.env * g;
+
+    let warped = textureSampleLevel(scene, scene_sampler, uv + vec2f(dx, 0.0), 0.0);
+    return vec4f(warped.rgb, clamp(m * u_field.env, 0.0, 1.0));
 }

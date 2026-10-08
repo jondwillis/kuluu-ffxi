@@ -2982,8 +2982,9 @@ mod tests {
 
     #[test]
     fn room_exit_discards_unexpired_distortion() {
-        use kuluu_render::distortion_pass::ActiveDistortion;
-        use std::time::{Duration, Instant};
+        use kuluu_render::distortion_pass::{ActiveDistortion, DistortionMap, LiveField};
+        use std::sync::Arc;
+        use std::time::Instant;
 
         let mut app = App::new();
         app.init_resource::<TrackedEntities>()
@@ -2993,18 +2994,24 @@ mod tests {
             .init_resource::<crate::graphics_store::GraphicsPersistSuspended>()
             .init_resource::<Assets<Mesh>>()
             .init_resource::<Assets<StandardMaterial>>()
-            .insert_resource(ActiveDistortion {
-                expires_at: Some(Instant::now() + Duration::from_secs(60)),
-                strength: 1.0,
-                ..Default::default()
+            .insert_resource({
+                let mut distortion = ActiveDistortion::default();
+                distortion.push(LiveField {
+                    center: Vec3::ZERO,
+                    half_extent: Vec2::ONE,
+                    haze_offset_x: 0.02,
+                    started_at: Instant::now(),
+                    duration_secs: 60.0,
+                    envelope: None,
+                    map: Arc::new(DistortionMap::new(1, 1, vec![0, 0, 0, 255])),
+                });
+                distortion
             })
             .add_systems(Update, tear_down_test_scene);
         app.world_mut().spawn(TestSceneScoped);
         app.update();
 
-        let distortion = app.world().resource::<ActiveDistortion>();
-        assert!(distortion.expires_at.is_none());
-        assert_eq!(distortion.strength, 0.0);
+        assert!(app.world().resource::<ActiveDistortion>().fields.is_empty());
     }
 
     // Everything the box borrows from production has to come back on launcher exit: the alpha kill

@@ -98,6 +98,7 @@ fn spawn(link_bindings: bool) -> App {
         .init_asset::<Image>()
         .init_asset::<FfxiParticleMaterial>()
         .init_resource::<ParticleSimulator>()
+        .init_resource::<crate::distortion_pass::ActiveDistortion>()
         .add_message::<SchedulerStageEvent>()
         .add_message::<crate::scheduler_runtime::ParticleSpawnTrace>()
         .add_message::<crate::audio::SfxEvent>()
