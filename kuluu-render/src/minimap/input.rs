@@ -98,6 +98,9 @@ pub fn handle_minimap_drag_input(
     let delta = pointer.delta;
     pointer.delta = Vec2::ZERO;
     pointer.left_dragged = false;
+    // Claim position-based camera aim too: while the pan owns the cursor, a
+    // near-edge position must not keep turning the chase camera.
+    pointer.cursor_pos = None;
 
     let Some(radius) = zoom.radius_yalms else {
         return;
@@ -138,7 +141,7 @@ pub fn recenter_minimap_view(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::camera::{CameraMode, ChaseCamera};
+    use crate::camera::{CameraMode, ChaseCamera, ViewFov};
     use crate::snapshot::SceneState;
     use bevy::input::mouse::MouseScrollUnit;
     use bevy::input::ButtonInput;
@@ -154,10 +157,12 @@ mod tests {
             .init_resource::<MinimapView>()
             .init_resource::<MinimapZoom>()
             .init_resource::<Bindings>()
+            .init_resource::<crate::input_mode::InputMode>()
             .init_resource::<ButtonInput<KeyCode>>()
             .init_resource::<SceneState>()
             .init_resource::<CameraMode>()
             .init_resource::<ChaseCamera>()
+            .init_resource::<ViewFov>()
             .insert_resource(MinimapHoverGate { hovered })
             .insert_resource(MousePointer {
                 wheel: 5.0,
@@ -215,8 +220,10 @@ mod tests {
         );
     }
 
+    /// A wheel the minimap claims stays out of both camera channels: the chase rig's distance and
+    /// the view zoom's projection focal.
     #[test]
-    fn hovered_scroll_does_not_move_camera_distance() {
+    fn hovered_scroll_steals_the_wheel_from_the_cameras_zoom() {
         let mut app = zoom_test_app(true);
         app.insert_resource(CameraMode::Chase);
         let initial = app.world().resource::<ChaseCamera>().distance;
@@ -230,7 +237,13 @@ mod tests {
         assert_eq!(
             app.world().resource::<ChaseCamera>().distance,
             initial,
-            "scrolling over the minimap must not zoom the chase camera"
+            "scrolling over the minimap must not move the chase camera"
+        );
+        let rest_focal = ViewFov::default().focal_length;
+        assert_eq!(
+            app.world().resource::<ViewFov>().focal_length,
+            rest_focal,
+            "the claimed wheel must leave the view zoom alone too"
         );
         assert_eq!(
             app.world().resource::<MinimapZoom>().radius_yalms,

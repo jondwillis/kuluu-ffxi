@@ -214,6 +214,215 @@ impl Default for ChaseCamera {
     }
 }
 
+/// The operator camera's projection focal length — the live value the view zoom
+/// (mouse wheel, PgUp/PgDn, `.`, `,`) integrates and [`apply_view_fov_system`] turns into the
+/// vertical FOV it pushes each frame. Runtime-only: `GraphicsSettings::fov_deg` is the base it
+/// re-seats from (in focal units), so a menu FOV change wins over a held zoom. Zooming the window (not the chase
+/// distance) keeps world-space nameplate billboards constant on screen — their size derives from
+/// `tan(fov/2)` (nameplate_billboard.rs), which is how retail's focal-driven projection behaves.
+#[derive(Resource)]
+pub struct ViewFov {
+    /// Retail's camera-manager field of the same role (`cam+0x2F4`, read by its zoom integrator
+    /// and by the projection build).
+    pub focal_length: f32,
+}
+
+impl Default for ViewFov {
+    fn default() -> Self {
+        Self {
+            focal_length: crate::graphics_settings::RETAIL_DEFAULT_FOCAL_LENGTH,
+        }
+    }
+}
+
+/// Which way [`ViewFov::step`] moves the focal length, named after the two retail zoom-key slots
+/// it comes from (device `0x3F` actions `0x4F` / `0x50`, `FFXiMain.dll retail-2026-09`
+/// RVA `0x1F812` / `0x1F86A`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZoomArm {
+    /// Lengthens the focal toward [`ViewFov::MAX_FOCAL`] — narrower fov, closer view.
+    In,
+    /// Shortens it toward [`ViewFov::MIN_FOCAL`] — wider fov, further view.
+    Out,
+}
+
+impl ViewFov {
+    /// The one rate retail's zoom has: focal units per `1/60 s` frame tick (`FFXiMain.dll
+    /// retail-2026-09` `.rdata` RVA `0x32A3E8` = `6.0f`). Keys (RVA `0x1F82F`, `0x1F87F`) and both
+    /// mouse-wheel arms (RVA `0x1F8D5`, `0x1F91D`) all apply exactly this same product — there is
+    /// no separate wheel sensitivity, only a longer or shorter *duration* it runs for (M34).
+    /// Because the tick counts elapsed frames, multiplying by it keeps the focal moving at
+    /// 6 × 60 = **360 focal per second** at any refresh rate (`tick` is `delta_secs × 60`, M29).
+    pub const FOCAL_STEP_PER_TICK: f32 = 6.0;
+
+    /// Frames the mouse-wheel accumulator owes per notch, i.e. how many frames of that one rate a
+    /// notch buys (`FFXiMain.dll retail-2026-09` RVA `0x25E210`: `acc += notches * 2`, fed by the
+    /// raw zDelta/120 at RVA `0x1DD8`; drained toward zero once per frame from RVA `0x25E240`).
+    pub const WHEEL_FRAMES_PER_NOTCH: i32 = 2;
+
+    /// Zoomed fully out (wide): focal clamp `242.0f` (`FFXiMain.dll retail-2026-09` `.rdata
+    /// 0x32A3D4`, M17) ≈ 76.9°.
+    pub const MIN_FOCAL: f32 = 242.0;
+
+    /// Zoomed fully in (tight): focal clamp `900.0f` (`FFXiMain.dll retail-2026-09` `.rdata
+    /// 0x32A3D8`, M17) ≈ 24.1°.
+    pub const MAX_FOCAL: f32 = 900.0;
+
+    /// The projection's vertical fov, in degrees, for a focal length over retail's fixed
+    /// projection half-height: `FOV = 2·atan(192/focal)` (M17/Q7 pass of the disassembly docs; the
+    /// formula itself is [web]-tier — XIClient `CMoElem::VirtOt1`, and it is what
+    /// `graphics_settings`' derived default already ships on).
+    pub fn deg_for_focal(focal_length: f32) -> f32 {
+        (2.0 * (crate::graphics_settings::RETAIL_PROJECTION_HALF_HEIGHT / focal_length).atan())
+            .to_degrees()
+    }
+
+    /// Inverse of [`Self::deg_for_focal`]: the focal length that gives `deg`, for re-seating the
+    /// zoom on a menu FOV. Not clamped to the band — retail's clamps live in the key integration,
+    /// and the menu row is product freedom beyond them.
+    pub fn focal_for_deg(deg: f32) -> f32 {
+        crate::graphics_settings::RETAIL_PROJECTION_HALF_HEIGHT / (deg.to_radians() * 0.5).tan()
+    }
+
+    /// The single zoom rate applied for one frame: `focal ± tick × 6.0` toward the arm's band end,
+    /// returning the new focal and whether this frame hit that end (retail tests each bound with an
+    /// x87 compare immediately after adding — `FFXiMain.dll retail-2026-09` RVA `0x1F83E` against
+    /// `900.0`, `0x1F88E`/`0x1F92C` against `242.0` — and clamping the stored value, M34). Passing
+    /// the elapsed frame count (M29: `delta_secs × 60`) reproduces retail's step exactly; one notch
+    /// of the wheel is just this same call running for [`Self::WHEEL_FRAMES_PER_NOTCH`] frames.
+    pub fn step(focal_length: f32, tick_frames: f32, arm: ZoomArm) -> (f32, bool) {
+        let step = Self::FOCAL_STEP_PER_TICK * tick_frames;
+        match arm {
+            ZoomArm::In => {
+                let next = focal_length + step;
+                if next >= Self::MAX_FOCAL {
+                    (Self::MAX_FOCAL, true)
+                } else {
+                    (next, false)
+                }
+            }
+            ZoomArm::Out => {
+                let next = focal_length - step;
+                if next <= Self::MIN_FOCAL {
+                    (Self::MIN_FOCAL, true)
+                } else {
+                    (next, false)
+                }
+            }
+        }
+    }
+
+    /// One frame of the both-zoom-keys-held path. Retail flags the pair (`[0x10456D84] = 1`, RVA
+    /// `0x1F806`) and from then on, while the flag stands, eases toward neutral by a quarter of the
+    /// remaining difference — `ease = (350 − focal) × 0.25` (`.rdata` RVAs `0x32A3DC`, `0x329CE4`) —
+    /// unless that step has fallen inside one focal unit (`−1.0 < ease < 1.0`, `.rdata` RVAs
+    /// `0x32A3F0`, `0x32961C`), when it stores exactly `350.0` and clears the flag (RVA
+    /// `0x1F76E..0x1F7C1`). Returns the new focal and whether it settled, i.e. whether retail
+    /// cleared its flag (`FFXiMain.dll retail-2026-09`, M34; this replaces the "unreachable ease"
+    /// reading in the earlier M17 pass — the ease is ordinary behaviour for any real gap).
+    pub fn ease_to_neutral(focal_length: f32) -> (f32, bool) {
+        let neutral = crate::graphics_settings::RETAIL_DEFAULT_FOCAL_LENGTH;
+        let ease = (neutral - focal_length) * Self::NEUTRAL_EASE_FRACTION;
+        if ease.abs() < Self::NEUTRAL_SNAP_BELOW_FOCAL {
+            (neutral, true)
+        } else {
+            (focal_length + ease, false)
+        }
+    }
+
+    /// Ease fraction of the remaining difference toward neutral, applied per frame on retail's
+    /// both-keys path (`FFXiMain.dll retail-2026-09` `.rdata` RVA `0x329CE4`).
+    const NEUTRAL_EASE_FRACTION: f32 = 0.25;
+
+    /// The step below which retail stops easing and stores neutral exactly, in focal units — its two
+    /// convergence compares bracket the ease at `.rdata` RVAs `0x32A3F0` and `0x32961C`
+    /// (`FFXiMain.dll retail-2026-09`).
+    const NEUTRAL_SNAP_BELOW_FOCAL: f32 = 1.0;
+
+    /// The vertical fov in degrees that `focal_length` projects to.
+    pub fn deg(&self) -> f32 {
+        Self::deg_for_focal(self.focal_length)
+    }
+}
+
+/// Retail's mouse-wheel zoom backlog: one signed frame count, `+= 2 × notches` as each
+/// `WM_MOUSEWHEEL` arrives (`FFXiMain.dll retail-2026-09` RVA `0x1DD8` divides raw zDelta by 120 and
+/// RVA `0x25E210` stores `acc += notches × 2` into `[0x1067A298]`), drained toward zero by one per
+/// frame (RVA `0x25E240`, called once from the frame function at RVA `0x1295A` via thunk RVA
+/// `0x25E0E0`), and cleared outright when a zoom arm hits a band end or a zoom key runs (RVA
+/// `0x25E230`, called from RVAs `0x1F8A7`, `0x1F8FF`, `0x1F945`). Holding a wheel therefore buys
+/// [`ViewFov::WHEEL_FRAMES_PER_NOTCH`] frames of the same focal rate the keys use — retail has one
+/// rate and two durations (M34).
+#[derive(Resource, Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct WheelZoom {
+    /// Retail's `[0x1067A298]`: frames of zoom still owed, sign = direction.
+    frames_owed: i32,
+}
+
+impl WheelZoom {
+    /// Notches in — retail's wheel adder (`FFXiMain.dll retail-2026-09` RVA `0x25E210`).
+    pub fn add_notches(&mut self, notches: i32) {
+        self.frames_owed += ViewFov::WHEEL_FRAMES_PER_NOTCH * notches;
+    }
+
+    /// The arm the owed frames drive — positive owes zoom-in (retail's `acc > 0` arm adds to the
+    /// focal at RVA `0x1F8D5`), negative owes zoom-out (`acc < 0`, RVA `0x1F91D`).
+    pub fn armed(&self) -> Option<ZoomArm> {
+        match self.frames_owed {
+            n if n > 0 => Some(ZoomArm::In),
+            n if n < 0 => Some(ZoomArm::Out),
+            _ => None,
+        }
+    }
+
+    /// One frame's drain toward zero, exactly as retail's per-frame decrement does it (RVA
+    /// `0x25E240`: `acc < 0 → acc + 1`, `acc > 0 → acc - 1`).
+    pub fn drain_one(&mut self) {
+        if self.frames_owed > 0 {
+            self.frames_owed -= 1;
+        } else if self.frames_owed < 0 {
+            self.frames_owed += 1;
+        }
+    }
+
+    /// Retail's clear (`acc = 0`, RVA `0x25E230`): a zoom key frame, or any arm reaching its band
+    /// end, discards whatever the wheel still owed.
+    pub fn clear(&mut self) {
+        self.frames_owed = 0;
+    }
+
+    /// Frames still owed — for tests and for anything that wants to know a scroll is in flight.
+    pub fn frames_owed(&self) -> i32 {
+        self.frames_owed
+    }
+}
+
+/// Pushes [`ViewFov`] into the operator camera's projection. Skipped while a running event
+/// holds the camera: `cutscene_camera::apply_frame` owns that fov per frame (focal-driven) and
+/// restores `settings.fov_deg` on release, so a zoom write would fight it mid-cutscene.
+pub fn apply_view_fov_system(
+    mut view_fov: ResMut<ViewFov>,
+    settings: Res<GraphicsSettings>,
+    cutscene: Res<crate::cutscene::CutsceneMode>,
+    mut last_base: Local<Option<f32>>,
+    mut cam_q: Query<&mut Projection, With<OperatorCamera>>,
+) {
+    // First frame and any menu change of the base FOV re-seat the zoom on it (degrees to focal).
+    if *last_base != Some(settings.fov_deg) {
+        view_fov.focal_length = ViewFov::focal_for_deg(settings.fov_deg);
+        *last_base = Some(settings.fov_deg);
+    }
+    if cutscene.camera_locked {
+        return;
+    }
+    let Ok(mut proj) = cam_q.single_mut() else {
+        return;
+    };
+    if let Projection::Perspective(p) = &mut *proj {
+        p.fov = ViewFov::deg_for_focal(view_fov.focal_length).to_radians();
+    }
+}
+
 #[derive(Resource, Debug, Clone, Copy)]
 pub struct CameraTransition {
     pub active: bool,
@@ -709,6 +918,163 @@ mod tests {
             layers.intersects(&RenderLayers::layer(WORLD_GIZMO_LAYER)),
             "operator camera must see the gizmo overlay layer so debug \
              overlays still show in the live 3D view"
+        );
+    }
+
+    #[test]
+    fn view_fov_defaults_to_the_retail_derived_value() {
+        assert_eq!(
+            ViewFov::default().focal_length,
+            crate::graphics_settings::RETAIL_DEFAULT_FOCAL_LENGTH
+        );
+        // The shipped default degree value is pinned by settings.rs's own guard test
+        // (`default_fov_derives_from_retail_focal_length`); this one pins that the resource and
+        // that constant agree through the focal conversion.
+        assert!(
+            (ViewFov::default().deg() - crate::graphics_settings::DEFAULT_FOV_DEG).abs() < 1e-4,
+            "the live zoom's default must be the retail-derived FOV"
+        );
+    }
+
+    #[test]
+    fn zoom_step_is_the_one_rate_and_clamps_at_both_band_ends() {
+        // Two frame ticks — retail's default cap — move the focal twice its per-tick step.
+        let (near, hit) = ViewFov::step(500.0, 2.0, ZoomArm::In);
+        assert_eq!((near, hit), (512.0, false));
+        let (far, hit) = ViewFov::step(500.0, 2.0, ZoomArm::Out);
+        assert_eq!((far, hit), (488.0, false));
+        let (top, hit) = ViewFov::step(ViewFov::MAX_FOCAL - 1.0, 2.0, ZoomArm::In);
+        assert_eq!((top, hit), (ViewFov::MAX_FOCAL, true));
+        let (bottom, hit) = ViewFov::step(ViewFov::MIN_FOCAL + 1.0, 2.0, ZoomArm::Out);
+        assert_eq!((bottom, hit), (ViewFov::MIN_FOCAL, true));
+    }
+
+    #[test]
+    fn one_wheel_notch_is_two_frames_of_the_same_rate_as_a_held_key() {
+        // The wheel buys duration, not a different step: `acc += 2` per notch, drained by 1/frame,
+        // each frame running the same `tick × 6.0` (`FFXiMain.dll retail-2026-09` RVAs 0x25E210 /
+        // 0x25E240 / 0x1F8D5). Three notches therefore spend six frames of that rate.
+        let mut wheel = WheelZoom::default();
+        wheel.add_notches(3);
+        assert_eq!(wheel.frames_owed(), 6);
+
+        let mut focal = 400.0;
+        let mut frames_zooming = 0;
+        for _ in 0..12 {
+            if let Some(arm) = wheel.armed() {
+                let (next, hit_clamp) = ViewFov::step(focal, 1.0, arm);
+                focal = next;
+                frames_zooming += 1;
+                if hit_clamp {
+                    wheel.clear();
+                }
+            }
+            wheel.drain_one();
+        }
+        assert_eq!(frames_zooming, 6);
+        assert_eq!(focal, 400.0 + 6.0 * ViewFov::FOCAL_STEP_PER_TICK);
+
+        // A zoom-key frame discards whatever the wheel still owed, so the two never stack up.
+        wheel.add_notches(2);
+        wheel.clear();
+        assert_eq!(wheel.armed(), None);
+    }
+
+    #[test]
+    fn the_wheel_counter_drains_toward_zero_from_either_sign() {
+        let mut wheel = WheelZoom::default();
+        wheel.add_notches(-1);
+        assert_eq!(wheel.armed(), Some(ZoomArm::Out));
+        for _ in 0..5 {
+            wheel.drain_one();
+        }
+        assert_eq!(wheel.frames_owed(), 0);
+        assert_eq!(wheel.armed(), None);
+    }
+
+    #[test]
+    fn both_zoom_keys_ease_to_neutral_and_then_settle_on_it() {
+        // `FFXiMain.dll retail-2026-09` RVA 0x1F76E: the ease keeps running until its own step falls
+        // inside one focal unit, and only then does it settle on neutral.
+        assert_eq!(ViewFov::ease_to_neutral(500.0), (462.5, false));
+        let mut focal = ViewFov::MIN_FOCAL;
+        let mut settled = false;
+        for _ in 0..40 {
+            (focal, settled) = ViewFov::ease_to_neutral(focal);
+            if settled {
+                break;
+            }
+        }
+        assert!(settled, "the ease must settle within a few dozen frames");
+        assert_eq!(focal, crate::graphics_settings::RETAIL_DEFAULT_FOCAL_LENGTH);
+    }
+
+    #[test]
+    fn focal_band_maps_to_the_documented_retail_fov_ends() {
+        // 242 ≈ 76.9° wide, 350 ≈ 57.5°, 900 ≈ 24.1° tight (M17) — the web-tier formula's
+        // published values, pinned so a change here cannot silently drift.
+        for &(focal, deg) in &[(242.0, 76.9), (350.0, 57.5), (900.0, 24.1)] {
+            let got = ViewFov::deg_for_focal(focal);
+            assert!(
+                (got - deg).abs() < 0.1,
+                "{focal} focal should project to ≈{deg}°, got {got:.2}"
+            );
+        }
+        let round_trip = ViewFov::focal_for_deg(ViewFov::deg_for_focal(437.0));
+        assert!((round_trip - 437.0).abs() < 1e-3);
+    }
+
+    /// An unrelated `GraphicsSettings` change must not stomp a live view zoom
+    /// (the blink seen while walking with the Commands UI open): only a real
+    /// `fov_deg` change re-seats, so the menu FOV row still wins.
+    #[test]
+    fn unrelated_settings_changes_cannot_stomp_a_view_zoom() {
+        use crate::graphics_settings::{apply_projection_system, GraphicsSettings};
+        let mut app = App::new();
+        app.init_resource::<GraphicsSettings>()
+            .init_resource::<ViewFov>()
+            .init_resource::<crate::cutscene::CutsceneMode>();
+        let cam = app
+            .world_mut()
+            .spawn((
+                OperatorCamera,
+                Projection::from(PerspectiveProjection {
+                    fov: crate::graphics_settings::DEFAULT_FOV_DEG.to_radians(),
+                    ..default()
+                }),
+            ))
+            .id();
+        app.add_systems(
+            Update,
+            (apply_projection_system, apply_view_fov_system).chain(),
+        );
+        // Frame 1 establishes the re-seat baseline.
+        app.update();
+        app.world_mut().resource_mut::<ViewFov>().focal_length = ViewFov::focal_for_deg(80.0);
+        // A settings write that leaves fov_deg alone — what every menu key
+        // used to do on its way through handle_menu_key's deref-mut handoffs.
+        app.world_mut()
+            .resource_mut::<GraphicsSettings>()
+            .bloom_intensity += 0.01;
+        app.update();
+        let fov_after_unrelated = {
+            let Projection::Perspective(p) = app.world().get::<Projection>(cam).unwrap() else {
+                panic!("perspective projection expected")
+            };
+            p.fov.to_degrees()
+        };
+        assert!(
+            (fov_after_unrelated - 80.0).abs() < 1e-3,
+            "a held zoom must survive unrelated settings changes, got {fov_after_unrelated}"
+        );
+        app.world_mut().resource_mut::<GraphicsSettings>().fov_deg = 45.0;
+        app.update();
+        let Projection::Perspective(p) = app.world().get::<Projection>(cam).unwrap() else {
+            panic!("perspective projection expected")
+        };
+        assert!(
+            (p.fov.to_degrees() - 45.0).abs() < 1e-3,
+            "a base fov_deg change must re-seat the zoom"
         );
     }
 }

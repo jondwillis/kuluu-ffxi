@@ -65,9 +65,7 @@ use tokio::runtime::Handle as RtHandle;
 use crate::launcher::Defaults;
 
 use self::bridge::NativeSource;
-use self::input::{
-    AutoRun, CameraAutoRecenter, CommandTx, HeadingTurnAccum, LocalPlayerPrediction,
-};
+use self::input::{AutoRun, CommandTx, HeadingTurnAccum, LocalPlayerPrediction};
 use self::launcher_ui::{LoginErrorMsg, PendingConnect};
 
 fn drive_feathers_cursor(
@@ -582,7 +580,6 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
 
     app.insert_resource(Time::<Fixed>::from_hz(60.0))
         .init_resource::<AutoRun>()
-        .init_resource::<CameraAutoRecenter>()
         .init_resource::<HeadingTurnAccum>()
         .init_resource::<LocalPlayerPrediction>()
         .init_resource::<entity_list_hud::EntityListScroll>()

@@ -607,6 +607,12 @@ fn default_nr_local_tone() -> f32 {
 fn default_nr_structure() -> f32 {
     1.0
 }
+fn default_camera_leash_yalms() -> f32 {
+    DEFAULT_CAMERA_LEASH_YALMS
+}
+fn default_camera_spring() -> bool {
+    true
+}
 
 #[derive(Resource, Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct GraphicsSettings {
@@ -712,12 +718,20 @@ pub struct GraphicsSettings {
     /// 1.0x). Applied via bevy's UiScale by apply_ui_scale_system.
     #[serde(default = "default_ui_scale")]
     pub ui_scale: f32,
-    /// Camera position-spring + boom easing. OFF by default while the
-    /// accel-driven UI jitter is under investigation (2026-08-27: disabling
-    /// this empirically killed the every-other-frame HUD jitter). Toggled in
-    /// the Debug menu; persisted here so the choice sticks.
-    #[serde(default)]
+    /// Camera spring (camera_collision.rs resolve_camera): the eye's
+    /// start/stop lag — movement loads it (a slower start), the eye pins
+    /// slightly behind while moving, follows, and catches up at the end. The
+    /// pull rate is how long the pin takes. Separate from the Camera_leash
+    /// row, which is the focus's pause box. On by default, the normal client
+    /// behaviour; persisted, a config from before the flip reads on.
+    #[serde(default = "default_camera_spring")]
     pub camera_spring: bool,
+    /// Chase-camera focus dead zone in yalms (the Debug menu Camera_leash row,
+    /// camera_collision.rs resolve_camera): the focus holds still while the
+    /// pivot stays inside it and is dragged to its edge once the pivot
+    /// leaves. 0 turns the leash off.
+    #[serde(default = "default_camera_leash_yalms")]
+    pub camera_leash_yalms: f32,
     #[serde(default)]
     pub chat_layout: ChatLayout,
     #[serde(default)]
@@ -822,6 +836,13 @@ pub const RETAIL_DEFAULT_FOCAL_LENGTH: f32 = 350.0;
 // = retail_default_fov_deg(); f32::atan is not const fn, so the derived value is
 // pinned by the default_fov_derives_from_retail_focal_length guard test.
 pub const DEFAULT_FOV_DEG: f32 = 57.495_83;
+
+// Debug menu Camera_leash row (camera_collision.rs resolve_camera): the
+// focus dead zone in yalms. The row steps it by 0.1 yalms; 0 turns the
+// leash off, 2.0 is the row's top.
+pub const DEFAULT_CAMERA_LEASH_YALMS: f32 = 0.0;
+pub const CAMERA_LEASH_STEP_YALMS: f32 = 0.1;
+pub const CAMERA_LEASH_MAX_YALMS: f32 = 2.0;
 
 // The FOV row steps in whole degrees, so anything inside half a step of the
 // derived default is the default.
@@ -991,7 +1012,8 @@ impl GraphicsSettings {
                 fps_cap: 0,
                 fov_deg: DEFAULT_FOV_DEG,
                 ui_scale: 1.0,
-                camera_spring: false,
+                camera_spring: true,
+                camera_leash_yalms: DEFAULT_CAMERA_LEASH_YALMS,
                 chat_layout: ChatLayout::default(),
                 debug_chat: false,
                 dynamic_lights: DynamicLights::Off,
@@ -1038,7 +1060,8 @@ impl GraphicsSettings {
                 fps_cap: 0,
                 fov_deg: DEFAULT_FOV_DEG,
                 ui_scale: 1.0,
-                camera_spring: false,
+                camera_spring: true,
+                camera_leash_yalms: DEFAULT_CAMERA_LEASH_YALMS,
                 chat_layout: ChatLayout::default(),
                 debug_chat: false,
                 dynamic_lights: DynamicLights::Vanilla,
@@ -1085,7 +1108,8 @@ impl GraphicsSettings {
                 fps_cap: 0,
                 fov_deg: DEFAULT_FOV_DEG,
                 ui_scale: 1.0,
-                camera_spring: false,
+                camera_spring: true,
+                camera_leash_yalms: DEFAULT_CAMERA_LEASH_YALMS,
                 chat_layout: ChatLayout::default(),
                 debug_chat: false,
                 dynamic_lights: DynamicLights::Vanilla,
@@ -1132,7 +1156,8 @@ impl GraphicsSettings {
                 fps_cap: 0,
                 fov_deg: DEFAULT_FOV_DEG,
                 ui_scale: 1.0,
-                camera_spring: false,
+                camera_spring: true,
+                camera_leash_yalms: DEFAULT_CAMERA_LEASH_YALMS,
                 chat_layout: ChatLayout::default(),
                 debug_chat: false,
                 dynamic_lights: DynamicLights::Vanilla,
@@ -1183,7 +1208,8 @@ impl GraphicsSettings {
                 fps_cap: 0,
                 fov_deg: DEFAULT_FOV_DEG,
                 ui_scale: 1.0,
-                camera_spring: false,
+                camera_spring: true,
+                camera_leash_yalms: DEFAULT_CAMERA_LEASH_YALMS,
                 chat_layout: ChatLayout::default(),
                 debug_chat: false,
                 dynamic_lights: DynamicLights::Enhanced,
@@ -1231,7 +1257,8 @@ impl GraphicsSettings {
                 fps_cap: 0,
                 fov_deg: DEFAULT_FOV_DEG,
                 ui_scale: 1.0,
-                camera_spring: false,
+                camera_spring: true,
+                camera_leash_yalms: DEFAULT_CAMERA_LEASH_YALMS,
                 chat_layout: ChatLayout::default(),
                 debug_chat: false,
                 dynamic_lights: DynamicLights::Enhanced,
@@ -3020,7 +3047,8 @@ mod tests {
             volumetric_fog: true,
             fov_deg: 90.0,
             ui_scale: 1.0,
-            camera_spring: false,
+            camera_spring: true,
+            camera_leash_yalms: DEFAULT_CAMERA_LEASH_YALMS,
             chat_layout: ChatLayout::default(),
             debug_chat: false,
             ..Default::default()

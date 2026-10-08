@@ -412,9 +412,14 @@ fn handle_retail_plus_row(
     use kuluu_render::hud::menu::RETAIL_KNOCKBACK;
     #[cfg(feature = "enhanced-mob-hp-under")]
     use kuluu_render::hud::menu::RETAIL_MOB_HP_UNDER;
-    use kuluu_render::hud::menu::{DEBUG_RETAIL_LABEL, DEBUG_RETAIL_SEPARATOR, RETAIL_DLSS_MENU};
+    use kuluu_render::hud::menu::{
+        DEBUG_RETAIL_LABEL, DEBUG_RETAIL_SEPARATOR, RETAIL_CAMERA_LEASH, RETAIL_DLSS_MENU,
+    };
     match label {
         DEBUG_RETAIL_SEPARATOR | DEBUG_RETAIL_LABEL => true,
+        // Number row: the value moves with Left/Right, so confirm does
+        // nothing rather than fall through to toggle_debug_panel.
+        RETAIL_CAMERA_LEASH => true,
         RETAIL_DLSS_MENU => {
             if !graphics.dlss_supported {
                 push_system_chat_line(
@@ -833,10 +838,10 @@ pub(super) fn handle_menu_key(
         }
     }
 
-    // Debug menu: the Volume row is a 0..=100 number adjusted with Left/Right.
-    // Every other Debug row is a toggle handled on the confirm key, so only
-    // Volume consumes arrows here; anything else falls through to normal list
-    // navigation.
+    // Debug menu: the Volume and Camera_leash rows are numbers adjusted with
+    // Left/Right. Every other Debug row is a toggle handled on the confirm
+    // key, so only those two rows consume arrows here; anything else falls
+    // through to normal list navigation.
     if matches!(kind, MenuKind::Debug) {
         let label = kuluu_render::hud::menu::entry_label(kind, cursor, dynamic);
         if label == kuluu_render::hud::menu::DEBUG_VOLUME {
@@ -848,6 +853,23 @@ pub(super) fn handle_menu_key(
                 audio_mute.cycle_master(1);
                 return None;
             }
+        }
+        if label == kuluu_render::hud::menu::RETAIL_CAMERA_LEASH {
+            let dir = if bindings.matches_logical(Action::NavLeft, key) {
+                -1
+            } else if bindings.matches_logical(Action::NavRight, key) {
+                1
+            } else {
+                return None;
+            };
+            let units = (graphics.camera_leash_yalms
+                / kuluu_render::graphics_settings::CAMERA_LEASH_STEP_YALMS)
+                .round() as i32
+                + dir;
+            graphics.camera_leash_yalms = (units.max(0) as f32
+                * kuluu_render::graphics_settings::CAMERA_LEASH_STEP_YALMS)
+                .min(kuluu_render::graphics_settings::CAMERA_LEASH_MAX_YALMS);
+            return None;
         }
     }
 
