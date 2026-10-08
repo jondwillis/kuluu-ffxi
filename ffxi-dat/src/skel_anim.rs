@@ -184,7 +184,22 @@ pub fn parse(id: DatId, data: &[u8]) -> SkeletonAnimation {
 
         let rotation = read_sequences(data, &mut pos, 4, num_frames);
         let translation = read_sequences(data, &mut pos, 3, num_frames);
-        let scale = read_sequences(data, &mut pos, 3, num_frames);
+        let scale = read_sequences(data, &mut pos, 3, num_frames).map(|mut channels| {
+            // A constant-only scale channel reading exactly zero is an *unwritten* channel, not a bone scaled
+            // to nothing. `hum_` joint 89 reads that way in the shipped locomotion clips (`idl1`/`wlk1`/
+            // `mvl1`/`mvr1`): its world basis measured exactly 0.0 the frame one of them owned the bone, taking
+            // joints 90-93 below it with it — the upper body vanishing mid-strafe. Authored identities read as
+            // (1,1,1) and animated channels keep their values verbatim (shipped motion reaches -0.033 to 1.31),
+            // so this is only about reading "unused": see `zero_scale_constants_read_as_identity`.
+            for channel in &mut channels {
+                if let Sequence::Const(value) = channel {
+                    if *value == 0.0 {
+                        *value = 1.0;
+                    }
+                }
+            }
+            channels
+        });
 
         let (Some(rotation), Some(translation), Some(scale)) = (rotation, translation, scale)
         else {
@@ -294,6 +309,92 @@ mod tests {
         assert_eq!(set[2].translation, [20.0, 5.0, 7.0]);
 
         assert_eq!(set[0].scale, [1.0, 1.0, 1.0]);
+    }
+
+    /// One joint, translation as constants (so the layout is fixed at 94 bytes), and a caller-chosen scale
+    /// channel setup; an optional two-frame array for X sits in the pool right after the entry.
+    fn anim_scale_case(
+        scale_offsets: [i32; 3],
+        scale_consts: [f32; 3],
+        x_array: Option<[f32; 2]>,
+    ) -> Vec<u8> {
+        let mut b = Vec::new();
+        pu16(&mut b, 0);
+        pu16(&mut b, 1);
+        pu16(&mut b, 2); // num_frames
+        pf(&mut b, 1.0); // key_frame_duration
+
+        pu32(&mut b, 7); // joint index
+
+        for _ in 0..4 {
+            pi32(&mut b, 0); // rotation: constant-only
+        }
+        pf(&mut b, 0.0);
+        pf(&mut b, 0.0);
+        pf(&mut b, 0.0);
+        pf(&mut b, 1.0);
+
+        for _ in 0..3 {
+            pi32(&mut b, 0); // translation: constant-only
+        }
+        pf(&mut b, 0.0); // authored zero — must stay zero (the rule is scale-only)
+        pf(&mut b, 5.0);
+        pf(&mut b, 7.0);
+
+        for o in scale_offsets {
+            pi32(&mut b, o);
+        }
+        for c in scale_consts {
+            pf(&mut b, c);
+        }
+        assert_eq!(b.len(), POOL_START + 4 + 32 + 24 + 24);
+        if let Some([a, c]) = x_array {
+            pf(&mut b, a);
+            pf(&mut b, c);
+        } else {
+            b.resize(b.len() + 8, 0);
+        }
+        b
+    }
+
+    /// A scale channel that is constant-only and zero is an unwritten channel: the shipped Hume skeleton's
+    /// joint 89 is keyed that way by `idl1`/`wlk1`/`mvl1`/`mvr1`, and applying the literal zeros collapsed that
+    /// bone's basis to nothing (upper body vanishing whenever a locomotion clip owned it). Other clips carry
+    /// constant (1,1,1), so this is about reading "unused" correctly, not about missing data.
+    #[test]
+    fn zero_scale_constants_read_as_identity() {
+        let anim = parse(
+            DatId::from_str("wlk1"),
+            &anim_scale_case([0, 0, 0], [0.0, 0.0, 0.0], None),
+        );
+        let set = anim.key_frame_sets.get(&7).unwrap();
+        assert_eq!(set[0].scale, [1.0, 1.0, 1.0]);
+        // Scoped to scale: an authored zero translation constant is real data and stays zero.
+        assert_eq!(set[0].translation, [0.0, 5.0, 7.0]);
+
+        let ones = parse(
+            DatId::from_str("cm00"),
+            &anim_scale_case([0, 0, 0], [1.0, 1.0, 1.0], None),
+        );
+        assert_eq!(
+            ones.key_frame_sets.get(&7).unwrap()[0].scale,
+            [1.0, 1.0, 1.0]
+        );
+    }
+
+    /// Only constant-only channels get that treatment: a key array is authored motion, whatever it contains
+    /// (shipped clips animate scale from -0.033 to 1.31).
+    #[test]
+    fn animated_scale_channels_keep_their_values() {
+        let pool_index = ((POOL_START + 4 + 32 + 24 + 24 - POOL_START) / 4) as i32;
+        let anim = parse(
+            DatId::from_str("gh01"),
+            &anim_scale_case([pool_index, 0, 0], [0.0, 0.0, 0.0], Some([-0.5, 2.0])),
+        );
+        let set = anim.key_frame_sets.get(&7).unwrap();
+        assert_eq!((set[0].scale[0], set[1].scale[0]), (-0.5, 2.0));
+        assert_eq!(set[0].scale[1], 1.0);
+        assert_eq!(set[1].scale[2], 1.0);
     }
 
     #[test]

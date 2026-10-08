@@ -139,7 +139,15 @@ pub struct Cib {
     /// World/Actor/SkeletalMeshActor.cpp SkeletalMeshActor::GetUpperBodyDatIndex), so a shield swaps in a variant
     /// with its own joint count.
     pub is_shield: u8,
-    pub weapon_constrain: u8,
+
+    /// The Info standard-joint byte (`research/xim resource/InfoSection.kt readInfoDefinition`,
+    /// `nullIf0xFF`): a reference slot in the actor's own skeleton naming this model's
+    /// weapon-handle joint. Measured on the retail install, Hume references 112..125 name bones
+    /// 3,4,6,7,9,... - one per weapon animation type - and each main-hand model's mesh binds to that
+    /// joint's child: a dagger (`motion_index` 3, byte `0x74`) names reference 116 = joint 9 and
+    /// binds to joint 10. While the actor is display-engaged retail re-parents this joint onto the
+    /// holding hand (`research/xim resource/SkeletonInstance.kt computeJointParentOverrides`).
+    pub standard_joint: Option<u8>,
     pub unknown2: u8,
     pub weapon_unknown3: u8,
 
@@ -181,7 +189,7 @@ impl Cib {
             motion_index: body[0x03],
             motion_option: body[0x04],
             is_shield: body[0x05],
-            weapon_constrain: body[0x06],
+            standard_joint: (body[0x06] != CIB_UNSET).then_some(body[0x06]),
             unknown2: body[0x07],
             weapon_unknown3: body[0x08],
             body_armour_waist: body[0x09],

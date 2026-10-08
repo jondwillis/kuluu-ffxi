@@ -302,21 +302,20 @@ pub fn idle_animation_id(inputs: &ActorAnimInputs) -> Vec<DatId> {
     animation_mode_variant(DatId::from_str("idl?"), inputs.idle_mode, "dl")
 }
 
-pub fn movement_direction(forward_vel: f32, strafe_vel: f32) -> Direction {
-    let speed_sq = forward_vel * forward_vel + strafe_vel * strafe_vel;
-    if speed_sq <= 1e-5 {
-        return Direction::None;
-    }
+// The travel speed below which xim stops classifying at all (Actor.kt getMovementDirection's
+// `magnitudeSquare() <= 1e-5`), squared units.
+const STILL_SPEED_SQ: f32 = 1e-5;
 
-    let inv = 1.0 / speed_sq.sqrt();
+/// research/xim Actor.kt getMovementDirection's bucketing, applied to the two cosines a caller has
+/// already resolved on its reference axes. xim's own comment: "Prefer to run forward > horizontal > backward".
+fn classify_travel(cos_angle: f32, lateral_cos: f32) -> Direction {
+    const FORWARD_COS_MIN: f32 = 0.25;
+    const BACKWARD_COS_MAX: f32 = -0.75;
 
-    let cos_angle = forward_vel * inv;
-
-    if cos_angle >= 0.25 {
+    if cos_angle >= FORWARD_COS_MIN {
         Direction::Forward
-    } else if cos_angle >= -0.75 {
-        let horizontal_cos = strafe_vel * inv;
-        if horizontal_cos >= 0.0 {
+    } else if cos_angle >= BACKWARD_COS_MAX {
+        if lateral_cos >= 0.0 {
             Direction::Right
         } else {
             Direction::Left
@@ -324,6 +323,44 @@ pub fn movement_direction(forward_vel: f32, strafe_vel: f32) -> Direction {
     } else {
         Direction::Backward
     }
+}
+
+pub fn movement_direction(forward_vel: f32, strafe_vel: f32) -> Direction {
+    let speed_sq = forward_vel * forward_vel + strafe_vel * strafe_vel;
+    if speed_sq <= STILL_SPEED_SQ {
+        return Direction::None;
+    }
+
+    let inv = 1.0 / speed_sq.sqrt();
+    classify_travel(forward_vel * inv, strafe_vel * inv)
+}
+
+/// research/xim Actor.kt getMovementDirection measures travel against the direction to the actor's
+/// target, not its own facing — that is the form the swing routines need (`moving_swing_routine`).
+/// `bearing` is the flat vector from the mover to that target. A degenerate bearing has no axis to
+/// classify on, so it answers like xim's own "no locked target and not strafing" branch: `None`.
+pub fn movement_direction_toward(
+    vel_x: f32,
+    vel_z: f32,
+    bearing_x: f32,
+    bearing_z: f32,
+) -> Direction {
+    let bearing_sq = bearing_x * bearing_x + bearing_z * bearing_z;
+    if bearing_sq <= STILL_SPEED_SQ || (vel_x * vel_x + vel_z * vel_z) <= STILL_SPEED_SQ {
+        return Direction::None;
+    }
+
+    let inv_speed = 1.0 / (vel_x * vel_x + vel_z * vel_z).sqrt();
+    let vx = vel_x * inv_speed;
+    let vz = vel_z * inv_speed;
+    // xim's lateral axis is bearing × UP, which in the flat XZ plane is (-bearing.z, bearing.x); a
+    // positive dot on it is travel to the target's right — the same pair combat_stance resolves an
+    // entity's own `right` from, so the Left/Right labels agree with the mvl?/mvr? clip choice.
+    let inv_bearing = 1.0 / bearing_sq.sqrt();
+    let bx = bearing_x * inv_bearing;
+    let bz = bearing_z * inv_bearing;
+
+    classify_travel(vx * bx + vz * bz, vx * -bz + vz * bx)
 }
 
 pub fn movement_animation(inputs: &ActorAnimInputs) -> Vec<DatId> {
@@ -666,6 +703,50 @@ mod tests {
         assert_eq!(movement_direction(0.0, -1.0), Direction::Left);
 
         assert_eq!(movement_direction(0.0, 0.0), Direction::None);
+    }
+
+    /// The same law measured against the vector to a target rather than the actor's own facing —
+    /// the form a travelling attacker's swing routine is chosen from. Bearing here is +X throughout.
+    #[test]
+    fn movement_direction_toward_a_target() {
+        assert_eq!(
+            movement_direction_toward(1.0, 0.0, 1.0, 0.0),
+            Direction::Forward
+        );
+        assert_eq!(
+            movement_direction_toward(-1.0, 0.0, 1.0, 0.0),
+            Direction::Backward
+        );
+
+        // xim takes the lateral axis as bearing × UP = (-b.z, b.x) in this plane: travel along +Z is
+        // to the target's right, and that sign is shared with mvl?/mvr? (both read MotionSample).
+        assert_eq!(
+            movement_direction_toward(0.0, 1.0, 1.0, 0.0),
+            Direction::Right
+        );
+        assert_eq!(
+            movement_direction_toward(0.0, -1.0, 1.0, 0.0),
+            Direction::Left
+        );
+
+        // xim's preference band: cos 0.5 is still Forward, while cos -0.9 is past both thresholds.
+        assert_eq!(
+            movement_direction_toward(0.5, (1.0f32 - 0.25).sqrt(), 1.0, 0.0),
+            Direction::Forward
+        );
+        assert_eq!(
+            movement_direction_toward(-0.9, (1.0f32 - 0.81).sqrt(), 1.0, 0.0),
+            Direction::Backward
+        );
+
+        assert_eq!(
+            movement_direction_toward(0.0, 0.0, 1.0, 0.0),
+            Direction::None
+        );
+        assert_eq!(
+            movement_direction_toward(1.0, 0.0, 0.0, 0.0),
+            Direction::None
+        );
     }
 
     #[test]
