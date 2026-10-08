@@ -8757,6 +8757,9 @@ mod tests {
                 transition_in: 0,
                 transition_out: 0,
                 random_group: None,
+                actor_rotation: None,
+                animation_mode: None,
+                turn_toward_step_degrees: None,
                 local_dir: HIT_SPARK_DIR,
                 model_transform: None,
                 follow_points: None,
@@ -9218,7 +9221,7 @@ mod tests {
         ];
         let at_root = |offset: Vec3| JointReference {
             index: 0,
-            unk_v0: [0.0; 3],
+            rotation: [0.0; 3],
             position_offset: offset.to_array(),
         };
         let mut references: Vec<JointReference> = (0..SYNTHETIC_REFERENCE_TABLE_LEN)
@@ -9226,7 +9229,7 @@ mod tests {
             .collect();
         references[1] = JointReference {
             index: 1,
-            unk_v0: [0.0; 3],
+            rotation: [0.0; 3],
             position_offset: [0.0; 3],
         };
         references[ffxi_dat::skel::standard_position::ABOVE_HEAD] =
@@ -9248,6 +9251,7 @@ mod tests {
             id: ffxi_dat::datid::DatId::from_str("synt"),
             joints,
             references,
+            look_at_limits: Vec::new(),
             bounding_boxes: vec![BoundingBox {
                 y_max: 0.0,
                 y_min: -SYNTHETIC_BOX_HEIGHT,

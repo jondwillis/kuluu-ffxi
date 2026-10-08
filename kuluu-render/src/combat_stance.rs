@@ -22,6 +22,65 @@ pub fn motion_dat_for_race(dll: Option<&ffxi_dat::main_dll::MainDll>, race: u8) 
         .or_else(|| motion_dat_fallback(crate::dat_vos2::skeleton_file_id_fallback(race)?))
 }
 
+/// The battle-motion blocks one weapon pairing owns: `main` always, `off_hand` only with a weapon in
+/// the sub slot, and `skirt_battle` (the waist/cloth block for this pairing) while engaged.
+/// research/xim poc/Model.kt PcModel.getMainBattleAnimationDirectory /
+/// getSubBattleAnimationDirectory / getSkirtBattleAnimationResource: both count by the weapon's own
+/// animation-type byte, and a sub slot holding anything other than `CIB_MOTION_INDEX_NONE` switches the
+/// main hand off [`motion_dat_for_race`] onto the dual-wield main-hand block.
+///
+/// Only `main` may be merged into the body's motion clip pool: these blocks do not extend an id family, they
+/// author a new member of it - the waist/cloth files 9928/9929/9930 carry `btl2` (with at02/at12/at22) where the
+/// race-wide file 9672 carries btl0/btl1 only, and every clip matching a parameterized id becomes a simultaneous
+/// layer, so merging them poses cloth motion over the body's stance and drags an equipped mesh off its hand.
+/// `off_hand`/`skirt_battle` need their own bone-masked animation slot (gaps §G.12) first.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BattleMotionBlocks {
+    pub main: u32,
+    pub off_hand: Option<u32>,
+    pub skirt_battle: Option<u32>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl BattleMotionBlocks {
+    /// `None` for a race with no battle block at all, and for the parts of the law an unread
+    /// FFXiMain.dll cannot answer (the dual-wield and skirt tables have no shipped fallback).
+    pub fn resolve(
+        dll: Option<&ffxi_dat::main_dll::MainDll>,
+        race: u8,
+        main_type: u8,
+        sub_type: Option<u8>,
+    ) -> Option<Self> {
+        let base = motion_dat_for_race(dll, race)?;
+        // xim's isDualWield reads the sub slot's animation byte and calls 0xFF "unset".
+        let none = ffxi_dat::cib::CIB_UNSET;
+        let dual_wield = dll.is_some() && sub_type.is_some_and(|b| b != none);
+        let main_base = match (dual_wield, dll) {
+            (true, Some(dll)) => dll
+                .base_dual_wield_main_hand_animation_index(race)
+                .map(u32::from),
+            _ => Some(base),
+        }?;
+        let main_type = u32::from(main_type);
+        let off_hand = match (dual_wield, sub_type, dll) {
+            (true, Some(sub_type), Some(dll)) => dll
+                .base_dual_wield_off_hand_animation_index(race)
+                .map(|file| file as u32 + u32::from(sub_type)),
+            _ => None,
+        };
+        let skirt_battle = dll.and_then(|dll| {
+            dll.base_skirt_animation_index(race, dual_wield)
+                .map(|file| file as u32 + main_type)
+        });
+        Some(Self {
+            main: main_base + main_type,
+            off_hand,
+            skirt_battle,
+        })
+    }
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 /// [`motion_dat_for_race`] keyed on the race's skeleton file id, which is what
 /// the animation caches below and the legacy VOS2 path carry instead of a race.
@@ -293,6 +352,8 @@ pub struct SelfMoveIntent {
     pub forward: f32,
     pub strafe: f32,
     pub scripted_speed: Option<f32>,
+    /// The camera was locked on for this moving tick, so the walker aimed the body at the target.
+    pub locked: bool,
 }
 
 impl SelfMoveIntent {
@@ -913,6 +974,13 @@ pub struct PredictSample {
 
     pub rendered_heading_rad: f32,
 
+    /// Frames of 1/60 s during which this actor's wire heading must not be taken. A HoldRotation stage
+    /// sets it from its authored duration: retail's task holds one refcount on the actor's orientation
+    /// and the per-entity update jumps past both the orientation copy and its angle wrap while that
+    /// count is non-zero (`FFXiMain.dll retail-2026-09` RVA 0x8FC08). The position keeps updating, as it
+    /// does in retail - only facing is held.
+    pub orientation_hold_frames: f32,
+
     /// Seconds since the last real position change; observe() resets it when a moved update lands.
     /// At the next moved observe() this is the measured inter-update interval. advance_prediction
     /// adds dt to it every frame.
@@ -975,6 +1043,7 @@ impl PredictSample {
             packet_speed_base: speed_base,
             idle_frames: 0,
             rendered_heading_rad: heading_to_rad(heading),
+            orientation_hold_frames: 0.0,
             sample_age: 0.0,
             // One AI tick per slot (vendor/server/src/map/map_constants.h kLogicUpdateRate):
             // the first segment budget is
@@ -1173,7 +1242,9 @@ impl EntityPrediction {
                     e.server_pos = server_pos;
                     e.sample_dirty = true;
                 }
-                e.target_heading = heading;
+                if e.orientation_hold_frames <= 0.0 {
+                    e.target_heading = heading;
+                }
                 e.packet_speed = speed;
                 e.packet_speed_base = speed_base;
             }
@@ -1186,8 +1257,16 @@ impl EntityPrediction {
 /// vendor/server/src/common/utils.cpp worldAngle (pinned vendor/server): LSB position_t.z is a
 /// horizontal axis, not vertical; see [`heading_forward`] for the full wire/Bevy mapping.
 #[inline]
-fn heading_to_rad(heading: u8) -> f32 {
+pub fn heading_to_rad(heading: u8) -> f32 {
     (heading as f32) * std::f32::consts::TAU / 256.0
+}
+
+/// The [`heading_to_rad`] inverse onto the wire byte, rounding to the nearest of the 256 steps.
+/// An authored angle (a drive-task's target, say) reaches an entity's facing only through this byte.
+#[inline]
+pub fn heading_byte_for_rad(rad: f32) -> u8 {
+    let turns = rad / std::f32::consts::TAU;
+    (turns * 256.0).round().rem_euclid(256.0) as u8
 }
 
 /// World-space direction an entity with this heading faces, in Bevy space.
@@ -1329,6 +1408,13 @@ fn advance_prediction(s: &mut PredictSample, dt: f32, record_outcome: bool) -> (
 
     if outcome.is_none() {
         s.idle_frames = s.idle_frames.saturating_add(1);
+    }
+
+    if s.orientation_hold_frames > 0.0 {
+        // The hold counts down in this layer's frame ticks, which is also the unit retail decrements
+        // its task timer in (`FFXiMain.dll retail-2026-09` RVA 0x62520: `remaining -= tick`).
+        s.orientation_hold_frames =
+            (s.orientation_hold_frames - dt * crate::scheduler_runtime::ROUTINE_FPS).max(0.0);
     }
 
     let target = heading_to_rad(s.target_heading);
@@ -1639,6 +1725,79 @@ mod tests {
                 "race {race} via its skeleton id"
             );
         }
+    }
+
+    /// Four `FFXiMain.dll` tables pick the combat motion DATs a PC loads: one per hand plus the
+    /// waist/cloth pair (research/xim MainDll.kt getBaseBattleAnimationIndex /
+    /// getBaseDualWieldMainHandAnimationIndex / getBaseDualWieldOffHandAnimationIndex /
+    /// getBaseSkirtAnimationIndex, consumed by poc/Model.kt PcModel). Pinned for Hume M (race 1) at
+    /// the values measured from this install's DLL: battle base 9672, dual-wield main hand 40815,
+    /// off hand 40431, skirt 9928 and skirt dual-wield 41071 — the skirt pair sits exactly +256 over
+    /// its partners, which is what xim's stride-4 `index*4 + 2` read produces. A getter drifting onto
+    /// the wrong half-word therefore fails here instead of silently loading someone else's DAT.
+    #[test]
+    fn battle_motion_block_tables_are_measured_for_hume_m() {
+        let Some(root) = ffxi_dat::archive::open_test_install() else {
+            return;
+        };
+        let dll = ffxi_dat::main_dll::MainDll::load(root.root()).expect("FFXiMain.dll loads");
+        const HUME_M: u8 = 1;
+
+        assert_eq!(dll.base_battle_animation_index(HUME_M), Some(9672));
+        assert_eq!(
+            dll.base_dual_wield_main_hand_animation_index(HUME_M),
+            Some(40815)
+        );
+        assert_eq!(
+            dll.base_dual_wield_off_hand_animation_index(HUME_M),
+            Some(40431)
+        );
+        assert_eq!(dll.base_skirt_animation_index(HUME_M, false), Some(9928));
+        assert_eq!(dll.base_skirt_animation_index(HUME_M, true), Some(41071));
+    }
+
+    /// A single-wielded weapon takes the race battle base plus its own animation byte; a second
+    /// weapon switches both hands onto the dual-wield bases instead (`Model.kt isDualWield`, whose
+    /// operand treats `CIB_UNSET` as "no off hand"). The waist/cloth block always comes from the
+    /// skirt table, offset by the *main* hand's byte. This math decides which DATs a held weapon's
+    /// anchor joints can ever be keyed in, so it is pinned rather than left to the loader.
+    #[test]
+    fn battle_motion_blocks_add_the_animation_byte_to_the_matching_base() {
+        let Some(root) = ffxi_dat::archive::open_test_install() else {
+            return;
+        };
+        let dll = ffxi_dat::main_dll::MainDll::load(root.root()).expect("FFXiMain.dll loads");
+        const HUME_M: u8 = 1;
+        const MAIN_BYTE: u8 = 3;
+
+        let one_hand = BattleMotionBlocks::resolve(Some(&dll), HUME_M, MAIN_BYTE, None)
+            .expect("Hume M has a battle block");
+        assert_eq!(one_hand.main, 9672 + u32::from(MAIN_BYTE));
+        assert_eq!(one_hand.off_hand, None);
+        assert_eq!(one_hand.skirt_battle, Some(9928 + u32::from(MAIN_BYTE)));
+
+        let two_hand = BattleMotionBlocks::resolve(Some(&dll), HUME_M, MAIN_BYTE, Some(1))
+            .expect("Hume M has a battle block");
+        assert_eq!(two_hand.main, 40815 + u32::from(MAIN_BYTE));
+        assert_eq!(two_hand.off_hand, Some(40431 + 1));
+        assert_eq!(two_hand.skirt_battle, Some(41071 + u32::from(MAIN_BYTE)));
+
+        // An unset sub byte is not a second weapon: it keeps the single-wield selection.
+        let unset_sub = BattleMotionBlocks::resolve(
+            Some(&dll),
+            HUME_M,
+            MAIN_BYTE,
+            Some(ffxi_dat::cib::CIB_UNSET),
+        )
+        .expect("Hume M has a battle block");
+        assert_eq!(unset_sub, one_hand);
+
+        // Without the DLL the loader keeps its pre-table behaviour: race base only.
+        let no_dll = BattleMotionBlocks::resolve(None, HUME_M, MAIN_BYTE, Some(1))
+            .expect("the fallback block exists for a PC race");
+        assert_eq!(no_dll.main, 9672 + u32::from(MAIN_BYTE));
+        assert_eq!(no_dll.off_hand, None);
+        assert_eq!(no_dll.skirt_battle, None);
     }
 
     #[test]
@@ -2039,6 +2198,7 @@ mod tests {
             joints: Vec::new(),
             references: Vec::new(),
             bounding_boxes: Vec::new(),
+            look_at_limits: Vec::new(),
         };
         let child = app
             .world_mut()
@@ -2079,6 +2239,7 @@ mod tests {
             joints: Vec::new(),
             references: Vec::new(),
             bounding_boxes: Vec::new(),
+            look_at_limits: Vec::new(),
         };
         let child = app
             .world_mut()
@@ -2119,6 +2280,7 @@ mod tests {
             joints: Vec::new(),
             references: Vec::new(),
             bounding_boxes: Vec::new(),
+            look_at_limits: Vec::new(),
         };
         let child = app
             .world_mut()
@@ -3048,5 +3210,35 @@ mod tests {
                 casual.per_bone.len()
             );
         }
+    }
+
+    /// A 0x2F HoldRotation stage leaves the wire heading un-taken for its duration. Retail buys that with
+    /// an ownership refcount on the orientation and jumps past the per-entity orientation copy while it is
+    /// held (`FFXiMain.dll retail-2026-09` RVA 0x8FC08); this layer carries the hold as a countdown in the
+    /// same frames that task's timer counts in (RVA 0x62520). The position keeps arriving - only facing
+    /// waits.
+    #[test]
+    fn an_orientation_hold_leaves_the_wire_heading_untaken() {
+        let mut prediction = EntityPrediction::default();
+        let id = 7u32;
+        prediction.observe(id, Vec3::ZERO, 0, 0, 0);
+
+        // Two seconds of updates against a one-second hold: every heading byte in the window is refused.
+        let held: &mut PredictSample = prediction.by_id.get_mut(&id).unwrap();
+        held.orientation_hold_frames = 60.0;
+        for step in 1..=2 {
+            prediction.observe(id, Vec3::new(step as f32, 0.0, 0.0), 64, 20, 20);
+            let sample = prediction.by_id.get_mut(&id).unwrap();
+            advance_prediction(sample, 0.5, true);
+        }
+        let frozen = &prediction.by_id[&id];
+        assert_eq!(frozen.target_heading, 0, "held: no wire heading taken");
+        assert_eq!(frozen.orientation_hold_frames, 0.0, "the hold expired");
+
+        prediction.observe(id, Vec3::new(3.0, 0.0, 0.0), 128, 20, 20);
+        assert_eq!(
+            prediction.by_id[&id].target_heading, 128,
+            "released: the next update is taken as usual"
+        );
     }
 }

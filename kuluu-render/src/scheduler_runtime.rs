@@ -1,4 +1,8 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use crate::look_at_gates::LookAtLockInterval;
+
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::Arc;
 
@@ -7,8 +11,14 @@ use crate::components::{IsSelf, WorldEntity};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::cutscene_camera::CutsceneCameraTasks;
 #[cfg(not(target_arch = "wasm32"))]
+use crate::rotation_drives::{
+    heading_of, ActorAirborne, ActorRotationDrive, PendingTurn, PlanTurn, SelfAuthoredHeading,
+};
+#[cfg(not(target_arch = "wasm32"))]
 use crate::scene::BakedActor;
+use crate::snapshot::EVENT_LOG_CAP;
 use bevy::prelude::*;
+use ffxi_actor::actor_state;
 use ffxi_dat::generator::Generator;
 use ffxi_dat::kind::ChunkKind;
 use ffxi_dat::scheduler::{
@@ -29,6 +39,11 @@ use kuluu_snapshot::{CutsceneCue, ExtSchedulerMotion};
 // durations count whole frames of this clock; DAT transition fields (CompletionMotion's HalfFrames)
 // count half-frames, so a stored V plays as V/2 whole frames at ROUTINE_FPS.
 pub const ROUTINE_FPS: f32 = 60.0;
+static NEXT_ROUTINE_INSTANCE: AtomicU64 = AtomicU64::new(1);
+
+fn next_routine_instance() -> u64 {
+    NEXT_ROUTINE_INSTANCE.fetch_add(1, Ordering::Relaxed)
+}
 
 // research/xim poc/ActorManager.kt updateAll — `elapsedFrames / 2f` into updateAnimation.
 pub const SKELETON_FRAME_DIVISOR: f32 = 2.0;
@@ -130,6 +145,7 @@ pub enum MotionStages {
 // frame clock.
 #[derive(Debug, Clone)]
 pub struct ActiveScheduler {
+    instance_id: u64,
     pub stages: Vec<TimedStage>,
 
     /// The routine's wire target (spell/victim/cutscene partner the actor acted on),
@@ -160,6 +176,7 @@ impl ActiveScheduler {
         let mut stages = s.stages.clone();
         stages.sort_by_key(|t| t.frame);
         Self {
+            instance_id: 0,
             stages,
             elapsed: 0.0,
             cursor: 0,
@@ -205,6 +222,7 @@ impl ActiveScheduler {
         }
         stages.sort_by_key(|t| t.frame);
         Some(Self {
+            instance_id: 0,
             stages,
             elapsed: 0.0,
             cursor: 0,
@@ -222,6 +240,7 @@ impl ActiveScheduler {
         flatten_routine(lookup, name, 0, motion, &mut path, &mut stages);
         stages.sort_by_key(|t| t.frame);
         Some(Self {
+            instance_id: 0,
             stages,
             elapsed: 0.0,
             cursor: 0,
@@ -272,6 +291,35 @@ impl ActiveScheduler {
         })
     }
 
+    /// The 0x89 LockLookAt intervals covering `frame`, each as `(fire frame, end frame)`. Retail runs
+    /// one suppression task per fired stage (FFXiMain.dll retail-2026-09 RVA 0x5B14C), so callers need
+    /// the stage identities rather than a bool: a task that ended on its own watchdog must not be
+    /// re-spawned by the interval that still covers it.
+    pub fn lock_look_at_intervals_at(&self, frame: u32) -> impl Iterator<Item = (u32, u32)> + '_ {
+        self.stages
+            .iter()
+            .filter(move |t| {
+                t.stage.kind == StageKind::LockLookAt
+                    && t.frame <= frame
+                    && frame < t.frame + t.stage.duration_frames as u32
+            })
+            .map(|t| (t.frame, t.frame + t.stage.duration_frames as u32))
+    }
+
+    /// The 0xA9/0xAA ActorRotation intervals covering `frame`, each as `(fire frame, end frame)`. A
+    /// drive-task with a mode-0 record never counts itself down (`FFXiMain.dll retail-2026-09`
+    /// RVA 0x5FB36 skips its timer for those), so the interval is the only thing that ends one.
+    pub fn actor_rotation_intervals_at(&self, frame: u32) -> impl Iterator<Item = (u32, u32)> + '_ {
+        self.stages
+            .iter()
+            .filter(move |t| {
+                t.stage.kind == StageKind::ActorRotation
+                    && t.frame <= frame
+                    && frame < t.frame + t.stage.duration_frames as u32
+            })
+            .map(|t| (t.frame, t.frame + t.stage.duration_frames as u32))
+    }
+
     /// The 0x75 SetModelVisibility overrides live at `frame`
     /// (`stage.frame <= frame < stage.frame + duration_frames`), in timeline order. The render
     /// layer folds them into the actor's hidden-slot set (research/xim EffectRoutineInstance.kt
@@ -317,7 +365,8 @@ pub struct ActiveSchedulers {
 }
 
 impl ActiveSchedulers {
-    pub fn one(active: ActiveScheduler) -> Self {
+    pub fn one(mut active: ActiveScheduler) -> Self {
+        active.instance_id = next_routine_instance();
         Self {
             routines: vec![active],
         }
@@ -327,12 +376,16 @@ impl ActiveSchedulers {
     /// an entity with no ActiveSchedulers yet (see `run_routine_on`'s pending-insert buffer):
     /// one component holding every routine instead of N deferred inserts where the last would
     /// have overwritten the rest.
-    pub fn many(entries: Vec<ActiveScheduler>) -> Self {
+    pub fn many(mut entries: Vec<ActiveScheduler>) -> Self {
+        for active in &mut entries {
+            active.instance_id = next_routine_instance();
+        }
         Self { routines: entries }
     }
 
     /// Enqueue a routine alongside the running ones instead of replacing them.
-    pub fn push(&mut self, active: ActiveScheduler) {
+    pub fn push(&mut self, mut active: ActiveScheduler) {
+        active.instance_id = next_routine_instance();
         self.routines.push(active);
     }
 
@@ -340,6 +393,49 @@ impl ActiveSchedulers {
     /// test itself (ActionTimer1 reached 2 and 3 when a hit reaction overlapped a swing).
     pub fn is_locked_now(&self) -> bool {
         self.routines.iter().any(|r| r.locks_at(r.current_frame()))
+    }
+
+    /// Every 0x89 LockLookAt interval this entity's running routines cover, each read at its own
+    /// routine clock.
+    pub fn lock_look_at_intervals_now(&self) -> Vec<(u32, u32)> {
+        self.routines
+            .iter()
+            .flat_map(|r| r.lock_look_at_intervals_at(r.current_frame()))
+            .collect()
+    }
+
+    pub fn lock_look_at_tasks_now(&self) -> Vec<LookAtLockInterval> {
+        self.routines
+            .iter()
+            .flat_map(|routine| {
+                let frame = routine.current_frame();
+                routine
+                    .stages
+                    .iter()
+                    .enumerate()
+                    .filter_map(move |(stage_index, timed)| {
+                        let end_frame = timed.frame + u32::from(timed.stage.duration_frames);
+                        (timed.stage.kind == StageKind::LockLookAt
+                            && timed.frame <= frame
+                            && frame < end_frame)
+                            .then_some(LookAtLockInterval {
+                                routine_instance: routine.instance_id,
+                                stage_index,
+                                fire_frame: timed.frame,
+                                end_frame,
+                            })
+                    })
+            })
+            .collect()
+    }
+
+    /// Every 0xA9/0xAA ActorRotation interval this entity's running routines cover, each read at its
+    /// own routine clock.
+    pub fn actor_rotation_intervals_now(&self) -> Vec<(u32, u32)> {
+        self.routines
+            .iter()
+            .flat_map(|r| r.actor_rotation_intervals_at(r.current_frame()))
+            .collect()
     }
 
     /// The hidden model-slot set this entity's running routines produce at their own current
@@ -2383,6 +2479,33 @@ fn self_knockback_travels(settings: &crate::graphics_settings::GraphicsSettings)
     !(cfg!(feature = "enhanced-ignore-knockback-self") && settings.ignore_knockback_self)
 }
 
+/// Applies a routine's animation-mode stage (`StageKind::AnimationMode`: xim opcodes 0x79/0x8C/0xA4/0xA5,
+/// `research/xim EffectRoutineInstance.kt handleAdjustAnimationModeRoutine`) to the actor whose routine
+/// fired it. That switch selects which family the actor's motion ids resolve against, and a drawn weapon's
+/// anchor bones are keyed only inside its own family.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn dispatch_animation_mode_stages(
+    mut events: MessageReader<SchedulerStageEvent>,
+    q_children: Query<&Children>,
+    mut q_render: Query<&mut crate::ffxi_actor_render::FfxiRenderActor>,
+) {
+    for ev in events.read() {
+        let Some(mode) = ev.stage.stage.animation_mode else {
+            continue;
+        };
+        // The stage belongs to the routine's owner, whose render actor sits among its children (the same
+        // walk `actor_routines_via_mut` uses).
+        let Ok(children) = q_children.get(ev.actor) else {
+            continue;
+        };
+        for child in children.iter() {
+            if let Ok(mut actor) = q_render.get_mut(child) {
+                actor.set_animation_mode(mode.slot, mode.variant as u8);
+                break;
+            }
+        }
+    }
+}
 /// Integrates every running knockback on the routine clock and hands the
 /// self actor's shove and lock to the walker (KnockBackInstance updateEffect
 /// adds the velocity after the movement-lock zeroing; here the walker adds
@@ -2418,6 +2541,328 @@ pub fn tick_knockbacks(
     if self_kb.active != self_active {
         self_kb.active = self_active;
     }
+}
+
+/// The ActorRotation drive-tasks one entity has running: retail keeps a task per fired stage and ends
+/// it with the routine that spawned it (`crate::rotation_drives`).
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Component, Default)]
+pub struct ActorRotationDrives {
+    drives: Vec<ActorRotationDrive>,
+}
+
+/// A fired 0xA9/0xAA stage spawns its drive-task, and retail's constructor reads the actor's angle
+/// record at that instant (`FFXiMain.dll retail-2026-09` RVA 0x5FA64..0x5FA8B) rather than starting
+/// from the authored value: a re-fired stage turns from wherever the last turn left the actor.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn spawn_actor_rotation_drives(
+    mut events: MessageReader<SchedulerStageEvent>,
+    state: Res<crate::snapshot::SceneState>,
+    // The harnesses that run the scheduler without the prediction pass have no sample to capture for
+    // a remote; those drives are skipped, exactly as before this system existed.
+    prediction: Option<Res<crate::combat_stance::EntityPrediction>>,
+    q_kind: Query<&WorldEntity>,
+    mut q_drives: Query<Option<&mut ActorRotationDrives>>,
+    mut pending_inserts: Local<HashMap<Entity, Vec<ActorRotationDrive>>>,
+    mut commands: Commands,
+) {
+    for ev in events.read() {
+        let Some(rotation) = ev.stage.stage.actor_rotation else {
+            continue;
+        };
+        let Ok(world) = q_kind.get(ev.actor) else {
+            continue;
+        };
+        // The capture needs something rendered to capture from: a remote entity no prediction sample
+        // has ever seen has no facing for the drive to turn, and retail would have had the actor's
+        // own record there.
+        let Some(live_heading_rad) = live_actor_heading(&state, prediction.as_deref(), world.id)
+        else {
+            continue;
+        };
+        let end_frame = ev.stage.frame + ev.stage.stage.duration_frames as u32;
+        let drive = ActorRotationDrive::fired_at(
+            ev.stage.frame,
+            end_frame,
+            ev.stage.stage.duration_frames,
+            &rotation,
+            [0.0, live_heading_rad, 0.0],
+        );
+        match q_drives.get_mut(ev.actor) {
+            Ok(Some(mut held)) => held.drives.push(drive),
+            // Buffered like the scheduler inserts above: two stages firing at one entity without
+            // drives yet merge into a single insert instead of overwriting each other.
+            Ok(None) => pending_inserts.entry(ev.actor).or_default().push(drive),
+            Err(_) => {}
+        }
+    }
+    for (entity, drives) in std::mem::take(&mut *pending_inserts) {
+        commands
+            .entity(entity)
+            .insert(ActorRotationDrives { drives });
+    }
+}
+
+/// A fired 0x2F HoldRotation stage puts its duration on the actor as a hold on its facing. Retail buys
+/// that with an orientation refcount (`FFXiMain.dll retail-2026-09`: handler RVA 0x5C8BA, task
+/// constructor at RVA 0x624B0 acquires through vtable slot byte `0x314`, its destructor at RVA 0x6248B
+/// releases), and the per-entity update skips the wire orientation copy while the count is non-zero (RVA
+/// 0x8FC08). Overlapping holds extend the countdown rather than nest: kuluu keeps one number, and only a
+/// routine that fires a second hold before the first expires can tell them apart.
+///
+/// Remote actors only. The local player's facing is produced by the walker (kuluu/src/view_native/input.rs)
+/// rather than copied from the wire, so there is no copy of theirs to skip.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn hold_orientations_from_stages(
+    mut events: MessageReader<SchedulerStageEvent>,
+    mut prediction: Option<ResMut<crate::combat_stance::EntityPrediction>>,
+    q_kind: Query<&WorldEntity>,
+) {
+    let Some(prediction) = prediction.as_mut() else {
+        return;
+    };
+    for ev in events.read() {
+        if ev.stage.stage.kind != StageKind::HoldRotation {
+            continue;
+        }
+        let Ok(world) = q_kind.get(ev.actor) else {
+            continue;
+        };
+        let Some(sample) = prediction.by_id.get_mut(&world.id) else {
+            continue;
+        };
+        let hold = ev.stage.stage.duration_frames as f32;
+        sample.orientation_hold_frames = sample.orientation_hold_frames.max(hold);
+    }
+}
+
+/// A fired 0x62 TurnToward stage measures the angle from its actor to the routine's target and stores it,
+/// with this stage's authored rate, as owed travel. Retail applies nothing when either object fails to
+/// resolve: handler RVA 0x5AF2C reads the turning actor through RVA 0x10062770 and the object to face
+/// through RVA 0x100627D0, and both failures branch away (FFXiMain.dll retail-2026-09). A routine with no
+/// target component is that case in kuluu, so the stage passes by. The angle itself is measured by
+/// [`crate::rotation_drives::measured_turn`]; each firing re-stores the pair and buys one more companion
+/// countdown, exactly as retail overwrites `actor+0x870`/`actor+0x874` while bumping its nesting counter.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn queue_turns_from_stages(
+    mut events: MessageReader<SchedulerStageEvent>,
+    state: Res<crate::snapshot::SceneState>,
+    prediction: Option<Res<crate::combat_stance::EntityPrediction>>,
+    q_kind: Query<&WorldEntity>,
+    q_place: Query<&Transform>,
+    q_target: Query<&ActionTarget>,
+    mut q_turns: Query<Option<&mut PendingTurn>>,
+    mut pending_inserts: Local<HashMap<Entity, PendingTurn>>,
+    mut commands: Commands,
+) {
+    for ev in events.read() {
+        let Some(step_degrees) = ev.stage.stage.turn_toward_step_degrees else {
+            continue;
+        };
+        let Ok(world) = q_kind.get(ev.actor) else {
+            continue;
+        };
+        let Some(target) = q_target.get(ev.actor).ok().and_then(|held| held.0) else {
+            continue;
+        };
+        let (Ok(from), Ok(toward)) = (q_place.get(ev.actor), q_place.get(target)) else {
+            continue;
+        };
+        // The heading retail corrects is the one on screen, so a turn starts from there: the walker's own
+        // angle for self, the predicted yaw for anyone else.
+        let Some(current_heading_rad) = live_actor_heading(&state, prediction.as_deref(), world.id)
+        else {
+            continue;
+        };
+        let plan = PlanTurn {
+            step_degrees,
+            duration_frames: ev.stage.stage.duration_frames as f32,
+        };
+        match q_turns.get_mut(ev.actor) {
+            Ok(Some(mut held)) => held.arm(
+                from.translation,
+                toward.translation,
+                current_heading_rad,
+                &plan,
+            ),
+            // Buffered like the drive inserts above, and carried across firings so a second stage in the
+            // same frame adds its companion as well as re-measuring.
+            Ok(None) => {
+                let mut fresh = pending_inserts.remove(&ev.actor).unwrap_or_default();
+                fresh.arm(
+                    from.translation,
+                    toward.translation,
+                    current_heading_rad,
+                    &plan,
+                );
+                pending_inserts.insert(ev.actor, fresh);
+            }
+            Err(_) => {}
+        }
+    }
+    for (entity, turn) in std::mem::take(&mut *pending_inserts) {
+        commands.entity(entity).insert(turn);
+    }
+}
+
+/// Steps every queued turn and hands the heading on. Retail's consumer lives in the actor's own update
+/// (`FFXiMain.dll retail-2026-09` RVA 0xC63D0 body; law at RVA 0xC66CA..0xC67DA) behind four gates, in this
+/// order: no orientation refcount (RVA 0xC6693), `[actor+0x102] == 0` (RVA 0xC66A1), `[actor+0x7A4] == -1`
+/// (RVA 0xC66AF) and the turn-enable counter `[actor+0x86C] != 0` (RVA 0xC66BC). Three are modelled here: a
+/// live HoldRotation blocks stepping (its kuluu stand-in is `orientation_hold_frames`), an in-flight
+/// knock-back blocks it as [`ActorAirborne`], and the enable counter is the companion list. `[actor+0x7A4]`
+/// is authored by stage `0x7A`, which kuluu does not run, so that one stays at its constructor `-1`. Which of
+/// this and the walker's facing update runs last each frame is unread in this build, as it is for ActorRotation.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn step_pending_turns(
+    time: Res<Time>,
+    state: Res<crate::snapshot::SceneState>,
+    mut prediction: Option<ResMut<crate::combat_stance::EntityPrediction>>,
+    mut self_heading: ResMut<SelfAuthoredHeading>,
+    mut q_turns: Query<(Entity, &WorldEntity, &mut PendingTurn)>,
+    q_airborne: Query<(), With<ActorAirborne>>,
+    mut commands: Commands,
+) {
+    let elapsed_retail_frames = time.delta_secs() * RETAIL_FPS;
+    let self_id = state.snapshot.self_char_id;
+    for (entity, world, mut turn) in &mut q_turns {
+        let is_self = Some(world.id) == self_id;
+        // Retail jumps clean out of the facing update while an orientation hold runs.
+        if !is_self
+            && prediction
+                .as_ref()
+                .and_then(|p| p.by_id.get(&world.id))
+                .is_some_and(|sample| sample.orientation_hold_frames > 0.0)
+        {
+            continue;
+        }
+        // In the air retail takes no step at all of the queued turn.
+        if q_airborne.get(entity).is_ok() {
+            continue;
+        }
+        let Some(current_heading_rad) = live_actor_heading(&state, prediction.as_deref(), world.id)
+        else {
+            continue;
+        };
+        if let Some(stepped) = turn.advance(current_heading_rad, elapsed_retail_frames) {
+            if is_self {
+                // Same hand-off as a rotation drive: the walker takes this as its base facing, so travel
+                // re-aims the body on a tick where it travels instead of fighting the turn.
+                *self_heading = SelfAuthoredHeading(Some(stepped));
+            } else if let Some(sample) =
+                prediction.as_mut().and_then(|p| p.by_id.get_mut(&world.id))
+            {
+                sample.target_heading = crate::combat_stance::heading_byte_for_rad(stepped);
+                // The integrator writes the orientation accumulator itself, with no ease between it and
+                // what is on screen - retail's consumer has one target: that record.
+                sample.rendered_heading_rad = stepped;
+            }
+        }
+        if turn.is_spent() || !turn.enabled() {
+            // Nothing can travel any more, and only this stage's handler ever re-enables a queue.
+            commands.entity(entity).remove::<PendingTurn>();
+        }
+    }
+}
+
+/// Puts the airborne gate on an actor for as long as its knock-back runs. Retail raises the flag in jump
+/// start and drops it on the landing test (`FFXiMain.dll retail-2026-09` RVA 0xAAACE / RVA 0xAAD1D, where the
+/// clear waits for the vector at `actor+0x130` to collapse below `.rdata 0x32E83C`); kuluu has no jump state
+/// from the wire, so the knock-back run that the same stage byte starts is what holds it up, and that run's
+/// last frame drops it.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn sync_actor_airborne(
+    tracked: Res<crate::scene::TrackedEntities>,
+    q_render: Query<&crate::ffxi_actor_render::FfxiRenderActor>,
+    mut held: Query<Option<&mut ActorAirborne>>,
+    mut commands: Commands,
+) {
+    for actor in &q_render {
+        let Some(&wire) = tracked.by_id.get(&actor.world_id) else {
+            continue;
+        };
+        let Ok(current) = held.get_mut(wire) else {
+            continue;
+        };
+        match (actor.knockback_active(), current) {
+            (true, None) => {
+                commands.entity(wire).insert(ActorAirborne);
+            }
+            (false, Some(_)) => {
+                commands.entity(wire).remove::<ActorAirborne>();
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Ticks every live drive and writes what it produced into the entity's facing. Retail's task holds the
+/// actor's own orientation record, which is also what its facing is derived from, so driving one has to
+/// go through the same field travel uses - not a parallel heading. A mode-0 drive re-writes the record
+/// every tick it lives; that is retail's law (its `k` is 1 while the task runs), and which of this task
+/// and the walker's facing update lands last per frame is unread in this build.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn tick_actor_rotation_drives(
+    time: Res<Time>,
+    state: Res<crate::snapshot::SceneState>,
+    mut prediction: Option<ResMut<crate::combat_stance::EntityPrediction>>,
+    mut self_heading: ResMut<SelfAuthoredHeading>,
+    q_scheds: Query<&ActiveSchedulers>,
+    mut q_drives: Query<(Entity, &WorldEntity, &mut ActorRotationDrives)>,
+    mut commands: Commands,
+) {
+    let elapsed_frames = time.delta_secs() * ROUTINE_FPS;
+    let self_id = state.snapshot.self_char_id;
+    for (entity, world, mut held) in &mut q_drives {
+        let open = q_scheds
+            .get(entity)
+            .map(|scheds| scheds.actor_rotation_intervals_now())
+            .unwrap_or_default();
+        held.drives.retain(|drive| open.contains(&drive.stage()));
+        if held.drives.is_empty() {
+            commands.entity(entity).remove::<ActorRotationDrives>();
+            continue;
+        }
+        let mut heading_rad = None;
+        for drive in &mut held.drives {
+            heading_rad = Some(heading_of(drive.advance(elapsed_frames)));
+        }
+        let Some(heading_rad) = heading_rad else {
+            continue;
+        };
+        if Some(world.id) == self_id {
+            // The walker takes this as its base facing, so travel still re-aims the body on a tick where
+            // it travels (crate::rotation_drives::SelfAuthoredHeading).
+            *self_heading = SelfAuthoredHeading(Some(heading_rad));
+        } else if let Some(sample) = prediction
+            .as_mut()
+            .and_then(|pred| pred.by_id.get_mut(&world.id))
+        {
+            sample.target_heading = crate::combat_stance::heading_byte_for_rad(heading_rad);
+            // Retail's mode-0 write is on the spot, so the rendered yaw joins it without easing; a
+            // counting-down drive writes its in-progress angle here too.
+            sample.rendered_heading_rad = heading_rad;
+        }
+    }
+}
+
+/// The heading an actor's drive-task captures when its stage fires: what is currently on screen —
+/// the predicted yaw for a remote entity, the walker's own heading for self.
+#[cfg(not(target_arch = "wasm32"))]
+fn live_actor_heading(
+    state: &crate::snapshot::SceneState,
+    prediction: Option<&crate::combat_stance::EntityPrediction>,
+    id: u32,
+) -> Option<f32> {
+    if state.snapshot.self_char_id == Some(id) {
+        return Some(crate::combat_stance::heading_to_rad(
+            state.snapshot.self_pos.heading,
+        ));
+    }
+    prediction?
+        .by_id
+        .get(&id)
+        .map(|sample| sample.rendered_heading_rad)
 }
 
 pub fn action_dat_file_id(
@@ -2971,6 +3416,10 @@ pub struct CutsceneActorState {
     touched: std::collections::HashSet<u32>,
     /// Server ids hidden by a running cutscene's EVENT_HIDE cue; cleared at CutsceneEnded.
     hidden: std::collections::HashSet<u32>,
+    /// Server ids with a running 0x6C TRANSPAR fade (the
+    /// crate::ffxi_actor_render::CutsceneTranspar component,
+    /// research/XiEvents/OpCodes/0x006C.md); cleared at CutsceneEnded.
+    faded: std::collections::HashSet<u32>,
 }
 
 /// A model root hidden by a running cutscene's ActorHide cue (ffxi-event/src/cue.rs).
@@ -3002,8 +3451,19 @@ impl CutsceneActorState {
         self.hidden.remove(&id);
     }
 
+    pub fn fade(&mut self, id: u32) {
+        self.faded.insert(id);
+    }
+
+    pub fn unfade(&mut self, id: u32) {
+        self.faded.remove(&id);
+    }
+
     pub fn is_empty(&self) -> bool {
-        self.touched.is_empty() && self.walks.is_empty() && self.hidden.is_empty()
+        self.touched.is_empty()
+            && self.walks.is_empty()
+            && self.hidden.is_empty()
+            && self.faded.is_empty()
     }
 }
 
@@ -3247,9 +3707,37 @@ pub fn apply_cutscene_actor_cues(
                     );
                 }
             }
-            // 0x6C TRANSPAR is not rendered yet: the kuluu-render consumer of this
-            // cue was retired with #813/#815 and nothing grounded has replaced it,
-            // so the cue falls through rather than driving a component no system reads.
+            // 0x6C: drive the target's opacity to the authored byte over the
+            // authored frames; the fade stops at CutsceneEnded at whatever
+            // value it has reached (ffxi-event/src/cue.rs Transpar).
+            CutsceneCue::Transpar {
+                target,
+                end_alpha,
+                duration_frames,
+            } => {
+                // Fading the local player model is a valid ask, so resolve
+                // without excluding self (research/XiEvents/OpCodes/0x006C.md).
+                let Some(id) = cutscene_actor_server_id(self_id, target) else {
+                    continue;
+                };
+                let Some(&entity) = tracked.by_id.get(&id) else {
+                    continue;
+                };
+                commands
+                    .entity(entity)
+                    .insert(crate::ffxi_actor_render::CutsceneTranspar::new(
+                        (end_alpha as f32 / 255.0).clamp(0.0, 1.0),
+                        (duration_frames as f32).max(1.0) / 60.0,
+                    ));
+                state.fade(id);
+                tracing::debug!(
+                    target: "kuluu_render::scheduler_runtime",
+                    id,
+                    end_alpha,
+                    duration_frames,
+                    "cutscene actor transpar"
+                );
+            }
             _ => {}
         }
     }
@@ -3311,6 +3799,7 @@ pub fn release_cutscene_actors(
     mut cursor: Local<u64>,
     mut q_xform: Query<&mut Transform, With<WorldEntity>>,
     q_hidden: Query<Entity, With<CutsceneHidden>>,
+    q_faded: Query<Entity, With<crate::ffxi_actor_render::CutsceneTranspar>>,
     q_scheds: Query<(Entity, &ActiveSchedulers), With<WorldEntity>>,
     q_children: Query<&Children>,
     mut q_actors: Query<&mut crate::ffxi_actor_render::FfxiRenderActor>,
@@ -3378,9 +3867,18 @@ pub fn release_cutscene_actors(
     for e in q_hidden.iter() {
         commands.entity(e).remove::<CutsceneHidden>();
     }
+    // Stop every running 0x6C fade at its current value: retail drops the
+    // fade's driver with the event's own ExtData
+    // (research/XiEvents/OpCodes/0x006C.md).
+    for e in q_faded.iter() {
+        commands
+            .entity(e)
+            .remove::<crate::ffxi_actor_render::CutsceneTranspar>();
+    }
     state.walks.clear();
     state.touched.clear();
     state.hidden.clear();
+    state.faded.clear();
 }
 
 // The routine the caster's cast-start effects were flattened from, so an interrupt can stop the
@@ -3725,13 +4223,13 @@ pub fn evaluate_switch(
     out
 }
 
-// research/xim Actor.kt displayAutoAttack: the swing routine is chosen by which limb struck.
-// Direction-of-movement variants (atf0/atb0/atl0/atr0) are not selected here; that needs the
-// attacker's locomotion state at swing time. No attacker-side crit swing exists on purpose: LSB
-// flags the crit only in the VICTIM's result block (CBattleEntity::OnAttack sets info CriticalHit
-// + hitDistortion Heavy from one bool; vendor/server/src/map/entities/battle_entity.cpp) and this
-// `animation` field is limb-selected, never
-// crit-selected - do not re-add a crit variant here.
+// research/xim Actor.kt displayAutoAttack: the swing routine is chosen by which limb struck - the
+// standing form of it, which is also what a travelling attacker falls back to when its model does
+// not carry the direction-of-travel variant `moving_swing_routine` names. No attacker-side crit
+// swing exists on purpose: LSB flags the crit only in the VICTIM's result block
+// (CBattleEntity::OnAttack sets info CriticalHit + hitDistortion Heavy from one bool;
+// vendor/server/src/map/entities/battle_entity.cpp) and this `animation` field is limb-selected,
+// never crit-selected - do not re-add a crit variant here.
 pub fn swing_routine(animation: ffxi_proto::melee::AttackAnimation) -> Option<[u8; 4]> {
     use ffxi_proto::melee::AttackAnimation;
     Some(match animation {
@@ -3762,6 +4260,174 @@ fn resolved_offhand_context(
     Some(rule.qualifies(model))
 }
 
+/// research/xim Actor.kt onAttackMainHand / onAttackSubHand: an attacker that is travelling takes the
+/// direction-of-travel routine - `atf0/atl0/atr0/atb0` main hand, `btf0/btl0/btr0/btb0` off-hand - and
+/// only a standing attack takes the limb's `ati?`/`bti?`. The H2H kicks have no directional form in
+/// xim's selection, so they answer `None` here and keep the limb routine. Whether such a routine is
+/// on this model is the caller's question; `real_dat_moving_swings_name_their_clips` pins which clip
+/// each one names in the race weapon-motion DAT.
+pub fn moving_swing_routine(
+    animation: ffxi_proto::melee::AttackAnimation,
+    direction: actor_state::Direction,
+) -> Option<[u8; 4]> {
+    use ffxi_proto::melee::AttackAnimation;
+    if direction == actor_state::Direction::None {
+        return None;
+    }
+    Some(match (animation, direction) {
+        (AttackAnimation::RightAttack, actor_state::Direction::Forward) => *b"atf0",
+        (AttackAnimation::RightAttack, actor_state::Direction::Left) => *b"atl0",
+        (AttackAnimation::RightAttack, actor_state::Direction::Right) => *b"atr0",
+        (AttackAnimation::RightAttack, actor_state::Direction::Backward) => *b"atb0",
+        (AttackAnimation::LeftAttack, actor_state::Direction::Forward) => *b"btf0",
+        (AttackAnimation::LeftAttack, actor_state::Direction::Left) => *b"btl0",
+        (AttackAnimation::LeftAttack, actor_state::Direction::Right) => *b"btr0",
+        (AttackAnimation::LeftAttack, actor_state::Direction::Backward) => *b"btb0",
+        _ => return None,
+    })
+}
+
+/// The routine one swing takes, answered once so both consumers of a single BATTLE2 melee start agree: this
+/// module's arm (which queues the voice routine, its SE subroutines and the damage callback) and the pose pass
+/// (`ffxi_actor_render::dispatch_action_overlay`, which poses the body). A live RNG here would arm one swing's
+/// sounds over another swing's animation, so the standing draw is keyed to `seed` — the swing's position in the
+/// event log, which each consumer derives identically from its own drain cursor.
+///
+/// Standing swings vary across the limb's authored variants: research/xim Actor.kt onAttackMainHand takes
+/// `getMainAttackIds(...)?.randomOrNull() ?: DatId("ati0")`, so a round may draw any authored `ati?` while kuluu
+/// has always drawn `ati0`. Whether retail randomises is unread — [I] sticks to xim, not the DLL. Only variants
+/// this model actually carries are candidates (`carried`), preserving what a model with no off-hand routines got:
+/// the limb routine, then `ati0`, rather than nothing.
+pub fn swing_routine_for(
+    animation: ffxi_proto::melee::AttackAnimation,
+    travel: actor_state::Direction,
+    seed: u64,
+    carried: &impl Fn([u8; 4]) -> bool,
+) -> [u8; 4] {
+    if let Some(moving) = moving_swing_routine(animation, travel).filter(|r| carried(*r)) {
+        return moving;
+    }
+    standing_swing_routine(animation, seed, carried).unwrap_or(*b"ati0")
+}
+
+/// The limb's standing routine drawn across its authored variants (`ati?`, `bt?`, `ct?`, `dt?`), lowest digit
+/// first. An empty candidate set answers `None`, which is where a limb the model does not ship falls through to
+/// the caller's fallback.
+fn standing_swing_routine(
+    animation: ffxi_proto::melee::AttackAnimation,
+    seed: u64,
+    carried: &impl Fn([u8; 4]) -> bool,
+) -> Option<[u8; 4]> {
+    let limb = swing_limb_prefix(animation)?;
+    let variants: Vec<[u8; 4]> = (b'0'..=b'9')
+        .map(|digit| [limb[0], limb[1], limb[2], digit])
+        .filter(|r| carried(*r))
+        .collect();
+    let first = *variants.first()?;
+    if variants.len() == 1 {
+        return Some(first);
+    }
+    Some(variants[(seed % variants.len() as u64) as usize])
+}
+
+/// The three letters of a limb's standing routine name (`ati`/`bti`/`cti`/`dti`), digit slot free.
+fn swing_limb_prefix(animation: ffxi_proto::melee::AttackAnimation) -> Option<[u8; 3]> {
+    use ffxi_proto::melee::AttackAnimation;
+    Some(match animation {
+        AttackAnimation::RightAttack => *b"ati",
+        AttackAnimation::LeftAttack => *b"bti",
+        AttackAnimation::RightKick => *b"cti",
+        AttackAnimation::LeftKick => *b"dti",
+        AttackAnimation::Throw => return None,
+    })
+}
+
+/// One direction-of-travel answer per BATTLE2 melee start, shared by the two consumers of that event.
+/// The scheduler arm and the pose pass drain the action EventLog on opposite sides of the pose pass,
+/// and `track_entity_motion_system` re-integrates motion samples between them: measured live on a
+/// strafe hold, one swing read velocity 0.0 at one consumer (`Direction::None`, so it posed the
+/// standing limb clip) and 0.02 four tenths of a millisecond later at the other (`Right`, so `atr0`'s
+/// sounds and damage went over that body). Retail cannot fork — there is one motion state per frame —
+/// so kuluu classifies once and replays the answer, keyed on the EventLog index both cursors use.
+#[derive(Resource, Default)]
+pub struct MeleeTravel {
+    answered: std::collections::VecDeque<(u64, actor_state::Direction)>,
+}
+
+impl MeleeTravel {
+    /// The travel bucket for one melee start: classified on first sight and replayed thereafter, so
+    /// `swing_routine_for` cannot be handed two different answers for the same swing.
+    pub fn for_event(
+        &mut self,
+        event_index: u64,
+        classify: impl FnOnce() -> actor_state::Direction,
+    ) -> actor_state::Direction {
+        if let Some((_, direction)) = self
+            .answered
+            .iter()
+            .find(|(index, _)| *index == event_index)
+        {
+            return *direction;
+        }
+        let direction = classify();
+        self.answered.push_back((event_index, direction));
+        while self.answered.len() > EVENT_LOG_CAP {
+            self.answered.pop_front();
+        }
+        direction
+    }
+}
+
+/// The travel bucket both consumers of a BATTLE2 melee start must agree on: memoised per EventLog
+/// index, and logged with its inputs on the one frame it is classified (a per-consumer line would let
+/// two different answers look like one swing).
+pub fn melee_travel_for_event(
+    memo: &mut MeleeTravel,
+    motion: &crate::combat_stance::EntityMotion,
+    event_index: u64,
+    attacker_id: u32,
+    victim_id: Option<u32>,
+) -> actor_state::Direction {
+    memo.for_event(event_index, || {
+        let direction = swing_travel_direction(motion, attacker_id, victim_id);
+        let samples = (motion.sample(attacker_id), victim_id.and_then(|id| motion.sample(id)));
+        if let (Some(attacker), Some(victim)) = samples {
+            tracing::debug!(target: "combat", "COMBAT_TRAVEL actor={} event={} vel=({:.2},{:.2}) bearing=({:.2},{:.2}) bucket={:?}",
+                attacker_id,
+                event_index,
+                attacker.smooth_vx,
+                attacker.smooth_vz,
+                victim.last_pos.x - attacker.last_pos.x,
+                victim.last_pos.z - attacker.last_pos.z,
+                direction,
+            );
+        }
+        direction
+    })
+}
+
+/// How an attacker is travelling relative to the thing it attacks. Both consumers reach it through
+/// [`melee_travel_for_event`], so it reads motion samples only: `MotionSample::last_pos` is where that
+/// entity was rendered, which is what its smoothed velocity moved along. An attacker or victim with no
+/// sample answers `Direction::None`, leaving the limb's standing routine.
+pub fn swing_travel_direction(
+    motion: &crate::combat_stance::EntityMotion,
+    attacker_id: u32,
+    victim_id: Option<u32>,
+) -> actor_state::Direction {
+    let (Some(attacker), Some(victim)) = (
+        motion.sample(attacker_id),
+        victim_id.and_then(|id| motion.sample(id)),
+    ) else {
+        return actor_state::Direction::None;
+    };
+    actor_state::movement_direction_toward(
+        attacker.smooth_vx,
+        attacker.smooth_vz,
+        victim.last_pos.x - attacker.last_pos.x,
+        victim.last_pos.z - attacker.last_pos.z,
+    )
+}
 // vendor/server/src/map/enums/four_cc.h — BasicAttack's FourCC is "atk0", the self-targeted
 // voice routine research/xim Actor.kt displayAutoAttack enqueues alongside the swing.
 #[cfg(not(target_arch = "wasm32"))]
@@ -3793,6 +4459,8 @@ pub fn dispatch_melee_action_started(
     mut q_scheds: Query<&mut ActiveSchedulers>,
     events: Res<crate::snapshot::EventLog>,
     tracked: Res<crate::scene::TrackedEntities>,
+    motion: Res<crate::combat_stance::EntityMotion>,
+    mut melee_travel: ResMut<MeleeTravel>,
     q_children: Query<&Children>,
     q_render: Query<&crate::ffxi_actor_render::FfxiRenderActor>,
     q_look: Query<&crate::components::LookComp>,
@@ -3809,7 +4477,7 @@ pub fn dispatch_melee_action_started(
     if new_count == 0 {
         return;
     }
-    for ev in events.recent.iter().rev().take(new_count).rev() {
+    for (event_index, ev) in events.recent_with_index().rev().take(new_count).rev() {
         let kuluu_snapshot::ViewerEvent::ActionStarted {
             actor_id,
             action_kind,
@@ -3856,9 +4524,18 @@ pub fn dispatch_melee_action_started(
                 actor_id, raw_result);
         }
         let resolution = result.map(|(r, _)| r);
+        // A travelling attacker swings the direction-of-travel routine when its own model carries it
+        // (research/xim Actor.kt onAttackMainHand). A routine this model does not ship asks for a
+        // resource that is not there, and retail answers that by doing nothing; falling through to
+        // `ati0` keeps the swing's sounds and damage callback rather than inventing an animation SE
+        // never authored for this weapon.
+        let travel =
+            melee_travel_for_event(&mut melee_travel, &motion, event_index, actor_id, target_id);
+        let swing_seed = event_index;
         let swing = result
-            .and_then(|(_, animation)| swing_routine(animation))
-            .filter(|r| lookup.get(r).is_some())
+            .map(|(_, animation)| {
+                swing_routine_for(animation, travel, swing_seed, &|r| lookup.get(&r).is_some())
+            })
             .unwrap_or(*b"ati0");
         let merged = [MELEE_VOICE_ROUTINE, swing];
         let offhand_context = resolved_offhand_context(
@@ -3892,11 +4569,17 @@ pub fn dispatch_melee_action_started(
             }
         }
         if resolution.is_some() {
-            tracing::debug!(target: "combat", "COMBAT_ARM actor={} target={:?} outcome={:?} swing={} armed_by={} offhand={:?}",
+            // The log names the seed because both consumers of one melee start key their swing selection to
+            // it: without it the pose pass's drawn variant could not be checked against these sound lines.
+            tracing::debug!(
+                target: "combat",
+                "COMBAT_ARM actor={} target={:?} outcome={:?} swing={} travel={:?} swing_seed={} armed_by={} offhand={:?}",
                 actor_id,
                 victim,
                 outcome,
                 fourcc(swing),
+                travel,
+                swing_seed,
                 fourcc(armed_by),
                 offhand_context);
         }
@@ -4388,62 +5071,6 @@ pub fn dispatch_spell_effect_stages(
     }
 }
 
-pub const EMOTE_ROUTINES_PER_FILE: u16 = 8;
-
-const SALUTE_NATION_MAX: u16 = 2;
-
-fn em_routine(sub: u16) -> [u8; 4] {
-    [
-        b'e',
-        b'm',
-        b'0',
-        b'0' + (sub % EMOTE_ROUTINES_PER_FILE) as u8,
-    ]
-}
-
-/// Emote id → (emote-file offset from the FFXiMain.dll race base, `em0N`
-/// routine). Derived empirically from the retail HumeM emote DATs (dump:
-/// examples/zz-emote-probe.rs; each routine's Motion clip mnemonic names the
-/// emote — bow/poi/sl1-3/kne/lau/wee, den/nod/wav/wel/gla/che/clp, …) and
-/// pinned to XIM's only known points (Actor.kt onGatheringAttempt HELM: Logging=(5,0),
-/// Mining=(6,0), Harvesting=(7,0) — confirmed by the files' Japanese tool
-/// particles: ono0=axe, turu=pickaxe, kama=sickle). Notable non-uniformities
-/// the old id/8 hypothesis missed: Point/Bow are swapped in file 0, Salute
-/// occupies em02..em04 (one per nation, 0x05A Param = nation), and ids ≥ 6
-/// sit at (id+2)/8 only through id 37. Returns None when no body routine
-/// exists in the era DATs (face-only emotes, id gaps, unmapped job emotes).
-pub fn emote_routine(emote_id: u16, param: u16) -> Option<(u32, [u8; 4])> {
-    match emote_id {
-        0 => Some((0, *b"em01")),
-        1 => Some((0, *b"em00")),
-        2 => Some((0, em_routine(2 + param.min(SALUTE_NATION_MAX)))),
-        3 => Some((0, *b"em05")),
-        4 => Some((0, *b"em06")),
-        5 => Some((0, *b"em07")),
-        6..=37 => {
-            let shifted = emote_id + 2;
-            Some((
-                (shifted / EMOTE_ROUTINES_PER_FILE) as u32,
-                em_routine(shifted % EMOTE_ROUTINES_PER_FILE),
-            ))
-        }
-        // HELM (server-initiated): axe / pickaxe / sickle files.
-        40 => Some((5, *b"em00")),
-        41 => Some((6, *b"em00")),
-        42 => Some((7, *b"em00")),
-        // Hurray variants (xe0..xe6) are weapon-keyed; selection unmapped — em00 default.
-        43 => Some((8, *b"em00")),
-        44 => Some((11, *b"em00")),
-        // Dance1-4 (dc0..dc3).
-        65..=68 => Some((12, em_routine(emote_id - 65))),
-        // Bell-ring motion variants (rx/rs); note→variant selection unmapped.
-        73 => Some((10, *b"em00")),
-        // Aim variants (ye0..ye6) are ranged-weapon-keyed; selection unmapped — em00 default.
-        96 => Some((9, *b"em00")),
-        _ => None,
-    }
-}
-
 #[cfg(not(target_arch = "wasm32"))]
 pub fn dispatch_entity_emoted(
     events: Res<crate::snapshot::EventLog>,
@@ -4488,7 +5115,8 @@ pub fn dispatch_entity_emoted(
         let Some(&actor_entity) = tracked.by_id.get(&actor_id) else {
             continue;
         };
-        let Some((file_offset, routine)) = emote_routine(emote_id, param) else {
+        let Some((file_offset, routine)) = ffxi_vocab::emote_anim::emote_routine(emote_id, param)
+        else {
             continue;
         };
         let race = q_look.get(actor_entity).ok().and_then(|l| look_race(&l.0));
@@ -4644,7 +5272,9 @@ impl Plugin for SchedulerRuntimePlugin {
             app.init_resource::<CutsceneCameraTasks>();
             app.init_resource::<ActionDatRoot>();
             app.init_resource::<PendingKnockbacks>();
+            app.init_resource::<MeleeTravel>();
             app.init_resource::<crate::ffxi_actor_render::SelfKnockback>();
+            app.init_resource::<crate::rotation_drives::SelfAuthoredHeading>();
             app.add_systems(Startup, load_global_effect_dir);
             // Ordered ahead of the poll so a root change landing on the same frame as an
             // in-flight dll cannot have the poll's `remove_resource::<ActionMainDllTask>`
@@ -5206,6 +5836,7 @@ mod tests {
         TimedStage {
             frame,
             stage: SchedulerStage {
+                animation_mode: None,
                 stage_words: ffxi_dat::scheduler::SYNTHESIZED_STAGE_WORDS,
                 kind,
                 raw_type,
@@ -5224,6 +5855,8 @@ mod tests {
                 idle_transition_time: None,
                 flinch_duration: None,
                 model_visibility: None,
+                actor_rotation: None,
+                turn_toward_step_degrees: None,
                 spell_effect: None,
                 sound_range: None,
                 control_flow: None,
@@ -5562,6 +6195,122 @@ mod tests {
             }
             assert_eq!(probe.is_locked_now(), locked, "frame {frame}");
         }
+    }
+
+    /// The LockLookAt intervals are `(fire frame, half-open end)` pairs rather than a bool, which is how
+    /// kuluu-render's look_at_gates tells two overlapping stages apart and keeps one that ended on its own
+    /// watchdog from being re-armed by the interval still covering it.
+    #[test]
+    fn lock_look_at_intervals_carry_their_stage_identities() {
+        let suppress = || {
+            let mut t = stage(6, StageKind::LockLookAt, 0x89, *b"    ");
+            t.stage.duration_frames = 24;
+            t
+        };
+        let cast = ActiveScheduler::from_scheduler(&make_scheduler(*b"atk1", vec![suppress()]));
+        assert_eq!(
+            cast.lock_look_at_intervals_at(5).count(),
+            0,
+            "a stage covers nothing before it fires"
+        );
+        assert_eq!(
+            cast.lock_look_at_intervals_at(6).collect::<Vec<_>>(),
+            vec![(6, 30)],
+            "the operand is the interval length"
+        );
+        assert_eq!(cast.lock_look_at_intervals_at(29).count(), 1);
+        assert_eq!(
+            cast.lock_look_at_intervals_at(30).count(),
+            0,
+            "half-open at the end"
+        );
+
+        let mut not_a_suppression = stage(0, StageKind::AnimationLock, 0x59, *b"    ");
+        not_a_suppression.stage.duration_frames = 60;
+        let swing =
+            ActiveScheduler::from_scheduler(&make_scheduler(*b"damg", vec![not_a_suppression]));
+        assert_eq!(swing.lock_look_at_intervals_at(10).count(), 0);
+
+        let mut probe = ActiveSchedulers::one(ActiveScheduler::from_scheduler(&make_scheduler(
+            *b"atk1",
+            vec![suppress()],
+        )));
+        for r in &mut probe.routines {
+            r.elapsed = 6.0 / ROUTINE_FPS;
+        }
+        assert_eq!(probe.lock_look_at_intervals_now(), vec![(6, 30)]);
+    }
+
+    #[test]
+    fn overlapping_look_locks_keep_instance_identity_after_retirement() {
+        use crate::look_at_gates::{advance_look_at_locks, LOCK_WATCHDOG_DISTANCE_YALMS};
+        const END_FRAME: u16 = 600;
+        let mut lock = stage(0, StageKind::LockLookAt, 0, *b"lock");
+        lock.stage.duration_frames = END_FRAME;
+        let active = ActiveScheduler::from_scheduler(&make_scheduler(*b"lock", vec![lock]));
+        let mut scheds = ActiveSchedulers::one(active.clone());
+        let mut tasks = Vec::new();
+        assert!(advance_look_at_locks(
+            &mut tasks,
+            &scheds.lock_look_at_tasks_now(),
+            Vec2::ZERO
+        ));
+        assert!(!advance_look_at_locks(
+            &mut tasks,
+            &scheds.lock_look_at_tasks_now(),
+            Vec2::X * LOCK_WATCHDOG_DISTANCE_YALMS
+        ));
+        scheds.push(active.clone());
+        let open = scheds.lock_look_at_tasks_now();
+        assert_ne!(open[0].routine_instance, open[1].routine_instance);
+        assert!(advance_look_at_locks(&mut tasks, &open, Vec2::ZERO));
+        assert_eq!(tasks.len(), 2);
+        let survivor = open[1];
+        scheds.routines.remove(0);
+        assert_eq!(scheds.lock_look_at_tasks_now(), vec![survivor]);
+        assert!(advance_look_at_locks(
+            &mut tasks,
+            &scheds.lock_look_at_tasks_now(),
+            Vec2::ZERO
+        ));
+        assert_eq!(tasks.len(), 1);
+        scheds.routines.clear();
+        assert!(!advance_look_at_locks(
+            &mut tasks,
+            &scheds.lock_look_at_tasks_now(),
+            Vec2::ZERO
+        ));
+        assert!(tasks.is_empty());
+        scheds.push(active);
+        assert_ne!(
+            scheds.lock_look_at_tasks_now()[0].routine_instance,
+            survivor.routine_instance
+        );
+        assert!(advance_look_at_locks(
+            &mut tasks,
+            &scheds.lock_look_at_tasks_now(),
+            Vec2::ZERO
+        ));
+    }
+
+    #[test]
+    fn same_frame_look_locks_keep_distinct_stage_identity() {
+        const END_FRAME: u16 = 600;
+        let mut lock = stage(0, StageKind::LockLookAt, 0, *b"lock");
+        lock.stage.duration_frames = END_FRAME;
+        let active = ActiveScheduler::from_scheduler(&make_scheduler(*b"lock", vec![lock, lock]));
+        let scheds = ActiveSchedulers::one(active);
+        let open = scheds.lock_look_at_tasks_now();
+        assert_eq!(open.len(), 2);
+        assert_eq!(open[0].routine_instance, open[1].routine_instance);
+        assert_ne!(open[0].stage_index, open[1].stage_index);
+        let mut tasks = Vec::new();
+        assert!(crate::look_at_gates::advance_look_at_locks(
+            &mut tasks,
+            &open,
+            Vec2::ZERO
+        ));
+        assert_eq!(tasks.len(), 2);
     }
 
     // 0x2E is the movement twin of 0x59: same interval rules, a different lock. The 0x2E
@@ -6795,7 +7544,7 @@ mod tests {
             return;
         };
         let base = dll.base_emote_index(1).expect("HumeM emote base") as u32;
-        let (offset, routine) = emote_routine(1, 0).expect("bow is mapped");
+        let (offset, routine) = ffxi_vocab::emote_anim::emote_routine(1, 0).expect("bow is mapped");
         let loc = root.resolve(base + offset).expect("emote file resolves");
         let bytes = std::fs::read(loc.path_under(&root)).expect("emote DAT readable");
         let (schedulers, assets, _cameras) = parse_action_bytes(&bytes);
@@ -6823,65 +7572,112 @@ mod tests {
     /// the file-0 irregularities the old id/8 hypothesis got wrong.
     #[test]
     fn emote_table_matches_dat_clip_mnemonics() {
-        assert_eq!(emote_routine(1, 0), Some((0, *b"em00")), "bow → bow? clip");
         assert_eq!(
-            emote_routine(0, 0),
+            ffxi_vocab::emote_anim::emote_routine(1, 0),
+            Some((0, *b"em00")),
+            "bow → bow? clip"
+        );
+        assert_eq!(
+            ffxi_vocab::emote_anim::emote_routine(0, 0),
             Some((0, *b"em01")),
             "point → poi? clip"
         );
         assert_eq!(
-            emote_routine(2, 0),
+            ffxi_vocab::emote_anim::emote_routine(2, 0),
             Some((0, *b"em02")),
             "salute san d'oria → sl1?"
         );
         assert_eq!(
-            emote_routine(2, 2),
+            ffxi_vocab::emote_anim::emote_routine(2, 2),
             Some((0, *b"em04")),
             "salute windurst → sl3?"
         );
         assert_eq!(
-            emote_routine(2, 9),
+            ffxi_vocab::emote_anim::emote_routine(2, 9),
             Some((0, *b"em04")),
             "salute clamps unknown nations"
         );
-        assert_eq!(emote_routine(3, 0), Some((0, *b"em05")), "kneel → kne?");
-        assert_eq!(emote_routine(5, 0), Some((0, *b"em07")), "cry → wee?");
-        assert_eq!(emote_routine(6, 0), Some((1, *b"em00")), "no → den?");
-        assert_eq!(emote_routine(8, 0), Some((1, *b"em02")), "wave → wav?");
         assert_eq!(
-            emote_routine(9, 0),
+            ffxi_vocab::emote_anim::emote_routine(3, 0),
+            Some((0, *b"em05")),
+            "kneel → kne?"
+        );
+        assert_eq!(
+            ffxi_vocab::emote_anim::emote_routine(5, 0),
+            Some((0, *b"em07")),
+            "cry → wee?"
+        );
+        assert_eq!(
+            ffxi_vocab::emote_anim::emote_routine(6, 0),
+            Some((1, *b"em00")),
+            "no → den?"
+        );
+        assert_eq!(
+            ffxi_vocab::emote_anim::emote_routine(8, 0),
+            Some((1, *b"em02")),
+            "wave → wav?"
+        );
+        assert_eq!(
+            ffxi_vocab::emote_anim::emote_routine(9, 0),
             Some((1, *b"em03")),
             "goodbye → wav? (second)"
         );
-        assert_eq!(emote_routine(13, 0), Some((1, *b"em07")), "clap → clp?");
-        assert_eq!(emote_routine(32, 0), Some((4, *b"em02")), "think → thk?");
-        assert_eq!(emote_routine(36, 0), Some((4, *b"em06")), "psych → gut?");
-        assert_eq!(emote_routine(37, 0), Some((4, *b"em07")));
         assert_eq!(
-            emote_routine(40, 0),
+            ffxi_vocab::emote_anim::emote_routine(13, 0),
+            Some((1, *b"em07")),
+            "clap → clp?"
+        );
+        assert_eq!(
+            ffxi_vocab::emote_anim::emote_routine(32, 0),
+            Some((4, *b"em02")),
+            "think → thk?"
+        );
+        assert_eq!(
+            ffxi_vocab::emote_anim::emote_routine(36, 0),
+            Some((4, *b"em06")),
+            "psych → gut?"
+        );
+        assert_eq!(
+            ffxi_vocab::emote_anim::emote_routine(37, 0),
+            Some((4, *b"em07"))
+        );
+        assert_eq!(
+            ffxi_vocab::emote_anim::emote_routine(40, 0),
             Some((5, *b"em00")),
             "logging → ono0 axe (XIM 5,0)"
         );
         assert_eq!(
-            emote_routine(41, 0),
+            ffxi_vocab::emote_anim::emote_routine(41, 0),
             Some((6, *b"em00")),
             "excavation → turu pickaxe (XIM 6,0)"
         );
         assert_eq!(
-            emote_routine(42, 0),
+            ffxi_vocab::emote_anim::emote_routine(42, 0),
             Some((7, *b"em00")),
             "harvesting → kama sickle (XIM 7,0)"
         );
-        assert_eq!(emote_routine(44, 0), Some((11, *b"em00")), "toss → tos?");
-        assert_eq!(emote_routine(65, 0), Some((12, *b"em00")), "dance1 → dc0?");
-        assert_eq!(emote_routine(68, 0), Some((12, *b"em03")), "dance4 → dc3?");
         assert_eq!(
-            emote_routine(38, 0),
+            ffxi_vocab::emote_anim::emote_routine(44, 0),
+            Some((11, *b"em00")),
+            "toss → tos?"
+        );
+        assert_eq!(
+            ffxi_vocab::emote_anim::emote_routine(65, 0),
+            Some((12, *b"em00")),
+            "dance1 → dc0?"
+        );
+        assert_eq!(
+            ffxi_vocab::emote_anim::emote_routine(68, 0),
+            Some((12, *b"em03")),
+            "dance4 → dc3?"
+        );
+        assert_eq!(
+            ffxi_vocab::emote_anim::emote_routine(38, 0),
             None,
             "shocked has no body routine in the era DATs"
         );
-        assert_eq!(emote_routine(39, 0), None, "id gap");
-        assert_eq!(emote_routine(45, 0), None, "id gap");
+        assert_eq!(ffxi_vocab::emote_anim::emote_routine(39, 0), None, "id gap");
+        assert_eq!(ffxi_vocab::emote_anim::emote_routine(45, 0), None, "id gap");
     }
 
     #[test]
@@ -8068,6 +8864,245 @@ mod tests {
         assert_eq!(swing_routine(AttackAnimation::Throw), None);
     }
 
+    /// research/xim Actor.kt onAttackMainHand / onAttackSubHand: travelling selects the direction of
+    /// travel; standing (and the H2H kicks, which have no directional form there) does not.
+    #[test]
+    fn moving_swings_take_the_direction_of_travel_routine() {
+        use ffxi_actor::actor_state::Direction;
+        use ffxi_proto::melee::AttackAnimation;
+
+        let name = |n: Option<[u8; 4]>| n.map(|b| String::from_utf8_lossy(&b).into_owned());
+        let main = |d| name(moving_swing_routine(AttackAnimation::RightAttack, d));
+        let off = |d| name(moving_swing_routine(AttackAnimation::LeftAttack, d));
+
+        assert_eq!(main(Direction::Forward).as_deref(), Some("atf0"));
+        assert_eq!(main(Direction::Left).as_deref(), Some("atl0"));
+        assert_eq!(main(Direction::Right).as_deref(), Some("atr0"));
+        assert_eq!(main(Direction::Backward).as_deref(), Some("atb0"));
+
+        assert_eq!(off(Direction::Forward).as_deref(), Some("btf0"));
+        assert_eq!(off(Direction::Left).as_deref(), Some("btl0"));
+        assert_eq!(off(Direction::Right).as_deref(), Some("btr0"));
+        assert_eq!(off(Direction::Backward).as_deref(), Some("btb0"));
+
+        assert_eq!(
+            moving_swing_routine(AttackAnimation::RightAttack, Direction::None),
+            None
+        );
+        assert_eq!(
+            moving_swing_routine(AttackAnimation::LeftAttack, Direction::None),
+            None
+        );
+        for d in [
+            Direction::Forward,
+            Direction::Left,
+            Direction::Right,
+            Direction::Backward,
+        ] {
+            assert_eq!(moving_swing_routine(AttackAnimation::RightKick, d), None);
+            assert_eq!(moving_swing_routine(AttackAnimation::LeftKick, d), None);
+        }
+    }
+
+    /// One BATTLE2 melee start is answered once. Captured live on a strafe hold: the scheduler arm and
+    /// the pose pass classified the same swing from motion samples four tenths of a millisecond apart,
+    /// took `None` and `Right`, and put an `atr0`'s sounds and damage over a standing body.
+    #[test]
+    fn one_melee_start_gets_one_travel_answer() {
+        use ffxi_actor::actor_state::Direction;
+        let mut memo = MeleeTravel::default();
+        assert_eq!(
+            memo.for_event(7, || Direction::Right),
+            Direction::Right,
+            "first sight classifies"
+        );
+        assert_eq!(
+            memo.for_event(7, || Direction::None),
+            Direction::Right,
+            "the other consumer replays that answer rather than re-reading motion"
+        );
+        assert_eq!(
+            memo.for_event(8, || Direction::Left),
+            Direction::Left,
+            "a different start classifies on its own samples"
+        );
+    }
+
+    #[test]
+    fn retained_melee_batches_replay_without_reclassifying() {
+        use crate::snapshot::EventLog;
+        use ffxi_actor::actor_state::Direction;
+
+        let mut events = EventLog::default();
+        let mut memo = MeleeTravel::default();
+        for _ in 0..2 {
+            for _ in 0..EVENT_LOG_CAP {
+                events.push(kuluu_snapshot::ViewerEvent::ActionStarted {
+                    actor_id: 1,
+                    action_id: 0,
+                    action_kind: ffxi_proto::melee::CATEGORY_BASIC_ATTACK,
+                    target_id: None,
+                    result: None,
+                    animation: None,
+                    outcome: None,
+                });
+            }
+            assert_eq!(events.recent.len(), EVENT_LOG_CAP);
+            for (event_index, _) in events.recent_with_index() {
+                assert_eq!(
+                    memo.for_event(event_index, || Direction::Right),
+                    Direction::Right
+                );
+            }
+            for (event_index, _) in events.recent_with_index() {
+                assert_eq!(
+                    memo.for_event(event_index, || panic!("retained melee start reclassified")),
+                    Direction::Right,
+                );
+            }
+            assert_eq!(memo.answered.len(), EVENT_LOG_CAP);
+        }
+    }
+
+    /// The swings the race weapon-motion DAT actually ships, and which clip each one names: those
+    /// Motion stages are exactly what the pose pass resolves. `atf0` and `atb0` share the authored
+    /// lunge clip; only left/right have their own.
+    #[test]
+    fn real_dat_moving_swings_name_their_clips() {
+        let Some(motion) = routines_in_file(HUME_M_WEAPON_MOTION_FILE) else {
+            return;
+        };
+        let clip_of = |name: &[u8; 4]| {
+            motion
+                .iter()
+                .find(|s| &s.name == name)
+                .and_then(|s| s.stages.iter().find(|t| t.stage.kind == StageKind::Motion))
+                .map(|t| String::from_utf8_lossy(&t.stage.id).into_owned())
+        };
+        for (routine, clip) in [
+            (b"atf0", "amb?"),
+            (b"atb0", "amb?"),
+            (b"atr0", "amr?"),
+            (b"atl0", "aml?"),
+        ] {
+            assert_eq!(
+                clip_of(routine).as_deref(),
+                Some(clip),
+                "{} names {clip} as its motion",
+                String::from_utf8_lossy(routine)
+            );
+        }
+    }
+
+    /// research/xim Actor.kt onAttackMainHand draws a standing swing over the limb's authored variants; kuluu
+    /// keys that draw to the swing's event index so its two consumers (sounds, pose) cannot disagree. The
+    /// selection law these pin: candidates are only routines this model carries, a carried travelling routine
+    /// wins over any standing draw, and an empty candidate set falls through to `ati0` as it always did.
+    #[test]
+    fn standing_swing_draws_stay_inside_the_carried_variants() {
+        use ffxi_actor::actor_state::Direction;
+        use ffxi_proto::melee::AttackAnimation;
+
+        let three = holds(&[*b"ati0", *b"ati1", *b"ati2"]);
+        let picks: Vec<[u8; 4]> = (0..6)
+            .map(|seed| {
+                swing_routine_for(AttackAnimation::RightAttack, Direction::None, seed, &three)
+            })
+            .collect();
+        assert!(
+            picks
+                .iter()
+                .all(|p| matches!(p, b"ati0" | b"ati1" | b"ati2")),
+            "drew {picks:?}, outside the carried set"
+        );
+        let distinct = picks.iter().collect::<std::collections::BTreeSet<_>>();
+        assert!(
+            distinct.len() >= 2,
+            "six standing swings all drew {picks:?}"
+        );
+        for (seed, pick) in picks.iter().enumerate() {
+            assert_eq!(
+                *pick,
+                swing_routine_for(
+                    AttackAnimation::RightAttack,
+                    Direction::None,
+                    seed as u64,
+                    &three
+                ),
+                "the same seed drew differently"
+            );
+        }
+
+        let with_travel = holds(&[*b"ati0", *b"ati1", *b"atr0"]);
+        assert_eq!(
+            swing_routine_for(
+                AttackAnimation::RightAttack,
+                Direction::Right,
+                3,
+                &with_travel
+            ),
+            *b"atr0",
+            "a carried travelling routine must win the pick"
+        );
+
+        let standing_only =
+            swing_routine_for(AttackAnimation::RightAttack, Direction::Left, 1, &three);
+        assert!(
+            matches!(&standing_only, b"ati0" | b"ati1" | b"ati2"),
+            "an uncarried travel direction falls back to the standing draw, got {standing_only:?}"
+        );
+
+        let one = holds(&[*b"bti0"]);
+        for seed in 0..4 {
+            assert_eq!(
+                swing_routine_for(AttackAnimation::LeftAttack, Direction::None, seed, &one),
+                *b"bti0",
+                "a limb with one variant draws it every time"
+            );
+        }
+
+        let kicks = holds(&[*b"ati0", *b"cti1"]);
+        assert_eq!(
+            swing_routine_for(AttackAnimation::RightKick, Direction::None, 7, &kicks),
+            *b"cti1",
+            "the kick draws its own limb, not the main hand"
+        );
+
+        let nothing = holds(&[]);
+        assert_eq!(
+            swing_routine_for(AttackAnimation::LeftAttack, Direction::None, 5, &nothing),
+            *b"ati0",
+            "an uncarried limb falls through to ati0 exactly as before"
+        );
+    }
+
+    fn holds(names: &[[u8; 4]]) -> impl Fn([u8; 4]) -> bool {
+        let names = names.to_vec();
+        move |r| names.contains(&r)
+    }
+
+    /// What the shipped race weapon-motion DAT carries for standing swings. More than one `ati?` is what makes
+    /// variety real on installed data rather than only possible in the selector.
+    #[test]
+    fn real_dat_standing_swing_variants_exist() {
+        let Some(motion) = routines_in_file(HUME_M_WEAPON_MOTION_FILE) else {
+            return;
+        };
+        let mut names: Vec<String> = motion
+            .iter()
+            .filter(|s| &s.name[..3] == b"ati" && s.name[3].is_ascii_digit())
+            .map(|s| String::from_utf8_lossy(&s.name).into_owned())
+            .collect();
+        names.sort();
+        let before = names.len();
+        names.dedup();
+        assert_eq!(names.len(), before, "duplicate routine names: {names:?}");
+        assert!(
+            before >= 2,
+            "file {HUME_M_WEAPON_MOTION_FILE} carries {names:?}"
+        );
+    }
+
     // Retail-DAT guard (skips without an install): the Carrion Worm's dig (`ini1`) and pop-up
     // (`init`) each carry the AnimationLock the pose-pass hold keys on and the StopRoutine
     // that stops the other, so both halves of StopRoutine are exercised by one file. Read
@@ -8512,6 +9547,23 @@ mod tests {
             });
     }
 
+    fn push_transpar(
+        app: &mut App,
+        target: kuluu_snapshot::CutsceneActor,
+        end_alpha: i32,
+        duration_frames: i32,
+    ) {
+        app.world_mut()
+            .resource_mut::<crate::snapshot::EventLog>()
+            .push(kuluu_snapshot::ViewerEvent::Cutscene {
+                cue: CutsceneCue::Transpar {
+                    target,
+                    end_alpha,
+                    duration_frames,
+                },
+            });
+    }
+
     /// Hides event 503's party lead (Curilla) and releases her on unhide.
     #[test]
     #[cfg(not(target_arch = "wasm32"))]
@@ -8633,6 +9685,56 @@ mod tests {
         );
         let state = app.world().resource::<CutsceneActorState>();
         assert!(state.is_empty());
+    }
+
+    /// 0x6C inserts the fade component on the target and stops it, at whatever
+    /// value it reached, on CutsceneEnded
+    /// (research/XiEvents/OpCodes/0x006C.md).
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn transpar_cue_inserts_the_fade_and_end_stops_it() {
+        const NPC: u32 = 0x010E_60D5;
+        let mut app = actor_cue_app();
+        app.init_resource::<crate::snapshot::SceneState>()
+            .add_systems(Update, release_cutscene_actors);
+        let npc = spawn_tracked_actor(&mut app, NPC);
+
+        push_transpar(
+            &mut app,
+            kuluu_snapshot::CutsceneActor::Entity { server_id: NPC },
+            0,
+            60,
+        );
+        app.update();
+        let fade = app
+            .world()
+            .get::<crate::ffxi_actor_render::CutsceneTranspar>(npc)
+            .expect("the cue must insert the fade");
+        assert!(
+            (fade.end - 0.0).abs() < f32::EPSILON,
+            "alpha byte 0 is fully transparent"
+        );
+        assert!(
+            (fade.total_secs - 1.0).abs() < 1e-6,
+            "60 frames is one second"
+        );
+        let state = app.world().resource::<CutsceneActorState>();
+        assert!(
+            state.faded.contains(&NPC),
+            "the fade must be recorded so release finds it"
+        );
+
+        app.world_mut()
+            .resource_mut::<crate::snapshot::EventLog>()
+            .push(kuluu_snapshot::ViewerEvent::CutsceneEnded);
+        app.update();
+        assert!(
+            app.world()
+                .get::<crate::ffxi_actor_render::CutsceneTranspar>(npc)
+                .is_none(),
+            "ended must stop the fade at its current value"
+        );
+        assert!(app.world().resource::<CutsceneActorState>().is_empty());
     }
 
     /// The 0x45 camera route drives the operator camera to where the DAT
@@ -8851,5 +9953,66 @@ mod tests {
                 focal(&mut app)
             );
         }
+    }
+
+    /// The airborne byte is the second gate in front of retail's facing integrator (`FFXiMain.dll
+    /// retail-2026-09` RVA 0xC66A1): while it is set, a queued turn takes no step at all.
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn an_airborne_actor_takes_no_step_of_its_queued_turn() {
+        const SELF: u32 = 7;
+        let mut app = App::new();
+        app.init_resource::<Time>()
+            .init_resource::<crate::snapshot::SceneState>()
+            .init_resource::<SelfAuthoredHeading>();
+        app.world_mut()
+            .resource_mut::<crate::snapshot::SceneState>()
+            .snapshot
+            .self_char_id = Some(SELF);
+
+        let mut turn = PendingTurn::default();
+        turn.arm(
+            Vec3::ZERO,
+            Vec3::new(0.0, 0.0, 4.0),
+            0.0,
+            &PlanTurn {
+                step_degrees: 45.0,
+                duration_frames: 100.0,
+            },
+        );
+        let entity = app
+            .world_mut()
+            .spawn((
+                crate::components::WorldEntity {
+                    id: SELF,
+                    act_index: 0,
+                    kind: kuluu_snapshot::EntityKind::Pc,
+                },
+                turn,
+                ActorAirborne,
+            ))
+            .id();
+        app.add_systems(Update, step_pending_turns);
+
+        let run =
+            |app: &mut App| {
+                app.world_mut().resource_mut::<Time>().advance_by(
+                    std::time::Duration::from_secs_f32(6.0 / crate::scheduler_runtime::RETAIL_FPS),
+                );
+                app.update();
+            };
+
+        run(&mut app);
+        assert!(
+            app.world().resource::<SelfAuthoredHeading>().0.is_none(),
+            "an airborne actor must not have its heading stepped"
+        );
+
+        app.world_mut().entity_mut(entity).remove::<ActorAirborne>();
+        run(&mut app);
+        assert!(
+            app.world().resource::<SelfAuthoredHeading>().0.is_some(),
+            "the same turn steps as soon as the actor is on the ground"
+        );
     }
 }

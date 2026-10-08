@@ -31,6 +31,14 @@ pub const RACE_CONFIG_HINT: u32 = 0xA01B_A01B;
 pub const ACTION_ANIM_HINT: u32 = 0xCB96_CB96;
 // research/xim MainDll.kt battleAnimationFileTableOffsetHint.
 pub const BATTLE_ANIM_HINT: u32 = 0xC825_C825;
+// Dual-wielded weapons animate out of a different block than single-wielded ones, and the off hand
+// has its own. research/xim MainDll.kt dualWieldMainHandFileTableOffsetHint /
+// dualWieldOffHandFileTableOffsetHint / battleSkirtAnimationFileTableOffsetHint /
+// battleSkirtDwAnimationFileTableOffsetHint.
+pub const BATTLE_DW_MAIN_ANIM_HINT: u32 = 0x6F9F_6F9F;
+pub const BATTLE_DW_OFF_ANIM_HINT: u32 = 0xEF9D_EF9D;
+pub const BATTLE_SKIRT_ANIM_HINT: u32 = 0x4826_C826;
+pub const BATTLE_SKIRT_DW_ANIM_HINT: u32 = 0xEF9F_6FA0;
 // research/xim MainDll.kt equipmentLookupTableOffsetHint. Unlike the per-race u16
 // tables the marker is the table's own first `(file_id, count)` pair rather than a
 // repeated word: 0x1BA8 = 7080 is HumeM's face base, and the count's high half is 0.
@@ -230,6 +238,10 @@ pub struct MainDll {
     race_config_base: Option<usize>,
     action_anim_base: Option<usize>,
     battle_anim_base: Option<usize>,
+    battle_dw_main_anim_base: Option<usize>,
+    battle_dw_off_anim_base: Option<usize>,
+    battle_skirt_anim_base: Option<usize>,
+    battle_skirt_dw_anim_base: Option<usize>,
     equipment_base: Option<usize>,
     command_table_base: Option<usize>,
 }
@@ -255,6 +267,10 @@ impl MainDll {
         let race_config_base = find_offset(&bytes, &window, RACE_CONFIG_HINT);
         let action_anim_base = find_offset(&bytes, &window, ACTION_ANIM_HINT);
         let battle_anim_base = find_offset(&bytes, &window, BATTLE_ANIM_HINT);
+        let battle_dw_main_anim_base = find_offset(&bytes, &window, BATTLE_DW_MAIN_ANIM_HINT);
+        let battle_dw_off_anim_base = find_offset(&bytes, &window, BATTLE_DW_OFF_ANIM_HINT);
+        let battle_skirt_anim_base = find_offset(&bytes, &window, BATTLE_SKIRT_ANIM_HINT);
+        let battle_skirt_dw_anim_base = find_offset(&bytes, &window, BATTLE_SKIRT_DW_ANIM_HINT);
         let equipment_base = find_offset(&bytes, &window, EQUIPMENT_HINT);
         let command_table_base = find_command_table(&bytes, &window);
         Ok(Self {
@@ -266,6 +282,10 @@ impl MainDll {
             race_config_base,
             action_anim_base,
             battle_anim_base,
+            battle_dw_main_anim_base,
+            battle_dw_off_anim_base,
+            battle_skirt_anim_base,
+            battle_skirt_dw_anim_base,
             equipment_base,
             command_table_base,
         })
@@ -375,6 +395,35 @@ impl MainDll {
     /// getActionAnimationIndex.
     pub fn base_action_animation_index(&self, race_index: u8) -> Option<u16> {
         self.read16(self.action_anim_base? + race_index as usize * 2)
+    }
+
+    /// First file of the dual-wield main-hand block: a weapon in each hand takes its own battle
+    /// motions from here rather than from [`Self::base_battle_animation_index`] (research/xim
+    /// MainDll.kt getBaseDualWieldMainHandAnimationIndex, consumed by poc/Model.kt
+    /// PcModel.getMainBattleAnimationDirectory).
+    pub fn base_dual_wield_main_hand_animation_index(&self, race_index: u8) -> Option<u16> {
+        self.read16(self.battle_dw_main_anim_base? + race_index as usize * 2)
+    }
+
+    /// First file of the dual-wield off-hand block, which supplies the sub weapon's own battle
+    /// motions alongside the main hand's (research/xim MainDll.kt
+    /// getBaseDualWieldOffHandAnimationIndex, consumed by poc/Model.kt
+    /// PcModel.getSubBattleAnimationDirectory).
+    pub fn base_dual_wield_off_hand_animation_index(&self, race_index: u8) -> Option<u16> {
+        self.read16(self.battle_dw_off_anim_base? + race_index as usize * 2)
+    }
+
+    /// First file of the waist/cloth battle-motion block for this weapon pairing. The two variants
+    /// sit in one stride-4 table at an odd half-word, which is why the read is `+ index*4 + 2` and
+    /// not the plain per-race stride the other tables use (research/xim MainDll.kt
+    /// getBaseSkirtAnimationIndex).
+    pub fn base_skirt_animation_index(&self, race_index: u8, dual_wield: bool) -> Option<u16> {
+        let base = if dual_wield {
+            self.battle_skirt_dw_anim_base?
+        } else {
+            self.battle_skirt_anim_base?
+        };
+        self.read16(base + race_index as usize * 4 + 2)
     }
 
     /// First file of the race's battle-animation block (the per-weapon-type
@@ -718,6 +767,10 @@ mod tests {
             race_config_base: None,
             action_anim_base: None,
             battle_anim_base: None,
+            battle_dw_main_anim_base: None,
+            battle_dw_off_anim_base: None,
+            battle_skirt_anim_base: None,
+            battle_skirt_dw_anim_base: None,
             equipment_base: None,
             command_table_base: None,
         }

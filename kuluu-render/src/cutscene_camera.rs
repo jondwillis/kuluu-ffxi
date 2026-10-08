@@ -1182,11 +1182,12 @@ mod tests {
             references: (0..ffxi_dat::camera::EID_NORMAL_MAX)
                 .map(|i| ffxi_dat::skel::JointReference {
                     index: 0,
-                    unk_v0: [0.0; 3],
+                    rotation: [0.0; 3],
                     position_offset: [0.0, i as f32, 0.0],
                 })
                 .collect(),
             bounding_boxes: Vec::new(),
+            look_at_limits: Vec::new(),
         };
         let pose = ffxi_actor::skeleton_instance::pose_world(
             &skeleton,

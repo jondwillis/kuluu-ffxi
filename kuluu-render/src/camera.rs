@@ -743,12 +743,13 @@ mod tests {
             references: vec![
                 JointReference {
                     index: bone,
-                    unk_v0: [0.0; 3],
+                    rotation: [0.0; 3],
                     position_offset: [1.0, -3.5, 2.0]
                 };
                 ABOVE_HEAD + 1
             ],
             bounding_boxes: Vec::new(),
+            look_at_limits: Vec::new(),
         }
     }
 
