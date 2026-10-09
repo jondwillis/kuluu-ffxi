@@ -146,6 +146,7 @@ fn capture(
                 started_at: Instant::now(),
                 duration_secs: HOLD_SECONDS as f32,
                 envelope: None,
+                follow: None,
             });
         }
     }

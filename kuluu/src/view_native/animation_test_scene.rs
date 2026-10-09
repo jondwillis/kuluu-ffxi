@@ -3089,6 +3089,7 @@ mod tests {
                     started_at: Instant::now(),
                     duration_secs: 60.0,
                     envelope: None,
+                    follow: None,
                 });
                 distortion
             })

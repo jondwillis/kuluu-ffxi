@@ -1214,6 +1214,7 @@ fn push_distortion_field(
     dist: &ffxi_dat::particle_gen::DistortionGeneratorDef,
     origin: Vec3,
     envelope: Option<ffxi_dat::particle_gen::KeyFrameTrack>,
+    follow: Option<Entity>,
     distortion: &mut crate::distortion_pass::ActiveDistortion,
 ) -> bool {
     let Some(half_extent) = procedural_half_extent(&dist.generator_view) else {
@@ -1226,8 +1227,28 @@ fn push_distortion_field(
         started_at: Instant::now(),
         duration_secs: dist.max_life_frames / ROUTINE_FPS,
         envelope,
+        follow: follow.map(crate::distortion_pass::FieldFollow::new),
     });
     true
+}
+
+/// Which actor carries a directly armed field, mirroring how [`attach_frame`] chooses its reference:
+/// a target-reference mode rides the target and falls back to the routine's owner when there is no
+/// target, as `attach_frame` does. Retail sets the unattached flag exactly when the attach code is 0,
+/// and an unattached element is carried by nothing.
+fn field_carry_actor(
+    def: &ParticleGeneratorDef,
+    owner: Entity,
+    target: Option<Entity>,
+) -> Option<Entity> {
+    use ffxi_dat::particle_gen::attach_mode as mode;
+    match def.attach_mode {
+        mode::UNATTACHED => None,
+        mode::TARGET | mode::TARGET_WITH_SOURCE_YAW | mode::TARGET_TO_SOURCE => {
+            Some(target.unwrap_or(owner))
+        }
+        _ => Some(owner),
+    }
 }
 
 // Retail sets the unattached flag exactly when the attach code is 0.
@@ -1382,7 +1403,9 @@ pub fn spawn_particle_generators(
                     let origin = attach_frame(&dist.generator_view, ev.actor, target_ent, &attach)
                         .map(|f| f.point(Vec3::from_array(dist.generator_view.base_position)))
                         .unwrap_or(actor_xf.translation);
-                    let armed = push_distortion_field(dist, origin, envelope, &mut distortion);
+                    let carry = field_carry_actor(&dist.generator_view, ev.actor, target_ent);
+                    let armed =
+                        push_distortion_field(dist, origin, envelope, carry, &mut distortion);
                     if tracing {
                         info!(
                             "animationtest trace: particle stage {} [{}] — DISTORTION field haze={:.3} life {:.1}s envelope={} pts{}",
@@ -2274,6 +2297,9 @@ fn instantiate_child_generators(
                             started_at: Instant::now(),
                             duration_secs: *life_frames / ROUTINE_FPS,
                             envelope: envelope.clone(),
+                            // A child fires at a point along its parent's path, and no attach mode
+                            // governs that placement, so nothing anchors it to an actor.
+                            follow: None,
                         });
                         true
                     }
@@ -10505,12 +10531,50 @@ mod tests {
         };
         let mut distortion = crate::distortion_pass::ActiveDistortion::default();
         assert!(
-            push_distortion_field(&def, Vec3::ZERO, None, &mut distortion),
+            push_distortion_field(&def, Vec3::ZERO, None, None, &mut distortion),
             "an unresolvable linked name must not stop a 0x22 field from arming"
         );
-        assert_eq!(distortion.fields.len(), 1);
-        assert_eq!(distortion.fields[0].half_extent, Vec2::ONE);
-        assert_eq!(distortion.fields[0].haze_offset, 0.02);
+        let armed = &distortion.fields[0];
+        // The authored g142 values land on the field as written: unit axes at scale [1,1,1], haze
+        // 0.02, a 45-frame life
+        // (`.agents/skills/retail-observe/references/2026-10-07-procedural-distortion.md`).
+        assert_eq!(armed.half_extent, Vec2::ONE);
+        assert_eq!(armed.haze_offset, 0.02);
+        assert_eq!(armed.duration_secs, def.max_life_frames / ROUTINE_FPS);
+    }
+
+    /// The carrying actor comes from the attach mode: a target-reference element rides the target and
+    /// falls back to the routine's owner where `attach_frame` would, a source one rides the caster, and
+    /// an unattached element is carried by nothing.
+    #[test]
+    fn authored_attach_mode_names_the_carrying_actor() {
+        use ffxi_dat::particle_gen::attach_mode as mode;
+        let owner = Entity::from_bits(7);
+        let target = Entity::from_bits(9);
+        let with = |attach_mode: u8| ParticleGeneratorDef {
+            attach_mode,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            field_carry_actor(&with(mode::TARGET), owner, Some(target)),
+            Some(target),
+            "a target-reference element rides its target"
+        );
+        assert_eq!(
+            field_carry_actor(&with(mode::TARGET_TO_SOURCE), owner, None),
+            Some(owner),
+            "no target falls back to the routine's owner"
+        );
+        assert_eq!(
+            field_carry_actor(&with(mode::SOURCE), owner, Some(target)),
+            Some(owner),
+            "a source-reference element rides its caster"
+        );
+        assert_eq!(
+            field_carry_actor(&with(mode::UNATTACHED), owner, Some(target)),
+            None
+        );
     }
 
     // A sound child writes the same SfxEvent a 0x02 stage naming that generator would.
