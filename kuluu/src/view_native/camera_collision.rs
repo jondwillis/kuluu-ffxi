@@ -20,48 +20,17 @@ use super::locked_camera::{
     TARGET_POINT_SLOT, WALL_RAY_RISE,
 };
 
-/// Spring-back orbit rate divisor (dist units): while a facing event holds the
-/// spring engaged, each frame rotates the eye about its focus by `ref ×
-/// SPRING_ORBIT_RATE / max(dist, SPRING_DIST_EPS)` radians. Retail reads both
-/// numbers from `.rdata`: 6.0 is FFXiMain.dll retail-2026-09 [0x1032A3E8]
-/// (consumer `fld` at RVA 0x1F1F8) and the distance floor 0.01 is
-/// [0x10329A18] (`fcom` gate 0x1F1E3). The consumer is purely angular:
-/// retail has no gap-proportional pull and no travel cap toward the goal.
-const SPRING_ORBIT_RATE: f32 = 6.0;
-
-/// The `max(dist, …)` floor on the orbit scale (FFXiMain.dll retail-2026-09
-/// [0x10329A18], consumer gate at RVA 0x1F1E3).
-const SPRING_DIST_EPS: f32 = 0.01;
-
-/// The released camera eases back behind the body at this rate (framerate-independent exponential)
-/// once the gap is inside super::input::LOCK_CAM_ARRIVAL_GAP_RAD; wider gaps turn at
-/// super::input::LOCK_CAM_MAX_TURN_RAD_PER_SEC (the lock-release catch). Retail's spring-back
-/// expression IS decodable: each facing event stores a reference angle = axis·(π/2)·turn (engage site
-/// FFXiMain.dll retail-2026-09 RVA 0xA6998, operand staged at [esp+0xC] 0xA6936 → eax 0xA697E), and
-/// the consumer orbits the look-at point by −ref × 6/max(dist, .01) per frame while a non-zero turn
-/// mode is set (applier 0x1EBB0). Every steering frame re-stores the ref term and any steer-zero frame
-/// calls the mode=0 release; that engage/release pair drives the free-camera spring here. This catch
-/// rate stays playtest-tuned.
+/// The lock-release catch: a released camera eases back behind the body at this
+/// rate (framerate-independent exponential) once the gap is inside
+/// super::input::LOCK_CAM_ARRIVAL_GAP_RAD; wider gaps turn at
+/// super::input::LOCK_CAM_MAX_TURN_RAD_PER_SEC. A deliberate tuning — no retail
+/// number fixes how fast a released camera returns, and retail's own spring-back
+/// consumer (engage FFXiMain.dll retail-2026-09 RVA 0xA6998 orbiting by −ref ×
+/// 6/max(dist, .01) at applier 0x1EBB0) is read in
+/// `.agents/skills/retail-observe/references/2026-10-07-camera-orbit-channels.md`
+/// as a channel gated separately from direct camera actions, which this build
+/// does not apply to manual orbit input.
 const LOCK_TURN_RATE: f32 = 12.0;
-
-/// One tick of retail's spring-back consumer: rotate `eye` about `focus` by
-/// −`ref_angle × SPRING_ORBIT_RATE / max(dist, SPRING_DIST_EPS)` radians,
-/// preserving the radius. `ref_angle` is what an engage stores per facing
-/// event — exactly that frame's heading-change term V·(π/2)·turn (engage site
-/// FFXiMain.dll retail-2026-09 RVA 0xA6998, operand staged at [esp+0xC]
-/// 0xA6936 → eax 0xA697E); the mode clears on any steer-zero frame (setter
-/// called with mode=0 — e.g. 0xA6A46). Retail's bearing is atan2(x, z) about
-/// the pivot (applier 0x1EBB0: `fpatan` over pivot−eye at 0x1EBCE, θ += Δ,
-/// polar rebuild), the same convention as chase yaw, so the orbit maps onto
-/// [`rotate_about`] without a sign change beyond the law's own negation.
-pub fn spring_orbit(eye: Vec2, focus: Vec2, ref_angle: f32) -> Vec2 {
-    if ref_angle == 0.0 {
-        return eye;
-    }
-    let d = (eye - focus).length();
-    let delta = -ref_angle * SPRING_ORBIT_RATE / d.max(SPRING_DIST_EPS);
-    rotate_about(eye, focus, delta)
-}
 
 /// The band's inner edge sits at zero, not a fraction of the zoom: no ratio
 /// constant exists in FFXiMain.dll retail-2026-09's camera event block — the
@@ -242,14 +211,11 @@ const TURN_OWED_SETTLED_RAD: f32 = 1e-3;
 /// interpolation seam, a stair step) never reaches the camera. The eye keeps
 /// its spot within the zoom band (outer edge = the zoom distance; inner edge
 /// zero — LEASH_INNER_EDGE), and outside it the leash clamps to the band's
-/// edge: retail has no positional pull at all. The spring is angular: while a
-/// facing event holds it engaged each frame orbits the eye about the focus by
-/// −ref × SPRING_ORBIT_RATE / max(dist, SPRING_DIST_EPS) radians (retail's
-/// consumer at FFXiMain.dll retail-2026-09 RVA 0x1F14D.. through applier
-/// 0x1EBB0). The yaw
-/// is the direction from the focus to the eye; with the spring off, a frame
-/// where something else wrote chase.yaw (the mouse, the yaw keys, a stair
-/// warp) swings the eye around the focus to that yaw at once. A Q/E turn
+/// edge: retail has no positional pull at all. `camera_spring` eases only the boom's
+/// distance, never the bearing. The yaw
+/// is the direction from the focus to the eye; a frame where something else wrote
+/// chase.yaw (the mouse, the yaw keys, a stair warp) swings the eye around the focus to that yaw at
+/// once, whatever `camera_spring` says. A Q/E turn
 /// is paid separately (ChaseCamera::turn_owed): the rig swings round the
 /// player after it at the lock-release catch, with the spring on or off.
 ///
@@ -502,31 +468,14 @@ pub fn resolve_camera(
         }
     }
 
-    // Eye: with the spring off, where it was, swung straight to the yaw when
-    // something else (arrows, mouse drag, Q/E's catch, the release ease) wrote chase.yaw
-    // since last frame — a manual turn moves the whole rig, eye and focus
-    // together, so nothing jumps. With the spring on retail replaces that
-    // swing: each facing event latches its heading change as the reference
-    // angle (mode engaged — FFXiMain.dll retail-2026-09 engage 0xA6998 stores
-    // exactly that frame's term V·(π/2)·turn), every tick under an engaged
-    // mode orbits the eye about the live focus by −ref × SPRING_ORBIT_RATE /
-    // max(dist, SPRING_DIST_EPS) (consumer 0x1F14D.. + applier 0x1EBB0), and
-    // any frame without a facing change is retail's release (setter with
-    // mode=0 — e.g. 0xA6A46): the eye just keeps its spot until the band
-    // clamps it. The lock-release ease feeds the same latch: retail's release
-    // catch behaves like the regular spring with a small ref (playtest).
-
-    // Locked on, the locked view owns the yaw outright, so the rig's eye is carried on the boom at its
-    // own distance and the spring's reference exists only for the free camera: orbiting the rig's eye
-    // while the yaw is driven elsewhere would only turn it off the boom.
-    let steer_event = manual_yaw != 0.0;
-    let spring_ref = if !settings.camera_spring || chase.snap_to_anchor || locked {
-        None
-    } else if steer_event {
-        Some(manual_yaw)
-    } else {
-        None
-    };
+    // A turn of the yaw swings the whole rig — eye and focus together — so nothing jumps: arrows,
+    // mouse drag, Q/E's catch or the release ease wrote chase.yaw since last frame. Swapping that swing
+    // for an orbit against the request is what made a spring-on build reverse manual and mouse yaw;
+    // `manual_orbit_preserves_direction_with_each_spring_setting` fails when it creeps back. Retail's
+    // separately gated actor-facing reference channel — read in
+    // `.agents/skills/retail-observe/references/2026-10-07-camera-orbit-channels.md` from the body-facing
+    // producer at FFXiMain.dll retail-2026-09 RVA 0xA692A..0xA6998 — is left unimplemented here, because
+    // that record does not establish applying it to direct camera actions.
     let (focus, eye_prev) = match (leash_state.eye, leash_state.yaw) {
         (Some(e), _) if !chase.snap_to_anchor && locked => {
             (focus, focus + yaw_dir(chase.yaw) * (e - focus).length())
@@ -538,23 +487,13 @@ pub fn resolve_camera(
                 let d = continuous_yaw(last_yaw, chase.yaw) - last_yaw;
                 (
                     rotate_about(focus, pivot_xz, d),
-                    // Retail's eye never swings with the yaw — its travel is
-                    // the orbit below; the focus keeps turning for coherence.
-                    if spring_ref.is_some() {
-                        e
-                    } else {
-                        rotate_about(e, pivot_xz, d)
-                    },
+                    rotate_about(e, pivot_xz, d),
                 )
             }
         }
         _ => (focus, focus + yaw_dir(chase.yaw) * max_h),
     };
-    let eye_orbited = match spring_ref {
-        Some(r) => spring_orbit(eye_prev, focus, r),
-        None => eye_prev,
-    };
-    let eye = leash(eye_orbited, focus, min_h, max_h, yaw_dir(chase.yaw));
+    let eye = leash(eye_prev, focus, min_h, max_h, yaw_dir(chase.yaw));
     let to_eye = eye - focus;
     if !locked {
         chase.yaw = continuous_yaw(chase.yaw, to_eye.x.atan2(to_eye.y));
@@ -1033,35 +972,67 @@ mod tests {
         assert!((v.x.atan2(v.y) - yaw).abs() < 1e-4);
     }
 
-    /// The spring's tick is retail's orbit law: the eye circles its focus by
-    /// −ref × 6/max(d, .01) radians — angular travel only (the radius stays),
-    /// half the distance doubles the angle, and a zero reference angle with a
-    /// latch does nothing.
+    /// A manual yaw request must move the camera by the requested amount under every
+    /// `camera_spring` setting and then hold: a spring setting gates boom-distance easing,
+    /// not the bearing (`.agents/skills/retail-observe/references/2026-10-07-camera-orbit-channels.md`).
     #[test]
-    fn spring_orbits_the_focus_by_the_law_angle() {
-        use std::f32::consts::FRAC_PI_4;
-        let focus = Vec2::ZERO;
-        let far = Vec2::new(0.0, 6.0); // boom yaw 0 (+z)
-        let moved = spring_orbit(far, focus, FRAC_PI_4);
-        assert!(
-            (moved.length() - 6.0).abs() < 1e-3,
-            "the orbit preserves the radius"
-        );
-        // One frame's orbit at d=6 turns −(π/4)·(6/6); bearings are atan2(x, z)
-        // like chase yaw, and rotate_about adds its angle in that convention.
-        let want_far = -(FRAC_PI_4 * (SPRING_ORBIT_RATE / 6.0));
-        assert!(
-            (moved.x.atan2(moved.y) - want_far).abs() < 1e-4,
-            "law angle at d=6: got {} want {want_far}",
-            moved.x.atan2(moved.y)
-        );
-        let near = spring_orbit(Vec2::new(0.0, 3.0), focus, FRAC_PI_4);
-        let want_near = -(FRAC_PI_4 * (SPRING_ORBIT_RATE / 3.0));
-        assert!(
-            (near.x.atan2(near.y) - want_near).abs() < 1e-4,
-            "half the distance doubles the orbit angle"
-        );
-        assert_eq!(spring_orbit(far, focus, 0.0), far);
+    fn manual_orbit_preserves_direction_with_each_spring_setting() {
+        const YAW_STEP: f32 = 0.1;
+        const EPSILON: f32 = 0.0001;
+        const TICK_HZ: f32 = 60.0;
+        for spring in [false, true] {
+            for step in [-YAW_STEP, YAW_STEP] {
+                let mut app = App::new();
+                app.init_resource::<Time>()
+                    .insert_resource(CameraMode::Chase)
+                    .insert_resource(kuluu_render::GraphicsSettings {
+                        camera_spring: spring,
+                        ..default()
+                    })
+                    .init_resource::<SceneState>()
+                    .init_resource::<ZoneCollisionBvh>()
+                    .init_resource::<kuluu_render::camera::CameraStepSmoothing>()
+                    .init_resource::<kuluu_render::cutscene::CutsceneMode>()
+                    .init_resource::<kuluu_render::lock_on::LockOn>()
+                    .init_resource::<kuluu_render::ViewFov>()
+                    .insert_resource(ChaseCamera {
+                        yaw: 0.0,
+                        synced_initial: true,
+                        snap_to_anchor: true,
+                        ..default()
+                    })
+                    .add_systems(Update, resolve_camera);
+                app.world_mut().spawn((IsSelf, Transform::default()));
+                let camera = app
+                    .world_mut()
+                    .spawn((OperatorCamera, Transform::default()))
+                    .id();
+                app.world_mut()
+                    .resource_mut::<Time>()
+                    .advance_by(std::time::Duration::from_secs_f32(1.0 / TICK_HZ));
+                app.world_mut().run_schedule(Update);
+                let initial_yaw = app.world().resource::<ChaseCamera>().yaw;
+                app.world_mut().resource_mut::<ChaseCamera>().yaw += step;
+                app.world_mut().run_schedule(Update);
+                let actual = app.world().resource::<ChaseCamera>().yaw - initial_yaw;
+                assert!(
+                    (actual - step).abs() < EPSILON,
+                    "spring={spring}, requested={step}, actual={actual}"
+                );
+                let eye = app.world().get::<Transform>(camera).unwrap().translation;
+                for _ in 0..10 {
+                    app.world_mut().run_schedule(Update);
+                }
+                assert!(
+                    (app.world().resource::<ChaseCamera>().yaw - initial_yaw - step).abs()
+                        < EPSILON
+                );
+                assert!(
+                    (app.world().get::<Transform>(camera).unwrap().translation - eye).length()
+                        < EPSILON
+                );
+            }
+        }
     }
 
     /// The behind-the-target case: a wide gap turns at the constant max rate,
