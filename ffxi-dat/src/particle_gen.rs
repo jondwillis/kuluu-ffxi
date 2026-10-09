@@ -832,10 +832,10 @@ pub struct ParticleGeneratorDef {
     // as particle.hazeOffset.x — a draw-time x translate the haze/distortion shader pass
     // offsets the previous-frame transform by (research/xim ParticleInitializers.kt
     // HazeOffsetInitializer; GLDrawer.kt previousFrameTransform). Unused on the mesh-particle
-    // path; a 0x22 Distortion generator carries it as DistortionGeneratorDef::haze_offset_x,
+    // path; a 0x22 Distortion generator carries it as DistortionGeneratorDef::haze_offset,
     // which kuluu-render/src/distortion_pass.rs applies. The sec3 0x24 ProgressValueUpdater
     // that animates the same value over life is not applied.
-    pub haze_offset_x: Option<f32>,
+    pub haze_offset: Option<f32>,
 
     // sec2 0x47 ParentRotateConfig: a no-payload marker — the child particle copies its
     // parent's rotation (research/xim ParticleInitializers.kt ParentRotateConfig; apply is
@@ -1240,7 +1240,7 @@ pub(crate) struct GeneratorSections {
     pub(crate) rumble_falloff: Option<[f32; 3]>,
     pub(crate) draw_distance_near: Option<f32>,
     pub(crate) draw_distance_far: Option<f32>,
-    pub(crate) haze_offset_x: Option<f32>,
+    pub(crate) haze_offset: Option<f32>,
     pub(crate) parent_rotate: bool,
     pub(crate) parent_color: bool,
     pub(crate) parent_scale: bool,
@@ -1415,7 +1415,7 @@ impl ParticleGeneratorDef {
             rumble_falloff: s.rumble_falloff,
             draw_distance_near: s.draw_distance_near,
             draw_distance_far: s.draw_distance_far,
-            haze_offset_x: s.haze_offset_x,
+            haze_offset: s.haze_offset,
             parent_rotate: s.parent_rotate,
             parent_color: s.parent_color,
             parent_scale: s.parent_scale,
@@ -1570,7 +1570,7 @@ fn parse_sections(body: &[u8]) -> Result<Option<(GeneratorSections, Vec<DecodedB
     let mut specular_rot_z_track = None;
     let mut specular_color_a_track = None;
     let mut rumble_track = None;
-    let mut haze_offset_x = None;
+    let mut haze_offset = None;
     let mut parent_rotate = false;
     let mut parent_rotate_2 = false;
     let mut batching_setup = false;
@@ -1830,7 +1830,7 @@ fn parse_sections(body: &[u8]) -> Result<Option<(GeneratorSections, Vec<DecodedB
             // research/xim ParticleInitializers.kt HazeOffsetInitializer: xim applies
             // only the second float, as particle.hazeOffset.x.
             SEC2_OPCODE_HAZE_OFFSET if payload + 8 <= body.len() => {
-                haze_offset_x = Some(f32_le(body, payload + 4));
+                haze_offset = Some(f32_le(body, payload + 4));
             }
             // research/xim ParticleGeneratorParser.kt sec2Handler — Weight Mesh[0..4].
             SEC2_OPCODE_WEIGHTED_MESH_WEIGHT_FIRST..=SEC2_OPCODE_WEIGHTED_MESH_WEIGHT_LAST
@@ -2556,7 +2556,7 @@ fn parse_sections(body: &[u8]) -> Result<Option<(GeneratorSections, Vec<DecodedB
             rumble_falloff,
             draw_distance_near,
             draw_distance_far,
-            haze_offset_x,
+            haze_offset,
             parent_rotate,
             parent_color,
             parent_scale,
@@ -2706,19 +2706,25 @@ pub struct DistortionGeneratorDef {
     pub continuous: bool,
     pub max_life_frames: f32,
 
-    /// sec2 0x32 HazeOffsetInitializer horizontal offset — biases the smear direction.
-    pub haze_offset_x: f32,
+    /// sec2 0x32 HazeOffsetInitializer's authored offset (g142: 0.02). One scalar covering both draw
+    /// axes: retail translates this element's final draw along its first and second axis together and
+    /// leaves the sampling coordinates alone, so it is neither a horizontal-only bias nor a pixel amount
+    /// (`.agents/skills/retail-observe/references/2026-10-07-procedural-distortion.md`).
+    pub haze_offset: f32,
 
-    /// sec2 0x2D KeyFrameValueSetup — the strength/alpha envelope over life (g142 binds k143:
-    /// 0 -> 0.48 hold -> 0.01). The field pass scales its haze by this curve; a PS2 half-scale
-    /// value like 0.502 is full strength.
+    /// sec2 0x2D KeyFrameValueSetup — the alpha track over life (g142 binds k143: 0 -> 0.48 hold ->
+    /// 0.01), sampled linearly and kept in 8 bits. It fades how much displaced scene shows; in that
+    /// authored path it never scales the haze translation. A PS2 half-scale value like 0.502 is full
+    /// strength.
     pub envelope_track: Option<[u8; 4]>,
 
     pub attach_type: AttachType,
 
-    /// The same sections read as a mesh generator, so a haze field resolves its linked texture,
-    /// billboard size and attachment point through the identical pipeline every other element
-    /// uses — the field's footprint is that quad drawn at its authored scale.
+    /// The same sections read as a mesh generator, for the placement, attachment and authored scale a
+    /// haze field shares with every other element. NOT its geometry: type 0x22 draws the built-in
+    /// footprint in `kuluu-render/src/distortion_pass.rs FOOTPRINT_LOCAL` and never resolves the linked
+    /// name as a mesh or image (same record — "the retail resolver deliberately bypasses named-resource
+    /// lookup for this element type").
     pub generator_view: ParticleGeneratorDef,
 }
 
@@ -2752,7 +2758,7 @@ impl DistortionGeneratorDef {
             auto_run: s.auto_run,
             continuous: s.continuous,
             max_life_frames: s.max_life_frames,
-            haze_offset_x: s.haze_offset_x.unwrap_or(0.0),
+            haze_offset: s.haze_offset.unwrap_or(0.0),
             envelope_track: s.alpha_track,
             attach_type: s.attach_type,
             generator_view: ParticleGeneratorDef::from_sections(s),
@@ -3980,11 +3986,11 @@ mod tests {
         sec2.extend(op(OPCODE_END, 0, &[]));
         let body = build(&sec2, 1, 1);
         let def = ParticleGeneratorDef::parse(&body).unwrap().unwrap();
-        assert_eq!(def.haze_offset_x, Some(1.25));
+        assert_eq!(def.haze_offset, Some(1.25));
         let plain = ParticleGeneratorDef::parse(&build(&setup, 1, 1))
             .unwrap()
             .unwrap();
-        assert_eq!(plain.haze_offset_x, None);
+        assert_eq!(plain.haze_offset, None);
     }
 
     // 0x47 ParentRotateConfig: a no-payload marker (research/xim

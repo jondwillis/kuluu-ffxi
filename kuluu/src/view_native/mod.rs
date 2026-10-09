@@ -1513,20 +1513,14 @@ mod zone_teardown_tests {
     }
 
     fn live_field_fixture() -> kuluu_render::distortion_pass::LiveField {
-        use std::sync::Arc;
         use std::time::Instant;
         kuluu_render::distortion_pass::LiveField {
             center: Vec3::ZERO,
             half_extent: Vec2::ONE,
-            haze_offset_x: 0.02,
+            haze_offset: 0.02,
             started_at: Instant::now(),
             duration_secs: 60.0,
             envelope: None,
-            map: Arc::new(kuluu_render::distortion_pass::DistortionMap::new(
-                1,
-                1,
-                vec![0, 0, 0, 255],
-            )),
         }
     }
 

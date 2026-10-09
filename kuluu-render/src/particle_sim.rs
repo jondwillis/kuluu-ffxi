@@ -437,13 +437,12 @@ enum ChildPayload {
         vertical_weight: f32,
     },
     Distortion {
-        haze_offset_x: f32,
+        haze_offset: f32,
         life_frames: f32,
         envelope: Option<ffxi_dat::particle_gen::KeyFrameTrack>,
-        // Footprint (quad × init_scale) and the linked texture bytes, resolved once at factory
-        // time. None = unresolved def data; the child then arms nothing but keeps running.
+        // Built-in footprint at the authored scale, resolved once at factory time. None = a
+        // degenerate scale; the child then arms nothing but keeps running.
         half_extent: Option<Vec2>,
-        map: Option<std::sync::Arc<crate::distortion_pass::DistortionMap>>,
     },
     Rumble {
         envelope: ffxi_dat::particle_gen::KeyFrameTrack,
@@ -1190,112 +1189,43 @@ fn rescale_track(
     }
 }
 
-// The element's linked texture + quad template — the same tier chain every element uses to
-// bind mesh and texture together (effect dir first, then global; qualified name, local-only
-// name, truncated id last).
-fn distortion_field_parts<'a>(
-    assets: &'a ActionAssets,
-    global: Option<&'a ActionAssets>,
-    local_dir: [u8; 4],
-    view: &ffxi_dat::particle_gen::ParticleGeneratorDef,
-) -> Option<(SpriteTemplate, &'a ffxi_dat::texture::DecodedTexture)> {
-    let tiers = [Some(assets), global];
-    match view.mesh_kind {
-        ParticleMeshKind::StaticMesh | ParticleMeshKind::WeightedMesh => {
-            let d3m = tiers
-                .into_iter()
-                .flatten()
-                .find_map(|a| a.d3m(local_dir, &view.mesh_id))?;
-            let template = sprite_template(d3m)?;
-            let (namespace, local) = d3m.texture_name_tokens();
-            let tex = [Some(assets), global].into_iter().flatten().find_map(|a| {
-                let by_name = (!local.is_empty()).then(|| {
-                    a.images_by_qualified_name
-                        .get(&(namespace.clone(), local.clone()))
-                        .or_else(|| a.images_by_name.get(&local))
-                });
-                by_name
-                    .flatten()
-                    .or_else(|| a.images.get(&d3m.texture_dat_id()))
-            })?;
-            Some((template, tex))
-        }
-        ParticleMeshKind::SpriteSheet => {
-            let ss = tiers
-                .into_iter()
-                .flatten()
-                .find_map(|a| a.sprite_sheet(local_dir, &view.mesh_id))?;
-            let template = sprite_sheet_templates(ss).into_iter().next()?;
-            let tex = [Some(assets), global].into_iter().flatten().find_map(|a| {
-                a.images_by_qualified_name
-                    .get(&(ss.category.clone(), ss.id.clone()))
-                    .or_else(|| a.images_by_name.get(&ss.id))
-            })?;
-            Some((template, tex))
-        }
-    }
-}
-
-// The linked texture as the field's footprint map. Particle alpha is authored at half scale,
-// like every other FFXI decoded-texture consumer (ffxi_dat::texture::ffxi_alpha_remap).
-fn distortion_map(
-    tex: &ffxi_dat::texture::DecodedTexture,
-) -> std::sync::Arc<crate::distortion_pass::DistortionMap> {
-    let mut rgba = tex.rgba.clone();
-    for px in rgba.chunks_exact_mut(4) {
-        px[3] = ffxi_dat::texture::ffxi_alpha_remap(px[3]);
-    }
-    std::sync::Arc::new(crate::distortion_pass::DistortionMap::new(
-        tex.width, tex.height, rgba,
-    ))
-}
-
-// Footprint half-size: quad template extent × authored init_scale. A zero result means the
-// def carries no usable footprint — no field draws; nothing here guesses one.
-fn field_half_extent(template: &SpriteTemplate, init_scale: [f32; 3]) -> Option<Vec2> {
-    let mut hx = 0.0_f32;
-    let mut hy = 0.0_f32;
-    for p in &template.positions {
-        hx = hx.max(p.x.abs());
-        hy = hy.max(p.y.abs());
-    }
-    if hx <= 0.0 || hy <= 0.0 || init_scale[0] == 0.0 || init_scale[1] == 0.0 {
+// The footprint a 0x22 element draws: its built-in unit diamond (center plus four axis endpoints at
+// ±1) at the authored init scale. Nothing is resolved for it — no mesh, image or sprite sheet — so an
+// absent linked name is normal here and arms anyway (`kuluu-render/src/distortion_pass.rs`, record
+// `.agents/skills/retail-observe/references/2026-10-07-procedural-distortion.md`). A zero scale is
+// degenerate, so that def draws nothing rather than something guessed.
+fn procedural_half_extent(
+    generator: &ffxi_dat::particle_gen::ParticleGeneratorDef,
+) -> Option<Vec2> {
+    let sx = generator.init_scale[0].abs();
+    let sy = generator.init_scale[1].abs();
+    if sx == 0.0 || sy == 0.0 {
         return None;
     }
     Some(Vec2::new(
-        hx * init_scale[0].abs(),
-        hy * init_scale[1].abs(),
+        sx * crate::distortion_pass::FOOTPRINT_LOCAL[3][0].abs(),
+        sy * crate::distortion_pass::FOOTPRINT_LOCAL[4][1].abs(),
     ))
 }
 
-// Anchor a live haze field at its attach-frame origin (the hit site). The footprint is the
-// linked texture quad drawn at authored scale, and that same texture's alpha says where inside
-// it the bend acts (kuluu-render/src/distortion_pass.rs).
+// Anchor a live haze field at its attach-frame origin (the hit site): built-in footprint, authored
+// scale and haze offset, alpha track fading coverage only.
 fn push_distortion_field(
     dist: &ffxi_dat::particle_gen::DistortionGeneratorDef,
-    assets: &ActionAssets,
-    global: Option<&ActionAssets>,
-    local_dir: [u8; 4],
     origin: Vec3,
     envelope: Option<ffxi_dat::particle_gen::KeyFrameTrack>,
     distortion: &mut crate::distortion_pass::ActiveDistortion,
 ) -> bool {
-    let Some((template, tex)) =
-        distortion_field_parts(assets, global, local_dir, &dist.generator_view)
-    else {
-        return false;
-    };
-    let Some(half_extent) = field_half_extent(&template, dist.generator_view.init_scale) else {
+    let Some(half_extent) = procedural_half_extent(&dist.generator_view) else {
         return false;
     };
     distortion.push(crate::distortion_pass::LiveField {
         center: origin,
         half_extent,
-        haze_offset_x: dist.haze_offset_x,
+        haze_offset: dist.haze_offset,
         started_at: Instant::now(),
         duration_secs: dist.max_life_frames / ROUTINE_FPS,
         envelope,
-        map: distortion_map(tex),
     });
     true
 }
@@ -1452,24 +1382,20 @@ pub fn spawn_particle_generators(
                     let origin = attach_frame(&dist.generator_view, ev.actor, target_ent, &attach)
                         .map(|f| f.point(Vec3::from_array(dist.generator_view.base_position)))
                         .unwrap_or(actor_xf.translation);
-                    let armed = push_distortion_field(
-                        dist,
-                        dist_assets,
-                        global.as_ref().map(|g| &g.assets),
-                        local_dir,
-                        origin,
-                        envelope,
-                        &mut distortion,
-                    );
+                    let armed = push_distortion_field(dist, origin, envelope, &mut distortion);
                     if tracing {
                         info!(
-                            "animationtest trace: particle stage {} [{}] — DISTORTION field haze_x={:.3} life {:.1}s envelope={} pts{}",
+                            "animationtest trace: particle stage {} [{}] — DISTORTION field haze={:.3} life {:.1}s envelope={} pts{}",
                             String::from_utf8_lossy(&ev.stage.stage.id),
                             String::from_utf8_lossy(&local_dir),
-                            dist.haze_offset_x,
+                            dist.haze_offset,
                             life_secs,
                             envelope_pts,
-                            if armed { "" } else { " — NOT ARMED: linked texture/footprint unresolved" },
+                            if armed {
+                                ""
+                            } else {
+                                " — NOT ARMED: authored scale is degenerate"
+                            },
                         );
                     }
                 } else if tracing {
@@ -2334,37 +2260,35 @@ fn instantiate_child_generators(
                 play_generator_sound(*se_id, *near, *far, *vertical_weight, r.pos, sfx_writer);
             }
             ChildPayload::Distortion {
-                haze_offset_x,
+                haze_offset,
                 life_frames,
                 envelope,
                 half_extent,
-                map,
             } => {
-                let armed = match (half_extent, map) {
-                    (Some(half), Some(map)) => {
+                let armed = match half_extent {
+                    Some(half) => {
                         distortion.push(crate::distortion_pass::LiveField {
                             center: r.pos,
                             half_extent: *half,
-                            haze_offset_x: *haze_offset_x,
+                            haze_offset: *haze_offset,
                             started_at: Instant::now(),
                             duration_secs: *life_frames / ROUTINE_FPS,
                             envelope: envelope.clone(),
-                            map: map.clone(),
                         });
                         true
                     }
-                    _ => false,
+                    None => false,
                 };
                 if tracing {
                     let line = format!(
-                        "child {} — DISTORTION field haze_x={:.3} life {:.1}s{}",
+                        "child {} — DISTORTION field haze={:.3} life {:.1}s{}",
                         String::from_utf8_lossy(&f.name),
-                        *haze_offset_x,
+                        *haze_offset,
                         *life_frames / ROUTINE_FPS,
                         if armed {
                             ""
                         } else {
-                            " — NOT ARMED: linked texture/footprint unresolved"
+                            " — NOT ARMED: authored scale is degenerate"
                         },
                     );
                     info!("animationtest trace: {line}");
@@ -2512,21 +2436,14 @@ fn resolve_child_bindings(
                 if let Ok(envelope) =
                     authored_envelope(assets, global, dist.envelope_track, id, def_dir)
                 {
-                    let parts =
-                        distortion_field_parts(assets, global, def_dir, &dist.generator_view);
-                    let half_extent = parts
-                        .as_ref()
-                        .and_then(|(t, _)| field_half_extent(t, dist.generator_view.init_scale));
-                    let map = parts.map(|(_, tex)| distortion_map(tex));
                     out.push(ChildFactory {
                         name: id,
                         on_expiry,
                         payload: ChildPayload::Distortion {
-                            haze_offset_x: dist.haze_offset_x,
+                            haze_offset: dist.haze_offset,
                             life_frames: dist.max_life_frames,
                             envelope,
-                            half_extent,
-                            map,
+                            half_extent: procedural_half_extent(&dist.generator_view),
                         },
                         children: Vec::new(),
                     });
@@ -4297,7 +4214,7 @@ mod tests {
             position_z_track: None,
             weighted_mesh_weight_tracks: [None; ffxi_dat::particle_gen::WEIGHTED_MESH_WEIGHTS],
             tod_volume_track: None,
-            haze_offset_x: None,
+            haze_offset: None,
             parent_rotate: false,
             parent_color: false,
             parent_scale: false,
@@ -10535,13 +10452,10 @@ mod tests {
             name: *b"ai90",
             on_expiry: false,
             payload: ChildPayload::Distortion {
-                haze_offset_x: 0.02,
+                haze_offset: 0.02,
                 life_frames: 60.0,
                 envelope: None,
                 half_extent: Some(Vec2::ONE),
-                map: Some(std::sync::Arc::new(
-                    crate::distortion_pass::DistortionMap::new(1, 1, vec![0, 0, 0, 255]),
-                )),
             },
             children: Vec::new(),
         });
@@ -10555,9 +10469,48 @@ mod tests {
         let dist = world.resource::<crate::distortion_pass::ActiveDistortion>();
         assert_eq!(dist.fields.len(), 2);
         for f in &dist.fields {
-            assert_eq!(f.haze_offset_x, 0.02);
+            assert_eq!(f.haze_offset, 0.02);
             assert_eq!(f.half_extent, Vec2::ONE);
         }
+    }
+
+    // Retail's resolver branches on element type 0x22 and returns before the named-resource search, so
+    // a haze element whose linked name resolves to nothing is the ordinary case rather than a failure:
+    // g142 in the crit chain names `dist`, and no mesh or image called `dist` exists in the global DAT
+    // set at all (`.agents/skills/retail-observe/references/2026-10-07-procedural-distortion.md`).
+    #[test]
+    fn haze_def_arms_with_no_mesh_or_image_resolved() {
+        let view = ParticleGeneratorDef {
+            init_scale: [1.0, 1.0, 1.0],
+            mesh_id: *b"dist",
+            ..Default::default()
+        };
+        assert_eq!(procedural_half_extent(&view), Some(Vec2::ONE));
+
+        let degenerate = ParticleGeneratorDef {
+            init_scale: [0.0, 1.5, 1.0],
+            ..view
+        };
+        assert_eq!(
+            procedural_half_extent(&degenerate),
+            None,
+            "a zero authored scale leaves no footprint to draw"
+        );
+
+        let def = ffxi_dat::particle_gen::DistortionGeneratorDef {
+            haze_offset: 0.02,
+            max_life_frames: 45.0,
+            generator_view: view,
+            ..Default::default()
+        };
+        let mut distortion = crate::distortion_pass::ActiveDistortion::default();
+        assert!(
+            push_distortion_field(&def, Vec3::ZERO, None, &mut distortion),
+            "an unresolvable linked name must not stop a 0x22 field from arming"
+        );
+        assert_eq!(distortion.fields.len(), 1);
+        assert_eq!(distortion.fields[0].half_extent, Vec2::ONE);
+        assert_eq!(distortion.fields[0].haze_offset, 0.02);
     }
 
     // A sound child writes the same SfxEvent a 0x02 stage naming that generator would.

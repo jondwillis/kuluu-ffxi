@@ -3069,8 +3069,7 @@ mod tests {
 
     #[test]
     fn room_exit_discards_unexpired_distortion() {
-        use kuluu_render::distortion_pass::{ActiveDistortion, DistortionMap, LiveField};
-        use std::sync::Arc;
+        use kuluu_render::distortion_pass::{ActiveDistortion, LiveField};
         use std::time::Instant;
 
         let mut app = App::new();
@@ -3086,11 +3085,10 @@ mod tests {
                 distortion.push(LiveField {
                     center: Vec3::ZERO,
                     half_extent: Vec2::ONE,
-                    haze_offset_x: 0.02,
+                    haze_offset: 0.02,
                     started_at: Instant::now(),
                     duration_secs: 60.0,
                     envelope: None,
-                    map: Arc::new(DistortionMap::new(1, 1, vec![0, 0, 0, 255])),
                 });
                 distortion
             })

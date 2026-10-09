@@ -1,17 +1,20 @@
-//! Screen-space haze FIELD pass for retail's 0x22 `Distortion` generator element. A distortion
-//! never draws pixels: it anchors a haze field at its attach site, with the footprint of its own
-//! linked texture quad drawn at its authored scale (the DAT gives the element that texture — its
-//! id resolves through the same mesh/texture chain every other particle element uses), and inside
-//! that footprint it displaces THIS frame's scene horizontally where the texture's alpha says so.
-//! Displacement only: source and destination are the same frame, so an extra copy of anything
-//! cannot exist. Displacement width comes from the authored sec2 0x32 offset; footprint extent
-//! and silhouette from the texture.
+//! Screen-space haze FIELD pass for retail's 0x22 `Distortion` generator element. A distortion never
+//! draws pixels of its own: it anchors a haze field at its attach site, and inside that field the
+//! scene drawn so far is redrawn displaced. The footprint is built into the element — its center plus
+//! four axis endpoints, scaled by the authored init scale — because type 0x22 deliberately bypasses
+//! named-resource lookup: no mesh, image or sprite sheet is ever resolved for it, and the copy's
+//! texture is this frame's scene. Retail-grounded in
+//! `.agents/skills/retail-observe/references/2026-10-07-procedural-distortion.md`.
+//! Coverage comes from raster interpolation of vertex alpha (center = the element's current alpha,
+//! four rim vertices transparent) across a fan of four triangles — not a gradient texture. The authored
+//! haze parameter translates the *drawn* fan along both draw axes while sampling coordinates stay on
+//! the original footprint, and it stays put while the bound alpha track fades coverage in and out.
 //!
 //! Scheduled in Core3d AFTER `Core3dSystems::PostProcess` (bloom/DOF/fog/TAA/tonemapping done) and
 //! before upscaling writes the window — the same bounds as [`crate::nameplate_final_pass`]. It is a
-//! strict no-op unless a distortion field is alive ([`ActiveDistortion`]). While any field is
-//! alive, one exact copy of the processed frame is taken first (fields write main; their displaced
-//! samples must come from untouched pixels), then each field draws over its own rect.
+//! strict no-op unless a distortion field is alive ([`ActiveDistortion`]). While any field is alive,
+//! one exact copy of the processed frame is taken first (fields write main; their displaced samples
+//! must come from untouched pixels), then every live fan draws in one pass.
 //!
 //! MSAA-safe by construction: bevy's ViewTarget "main" texture is ALWAYS single-sample — under
 //! Msaa2/4/8 the geometry pass renders into a separate multi-sample buffer that wgpu resolves INTO
@@ -19,78 +22,89 @@
 //! unsampled view holds the fully processed image in every AA mode. Both passes here touch only
 //! that single-sample surface; nothing samples a multi-sample buffer.
 
-use std::collections::{hash_map::Entry, HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 use std::time::Instant;
 
 use bevy::asset::{embedded_asset, AssetServer};
 use bevy::core_pipeline::{upscaling::upscaling, Core3d, Core3dSystems};
+use bevy::mesh::VertexBufferLayout;
 use bevy::prelude::*;
 use bevy::render::render_resource::{
-    binding_types::{sampler as smp_entry, texture_2d, uniform_buffer},
+    binding_types::{sampler as smp_entry, texture_2d},
     BindGroupEntries, BindGroupLayoutDescriptor, BindGroupLayoutEntries, BlendComponent,
-    BlendFactor, BlendOperation, BlendState, Buffer, BufferBinding, BufferDescriptor, BufferUsages,
+    BlendFactor, BlendOperation, BlendState, Buffer, BufferDescriptor, BufferUsages,
     CachedRenderPipelineId, ColorTargetState, ColorWrites, Extent3d, FilterMode, FragmentState,
-    LoadOp, MultisampleState, Operations, PipelineCache, PrimitiveState, PrimitiveTopology,
-    RenderPassColorAttachment, RenderPassDescriptor, RenderPipelineDescriptor, Sampler,
-    SamplerBindingType, SamplerDescriptor, ShaderStages, ShaderType, StoreOp, Texture,
-    TextureDataOrder, TextureDescriptor, TextureDimension, TextureFormat, TextureSampleType,
-    TextureUsages, TextureView, TextureViewDescriptor, VertexState,
+    FrontFace, LoadOp, MultisampleState, Operations, PipelineCache, PrimitiveState,
+    PrimitiveTopology, RenderPassColorAttachment, RenderPassDescriptor, RenderPipelineDescriptor,
+    Sampler, SamplerBindingType, SamplerDescriptor, ShaderStages, StoreOp, Texture,
+    TextureDescriptor, TextureDimension, TextureFormat, TextureSampleType, TextureUsages,
+    TextureView, TextureViewDescriptor, VertexFormat, VertexState, VertexStepMode,
 };
 use bevy::render::renderer::{RenderContext, RenderDevice, RenderQueue, ViewQuery};
 use bevy::render::view::{ExtractedView, ViewTarget};
 use bevy::render::{Extract, RenderApp, RenderStartup};
 
-/// The linked texture of a distortion element, RGBA8 with alpha already remapped to full range.
-/// Its dimensions set the field's footprint aspect; its alpha sets where inside the footprint
-/// haze acts (and the displacement follows that silhouette's horizontal gradient).
-#[derive(Debug)]
-pub struct DistortionMap {
-    pub width: u32,
-    pub height: u32,
-    pub rgba: Vec<u8>,
-    id: u64,
-}
+/// The element's built-in local footprint: its center and the four axis endpoints, in the element's
+/// own units before the authored scale. Retail has no other geometry for this element type — that is
+/// what lets it draw with no mesh or image bound at all (`.agents/skills/retail-observe/references/2026-10-07-procedural-distortion.md`,
+/// "Footprint and scene sampling").
+pub const FOOTPRINT_LOCAL: [[f32; 2]; 5] =
+    [[0.0, 0.0], [-1.0, 0.0], [0.0, -1.0], [1.0, 0.0], [0.0, 1.0]];
 
-static NEXT_MAP_ID: AtomicU64 = AtomicU64::new(1);
+/// The fan's four triangles as (center, rim, next rim) index triples into [`FOOTPRINT_LOCAL`]:
+/// center, the four ordered rim points, and the first rim point again.
+pub const FAN_TRIANGLES: [[usize; 3]; 4] = [[0, 1, 2], [0, 2, 3], [0, 3, 4], [0, 4, 1]];
 
-impl DistortionMap {
-    pub fn new(width: u32, height: u32, rgba: Vec<u8>) -> Self {
-        Self {
-            width,
-            height,
-            rgba,
-            id: NEXT_MAP_ID.fetch_add(1, Ordering::Relaxed),
-        }
-    }
-}
+/// Retail caps the intermediate capture at this many texels across an axis and magnifies it back over
+/// the footprint, so a field wider than that shows coarse scene content (same record: "Capture
+/// dimensions at or above 256 are reduced using 255 divided by the projected extent on that axis").
+const CAPTURE_MAX_TEXELS_PER_AXIS: f32 = 255.0;
+const CAPTURE_REDUCED_FROM_EXTENT_PX: f32 = 256.0;
+
+/// The width of the alpha channel retail's tick keeps sampled values in: scaled by 255, negatives sent
+/// to zero, held as one byte (same record, "Coverage, color and time"). Stepping through this is what
+/// makes a fade quantise rather than glide.
+const ALPHA_BYTE_MAX: f32 = 255.0;
 
 /// One live haze field. Main-world side; extracted verbatim each frame and drawn per-view.
 #[derive(Clone)]
 pub struct LiveField {
     /// World-space anchor — the generator's attach-frame origin (hit site).
     pub center: Vec3,
-    /// Footprint half-size in world units, from the linked quad × authored init_scale.
+    /// Footprint half-size in world units: [`FOOTPRINT_LOCAL`]'s unit axes at the authored init scale.
     pub half_extent: Vec2,
-    /// sec2 0x32 HazeOffsetInitializer horizontal offset as authored (g142: 0.02).
-    pub haze_offset_x: f32,
+    /// sec2 0x32 HazeOffsetInitializer's authored offset (g142: 0.02). It shifts the drawn fan along
+    /// both draw axes; it is not a pixel or viewport-UV amount, so projection and attachment set how
+    /// far the displaced image actually lands.
+    pub haze_offset: f32,
     pub started_at: Instant,
     pub duration_secs: f32,
-    /// sec2 0x2D KeyFrameValueSetup envelope over life (g142 binds k143); `None` = constant.
+    /// sec2 0x2D KeyFrameValueSetup — the alpha track over life (g142 binds k143). It fades coverage
+    /// only; in that authored path it never scales the haze translation. `None` = constant full alpha.
     pub envelope: Option<ffxi_dat::particle_gen::KeyFrameTrack>,
-    pub map: Arc<DistortionMap>,
 }
 
 impl LiveField {
-    /// The envelope value at `now`; drives both displacement width and coverage alpha.
-    fn env(&self, now: Instant) -> f32 {
-        let progress =
-            ((now - self.started_at).as_secs_f32() / self.duration_secs.max(1e-6)).clamp(0.0, 1.0);
-        self.envelope
+    /// Life progress, computed retail-side as one minus remaining life over initial life.
+    fn progress(&self, now: Instant) -> f32 {
+        let elapsed = (now - self.started_at).as_secs_f32();
+        (elapsed / self.duration_secs.max(1e-6)).clamp(0.0, 1.0)
+    }
+
+    /// The element's current alpha as the graphics pipeline holds it: the track is sampled linearly,
+    /// scaled by 255, negatives clamped to zero and the result kept in 8 bits (same record, "Coverage,
+    /// color and time"). Quantizing here rather than keeping a float is what makes the fade step.
+    pub fn alpha_byte(&self, now: Instant) -> u8 {
+        let sampled = self
+            .envelope
             .as_ref()
-            .map(|t| t.sample(progress))
-            .unwrap_or(1.0)
+            .map(|track| track.sample(self.progress(now)))
+            .unwrap_or(1.0);
+        (sampled * ALPHA_BYTE_MAX).clamp(0.0, ALPHA_BYTE_MAX) as u8
+    }
+
+    /// The center vertex's alpha — the fan rim is transparent, so this is the field's peak coverage.
+    fn center_alpha(&self, now: Instant) -> f32 {
+        self.alpha_byte(now) as f32 / ALPHA_BYTE_MAX
     }
 
     fn is_expired(&self, now: Instant) -> bool {
@@ -134,82 +148,186 @@ fn extract_distortion(
     data.operator_cam = operator_cameras.iter().next();
 }
 
-/// Per-field uniform. Byte layout must match distortion.wgsl `FieldUniform` (2×vec2 + 2 f32).
-#[derive(ShaderType, Clone, Copy)]
-struct FieldUniform {
-    rect_min: Vec2,
-    rect_max: Vec2,
-    haze: f32,
-    env: f32,
+/// One fan vertex. `FAN_TRIANGLES` × 3 vertices per field, all fields in one buffer and one draw.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FanVertex {
+    /// Projected corner with the haze translation applied (drawn position).
+    pub pos_shifted: Vec2,
+    /// The same corner without it — sampling happens here, so what shows inside the fan is scene
+    /// content from the original footprint.
+    pub sample_ndc: Vec2,
+    /// Top-left of the field's projected bounding box, carried flat so the fragment can step a
+    /// capture grid.
+    pub foot_origin: Vec2,
+    /// One texel of that grid in NDC per axis.
+    pub capture_step: Vec2,
+    pub vertex_alpha: f32,
+    pub vertex_rgb: f32,
 }
 
-const FIELD_UNIFORM_SIZE: u64 = 24;
+/// Floats written per [`FanVertex`], and the attribute order `distortion.wgsl` expects.
+pub const FAN_VERTEX_FLOATS: usize = 10;
+const FAN_VERTEX_BYTES: usize = FAN_VERTEX_FLOATS * std::mem::size_of::<f32>();
 
-fn field_uniform_bytes(u: FieldUniform) -> [u8; FIELD_UNIFORM_SIZE as usize] {
-    let mut bytes = [0u8; FIELD_UNIFORM_SIZE as usize];
-    bytes[0..4].copy_from_slice(&u.rect_min.x.to_le_bytes());
-    bytes[4..8].copy_from_slice(&u.rect_min.y.to_le_bytes());
-    bytes[8..12].copy_from_slice(&u.rect_max.x.to_le_bytes());
-    bytes[12..16].copy_from_slice(&u.rect_max.y.to_le_bytes());
-    bytes[16..20].copy_from_slice(&u.haze.to_le_bytes());
-    bytes[20..24].copy_from_slice(&u.env.to_le_bytes());
-    bytes
+/// The vertex RGB a fan corner carries. Retail's four rim vertices and the closing vertex hold
+/// [128,128,128]; the center takes the element's own colour, which no g142 observation pins down.
+/// Until something grounds it the center carries the same value, because the fan's colour op is a
+/// doubled modulate of texture and vertex colour, so [128,128,128] leaves the scene copy untouched —
+/// coverage stays the only thing shaping what shows (same record, "Coverage, color and time").
+pub const FAN_RIM_VERTEX_RGB: f32 = 128.0 / 255.0;
+pub const FAN_CENTER_VERTEX_RGB: f32 = FAN_RIM_VERTEX_RGB;
+
+fn fan_vertex_bytes(v: &FanVertex, out: &mut Vec<u8>) {
+    for value in [
+        v.pos_shifted.x,
+        v.pos_shifted.y,
+        v.sample_ndc.x,
+        v.sample_ndc.y,
+        v.foot_origin.x,
+        v.foot_origin.y,
+        v.capture_step.x,
+        v.capture_step.y,
+        v.vertex_alpha,
+        v.vertex_rgb,
+    ] {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
 }
 
-/// Project a billboard-anchored field rect to NDC: the quad corners
-/// `center ± right·hx ± up·hy` (basis taken from `world_from_view`, so it faces the camera like
-/// every other hi14 element) through `clip`. Returns None when any corner is behind the camera,
-/// or once clipped to [-1,1] nothing of the rect survives — untouched pixels either way.
-fn field_rect(world_from_view: Mat4, clip: Mat4, center: Vec3, half: Vec2) -> Option<(Vec2, Vec2)> {
+/// Project one footprint point (its local unit axes scaled by the field's authored extent) through the
+/// view. `Some` only when the point survives the near plane; a billboard basis comes from
+/// `world_from_view`, so the footprint faces the camera like every other hi14 element.
+fn project_footprint_point(
+    world_from_view: Mat4,
+    clip: Mat4,
+    center: Vec3,
+    half: Vec2,
+    local: [f32; 2],
+    offset_local: Vec2,
+) -> Option<Vec2> {
     let right = world_from_view.col(0).truncate();
     let up = world_from_view.col(1).truncate();
-    let view_from_world = world_from_view.inverse();
-    let mut min = Vec2::splat(f32::MAX);
-    let mut max = Vec2::splat(-f32::MAX);
-    for sx in [-1.0, 1.0] {
-        for sy in [-1.0, 1.0] {
-            let corner = center + right * (sx * half.x) + up * (sy * half.y);
-            let c = clip * view_from_world * corner.extend(1.0);
-            if c.w <= 1e-6 {
-                return None;
-            }
-            let n = Vec2::new(c.x / c.w, c.y / c.w);
-            min = min.min(n);
-            max = max.max(n);
-        }
-    }
-    // Preserve the original footprint so viewport clipping crops its texture.
-    let visible_min = Vec2::new(min.x.max(-1.0), min.y.max(-1.0));
-    let visible_max = Vec2::new(max.x.min(1.0), max.y.min(1.0));
-    if visible_max.x - visible_min.x <= 0.0 || visible_max.y - visible_min.y <= 0.0 {
+    let point = center
+        + right * ((local[0] + offset_local.x) * half.x)
+        + up * ((local[1] + offset_local.y) * half.y);
+    let c = clip * world_from_view.inverse() * point.extend(1.0);
+    if c.w <= 1e-6 {
         return None;
     }
-    Some((min, max))
+    Some(Vec2::new(c.x / c.w, c.y / c.w))
 }
 
-fn field_bgl_descriptors() -> (BindGroupLayoutDescriptor, BindGroupLayoutDescriptor) {
-    let group0 = BindGroupLayoutDescriptor::new(
+/// The intermediate capture for a footprint whose projected box starts at `bbox_min` and spans
+/// `extent_ndc`: that same origin, plus the NDC width of one capture texel on each axis. Below
+/// [`CAPTURE_REDUCED_FROM_EXTENT_PX`] there is no reduction — one texel per screen pixel — and from
+/// there up the capture holds [`CAPTURE_MAX_TEXELS_PER_AXIS`] across however wide the field gets.
+pub fn capture_grid(bbox_min: Vec2, extent_ndc: Vec2, viewport_px: Vec2) -> (Vec2, Vec2) {
+    let extent_px = extent_ndc.abs() * 0.5 * viewport_px;
+    let texels = Vec2::new(
+        if extent_px.x >= CAPTURE_REDUCED_FROM_EXTENT_PX {
+            CAPTURE_MAX_TEXELS_PER_AXIS
+        } else {
+            extent_px.max(Vec2::ONE).x
+        },
+        if extent_px.y >= CAPTURE_REDUCED_FROM_EXTENT_PX {
+            CAPTURE_MAX_TEXELS_PER_AXIS
+        } else {
+            extent_px.max(Vec2::ONE).y
+        },
+    );
+    (bbox_min, extent_ndc / texels)
+}
+
+/// The fan for one field: the five projected footprint points joined center→rim in [`FAN_TRIANGLES`],
+/// drawn at the haze-translated position while sampling stays on the untranslated projection. `None`
+/// when anything of the footprint falls behind the near plane, or once the bounding box has no area —
+/// untouched pixels either way.
+pub fn build_fan(
+    world_from_view: Mat4,
+    clip: Mat4,
+    field: &LiveField,
+    now: Instant,
+    viewport_px: Vec2,
+) -> Option<Vec<FanVertex>> {
+    let center_alpha = field.center_alpha(now);
+    if center_alpha <= 0.0 {
+        return None;
+    }
+    // The haze offset is authored in the element's own units, so it travels with the footprint: it is
+    // a fraction of the extent, not of the screen. Both draw axes take it; sampling must not.
+    let haze_local = Vec2::new(field.haze_offset, field.haze_offset);
+
+    let mut shifted = [Vec2::ZERO; 5];
+    let mut unshifted = [Vec2::ZERO; 5];
+    for i in 0..5 {
+        let (Some(s), Some(u)) = (
+            project_footprint_point(
+                world_from_view,
+                clip,
+                field.center,
+                field.half_extent,
+                FOOTPRINT_LOCAL[i],
+                haze_local,
+            ),
+            project_footprint_point(
+                world_from_view,
+                clip,
+                field.center,
+                field.half_extent,
+                FOOTPRINT_LOCAL[i],
+                Vec2::ZERO,
+            ),
+        ) else {
+            return None;
+        };
+        shifted[i] = s;
+        unshifted[i] = u;
+    }
+
+    let mut min = Vec2::splat(f32::MAX);
+    let mut max = Vec2::splat(-f32::MAX);
+    for p in unshifted.iter() {
+        min = min.min(*p);
+        max = max.max(*p);
+    }
+    let extent_ndc = max - min;
+    if extent_ndc.x <= 0.0 || extent_ndc.y <= 0.0 {
+        return None;
+    }
+    let (origin, step) = capture_grid(min, extent_ndc, viewport_px);
+
+    let mut fan = Vec::with_capacity(FAN_TRIANGLES.len() * 3);
+    for tri in FAN_TRIANGLES.iter() {
+        for &idx in tri.iter() {
+            let is_center = FOOTPRINT_LOCAL[idx][0] == 0.0 && FOOTPRINT_LOCAL[idx][1] == 0.0;
+            fan.push(FanVertex {
+                pos_shifted: shifted[idx],
+                sample_ndc: unshifted[idx],
+                foot_origin: origin,
+                capture_step: step,
+                vertex_alpha: if is_center { center_alpha } else { 0.0 },
+                vertex_rgb: if is_center {
+                    FAN_CENTER_VERTEX_RGB
+                } else {
+                    FAN_RIM_VERTEX_RGB
+                },
+            });
+        }
+    }
+    Some(fan)
+}
+
+fn field_bgl_descriptors() -> BindGroupLayoutDescriptor {
+    BindGroupLayoutDescriptor::new(
         "distortion_field_bgl0",
         &BindGroupLayoutEntries::sequential(
             ShaderStages::FRAGMENT,
             (
-                uniform_buffer::<FieldUniform>(false),
                 texture_2d(TextureSampleType::Float { filterable: true }),
                 smp_entry(SamplerBindingType::Filtering),
             ),
         ),
-    );
-    let group1 = BindGroupLayoutDescriptor::new(
-        "distortion_field_bgl1",
-        &BindGroupLayoutEntries::sequential(
-            ShaderStages::FRAGMENT,
-            (
-                texture_2d(TextureSampleType::Float { filterable: true }),
-                smp_entry(SamplerBindingType::Filtering),
-            ),
-        ),
-    );
-    (group0, group1)
+    )
 }
 
 fn copy_bgl_descriptor() -> BindGroupLayoutDescriptor {
@@ -222,46 +340,47 @@ fn copy_bgl_descriptor() -> BindGroupLayoutDescriptor {
     )
 }
 
-/// GPU handles shared by the pass (created once at RenderStartup). The scene copy texture is
-/// created lazily sized to the view; haze map textures are cached per [`DistortionMap`] id.
+/// GPU handles shared by the pass (created once at RenderStartup). The scene copy texture is created
+/// lazily sized to the view; the fan vertex buffer grows with the number of fields drawing.
 #[derive(Resource)]
 struct DistortionPassGpu {
     field_shader: Handle<Shader>,
     copy_shader: Handle<Shader>,
-    /// Shared between bind groups AND the pipeline descriptor (single source of truth for the
-    /// layout shape) — same pattern as [`crate::nameplate_final_pass`].
     field_bgl0: BindGroupLayoutDescriptor,
-    field_bgl1: BindGroupLayoutDescriptor,
     copy_bgl: BindGroupLayoutDescriptor,
     sampler: Sampler,
     scene_copy_texture: Option<Texture>,
     scene_copy_view: Option<TextureView>,
     copy_key: Option<(u32, u32, TextureFormat)>,
-    map_cache: HashMap<u64, (Texture, TextureView)>,
-    field_uniforms: Vec<Buffer>,
+    fan_buffer: Buffer,
+    fan_capacity_verts: usize,
 }
 
 impl DistortionPassGpu {
     fn new(device: &RenderDevice, asset_server: &AssetServer) -> Self {
-        let (field_bgl0, field_bgl1) = field_bgl_descriptors();
         let sampler = device.create_sampler(&SamplerDescriptor {
             label: Some("distortion_pass_sampler"),
             mag_filter: FilterMode::Linear,
             min_filter: FilterMode::Linear,
             ..Default::default()
         });
+        let fan_buffer = device.create_buffer(&BufferDescriptor {
+            label: Some("distortion_fan_vertices"),
+            size: FAN_VERTEX_BYTES as u64 * VERTICES_PER_FIELD as u64,
+            usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         Self {
             field_shader: asset_server.load("embedded://kuluu_render/distortion.wgsl"),
             copy_shader: asset_server.load("embedded://kuluu_render/distortion_copy.wgsl"),
-            field_bgl0,
-            field_bgl1,
+            field_bgl0: field_bgl_descriptors(),
             copy_bgl: copy_bgl_descriptor(),
             sampler,
             scene_copy_texture: None,
             scene_copy_view: None,
             copy_key: None,
-            map_cache: HashMap::new(),
-            field_uniforms: Vec::new(),
+            fan_buffer,
+            fan_capacity_verts: VERTICES_PER_FIELD as usize,
         }
     }
 
@@ -300,79 +419,55 @@ impl DistortionPassGpu {
         self.scene_copy_view = Some(view);
     }
 
-    /// Drop cached map textures whose [`DistortionMap`] id is no longer in the live set.
-    fn prune_maps(&mut self, live: &HashSet<u64>) {
-        let stale: Vec<u64> = self
-            .map_cache
-            .keys()
-            .copied()
-            .filter(|id| !live.contains(id))
-            .collect();
-        for id in stale {
-            if let Some((texture, _)) = self.map_cache.remove(&id) {
-                texture.destroy();
-            }
+    /// Recreate the fan buffer when more fields are drawing than it can hold; it never shrinks, so a
+    /// burst of hits does not reallocate every frame afterwards.
+    fn ensure_fan_capacity(&mut self, device: &RenderDevice, verts_needed: usize) {
+        if verts_needed <= self.fan_capacity_verts && self.fan_capacity_verts > 0 {
+            return;
         }
+        let capacity = verts_needed
+            .next_power_of_two()
+            .max(VERTICES_PER_FIELD as usize);
+        self.fan_buffer.destroy();
+        self.fan_buffer = device.create_buffer(&BufferDescriptor {
+            label: Some("distortion_fan_vertices"),
+            size: FAN_VERTEX_BYTES as u64 * capacity as u64,
+            usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.fan_capacity_verts = capacity;
     }
+}
 
-    fn map_view_for(
-        &mut self,
-        device: &RenderDevice,
-        queue: &RenderQueue,
-        map: &DistortionMap,
-    ) -> Option<TextureView> {
-        if let Entry::Vacant(e) = self.map_cache.entry(map.id) {
-            let texture = device.create_texture_with_data(
-                queue,
-                &TextureDescriptor {
-                    label: Some("distortion_haze_map"),
-                    size: Extent3d {
-                        width: map.width.max(1),
-                        height: map.height.max(1),
-                        depth_or_array_layers: 1,
-                    },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: TextureDimension::D2,
-                    format: TextureFormat::Rgba8Unorm,
-                    usage: TextureUsages::TEXTURE_BINDING,
-                    view_formats: &[],
-                },
-                TextureDataOrder::LayerMajor,
-                &map.rgba,
-            );
-            let view = texture.create_view(&TextureViewDescriptor::default());
-            e.insert((texture, view));
-        }
-        self.map_cache.get(&map.id).map(|(_, view)| view.clone())
-    }
+/// Four triangles per fan.
+const VERTICES_PER_FIELD: u32 = (FAN_TRIANGLES.len() * 3) as u32;
 
-    fn uniform_for(&mut self, device: &RenderDevice, index: usize) -> Option<Buffer> {
-        while self.field_uniforms.len() <= index {
-            self.field_uniforms
-                .push(device.create_buffer(&BufferDescriptor {
-                    label: Some("distortion_field_uniform"),
-                    size: FIELD_UNIFORM_SIZE,
-                    usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                }));
-        }
-        self.field_uniforms.get(index).cloned()
-    }
+fn fan_vertex_layout() -> VertexBufferLayout {
+    VertexBufferLayout::from_vertex_formats(
+        VertexStepMode::Vertex,
+        [
+            VertexFormat::Float32x2,
+            VertexFormat::Float32x2,
+            VertexFormat::Float32x2,
+            VertexFormat::Float32x2,
+            VertexFormat::Float32,
+            VertexFormat::Float32,
+        ],
+    )
 }
 
 fn field_pipeline_descriptor(
     shader: &Handle<Shader>,
     bgl0: &BindGroupLayoutDescriptor,
-    bgl1: &BindGroupLayoutDescriptor,
     format: TextureFormat,
 ) -> RenderPipelineDescriptor {
     RenderPipelineDescriptor {
         label: Some("distortion_field".into()),
-        layout: vec![bgl0.clone(), bgl1.clone()],
+        layout: vec![bgl0.clone()],
         vertex: VertexState {
             shader: shader.clone(),
             entry_point: Some("vs".into()),
+            buffers: vec![fan_vertex_layout()],
             ..Default::default()
         },
         fragment: Some(FragmentState {
@@ -381,8 +476,8 @@ fn field_pipeline_descriptor(
             shader_defs: Vec::new(),
             targets: vec![Some(ColorTargetState {
                 format,
-                // Standard alpha blend (the old wgpu `BlendState::Alpha` constant): the field's
-                // output alpha is map silhouette × envelope, so outside it pixels stay original.
+                // The fan's own coverage decides how much displaced scene shows; outside it the pixel
+                // stays as drawn. Same factors retail uses for this element (src-alpha / inv-src-alpha).
                 blend: Some(BlendState {
                     color: BlendComponent {
                         operation: BlendOperation::Add,
@@ -400,6 +495,10 @@ fn field_pipeline_descriptor(
         }),
         primitive: PrimitiveState {
             topology: PrimitiveTopology::TriangleList,
+            // The fan's winding follows the projection basis, which flips with handedness; nothing
+            // here needs back-face culling.
+            front_face: FrontFace::Ccw,
+            cull_mode: None,
             ..Default::default()
         },
         depth_stencil: None,
@@ -443,11 +542,9 @@ fn copy_pipeline_descriptor(
     }
 }
 
-/// Core3d sub-schedule (per camera run): copy the processed frame exactly, then draw each live
-/// field over its projected rect — displaced same-frame scene blended back with the map's alpha.
-/// Gated to the operator camera; every other 3D camera (launcher, minimap bake, ...) runs its own
-/// Core3d schedule and skips — same gate as [`crate::nameplate_final_pass`].
-#[allow(clippy::type_complexity)]
+/// Core3d sub-schedule (per camera run): copy the processed frame exactly, then draw every live fan in
+/// one pass over it. Gated to the operator camera; every other 3D camera (launcher, minimap bake, ...)
+/// runs its own Core3d schedule and skips — same gate as [`crate::nameplate_final_pass`].
 fn draw_distortion_fields(
     view: ViewQuery<(&ExtractedView, &ViewTarget)>,
     data: Res<DistortionPassData>,
@@ -484,14 +581,11 @@ fn draw_distortion_fields(
     let format = target.main_texture_format();
     let size = target.main_texture().size();
     gpu.ensure_copy(&device, size, format);
-    let live_ids: HashSet<u64> = data.fields.iter().map(|f| f.map.id).collect();
-    gpu.prune_maps(&live_ids);
 
     if pipe_state.as_ref().is_none_or(|(f, _)| *f != format) {
         let field_id = pipeline_cache.queue_render_pipeline(field_pipeline_descriptor(
             &gpu.field_shader,
             &gpu.field_bgl0,
-            &gpu.field_bgl1,
             format,
         ));
         let copy_id = pipeline_cache.queue_render_pipeline(copy_pipeline_descriptor(
@@ -544,68 +638,47 @@ fn draw_distortion_fields(
         pass.draw(0..3, 0..1);
     }
 
+    // Every visible field's fan into one vertex stream. A field whose alpha has faded to nothing (or
+    // whose footprint fell behind the near plane) contributes no triangles rather than a transparent
+    // draw of its own.
     let world_from_view = ev.world_from_view.to_matrix();
     let clip = ev.clip_from_view;
+    let viewport_px = Vec2::new(size.width as f32, size.height as f32);
     let now = Instant::now();
-    let field_bgl0 = pipeline_cache.get_bind_group_layout(&gpu.field_bgl0);
-    let field_bgl1 = pipeline_cache.get_bind_group_layout(&gpu.field_bgl1);
 
-    for (i, f) in data.fields.iter().enumerate() {
-        let env = f.env(now);
-        if env <= 0.0 {
-            continue;
+    let mut verts: Vec<u8> = Vec::new();
+    for field in data.fields.iter() {
+        if let Some(fan) = build_fan(world_from_view, clip, field, now, viewport_px) {
+            for v in &fan {
+                fan_vertex_bytes(v, &mut verts);
+            }
         }
-        let Some((rect_min, rect_max)) = field_rect(world_from_view, clip, f.center, f.half_extent)
-        else {
-            continue;
-        };
-        let Some(uniform_buffer) = gpu.uniform_for(&device, i) else {
-            continue;
-        };
-        queue.write_buffer(
-            &uniform_buffer,
-            0,
-            &field_uniform_bytes(FieldUniform {
-                rect_min,
-                rect_max,
-                haze: f.haze_offset_x,
-                env,
-            }),
-        );
-        let Some(map_view) = gpu.map_view_for(&device, &queue, &f.map) else {
-            continue;
-        };
-        let bg0 = device.create_bind_group(
-            "distortion_field_0",
-            &field_bgl0,
-            &BindGroupEntries::sequential((
-                BufferBinding {
-                    buffer: &uniform_buffer,
-                    offset: 0,
-                    size: None,
-                },
-                &scene_copy_view,
-                &gpu.sampler,
-            )),
-        );
-        let bg1 = device.create_bind_group(
-            "distortion_field_1",
-            &field_bgl1,
-            &BindGroupEntries::sequential((&map_view, &gpu.sampler)),
-        );
-        let mut pass = ctx.begin_tracked_render_pass(RenderPassDescriptor {
-            label: Some("distortion_field"),
-            color_attachments: &[Some(target.get_unsampled_color_attachment())],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-            multiview_mask: None,
-        });
-        pass.set_render_pipeline(field_pipeline);
-        pass.set_bind_group(0, &bg0, &[]);
-        pass.set_bind_group(1, &bg1, &[]);
-        pass.draw(0..3, 0..1);
     }
+    if verts.is_empty() {
+        return;
+    }
+    let vert_count = verts.len() / FAN_VERTEX_BYTES;
+    gpu.ensure_fan_capacity(&device, vert_count);
+    queue.write_buffer(&gpu.fan_buffer, 0, &verts);
+
+    let bgl0 = pipeline_cache.get_bind_group_layout(&gpu.field_bgl0);
+    let field_bg = device.create_bind_group(
+        "distortion_field_0",
+        &bgl0,
+        &BindGroupEntries::sequential((&scene_copy_view, &gpu.sampler)),
+    );
+    let mut pass = ctx.begin_tracked_render_pass(RenderPassDescriptor {
+        label: Some("distortion_field"),
+        color_attachments: &[Some(target.get_unsampled_color_attachment())],
+        depth_stencil_attachment: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    });
+    pass.set_render_pipeline(field_pipeline);
+    pass.set_bind_group(0, &field_bg, &[]);
+    pass.set_vertex_buffer(0, gpu.fan_buffer.slice(..));
+    pass.draw(0..vert_count as u32, 0..1);
 }
 
 fn init_distortion_pass_gpu(
@@ -645,79 +718,216 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    /// The uniform byte layout is a wire contract with distortion.wgsl — pin it so a field
-    /// reorder cannot silently desync the two.
-    #[test]
-    fn uniform_bytes_match_the_wgsl_layout() {
-        let bytes = field_uniform_bytes(FieldUniform {
-            rect_min: Vec2::new(-0.5, -0.25),
-            rect_max: Vec2::new(0.5, 0.75),
-            haze: 0.02,
-            env: 0.48,
-        });
-        assert_eq!(bytes[0..4], (-0.5f32).to_le_bytes());
-        assert_eq!(bytes[4..8], (-0.25f32).to_le_bytes());
-        assert_eq!(bytes[8..12], 0.5f32.to_le_bytes());
-        assert_eq!(bytes[12..16], 0.75f32.to_le_bytes());
-        assert_eq!(bytes[16..20], 0.02f32.to_le_bytes());
-        assert_eq!(bytes[20..24], 0.48f32.to_le_bytes());
+    fn field(half: Vec2, haze: f32) -> LiveField {
+        LiveField {
+            center: Vec3::ZERO,
+            half_extent: half,
+            haze_offset: haze,
+            started_at: Instant::now(),
+            duration_secs: 1.0,
+            envelope: None,
+        }
     }
 
+    /// The eye that has the world origin in front of it. `build_fan` takes the view's own pair of
+    /// matrices, and `clip_from_view` is right-handed — its forward axis is −Z — so an eye pushed to +3
+    /// on Z looks back along the origin, while one at −3 has the origin behind it.
+    fn eye_ahead_of_origin() -> Mat4 {
+        Mat4::from_translation(Vec3::new(0.0, 0.0, 3.0))
+    }
+
+    /// The fan is four triangles over the built-in footprint — twelve vertices, and every one of them
+    /// references the center or a rim corner exactly once around.
     #[test]
-    fn field_facing_the_camera_projects_inside_ndc() {
-        let identity = Mat4::IDENTITY;
+    fn fan_covers_the_built_in_footprint_with_four_triangles() {
+        let world_from_view = eye_ahead_of_origin();
         let clip = Mat4::perspective_rh(std::f32::consts::FRAC_PI_3, 1.0, 0.1, 500.0);
-        let Some((min, max)) = field_rect(
-            identity,
+        let f = field(Vec2::ONE, 0.0);
+        let fan =
+            build_fan(world_from_view, clip, &f, f.started_at, Vec2::splat(1280.0)).expect("fan");
+        assert_eq!(fan.len(), FAN_TRIANGLES.len() * 3);
+
+        // The diamond's own extents: the four rim corners sit left/right/below/above the center.
+        let mut xs = fan.iter().map(|v| v.sample_ndc.x).collect::<Vec<_>>();
+        xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert!(xs[0] < 0.0 && *xs.last().unwrap() > 0.0);
+        let mut ys = fan.iter().map(|v| v.sample_ndc.y).collect::<Vec<_>>();
+        ys.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert!(ys[0] < 0.0 && *ys.last().unwrap() > 0.0);
+
+        // Exactly four center vertices carry the alpha; eight rim vertices are transparent.
+        let centers = fan.iter().filter(|v| v.vertex_alpha > 0.0).count();
+        assert_eq!(centers, 4);
+        assert!(fan.iter().filter(|v| v.vertex_alpha == 0.0).count() == 8);
+    }
+
+    /// The haze offset moves the drawn fan on BOTH axes by the same authored amount while leaving the
+    /// sampling coordinate of that corner untouched — displacement without a second sample.
+    #[test]
+    fn haze_shifts_the_draw_on_both_axes_but_never_the_sample() {
+        let clip = Mat4::perspective_rh(std::f32::consts::FRAC_PI_3, 1.0, 0.1, 500.0);
+        let world = eye_ahead_of_origin();
+        let no_haze = field(Vec2::ONE, 0.0);
+        let with = field(Vec2::ONE, 0.02);
+
+        let a = build_fan(
+            world,
             clip,
-            Vec3::new(0.0, 0.0, -3.0),
-            Vec2::new(1.0, 1.0),
-        ) else {
-            panic!("a centred front field must project");
+            &no_haze,
+            no_haze.started_at,
+            Vec2::splat(1280.0),
+        )
+        .unwrap();
+        let b = build_fan(world, clip, &with, with.started_at, Vec2::splat(1280.0)).unwrap();
+
+        // Same corner index in both fans (same triangle order), so compare per-corner.
+        for i in 0..a.len() {
+            let dx = (b[i].pos_shifted.x - a[i].pos_shifted.x).abs();
+            let dy = (b[i].pos_shifted.y - a[i].pos_shifted.y).abs();
+            assert!(dx > 1e-6, "corner {i} must move horizontally with the haze");
+            assert!(dy > 1e-6, "corner {i} must move vertically too");
+            assert_eq!(
+                a[i].sample_ndc, b[i].sample_ndc,
+                "sampling stays put at {i}"
+            );
+        }
+
+        // And it scales with the authored extent (it is a fraction of the footprint, not of the
+        // screen): doubling the footprint doubles how far the fan travels.
+        let big = field(Vec2::splat(2.0), 0.02);
+        let c = build_fan(world, clip, &big, big.started_at, Vec2::splat(1280.0)).unwrap();
+        assert!((c[4].pos_shifted.x - a[4].pos_shifted.x).abs() > 0.0);
+    }
+
+    /// The envelope fades coverage only. Two fields with the same authored haze must be displaced by
+    /// exactly the same amount regardless of where their alpha track has got to.
+    #[test]
+    fn haze_translation_does_not_scale_with_the_alpha_track() {
+        let clip = Mat4::perspective_rh(std::f32::consts::FRAC_PI_3, 1.0, 0.1, 500.0);
+        let world = eye_ahead_of_origin();
+        // g142's k143 knots at the precision the record carries them: the DAT stores these as 32-bit
+        // floats, so rounding a knot here would move the plateau the test is measuring.
+        #[allow(clippy::excessive_precision)]
+        let track = ffxi_dat::particle_gen::KeyFrameTrack {
+            points: vec![
+                (0.0, 0.0),
+                (0.26666688919067383, 0.479_999_661_445_617_7),
+                (0.7260417938232422, 0.479_999_721_050_262_45),
+                (1.0, 0.010_000_495_240_092_278),
+            ],
         };
-        assert!(min.x < 0.0 && max.x > 0.0);
-        assert!(min.y < 0.0 && max.y > 0.0);
-        // Smaller than the half-frustum at that depth: it must not fill the screen.
-        assert!(max.x < 1.0);
+        let mut early = field(Vec2::ONE, 0.02);
+        early.envelope = Some(track.clone());
+        let late = LiveField {
+            envelope: Some(track.clone()),
+            ..field(Vec2::ONE, 0.02)
+        };
+
+        // Early in life the track has climbed to its plateau; later it has fallen away. The drawn
+        // position must not care which of the two it is.
+        let at_plateau = build_fan(
+            world,
+            clip,
+            &early,
+            early.started_at + Duration::from_secs_f32(0.3 * 1.0),
+            Vec2::splat(1280.0),
+        );
+        let faded = build_fan(
+            world,
+            clip,
+            &late,
+            late.started_at + Duration::from_secs_f32(0.95 * 1.0),
+            Vec2::splat(1280.0),
+        );
+        match (at_plateau, faded) {
+            (Some(p), Some(d)) => {
+                for i in 0..p.len() {
+                    assert_eq!(p[i].pos_shifted.x, d[i].pos_shifted.x);
+                    assert_eq!(p[i].pos_shifted.y, d[i].pos_shifted.y);
+                }
+            }
+            (Some(_), None) => {
+                panic!("a nearly-faded g142 field still draws (k143 ends above zero)")
+            }
+            _ => panic!("both fields must draw"),
+        }
+
+        // Coverage, though, is quantized to a byte and it does fall: the plateau is brighter than
+        // the tail, and both are non-zero (which is why the tail still draws above).
+        let mut f = field(Vec2::ONE, 0.0);
+        f.envelope = Some(track.clone());
+        let plateau_byte = f.alpha_byte(f.started_at + Duration::from_secs_f32(0.3));
+        let tail_byte = f.alpha_byte(f.started_at + Duration::from_secs_f32(0.95));
+        assert!(plateau_byte > 0 && tail_byte > 0);
+        assert!(
+            plateau_byte > tail_byte,
+            "k143 fades coverage: plateau byte {plateau_byte} must sit above the tail byte {tail_byte}"
+        );
     }
 
+    /// A field whose alpha track has reached zero contributes no geometry at all.
     #[test]
-    fn partially_clipped_field_preserves_footprint_coordinates() {
-        let center = Vec3::X;
-        let half = Vec2::ONE;
-        let (min, max) = field_rect(Mat4::IDENTITY, Mat4::IDENTITY, center, half)
-            .expect("a partly visible footprint must project");
-        assert_eq!(min.x, center.x - half.x);
-        assert_eq!(max.x, center.x + half.x);
-        let viewport_edge_u = (1.0 - min.x) / (max.x - min.x);
-        assert_eq!(viewport_edge_u, 0.5);
-    }
-
-    #[test]
-    fn field_behind_the_camera_does_not_draw() {
+    fn a_field_at_zero_alpha_draws_nothing() {
         let clip = Mat4::perspective_rh(std::f32::consts::FRAC_PI_3, 1.0, 0.1, 500.0);
-        assert!(field_rect(Mat4::IDENTITY, clip, Vec3::new(0.0, 0.0, 5.0), Vec2::ONE).is_none());
+        let world = eye_ahead_of_origin();
+        let mut f = field(Vec2::ONE, 0.02);
+        f.envelope = Some(ffxi_dat::particle_gen::KeyFrameTrack {
+            points: vec![(0.0, 0.0), (1.0, 0.0)],
+        });
+        assert!(build_fan(world, clip, &f, f.started_at, Vec2::splat(1280.0)).is_none());
+
+        // Same field and same view with the track taken away: it is the alpha that produced no
+        // geometry here, not the matrices.
+        let untracked = LiveField {
+            envelope: None,
+            ..f
+        };
+        assert!(build_fan(world, clip, &untracked, f.started_at, Vec2::splat(1280.0)).is_some());
     }
 
+    /// A footprint that has fallen behind the eye contributes nothing — there is no projected box to
+    /// copy the scene out of.
     #[test]
-    fn field_off_screen_after_clipping_does_not_draw() {
+    fn a_field_behind_the_eye_draws_nothing() {
         let clip = Mat4::perspective_rh(std::f32::consts::FRAC_PI_3, 1.0, 0.1, 500.0);
-        // Far to the +X side at a shallow depth: projects past NDC on both corners → clipped away.
-        assert!(field_rect(Mat4::IDENTITY, clip, Vec3::new(90.0, 0.0, -2.0), Vec2::ONE).is_none());
+        let behind = Mat4::from_translation(Vec3::new(0.0, 0.0, -3.0));
+        let f = field(Vec2::ONE, 0.02);
+        assert!(build_fan(behind, clip, &f, f.started_at, Vec2::splat(1280.0)).is_none());
+    }
+
+    /// The capture grid: one texel per pixel up to the cap, then 255 across however wide the footprint
+    /// gets — which is what makes a big field look coarse.
+    #[test]
+    fn capture_grid_reduces_only_above_the_authored_extent_cap() {
+        let viewport = Vec2::new(1280.0, 720.0);
+        // Half the screen across (NDC extent 1.0 → 640 px) is over the cap, so the capture holds 255
+        // texels and each one covers more than a pixel.
+        let (_, big_step) = capture_grid(Vec2::new(-0.5, -0.25), Vec2::new(1.0, 0.5), viewport);
+        assert!((big_step.x - 1.0 / CAPTURE_MAX_TEXELS_PER_AXIS).abs() < 1e-6);
+        // A footprint exactly at the cap reduces too; one pixel below it keeps a texel per pixel.
+        let at_cap_ndc = Vec2::new(
+            2.0 * CAPTURE_REDUCED_FROM_EXTENT_PX / viewport.x,
+            2.0 * CAPTURE_REDUCED_FROM_EXTENT_PX / viewport.y,
+        );
+        let (origin, at_cap) = capture_grid(Vec2::ZERO, at_cap_ndc, viewport);
+        assert!((at_cap.x - at_cap_ndc.x / CAPTURE_MAX_TEXELS_PER_AXIS).abs() < 1e-6);
+        assert_eq!(
+            origin,
+            Vec2::ZERO,
+            "the grid starts at the footprint's own box"
+        );
+        let under = at_cap_ndc * 0.9;
+        let (_, under_step) = capture_grid(Vec2::ZERO, under, viewport);
+        let under_px = under.x * 0.5 * viewport.x;
+        assert!(
+            (under_step.x - under.x / under_px).abs() < 1e-6,
+            "below the cap the capture keeps one texel per screen pixel"
+        );
     }
 
     #[test]
     fn fields_expire_on_their_authored_life() {
-        let map = Arc::new(DistortionMap::new(1, 1, vec![0, 0, 0, 255]));
-        let live = LiveField {
-            center: Vec3::ZERO,
-            half_extent: Vec2::ONE,
-            haze_offset_x: 0.02,
-            started_at: Instant::now(),
-            duration_secs: 60.0 / 60.0,
-            envelope: None,
-            map: map.clone(),
-        };
+        let live = field(Vec2::ONE, 0.02);
         assert!(!live.is_expired(Instant::now()));
         let later = live.started_at + Duration::from_secs_f32(1.1);
         assert!(live.is_expired(later));
@@ -726,5 +936,47 @@ mod tests {
         assert!(d.fields.is_empty());
         d.push(live);
         assert_eq!(d.fields.len(), 1);
+    }
+
+    /// The vertex stream is a wire contract with distortion.wgsl: four vec2s then two scalars, little
+    /// endian, so a reorder cannot silently desync the two.
+    #[test]
+    fn fan_vertex_bytes_match_the_wgsl_layout() {
+        let v = FanVertex {
+            pos_shifted: Vec2::new(-0.5, -0.25),
+            sample_ndc: Vec2::new(0.5, 0.75),
+            foot_origin: Vec2::new(-1.0, 1.0),
+            capture_step: Vec2::new(0.001, 0.002),
+            vertex_alpha: 0.48,
+            vertex_rgb: 1.0,
+        };
+        let mut bytes = Vec::new();
+        fan_vertex_bytes(&v, &mut bytes);
+        assert_eq!(bytes.len(), FAN_VERTEX_BYTES);
+        // Every slot of the contract in order: two draw axes, two sampling axes, the box origin, the
+        // capture texel step, then the two scalars.
+        let float_at = |slot: usize| -> [u8; 4] {
+            bytes[slot * 4..(slot + 1) * 4]
+                .try_into()
+                .expect("one float")
+        };
+        let contract: [(usize, f32); FAN_VERTEX_FLOATS] = [
+            (0, -0.5),
+            (1, -0.25),
+            (2, 0.5),
+            (3, 0.75),
+            (4, -1.0),
+            (5, 1.0),
+            (6, 0.001),
+            (7, 0.002),
+            (8, 0.48),
+            (9, 1.0),
+        ];
+        for (slot, want) in contract {
+            assert_eq!(float_at(slot), want.to_le_bytes(), "slot {slot}");
+        }
+
+        let layout = fan_vertex_layout();
+        assert_eq!(layout.array_stride as usize, FAN_VERTEX_BYTES);
     }
 }
