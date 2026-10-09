@@ -3711,7 +3711,6 @@ fn advance_actor_pose(
     let target_pose = look.map(|input| {
         look_point_actor_local(
             input.pose_rotation,
-            *scale,
             input.actor_world,
             input.target_attach_world,
         )
@@ -3891,25 +3890,13 @@ pub(crate) struct LookAtInput {
     pub target_attach_world: Vec3,
 }
 
-/// The actor-local space retail keeps its chased look point in (`model+0xB0..B8`).
-/// `FFXiMain.dll retail-2026-09` fetches the target's attach 3 in world space (`[vt+0x1C4](3)` at
-/// RVA 0xD5C64, helper RVA 0xD4560), drops it by `1.2f` when the visibility WORD is set and stores it at
-/// actor+0x848/0x84C/0x850 (RVA 0xD5C92..0xD5C9E); then RVA 0xD5CDA..0xD5D25 turns it into the value the bend
-/// actually uses: subtract `*vt+0x1BC` (RVA 0xA4740 = `lea eax,[ecx+0x5fc]`, the actor position) through the
-/// in-place subtract helper RVA 0x270a0, build an identity matrix with zeroed rotation (`0x27990` / `0x279b0`),
-/// rotate it by **−yaw** about Y — `fld [eax+4] / fchs` on the pointer from `vt+0x1C0` (RVA 0xA4750 =
-/// `lea eax,[ecx+0x61c]`, whose `.y` is actor+0x620) through helper RVA 0x27bd0 — and transform the point
-/// (helper RVA 0x28200). So: world offset, yaw removed, nothing else. kuluu's heading lives on the entity transform
-/// (`scene.rs` `heading_to_quat`, slerped toward it for self), so `pose_rotation` is that frame's rotation and this
-/// takes it out exactly once; `scale` divides because kuluu folds model scale into pose space, where retail composes
-/// it later.
+// RootTransform.scale already places posed joints in scaled actor space.
 pub(crate) fn look_point_actor_local(
     pose_rotation: Quat,
-    actor_scale: f32,
     actor_world: Vec3,
     target_attach_world: Vec3,
 ) -> Vec3 {
-    let offset = (target_attach_world - actor_world) / actor_scale.max(f32::EPSILON);
+    let offset = target_attach_world - actor_world;
     pose_rotation.inverse() * offset
 }
 
@@ -4217,8 +4204,7 @@ mod head_look_tests {
             // Ahead of a nose-`+X` actor and slightly above the anchor: yaw-only in the nose frame.
             let in_pose_space = Vec3::new(4.0, -0.5, 0.0);
             let target_attach_world = actor_world + pose_rotation * in_pose_space;
-            let local =
-                look_point_actor_local(pose_rotation, 1.0, actor_world, target_attach_world);
+            let local = look_point_actor_local(pose_rotation, actor_world, target_attach_world);
             assert!(
                 (local - in_pose_space).length() < 1e-4,
                 "quarter turn {quarter_turns}: expected {in_pose_space}, got {local}"
@@ -4233,21 +4219,71 @@ mod head_look_tests {
         let facing = std::f32::consts::FRAC_PI_2;
         let pose_rotation = Quat::from_rotation_y(facing);
         // A target one unit along world +Z from the actor.
-        let local = look_point_actor_local(pose_rotation, 1.0, actor_world, actor_world + Vec3::Z);
+        let local = look_point_actor_local(pose_rotation, actor_world, actor_world + Vec3::Z);
         assert!(
             (local.length() - 1.0).abs() < 1e-5,
             "rotation-only offset: {local}"
         );
         // Ry(-90deg) . +Z = -X: the target sits behind the nose once that yaw is removed.
         assert!(local.x < -0.99 && local.z.abs() < 1e-5, "{local}");
-        // Scale divides (kuluu folds it into pose space), so a halved model keeps the authored offsets.
-        let scaled = look_point_actor_local(
-            Quat::IDENTITY,
-            2.0,
-            actor_world,
-            actor_world + Vec3::X * 4.0,
-        );
-        assert!((scaled - Vec3::X * 2.0).length() < 1e-5, "{scaled}");
+    }
+
+    #[test]
+    fn a_level_target_stays_level_with_scaled_posed_joints() {
+        use ffxi_actor::look_bend::{attach_frame, BendFrame};
+        use ffxi_actor::skeleton_instance::{pose_world, RootTransform};
+        use ffxi_dat::skel::{standard_position, Joint, JointReference};
+
+        const NECK_HEIGHT: f32 = -1.5;
+        const TARGET_DISTANCE: f32 = 4.0;
+        const EPSILON: f32 = 0.0001;
+        let skeleton = Skeleton {
+            id: DatId::from_str("test"),
+            joints: vec![
+                Joint {
+                    rotation: Quat::IDENTITY.to_array(),
+                    translation: Vec3::ZERO.to_array(),
+                    parent: None,
+                },
+                Joint {
+                    rotation: Quat::IDENTITY.to_array(),
+                    translation: [0.0, NECK_HEIGHT, 0.0],
+                    parent: Some(0),
+                },
+            ],
+            references: vec![
+                JointReference {
+                    index: 1,
+                    rotation: [0.0; 3],
+                    position_offset: [0.0; 3]
+                };
+                standard_position::NECK + 1
+            ],
+            bounding_boxes: Vec::new(),
+            look_at_limits: Vec::new(),
+        };
+        let actor_world = Vec3::new(7.0, 1.0, -3.0);
+        let pose_rotation = Quat::from_rotation_y(std::f32::consts::FRAC_PI_2);
+        for scale in [0.5, 0.85, 1.0, 2.0] {
+            let pose = pose_world(
+                &skeleton,
+                |_| None,
+                RootTransform {
+                    scale: Vec3::splat(scale),
+                    ..RootTransform::identity()
+                },
+                &[],
+            );
+            let neck = attach_frame(&pose, &skeleton, standard_position::NECK).unwrap();
+            let expected = neck.origin + POSE_FORWARD * TARGET_DISTANCE;
+            let target_world = actor_world + pose_rotation * expected;
+            let actual = look_point_actor_local(pose_rotation, actor_world, target_world);
+            let bend = BendFrame::new(&pose, &skeleton, actual, POSE_FORWARD, 0.0).unwrap();
+            assert!(
+                (bend.look - POSE_FORWARD * TARGET_DISTANCE).length() < EPSILON,
+                "scale {scale}: {bend:?}"
+            );
+        }
     }
 
     #[test]
