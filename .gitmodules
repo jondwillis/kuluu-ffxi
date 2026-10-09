@@ -24,3 +24,9 @@
 [submodule "research/xi-tools"]
 	path = research/xi-tools
 	url = https://github.com/vekien/xi-tools.git
+[submodule "research/DancingMad"]
+	path = research/DancingMad
+	url = https://github.com/WGINC/DancingMad.git
+[submodule "research/cow_ffxi_disassembly"]
+	path = research/cow_ffxi_disassembly
+	url = https://github.com/cowrevenge/cow_ffxi_disassembly.git

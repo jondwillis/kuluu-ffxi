@@ -90,35 +90,48 @@ the higher tier:
    `kuluu-render` materials and `ffxi-actor` posing.
    Build: v1.6.0; it ships no client and reads whatever install it is pointed
    at (the author's is CatsEyeXI, with lists baked by xi-tools).
-6. **`xim/`** — broad behavioral/architecture reference (actor handling,
-   packet flow, DAT pipeline), but the author rarely consulted the
-   disassembly and states XIM is unaware of in-memory-only bits/fields.
-   **Do not trust XIM for bit-level format details** — it carries latent
-   bugs there (e.g. it walks DAT chunks with a 20-bit size field where
-   retail uses 19; harmless on retail data only because bit 26
-   (`is_shadow`) is always clear). Confirm any XIM-derived mask or width
-   against XIClient or the disassembly.
-
-   The drift is wider than bit widths. Aamace's own guidance is to stay
-   skeptical of XIM wherever an effect is subtle in-game, because XIM
-   reproduces what is *observable*, not what the client computes. So a
-   detail XIM omits is weak evidence that retail omits it. Worked example:
-   XIM's chase camera skips triangles by a `hitWall` material bit
-   (`type & 0x40`), which reads as the whole rule; XIClient shows retail
-   also gates that skip on the mesh header flags and takes the bit from the
-   triangle's third vertex index (`Flags != 0 && VertexIndex3 & 0x4000`).
-   XIM was right about the shape and wrong about the predicate — the usual
-   failure mode. Use XIM to find *where* to look, then read XIClient.
+6. **`xim/`** — lookup aid only, not evidence of retail behavior or a source
+   of constants. Use it to locate a question, then establish the answer from
+   applicable primary evidence. This applies to animation, effects, timing and
+   camera policy as well as binary layouts. Existing XIM-derived code, tests,
+   beads and records remain hypotheses until independently corroborated.
+   A disagreement with XIM cannot by itself justify reverting DLL/DAT-grounded
+   work or filing a parity defect. Follow the
+   [source-conflict procedure](../.agents/skills/retail-grounding/SKILL.md#resolve-conflicting-sources).
    Build: the unversioned `source.zip` from xim.pages.dev (`1.0-SNAPSHOT`);
-   the copy fetched here carries content dated 2026-03-09 and LSB tables from
-   2024-06-30.
+   the copy previously fetched here carried content dated 2026-03-09 and LSB
+   tables from 2024-06-30.
+
+## Dancer research and contributor tooling
+
+- `DancingMad/` — independent research and tooling for the PC client's
+  graphics, animation and Dancer middleware, cross-referenced with PS2 debug
+  data. It is not SE's original engine source. Pinned to the contributor-cited
+  revision `4243c7e`; see [its README](DancingMad/README.md).
+- `cow_ffxi_disassembly/` — the contributor's DLL/DAT research and scanner
+  suite, including the Dancer ingest; see [its README](cow_ffxi_disassembly/README.md).
+
+Both are submodules; their exact revisions are recorded by the gitlinks.
+Populate them on demand:
+
+```bash
+git submodule update --init research/DancingMad research/cow_ffxi_disassembly
+```
+
+These are research references, not build inputs under `vendor/`. They can
+supply investigation leads and reproducible tooling; their claims still need
+build-specific provenance and a distinction between verified findings and
+inference. PS2 symbols do not alone establish current PC behavior. Apply the
+same reader/writer separation and interop-record requirements as for local
+binary inspection; do not transplant decompiled implementation or internal
+layouts into Kuluu. Neither reference automatically overrides an applicable
+retail observation or independently verified record.
 
 ## XIM
 
 [XIM](https://xim.pages.dev/) is Aamace's from-scratch browser FFXI client
-PoC (unrelated to atom0s's Xi* repos). It's a
-useful reference for vanilla feature behavior — actor/animation handling,
-packet flow, DAT parsing — when filling in the parity scoreboard.
+PoC (unrelated to atom0s's Xi* repos). Kept as a historical lookup aid,
+not a source for vanilla acceptance criteria or parity planning.
 
 - Live app:   <https://xim.pages.dev/>
 - Source zip: <https://xim.pages.dev/source.zip>
