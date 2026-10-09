@@ -147,6 +147,7 @@ fn capture(
                 duration_secs: HOLD_SECONDS as f32,
                 envelope: None,
                 follow: None,
+                owned_by: None,
             });
         }
     }

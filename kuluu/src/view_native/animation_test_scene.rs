@@ -3090,6 +3090,7 @@ mod tests {
                     duration_secs: 60.0,
                     envelope: None,
                     follow: None,
+                    owned_by: None,
                 });
                 distortion
             })

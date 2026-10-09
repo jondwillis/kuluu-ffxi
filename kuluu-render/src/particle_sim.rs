@@ -1215,6 +1215,7 @@ fn push_distortion_field(
     origin: Vec3,
     envelope: Option<ffxi_dat::particle_gen::KeyFrameTrack>,
     follow: Option<Entity>,
+    owned_by: Option<crate::distortion_pass::EffectHandle>,
     distortion: &mut crate::distortion_pass::ActiveDistortion,
 ) -> bool {
     let Some(half_extent) = procedural_half_extent(&dist.generator_view) else {
@@ -1228,6 +1229,7 @@ fn push_distortion_field(
         duration_secs: dist.max_life_frames / ROUTINE_FPS,
         envelope,
         follow: follow.map(crate::distortion_pass::FieldFollow::new),
+        owned_by,
     });
     true
 }
@@ -1404,8 +1406,20 @@ pub fn spawn_particle_generators(
                         .map(|f| f.point(Vec3::from_array(dist.generator_view.base_position)))
                         .unwrap_or(actor_xf.translation);
                     let carry = field_carry_actor(&dist.generator_view, ev.actor, target_ent);
-                    let armed =
-                        push_distortion_field(dist, origin, envelope, carry, &mut distortion);
+                    // The stage names the generator it spawned, so the field stays answerable to it:
+                    // a later Stop or dampen for `(actor, id)` reaches the haze as well as particles.
+                    let handle = crate::distortion_pass::EffectHandle {
+                        owner: ev.actor,
+                        generator: ev.stage.stage.id,
+                    };
+                    let armed = push_distortion_field(
+                        dist,
+                        origin,
+                        envelope,
+                        carry,
+                        Some(handle),
+                        &mut distortion,
+                    );
                     if tracing {
                         info!(
                             "animationtest trace: particle stage {} [{}] — DISTORTION field haze={:.3} life {:.1}s envelope={} pts{}",
@@ -2262,6 +2276,9 @@ fn instantiate_child_generators(
         };
         // Clone the factory's payload out before pushing: the push shifts every index.
         let children = f.children.clone();
+        // A child's field answers to the generator holding its factory, so a dampen on that generator
+        // takes the haze with the rest of the effect instead of only its particles.
+        let factory_origin = sim.generators[r.factory_owner].origin_routine;
         match &f.payload {
             ChildPayload::Sound {
                 se_id,
@@ -2300,6 +2317,12 @@ fn instantiate_child_generators(
                             // A child fires at a point along its parent's path, and no attach mode
                             // governs that placement, so nothing anchors it to an actor.
                             follow: None,
+                            owned_by: factory_origin.map(|o| {
+                                crate::distortion_pass::EffectHandle {
+                                    owner: o.owner,
+                                    generator: o.gen_id,
+                                }
+                            }),
                         });
                         true
                     }
@@ -10535,8 +10558,12 @@ mod tests {
             ..Default::default()
         };
         let mut distortion = crate::distortion_pass::ActiveDistortion::default();
+        let handle = crate::distortion_pass::EffectHandle {
+            owner: Entity::from_bits(5),
+            generator: *b"g142",
+        };
         assert!(
-            push_distortion_field(&def, Vec3::ZERO, None, None, &mut distortion),
+            push_distortion_field(&def, Vec3::ZERO, None, None, Some(handle), &mut distortion),
             "an unresolvable linked name must not stop a 0x22 field from arming"
         );
         let armed = &distortion.fields[0];
@@ -10546,6 +10573,9 @@ mod tests {
         assert_eq!(armed.half_extent, Vec2::ONE);
         assert_eq!(armed.haze_offset, 0.02);
         assert_eq!(armed.duration_secs, def.max_life_frames / ROUTINE_FPS);
+        // The field stays answerable to the generator that armed it: a dampen for `(owner, id)` finds
+        // it by exactly that pair.
+        assert_eq!(armed.owned_by, Some(handle));
     }
 
     /// The carrying actor comes from the attach mode: a target-reference element rides the target and
