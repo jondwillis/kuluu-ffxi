@@ -143,7 +143,8 @@ pub struct ActiveScheduler {
     pub stages: Vec<TimedStage>,
 
     /// One id for this running routine in [`crate::look_at_gates::LockLookAtInterval`] keys. The stages
-    /// never change after construction, so `(instance, slot)` names one stage for the routine's life.
+    /// never change after construction, so `(instance, slot)` names one stage for the routine's life; the
+    /// id itself belongs to the run, so it is taken (and re-taken) when an entry starts running.
     instance: u64,
 
     /// The routine's wire target (spell/victim/cutscene partner the actor acted on),
@@ -170,6 +171,15 @@ pub struct ActiveScheduler {
 }
 
 impl ActiveScheduler {
+    /// Identity belongs to the running routine, not to the data it was built from. An entry enqueued here
+    /// may already carry an id handed out elsewhere - a clone, or a scheduler built before its turn - and
+    /// two entries sharing one id also share `(instance, slot)`, so their look-lock tasks merge into one
+    /// another's. Retail gives every fired stage its own task (FFXiMain.dll retail-2026-09: per-stage task
+    /// constructors at RVA 0x5F4BC / RVA 0x5F4D2).
+    fn stamp_running_instance(&mut self) {
+        self.instance = NEXT_ROUTINE_INSTANCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub fn from_scheduler(s: &Scheduler) -> Self {
         let mut stages = s.stages.clone();
         stages.sort_by_key(|t| t.frame);
@@ -374,7 +384,8 @@ pub struct ActiveSchedulers {
 }
 
 impl ActiveSchedulers {
-    pub fn one(active: ActiveScheduler) -> Self {
+    pub fn one(mut active: ActiveScheduler) -> Self {
+        active.stamp_running_instance();
         Self {
             routines: vec![active],
         }
@@ -384,12 +395,16 @@ impl ActiveSchedulers {
     /// an entity with no ActiveSchedulers yet (see `run_routine_on`'s pending-insert buffer):
     /// one component holding every routine instead of N deferred inserts where the last would
     /// have overwritten the rest.
-    pub fn many(entries: Vec<ActiveScheduler>) -> Self {
+    pub fn many(mut entries: Vec<ActiveScheduler>) -> Self {
+        for entry in &mut entries {
+            entry.stamp_running_instance();
+        }
         Self { routines: entries }
     }
 
     /// Enqueue a routine alongside the running ones instead of replacing them.
-    pub fn push(&mut self, active: ActiveScheduler) {
+    pub fn push(&mut self, mut active: ActiveScheduler) {
+        active.stamp_running_instance();
         self.routines.push(active);
     }
 
@@ -6233,6 +6248,83 @@ mod tests {
         let now = probe.lock_look_at_intervals_now();
         assert_eq!(now.len(), 1);
         assert_eq!((now[0].fire_frame, now[0].end_frame), (6, 30));
+    }
+
+    /// Two instances of one routine running at once must keep separate look-lock identities: retiring
+    /// the older one cannot disable the newer one's interval, and a later run gets fresh state rather
+    /// than inheriting a released anchor.
+    #[test]
+    fn overlapping_look_locks_keep_instance_identity_after_retirement() {
+        use crate::look_at_gates::{advance_look_at_locks, LOCK_WATCHDOG_DISTANCE_YALMS};
+        const END_FRAME: u16 = 600;
+        let mut lock = stage(0, StageKind::LockLookAt, 0x89, *b"    ");
+        lock.stage.duration_frames = END_FRAME;
+        let active = ActiveScheduler::from_scheduler(&make_scheduler(*b"lock", vec![lock]));
+        let mut scheds = ActiveSchedulers::one(active.clone());
+        let mut tasks = Vec::new();
+        assert!(advance_look_at_locks(
+            &mut tasks,
+            &scheds.lock_look_at_intervals_now(),
+            Vec2::ZERO
+        ));
+        assert!(!advance_look_at_locks(
+            &mut tasks,
+            &scheds.lock_look_at_intervals_now(),
+            Vec2::X * LOCK_WATCHDOG_DISTANCE_YALMS
+        ));
+        scheds.push(active.clone());
+        let open = scheds.lock_look_at_intervals_now();
+        assert_ne!(open[0].routine_instance, open[1].routine_instance);
+        assert!(advance_look_at_locks(&mut tasks, &open, Vec2::ZERO));
+        assert_eq!(tasks.len(), 2);
+        let survivor = open[1];
+        scheds.routines.remove(0);
+        assert_eq!(scheds.lock_look_at_intervals_now(), vec![survivor]);
+        assert!(advance_look_at_locks(
+            &mut tasks,
+            &scheds.lock_look_at_intervals_now(),
+            Vec2::ZERO
+        ));
+        assert_eq!(tasks.len(), 1);
+        scheds.routines.clear();
+        assert!(!advance_look_at_locks(
+            &mut tasks,
+            &scheds.lock_look_at_intervals_now(),
+            Vec2::ZERO
+        ));
+        assert!(tasks.is_empty());
+        scheds.push(active);
+        assert_ne!(
+            scheds.lock_look_at_intervals_now()[0].routine_instance,
+            survivor.routine_instance
+        );
+        assert!(advance_look_at_locks(
+            &mut tasks,
+            &scheds.lock_look_at_intervals_now(),
+            Vec2::ZERO
+        ));
+    }
+
+    /// Two lock stages firing on the same frame of one routine are two locks: sharing their frames must
+    /// not merge them into a single task.
+    #[test]
+    fn same_frame_look_locks_keep_distinct_stage_identity() {
+        const END_FRAME: u16 = 600;
+        let mut lock = stage(0, StageKind::LockLookAt, 0x89, *b"    ");
+        lock.stage.duration_frames = END_FRAME;
+        let active = ActiveScheduler::from_scheduler(&make_scheduler(*b"lock", vec![lock, lock]));
+        let scheds = ActiveSchedulers::one(active);
+        let open = scheds.lock_look_at_intervals_now();
+        assert_eq!(open.len(), 2);
+        assert_eq!(open[0].routine_instance, open[1].routine_instance);
+        assert_ne!(open[0].stage_slot, open[1].stage_slot);
+        let mut tasks = Vec::new();
+        assert!(crate::look_at_gates::advance_look_at_locks(
+            &mut tasks,
+            &open,
+            Vec2::ZERO
+        ));
+        assert_eq!(tasks.len(), 2);
     }
 
     // 0x2E is the movement twin of 0x59: same interval rules, a different lock. The 0x2E
