@@ -4287,6 +4287,99 @@ mod head_look_tests {
     }
 
     #[test]
+    fn live_look_gates_use_the_self_status_channel() {
+        use ffxi_proto::decode::animation;
+        const SELF_ID: u32 = 11;
+        const REMOTE_ID: u32 = 12;
+        bevy::tasks::ComputeTaskPool::get_or_init(Default::default);
+        let mut app = App::new();
+        app.init_resource::<Time>()
+            .init_resource::<crate::snapshot::SceneState>()
+            .init_resource::<combat_stance::EntityMotion>()
+            .init_resource::<combat_stance::RestStance>()
+            .init_resource::<combat_stance::WalkMode>()
+            .init_resource::<combat_stance::SelfMoveIntent>()
+            .init_resource::<FfxiSkinRegistry>()
+            .init_resource::<crate::scene::Target>()
+            .init_resource::<crate::scene::TrackedEntities>()
+            .add_systems(Update, tick_live_ffxi_actors);
+        let wire = |id| kuluu_snapshot::Entity {
+            id,
+            act_index: id as u16,
+            kind: kuluu_snapshot::EntityKind::Pc,
+            name: None,
+            pos: Default::default(),
+            heading: 0,
+            hp_pct: Some(100),
+            bt_target_id: 0,
+            face_target: 0,
+            claim_id: 0,
+            speed: 0,
+            speed_base: 0,
+            look: None,
+            animation: animation::NONE,
+            animationsub: 0,
+            mount: None,
+            status: 0,
+            char_flags: Default::default(),
+            monstrosity: false,
+            name_vis: None,
+        };
+        let self_actor = app
+            .world_mut()
+            .spawn((
+                render_actor_stub(SELF_ID),
+                GlobalTransform::default(),
+                Visibility::Inherited,
+            ))
+            .id();
+        let remote_actor = app
+            .world_mut()
+            .spawn((
+                render_actor_stub(REMOTE_ID),
+                GlobalTransform::default(),
+                Visibility::Inherited,
+            ))
+            .id();
+        {
+            let snapshot = &mut app
+                .world_mut()
+                .resource_mut::<crate::snapshot::SceneState>()
+                .snapshot;
+            snapshot.self_char_id = Some(SELF_ID);
+            snapshot.entities = vec![wire(SELF_ID), wire(REMOTE_ID)];
+        }
+        for status in [
+            animation::ATTACK,
+            animation::HEALING,
+            animation::FISHING_START,
+            animation::SIT,
+            animation::CHOCOBO,
+            animation::MOUNT,
+        ] {
+            app.world_mut()
+                .resource_mut::<crate::snapshot::SceneState>()
+                .snapshot
+                .self_server_status = status;
+            app.update();
+            assert_eq!(
+                app.world()
+                    .get::<FfxiRenderActor>(self_actor)
+                    .unwrap()
+                    .wire_animation,
+                status
+            );
+            assert_eq!(
+                app.world()
+                    .get::<FfxiRenderActor>(remote_actor)
+                    .unwrap()
+                    .wire_animation,
+                animation::NONE
+            );
+        }
+    }
+
+    #[test]
     fn release_is_positional_not_angular() {
         // Inside the horizon (0.3) or past half a unit behind the shoulder line (-0.5 on +X):
         // both release, and neither test looks at an angle.
@@ -5619,8 +5712,11 @@ pub fn tick_live_ffxi_actors(
                 running_mode: modes.running,
                 ..Default::default()
             };
-            actor.wire_animation =
-                snap.map_or(ffxi_proto::decode::animation::NONE, |s| s.animation);
+            actor.wire_animation = if drives_from_self_input {
+                state.snapshot.self_server_status
+            } else {
+                snap.map_or(ffxi_proto::decode::animation::NONE, |s| s.animation)
+            };
 
             // Retail aims nothing until both look-at gates pass: the wire status byte alone can drop the
             // target, and a live 0x89 LockLookAt task does the same from an action (crate::look_at_gates).
