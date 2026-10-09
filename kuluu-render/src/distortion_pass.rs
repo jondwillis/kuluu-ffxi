@@ -65,6 +65,30 @@ const CAPTURE_REDUCED_FROM_EXTENT_PX: f32 = 256.0;
 /// makes a fade quantise rather than glide.
 const ALPHA_BYTE_MAX: f32 = 255.0;
 
+/// The actor carrying a live field while it lives, and where that actor stood when the carry last
+/// applied. Retail attaches g142's element to an actor
+/// (`.agents/skills/retail-observe/references/2026-10-07-procedural-distortion.md`, "The clean global
+/// generator g142"), so a directly armed field tracks that actor frame by frame instead of sitting
+/// where the hit landed. Only translation is carried: the fan is built screen-facing from `center` by
+/// [`build_fan`], so there is no geometry for a rotation to steer.
+#[derive(Clone, Copy)]
+pub struct FieldFollow {
+    /// The anchor actor — the attach frame's own reference, not necessarily the routine's owner.
+    pub actor: Entity,
+    last_actor_pos: Option<Vec3>,
+}
+
+impl FieldFollow {
+    /// A carry that has not seen its anchor yet: the first tick records where the actor stands and
+    /// moves nothing, so a field armed before its anchor is measured stays at its attach site.
+    pub fn new(actor: Entity) -> Self {
+        Self {
+            actor,
+            last_actor_pos: None,
+        }
+    }
+}
+
 /// One live haze field. Main-world side; extracted verbatim each frame and drawn per-view.
 #[derive(Clone)]
 pub struct LiveField {
@@ -81,6 +105,9 @@ pub struct LiveField {
     /// sec2 0x2D KeyFrameValueSetup — the alpha track over life (g142 binds k143). It fades coverage
     /// only; in that authored path it never scales the haze translation. `None` = constant full alpha.
     pub envelope: Option<ffxi_dat::particle_gen::KeyFrameTrack>,
+    /// Motion carry while an anchor actor lives; dropped when that actor is gone, which leaves the
+    /// field finishing its authored life in world space rather than vanishing with it.
+    pub follow: Option<FieldFollow>,
 }
 
 impl LiveField {
@@ -123,6 +150,29 @@ pub struct ActiveDistortion {
 impl ActiveDistortion {
     pub fn push(&mut self, field: LiveField) {
         self.fields.push(field);
+    }
+}
+
+/// Carries each live field with its anchor actor while that actor is present. When the actor is gone
+/// the carry drops, leaving the field's own life clock to finish in world space — the field stops
+/// tracking rather than disappearing early.
+fn carry_attached_distortion_fields(
+    q_actor: Query<&GlobalTransform>,
+    mut distortion: ResMut<ActiveDistortion>,
+) {
+    for field in &mut distortion.fields {
+        let Some(follow) = field.follow.as_mut() else {
+            continue;
+        };
+        let Ok(actor) = q_actor.get(follow.actor) else {
+            field.follow = None;
+            continue;
+        };
+        let here = actor.translation();
+        if let Some(there) = follow.last_actor_pos {
+            field.center += here - there;
+        }
+        follow.last_actor_pos = Some(here);
     }
 }
 
@@ -695,8 +745,10 @@ impl Plugin for DistortionPassPlugin {
     fn build(&self, app: &mut App) {
         embedded_asset!(app, "distortion.wgsl");
         embedded_asset!(app, "distortion_copy.wgsl");
-        app.init_resource::<ActiveDistortion>()
-            .add_systems(Update, prune_distortion_fields);
+        app.init_resource::<ActiveDistortion>().add_systems(
+            Update,
+            (carry_attached_distortion_fields, prune_distortion_fields).chain(),
+        );
         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
             render_app
                 .init_resource::<DistortionPassData>()
@@ -726,6 +778,7 @@ mod tests {
             started_at: Instant::now(),
             duration_secs: 1.0,
             envelope: None,
+            follow: None,
         }
     }
 
@@ -936,6 +989,97 @@ mod tests {
         assert!(d.fields.is_empty());
         d.push(live);
         assert_eq!(d.fields.len(), 1);
+    }
+
+    /// A carried field moves by exactly what its anchor actor moved, and stops being carried once that
+    /// actor despawns — leaving the authored life to run out where the field then stands.
+    #[test]
+    fn a_carried_field_moves_with_its_anchor_and_freezes_without_it() {
+        use bevy::ecs::system::RunSystemOnce;
+
+        let mut world = World::default();
+        world.init_resource::<ActiveDistortion>();
+        let actor = world.spawn(GlobalTransform::from_xyz(0.0, 0.0, 2.0)).id();
+
+        let mut armed = field(Vec2::ONE, 0.0);
+        armed.follow = Some(FieldFollow::new(actor));
+        world.resource_mut::<ActiveDistortion>().push(armed);
+
+        // First sight of the anchor only records where it stands: an armed field stays at its attach
+        // site rather than snapping to the actor.
+        let carried = |world: &mut World| {
+            world
+                .run_system_once(carry_attached_distortion_fields)
+                .unwrap()
+        };
+        carried(&mut world);
+        assert_eq!(
+            world.resource::<ActiveDistortion>().fields[0].center,
+            Vec3::ZERO,
+            "the first tick of a carry moves nothing"
+        );
+
+        world
+            .entity_mut(actor)
+            .insert(GlobalTransform::from_xyz(0.0, 0.0, 5.0));
+        carried(&mut world);
+        assert_eq!(
+            world.resource::<ActiveDistortion>().fields[0].center,
+            Vec3::new(0.0, 0.0, 3.0),
+            "the field follows its anchor's movement"
+        );
+
+        world.entity_mut(actor).despawn();
+        carried(&mut world);
+        let fields = &world.resource::<ActiveDistortion>().fields;
+        assert!(
+            fields[0].follow.is_none(),
+            "a despawned anchor stops carrying the field"
+        );
+        assert_eq!(
+            fields[0].center,
+            Vec3::new(0.0, 0.0, 3.0),
+            "the field keeps its last position rather than vanishing with the actor"
+        );
+    }
+
+    /// A footprint hanging off the edge of the screen keeps its own projected coordinates: nothing in
+    /// the mapping is clamped to the viewport, so the field neither stretches nor shrinks as it gets
+    /// partly cut off. Corners outside NDC are simply not rasterized.
+    #[test]
+    fn partially_offscreen_field_keeps_its_projected_footprint() {
+        // Close enough that the footprint is wider than the frustum: some corners land outside NDC.
+        let world_from_view = Mat4::from_translation(Vec3::new(0.0, 0.0, 1.2));
+        let clip = Mat4::perspective_rh(std::f32::consts::FRAC_PI_3, 1.0, 0.1, 500.0);
+        let f = field(Vec2::ONE, 0.0);
+        let fan =
+            build_fan(world_from_view, clip, &f, f.started_at, Vec2::splat(1280.0)).expect("fan");
+
+        let off_screen = fan
+            .iter()
+            .any(|v| v.sample_ndc.x.abs() > 1.0 || v.sample_ndc.y.abs() > 1.0);
+        assert!(
+            off_screen,
+            "this fixture is meant to put corners outside the viewport"
+        );
+
+        // Every rim corner equals its straight projection, outside the viewport exactly as inside it.
+        for (idx, &local) in FOOTPRINT_LOCAL.iter().enumerate().skip(1) {
+            let Some(expected) = project_footprint_point(
+                world_from_view,
+                clip,
+                f.center,
+                f.half_extent,
+                local,
+                Vec2::ZERO,
+            ) else {
+                panic!("a corner in front of the near plane must project");
+            };
+            assert!(
+                fan.iter().any(|v| v.sample_ndc == expected),
+                "corner {idx} projects to {expected:?}, which no fan vertex carries"
+            );
+        }
     }
 
     /// The vertex stream is a wire contract with distortion.wgsl: four vec2s then two scalars, little
