@@ -334,16 +334,17 @@ InEvent. If those symptoms return, check that header/sync invariant first.
 ## Cleanup and ownership
 
 ```bash
-taskkill //F //IM kuluu.exe ; tasklist | grep -ic kuluu     # Windows: kill, then count must be 0
-pkill -f kuluu        ; pgrep -c kuluu                      # Unix: same
+# Set OWNED_PID to the PID recorded when this run launched its client.
+taskkill //PID "$OWNED_PID"      # Windows Git Bash
+kill -TERM "$OWNED_PID"         # Unix
 ```
 
 - **Prefer a clean disconnect** (MCP `disconnect`, the Unix agent socket, or client exit) over a
   kill: a hard kill leaves the map server holding the char for minutes and the next lobby login
   times out. `references/stack.md` owns that failure mode and its single-row repair — including why
   the `WHERE` clause is not optional.
-- **GM `/shutdown` + enter** (then ~35s for the containers to come back) releases every held
-  session at once, which disturbs anyone else logged in: say in your report that you used it.
+- **GM `/shutdown` restarts the shared server.** It is not client cleanup. Use it only for
+  an explicitly authorized server-restart test; record the interruption in the report.
 - **Never kill a kuluu process you did not start.** The user plays on this machine too; confirm
   ownership before any taskkill.
 
