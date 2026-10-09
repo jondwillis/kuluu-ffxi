@@ -60,6 +60,28 @@ which claim remains an inference. Do not make unrelated work wait for a client
 login, exhaustive reverse engineering, or optional tooling. Follow existing
 authorization for live actions; this skill adds no approval gate.
 
+## Resolve conflicting sources
+
+Before proposing a parity correction, corrective bead or reversion, identify
+both competing rules and the evidence for each: record path, source revision,
+client build, inputs and observable consequence. XIM can supply search terms;
+it cannot establish the rule, even when an old bead, test or observation record
+repeats it. A record's title or location does not promote its source's authority.
+
+Prefer applicable primary evidence over community reconstructions. Do not
+replace a DLL/DAT-grounded rule merely to agree with XIM, an inherited test or
+a different branch. Conversely, a DLL citation alone does not prove its
+interpretation: check build, caller, predicates and whether the finding covers
+the disputed behavior. Resolve a real contradiction with a discriminating
+retail observation or a build-scoped binary/DAT investigation, preserving the
+reader/writer separation below.
+
+When evidence supersedes a hypothesis, mark the affected record's claim as
+superseded and link the replacement; update dependent bead assumptions instead
+of filing competing implementation tasks. Preserve valid independent findings
+and provenance. If neither claim is settled, track an investigation with the
+uncertainty explicit, rather than prescribing either behavior as a fix.
+
 ## Turn the evidence into code
 
 Trace the rule end to end: where the input comes from, its units and coordinate

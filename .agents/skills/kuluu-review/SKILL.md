@@ -37,6 +37,12 @@ Follow the defect-first discipline of the generic review-agent: inspect surround
 
 Require an evidence source and its supported conclusion for every material behavioral claim. Client behavior needs decisive retail observation, build-scoped binary inspection, DAT interpretation or an applicable official retail specification. Our implementation, matching test expectations, screenshots of Kuluu, green CI and community recreations do not independently establish retail behavior. Reuse verified records when they cover the claim. LSB is sufficient for server-owned wire semantics; label client presentation and workflow support separately. Cite a source path and symbol or a direct URL, build/pin where relevant, and state what remains inferred. Unsupported material parity or inclusion claims prevent a merge-ready recommendation.
 
+For conflicting retail claims, apply the
+[grounding conflict procedure](../retail-grounding/SKILL.md#resolve-conflicting-sources)
+before proposing a corrective bead or reverting a contributor's change. An XIM
+mismatch or an inherited test expectation alone is not a demonstrated defect;
+identify the evidence that supersedes the existing rule.
+
 Route LSB-boundary changes to [lsb-mirror-check](../lsb-mirror-check/SKILL.md), state-contract checks and applicable protocol reviewers. Route new spawns, resources or state-boundary work to [bevy-lifecycle-symmetry](../bevy-lifecycle-symmetry/SKILL.md). Use the repository check commands; distinguish a passing hook from full CI, skipped integration tests from executed ones, and a baseline failure from a regression.
 
 Assess readiness against changed behavior and stated claims. Disclose relevant pre-existing gaps without requiring unrelated fixes. Tooling that only forwards existing inputs needs evidence of event routing and activation; it needs media when it changes visible behavior or claims an observed outcome.
