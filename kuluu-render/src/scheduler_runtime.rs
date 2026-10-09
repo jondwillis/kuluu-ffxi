@@ -2666,7 +2666,6 @@ pub fn queue_turns_from_stages(
     prediction: Option<Res<crate::combat_stance::EntityPrediction>>,
     q_kind: Query<&WorldEntity>,
     q_place: Query<&Transform>,
-    q_target: Query<&ActionTarget>,
     mut q_turns: Query<Option<&mut PendingTurn>>,
     mut pending_inserts: Local<HashMap<Entity, PendingTurn>>,
     mut commands: Commands,
@@ -2678,7 +2677,7 @@ pub fn queue_turns_from_stages(
         let Ok(world) = q_kind.get(ev.actor) else {
             continue;
         };
-        let Some(target) = q_target.get(ev.actor).ok().and_then(|held| held.0) else {
+        let Some(target) = ev.target else {
             continue;
         };
         let (Ok(from), Ok(toward)) = (q_place.get(ev.actor), q_place.get(target)) else {
@@ -6358,6 +6357,77 @@ mod tests {
                 .collect::<std::collections::HashSet<_>>(),
             identities
         );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn turn_toward_uses_its_routine_target_instead_of_another_actions_target() {
+        const SELF_ID: u32 = 11;
+        const STEP_DEGREES: f32 = 45.0;
+        for has_target in [true, false] {
+            let mut app = App::new();
+            app.add_message::<SchedulerStageEvent>()
+                .add_message::<CutsceneMotionDone>()
+                .init_resource::<Time>()
+                .init_resource::<crate::snapshot::SceneState>()
+                .add_systems(
+                    Update,
+                    (tick_active_schedulers, queue_turns_from_stages).chain(),
+                );
+            app.world_mut()
+                .resource_mut::<crate::snapshot::SceneState>()
+                .snapshot
+                .self_char_id = Some(SELF_ID);
+            let stale = app
+                .world_mut()
+                .spawn(Transform::from_xyz(5.0, 0.0, -5.0))
+                .id();
+            let correct = app
+                .world_mut()
+                .spawn(Transform::from_xyz(5.0, 0.0, 5.0))
+                .id();
+            let mut timed = stage(
+                0,
+                StageKind::TurnToward,
+                0,
+                ffxi_dat::scheduler::NO_STAGE_ID,
+            );
+            timed.stage.duration_frames = ROUTINE_FPS as u16;
+            timed.stage.turn_toward_step_degrees = Some(STEP_DEGREES);
+            let routine = ActiveScheduler::from_scheduler(&make_scheduler(*b"turn", vec![timed]))
+                .with_target(has_target.then_some(correct));
+            let actor = app
+                .world_mut()
+                .spawn((
+                    WorldEntity {
+                        id: SELF_ID,
+                        act_index: SELF_ID as u16,
+                        kind: kuluu_snapshot::EntityKind::Pc,
+                    },
+                    Transform::default(),
+                    ActionTarget(Some(stale)),
+                    ActiveSchedulers::one(routine),
+                ))
+                .id();
+            app.update();
+            if has_target {
+                let heading = app
+                    .world_mut()
+                    .get_mut::<PendingTurn>(actor)
+                    .unwrap()
+                    .advance(0.0, 1.0)
+                    .unwrap();
+                assert!(
+                    heading < 0.0,
+                    "must face the routine target on +Z, got {heading}"
+                );
+            } else {
+                assert!(
+                    app.world().get::<PendingTurn>(actor).is_none(),
+                    "a targetless routine must not borrow the shared target"
+                );
+            }
+        }
     }
 
     /// The lock test is per-routine and interval-based: a routine with no AnimationLock stage
@@ -10415,6 +10485,16 @@ mod tests {
             .resource_mut::<crate::scene::TrackedEntities>()
             .by_id
             .insert(REMOTE, remote_actor);
+        app.world_mut()
+            .get_mut::<ActiveSchedulers>(self_actor)
+            .unwrap()
+            .routines[0]
+            .target = Some(remote_actor);
+        app.world_mut()
+            .get_mut::<ActiveSchedulers>(remote_actor)
+            .unwrap()
+            .routines[0]
+            .target = Some(self_actor);
         // The routine's wire target is the remote: that is what a `TurnToward` stage faces.
         app.world_mut()
             .entity_mut(self_actor)
