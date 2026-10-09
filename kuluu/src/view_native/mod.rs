@@ -1,5 +1,18 @@
 #[cfg(feature = "debug-animation_room")]
 pub mod animation_test_scene;
+
+/// This build's animation-room drive surface, for the key-drive knob query. None means the room is
+/// not compiled in — the listener answers that explicitly rather than leaving a driver guessing.
+#[cfg(feature = "debug-animation_room")]
+pub fn animtest_knobs() -> Option<serde_json::Value> {
+    Some(animation_test_scene::knob_report())
+}
+
+#[cfg(not(feature = "debug-animation_room"))]
+pub fn animtest_knobs() -> Option<serde_json::Value> {
+    None
+}
+
 mod app_icon;
 pub mod auto_target;
 pub mod bridge;

@@ -70,6 +70,90 @@ const WR_ENTRY_OFFSET: Vec3 = Vec3::new(238.241, -49.754, 139.944);
 const ZONE_ID_ENV: &str = "ANIMTEST_ZONE_ID";
 const MZB_FILE_ID_ENV: &str = "ANIMTEST_MZB_FILE_ID";
 const WORLD_POS_ENV: &str = "ANIMTEST_WORLD_POS";
+const HOUR_ENV: &str = "ANIMTEST_HOUR";
+const ACTOR_POS_ENV: &str = "ANIMTEST_ACTOR_POS";
+const CAMERA_ENV: &str = "ANIMTEST_CAM";
+const AUTO_CASES_ENV: &str = "ANIMTEST_AUTO";
+const SHOT_PATH_ENV: &str = "ANIMTEST_SHOT_PATH";
+const LAMP_SHADOWS_ON_ENV: &str = "ANIMTEST_LAMP_SHADOWS_ON";
+const SKY_OFF_ENV: &str = "ANIMTEST_SKY_OFF";
+const LAMP_HALOS_OFF_ENV: &str = "ANIMTEST_LAMP_HALOS_OFF";
+const WALL_GLOW_OFF_ENV: &str = "ANIMTEST_WALL_GLOW_OFF";
+const LAMP_ALPHA_ENV: &str = "ANIMTEST_LAMP_ALPHA";
+
+/// Every environment knob the room reads, described the way a driver needs it. `kuluu animtest
+/// --knobs` and the key-drive knob query print this table; a read site that invents a name missing
+/// from it fails `every_env_read_is_a_listed_knob`, so nothing outside this file keeps a copy.
+pub const ENV_KNOBS: &[(&str, &str)] = &[
+    (
+        ZONE_ID_ENV,
+        "zone id the LoadZone case loads; set together with ANIMTEST_MZB_FILE_ID",
+    ),
+    (
+        MZB_FILE_ID_ENV,
+        "MZB file id of the zone geometry for LoadZone; set together with ANIMTEST_ZONE_ID",
+    ),
+    (
+        WORLD_POS_ENV,
+        "x,y,z placement offset for that zone (zero lands geometry at absolute mzb_to_bevy coords)",
+    ),
+    (
+        HOUR_ENV,
+        "pins the VanaClock to a game hour on LoadZone, for night/midday captures",
+    ),
+    (
+        ACTOR_POS_ENV,
+        "x,y,z re-bases the worm/hume pair (worm at base-1x, hume at base+1x)",
+    ),
+    (
+        CAMERA_ENV,
+        "px,py,pz,tx,ty,tz sets the box camera position and look-at target",
+    ),
+    (
+        AUTO_CASES_ENV,
+        "comma-separated case names fired on a fixed clock with no input; also opens the box",
+    ),
+    (
+        SHOT_PATH_ENV,
+        "file name for the shot case's in-app readback (else numbered screenshot output)",
+    ),
+    (
+        LAMP_SHADOWS_ON_ENV,
+        "presence skips the dynamic-light suppression that lamp captures otherwise get",
+    ),
+    (
+        SKY_OFF_ENV,
+        "comma-separated night-fx fields (moon,fog,sun,stars) pre-checked off",
+    ),
+    (
+        LAMP_HALOS_OFF_ENV,
+        "presence hides the lamp halo billboards for A/B captures",
+    ),
+    (
+        WALL_GLOW_OFF_ENV,
+        "presence hides wall-glow washes for A/B captures",
+    ),
+    (
+        LAMP_ALPHA_ENV,
+        "0..1 lantern-alpha value scripted for A/B shots",
+    ),
+];
+
+/// The room's own drive surface: what it can fire, what it reads from the environment, and how its
+/// auto-fire clock is spaced. Printed by `kuluu animtest --knobs` and by a key-drive knob query.
+pub fn knob_report() -> serde_json::Value {
+    serde_json::json!({
+        "surface": "animation_room",
+        "compiled_in": true,
+        "cases": Case::ALL.map(|case| case.auto_name()).to_vec(),
+        "env": ENV_KNOBS
+            .iter()
+            .map(|(name, purpose)| serde_json::json!({ "name": name, "purpose": purpose }))
+            .collect::<Vec<_>>(),
+        "auto_first_delay_secs": AUTO_FIRST_DELAY_SECS,
+        "auto_spacing_secs": AUTO_SPACING_SECS,
+    })
+}
 
 fn warn_env(var: &str, value: &str, reason: &str) {
     eprintln!("[animationtest] ignoring {var}={value}: {reason}");
@@ -143,18 +227,18 @@ fn env_zone_override() -> Option<(u16, u32, Vec3)> {
 
 // ANIMTEST_HOUR pins VanaClock to a fixed game hour on LoadZone (night/midday captures).
 fn env_hour_override() -> Option<f32> {
-    env_parse("ANIMTEST_HOUR")
+    env_parse(HOUR_ENV)
 }
 
 // ANIMTEST_ACTOR_POS="x,y,z" re-bases the worm/hume pair (worm at base-1x, hume at base+1x)
 // so an actor can stand under a zone lamp for lighting captures.
 fn env_actor_pos() -> Option<Vec3> {
-    env_f32s::<3>("ANIMTEST_ACTOR_POS").map(Vec3::from_array)
+    env_f32s::<3>(ACTOR_POS_ENV).map(Vec3::from_array)
 }
 
 // ANIMTEST_CAM="px,py,pz,tx,ty,tz" overrides the box camera's position and look-at target.
 fn env_camera_override() -> Option<(Vec3, Vec3)> {
-    let v = env_f32s::<6>("ANIMTEST_CAM")?;
+    let v = env_f32s::<6>(CAMERA_ENV)?;
     let (pos, target) = v.split_at(v.len() / 2);
     Some((Vec3::from_slice(pos), Vec3::from_slice(target)))
 }
@@ -385,11 +469,11 @@ fn parse_auto_cases(raw: &str) -> Vec<Case> {
     for name in raw.split(',').map(str::trim) {
         match case_from_name(name) {
             Some(case) => cases.push(case),
-            None => warn_env("ANIMTEST_AUTO", raw, &format!("unknown case {name:?}")),
+            None => warn_env(AUTO_CASES_ENV, raw, &format!("unknown case {name:?}")),
         }
     }
     if cases.is_empty() {
-        warn_env("ANIMTEST_AUTO", raw, "no case names recognised");
+        warn_env(AUTO_CASES_ENV, raw, "no case names recognised");
     }
     cases
 }
@@ -557,7 +641,7 @@ impl Plugin for AnimationTestScenePlugin {
             .init_resource::<crate::graphics_store::GraphicsPersistSuspended>();
         // ANIMTEST_AUTO=nhit,chit,... — fire the named cases on a fixed clock with no input
         // (standalone tester parity); opening the box too, so the whole run is hands-free.
-        let auto_cases = env_set("ANIMTEST_AUTO")
+        let auto_cases = env_set(AUTO_CASES_ENV)
             .map(|raw| parse_auto_cases(&raw))
             .unwrap_or_default();
         if !auto_cases.is_empty() {
@@ -1698,7 +1782,7 @@ fn run_pending_case(
             log_line(&mut log, "weather: clouds set (weat/clod)".into());
         }
         Case::Shot => {
-            let path = std::env::var("ANIMTEST_SHOT_PATH")
+            let path = std::env::var(SHOT_PATH_ENV)
                 .ok()
                 .map(std::path::PathBuf::from);
             log_line(
@@ -2117,8 +2201,8 @@ fn load_sg_lamp_room(
     commands.insert_resource(TestZoneActive(true));
     // The user's own Enhanced dynamic-lights/VF settings stay out of lamp captures, which want
     // authored lighting only. ANIMTEST_LAMP_SHADOWS_ON=1 skips the suppression.
-    if std::env::var("ANIMTEST_LAMP_SHADOWS_ON").is_ok() {
-        log_line(&mut *log, "shadows: ON (ANIMTEST_LAMP_SHADOWS_ON)".into());
+    if std::env::var(LAMP_SHADOWS_ON_ENV).is_ok() {
+        log_line(&mut *log, format!("shadows: ON ({LAMP_SHADOWS_ON_ENV})"));
     } else {
         commands.insert_resource(ShadowsOff(true));
         log_line(
@@ -2129,7 +2213,7 @@ fn load_sg_lamp_room(
     }
     // ANIMTEST_SKY_OFF="moon,fog,sun,stars" pre-checks the night-fx kill switches for headless
     // A/B captures (the panel labels mirror from the override, same as a click would).
-    if let Ok(list) = std::env::var("ANIMTEST_SKY_OFF") {
+    if let Ok(list) = std::env::var(SKY_OFF_ENV) {
         let mut hit: Vec<&'static str> = Vec::new();
         for name in list.split(',').map(|s| s.trim().to_ascii_lowercase()) {
             match SkyFxField::ALL.into_iter().find(|f| f.label() == name) {
@@ -2137,13 +2221,13 @@ fn load_sg_lamp_room(
                     *field.set(&mut zone.sky_fx) = true;
                     hit.push(field.label());
                 }
-                None => warn_env("ANIMTEST_SKY_OFF", &list, &format!("unknown field {name}")),
+                None => warn_env(SKY_OFF_ENV, &list, &format!("unknown field {name}")),
             }
         }
         log_line(&mut *log, format!("sky fx seeded off: {}", hit.join(", ")));
     }
     // ANIMTEST_LAMP_HALOS_OFF=1 pre-checks the lamps kill switch for headless A/B captures.
-    if std::env::var_os("ANIMTEST_LAMP_HALOS_OFF").is_some() {
+    if std::env::var_os(LAMP_HALOS_OFF_ENV).is_some() {
         zone.lamps_off.0 = true;
         log_line(
             &mut *log,
@@ -2151,7 +2235,7 @@ fn load_sg_lamp_room(
         );
     }
     // ANIMTEST_WALL_GLOW_OFF=1 pre-checks the wall-glow kill switch for headless A/B captures.
-    if std::env::var_os("ANIMTEST_WALL_GLOW_OFF").is_some() {
+    if std::env::var_os(WALL_GLOW_OFF_ENV).is_some() {
         zone.wall_glow_off.0 = true;
         log_line(&mut *log, "wall glow: seeded OFF (washes hidden)".into());
     }
@@ -2208,7 +2292,7 @@ fn arm_lamp_room(
             ),
         );
     }
-    if let Some(v) = env_parse::<f32>("ANIMTEST_LAMP_ALPHA") {
+    if let Some(v) = env_parse::<f32>(LAMP_ALPHA_ENV) {
         sim.set_lamp_halos_lift(v);
         log_line(&mut log, format!("lantern alpha scripted to {v:.3}"));
     }
@@ -3048,5 +3132,43 @@ mod tests {
         let sim = app.world().resource::<ParticleSimulator>();
         assert_eq!(sim.lamp_halos_lift(), LAMP_ALPHAMAP_LIFT_DEFAULT);
         assert_eq!(sim.wash_alpha_lift(), WASH_ALPHA_LIFT_DEFAULT);
+    }
+
+    #[test]
+    fn knob_report_lists_every_case_and_knob() {
+        let report = knob_report();
+        let cases = report["cases"].as_array().expect("case name array");
+        assert_eq!(cases.len(), Case::ALL.len());
+        for case in Case::ALL {
+            assert!(
+                cases.contains(&serde_json::json!(case.auto_name())),
+                "{} missing from the knob report",
+                case.auto_name()
+            );
+        }
+        let env = report["env"].as_array().expect("env knob array");
+        assert_eq!(env.len(), ENV_KNOBS.len());
+        for (name, _) in ENV_KNOBS {
+            assert!(
+                env.iter().any(|e| e["name"] == *name),
+                "{name} missing from the knob report"
+            );
+        }
+    }
+
+    #[test]
+    fn every_env_read_is_a_listed_knob() {
+        // Read sites name their variable as a string literal only in its `const *_ENV` definition,
+        // so any literal that is not table-backed means the report has gone stale.
+        let source = include_str!("./animation_test_scene.rs");
+        let unlisted: Vec<&str> = source
+            .split('"')
+            .filter(|token| token.starts_with("ANIMTEST_"))
+            .filter(|token| !ENV_KNOBS.iter().any(|(name, _)| name == token))
+            .collect();
+        assert!(
+            unlisted.is_empty(),
+            "env read outside the knob table: {unlisted:?}"
+        );
     }
 }
