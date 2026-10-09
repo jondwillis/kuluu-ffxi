@@ -108,6 +108,10 @@ pub struct LiveField {
     /// Motion carry while an anchor actor lives; dropped when that actor is gone, which leaves the
     /// field finishing its authored life in world space rather than vanishing with it.
     pub follow: Option<FieldFollow>,
+    /// Which generator emitted this field — the key that lets `0x1E ParticleDampen` reach it exactly as
+    /// it force-expires that generator's live particles. See [`EffectHandle`] and
+    /// [`ActiveDistortion::dampen_owned_by`].
+    pub owned_by: Option<EffectHandle>,
 }
 
 impl LiveField {
@@ -139,6 +143,20 @@ impl LiveField {
     }
 }
 
+/// The generator a field answers to. Routine-spawned generators are addressed as `(owner, id)` — that
+/// is how `StopParticleGeneratorRoutine` and `0x1E ParticleDampen` name them in
+/// `research/xim EffectRoutineInstance.kt handleParticleEffectDampen` — and the field carries the same
+/// pair so those stages do not stop at the particle half of an effect. The two lifecycle verbs stay
+/// distinct, as retail keeps them: Stop leaves this field to play out its authored life just as it
+/// leaves live particles, while dampen force-expires it together with them.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EffectHandle {
+    /// The entity the routine ran on, which is how `RoutineOrigin` keys a generator too.
+    pub owner: Entity,
+    /// The generator chunk id the stage named.
+    pub generator: [u8; 4],
+}
+
 /// Main-world: the live distortion fields. Pushed by `spawn_particle_generators` when a 0x22 def
 /// spawns; pruned here on life expiry and reset (insert [`Default`]) by zone teardown like every
 /// other transient effect resource.
@@ -150,6 +168,18 @@ pub struct ActiveDistortion {
 impl ActiveDistortion {
     pub fn push(&mut self, field: LiveField) {
         self.fields.push(field);
+    }
+
+    /// Force-expire the fields one generator owns, which is what `0x1E ParticleDampen` does to the
+    /// live particles of the generator it names. Returns how many fields went; fields of other
+    /// generators, and any armed without a handle, are left alone.
+    pub fn dampen_owned_by(&mut self, owner: Entity, gen_id: [u8; 4]) -> usize {
+        let before = self.fields.len();
+        self.fields.retain(|f| {
+            !f.owned_by
+                .is_some_and(|h| h.owner == owner && h.generator == gen_id)
+        });
+        before - self.fields.len()
     }
 }
 
@@ -779,6 +809,7 @@ mod tests {
             duration_secs: 1.0,
             envelope: None,
             follow: None,
+            owned_by: None,
         }
     }
 
@@ -989,6 +1020,35 @@ mod tests {
         assert!(d.fields.is_empty());
         d.push(live);
         assert_eq!(d.fields.len(), 1);
+    }
+
+    /// Dampen reaches a haze field through the generator that armed it — same `(owner, id)` pair the
+    /// particle lifecycle uses — and takes only that generator's fields.
+    #[test]
+    fn a_dampen_takes_the_named_generators_fields() {
+        let mine = EffectHandle {
+            owner: Entity::from_bits(3),
+            generator: *b"gr01",
+        };
+        let other = EffectHandle {
+            owner: Entity::from_bits(4),
+            generator: *b"gr02",
+        };
+        let mut d = ActiveDistortion::default();
+        for handle in [Some(mine), Some(other), None] {
+            let mut f = field(Vec2::ONE, 0.02);
+            f.owned_by = handle;
+            d.push(f);
+        }
+
+        assert_eq!(d.dampen_owned_by(Entity::from_bits(3), *b"gr01"), 1);
+        assert_eq!(
+            d.fields.len(),
+            2,
+            "another generator's field and an unhandled one both survive"
+        );
+        assert!(d.fields.iter().any(|f| f.owned_by == Some(other)));
+        assert!(d.fields.iter().any(|f| f.owned_by.is_none()));
     }
 
     /// A carried field moves by exactly what its anchor actor moved, and stops being carried once that

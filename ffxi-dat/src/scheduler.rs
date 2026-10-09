@@ -99,7 +99,7 @@ const SET_MODEL_VISIBILITY_PAYLOAD_LEN: usize = 16;
 const JOINT_SNAPSHOT_OPCODE: u8 = 0x22;
 // research/xim EffectRoutineParser.kt parseSection2 0x1E ParticleDampenRoutine: genRef
 // (DatId) + zero32 after delay/duration - a 4-dword stage.
-const PARTICLE_DAMPEN_OPCODE: u8 = 0x1E;
+pub const PARTICLE_DAMPEN_OPCODE: u8 = 0x1E;
 // research/xim EffectRoutineParser.kt parseSection2 0x19 SpellEffect: the u32 after
 // delay/duration is the spell animation index, not a DatId - the handler resolves the
 // spell file-table offset plus the index to the effect DAT and runs its `main` routine

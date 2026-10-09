@@ -5015,15 +5015,20 @@ pub fn dispatch_stop_particle_stages(
 // 0x1E ParticleDampen: emission stops and the already-live particles are force-expired at
 // once (research/xim EffectRoutineInstance.kt handleParticleEffectDampen).
 #[cfg(not(target_arch = "wasm32"))]
+// The haze field a 0x22 element armed is part of the same effect as its particles: the stage names
+// `(actor, generator id)`, and both halves answer to it. Stop stages deliberately leave fields alone,
+// as they leave live particles to play out; only dampen force-expires them.
 pub fn dispatch_particle_dampen_stages(
     mut events: MessageReader<SchedulerStageEvent>,
     mut sim: ResMut<crate::particle_sim::ParticleSimulator>,
+    mut distortion: ResMut<crate::distortion_pass::ActiveDistortion>,
 ) {
     for ev in events.read() {
         if ev.stage.stage.kind != StageKind::ParticleDampen {
             continue;
         }
         sim.dampen_generator(ev.actor, ev.stage.stage.id);
+        distortion.dampen_owned_by(ev.actor, ev.stage.stage.id);
     }
 }
 
@@ -10380,5 +10385,60 @@ mod tests {
             released,
             "the same gate drops the actor once the knock-back run ends"
         );
+    }
+
+    /// `0x1E ParticleDampen` names one generator, and the haze field that generator armed is
+    /// force-expired together with its particles instead of running out its authored life on its own.
+    #[test]
+    fn a_dampen_stage_drains_the_generators_haze_field_too() {
+        use crate::distortion_pass::{ActiveDistortion, EffectHandle, LiveField};
+
+        let mut app = App::new();
+        app.add_message::<SchedulerStageEvent>()
+            .init_resource::<crate::particle_sim::ParticleSimulator>()
+            .init_resource::<ActiveDistortion>()
+            .add_systems(Update, dispatch_particle_dampen_stages);
+
+        let actor = app.world_mut().spawn(()).id();
+        let other_actor = app.world_mut().spawn(()).id();
+        {
+            let mut live = app.world_mut().resource_mut::<ActiveDistortion>();
+            for (owner, gen) in [(actor, *b"gr01"), (other_actor, *b"gr02")] {
+                live.push(LiveField {
+                    center: Vec3::ZERO,
+                    half_extent: Vec2::ONE,
+                    haze_offset: 0.02,
+                    started_at: std::time::Instant::now(),
+                    duration_secs: 1.0,
+                    envelope: None,
+                    follow: None,
+                    owned_by: Some(EffectHandle {
+                        owner,
+                        generator: gen,
+                    }),
+                });
+            }
+        }
+
+        app.world_mut().write_message(SchedulerStageEvent {
+            actor,
+            target: None,
+            stage: stage(
+                0,
+                StageKind::ParticleDampen,
+                ffxi_dat::scheduler::PARTICLE_DAMPEN_OPCODE,
+                *b"gr01",
+            ),
+            scheduler: *b"damg",
+        });
+        app.update();
+
+        let fields = &app.world().resource::<ActiveDistortion>().fields;
+        assert_eq!(
+            fields.len(),
+            1,
+            "the named generator's field is force-expired; another generator's survives"
+        );
+        assert_eq!(fields[0].owned_by.map(|h| h.owner), Some(other_actor));
     }
 }
