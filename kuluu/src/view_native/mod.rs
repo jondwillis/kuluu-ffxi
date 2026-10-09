@@ -1037,6 +1037,7 @@ fn despawn_ingame_entities(
         ResMut<kuluu_render::ffxi_actor_render::SelfKnockback>,
         ResMut<kuluu_render::scheduler_runtime::PendingKnockbacks>,
         Option<ResMut<kuluu_render::distortion_pass::ActiveDistortion>>,
+        Option<ResMut<kuluu_render::rotation_drives::SelfAuthoredHeading>>,
     ),
     mut last_zone: ResMut<LastAutoLoadedZone>,
     mut last_atmo: ResMut<LastAtmosphereZone>,
@@ -1077,6 +1078,11 @@ fn despawn_ingame_entities(
     *zone_geom.11 = kuluu_render::scheduler_runtime::PendingKnockbacks::default();
     if let Some(distortion) = zone_geom.12.as_mut() {
         **distortion = kuluu_render::distortion_pass::ActiveDistortion::default();
+    }
+    // A published authored heading is one tick's worth of facing; carrying it into the next zone would
+    // re-aim the local player wherever they land.
+    if let Some(authored) = zone_geom.13.as_mut() {
+        **authored = kuluu_render::rotation_drives::SelfAuthoredHeading::default();
     }
     last_zone.file_id = None;
     last_atmo.file_id = None;
@@ -1522,6 +1528,21 @@ mod zone_teardown_tests {
             duration_secs: 60.0,
             envelope: None,
         }
+    }
+
+    /// A facing an authored turn published is one tick's worth: carried across a zone change it would
+    /// re-aim the player wherever they land.
+    #[test]
+    fn teardown_discards_an_unspent_authored_heading() {
+        use kuluu_render::rotation_drives::SelfAuthoredHeading;
+
+        let mut world = world_with_teardown_resources();
+        let mut authored = SelfAuthoredHeading::default();
+        authored.publish(1.0);
+        world.insert_resource(authored);
+        world.run_system_once(despawn_ingame_entities).unwrap();
+
+        assert!(world.resource::<SelfAuthoredHeading>().0.is_none());
     }
 
     #[test]

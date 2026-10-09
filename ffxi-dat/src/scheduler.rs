@@ -40,7 +40,7 @@ const ANIMATION_LOCK_MAGIC_OPCODE: u8 = 0x59;
 const START_ROUTINE_MARKER_OPCODE: u8 = 0x01;
 const ACTOR_POSITION_SNAPSHOT_OPCODE: u8 = 0x15;
 const MOVEMENT_LOCK_OPCODE: u8 = 0x2E;
-const FACING_LOCK_OPCODE: u8 = 0x2F;
+pub const FACING_LOCK_OPCODE: u8 = 0x2F;
 const TOGGLE_BROADCAST_ON_OPCODE: u8 = 0x31;
 const TOGGLE_BROADCAST_OFF_OPCODE: u8 = 0x32;
 const FLINCH_CASTER_OPCODE: u8 = 0x21;
@@ -63,7 +63,7 @@ const LOCK_LOOK_AT_OPCODE: u8 = 0x89;
 // handler RVA 0x5B3DF) calls the gate at RVA 0x100627D0. Each allocates 0xA0 bytes (`push 0xa0`:
 // RVA 0x5B3A1 / RVA 0x5B3EE) for `CMoActorRotationDriveTask`, whose constructor is at
 // FFXiMain.dll retail-2026-09 RVA 0x5FA20. Only stage 0xA9 occurs in the shipped DATs.
-const ACTOR_ROTATION_OPCODE: u8 = 0xA9;
+pub const ACTOR_ROTATION_OPCODE: u8 = 0xA9;
 const ACTOR_ROTATION_ALT_OPCODE: u8 = 0xAA;
 // The constructor reads three degree floats at record +8/+0xC/+0x10 (each multiplied by pi/180 at
 // FFXiMain.dll retail-2026-09 RVA 0x5FA95 / RVA 0x5FABB / RVA 0x5FACB) and one byte at record
@@ -82,7 +82,7 @@ const ACTOR_ROTATION_MODE_OFFSET: usize = ID_OFFSET + 12;
 // the shared stage reader (RVA 0x1005E590) but - unlike every lock task - never rounded down first, so
 // the fetch keeps its fraction; it feeds the companion task at RVA 0x60F80, which releases its bump of
 // the actor's turn-enable counter when that countdown runs out (destructor RVA 0x60F40).
-const TURN_TOWARD_OPCODE: u8 = 0x62;
+pub const TURN_TOWARD_OPCODE: u8 = 0x62;
 // The step is the only payload word: a three-dword stage, so the slot other kinds read as DatId holds
 // it (`FFXiMain.dll retail-2026-09`: the load at RVA 0x5B016 sits on the record's +8 offset, which the
 // shared delay/duration pair occupies two dwords earlier).
@@ -768,10 +768,10 @@ pub struct TimedStage {
 
 /// The four AdjustAnimationModeRoutine opcodes, one per [`AnimModeSlot`] (research/xim
 /// EffectRoutineParser.kt parseSection2).
-const ADJUST_ANIM_MODE_BATTLE_OPCODE: u8 = 0x79;
-const ADJUST_ANIM_MODE_IDLE_OPCODE: u8 = 0x8C;
-const ADJUST_ANIM_MODE_WALKING_OPCODE: u8 = 0xA4;
-const ADJUST_ANIM_MODE_RUNNING_OPCODE: u8 = 0xA5;
+pub const ADJUST_ANIM_MODE_BATTLE_OPCODE: u8 = 0x79;
+pub const ADJUST_ANIM_MODE_IDLE_OPCODE: u8 = 0x8C;
+pub const ADJUST_ANIM_MODE_WALKING_OPCODE: u8 = 0xA4;
+pub const ADJUST_ANIM_MODE_RUNNING_OPCODE: u8 = 0xA5;
 
 /// Which slot an animation-mode opcode switches, or `None` for any other opcode.
 pub fn anim_mode_slot_of_opcode(raw_type: u8) -> Option<AnimModeSlot> {

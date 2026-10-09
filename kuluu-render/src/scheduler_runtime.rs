@@ -8,7 +8,7 @@ use crate::components::{IsSelf, WorldEntity};
 use crate::cutscene_camera::CutsceneCameraTasks;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::rotation_drives::{
-    heading_of, ActorAirborne, ActorRotationDrive, PendingTurn, PlanTurn,
+    heading_of, ActorAirborne, ActorRotationDrive, PendingTurn, PlanTurn, SelfAuthoredHeading,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use crate::scene::BakedActor;
@@ -2714,6 +2714,7 @@ pub fn step_pending_turns(
     mut prediction: Option<ResMut<crate::combat_stance::EntityPrediction>>,
     mut q_turns: Query<(Entity, &WorldEntity, &mut PendingTurn)>,
     q_airborne: Query<(), With<ActorAirborne>>,
+    mut self_heading: ResMut<SelfAuthoredHeading>,
     mut commands: Commands,
 ) {
     let elapsed_retail_frames = time.delta_secs() * RETAIL_FPS;
@@ -2738,15 +2739,17 @@ pub fn step_pending_turns(
             continue;
         };
         if let Some(stepped) = turn.advance(current_heading_rad, elapsed_retail_frames) {
-            // Self keeps its own facing in the walker; only remote actors have an orientation record
-            // for the integrator to write.
-            if !is_self {
-                if let Some(sample) = prediction.as_mut().and_then(|p| p.by_id.get_mut(&world.id)) {
-                    sample.target_heading = crate::combat_stance::heading_byte_for_rad(stepped);
-                    // The integrator writes the orientation accumulator itself, with no ease between it
-                    // and what is on screen - retail's consumer has one target: that record.
-                    sample.rendered_heading_rad = stepped;
-                }
+            if is_self {
+                // Same hand-off as a rotation drive: the walker takes this as its base facing for the
+                // tick, so travel still re-aims the body on a tick where the player travels.
+                self_heading.publish(stepped);
+            } else if let Some(sample) =
+                prediction.as_mut().and_then(|p| p.by_id.get_mut(&world.id))
+            {
+                sample.target_heading = crate::combat_stance::heading_byte_for_rad(stepped);
+                // The integrator writes the orientation accumulator itself, with no ease between it
+                // and what is on screen - retail's consumer has one target: that record.
+                sample.rendered_heading_rad = stepped;
             }
         }
         if turn.is_spent() || !turn.enabled() {
@@ -2799,6 +2802,7 @@ pub fn tick_actor_rotation_drives(
     mut prediction: Option<ResMut<crate::combat_stance::EntityPrediction>>,
     q_scheds: Query<&ActiveSchedulers>,
     mut q_drives: Query<(Entity, &WorldEntity, &mut ActorRotationDrives)>,
+    mut self_heading: ResMut<SelfAuthoredHeading>,
     mut commands: Commands,
 ) {
     let elapsed_frames = time.delta_secs() * ROUTINE_FPS;
@@ -2820,17 +2824,18 @@ pub fn tick_actor_rotation_drives(
         let Some(heading_rad) = heading_rad else {
             continue;
         };
-        // Self keeps its own facing in the walker; only remote actors have an orientation record.
-        if Some(world.id) != self_id {
-            if let Some(sample) = prediction
-                .as_mut()
-                .and_then(|pred| pred.by_id.get_mut(&world.id))
-            {
-                sample.target_heading = crate::combat_stance::heading_byte_for_rad(heading_rad);
-                // Retail's mode-0 write is on the spot, so the rendered yaw joins it without easing; a
-                // counting-down drive writes its in-progress angle here too.
-                sample.rendered_heading_rad = heading_rad;
-            }
+        if Some(world.id) == self_id {
+            // The local player has no orientation record to write: the walker owns that facing, so this
+            // hands the drive's angle over for the tick and lets travel re-aims win afterwards.
+            self_heading.publish(heading_rad);
+        } else if let Some(sample) = prediction
+            .as_mut()
+            .and_then(|pred| pred.by_id.get_mut(&world.id))
+        {
+            sample.target_heading = crate::combat_stance::heading_byte_for_rad(heading_rad);
+            // Retail's mode-0 write is on the spot, so the rendered yaw joins it without easing; a
+            // counting-down drive writes its in-progress angle here too.
+            sample.rendered_heading_rad = heading_rad;
         }
     }
 }
@@ -5266,6 +5271,10 @@ impl Plugin for SchedulerRuntimePlugin {
             app.init_resource::<ActionDatRoot>();
             app.init_resource::<PendingKnockbacks>();
             app.init_resource::<MeleeTravel>();
+            // The one-frame hand-off of an authored heading to the local walker. It is taken by
+            // `dispatch_movement_system` (kuluu/src/view_native/input.rs) whichever way that tick goes,
+            // and reset with the other transient actor state at kuluu's `despawn_ingame_entities`.
+            app.init_resource::<crate::rotation_drives::SelfAuthoredHeading>();
             app.init_resource::<crate::ffxi_actor_render::SelfKnockback>();
             app.add_systems(Startup, load_global_effect_dir);
             // Ordered ahead of the poll so a root change landing on the same frame as an
@@ -5331,6 +5340,53 @@ impl Plugin for SchedulerRuntimePlugin {
                     dispatch_target_routine_stages,
                 )
                     .chain(),
+            );
+            // The actor's own authored motion, stored as it is fired. Animation mode first: it selects the
+            // family every later id in that routine resolves against, then come the orientation hold and
+            // the queued turn and rotation drive each actor collects — none of these integrates anything
+            // per frame, which is what the block below does. A tuple of its own because Bevy chains at
+            // most 20 systems into one (`bevy_ecs schedule/config.rs` IntoScheduleConfigs impls), and this
+            // schedule's consumer chain was already at that ceiling.
+            app.add_systems(
+                Update,
+                (
+                    dispatch_animation_mode_stages,
+                    hold_orientations_from_stages,
+                    spawn_actor_rotation_drives,
+                    queue_turns_from_stages,
+                )
+                    .chain()
+                    .after(dispatch_target_routine_stages),
+            );
+            // The authored-facing integrators, and the control order they run in.
+            //
+            // Retail's own walker/drive order is unread in this build (the stage handlers say what each
+            // task stores, not which lands last per frame), so the order below is this project's explicit
+            // policy rather than a reconstructed retail sequence — and it is pinned here because the
+            // alternative is whatever Bevy happens to schedule first:
+            //   1. the airborne gate before anything that consults it (a knock-back blocks a queued turn);
+            //   2. a drive's angle over a queued turn's, since a running ActorRotation task owns the
+            //      actor's orientation record while it lives and a turn cannot claim facing underneath it;
+            //   3. everything after the prediction/grounding pass, so an authored heading is not clobbered
+            //      by the wire copy in the same frame;
+            //   4. all of it inside Update, which Bevy runs after FixedUpdate (`bevy_app main_schedule.rs`
+            //      `Default for MainScheduleOrder`), and the local walker lives in FixedUpdate: an authored
+            //      heading published this frame is taken by the walker's next tick, where any travel the
+            //      player is doing re-aims over it. That is what makes the hand-off self-clearing — see
+            //      `crate::rotation_drives::SelfAuthoredHeading`.
+            app.add_systems(
+                Update,
+                (
+                    sync_actor_airborne,
+                    step_pending_turns,
+                    tick_actor_rotation_drives,
+                )
+                    .chain()
+                    .after(crate::combat_stance::predict_entities_system)
+                    .after(crate::combat_stance::ground_remote_movers_system)
+                    .after(hold_orientations_from_stages)
+                    .after(spawn_actor_rotation_drives)
+                    .after(queue_turns_from_stages),
             );
             app.add_systems(
                 Update,
@@ -10023,6 +10079,7 @@ mod tests {
                 ActorAirborne,
             ))
             .id();
+        app.init_resource::<SelfAuthoredHeading>();
         let armed = app
             .world()
             .entity(entity)
@@ -10063,6 +10120,265 @@ mod tests {
         assert!(
             !still_owed_the_full_turn,
             "the same turn steps as soon as the actor is on the ground"
+        );
+    }
+
+    /// The consumers that act on a routine's authored facing have to be live in the app production
+    /// builds, not only when a test asks for them: scheduled nowhere, a turn an author wrote stepped
+    /// internal bookkeeping and never reached an actor. This runs all of them through
+    /// `SchedulerRuntimePlugin` alone — this test registers no system and writes no stage event; every
+    /// stage fires from routines the plugin's own scheduler advances.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn the_plugin_itself_runs_every_authored_facing_consumer() {
+        const SELF: u32 = 11;
+        const REMOTE: u32 = 12;
+        /// The heading an `ActorRotation` stage authors, and the frames each authored stage stays open.
+        const AUTHORED_HEADING_DEGREES: f32 = 90.0;
+        const STAGE_FRAMES: u16 = 120;
+        /// A turn slow enough that its queue is still owed angle when the rotation drive joins it, so a
+        /// frame holds both integrators and their order shows in what ends up published.
+        const TURN_STEP_DEGREES: f32 = 4.0;
+        /// The frame the `ActorRotation` stage fires on — after a few turn steps have already landed.
+        const ROTATION_FRAME: u32 = 10;
+        /// The variant the animation-mode stage switches to. With the remote on +Z and the player at
+        /// its default facing, each consumer has a real angle owed to it.
+        const ANIM_MODE_VARIANT: u8 = 3;
+        const START_HEADING_BYTE: u8 = 0;
+
+        bevy::tasks::AsyncComputeTaskPool::get_or_init(Default::default);
+        let mut app = App::new();
+        app.set_error_handler(bevy::ecs::error::ignore);
+        app.init_resource::<Time>()
+            .init_resource::<crate::snapshot::SceneState>()
+            .add_plugins(SchedulerRuntimePlugin);
+
+        {
+            let mut scene = app
+                .world_mut()
+                .resource_mut::<crate::snapshot::SceneState>();
+            scene.snapshot.self_char_id = Some(SELF);
+            scene.snapshot.self_pos.heading = START_HEADING_BYTE;
+        }
+        let remote_pos = Vec3::new(0.0, 0.0, 4.0);
+        let mut prediction = crate::combat_stance::EntityPrediction::default();
+        // A sample for the remote exists the way a wire update would have made it: its orientation hold
+        // and any drive's angle are written into that record.
+        prediction.observe(REMOTE, remote_pos, 8, 0, 0);
+        app.insert_resource(prediction);
+        app.init_resource::<crate::scene::TrackedEntities>();
+
+        let mut anim_mode = stage(
+            0,
+            StageKind::AnimationMode,
+            ffxi_dat::scheduler::ADJUST_ANIM_MODE_BATTLE_OPCODE,
+            ffxi_dat::scheduler::NO_STAGE_ID,
+        );
+        anim_mode.stage.animation_mode = Some(ffxi_dat::scheduler::AnimationMode {
+            slot: ffxi_dat::scheduler::AnimModeSlot::Battle,
+            variant: ANIM_MODE_VARIANT as u32,
+        });
+        let mut turn_toward = stage(
+            0,
+            StageKind::TurnToward,
+            ffxi_dat::scheduler::TURN_TOWARD_OPCODE,
+            ffxi_dat::scheduler::NO_STAGE_ID,
+        );
+        turn_toward.stage.duration_frames = STAGE_FRAMES;
+        turn_toward.stage.turn_toward_step_degrees = Some(TURN_STEP_DEGREES);
+        let mut hold_rotation = stage(
+            0,
+            StageKind::HoldRotation,
+            ffxi_dat::scheduler::FACING_LOCK_OPCODE,
+            ffxi_dat::scheduler::NO_STAGE_ID,
+        );
+        hold_rotation.stage.duration_frames = STAGE_FRAMES;
+        let mut authored_rotation = stage(
+            ROTATION_FRAME,
+            StageKind::ActorRotation,
+            ffxi_dat::scheduler::ACTOR_ROTATION_OPCODE,
+            ffxi_dat::scheduler::NO_STAGE_ID,
+        );
+        authored_rotation.stage.duration_frames = STAGE_FRAMES;
+        let rotation = ffxi_dat::scheduler::ActorRotation {
+            angles_degrees: [0.0, AUTHORED_HEADING_DEGREES, 0.0],
+            mode: 0,
+        };
+        authored_rotation.stage.actor_rotation = Some(rotation);
+
+        let self_actor = app
+            .world_mut()
+            .spawn((
+                crate::components::WorldEntity {
+                    id: SELF,
+                    act_index: 0,
+                    kind: kuluu_snapshot::EntityKind::Pc,
+                },
+                Transform::default(),
+                ActiveSchedulers::one(ActiveScheduler::from_scheduler(
+                    &ffxi_dat::scheduler::Scheduler {
+                        name: *b"tsts",
+                        stages: vec![anim_mode, turn_toward, authored_rotation],
+                    },
+                )),
+            ))
+            .id();
+        let remote_actor = app
+            .world_mut()
+            .spawn((
+                crate::components::WorldEntity {
+                    id: REMOTE,
+                    act_index: 1,
+                    kind: kuluu_snapshot::EntityKind::Npc,
+                },
+                Transform::from_translation(remote_pos),
+                // Its own routine faces back at the player, so the queue exists and the hold below is
+                // what keeps it from stepping.
+                ActionTarget(Some(self_actor)),
+                ActiveSchedulers::one(ActiveScheduler::from_scheduler(
+                    &ffxi_dat::scheduler::Scheduler {
+                        name: *b"tstr",
+                        stages: vec![hold_rotation, turn_toward],
+                    },
+                )),
+                crate::ffxi_actor_render::render_actor_stub(REMOTE),
+            ))
+            .id();
+        let self_visual = app
+            .world_mut()
+            .spawn((
+                bevy::prelude::ChildOf(self_actor),
+                crate::ffxi_actor_render::render_actor_stub(SELF),
+            ))
+            .id();
+        app.world_mut()
+            .resource_mut::<crate::scene::TrackedEntities>()
+            .by_id
+            .insert(REMOTE, remote_actor);
+        // The routine's wire target is the remote: that is what a `TurnToward` stage faces.
+        app.world_mut()
+            .entity_mut(self_actor)
+            .insert(ActionTarget(Some(remote_actor)));
+
+        let run =
+            |app: &mut App| {
+                app.world_mut().resource_mut::<Time>().advance_by(
+                    std::time::Duration::from_secs_f32(1.0 / crate::scheduler_runtime::ROUTINE_FPS),
+                );
+                app.update();
+            };
+
+        for _ in 0..4 {
+            run(&mut app);
+        }
+
+        let want_modes = {
+            let mut modes = crate::ffxi_actor_render::ActorAnimModes::default();
+            modes.set(ffxi_dat::scheduler::AnimModeSlot::Battle, ANIM_MODE_VARIANT);
+            modes
+        };
+        assert_eq!(
+            app.world()
+                .entity(self_visual)
+                .get::<crate::ffxi_actor_render::FfxiRenderActor>()
+                .expect("the actor's visual")
+                .anim_modes(),
+            want_modes,
+            "an animation-mode stage must reach the render actor through the plugin's own schedule"
+        );
+
+        let self_turn = app
+            .world()
+            .entity(self_actor)
+            .get::<PendingTurn>()
+            .expect("the fired turn-toward stage queues a turn");
+        assert!(self_turn.remaining_rad() > 0.0, "still owed angle to turn");
+        let remote_turn_armed = app
+            .world()
+            .entity(remote_actor)
+            .get::<PendingTurn>()
+            .expect("the remote's own fired stage queues a turn too")
+            .remaining_rad();
+        assert!(remote_turn_armed > 0.0, "the remote's queue has an angle");
+
+        let published_by_turn = app.world().resource::<SelfAuthoredHeading>().0.expect(
+            "a stepped self turn hands its heading to the walker slot on the frame it steps",
+        );
+        assert!(
+            app.world()
+                .entity(self_actor)
+                .get::<PendingTurn>()
+                .is_some_and(|turn| turn.remaining_rad() > 0.0),
+            "the queue is stepped, not re-armed: the angle it owes shrinks"
+        );
+
+        assert!(
+            app.world().entity(remote_actor).contains::<PendingTurn>(),
+            "a held actor keeps its queue"
+        );
+        assert_eq!(
+            app.world()
+                .entity(remote_actor)
+                .get::<PendingTurn>()
+                .expect("still queued")
+                .remaining_rad(),
+            remote_turn_armed,
+            "the orientation hold a HoldRotation stage put on the record blocks its queue"
+        );
+
+        for _ in 4..(ROTATION_FRAME as usize + 3) {
+            run(&mut app);
+        }
+        assert!(
+            app.world()
+                .entity(self_actor)
+                .contains::<ActorRotationDrives>(),
+            "the fired actor-rotation stage spawns its drive-task on the actor"
+        );
+        let authored_heading = crate::rotation_drives::authored_radians(&rotation)
+            [crate::rotation_drives::HEADING_COMPONENT];
+        assert!(
+            app.world()
+                .entity(self_actor)
+                .get::<PendingTurn>()
+                .is_some_and(|turn| turn.remaining_rad() > 0.0),
+            "the queued turn is still owed angle where the drive publishes, so this frame has both"
+        );
+        assert_eq!(
+            app.world().resource::<SelfAuthoredHeading>().0.expect(
+                "a running rotation drive hands its angle to the walker slot every tick it lives",
+            ),
+            authored_heading,
+            "the drive's angle outranks a queued turn stepping in the same frame"
+        );
+
+        assert!(
+            (published_by_turn - authored_heading).abs() > 1e-6,
+            "the two hand-offs are distinguishable, or this test proves nothing about their order"
+        );
+
+        app.world_mut()
+            .entity_mut(remote_actor)
+            .get_mut::<crate::ffxi_actor_render::FfxiRenderActor>()
+            .expect("the remote's render actor")
+            .begin_knockback(Vec2::X, 4, 12.0);
+        run(&mut app);
+        assert!(
+            app.world().entity(remote_actor).contains::<ActorAirborne>(),
+            "a knock-back run puts the actor in the air through the plugin's own gate"
+        );
+
+        let mut released = false;
+        for _ in 0..120 {
+            run(&mut app);
+            if !app.world().entity(remote_actor).contains::<ActorAirborne>() {
+                released = true;
+                break;
+            }
+        }
+        assert!(
+            released,
+            "the same gate drops the actor once the knock-back run ends"
         );
     }
 }

@@ -4,7 +4,7 @@
 //! an absolute target rather than adding a delta (`FFXiMain.dll retail-2026-09` RVA 0x5FA64..0x5FA8B
 //! captures the live triple through the orientation accessor at vtable slot byte `0x1C0`, RVA 0x820F0).
 
-use bevy::prelude::{Component, Vec3};
+use bevy::prelude::{Component, Resource, Vec3};
 use ffxi_dat::scheduler::ActorRotation;
 
 /// The degrees→radians factor retail converts each authored angle with in its constructor (`FFXiMain.dll
@@ -174,6 +174,29 @@ pub struct PendingTurn {
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Component, Debug, Default)]
 pub struct ActorAirborne;
+
+/// The heading this frame's authored turn or rotation drive holds for the local player. Written by
+/// `scheduler_runtime::tick_actor_rotation_drives` and `scheduler_runtime::step_pending_turns`, and
+/// TAKEN rather than read by the walker (`kuluu/src/view_native/input.rs`, where the tick's base facing
+/// is chosen), so an authored turn cannot outlive itself: on a tick where the player travels, travel
+/// re-aims over it; when nothing is turning, there is no stale value to fight the player's own facing.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Resource, Default)]
+pub struct SelfAuthoredHeading(pub Option<f32>);
+
+#[cfg(not(target_arch = "wasm32"))]
+impl SelfAuthoredHeading {
+    /// Record what this frame's integrators produced. Later integrations in the same frame win, which
+    /// is the control order documented at `SchedulerRuntimePlugin::build`.
+    pub fn publish(&mut self, heading_rad: f32) {
+        self.0 = Some(heading_rad);
+    }
+
+    /// Consume the pending authored heading, leaving nothing behind for a later tick.
+    pub fn take(&mut self) -> Option<f32> {
+        self.0.take()
+    }
+}
 
 /// The angle and rate one fired turn stage stores on its actor (`FFXiMain.dll retail-2026-09` handler
 /// RVA 0x5AF2C, measurement at RVA 0x5AF79..0x5B083). `current_heading_rad` is what the orientation

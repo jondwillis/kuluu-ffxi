@@ -59,6 +59,9 @@ pub struct MoveEnvParams<'w, 's> {
     /// The mouse wheel's frames of zoom owed to spend here (retail's `[0x1067A298]` counter,
     /// `FFXiMain.dll retail-2026-09`).
     pub wheel_zoom: ResMut<'w, kuluu_render::WheelZoom>,
+    /// The facing one of kuluu-render's authored-turn integrators published for this player on its last
+    /// frame. Bundled here because this fn is at bevy's system-parameter ceiling.
+    pub authored_heading: ResMut<'w, kuluu_render::rotation_drives::SelfAuthoredHeading>,
 }
 
 /// Rising-edge memory for the pad stick, standing in for `just_pressed` where
@@ -1022,6 +1025,13 @@ pub fn dispatch_movement_system(
     let move_intent = &mut stance.move_intent;
     // Default to stopped so every early return below reports no movement.
     **move_intent = kuluu_render::combat_stance::SelfMoveIntent::default();
+    // The authored heading is taken on every tick this system runs, acting or not, because that
+    // consumption is what bounds its life to one walker tick: a turn published just as a menu takes the
+    // keys, or just before a zone change, cannot resurface behind them.
+    let authored_facing = env
+        .authored_heading
+        .take()
+        .map(kuluu_render::combat_stance::heading_byte_for_rad);
 
     let identity = (
         state.snapshot.self_char_id,
@@ -1552,7 +1562,9 @@ pub fn dispatch_movement_system(
             locals.qe_facing = None;
             None
         };
-        let standing_heading = standing_qe_heading;
+        // A routine turns a standing actor too, so an authored heading reaches the wire on its own: this
+        // gate answers to the keys alone and left every face-the-target routine with no path out.
+        let standing_heading = authored_facing.or(standing_qe_heading);
         if snapshot_driven && standing_heading.is_none() {
             return;
         }
@@ -1620,10 +1632,14 @@ pub fn dispatch_movement_system(
         ..default()
     };
 
-    // The drive's heading is this tick's base facing (the scheduler ticks the actor's own angle
-    // record, and retail's facing derives from it); every travel assignment below re-aims over it
-    // on a tick where the player travels.
-    let mut heading = self_pos.heading;
+    // An authored turn or rotation drive owns this tick's base facing, and every travel assignment below
+    // re-aims over it on a tick where the player travels. The heading then leaves through the Move
+    // command, which is how an authored self-turn reaches the wire (`kuluu-render`'s
+    // SchedulerRuntimePlugin documents why these integrators publish one schedule before this system runs).
+    let mut heading = match authored_facing {
+        Some(byte) => byte,
+        None => self_pos.heading,
+    };
     if player_rotate_u8 != 0 {
         let delta = player_rotate_u8.rem_euclid(256) as u8;
         heading = heading.wrapping_add(delta);
@@ -2307,6 +2323,7 @@ mod tests {
             .init_resource::<kuluu_render::scene::TrackedEntities>()
             .init_resource::<kuluu_render::ffxi_actor_render::SelfKnockback>()
             .init_resource::<kuluu_render::cutscene::CutsceneMode>()
+            .init_resource::<kuluu_render::rotation_drives::SelfAuthoredHeading>()
             .init_resource::<super::super::walker::debug::FieldDebug>()
             .add_systems(
                 Update,
@@ -4070,6 +4087,25 @@ mod tests {
             self.app.world().resource::<AutoRun>().phantom_forward
         }
 
+        /// Publishes an authored facing the way `kuluu-render`'s rotation integrators do, so what the
+        /// test measures is the walker's own consumption of it.
+        fn publish_authored(&mut self, heading: u8) {
+            let mut authored =
+                self.app
+                    .world_mut()
+                    .resource_mut::<kuluu_render::rotation_drives::SelfAuthoredHeading>();
+            authored.publish(kuluu_render::combat_stance::heading_to_rad(heading));
+        }
+
+        /// The facing still waiting to be taken, if any.
+        fn authored_residue(&self) -> Option<u8> {
+            self.app
+                .world()
+                .resource::<kuluu_render::rotation_drives::SelfAuthoredHeading>()
+                .0
+                .map(kuluu_render::combat_stance::heading_byte_for_rad)
+        }
+
         fn camera_yaw(&self) -> f32 {
             self.app.world().resource::<ChaseCamera>().yaw
         }
@@ -4892,6 +4928,66 @@ mod tests {
 
         let entities = vec![ent(1, 100.0, 0.0), ent(2, 200.0, 0.0)];
         assert_eq!(first_pick(&entities, None, culled_proj), None);
+    }
+
+    /// Most authored turns fire on a player who is not travelling, so an authored facing has to reach the
+    /// wire command with no key held — and it is owed exactly one tick, because the walker takes it.
+    #[test]
+    fn an_authored_facing_turns_a_standing_player_once() {
+        const AUTHORED_BYTE: u8 = 64;
+        let mut drive = MoveDrive::new();
+        let start = drive.tick().0;
+        assert_eq!(
+            drive.authored_residue(),
+            None,
+            "nothing pending before the routine fires"
+        );
+
+        drive.publish_authored(AUTHORED_BYTE);
+        let (heading, pos) = drive.tick();
+        assert_eq!(
+            heading, AUTHORED_BYTE,
+            "an authored facing turns the standing body and goes out on the wire"
+        );
+        assert_eq!(drive.authored_residue(), None, "the tick consumed it");
+        assert_eq!(
+            drive.tick().1,
+            pos,
+            "a turn in place moves nobody: the facing is not a step"
+        );
+        assert_ne!(
+            heading, start,
+            "and it really did turn from where the player stood"
+        );
+    }
+
+    /// Travelling owns its own heading: an authored turn that lands on a tick where the player is moving
+    /// publishes a facing, and the travel assignment re-aims over it rather than fighting the step.
+    #[test]
+    fn travel_re_aims_over_an_authored_facing() {
+        let mut drive = MoveDrive::new();
+        drive.press(KeyCode::KeyW);
+        let ticks = drive.run(SETTLE_TICKS + 2);
+        let (travelled, travelled_pos) = *ticks.last().expect("a settled run has ticks");
+
+        // A settled run holds its heading tick after tick, so this one answers for itself: the authored
+        // byte is half a turn off the run and none of it reaches the wire.
+        drive.publish_authored(travelled.wrapping_add(128));
+        let (heading, pos) = drive.tick();
+        assert_eq!(
+            heading, travelled,
+            "the run keeps its facing whatever the routine published"
+        );
+        assert_eq!(
+            drive.authored_residue(),
+            None,
+            "taken even though it was not used"
+        );
+        let step = pos - travelled_pos;
+        assert!(
+            step.length() > 0.0,
+            "and the run is still travelling its own way"
+        );
     }
 }
 
