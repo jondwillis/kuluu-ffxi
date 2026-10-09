@@ -10661,6 +10661,7 @@ mod tests {
         }
 
         app.world_mut().write_message(SchedulerStageEvent {
+            identity: RoutineStageIdentity::default(),
             actor,
             target: None,
             stage: stage(
