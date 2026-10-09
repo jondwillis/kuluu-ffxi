@@ -104,12 +104,19 @@ the higher tier:
 
 ## Dancer research and contributor tooling
 
-[DancingMad](https://github.com/WGINC/DancingMad/tree/4243c7e58766691529b9612d1c71ea7bc17b4e99)
-is independent research and tooling for the PC client's graphics, animation
-and Dancer middleware, cross-referenced with PS2 debug data. It is not SE's
-original engine source. The revision above is the one cited by the contributor's
-[cow_ffxi_disassembly research vault](https://github.com/cowrevenge/cow_ffxi_disassembly),
-whose README points to its Dancer ingest and DLL/DAT scanner suite.
+- `DancingMad/` — independent research and tooling for the PC client's
+  graphics, animation and Dancer middleware, cross-referenced with PS2 debug
+  data. It is not SE's original engine source. Pinned to the contributor-cited
+  revision `4243c7e`; see [its README](DancingMad/README.md).
+- `cow_ffxi_disassembly/` — the contributor's DLL/DAT research and scanner
+  suite, including the Dancer ingest; see [its README](cow_ffxi_disassembly/README.md).
+
+Both are submodules; their exact revisions are recorded by the gitlinks.
+Populate them on demand:
+
+```bash
+git submodule update --init research/DancingMad research/cow_ffxi_disassembly
+```
 
 These are research references, not build inputs under `vendor/`. They can
 supply investigation leads and reproducible tooling; their claims still need
