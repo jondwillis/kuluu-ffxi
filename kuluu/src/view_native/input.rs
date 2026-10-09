@@ -1568,15 +1568,14 @@ pub fn dispatch_movement_system(
         if snapshot_driven && standing_heading.is_none() {
             return;
         }
-        if let Some(h) = standing_heading {
-            if h != self_pos.heading {
-                let _ = cmd_tx.0.try_send(AgentCommand::Move {
-                    x: basis_pos.x,
-                    y: basis_pos.y,
-                    z: basis_pos.z,
-                    heading: h,
-                });
-            }
+        let resolved_heading = standing_heading.unwrap_or(self_pos.heading);
+        if resolved_heading != self_pos.heading {
+            let _ = cmd_tx.0.try_send(AgentCommand::Move {
+                x: basis_pos.x,
+                y: basis_pos.y,
+                z: basis_pos.z,
+                heading: resolved_heading,
+            });
         }
         let res = super::walker::step(
             &env.collision,
@@ -1598,7 +1597,7 @@ pub fn dispatch_movement_system(
             basis_pos.x,
             basis_pos.y,
             res.feet_z,
-            self_pos.heading,
+            resolved_heading,
             speed_yps,
             &res,
         );
@@ -1612,7 +1611,7 @@ pub fn dispatch_movement_system(
                 x: basis_pos.x,
                 y: basis_pos.y,
                 z: feet_z,
-                heading: self_pos.heading,
+                heading: resolved_heading,
             });
         }
         prediction.pos = Vec3::new(basis_pos.x, basis_pos.y, feet_z);
@@ -4958,6 +4957,37 @@ mod tests {
         assert_ne!(
             heading, start,
             "and it really did turn from where the player stood"
+        );
+    }
+
+    #[test]
+    fn grounding_a_standing_turn_keeps_the_authored_heading() {
+        const AUTHORED_BYTE: u8 = 64;
+        const FLOOR_RISE: f32 = 0.2;
+        const FLOOR_SETTLE_TICKS: usize = 3;
+        let mut drive = MoveDrive::new();
+        drive.app.insert_resource(slab_collision(FLOOR_RISE));
+        drive.publish_authored(AUTHORED_BYTE);
+        let (heading, _) = drive.tick();
+        assert_eq!(
+            heading, AUTHORED_BYTE,
+            "the floor correction must preserve the turn"
+        );
+        assert!(drive
+            .run(FLOOR_SETTLE_TICKS)
+            .iter()
+            .all(|(h, _)| *h == AUTHORED_BYTE));
+        let feet = drive
+            .app
+            .world()
+            .resource::<SceneState>()
+            .snapshot
+            .self_pos
+            .pos
+            .z;
+        assert!(
+            (feet + FLOOR_RISE).abs() < DIALOG_FLOOR_SNAP_EPSILON,
+            "grounding must also apply: {feet}"
         );
     }
 
