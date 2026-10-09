@@ -83,6 +83,14 @@ enum Command {
         skip_intro_cs: bool,
     },
 
+    /// Print the animation room's drive knobs (case names, env variables, auto-fire clock) and
+    /// exit. Needs no server and no install, so a driver enumerates what this build can do instead
+    /// of transcribing it; a build without the room says that rather than printing an empty list.
+    Animtest {
+        #[arg(long)]
+        knobs: bool,
+    },
+
     Play {
         user: Option<String>,
         password: Option<String>,
@@ -233,6 +241,23 @@ fn main() -> Result<()> {
     rt.block_on(async move { run_command_async(args, auth).await })
 }
 
+/// The knob report of the build actually running. Room-less builds answer with `compiled_in` false
+/// and the features to add, which is a usable answer; silence is not.
+fn animtest_knob_json() -> String {
+    #[cfg(feature = "native-window")]
+    let knobs: Option<serde_json::Value> = kuluu::view_native::animtest_knobs();
+    #[cfg(not(feature = "native-window"))]
+    let knobs: Option<serde_json::Value> = None;
+    knobs.unwrap_or_else(|| {
+        serde_json::json!({
+            "surface": "animation_room",
+            "compiled_in": false,
+            "hint": "rebuild with --features native-window,debug-animation_room to drive the room",
+        })
+    })
+    .to_string()
+}
+
 fn resolve_dat_root(require_dat: bool) -> Result<Option<std::sync::Arc<ffxi_dat::DatRoot>>> {
     match ffxi_dat::DatRoot::from_env_or_default() {
         Ok(root) => {
@@ -274,6 +299,13 @@ fn resolve_dat_root(require_dat: bool) -> Result<Option<std::sync::Arc<ffxi_dat:
 /// DebugControl to land on (relay::serve takes None for it).
 async fn run_command_async(args: Args, auth: auth_client::AuthClient) -> Result<()> {
     match args.command {
+        Command::Animtest { knobs } => {
+            if !knobs {
+                bail!("animtest takes a flag — try `kuluu animtest --knobs`");
+            }
+            println!("{}", animtest_knob_json());
+            return Ok(());
+        }
         Command::Install { .. } | Command::SteamShortcut { .. } => {
             unreachable!("handled before the runtime starts")
         }

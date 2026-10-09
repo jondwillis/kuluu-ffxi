@@ -692,8 +692,9 @@ pub(crate) fn register(
             std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port))
         });
         let queue = key_msgs.clone();
+        let knobs = super::animtest_knobs();
         runtime.spawn(async move {
-            super::key_drive::serve_key_drive(addr, queue).await;
+            super::key_drive::serve_key_drive(addr, queue, knobs).await;
         });
     }
 

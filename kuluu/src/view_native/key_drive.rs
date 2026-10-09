@@ -11,6 +11,7 @@
 //!   {"key":"W","down":true}  press and HOLD (pair with up)
 //!   {"key":"W","up":true}    release a held key
 //!   {"text":"abc123"}       type literal text; each character becomes a tap
+//!   {"query":"knobs"}        ask what this build can drive: one JSON reply on the connection
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -165,10 +166,35 @@ impl Default for KeyDriveQueue {
     }
 }
 
+/// The listener's own question: what can this build drive. Answering it here (rather than going
+/// silent on an unknown line) is what lets a driver enumerate cases and env knobs instead of
+/// transcribing them from a document that may be stale.
+pub const KNOB_QUERY: &str = "knobs";
+
+fn knob_query_reply(line: &str, knob_report: Option<&serde_json::Value>) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(line.trim()).ok()?;
+    if value.get("query")?.as_str()? != KNOB_QUERY {
+        return None;
+    }
+    Some(
+        knob_report
+            .cloned()
+            .unwrap_or_else(
+                || serde_json::json!({ "surface": "animation_room", "compiled_in": false }),
+            )
+            .to_string(),
+    )
+}
+
 /// Bind and serve the `FFXI_STAIR_DRIVE`-style TCP listener. One JSON line per
-/// connection; each valid line enqueues one [KeyMsg]. Malformed lines are
-/// skipped (the connection stays open over a typo).
-pub async fn serve_key_drive(addr: SocketAddr, queue: Arc<Mutex<Vec<KeyMsg>>>) {
+/// connection; each valid line enqueues one [KeyMsg]. A [`KNOB_QUERY`] line is answered on that
+/// connection instead. Malformed lines are skipped (the connection stays open over a typo).
+/// `knob_report` is this build's animation-room surface, or None when the room is not compiled in.
+pub async fn serve_key_drive(
+    addr: SocketAddr,
+    queue: Arc<Mutex<Vec<KeyMsg>>>,
+    knob_report: Option<serde_json::Value>,
+) {
     let Ok(listener) = tokio::net::TcpListener::bind(addr).await else {
         tracing::warn!(%addr, "FFXI_KEY_DRIVE bind failed");
         return;
@@ -178,9 +204,20 @@ pub async fn serve_key_drive(addr: SocketAddr, queue: Arc<Mutex<Vec<KeyMsg>>>) {
         let Ok((sock, _)) = listener.accept().await else {
             break;
         };
-        use tokio::io::{AsyncBufReadExt, BufReader};
-        let mut lines = BufReader::new(tokio::io::BufWriter::new(sock)).lines();
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let (read_half, mut write_half) = sock.into_split();
+        let mut lines = BufReader::new(read_half).lines();
         while let Ok(Some(line)) = lines.next_line().await {
+            if let Some(reply) = knob_query_reply(&line, knob_report.as_ref()) {
+                if write_half
+                    .write_all(format!("{reply}\n").as_bytes())
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                continue;
+            }
             match KeyMsg::from_json_line(&line) {
                 Some(msg) => {
                     if let Ok(mut q) = queue.lock() {
@@ -189,6 +226,30 @@ pub async fn serve_key_drive(addr: SocketAddr, queue: Arc<Mutex<Vec<KeyMsg>>>) {
                 }
                 None => tracing::debug!(line = %line, "FFXI_KEY_DRIVE: unparseable line"),
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod knob_query_tests {
+    use super::*;
+
+    #[test]
+    fn only_a_knob_query_is_answered() {
+        let report = serde_json::json!({ "surface": "animation_room", "cases": ["zone"] });
+        assert_eq!(
+            knob_query_reply(r#"{"query":"knobs"}"#, Some(&report)).as_deref(),
+            Some(report.to_string().as_str())
+        );
+        // A room-less build says so rather than going quiet on the driver.
+        let absent = knob_query_reply(r#"{"query":"knobs"}"#, None).expect("absent-room answer");
+        let parsed: serde_json::Value = serde_json::from_str(&absent).expect("valid json");
+        assert!(
+            !parsed["compiled_in"].as_bool().unwrap(),
+            "a room-less build must not claim otherwise"
+        );
+        for not_a_query in [r#"{"key":"Enter"}"#, r#"{"text":"//whereami"}"#, "not json"] {
+            assert_eq!(knob_query_reply(not_a_query, Some(&report)), None);
         }
     }
 }
