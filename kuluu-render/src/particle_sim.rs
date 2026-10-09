@@ -8872,6 +8872,7 @@ mod tests {
             .insert((assets, crate::scheduler_runtime::ActionTarget(Some(victim))));
         app.world_mut()
             .write_message(crate::scheduler_runtime::SchedulerStageEvent {
+                identity: Default::default(),
                 actor: attacker,
                 target: None,
                 stage: particle_stage(gen_id),
@@ -9058,6 +9059,7 @@ mod tests {
             crate::scheduler_runtime::ActionTarget(Some(actor)),
         ));
         app.world_mut().write_message(SchedulerStageEvent {
+            identity: Default::default(),
             actor,
             target: Some(actor),
             stage,
@@ -9198,6 +9200,7 @@ mod tests {
         let actor = spawn_posed_actor(&mut app, &skeleton, &pose, ACTOR_WORLD);
         app.world_mut().entity_mut(actor).insert(assets);
         app.world_mut().write_message(SchedulerStageEvent {
+            identity: Default::default(),
             actor,
             target: None,
             stage,
@@ -9429,6 +9432,7 @@ mod tests {
             crate::scheduler_runtime::ActionTarget(Some(target)),
         ));
         app.world_mut().write_message(SchedulerStageEvent {
+            identity: Default::default(),
             actor: caster,
             target: Some(target),
             stage: particle_stage(SYNTHETIC_GENERATOR),
@@ -9600,6 +9604,7 @@ mod tests {
         app.world_mut().entity_mut(actor).insert(assets);
         for stage in [lettering_stage, sparkle_stage] {
             app.world_mut().write_message(SchedulerStageEvent {
+                identity: Default::default(),
                 actor,
                 target: None,
                 stage,

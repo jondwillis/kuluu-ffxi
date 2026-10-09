@@ -108,6 +108,7 @@ fn spawn(link_bindings: bool) -> App {
         .spawn((assets(link_bindings), Transform::IDENTITY))
         .id();
     app.world_mut().write_message(SchedulerStageEvent {
+        identity: Default::default(),
         actor,
         target: Some(actor),
         stage: particle_stage(SOURCE),

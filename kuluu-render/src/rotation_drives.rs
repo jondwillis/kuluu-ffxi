@@ -4,6 +4,7 @@
 //! an absolute target rather than adding a delta (`FFXiMain.dll retail-2026-09` RVA 0x5FA64..0x5FA8B
 //! captures the live triple through the orientation accessor at vtable slot byte `0x1C0`, RVA 0x820F0).
 
+use crate::scheduler_runtime::RoutineStageIdentity;
 use bevy::prelude::{Component, Resource, Vec3};
 use ffxi_dat::scheduler::ActorRotation;
 
@@ -37,9 +38,7 @@ pub const HEADING_COMPONENT: usize = 1;
 /// record says they should end up, and the countdown between them.
 #[derive(Debug, Clone, Copy)]
 pub struct ActorRotationDrive {
-    /// The stage identity, as `(fire frame, half-open end)` — what retires the drive once no running
-    /// routine covers it. Retail tears the task down with its scheduler; a mode-0 task never counts
-    /// itself down (its timer is inert), so the interval is the only thing that ends one.
+    identity: RoutineStageIdentity,
     fire_frame: u32,
     end_frame: u32,
     /// The record's mode byte. Every shipped record carries 0, which retail branches on twice
@@ -62,6 +61,7 @@ impl ActorRotationDrive {
     /// — retail captures it in the constructor, so a re-fired stage starts from the current pose rather
     /// than from where an earlier drive left off.
     pub fn fired_at(
+        identity: RoutineStageIdentity,
         fire_frame: u32,
         end_frame: u32,
         duration_frames: u16,
@@ -70,6 +70,7 @@ impl ActorRotationDrive {
     ) -> Self {
         let duration = duration_frames as f32;
         Self {
+            identity,
             fire_frame,
             end_frame,
             mode: rotation.mode,
@@ -81,8 +82,8 @@ impl ActorRotationDrive {
     }
 
     /// The stage interval this drive was adopted from.
-    pub fn stage(&self) -> (u32, u32) {
-        (self.fire_frame, self.end_frame)
+    pub fn stage(&self) -> (RoutineStageIdentity, u32, u32) {
+        (self.identity, self.fire_frame, self.end_frame)
     }
 
     /// One tick of retail's update: the countdown only runs when the mode byte is set, progress is
@@ -336,7 +337,8 @@ mod actor_rotation_drive_tests {
     #[test]
     fn mode_zero_applies_the_authored_angle_immediately() {
         let turn = rotation([0.0, -90.0, 0.0], 0);
-        let mut drive = ActorRotationDrive::fired_at(10, 70, 60, &turn, [0.0, 0.4, 0.0]);
+        let mut drive =
+            ActorRotationDrive::fired_at(Default::default(), 10, 70, 60, &turn, [0.0, 0.4, 0.0]);
         let first = drive.advance(1.0);
         assert!(close(
             first[HEADING_COMPONENT],
@@ -361,7 +363,7 @@ mod actor_rotation_drive_tests {
         let from = [0.0, 0.0, 0.0];
         let turn = rotation([0.0, 90.0, 0.0], 1);
         let to = authored_radians(&turn)[HEADING_COMPONENT];
-        let mut drive = ActorRotationDrive::fired_at(0, 100, 100, &turn, from);
+        let mut drive = ActorRotationDrive::fired_at(Default::default(), 0, 100, 100, &turn, from);
 
         // A quarter through the countdown writes a quarter of the way to the authored angle.
         let quarter = drive.advance(25.0);
@@ -382,12 +384,25 @@ mod actor_rotation_drive_tests {
     /// first left it, because kuluu captures live values per fire.
     #[test]
     fn a_refire_starts_from_the_angle_the_record_holds() {
-        let mut first =
-            ActorRotationDrive::fired_at(0, 10, 10, &rotation([0.0, 90.0, 0.0], 0), [0.0; 3]);
+        let mut first = ActorRotationDrive::fired_at(
+            Default::default(),
+            0,
+            10,
+            10,
+            &rotation([0.0, 90.0, 0.0], 0),
+            [0.0; 3],
+        );
         let handed_on = heading_of(first.advance(1.0));
 
         let again = rotation([0.0, -90.0, 0.0], 0);
-        let mut second = ActorRotationDrive::fired_at(20, 30, 10, &again, [0.0, handed_on, 0.0]);
+        let mut second = ActorRotationDrive::fired_at(
+            Default::default(),
+            20,
+            30,
+            10,
+            &again,
+            [0.0, handed_on, 0.0],
+        );
         assert!(close(
             heading_of(second.advance(1.0)),
             authored_radians(&again)[HEADING_COMPONENT]
@@ -405,8 +420,14 @@ mod actor_rotation_drive_tests {
             -(WRAP_LIMIT_RADIANS + 0.1) + WRAP_TWO_PI
         ));
 
-        let mut drive =
-            ActorRotationDrive::fired_at(0, 10, 10, &rotation([0.0, 200.0, 0.0], 0), [0.0; 3]);
+        let mut drive = ActorRotationDrive::fired_at(
+            Default::default(),
+            0,
+            10,
+            10,
+            &rotation([0.0, 200.0, 0.0], 0),
+            [0.0; 3],
+        );
         let applied = drive.advance(1.0);
         assert!(applied[HEADING_COMPONENT] < WRAP_LIMIT_RADIANS);
         assert!(!close(
@@ -425,6 +446,7 @@ mod actor_rotation_drive_tests {
             assert_eq!(authored[2], 0.0);
 
             let mut drive = ActorRotationDrive::fired_at(
+                Default::default(),
                 0,
                 10,
                 10,

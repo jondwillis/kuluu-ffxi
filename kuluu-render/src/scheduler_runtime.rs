@@ -325,18 +325,28 @@ impl ActiveScheduler {
             )
     }
 
-    /// The 0xA9/0xAA ActorRotation intervals covering `frame`, each as `(fire frame, end frame)`. A
-    /// drive-task with a mode-0 record never counts itself down (`FFXiMain.dll retail-2026-09`
-    /// RVA 0x5FB36 skips its timer for those), so the interval is the only thing that ends one.
-    pub fn actor_rotation_intervals_at(&self, frame: u32) -> impl Iterator<Item = (u32, u32)> + '_ {
+    pub fn actor_rotation_intervals_at(
+        &self,
+        frame: u32,
+    ) -> impl Iterator<Item = (RoutineStageIdentity, u32, u32)> + '_ {
         self.stages
             .iter()
-            .filter(move |t| {
+            .enumerate()
+            .filter(move |(_, t)| {
                 t.stage.kind == StageKind::ActorRotation
                     && t.frame <= frame
                     && frame < t.frame + t.stage.duration_frames as u32
             })
-            .map(|t| (t.frame, t.frame + t.stage.duration_frames as u32))
+            .map(move |(stage_slot, t)| {
+                (
+                    RoutineStageIdentity {
+                        routine_instance: self.instance,
+                        stage_slot,
+                    },
+                    t.frame,
+                    t.frame + t.stage.duration_frames as u32,
+                )
+            })
     }
 
     /// The 0x75 SetModelVisibility overrides live at `frame`
@@ -425,7 +435,7 @@ impl ActiveSchedulers {
 
     /// Every 0xA9/0xAA ActorRotation interval this entity's running routines cover, each read at its
     /// own routine clock.
-    pub fn actor_rotation_intervals_now(&self) -> Vec<(u32, u32)> {
+    pub fn actor_rotation_intervals_now(&self) -> Vec<(RoutineStageIdentity, u32, u32)> {
         self.routines
             .iter()
             .flat_map(|r| r.actor_rotation_intervals_at(r.current_frame()))
@@ -494,8 +504,15 @@ impl ActiveSchedulers {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct RoutineStageIdentity {
+    pub routine_instance: u64,
+    pub stage_slot: usize,
+}
+
 #[derive(Message, Debug, Clone, Copy)]
 pub struct SchedulerStageEvent {
+    pub identity: RoutineStageIdentity,
     pub actor: Entity,
 
     /// The running routine's target, carried so consumers can resolve on-target
@@ -538,6 +555,10 @@ pub fn tick_active_schedulers(
                     break;
                 }
                 writer.write(SchedulerStageEvent {
+                    identity: RoutineStageIdentity {
+                        routine_instance: sched.instance,
+                        stage_slot: sched.cursor,
+                    },
                     actor: entity,
                     target: sched.target,
                     stage: next,
@@ -2576,6 +2597,7 @@ pub fn spawn_actor_rotation_drives(
         };
         let end_frame = ev.stage.frame + ev.stage.stage.duration_frames as u32;
         let drive = ActorRotationDrive::fired_at(
+            ev.identity,
             ev.stage.frame,
             end_frame,
             ev.stage.stage.duration_frames,
@@ -5619,6 +5641,7 @@ mod tests {
         let caster = caster.id();
 
         app.world_mut().write_message(SchedulerStageEvent {
+            identity: Default::default(),
             actor: caster,
             target: None,
             stage: stage(0, kind, 0, stage_id),
@@ -5797,6 +5820,7 @@ mod tests {
                 ))
                 .id();
             app.world_mut().write_message(SchedulerStageEvent {
+                identity: Default::default(),
                 actor,
                 target: target_bound.then_some(target),
                 stage: stage(0, StageKind::SoundNonPositional, raw_type, STAGE_ID),
@@ -6198,6 +6222,141 @@ mod tests {
         assert_eq!(
             scheds.routines[0].name, *b"ini1",
             "the stopper survives its own stage"
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn stopped_rotation_with_a_matching_interval_cannot_keep_publishing() {
+        const SELF_ID: u32 = 11;
+        const FIRST_ANGLE: f32 = 30.0;
+        const SECOND_ANGLE: f32 = -90.0;
+        let mut app = App::new();
+        app.add_message::<SchedulerStageEvent>()
+            .add_message::<CutsceneMotionDone>()
+            .init_resource::<Time>()
+            .init_resource::<crate::snapshot::SceneState>()
+            .init_resource::<SelfAuthoredHeading>()
+            .add_systems(
+                Update,
+                (
+                    tick_active_schedulers,
+                    dispatch_stop_routine_stages,
+                    spawn_actor_rotation_drives,
+                    tick_actor_rotation_drives,
+                )
+                    .chain(),
+            );
+        app.world_mut()
+            .resource_mut::<crate::snapshot::SceneState>()
+            .snapshot
+            .self_char_id = Some(SELF_ID);
+        let rotation = |angle| {
+            let mut timed = stage(
+                0,
+                StageKind::ActorRotation,
+                0,
+                ffxi_dat::scheduler::NO_STAGE_ID,
+            );
+            timed.stage.duration_frames = ROUTINE_FPS as u16;
+            timed.stage.actor_rotation = Some(ffxi_dat::scheduler::ActorRotation {
+                angles_degrees: [0.0, angle, 0.0],
+                mode: 0,
+            });
+            timed
+        };
+        let first = rotation(FIRST_ANGLE);
+        let mut scheds = ActiveSchedulers::one(ActiveScheduler::from_scheduler(&make_scheduler(
+            *b"one1",
+            vec![first],
+        )));
+        scheds.push(ActiveScheduler::from_scheduler(&make_scheduler(
+            *b"two2",
+            vec![rotation(SECOND_ANGLE)],
+        )));
+        let actor = app
+            .world_mut()
+            .spawn((
+                WorldEntity {
+                    id: SELF_ID,
+                    act_index: SELF_ID as u16,
+                    kind: kuluu_snapshot::EntityKind::Pc,
+                },
+                scheds,
+            ))
+            .id();
+        app.update();
+        assert_eq!(
+            app.world()
+                .get::<ActorRotationDrives>(actor)
+                .unwrap()
+                .drives
+                .len(),
+            2
+        );
+        let stop = make_scheduler(
+            *b"stop",
+            vec![stage(0, StageKind::StopRoutine, 0, *b"two2")],
+        );
+        app.world_mut()
+            .get_mut::<ActiveSchedulers>(actor)
+            .unwrap()
+            .push(ActiveScheduler::from_scheduler(&stop));
+        app.update();
+        assert_eq!(
+            app.world()
+                .get::<ActorRotationDrives>(actor)
+                .unwrap()
+                .drives
+                .len(),
+            1
+        );
+        let expected = heading_of(crate::rotation_drives::authored_radians(
+            first.stage.actor_rotation.as_ref().unwrap(),
+        ));
+        assert_eq!(
+            app.world().resource::<SelfAuthoredHeading>().0,
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn rotation_events_distinguish_cloned_instances_and_same_frame_slots() {
+        let mut turn = stage(
+            0,
+            StageKind::ActorRotation,
+            0,
+            ffxi_dat::scheduler::NO_STAGE_ID,
+        );
+        turn.stage.duration_frames = ROUTINE_FPS as u16;
+        let active = ActiveScheduler::from_scheduler(&make_scheduler(*b"turn", vec![turn, turn]));
+        let mut scheds = ActiveSchedulers::one(active.clone());
+        scheds.push(active);
+        let mut app = App::new();
+        app.add_message::<SchedulerStageEvent>()
+            .add_message::<CutsceneMotionDone>()
+            .init_resource::<Time>()
+            .init_resource::<CapturedStages>()
+            .add_systems(Update, (tick_active_schedulers, capture_stages).chain());
+        let actor = app.world_mut().spawn(scheds).id();
+        app.update();
+        let captured = &app.world().resource::<CapturedStages>().0;
+        assert_eq!(captured.len(), 4);
+        let identities = captured
+            .iter()
+            .map(|e| e.identity)
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(identities.len(), captured.len());
+        let open = app
+            .world()
+            .get::<ActiveSchedulers>(actor)
+            .unwrap()
+            .actor_rotation_intervals_now();
+        assert_eq!(
+            open.iter()
+                .map(|i| i.0)
+                .collect::<std::collections::HashSet<_>>(),
+            identities
         );
     }
 
@@ -8891,6 +9050,7 @@ mod tests {
             app.world_mut().entity_mut(child).insert(ChildOf(parent));
 
             app.world_mut().write_message(SchedulerStageEvent {
+                identity: Default::default(),
                 actor: parent,
                 target: None,
                 stage: TimedStage {

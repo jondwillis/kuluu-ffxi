@@ -60,6 +60,7 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
     let actor = commands.spawn((assets, Transform::IDENTITY)).id();
     commands.queue(move |world: &mut World| {
         world.write_message(SchedulerStageEvent {
+            identity: Default::default(),
             actor,
             target: Some(actor),
             stage: particle_stage(SOURCE),
