@@ -29,7 +29,7 @@ use ffxi_dat::datid::DatId;
 use ffxi_dat::resource_dir::ResourceDir;
 use ffxi_dat::scheduler::{Scheduler, StageKind};
 use ffxi_dat::skel::Skeleton;
-use ffxi_dat::skel_anim::SkeletonAnimation;
+use ffxi_dat::skel_anim::{KeyFrameTransform, SkeletonAnimation};
 use ffxi_dat::skel_mesh::{MeshBuffer, MeshType, SkelMesh};
 use ffxi_dat::texture::{decode_texture, DecodedTexture};
 use ffxi_dat::{walk_tree, ChunkKind, ChunkNode, DatRoot};
@@ -1569,6 +1569,13 @@ pub struct FfxiRenderActor {
     /// buffer is not reallocated per frame.
     pose_scratch: BonePoseScratch,
 
+    /// Per joint, who wrote it at the last pose pass — and when a keyed joint loses its last live
+    /// writer mid-playback ([`BoneRelease::Released`]), its final record glides to rest instead of
+    /// vanishing into bind in one frame. Measured on Hume M: the second-layer locomotion clips cover
+    /// joints 38..47 but `idl2` keys only {38,40,42,43,44,47}, so a locked stop handed those away at
+    /// blend completion as a one-frame ~30 deg snap past the gait's own reach — the flicker at side-step end.
+    release_states: Vec<BoneRelease>,
+
     /// The `(handle joint, hand bone)` pairs this actor's equipped weapons resolve to; empty unless
     /// the model loaded with a weapon naming a handle. Applied while display-engaged - see
     /// [`weapon_handle_overrides`].
@@ -2326,6 +2333,7 @@ pub fn make_render_actor(
         world_pose: Vec::new(),
         pose_work: PoseScratch::default(),
         pose_scratch: BonePoseScratch::new(),
+        release_states: Vec::new(),
         weapon_handles: loaded.weapon_handles.clone(),
         point_light_selection: None,
     }
@@ -3082,8 +3090,9 @@ fn reset_actor_pose_state(actor: &mut FfxiRenderActor, elapsed_frames: f32, name
     actor.wire_animation = ffxi_proto::decode::animation::NONE;
     actor.coordinator.clear();
     // A carried record belongs to the clip that wrote it, so a reset drops them with the layers: the
-    // next pose pass starts from the bind pose again.
+    // next pose pass starts from the bind pose again. Released records are held poses too.
     actor.pose_scratch.clear();
+    actor.release_states.clear();
     actor.current_clip = None;
     actor.registered_slots = [None; 8];
     actor.pending_idle_registrations = [None; 8];
@@ -3098,6 +3107,39 @@ fn reset_actor_pose_state(actor: &mut FfxiRenderActor, elapsed_frames: f32, name
         name,
     );
     actor.death_phase = actor_state::DeathPhase::Unobserved;
+}
+
+/// Who wrote a joint at the last pose pass (see `FfxiRenderActor::release_states`).
+#[derive(Clone, Copy)]
+enum BoneRelease {
+    /// Sampled a record this frame — or the last frame, kept for the release edge.
+    Held(KeyFrameTransform),
+    /// Every live layer that keyed it is gone mid-playback: its held record rides to rest over
+    /// `LOCOMOTION_XFADE_IN`, so the handover settles like every other gait blend lands.
+    Released {
+        from: KeyFrameTransform,
+        elapsed_frames: f32,
+    },
+    /// Nothing has keyed it yet, or its glide landed: bind composes it until a record returns.
+    Rest,
+}
+
+/// A released record at fraction `t` of its settle. Animation records are multiplicative overlays on the
+/// bind data (`update_joint`, ffxi-actor/src/skeleton_instance.rs), so rest is the default record itself:
+/// rotation takes the short arc home, translation and scale give their offsets back.
+fn settled_toward_rest(from: &KeyFrameTransform, t: f32) -> KeyFrameTransform {
+    let [x, y, z, w] = from.rotation;
+    let held = Quat::from_xyzw(x, y, z, w);
+    if !held.is_finite() {
+        return KeyFrameTransform::default();
+    }
+    let glide_back = |values: &[f32; 3], rest: f32| values.map(|v| v + (rest - v) * t);
+    let home = held.slerp(Quat::IDENTITY, t).to_array();
+    KeyFrameTransform {
+        rotation: [home[0], home[1], home[2], home[3]],
+        translation: glide_back(&from.translation, 0.0),
+        scale: glide_back(&from.scale, 1.0),
+    }
 }
 
 /// Whether this request replaces one side step with its opposite, the only re-gait whose crossfade
@@ -3157,6 +3199,7 @@ fn advance_actor_pose(
         world_pose,
         pose_work,
         pose_scratch,
+        release_states,
         weapon_handles,
         rejected_clips,
         rejected_routines,
@@ -3710,11 +3753,67 @@ fn advance_actor_pose(
         (*locked_torso_weight - torso_step).max(0.0)
     };
 
+    // The release edge: joints with a record this tick keep one; joints whose last writer retired
+    // mid-playback ride theirs to rest over the gait handover window instead of dropping into bind in
+    // one frame (`FfxiRenderActor::release_states` — the leg/hem pop at side-step end). Rest is where an
+    // unkeyed joint composes anyway; the glide only decides how fast it gets there.
+    if release_states.len() != skeleton.joints.len() {
+        release_states.resize(skeleton.joints.len(), BoneRelease::Rest);
+    }
+    let elapsed_frames_step = elapsed_frames.min(LOCOMOTION_XFADE_IN);
+    let mut settling: Vec<(usize, KeyFrameTransform)> = Vec::new();
+    for (bone, state) in release_states
+        .iter_mut()
+        .enumerate()
+        .take(skeleton.joints.len())
+    {
+        *state = match (pose_scratch.get(bone), *state) {
+            (Some(record), _) => BoneRelease::Held(record),
+            (None, BoneRelease::Rest) => BoneRelease::Rest,
+            (None, BoneRelease::Held(from)) => {
+                settling.push((bone, from));
+                BoneRelease::Released {
+                    from,
+                    elapsed_frames: 0.0,
+                }
+            }
+            (
+                None,
+                BoneRelease::Released {
+                    from,
+                    elapsed_frames,
+                },
+            ) => {
+                // Clamped so a long frame lands on rest exactly once rather than extrapolating.
+                let settled = (elapsed_frames + elapsed_frames_step).min(LOCOMOTION_XFADE_IN);
+                settling.push((
+                    bone,
+                    settled_toward_rest(&from, settled / LOCOMOTION_XFADE_IN),
+                ));
+                if settled >= LOCOMOTION_XFADE_IN {
+                    BoneRelease::Rest
+                } else {
+                    BoneRelease::Released {
+                        from,
+                        elapsed_frames: settled,
+                    }
+                }
+            }
+        };
+    }
+
     pose_world_mounted_into(
         world_pose,
         pose_work,
         skeleton,
-        |joint| pose_scratch.get(joint),
+        |joint| {
+            pose_scratch.get(joint).or_else(|| {
+                settling
+                    .iter()
+                    .find(|(bone, _)| *bone == joint)
+                    .map(|(_, record)| *record)
+            })
+        },
         RootTransform {
             facing_dir: *facing_dir,
             skew: 0.0,
@@ -7925,6 +8024,105 @@ mod pose_resolution_tests {
             );
         }
     }
+    /// A locked stop must not hand a joint back in one frame. The second-layer locomotion clips key
+    /// joints 38..47 while `idl2` keys only {38,40,42,43,44,47}, so every stop releases joints
+    /// {39,41,45,46} mid-playback; their final records now ride to rest over the gait handover window
+    /// (`BoneRelease`). Joint 46's pose is watched relative to its parent against the bind-local
+    /// placement. The tick after the stop blend dies was measured at -15.9 deg with no glide (identical
+    /// across drives and modes), then frozen for good; a live side-step steps at most ~10 deg/tick by
+    /// its own motion, so the boundary is asserted continuous while gait ticks are left alone.
+    #[test]
+    fn releasing_a_locked_stop_glides_released_joints_to_rest() {
+        // Between the honest gait's largest single step (~10) and the measured snap (15.9): what the
+        // eye caught at side-step end was that boundary jump, not the gait.
+        const MAX_BOUNDARY_STEP_DEG: f32 = 12.0;
+
+        let Some(loaded) = load_hume_m() else { return };
+        let disp = |a: &Mat4, b: &Mat4| -> f32 {
+            let one = |ua: Vec3, ub: Vec3| ua.dot(ub).clamp(-1.0, 1.0).acos().to_degrees();
+            (one(a.x_axis.truncate(), b.x_axis.truncate())
+                + one(a.y_axis.truncate(), b.y_axis.truncate())
+                + one(a.z_axis.truncate(), b.y_axis.truncate()))
+                / 3.0
+        };
+
+        // The joint's placement under bind composition (no records at all), parent-relative: the rest
+        // position a released bone settles to.
+        let mut bind_pose = Vec::new();
+        ffxi_actor::skeleton_instance::pose_world_into(
+            &mut bind_pose,
+            &mut PoseScratch::default(),
+            &loaded.skeleton,
+            |_| None as Option<KeyFrameTransform>,
+            RootTransform {
+                facing_dir: 0.0,
+                skew: 0.0,
+                slope_oriented: false,
+                scale: Vec3::ONE,
+            },
+            &[],
+        );
+        let parent = loaded.skeleton.joints[46].parent.unwrap();
+        let rest_local = bind_pose[parent].inverse() * bind_pose[46];
+
+        for (locked, aim) in [(true, true), (false, false)] {
+            // Three strafe lengths put the release at different points of the side-step loop.
+            for strafe_ticks in [23_u32, 35, 47] {
+                let mut actor = make_render_actor(&loaded, 0, Vec::new(), 1, 0.0, 1.0);
+                actor.locked_on = locked;
+                let release_at = strafe_ticks;
+                let mut previous: Option<(u32, f32)> = None;
+                let mut was_transitioning = false;
+                for tick in 0..release_at + 24 {
+                    actor.inputs = inputs_for_pose(
+                        if tick < release_at {
+                            PoseState::StrafeLeft
+                        } else {
+                            PoseState::Idle
+                        },
+                        false,
+                    );
+                    advance_actor_pose(
+                        &mut actor,
+                        1.0,
+                        crate::look_at_gates::LookState::Aiming,
+                        if aim {
+                            Some(LookAtInput {
+                                pose_rotation: Quat::IDENTITY,
+                                actor_world: Vec3::ZERO,
+                                target_attach_world: Vec3::new(0.0, 1.2, 3.0),
+                            })
+                        } else {
+                            None
+                        },
+                        None,
+                        false,
+                        None,
+                    );
+                    let transitioning = actor.coordinator.is_transitioning();
+                    if tick >= release_at.saturating_sub(1) {
+                        let now = actor.world_pose();
+                        let dev_from_rest = disp(&rest_local, &(now[parent].inverse() * now[46]));
+                        // Assert exactly at the blend-death boundary: the frame's step against the one
+                        // before it. Live-gait ticks stay unmeasured - a running side-step legitimately
+                        // steps ~10 deg/tick by its own motion, and that is not what this pins.
+                        if was_transitioning && !transitioning {
+                            if let Some((prev_tick, prev_dev)) = previous {
+                                let step = (dev_from_rest - prev_dev).abs();
+                                assert!(
+                                    step <= MAX_BOUNDARY_STEP_DEG,
+                                    "locked={locked} aim={aim} strafe={strafe_ticks}: joint 46 moved                                      {step:.1} deg against its rest placement on the blend-death tick                                      ({prev_tick}->{tick}); released records must glide to rest over                                      the gait handover window",
+                                );
+                            }
+                        }
+                        previous = Some((tick, dev_from_rest));
+                    }
+                    was_transitioning = transitioning;
+                }
+            }
+        }
+    }
+
     /// Releasing side step into forward hands over with no snap: across the tick where the locomotion
     /// blend lands and the first frames after it, no bone moves further per tick than the running gait
     /// ever covers alone. The release's blend wiring goes with it — every layer crossfades for exactly
