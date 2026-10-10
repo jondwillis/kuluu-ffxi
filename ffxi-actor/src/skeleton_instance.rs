@@ -235,12 +235,22 @@ fn update_joint(
             anim_t
         };
 
-        rotation = Quat::from_xyzw(
-            anim.rotation[0],
-            anim.rotation[1],
-            anim.rotation[2],
-            anim.rotation[3],
-        ) * rotation;
+        // A blended record is retail's raw weighted sum (`merge_layer_rotation`, FFXiMain.dll retail-2026-09
+        // RVA 0x33220, no normalisation), so its length carries no rotation information during a crossfade — and an
+        // unnormalised quaternion multiplied down the hierarchy scales by |q|^2: measured on shipped Hume clips at
+        // 0.548 basis scale mid-fade on one spine-side bone, everything below it following, back to exactly 1.0 the
+        // frame the fade ended (a torso that visibly shrinks). Retail stores raw and normalises at consumption:
+        // RVA 0x34b80 reads the pose scratch `.data 0x1045F030` and calls quat-mul (0x32b50) and the normalise
+        // helper (0x32e10).
+        let [r0, r1, r2, r3] = anim.rotation;
+        let norm = (r0 * r0 + r1 * r1 + r2 * r2 + r3 * r3).sqrt();
+        rotation = if norm.is_finite() && norm > f32::EPSILON {
+            Quat::from_xyzw(r0 / norm, r1 / norm, r2 / norm, r3 / norm) * rotation
+        } else {
+            // A degenerate sum (exactly antipodal keys) carries no axis at all: leave the bone on its bind
+            // rotation for that frame rather than inventing one.
+            rotation
+        };
 
         if !is_root {
             scale *= arr3(anim.scale);
@@ -409,6 +419,34 @@ pub fn find_head_neck(skeleton: &Skeleton) -> Option<(usize, usize)> {
     Some((neck, head))
 }
 
+/// `root` and every joint composed under it when the pose was built with `parent_overrides` (the `(joint, new
+/// parent)` pairs [`pose_world`] takes): an overridden joint hangs from its new parent, not its authored one.
+pub fn composed_subtree(
+    skeleton: &Skeleton,
+    parent_overrides: &[(usize, usize)],
+    root: usize,
+) -> Vec<usize> {
+    let parent_of = |joint: usize| {
+        parent_overrides
+            .iter()
+            .find(|(child, _)| *child == joint)
+            .map(|&(_, parent)| parent)
+            .or_else(|| skeleton.joints.get(joint).and_then(|j| j.parent))
+    };
+    let mut out = vec![root];
+    let mut next = 0;
+    while next < out.len() {
+        let current = out[next];
+        for joint in 0..skeleton.joints.len() {
+            if parent_of(joint) == Some(current) && !out.contains(&joint) {
+                out.push(joint);
+            }
+        }
+        next += 1;
+    }
+    out
+}
+
 pub fn neck_subtree(skeleton: &Skeleton, neck: usize) -> Vec<usize> {
     let n = skeleton.joints.len();
     let mut out = vec![neck];
@@ -461,6 +499,7 @@ mod tests {
             joints,
             references: Vec::new(),
             bounding_boxes: Vec::new(),
+            look_at_limits: Vec::new(),
         }
     }
 
@@ -471,7 +510,7 @@ mod tests {
     fn jref(index: usize) -> JointReference {
         JointReference {
             index,
-            unk_v0: [0.0; 3],
+            rotation: [0.0; 3],
             position_offset: [0.0; 3],
         }
     }
@@ -618,6 +657,45 @@ mod tests {
         let child_t = world[1].transform_point3(Vec3::ZERO);
 
         assert!(approx(child_t, Vec3::new(0.0, 0.0, -1.0), 1e-4));
+    }
+
+    /// A pose record's rotation is consumed as a unit quaternion, never as a scale. A blend stores retail's raw
+    /// weighted sum (`merge_layer_rotation`, FFXiMain.dll retail-2026-09 RVA 0x33220, no normalisation), so mid-fade
+    /// those four floats are short and that length would reach the joint chain as basis scale instead of rotation:
+    /// measured on shipped Hume clips at 0.548 of settled size mid-crossfade, everything below the bone following.
+    #[test]
+    fn a_short_blended_rotation_rotates_without_scaling() {
+        let s = skel(vec![
+            joint(None, [0.0, 0.0, 0.0]),
+            joint(Some(0), [1.0, 0.0, 0.0]),
+        ]);
+        // A yaw-90 quaternion multiplied by 0.5 — the kind of short record a blend produces.
+        let half = Quat::from_rotation_y(std::f32::consts::FRAC_PI_2) * 0.5;
+        let anim = move |i: usize| {
+            (i == 0).then_some(KeyFrameTransform {
+                rotation: [half.x, half.y, half.z, half.w],
+                translation: [0.0, 0.0, 0.0],
+                scale: [1.0, 1.0, 1.0],
+            })
+        };
+        let world = pose_world(&s, anim, RootTransform::identity(), &[]);
+
+        for (joint, m) in world.iter().enumerate() {
+            for axis in 0..3 {
+                let len = m.col(axis).truncate().length();
+                assert!(
+                    (len - 1.0).abs() < 1e-4,
+                    "joint {joint} basis vector {axis} has length {len}; a short quaternion scaled the bone (|q|^2 = {})",
+                    half.length_squared(),
+                );
+            }
+        }
+        // The rotation itself still applies: yaw 90 takes +X to -Z.
+        assert!(approx(
+            world[1].transform_point3(Vec3::ZERO),
+            Vec3::new(0.0, 0.0, -1.0),
+            1e-4
+        ));
     }
 
     #[test]
@@ -806,7 +884,7 @@ mod tests {
             ABOVE_HEAD + 1,
             JointReference {
                 index: 0,
-                unk_v0: [0.0; 3],
+                rotation: [0.0; 3],
                 position_offset: [1.0, -4.0, 5.0],
             },
         );
@@ -848,7 +926,7 @@ mod tests {
             ABOVE_HEAD + 1,
             JointReference {
                 index: 0,
-                unk_v0: [0.0; 3],
+                rotation: [0.0; 3],
                 position_offset: [0.0, f32::NAN, 0.0],
             },
         );
@@ -864,7 +942,7 @@ mod tests {
 
         s.references.push(JointReference {
             index: 1,
-            unk_v0: [0.0, 0.0, 0.0],
+            rotation: [0.0, 0.0, 0.0],
             position_offset: [0.0, 1.0, 0.0],
         });
         let world = pose_world(&s, |_| None, RootTransform::identity(), &[]);
@@ -909,7 +987,7 @@ mod tests {
     fn jref_at_root(_: usize) -> JointReference {
         JointReference {
             index: 0,
-            unk_v0: [0.0; 3],
+            rotation: [0.0; 3],
             position_offset: [0.0; 3],
         }
     }
@@ -1061,5 +1139,87 @@ mod tests {
         }
 
         assert_selector_tracks_the_other_actor(&world, &s);
+    }
+
+    /// A joint no live clip keys composes from its own bind data, not from whatever motion happened to
+    /// write it last: retail's reset pass clears every pose-scratch record before sampling (`FFXiMain.dll
+    /// retail-2026-09` RVA 0x1A463..0x1A4B5), so a finished clip cannot leave its rotation in the skeleton.
+    /// Inheriting it instead is what pinned an upper body to one old battle pose forever.
+    #[test]
+    fn an_unkeyed_joint_composes_from_bind_not_from_history() {
+        use crate::animation::{BonePoseScratch, LoopParams, SkeletonAnimationCoordinator};
+        use ffxi_dat::skel_anim::{KeyFrameTransform, SkeletonAnimation};
+
+        // A rig whose weapon joint (1) binds far from anywhere a clip puts it, so a bind-pose snap
+        // shows up as a world-matrix jump. Joint 0 is keyed identically by both clips, which makes
+        // any change in the weapon's world matrix come from its own local transform alone.
+        let skel = skel(vec![
+            joint(None, [0.0; 3]),
+            joint(Some(0), [9.5, -9.5, 9.5]),
+        ]);
+        let keyed = |x: f32| KeyFrameTransform {
+            rotation: IDENTITY_QUAT,
+            translation: [x, 0.0, 0.0],
+            scale: [1.0; 3],
+        };
+        let clip = |id: &str, joints: &[u32]| SkeletonAnimation {
+            id: DatId::from_str(id),
+            num_joints: skel.joints.len(),
+            num_frames: 3,
+            key_frame_duration: 1.0,
+            key_frame_sets: joints.iter().map(|j| (*j, vec![keyed(4.0); 3])).collect(),
+        };
+        let once = || LoopParams {
+            loop_duration: None,
+            num_loops: None,
+            low_priority: false,
+        };
+
+        let mut coord = SkeletonAnimationCoordinator::new();
+        let mut scratch = BonePoseScratch::new();
+
+        // The battle clip keys both joints: the weapon joint lands at its authored hand offset.
+        coord.register_animation(clip("wpaa", &[0, 1]), once(), None, |_| true);
+        coord.sample_pose(skel.joints.len(), &mut scratch);
+        let before = pose_world(
+            &skel,
+            |joint| scratch.get(joint),
+            RootTransform::identity(),
+            &[],
+        );
+
+        // The next clip is sparse and keys only joint 0.
+        coord.clear();
+        coord.register_animation(clip("wpab", &[0]), once(), None, |_| true);
+        coord.sample_pose(skel.joints.len(), &mut scratch);
+        assert!(
+            scratch.get(1).is_none(),
+            "joint 1 kept a record no live layer keyed"
+        );
+        let after = pose_world(
+            &skel,
+            |joint| scratch.get(joint),
+            RootTransform::identity(),
+            &[],
+        );
+
+        // Teeth: `after` must match the same rig posed with joint 1 never keyed at all, and must differ
+        // from what the finished clip left behind.
+        let mut coord2 = SkeletonAnimationCoordinator::new();
+        coord2.register_animation(clip("wpab", &[0]), once(), None, |_| true);
+        let from_bind = pose_world(
+            &skel,
+            |joint| coord2.get_joint_transform(joint),
+            RootTransform::identity(),
+            &[],
+        );
+        assert_eq!(
+            after[1], from_bind[1],
+            "an unkeyed joint must compose exactly as one that was never keyed"
+        );
+        assert_ne!(
+            after[1], before[1],
+            "the finished clip's rotation is still in the skeleton"
+        );
     }
 }

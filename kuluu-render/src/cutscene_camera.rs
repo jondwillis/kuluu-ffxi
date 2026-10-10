@@ -1150,6 +1150,7 @@ mod tests {
         let baked = BakedActor {
             min_mesh_y: 0.0,
             actor_height: 2.0,
+            skeleton_span: None,
         };
         assert!(
             (eid_model_point(2, Some(&baked), None).unwrap() - Vec3::new(0.0, 2.1, 0.0)).length()
@@ -1182,11 +1183,12 @@ mod tests {
             references: (0..ffxi_dat::camera::EID_NORMAL_MAX)
                 .map(|i| ffxi_dat::skel::JointReference {
                     index: 0,
-                    unk_v0: [0.0; 3],
+                    rotation: [0.0; 3],
                     position_offset: [0.0, i as f32, 0.0],
                 })
                 .collect(),
             bounding_boxes: Vec::new(),
+            look_at_limits: Vec::new(),
         };
         let pose = ffxi_actor::skeleton_instance::pose_world(
             &skeleton,
@@ -1482,6 +1484,7 @@ mod tests {
                 BakedActor {
                     min_mesh_y: 0.0,
                     actor_height: 2.0,
+                    skeleton_span: None,
                 },
             ))
             .with_children(|parent| {

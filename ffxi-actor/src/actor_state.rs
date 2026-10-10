@@ -239,6 +239,16 @@ impl Default for ActorAnimInputs {
     }
 }
 
+impl ActorAnimInputs {
+    /// The bucket this frame's travel falls in, before any per-actor latch; `None` while still.
+    pub fn travel(&self) -> Direction {
+        if !self.moving {
+            return Direction::None;
+        }
+        movement_direction(self.forward_vel, self.strafe_vel)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FishingClip {
     pub id: DatId,
@@ -302,21 +312,20 @@ pub fn idle_animation_id(inputs: &ActorAnimInputs) -> Vec<DatId> {
     animation_mode_variant(DatId::from_str("idl?"), inputs.idle_mode, "dl")
 }
 
-pub fn movement_direction(forward_vel: f32, strafe_vel: f32) -> Direction {
-    let speed_sq = forward_vel * forward_vel + strafe_vel * strafe_vel;
-    if speed_sq <= 1e-5 {
-        return Direction::None;
-    }
+// The travel speed below which xim stops classifying at all (Actor.kt getMovementDirection's
+// `magnitudeSquare() <= 1e-5`), squared units.
+const STILL_SPEED_SQ: f32 = 1e-5;
 
-    let inv = 1.0 / speed_sq.sqrt();
+/// research/xim Actor.kt getMovementDirection's bucketing, applied to the two cosines a caller has
+/// already resolved on its reference axes. xim's own comment: "Prefer to run forward > horizontal > backward".
+fn classify_travel(cos_angle: f32, lateral_cos: f32) -> Direction {
+    const FORWARD_COS_MIN: f32 = 0.25;
+    const BACKWARD_COS_MAX: f32 = -0.75;
 
-    let cos_angle = forward_vel * inv;
-
-    if cos_angle >= 0.25 {
+    if cos_angle >= FORWARD_COS_MIN {
         Direction::Forward
-    } else if cos_angle >= -0.75 {
-        let horizontal_cos = strafe_vel * inv;
-        if horizontal_cos >= 0.0 {
+    } else if cos_angle >= BACKWARD_COS_MAX {
+        if lateral_cos >= 0.0 {
             Direction::Right
         } else {
             Direction::Left
@@ -326,18 +335,123 @@ pub fn movement_direction(forward_vel: f32, strafe_vel: f32) -> Direction {
     }
 }
 
-pub fn movement_animation(inputs: &ActorAnimInputs) -> Vec<DatId> {
-    if inputs.walking {
-        return animation_mode_variant(DatId::from_str("wlk?"), inputs.walking_mode, "lk");
+pub fn movement_direction(forward_vel: f32, strafe_vel: f32) -> Direction {
+    let speed_sq = forward_vel * forward_vel + strafe_vel * strafe_vel;
+    if speed_sq <= STILL_SPEED_SQ {
+        return Direction::None;
     }
 
-    match movement_direction(inputs.forward_vel, inputs.strafe_vel) {
-        Direction::None | Direction::Forward => {
-            animation_mode_variant(DatId::from_str("run?"), inputs.running_mode, "un")
+    let inv = 1.0 / speed_sq.sqrt();
+    classify_travel(forward_vel * inv, strafe_vel * inv)
+}
+
+/// research/xim Actor.kt getMovementDirection measures travel against the direction to the actor's
+/// target, not its own facing — that is the form the swing routines need (`moving_swing_routine`).
+/// `bearing` is the flat vector from the mover to that target. A degenerate bearing has no axis to
+/// classify on, so it answers like xim's own "no locked target and not strafing" branch: `None`.
+pub fn movement_direction_toward(
+    vel_x: f32,
+    vel_z: f32,
+    bearing_x: f32,
+    bearing_z: f32,
+) -> Direction {
+    let bearing_sq = bearing_x * bearing_x + bearing_z * bearing_z;
+    if bearing_sq <= STILL_SPEED_SQ || (vel_x * vel_x + vel_z * vel_z) <= STILL_SPEED_SQ {
+        return Direction::None;
+    }
+
+    let inv_speed = 1.0 / (vel_x * vel_x + vel_z * vel_z).sqrt();
+    let vx = vel_x * inv_speed;
+    let vz = vel_z * inv_speed;
+    // xim's lateral axis is bearing × UP, which in the flat XZ plane is (-bearing.z, bearing.x); a
+    // positive dot on it is travel to the target's right — the same pair combat_stance resolves an
+    // entity's own `right` from, so the Left/Right labels agree with the mvl?/mvr? clip choice.
+    let inv_bearing = 1.0 / bearing_sq.sqrt();
+    let bx = bearing_x * inv_bearing;
+    let bz = bearing_z * inv_bearing;
+
+    classify_travel(vx * bx + vz * bz, vx * -bz + vz * bx)
+}
+
+/// The motion-name chooser: `travel` is the bucket after [`SideStepFlipLatch`], which is what the
+/// chooser reads. Travel back from the target names the back-step clip (`mvb?`), walking or
+/// running; a run that buckets left or right of the line to the target names the side-step clips
+/// (`mvl?`/`mvr?`); forward travel keeps the gait. The local player's free motion never reaches
+/// those buckets (the walker turns the body onto its travel), so for it they show with the camera
+/// locked on, weapon out or not.
+///
+/// Provenance (`FFXiMain.dll retail-2026-09`): the chooser at RVA 0xC8D36..0xC8DC5 names `mvl `
+/// (RVA 0xC8DAF) for bucket 4, `mvb ` (RVA 0xC8DB7) for 3 and `mvr ` (RVA 0xC8DBF) for 2 whenever
+/// auto-run is on or free-run is off; the lock handlers clear free-run (RVA 0xC5440, RVA 0xC54C0)
+/// and the release sets it (RVA 0xC5410). Its other naming path (RVA 0xC8DC7) names `wlk ` for the
+/// side buckets but still jumps to the `mvb ` store for bucket 3 (RVA 0xC8DD3). The buckets come
+/// from the classifier at RVA 0xA80D0, whose 2/3/4 exits test x87 C0 (`fnstsw` then
+/// `and eax, 0x100`), the less-than flag, so all four exits are live.
+pub fn movement_animation(inputs: &ActorAnimInputs, travel: Direction) -> Vec<DatId> {
+    match travel {
+        Direction::Backward => vec![DatId::from_str("mvb?")],
+        _ if inputs.walking => {
+            animation_mode_variant(DatId::from_str("wlk?"), inputs.walking_mode, "lk")
         }
         Direction::Left => vec![DatId::from_str("mvl?")],
         Direction::Right => vec![DatId::from_str("mvr?")],
-        Direction::Backward => vec![DatId::from_str("mvb?")],
+        Direction::None | Direction::Forward => {
+            animation_mode_variant(DatId::from_str("run?"), inputs.running_mode, "un")
+        }
+    }
+}
+
+/// Rendered frames of straight gait a direct left/right flip shows before the new side step.
+pub const SIDE_STEP_FLIP_STRAIGHT_FRAMES: f32 = 2.0;
+
+/// A direct change of side step, left to right or right to left, shows the straight gait for
+/// [`SIDE_STEP_FLIP_STRAIGHT_FRAMES`] rendered frames before the new side step plays, so the
+/// chooser never goes from one side step straight to the other. Every other change passes through
+/// untouched. A still frame clears the comparison (only consecutive moving frames can flip) but
+/// leaves any straight frames still owed for the next moving frame.
+///
+/// Provenance (`FFXiMain.dll retail-2026-09`): RVA 0xA7EF6..0xA7F2D compares the stored bucket
+/// with the classifier's new one; a 2→4 or 4→2 change arms a per-actor byte at 2, and while it is
+/// positive every moving frame decrements it and stores bucket 1 for the chooser. A still frame
+/// (travel length at most 0.001) stores bucket 0 instead and skips the byte (RVA 0xA6C05).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SideStepFlipLatch {
+    /// The bucket the chooser read last frame.
+    shown: Direction,
+    /// Rendered frames of straight gait still owed after a flip.
+    straight_owed: f32,
+}
+
+impl Default for SideStepFlipLatch {
+    fn default() -> Self {
+        Self {
+            shown: Direction::None,
+            straight_owed: 0.0,
+        }
+    }
+}
+
+impl SideStepFlipLatch {
+    /// One frame of travel. `classified` is this frame's bucket ([`ActorAnimInputs::travel`]) and
+    /// `rendered_frames` how far retail's rendered-frame clock advanced. Returns what the chooser reads.
+    pub fn advance(&mut self, classified: Direction, rendered_frames: f32) -> Direction {
+        if classified == Direction::None {
+            self.shown = Direction::None;
+            return Direction::None;
+        }
+        if matches!(
+            (self.shown, classified),
+            (Direction::Left, Direction::Right) | (Direction::Right, Direction::Left)
+        ) {
+            self.straight_owed = SIDE_STEP_FLIP_STRAIGHT_FRAMES;
+        }
+        self.shown = if self.straight_owed > 0.0 {
+            self.straight_owed = (self.straight_owed - rendered_frames).max(0.0);
+            Direction::Forward
+        } else {
+            classified
+        };
+        self.shown
     }
 }
 
@@ -441,9 +555,10 @@ pub fn next_death_phase(
     }
 }
 
-pub fn selected_animation(inputs: &ActorAnimInputs) -> SelectedAnimation {
+/// `travel` is the chooser's bucket ([`movement_animation`]); a still actor ignores it.
+pub fn selected_animation(inputs: &ActorAnimInputs, travel: Direction) -> SelectedAnimation {
     if inputs.moving {
-        let id = movement_animation(inputs)[0];
+        let id = movement_animation(inputs, travel)[0];
         SelectedAnimation { id, idle: false }
     } else {
         let id = idle_animation_id(inputs)[0];
@@ -613,41 +728,127 @@ mod tests {
 
     #[test]
     fn movement_ids_by_direction() {
-        let walk = ActorAnimInputs {
-            walking: true,
-            ..Default::default()
+        let run = |forward_vel: f32, strafe_vel: f32| {
+            let inputs = ActorAnimInputs {
+                moving: true,
+                forward_vel,
+                strafe_vel,
+                ..Default::default()
+            };
+            idstr(movement_animation(&inputs, inputs.travel())[0])
         };
-        assert_eq!(idstr(movement_animation(&walk)[0]), "wlk?");
 
-        let fwd = ActorAnimInputs {
-            forward_vel: 1.0,
-            ..Default::default()
+        let walk = |forward_vel: f32, strafe_vel: f32| {
+            let inputs = ActorAnimInputs {
+                moving: true,
+                walking: true,
+                forward_vel,
+                strafe_vel,
+                ..Default::default()
+            };
+            idstr(movement_animation(&inputs, inputs.travel())[0])
         };
-        assert_eq!(idstr(movement_animation(&fwd)[0]), "run?");
+        assert_eq!(walk(0.0, -1.0), "wlk?");
+        assert_eq!(walk(1.0, 0.0), "wlk?");
+        assert_eq!(
+            walk(-1.0, 0.0),
+            "mvb?",
+            "a walking back step is the back step"
+        );
 
-        let none = ActorAnimInputs::default();
-        assert_eq!(idstr(movement_animation(&none)[0]), "run?");
+        assert_eq!(run(1.0, 0.0), "run?");
+        assert_eq!(run(0.0, 0.0), "run?");
+        assert_eq!(run(-0.5, -1.0), "mvl?");
+        assert_eq!(run(0.0, 1.0), "mvr?");
+        assert_eq!(run(-1.0, 0.0), "mvb?", "backward names the back step");
+    }
 
-        let left = ActorAnimInputs {
-            forward_vel: -0.5,
-            strafe_vel: -1.0,
-            ..Default::default()
-        };
-        assert_eq!(idstr(movement_animation(&left)[0]), "mvl?");
-
-        let right = ActorAnimInputs {
+    #[test]
+    fn a_still_actor_has_no_travel_bucket() {
+        let still = ActorAnimInputs {
             forward_vel: 0.0,
             strafe_vel: 1.0,
             ..Default::default()
         };
-        assert_eq!(idstr(movement_animation(&right)[0]), "mvr?");
+        assert_eq!(still.travel(), Direction::None);
+        assert_eq!(
+            ActorAnimInputs {
+                moving: true,
+                ..still
+            }
+            .travel(),
+            Direction::Right
+        );
+    }
 
-        let back = ActorAnimInputs {
-            forward_vel: -1.0,
-            strafe_vel: 0.0,
-            ..Default::default()
-        };
-        assert_eq!(idstr(movement_animation(&back)[0]), "mvb?");
+    /// Steps `latch` through `buckets` one rendered frame each and returns what the chooser read.
+    fn shown(latch: &mut SideStepFlipLatch, buckets: &[Direction]) -> Vec<Direction> {
+        buckets.iter().map(|&b| latch.advance(b, 1.0)).collect()
+    }
+
+    #[test]
+    fn a_direct_side_step_flip_runs_straight_for_two_frames() {
+        use Direction::{Forward, Left, Right};
+        let mut latch = SideStepFlipLatch::default();
+        assert_eq!(
+            shown(&mut latch, &[Left, Left, Right, Right, Right, Right]),
+            [Left, Left, Forward, Forward, Right, Right]
+        );
+        assert_eq!(
+            shown(&mut latch, &[Left, Left, Left]),
+            [Forward, Forward, Left]
+        );
+    }
+
+    #[test]
+    fn only_a_direct_flip_arms_the_latch() {
+        use Direction::{Backward, Forward, Left, Right};
+        let mut latch = SideStepFlipLatch::default();
+        assert_eq!(
+            shown(&mut latch, &[Left, Forward, Right, Backward, Left]),
+            [Left, Forward, Right, Backward, Left],
+            "a bucket in between is not a flip"
+        );
+        let mut latch = SideStepFlipLatch::default();
+        assert_eq!(
+            shown(&mut latch, &[Right, Direction::None, Left, Left]),
+            [Right, Direction::None, Left, Left],
+            "a still frame in between clears the comparison"
+        );
+    }
+
+    /// Flipping back while the straight frames run does not extend them; the frame after they end
+    /// shows whatever the travel is by then.
+    #[test]
+    fn a_flip_back_inside_the_window_does_not_extend_it() {
+        use Direction::{Forward, Left, Right};
+        let mut latch = SideStepFlipLatch::default();
+        assert_eq!(
+            shown(&mut latch, &[Right, Left, Right, Right]),
+            [Right, Forward, Forward, Right]
+        );
+    }
+
+    /// The window is rendered-frame time, so a faster pose clock shows it for more, shorter frames.
+    #[test]
+    fn the_straight_window_is_frame_time_not_a_call_count() {
+        use Direction::{Forward, Left, Right};
+        const HALF_FRAME: f32 = 0.5;
+        let mut latch = SideStepFlipLatch::default();
+        latch.advance(Left, HALF_FRAME);
+        let read: Vec<Direction> = (0..6).map(|_| latch.advance(Right, HALF_FRAME)).collect();
+        assert_eq!(read, [Forward, Forward, Forward, Forward, Right, Right]);
+    }
+
+    /// A stop inside the window keeps what is still owed: the next moving frame pays it off.
+    #[test]
+    fn a_stop_inside_the_window_keeps_what_is_owed() {
+        use Direction::{Forward, Left, Right};
+        let mut latch = SideStepFlipLatch::default();
+        assert_eq!(
+            shown(&mut latch, &[Left, Right, Direction::None, Right, Right]),
+            [Left, Forward, Direction::None, Forward, Right]
+        );
     }
 
     #[test]
@@ -666,6 +867,50 @@ mod tests {
         assert_eq!(movement_direction(0.0, -1.0), Direction::Left);
 
         assert_eq!(movement_direction(0.0, 0.0), Direction::None);
+    }
+
+    /// The same law measured against the vector to a target rather than the actor's own facing —
+    /// the form a travelling attacker's swing routine is chosen from. Bearing here is +X throughout.
+    #[test]
+    fn movement_direction_toward_a_target() {
+        assert_eq!(
+            movement_direction_toward(1.0, 0.0, 1.0, 0.0),
+            Direction::Forward
+        );
+        assert_eq!(
+            movement_direction_toward(-1.0, 0.0, 1.0, 0.0),
+            Direction::Backward
+        );
+
+        // xim takes the lateral axis as bearing × UP = (-b.z, b.x) in this plane: travel along +Z is
+        // to the target's right, and that sign is shared with mvl?/mvr? (both read MotionSample).
+        assert_eq!(
+            movement_direction_toward(0.0, 1.0, 1.0, 0.0),
+            Direction::Right
+        );
+        assert_eq!(
+            movement_direction_toward(0.0, -1.0, 1.0, 0.0),
+            Direction::Left
+        );
+
+        // xim's preference band: cos 0.5 is still Forward, while cos -0.9 is past both thresholds.
+        assert_eq!(
+            movement_direction_toward(0.5, (1.0f32 - 0.25).sqrt(), 1.0, 0.0),
+            Direction::Forward
+        );
+        assert_eq!(
+            movement_direction_toward(-0.9, (1.0f32 - 0.81).sqrt(), 1.0, 0.0),
+            Direction::Backward
+        );
+
+        assert_eq!(
+            movement_direction_toward(0.0, 0.0, 1.0, 0.0),
+            Direction::None
+        );
+        assert_eq!(
+            movement_direction_toward(1.0, 0.0, 0.0, 0.0),
+            Direction::None
+        );
     }
 
     #[test]
@@ -693,11 +938,12 @@ mod tests {
     #[test]
     fn running_mode_variant_for_run() {
         let i = ActorAnimInputs {
+            moving: true,
             forward_vel: 1.0,
             running_mode: 4,
             ..Default::default()
         };
-        let ids = movement_animation(&i);
+        let ids = movement_animation(&i, i.travel());
         assert_eq!(idstr(ids[0]), "4un?");
         assert_eq!(idstr(ids[1]), "run?");
     }
@@ -705,11 +951,12 @@ mod tests {
     #[test]
     fn walking_mode_variant() {
         let i = ActorAnimInputs {
+            moving: true,
             walking: true,
             walking_mode: 5,
             ..Default::default()
         };
-        let ids = movement_animation(&i);
+        let ids = movement_animation(&i, i.travel());
         assert_eq!(idstr(ids[0]), "5lk?");
         assert_eq!(idstr(ids[1]), "wlk?");
     }
@@ -863,7 +1110,7 @@ mod tests {
     #[test]
     fn selected_animation_switches_on_moving() {
         let idle = ActorAnimInputs::default();
-        let sel = selected_animation(&idle);
+        let sel = selected_animation(&idle, idle.travel());
         assert_eq!(idstr(sel.id), "idl?");
         assert!(sel.idle);
 
@@ -872,7 +1119,7 @@ mod tests {
             forward_vel: 1.0,
             ..Default::default()
         };
-        let sel = selected_animation(&moving);
+        let sel = selected_animation(&moving, moving.travel());
         assert_eq!(idstr(sel.id), "run?");
         assert!(!sel.idle);
     }

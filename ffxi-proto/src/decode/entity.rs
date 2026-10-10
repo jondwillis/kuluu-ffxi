@@ -637,7 +637,18 @@ impl LookData {
         }
         let off = Self::LOOK_BODY_OFFSET;
         let size = u16::from_le_bytes(body.get(off..off + 2)?.try_into().ok()?);
-        Some(match size & 7 {
+        Some(Self::retail_type_of_look_size(size))
+    }
+
+    /// The same SubKind-to-Type table read on its own, for consumers that hold a decoded `look.size`
+    /// rather than the packet body. Retail takes the three low bits of `look.size` (`mov al, byte ptr
+    /// [esi + 0x30] / and eax, 7`, `FFXiMain.dll retail-2026-09` RVA 0x9C90A) into an eight-arm jump
+    /// table at RVA 0x9CE88 (`jmp dword ptr [eax*4 + 0x1009ce88]`, RVA 0x9C916), so every masked value
+    /// has its own arm and none of them is a default — the `ja` that precedes it (RVA 0x9C910) can only
+    /// reach an epilogue. SubKind 1 is the one arm with two stores (Type 1, or Type 0 when bit 30 of the
+    /// entity's `+0x12C` flags says otherwise); it lands as 1 here because kuluu has no such flag.
+    pub const fn retail_type_of_look_size(size: u16) -> u8 {
+        match size & 7 {
             0 => 2,
             1 => 1,
             2 => 3,
@@ -646,7 +657,7 @@ impl LookData {
             5 => 6,
             6 => 7,
             _ => 8,
-        })
+        }
     }
 
     pub const CHAR_PC_GRAP_OFFSET: usize = 0x44;

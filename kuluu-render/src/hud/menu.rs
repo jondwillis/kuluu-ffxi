@@ -345,6 +345,11 @@ pub const RETAIL_JOB_DISPLAY: &str = "Job Display";
 /// `enhanced-ignore-knockback-self`.
 #[cfg(feature = "enhanced-ignore-knockback-self")]
 pub const RETAIL_KNOCKBACK: &str = "Knockback";
+/// Retail+ camera leash row: the chase camera's focus dead zone in yalms
+/// (camera_collision.rs resolve_camera). Left/Right step it by
+/// CAMERA_LEASH_STEP_YALMS; 0 turns the leash off. Persists in
+/// GraphicsSettings.
+pub const RETAIL_CAMERA_LEASH: &str = "Camera_leash";
 
 const DEBUG_ENTRIES: &[&str] = &[
     DEBUG_PERF,
@@ -377,6 +382,7 @@ const DEBUG_ENTRIES: &[&str] = &[
     RETAIL_JOB_DISPLAY,
     #[cfg(feature = "enhanced-ignore-knockback-self")]
     RETAIL_KNOCKBACK,
+    RETAIL_CAMERA_LEASH,
 ];
 
 /// The settings pages whose rows are derived from `GraphicsSection` lists.
@@ -1543,6 +1549,9 @@ fn format_row_body(
                             "on"
                         }
                     );
+                }
+                if label == RETAIL_CAMERA_LEASH {
+                    return format!("{label:<14}[{:.1}]", settings.camera_leash_yalms);
                 }
                 let on =
                     debug_panel_state(label, panels, net_status_on, sound_on, clock_debug_hold);

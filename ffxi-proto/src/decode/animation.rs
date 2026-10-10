@@ -8,6 +8,9 @@ pub const HEALING: u8 = 33;
 
 pub const SIT: u8 = 47;
 
+/// A ranged attack in flight (`enum ANIMATIONTYPE`, vendor/server/data/enums/animation.yaml `ranged`).
+pub const RANGED: u8 = 48;
+
 /// A door's swing state. Retail keeps the same value as the door actor's
 /// `GameStatus` (research/XIClient/src/XIClient/include/World/Actor/GameStatus.h, `D_OPEN` /
 /// `D_CLOSE`), so this one byte is the whole of what the server says about a

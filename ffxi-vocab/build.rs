@@ -1277,7 +1277,18 @@ fn scrape_transport() -> Result<()> {
     println!("cargo:rerun-if-changed={MODEL_SOURCE}");
     let model_types =
         lsb_scrape::parse_cpp_plain_enum(&fs::read_to_string(MODEL_SOURCE)?, "MODELTYPE")?;
-    for name in ["MODEL_ELEVATOR", "MODEL_SHIP"] {
+    // The whole enum, not just the two transport kinds: `look.size` also decides which entity Types
+    // exist at all (the retail SubKind dispatch stamps an entity's Type byte from this same nibble).
+    for name in [
+        "MODEL_STANDARD",
+        "MODEL_EQUIPPED",
+        "MODEL_DOOR",
+        "MODEL_ELEVATOR",
+        "MODEL_SHIP",
+        "MODEL_UNK_5",
+        "MODEL_AUTOMATON",
+        "MODEL_CHOCOBO",
+    ] {
         let (value, _) = model_types
             .iter()
             .find(|(_, key)| key == name)

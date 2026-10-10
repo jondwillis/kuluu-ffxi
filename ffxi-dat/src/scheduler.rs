@@ -40,7 +40,7 @@ const ANIMATION_LOCK_MAGIC_OPCODE: u8 = 0x59;
 const START_ROUTINE_MARKER_OPCODE: u8 = 0x01;
 const ACTOR_POSITION_SNAPSHOT_OPCODE: u8 = 0x15;
 const MOVEMENT_LOCK_OPCODE: u8 = 0x2E;
-const FACING_LOCK_OPCODE: u8 = 0x2F;
+pub const FACING_LOCK_OPCODE: u8 = 0x2F;
 const TOGGLE_BROADCAST_ON_OPCODE: u8 = 0x31;
 const TOGGLE_BROADCAST_OFF_OPCODE: u8 = 0x32;
 const FLINCH_CASTER_OPCODE: u8 = 0x21;
@@ -52,6 +52,42 @@ const KNOCKBACK_OPCODE: u8 = 0x5E;
 const KNOCKBACK_ALT_OPCODE: u8 = 0xBF;
 const STOP_ROUTINE_OPCODE: u8 = 0x5F;
 const DISPLAY_DEAD_OPCODE: u8 = 0x78;
+// FFXiMain.dll retail-2026-09 dispatches stages as `case = byte - 2` (`lea edx,[eax-2]` at RVA
+// 0x57FC9, jump table RVA 0x5DC1C); this byte's handler allocates its task at `0x80` bytes (RVA
+// 0x5B15B) and builds it at RVA 0x5F450. The operand comes from the shared stage reader at RVA
+// 0x5E590: signed word `[record+6]`, scaled by the routine context's timing scale.
+const LOCK_LOOK_AT_OPCODE: u8 = 0x89;
+// Both bytes build the same task class and read the same record layout; they differ only in which
+// resolver gates construction. Stage 0xA9 (case 167, handler RVA 0x5B392) calls the gate at RVA
+// 0x10062770 and jumps onto the shared argument tail from RVA 0x5B3DD; stage 0xAA (case 168,
+// handler RVA 0x5B3DF) calls the gate at RVA 0x100627D0. Each allocates 0xA0 bytes (`push 0xa0`:
+// RVA 0x5B3A1 / RVA 0x5B3EE) for `CMoActorRotationDriveTask`, whose constructor is at
+// FFXiMain.dll retail-2026-09 RVA 0x5FA20. Only stage 0xA9 occurs in the shipped DATs.
+pub const ACTOR_ROTATION_OPCODE: u8 = 0xA9;
+const ACTOR_ROTATION_ALT_OPCODE: u8 = 0xAA;
+// The constructor reads three degree floats at record +8/+0xC/+0x10 (each multiplied by pi/180 at
+// FFXiMain.dll retail-2026-09 RVA 0x5FA95 / RVA 0x5FABB / RVA 0x5FACB) and one byte at record
+// +0x14, after the shared delay/duration word pair - a six-dword stage with no DatId.
+const ACTOR_ROTATION_PAYLOAD_LEN: usize = 24;
+const ACTOR_ROTATION_ANGLES_OFFSET: usize = ID_OFFSET;
+const ACTOR_ROTATION_MODE_OFFSET: usize = ID_OFFSET + 12;
+// FFXiMain.dll retail-2026-09 dispatch case 96 (jump-table cell RVA 0x5DD9C, handler RVA 0x5AF2C):
+// the stage queues a bounded yaw turn of its actor toward the routine's target. Both objects come
+// from the routine context - the turning actor through RVA 0x10062770 and the object to face through
+// RVA 0x100627D0 - and if either fails to resolve, nothing is stored at all (both branches go to RVA
+// 0x5AC96). Positions come from vtable slot byte `0x1BC` and the heading being corrected from slot
+// byte `0x1C0`. The authored float after delay/duration becomes radians with the same factor
+// ActorRotation uses (multiplied at RVA 0x5B019 reading `.rdata 0x32A9F4`) and is stored on the actor,
+// sign-matched to the geometric difference, as the turn's per-frame step. Its duration word is read by
+// the shared stage reader (RVA 0x1005E590) but - unlike every lock task - never rounded down first, so
+// the fetch keeps its fraction; it feeds the companion task at RVA 0x60F80, which releases its bump of
+// the actor's turn-enable counter when that countdown runs out (destructor RVA 0x60F40).
+pub const TURN_TOWARD_OPCODE: u8 = 0x62;
+// The step is the only payload word: a three-dword stage, so the slot other kinds read as DatId holds
+// it (`FFXiMain.dll retail-2026-09`: the load at RVA 0x5B016 sits on the record's +8 offset, which the
+// shared delay/duration pair occupies two dwords earlier).
+const TURN_TOWARD_PAYLOAD_LEN: usize = STAGE_WITH_ID_LEN;
+const TURN_TOWARD_STEP_OFFSET: usize = ID_OFFSET;
 // research/xim EffectRoutineParser.kt parseSection2 0x75 SetModelVisibilityRoutine: the payload
 // after delay/duration is hidden (u32 == 1), slot (u16), ifEngaged (u16 == 1) - a 4-dword
 // stage, no DatId.
@@ -63,7 +99,7 @@ const SET_MODEL_VISIBILITY_PAYLOAD_LEN: usize = 16;
 const JOINT_SNAPSHOT_OPCODE: u8 = 0x22;
 // research/xim EffectRoutineParser.kt parseSection2 0x1E ParticleDampenRoutine: genRef
 // (DatId) + zero32 after delay/duration - a 4-dword stage.
-const PARTICLE_DAMPEN_OPCODE: u8 = 0x1E;
+pub const PARTICLE_DAMPEN_OPCODE: u8 = 0x1E;
 // research/xim EffectRoutineParser.kt parseSection2 0x19 SpellEffect: the u32 after
 // delay/duration is the spell animation index, not a DatId - the handler resolves the
 // spell file-table offset plus the index to the effect DAT and runs its `main` routine
@@ -192,6 +228,16 @@ pub struct FollowPoints {
     pub rotation: f32,
 }
 
+/// Authored orientation for a [`StageKind::ActorRotation`] stage: three angles in degrees at the
+/// record order retail passes them to its constructor, and the mode byte that selects which of the
+/// two write paths the task takes (its tick branches on it at FFXiMain.dll retail-2026-09 RVA
+/// 0x5FBCF..0x5FBDC).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ActorRotation {
+    pub angles_degrees: [f32; 3],
+    pub mode: u8,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ModelTransform {
     pub final_value: [f32; 3],
@@ -207,6 +253,38 @@ pub struct ModelVisibility {
     pub hidden: bool,
     pub slot: u16,
     pub if_engaged: bool,
+}
+
+/// Which family a model resolves its motion ids against, as switched by
+/// [`StageKind::AnimationMode`] (research/xim EffectRoutineInstance.kt handleAdjustAnimationModeRoutine:
+/// case 0 battle, 1 idle, 2 walking, 3 running).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnimModeSlot {
+    Battle,
+    Idle,
+    Walking,
+    Running,
+}
+
+impl AnimModeSlot {
+    /// The handler's case number, which is also the index a consumer stores these by.
+    pub fn index(self) -> usize {
+        match self {
+            Self::Battle => 0,
+            Self::Idle => 1,
+            Self::Walking => 2,
+            Self::Running => 3,
+        }
+    }
+}
+
+/// Payload of the four animation-mode stages: one dword (`research/xim EffectRoutineParser.kt
+/// parseSection2`) naming the variant the actor's later motion ids take, with the unmarked id kept as the
+/// fallback (`Actor.kt getAnimationModeVariant`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AnimationMode {
+    pub slot: AnimModeSlot,
+    pub variant: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -263,6 +341,18 @@ pub struct SchedulerStage {
     // u16) occupies the dwords the generic decoder reads `id` from (research/xim
     // EffectRoutineParser.kt parseSection2); `id` is `NO_STAGE_ID` there.
     pub model_visibility: Option<ModelVisibility>,
+
+    /// `Some` for [`StageKind::ActorRotation`] stages that carry the full six-dword payload; the
+    /// angles are degrees, as authored.
+    pub actor_rotation: Option<ActorRotation>,
+
+    /// `Some` for [`StageKind::TurnToward`] stages carrying their one payload dword: the turn's
+    /// per-frame step in degrees, as authored. Retail reads that dword as a float (load at RVA 0x5B016,
+    /// converted at RVA 0x5B019), so the slot is not a DatId (`FFXiMain.dll retail-2026-09`).
+    pub turn_toward_step_degrees: Option<f32>,
+
+    /// `Some` exactly for [`StageKind::AnimationMode`]: the +8 dword is the variant value, not a DatId.
+    pub animation_mode: Option<AnimationMode>,
 
     // `Some` exactly for `SpellEffect`: the +8 dword is the spell animation index, not a
     // DatId (research/xim EffectRoutineParser.kt parseSection2 0x19); `id` is
@@ -364,6 +454,60 @@ pub enum StageKind {
     /// EffectRoutineParser.kt parseSection2 MovementLockEffect): the actor's movement is
     /// withheld for the interval, the pose is untouched - facing is the separate 0x2F lock.
     MovementLock,
+
+    /// 0x2F - HoldRotation (research/xim EffectRoutineParser.kt parseSection2 FacingLockEffect):
+    /// for `duration_frames` retail stops copying the wire orientation onto the actor, so whatever a
+    /// drive-task wrote stays. Retail's task takes one refcount on the actor's orientation
+    /// (`FFXiMain.dll retail-2026-09`): handler RVA 0x5C8BA allocates it and its constructor at
+    /// RVA 0x624B0 acquires through vtable
+    /// slot byte `0x314` (RVA 0x62508), releasing in its destructor at RVA 0x6248B; the per-entity
+    /// update tests that count at RVA 0x8FC08 and skips both the orientation copy and its angle wrap
+    /// while it is non-zero. The hold length is the generic duration word, read by the shared stage
+    /// reader (RVA 0x5E590), so the stage carries nothing past delay/duration.
+    HoldRotation,
+
+    /// 0x89 - LockLookAt: while it runs, the actor behaves as if it has no look-at target. The task
+    /// sets bit 1 of `[actor+0x840]` when it is built and clears it when it ends (`FFXiMain.dll
+    /// retail-2026-09` RVA 0x5F4A2..0x5F4AB / RVA 0x5F67E..0x5F68B), and the look-at owner tests that
+    /// bit at RVA 0xD5B90..0xD5B9A, where a set bit throws away the target it just resolved. The task
+    /// also ends itself once the actor stands `1.0f` yalm or more horizontally from where the stage
+    /// fired (anchor written at RVA 0x5F4BC / RVA 0x5F4D2, compared at RVA 0x5F5AA / RVA 0x5F60F), so
+    /// `duration_frames` is a bound rather than a promise.
+    LockLookAt,
+
+    /// 0xA9 / 0xAA - ActorRotation: drive one actor's three orientation angles from whatever they
+    /// are when the stage fires to the authored absolute euler, over `duration_frames` (the task's
+    /// tick interpolates between a start captured in its constructor and the authored target:
+    /// FFXiMain.dll retail-2026-09 RVA 0x5FB67..0x5FBBa; progress is
+    /// `1 - remaining / duration`, computed at RVA 0x5FCDC..0x5FCE5 against the countdown it keeps
+    /// at task+0x74/+0x78). The payload is [`SchedulerStage::actor_rotation`]; axis identity of the
+    /// three authored floats follows the record order, which is what retail feeds the lerp.
+    ActorRotation,
+
+    /// 0x62 - TurnToward: turn this actor's heading toward the routine target at the authored rate,
+    /// for as long as the stage lasts. Retail does it in two halves, both fired by handler RVA 0x5AF2C.
+    /// Once, on the spot: the angle between the direction to the target and the heading the actor holds
+    /// right now is measured (positions through vtable slot byte `0x1BC`, current heading through slot
+    /// byte `0x1C0` component 1) and stored as a remaining magnitude plus a signed per-frame step taken
+    /// from this stage's float - magnitude via the setter at RVA 0x5E7C0 (call site RVA 0x5B08F), step
+    /// through RVA 0x5E7D0 (RVA 0x5B0B6). Then per frame: while a turn is enabled, the actor's own update
+    /// adds one signed step to its heading accumulator and shortens the magnitude by `|step|`, backing the
+    /// heading off again by the leftover when a step overshoots so the net travel is exactly the angle it
+    /// measured (`FFXiMain.dll retail-2026-09` RVA 0xC66CA..0xC67DA). Consumption needs four things true of
+    /// the actor: no orientation refcount, `[actor+0x102] == 0`, `[actor+0x7A4] == -1` and a non-zero
+    /// turn-enable nesting count `[actor+0x86C]`; this stage supplies that last one itself (bumped at RVA
+    /// 0x5AF7D, released by its companion task's destructor at RVA 0x60F40), which is what bounds the turn
+    /// to `duration_frames`. A fifth condition ends it early on any frame where the remaining magnitude is
+    /// not strictly positive (RVA 0xC66CA..0xC66DD).
+    TurnToward,
+
+    /// 0x79 (battle) / 0x8C (idle) / 0xA4 (walking) / 0xA5 (running) — AdjustAnimationModeRoutine
+    /// (`research/xim EffectRoutineParser.kt parseSection2`): from this stage on the actor resolves that
+    /// slot's motion ids against a variant family and keeps the unmarked id as fallback, so `btl?` becomes
+    /// e.g. `3tl?` with `btl?` still tried (`ActorModel.kt battleAnimationMode`, `Actor.kt
+    /// getIdleAnimationId`). It is how an equipped weapon's motion group reaches the pose: the weapon-anchor
+    /// bones are keyed only by that family's clips.
+    AnimationMode,
 
     /// 0x75 - SetModelVisibility: show or hide one model slot of the actor for the stage's
     /// duration (research/xim EffectRoutineParser.kt parseSection2 SetModelVisibilityRoutine);
@@ -529,6 +673,10 @@ impl StageKind {
             ANIMATION_LOCK_OPCODE | ANIMATION_LOCK_MAGIC_OPCODE => Self::AnimationLock,
             // research/xim EffectRoutineParser.kt parseSection2 - MovementLockEffect, argument-less.
             MOVEMENT_LOCK_OPCODE => Self::MovementLock,
+            // FFXiMain.dll retail-2026-09 dispatch case 45 (jump-table cell RVA 0x5DCD0) holds the
+            // actor's orientation for its duration; see `StageKind::HoldRotation`.
+            FACING_LOCK_OPCODE => Self::HoldRotation,
+            TURN_TOWARD_OPCODE => Self::TurnToward,
             // research/xim EffectRoutineParser.kt parseSection2 - SetModelVisibilityRoutine:
             // hidden u32, slot u16, ifEngaged u16 after delay/duration; no DatId.
             SET_MODEL_VISIBILITY_OPCODE if length_words * 4 >= SET_MODEL_VISIBILITY_PAYLOAD_LEN => {
@@ -585,6 +733,18 @@ impl StageKind {
             // form every melee routine uses (`ati0` links the weapon's `skaz` whoosh, `atk0`
             // the race/face `vatk` grunt).
             0x57 => Self::SubRoutine,
+            // research/xim EffectRoutineParser.kt parseSection2 - AdjustAnimationModeRoutine, one opcode
+            // per slot; its +8 dword is the variant value, not a DatId.
+            ADJUST_ANIM_MODE_BATTLE_OPCODE
+            | ADJUST_ANIM_MODE_IDLE_OPCODE
+            | ADJUST_ANIM_MODE_WALKING_OPCODE
+            | ADJUST_ANIM_MODE_RUNNING_OPCODE => Self::AnimationMode,
+            LOCK_LOOK_AT_OPCODE => Self::LockLookAt,
+            ACTOR_ROTATION_OPCODE | ACTOR_ROTATION_ALT_OPCODE
+                if length_words * 4 >= ACTOR_ROTATION_PAYLOAD_LEN =>
+            {
+                Self::ActorRotation
+            }
             _ => Self::Unknown,
         }
     }
@@ -604,6 +764,24 @@ pub struct Scheduler {
 pub struct TimedStage {
     pub frame: u32,
     pub stage: SchedulerStage,
+}
+
+/// The four AdjustAnimationModeRoutine opcodes, one per [`AnimModeSlot`] (research/xim
+/// EffectRoutineParser.kt parseSection2).
+pub const ADJUST_ANIM_MODE_BATTLE_OPCODE: u8 = 0x79;
+pub const ADJUST_ANIM_MODE_IDLE_OPCODE: u8 = 0x8C;
+pub const ADJUST_ANIM_MODE_WALKING_OPCODE: u8 = 0xA4;
+pub const ADJUST_ANIM_MODE_RUNNING_OPCODE: u8 = 0xA5;
+
+/// Which slot an animation-mode opcode switches, or `None` for any other opcode.
+pub fn anim_mode_slot_of_opcode(raw_type: u8) -> Option<AnimModeSlot> {
+    match raw_type {
+        ADJUST_ANIM_MODE_BATTLE_OPCODE => Some(AnimModeSlot::Battle),
+        ADJUST_ANIM_MODE_IDLE_OPCODE => Some(AnimModeSlot::Idle),
+        ADJUST_ANIM_MODE_WALKING_OPCODE => Some(AnimModeSlot::Walking),
+        ADJUST_ANIM_MODE_RUNNING_OPCODE => Some(AnimModeSlot::Running),
+        _ => None,
+    }
 }
 
 pub const NO_LOCAL_DIR: [u8; 4] = [0; 4];
@@ -719,6 +897,28 @@ impl Scheduler {
                         slot: read_u16(ID_OFFSET + 4),
                         if_engaged: read_u16(ID_OFFSET + 6) == 1,
                     });
+                let actor_rotation = (kind == StageKind::ActorRotation
+                    && stage_bytes >= ACTOR_ROTATION_PAYLOAD_LEN)
+                    .then(|| ActorRotation {
+                        angles_degrees: [
+                            f32::from_bits(read_u32(ACTOR_ROTATION_ANGLES_OFFSET)),
+                            f32::from_bits(read_u32(ACTOR_ROTATION_ANGLES_OFFSET + 4)),
+                            f32::from_bits(read_u32(ACTOR_ROTATION_ANGLES_OFFSET + 8)),
+                        ],
+                        mode: body[cursor + ACTOR_ROTATION_MODE_OFFSET],
+                    });
+                // FFXiMain.dll retail-2026-09 handler RVA 0x5AF2C takes this kind's +8 dword as a float:
+                // the turn's per-frame step in degrees, converted by `.rdata 0x32A9F4` before it is stored
+                // on the actor. It is payload, not a DatId.
+                let turn_toward_step_degrees = (kind == StageKind::TurnToward
+                    && stage_bytes >= TURN_TOWARD_PAYLOAD_LEN)
+                    .then(|| f32::from_bits(read_u32(TURN_TOWARD_STEP_OFFSET)));
+                let animation_mode = anim_mode_slot_of_opcode(raw_type)
+                    .filter(|_| kind == StageKind::AnimationMode)
+                    .map(|slot| AnimationMode {
+                        slot,
+                        variant: read_u32(ID_OFFSET),
+                    });
                 // research/xim EffectRoutineParser.kt parseSection2 0x19 - the +8 dword is
                 // the spell animation index, not a DatId.
                 let spell_effect = payload
@@ -765,6 +965,9 @@ impl Scheduler {
                     || actor_fade.is_some()
                     || idle_transition_time.is_some()
                     || model_visibility.is_some()
+                    || actor_rotation.is_some()
+                    || turn_toward_step_degrees.is_some()
+                    || animation_mode.is_some()
                     || control_flow.is_some()
                     || matches!(
                         kind,
@@ -816,6 +1019,9 @@ impl Scheduler {
                         idle_transition_time,
                         flinch_duration,
                         model_visibility,
+                        actor_rotation,
+                        turn_toward_step_degrees,
+                        animation_mode,
                         spell_effect,
                         sound_range,
                         control_flow,
@@ -1971,6 +2177,7 @@ mod tests {
         for (opcode, words, kind) in [
             (ANIMATION_LOCK_MAGIC_OPCODE, 2, StageKind::AnimationLock),
             (MOVEMENT_LOCK_OPCODE, 2, StageKind::MovementLock),
+            (LOCK_LOOK_AT_OPCODE, 3, StageKind::LockLookAt),
             (
                 SET_MODEL_VISIBILITY_OPCODE,
                 4,
@@ -2000,6 +2207,16 @@ mod tests {
                 KNOCKBACK_ALT_OPCODE,
                 KNOCKBACK_STAGE_WORDS as usize,
                 StageKind::Knockback,
+            ),
+            (
+                ACTOR_ROTATION_OPCODE,
+                ACTOR_ROTATION_STAGE_WORDS,
+                StageKind::ActorRotation,
+            ),
+            (
+                ACTOR_ROTATION_ALT_OPCODE,
+                ACTOR_ROTATION_STAGE_WORDS,
+                StageKind::ActorRotation,
             ),
             (DISPLAY_DEAD_OPCODE, 5, StageKind::DisplayDead),
             (TRANSITION_TO_IDLE_OPCODE, 3, StageKind::TransitionToIdle),
@@ -2135,6 +2352,76 @@ mod tests {
         assert_eq!(st.kind, StageKind::AnimationLock);
         assert_eq!(st.duration_frames, 112);
         assert_eq!(st.id, NO_STAGE_ID);
+    }
+
+    // The look-at suppression stage carries one operand, the duration word at `[record+6]`; the dword
+    // after it is zero in every shipped record of this install, so it must not surface as a DatId.
+    #[test]
+    fn lock_look_at_reads_its_duration_operand_and_no_id() {
+        const LOCK_LOOK_AT_DURATION_FRAMES: u16 = 192;
+        let mut body = vec![0u8; SCHEDULER_HEADER_LEN];
+        body.extend(timed_stage_bytes(
+            LOCK_LOOK_AT_OPCODE,
+            ARGLESS_STAGE_WORDS + 1,
+            0,
+            LOCK_LOOK_AT_DURATION_FRAMES,
+        ));
+        body.extend_from_slice(&0u32.to_le_bytes());
+
+        let s = Scheduler::parse(*b"lkla", &body).unwrap();
+        let st = s.stages[0].stage;
+        assert_eq!(st.kind, StageKind::LockLookAt);
+        assert_eq!(st.duration_frames, LOCK_LOOK_AT_DURATION_FRAMES);
+        assert_eq!(st.id, NO_STAGE_ID);
+    }
+
+    const ACTOR_ROTATION_STAGE_WORDS: usize = ACTOR_ROTATION_PAYLOAD_LEN / 4;
+
+    /// The shipped rotation records all hold a zero first/third angle, the turn on the middle one,
+    /// and mode byte 0. A stage shorter than the payload is not a rotation: it would read past its
+    /// own bytes.
+    #[test]
+    fn actor_rotation_reads_its_euler_and_mode_and_is_not_a_datid() {
+        const TURN_DEGREES: f32 = -135.0;
+        const ROTATION_FRAMES: u16 = 24;
+        let mut body = vec![0u8; SCHEDULER_HEADER_LEN];
+        body.extend(timed_stage_bytes(
+            ACTOR_ROTATION_OPCODE,
+            ACTOR_ROTATION_STAGE_WORDS as u8,
+            0,
+            ROTATION_FRAMES,
+        ));
+        for angle in [0.0f32, TURN_DEGREES, 0.0] {
+            body.extend_from_slice(&angle.to_le_bytes());
+        }
+        body.extend_from_slice(&[1, 0, 0, 0]);
+
+        let s = Scheduler::parse(*b"rota", &body).unwrap();
+        let st = s.stages[0].stage;
+        assert_eq!(st.kind, StageKind::ActorRotation);
+        assert_eq!(st.duration_frames, ROTATION_FRAMES);
+        assert_eq!(
+            st.actor_rotation,
+            Some(ActorRotation {
+                angles_degrees: [0.0, TURN_DEGREES, 0.0],
+                mode: 1,
+            })
+        );
+        assert_eq!(
+            st.id, NO_STAGE_ID,
+            "the euler and mode dwords must not read as a DatId"
+        );
+    }
+
+    #[test]
+    fn actor_rotation_needs_its_whole_payload_to_map() {
+        for words in 3..ACTOR_ROTATION_STAGE_WORDS {
+            assert_eq!(
+                StageKind::from_stage(ACTOR_ROTATION_OPCODE, words),
+                StageKind::Unknown,
+                "{words} dwords cannot hold three angles and a mode"
+            );
+        }
     }
 
     // research/xim EffectRoutineParser.kt parseSection2 — delay is read for EVERY opcode, so an 8-byte

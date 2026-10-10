@@ -9,7 +9,7 @@ use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat, T
 use bevy::render::view::screenshot::{save_to_disk, Capturing, Screenshot};
 use bevy::winit::WinitPlugin;
 use kuluu_render::camera::OperatorCamera;
-use kuluu_render::distortion_pass::{ActiveDistortion, DistortionPassPlugin};
+use kuluu_render::distortion_pass::{ActiveDistortion, DistortionPassPlugin, LiveField};
 
 const SIZE: u32 = 512;
 const BASELINE_FRAME: u32 = 60;
@@ -22,6 +22,12 @@ const HOLD_SECONDS: u64 = 60;
 const STEP_SECONDS: f64 = 1.0 / 60.0;
 const MARKER_OFFSET: f32 = 1.0;
 const CAMERA_DISTANCE: f32 = 6.0;
+const FIELD_HALF_EXTENT: f32 = 0.7;
+/// Two fans over the marker's path: the control carries no haze offset and must leave its pixels
+/// untouched, the probe carries one and must show the scene displaced inside the diamond.
+const PROBE_CONTROL_X: f32 = -0.9;
+const PROBE_HAZE_X: f32 = 0.9;
+const PROBE_HAZE_OFFSET: f32 = 0.1;
 
 #[derive(Resource)]
 struct CaptureTarget {
@@ -130,9 +136,20 @@ fn capture(
         };
     }
     if *frame == ENABLE_FRAME {
-        distortion.started_at = Instant::now();
-        distortion.duration_secs = HOLD_SECONDS as f32;
-        distortion.expires_at = Some(Instant::now() + Duration::from_secs(HOLD_SECONDS));
+        // A 0x22 field has no texture of its own — the footprint is built in and the scene copy is
+        // what it draws — so both fans are armed from extent, haze and life alone.
+        for (x, haze) in [(PROBE_CONTROL_X, 0.0), (PROBE_HAZE_X, PROBE_HAZE_OFFSET)] {
+            distortion.push(LiveField {
+                center: Vec3::new(x, 0.0, 0.0),
+                half_extent: Vec2::splat(FIELD_HALF_EXTENT),
+                haze_offset: haze,
+                started_at: Instant::now(),
+                duration_secs: HOLD_SECONDS as f32,
+                envelope: None,
+                follow: None,
+                owned_by: None,
+            });
+        }
     }
     if *frame == RESET_FRAME {
         *distortion = ActiveDistortion::default();
@@ -149,6 +166,26 @@ fn capture(
             .observe(save_to_disk(target.directory.join(filename)));
     }
     if *frame >= EXIT_FRAME && capturing.is_empty() {
+        verdict(&target.directory);
         exit.write(AppExit::Success);
     }
+}
+
+/// A pass whose shader never resolved draws nothing, and every capture then looks clean. Say so here,
+/// where someone is holding the three frames, rather than leaving it for a reviewer to notice.
+fn verdict(directory: &std::path::Path) {
+    let read = |name: &str| -> Vec<u8> { std::fs::read(directory.join(name)).unwrap_or_default() };
+    let baseline = read("distortion-baseline.png");
+    let active = read("distortion-active.png");
+    let after_reset = read("distortion-after-reset.png");
+    println!(
+        "baseline {} bytes, active {} bytes, after reset {} bytes",
+        baseline.len(),
+        active.len(),
+        after_reset.len()
+    );
+    assert!(
+        !active.is_empty() && active != baseline,
+        "the armed frames are byte-identical to the baseline: no haze field drew anything"
+    );
 }

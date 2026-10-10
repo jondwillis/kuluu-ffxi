@@ -376,6 +376,7 @@ fn do_rebake(
             BakedActor {
                 min_mesh_y: 0.0,
                 actor_height: 1.7,
+                skeleton_span: None,
             },
         ))
         .id();

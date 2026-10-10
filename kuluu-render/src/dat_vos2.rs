@@ -637,6 +637,7 @@ pub fn process_load_vos2_requests(
                 commands.entity(bevy_e).insert(crate::scene::BakedActor {
                     min_mesh_y: actor_min_y,
                     actor_height,
+                    skeleton_span: None,
                 });
                 info!(
                     "skinned actor spawn: file_id={} entity_id={} verts={} groups={} \
@@ -692,6 +693,7 @@ pub fn process_load_vos2_requests(
                 commands.entity(bevy_e).insert(crate::scene::BakedActor {
                     min_mesh_y: merged_min,
                     actor_height: (merged_max - merged_min).max(0.1),
+                    skeleton_span: None,
                 });
             }
         }
@@ -1556,6 +1558,7 @@ pub fn process_load_vos2_requests_ffxi(
         commands.entity(bevy_e).insert(BakedActor {
             min_mesh_y: actor_min,
             actor_height,
+            skeleton_span: None,
         });
     }
 }
@@ -2410,6 +2413,7 @@ pub fn spawn_prepared_equipped(
         commands.entity(parent).insert(BakedActor {
             min_mesh_y: prepared.min_mesh_y,
             actor_height,
+            skeleton_span: None,
         });
     }
     spawned

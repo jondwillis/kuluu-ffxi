@@ -60,6 +60,7 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
     let actor = commands.spawn((assets, Transform::IDENTITY)).id();
     commands.queue(move |world: &mut World| {
         world.write_message(SchedulerStageEvent {
+            identity: Default::default(),
             actor,
             target: Some(actor),
             stage: particle_stage(SOURCE),
@@ -133,6 +134,7 @@ fn captures_immediate_link_bindings_through_production_rendering() {
         )))
         .add_plugins(crate::ffxi_particle_material::FfxiParticleMaterialPlugin)
         .init_resource::<ParticleSimulator>()
+        .init_resource::<crate::distortion_pass::ActiveDistortion>()
         .init_resource::<crate::graphics_settings::GraphicsSettings>()
         .add_message::<SchedulerStageEvent>()
         .add_message::<crate::audio::SfxEvent>()

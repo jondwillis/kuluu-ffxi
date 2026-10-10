@@ -1,5 +1,5 @@
 use std::sync::OnceLock;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use bevy::asset::RenderAssetUsages;
 use bevy::mesh::{Indices, PrimitiveTopology};
@@ -437,9 +437,12 @@ enum ChildPayload {
         vertical_weight: f32,
     },
     Distortion {
-        haze_offset_x: f32,
+        haze_offset: f32,
         life_frames: f32,
         envelope: Option<ffxi_dat::particle_gen::KeyFrameTrack>,
+        // Built-in footprint at the authored scale, resolved once at factory time. None = a
+        // degenerate scale; the child then arms nothing but keeps running.
+        half_extent: Option<Vec2>,
     },
     Rumble {
         envelope: ffxi_dat::particle_gen::KeyFrameTrack,
@@ -1186,21 +1189,68 @@ fn rescale_track(
     }
 }
 
-fn arm_distortion_effect(
-    haze_offset_x: f32,
-    life_frames: f32,
+// The footprint a 0x22 element draws: its built-in unit diamond (center plus four axis endpoints at
+// ±1) at the authored init scale. Nothing is resolved for it — no mesh, image or sprite sheet — so an
+// absent linked name is normal here and arms anyway (`kuluu-render/src/distortion_pass.rs`, record
+// `.agents/skills/retail-observe/references/2026-10-07-procedural-distortion.md`). A zero scale is
+// degenerate, so that def draws nothing rather than something guessed.
+fn procedural_half_extent(
+    generator: &ffxi_dat::particle_gen::ParticleGeneratorDef,
+) -> Option<Vec2> {
+    let sx = generator.init_scale[0].abs();
+    let sy = generator.init_scale[1].abs();
+    if sx == 0.0 || sy == 0.0 {
+        return None;
+    }
+    Some(Vec2::new(
+        sx * crate::distortion_pass::FOOTPRINT_LOCAL[3][0].abs(),
+        sy * crate::distortion_pass::FOOTPRINT_LOCAL[4][1].abs(),
+    ))
+}
+
+// Anchor a live haze field at its attach-frame origin (the hit site): built-in footprint, authored
+// scale and haze offset, alpha track fading coverage only.
+fn push_distortion_field(
+    dist: &ffxi_dat::particle_gen::DistortionGeneratorDef,
+    origin: Vec3,
     envelope: Option<ffxi_dat::particle_gen::KeyFrameTrack>,
-    commands: &mut Commands,
-) {
-    let life_secs = life_frames / ROUTINE_FPS;
-    commands.insert_resource(crate::distortion_pass::ActiveDistortion {
-        haze_offset_x,
-        expires_at: Some(Instant::now() + Duration::from_secs_f32(life_secs)),
-        envelope,
+    follow: Option<Entity>,
+    owned_by: Option<crate::distortion_pass::EffectHandle>,
+    distortion: &mut crate::distortion_pass::ActiveDistortion,
+) -> bool {
+    let Some(half_extent) = procedural_half_extent(&dist.generator_view) else {
+        return false;
+    };
+    distortion.push(crate::distortion_pass::LiveField {
+        center: origin,
+        half_extent,
+        haze_offset: dist.haze_offset,
         started_at: Instant::now(),
-        duration_secs: life_secs,
-        strength: 1.0,
+        duration_secs: dist.max_life_frames / ROUTINE_FPS,
+        envelope,
+        follow: follow.map(crate::distortion_pass::FieldFollow::new),
+        owned_by,
     });
+    true
+}
+
+/// Which actor carries a directly armed field, mirroring how [`attach_frame`] chooses its reference:
+/// a target-reference mode rides the target and falls back to the routine's owner when there is no
+/// target, as `attach_frame` does. Retail sets the unattached flag exactly when the attach code is 0,
+/// and an unattached element is carried by nothing.
+fn field_carry_actor(
+    def: &ParticleGeneratorDef,
+    owner: Entity,
+    target: Option<Entity>,
+) -> Option<Entity> {
+    use ffxi_dat::particle_gen::attach_mode as mode;
+    match def.attach_mode {
+        mode::UNATTACHED => None,
+        mode::TARGET | mode::TARGET_WITH_SOURCE_YAW | mode::TARGET_TO_SOURCE => {
+            Some(target.unwrap_or(owner))
+        }
+        _ => Some(owner),
+    }
 }
 
 // Retail sets the unattached flag exactly when the attach code is 0.
@@ -1261,6 +1311,7 @@ pub fn spawn_particle_generators(
     mut mats: ResMut<Assets<FfxiParticleMaterial>>,
     mut images: ResMut<Assets<Image>>,
     mut sim: ResMut<ParticleSimulator>,
+    mut distortion: ResMut<crate::distortion_pass::ActiveDistortion>,
     mut commands: Commands,
 ) {
     let tracing = trace.is_some_and(|t| t.0);
@@ -1348,20 +1399,40 @@ pub fn spawn_particle_generators(
                     };
                     let life_secs = dist.max_life_frames / ROUTINE_FPS;
                     let envelope_pts = envelope.as_ref().map(|t| t.points.len()).unwrap_or(0);
-                    arm_distortion_effect(
-                        dist.haze_offset_x,
-                        dist.max_life_frames,
-                        envelope.clone(),
-                        &mut commands,
+                    // The field anchors at its attach-frame origin — the hit site, same
+                    // convention as the sound and rumble cues in this chain.
+                    let target_ent = q_action_target.get(ev.actor).ok().and_then(|t| t.0);
+                    let origin = attach_frame(&dist.generator_view, ev.actor, target_ent, &attach)
+                        .map(|f| f.point(Vec3::from_array(dist.generator_view.base_position)))
+                        .unwrap_or(actor_xf.translation);
+                    let carry = field_carry_actor(&dist.generator_view, ev.actor, target_ent);
+                    // The stage names the generator it spawned, so the field stays answerable to it:
+                    // a later Stop or dampen for `(actor, id)` reaches the haze as well as particles.
+                    let handle = crate::distortion_pass::EffectHandle {
+                        owner: ev.actor,
+                        generator: ev.stage.stage.id,
+                    };
+                    let armed = push_distortion_field(
+                        dist,
+                        origin,
+                        envelope,
+                        carry,
+                        Some(handle),
+                        &mut distortion,
                     );
                     if tracing {
                         info!(
-                            "animationtest trace: particle stage {} [{}] — DISTORTION armed haze_x={:.3} life {:.1}s envelope={} pts",
+                            "animationtest trace: particle stage {} [{}] — DISTORTION field haze={:.3} life {:.1}s envelope={} pts{}",
                             String::from_utf8_lossy(&ev.stage.stage.id),
                             String::from_utf8_lossy(&local_dir),
-                            dist.haze_offset_x,
+                            dist.haze_offset,
                             life_secs,
                             envelope_pts,
+                            if armed {
+                                ""
+                            } else {
+                                " — NOT ARMED: authored scale is degenerate"
+                            },
                         );
                     }
                 } else if tracing {
@@ -1876,6 +1947,7 @@ pub fn tick_particle_simulator(
     wall_washes: Option<Res<WallWashOff>>,
     mut trace_writer: MessageWriter<crate::scheduler_runtime::ParticleSpawnTrace>,
     mut sfx_writer: MessageWriter<crate::audio::SfxEvent>,
+    mut distortion: ResMut<crate::distortion_pass::ActiveDistortion>,
 ) {
     // Box kill switches, applied as a per-entity marker diff (live both ways): glow billboards
     // hide while the box's lamps row is set; wash volumes hide when their box row is unchecked.
@@ -1907,6 +1979,7 @@ pub fn tick_particle_simulator(
         trace.is_some_and(|t| t.0),
         &mut trace_writer,
         &mut sfx_writer,
+        &mut distortion,
     );
 }
 
@@ -2120,6 +2193,7 @@ fn instantiate_child_generators(
     tracing: bool,
     trace_writer: &mut MessageWriter<crate::scheduler_runtime::ParticleSpawnTrace>,
     sfx_writer: &mut MessageWriter<crate::audio::SfxEvent>,
+    distortion: &mut crate::distortion_pass::ActiveDistortion,
 ) {
     struct SpawnReq {
         // The generator that holds child_factories[factory_idx].
@@ -2202,6 +2276,9 @@ fn instantiate_child_generators(
         };
         // Clone the factory's payload out before pushing: the push shifts every index.
         let children = f.children.clone();
+        // A child's field answers to the generator holding its factory, so a dampen on that generator
+        // takes the haze with the rest of the effect instead of only its particles.
+        let factory_origin = sim.generators[r.factory_owner].origin_routine;
         match &f.payload {
             ChildPayload::Sound {
                 se_id,
@@ -2223,21 +2300,49 @@ fn instantiate_child_generators(
                 play_generator_sound(*se_id, *near, *far, *vertical_weight, r.pos, sfx_writer);
             }
             ChildPayload::Distortion {
-                haze_offset_x,
+                haze_offset,
                 life_frames,
                 envelope,
+                half_extent,
             } => {
+                let armed = match half_extent {
+                    Some(half) => {
+                        distortion.push(crate::distortion_pass::LiveField {
+                            center: r.pos,
+                            half_extent: *half,
+                            haze_offset: *haze_offset,
+                            started_at: Instant::now(),
+                            duration_secs: *life_frames / ROUTINE_FPS,
+                            envelope: envelope.clone(),
+                            // A child fires at a point along its parent's path, and no attach mode
+                            // governs that placement, so nothing anchors it to an actor.
+                            follow: None,
+                            owned_by: factory_origin.map(|o| {
+                                crate::distortion_pass::EffectHandle {
+                                    owner: o.owner,
+                                    generator: o.gen_id,
+                                }
+                            }),
+                        });
+                        true
+                    }
+                    None => false,
+                };
                 if tracing {
                     let line = format!(
-                        "child {} — DISTORTION armed haze_x={:.3} life {:.1}s",
+                        "child {} — DISTORTION field haze={:.3} life {:.1}s{}",
                         String::from_utf8_lossy(&f.name),
-                        *haze_offset_x,
-                        *life_frames / ROUTINE_FPS
+                        *haze_offset,
+                        *life_frames / ROUTINE_FPS,
+                        if armed {
+                            ""
+                        } else {
+                            " — NOT ARMED: authored scale is degenerate"
+                        },
                     );
                     info!("animationtest trace: {line}");
                     trace_writer.write(crate::scheduler_runtime::ParticleSpawnTrace(line));
                 }
-                arm_distortion_effect(*haze_offset_x, *life_frames, envelope.clone(), commands);
             }
             ChildPayload::Rumble {
                 envelope,
@@ -2384,9 +2489,10 @@ fn resolve_child_bindings(
                         name: id,
                         on_expiry,
                         payload: ChildPayload::Distortion {
-                            haze_offset_x: dist.haze_offset_x,
+                            haze_offset: dist.haze_offset,
                             life_frames: dist.max_life_frames,
                             envelope,
+                            half_extent: procedural_half_extent(&dist.generator_view),
                         },
                         children: Vec::new(),
                     });
@@ -4048,6 +4154,8 @@ fn empty_mesh() -> Mesh {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Tests use Duration directly; non-test code does not import it at the file root.
+    use std::time::Duration;
 
     mod cleanup_capture;
     #[cfg(not(target_arch = "wasm32"))]
@@ -4155,7 +4263,7 @@ mod tests {
             position_z_track: None,
             weighted_mesh_weight_tracks: [None; ffxi_dat::particle_gen::WEIGHTED_MESH_WEIGHTS],
             tod_volume_track: None,
-            haze_offset_x: None,
+            haze_offset: None,
             parent_rotate: false,
             parent_color: false,
             parent_scale: false,
@@ -4436,6 +4544,7 @@ mod tests {
         let mut sim = ParticleSimulator::default();
         sim.generators.push(g);
         world.insert_resource(sim);
+        world.insert_resource(crate::distortion_pass::ActiveDistortion::default());
 
         world.run_system_once(sync_particle_meshes).unwrap();
         assert!(
@@ -4504,6 +4613,7 @@ mod tests {
         let mut sim = ParticleSimulator::default();
         sim.generators.push(g);
         world.insert_resource(sim);
+        world.insert_resource(crate::distortion_pass::ActiveDistortion::default());
         (world, mesh, entity)
     }
 
@@ -4816,7 +4926,9 @@ mod tests {
         // tick reads the Dynamic Lights setting (Default = Vanilla, texture path).
         world.insert_resource(crate::graphics_settings::GraphicsSettings::default());
         world.insert_resource(Assets::<Mesh>::default());
+        world.insert_resource(crate::distortion_pass::ActiveDistortion::default());
         world.insert_resource(sim);
+        world.insert_resource(crate::distortion_pass::ActiveDistortion::default());
         world.run_system_once(tick_particle_simulator).unwrap();
 
         let sim = world.resource::<ParticleSimulator>();
@@ -6569,6 +6681,7 @@ mod tests {
         let mut sim = ParticleSimulator::default();
         sim.generators.push(g);
         world.insert_resource(sim);
+        world.insert_resource(crate::distortion_pass::ActiveDistortion::default());
         world.insert_resource(Time::<()>::default());
 
         world.run_system_once(track_attached_origins).unwrap();
@@ -6613,6 +6726,7 @@ mod tests {
         let mut sim = ParticleSimulator::default();
         sim.generators.push(g);
         world.insert_resource(sim);
+        world.insert_resource(crate::distortion_pass::ActiveDistortion::default());
         world.insert_resource(Time::<()>::default());
 
         world.run_system_once(track_attached_origins).unwrap();
@@ -8757,6 +8871,9 @@ mod tests {
                 transition_in: 0,
                 transition_out: 0,
                 random_group: None,
+                actor_rotation: None,
+                animation_mode: None,
+                turn_toward_step_degrees: None,
                 local_dir: HIT_SPARK_DIR,
                 model_transform: None,
                 follow_points: None,
@@ -8787,6 +8904,7 @@ mod tests {
             .init_asset::<Image>()
             .init_asset::<FfxiParticleMaterial>()
             .init_resource::<ParticleSimulator>()
+            .init_resource::<crate::distortion_pass::ActiveDistortion>()
             .add_message::<crate::scheduler_runtime::SchedulerStageEvent>()
             .add_message::<crate::scheduler_runtime::ParticleSpawnTrace>()
             .add_message::<crate::audio::SfxEvent>()
@@ -8803,6 +8921,7 @@ mod tests {
             .insert((assets, crate::scheduler_runtime::ActionTarget(Some(victim))));
         app.world_mut()
             .write_message(crate::scheduler_runtime::SchedulerStageEvent {
+                identity: Default::default(),
                 actor: attacker,
                 target: None,
                 stage: particle_stage(gen_id),
@@ -8963,6 +9082,7 @@ mod tests {
             .init_asset::<Image>()
             .init_asset::<FfxiParticleMaterial>()
             .init_resource::<ParticleSimulator>()
+            .init_resource::<crate::distortion_pass::ActiveDistortion>()
             .add_message::<SchedulerStageEvent>()
             .add_message::<crate::scheduler_runtime::ParticleSpawnTrace>()
             .add_message::<crate::audio::SfxEvent>()
@@ -8988,6 +9108,7 @@ mod tests {
             crate::scheduler_runtime::ActionTarget(Some(actor)),
         ));
         app.world_mut().write_message(SchedulerStageEvent {
+            identity: Default::default(),
             actor,
             target: Some(actor),
             stage,
@@ -9103,6 +9224,7 @@ mod tests {
             .init_asset::<Image>()
             .init_asset::<FfxiParticleMaterial>()
             .init_resource::<ParticleSimulator>()
+            .init_resource::<crate::distortion_pass::ActiveDistortion>()
             .add_message::<SchedulerStageEvent>()
             .add_message::<crate::scheduler_runtime::ParticleSpawnTrace>()
             .add_message::<crate::audio::SfxEvent>()
@@ -9127,6 +9249,7 @@ mod tests {
         let actor = spawn_posed_actor(&mut app, &skeleton, &pose, ACTOR_WORLD);
         app.world_mut().entity_mut(actor).insert(assets);
         app.world_mut().write_message(SchedulerStageEvent {
+            identity: Default::default(),
             actor,
             target: None,
             stage,
@@ -9218,7 +9341,7 @@ mod tests {
         ];
         let at_root = |offset: Vec3| JointReference {
             index: 0,
-            unk_v0: [0.0; 3],
+            rotation: [0.0; 3],
             position_offset: offset.to_array(),
         };
         let mut references: Vec<JointReference> = (0..SYNTHETIC_REFERENCE_TABLE_LEN)
@@ -9226,7 +9349,7 @@ mod tests {
             .collect();
         references[1] = JointReference {
             index: 1,
-            unk_v0: [0.0; 3],
+            rotation: [0.0; 3],
             position_offset: [0.0; 3],
         };
         references[ffxi_dat::skel::standard_position::ABOVE_HEAD] =
@@ -9248,6 +9371,7 @@ mod tests {
             id: ffxi_dat::datid::DatId::from_str("synt"),
             joints,
             references,
+            look_at_limits: Vec::new(),
             bounding_boxes: vec![BoundingBox {
                 y_max: 0.0,
                 y_min: -SYNTHETIC_BOX_HEIGHT,
@@ -9318,6 +9442,7 @@ mod tests {
             .init_asset::<Image>()
             .init_asset::<FfxiParticleMaterial>()
             .init_resource::<ParticleSimulator>()
+            .init_resource::<crate::distortion_pass::ActiveDistortion>()
             .add_message::<SchedulerStageEvent>()
             .add_message::<crate::scheduler_runtime::ParticleSpawnTrace>()
             .add_message::<crate::audio::SfxEvent>()
@@ -9356,6 +9481,7 @@ mod tests {
             crate::scheduler_runtime::ActionTarget(Some(target)),
         ));
         app.world_mut().write_message(SchedulerStageEvent {
+            identity: Default::default(),
             actor: caster,
             target: Some(target),
             stage: particle_stage(SYNTHETIC_GENERATOR),
@@ -9527,6 +9653,7 @@ mod tests {
         app.world_mut().entity_mut(actor).insert(assets);
         for stage in [lettering_stage, sparkle_stage] {
             app.world_mut().write_message(SchedulerStageEvent {
+                identity: Default::default(),
                 actor,
                 target: None,
                 stage,
@@ -10085,7 +10212,9 @@ mod tests {
         // tick reads the Dynamic Lights setting for its enhance-mode suppression (Default =
         // Vanilla, so these tests exercise the retail texture path).
         world.insert_resource(crate::graphics_settings::GraphicsSettings::default());
+        world.insert_resource(crate::distortion_pass::ActiveDistortion::default());
         world.insert_resource(sim);
+        world.insert_resource(crate::distortion_pass::ActiveDistortion::default());
         world
     }
 
@@ -10377,9 +10506,10 @@ mod tests {
             name: *b"ai90",
             on_expiry: false,
             payload: ChildPayload::Distortion {
-                haze_offset_x: 0.02,
+                haze_offset: 0.02,
                 life_frames: 60.0,
                 envelope: None,
+                half_extent: Some(Vec2::ONE),
             },
             children: Vec::new(),
         });
@@ -10388,8 +10518,98 @@ mod tests {
         let mut world = child_test_world(sim);
         tick_world(&mut world, ONE_FRAME_SECS); // parent emits; the child arms on instantiation
 
+        // The primed first tick emits ppe+1 = 2 parent particles; each particle arms its own
+        // field at its own position.
         let dist = world.resource::<crate::distortion_pass::ActiveDistortion>();
-        assert_eq!(dist.haze_offset_x, 0.02);
+        assert_eq!(dist.fields.len(), 2);
+        for f in &dist.fields {
+            assert_eq!(f.haze_offset, 0.02);
+            assert_eq!(f.half_extent, Vec2::ONE);
+        }
+    }
+
+    // Retail's resolver branches on element type 0x22 and returns before the named-resource search, so
+    // a haze element whose linked name resolves to nothing is the ordinary case rather than a failure:
+    // g142 in the crit chain names `dist`, and no mesh or image called `dist` exists in the global DAT
+    // set at all (`.agents/skills/retail-observe/references/2026-10-07-procedural-distortion.md`).
+    #[test]
+    fn haze_def_arms_with_no_mesh_or_image_resolved() {
+        let view = ParticleGeneratorDef {
+            init_scale: [1.0, 1.0, 1.0],
+            mesh_id: *b"dist",
+            ..Default::default()
+        };
+        assert_eq!(procedural_half_extent(&view), Some(Vec2::ONE));
+
+        let degenerate = ParticleGeneratorDef {
+            init_scale: [0.0, 1.5, 1.0],
+            ..view
+        };
+        assert_eq!(
+            procedural_half_extent(&degenerate),
+            None,
+            "a zero authored scale leaves no footprint to draw"
+        );
+
+        let def = ffxi_dat::particle_gen::DistortionGeneratorDef {
+            haze_offset: 0.02,
+            max_life_frames: 45.0,
+            generator_view: view,
+            ..Default::default()
+        };
+        let mut distortion = crate::distortion_pass::ActiveDistortion::default();
+        let handle = crate::distortion_pass::EffectHandle {
+            owner: Entity::from_bits(5),
+            generator: *b"g142",
+        };
+        assert!(
+            push_distortion_field(&def, Vec3::ZERO, None, None, Some(handle), &mut distortion),
+            "an unresolvable linked name must not stop a 0x22 field from arming"
+        );
+        let armed = &distortion.fields[0];
+        // The authored g142 values land on the field as written: unit axes at scale [1,1,1], haze
+        // 0.02, a 45-frame life
+        // (`.agents/skills/retail-observe/references/2026-10-07-procedural-distortion.md`).
+        assert_eq!(armed.half_extent, Vec2::ONE);
+        assert_eq!(armed.haze_offset, 0.02);
+        assert_eq!(armed.duration_secs, def.max_life_frames / ROUTINE_FPS);
+        // The field stays answerable to the generator that armed it: a dampen for `(owner, id)` finds
+        // it by exactly that pair.
+        assert_eq!(armed.owned_by, Some(handle));
+    }
+
+    /// The carrying actor comes from the attach mode: a target-reference element rides the target and
+    /// falls back to the routine's owner where `attach_frame` would, a source one rides the caster, and
+    /// an unattached element is carried by nothing.
+    #[test]
+    fn authored_attach_mode_names_the_carrying_actor() {
+        use ffxi_dat::particle_gen::attach_mode as mode;
+        let owner = Entity::from_bits(7);
+        let target = Entity::from_bits(9);
+        let with = |attach_mode: u8| ParticleGeneratorDef {
+            attach_mode,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            field_carry_actor(&with(mode::TARGET), owner, Some(target)),
+            Some(target),
+            "a target-reference element rides its target"
+        );
+        assert_eq!(
+            field_carry_actor(&with(mode::TARGET_TO_SOURCE), owner, None),
+            Some(owner),
+            "no target falls back to the routine's owner"
+        );
+        assert_eq!(
+            field_carry_actor(&with(mode::SOURCE), owner, Some(target)),
+            Some(owner),
+            "a source-reference element rides its caster"
+        );
+        assert_eq!(
+            field_carry_actor(&with(mode::UNATTACHED), owner, Some(target)),
+            None
+        );
     }
 
     // A sound child writes the same SfxEvent a 0x02 stage naming that generator would.

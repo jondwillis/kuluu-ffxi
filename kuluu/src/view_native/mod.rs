@@ -1,5 +1,18 @@
 #[cfg(feature = "debug-animation_room")]
 pub mod animation_test_scene;
+
+/// This build's animation-room drive surface, for the key-drive knob query. None means the room is
+/// not compiled in — the listener answers that explicitly rather than leaving a driver guessing.
+#[cfg(feature = "debug-animation_room")]
+pub fn animtest_knobs() -> Option<serde_json::Value> {
+    Some(animation_test_scene::knob_report())
+}
+
+#[cfg(not(feature = "debug-animation_room"))]
+pub fn animtest_knobs() -> Option<serde_json::Value> {
+    None
+}
+
 mod app_icon;
 pub mod auto_target;
 pub mod bridge;
@@ -21,6 +34,7 @@ pub mod launcher_backdrop;
 // until then.
 #[allow(deprecated)]
 pub mod launcher_ui;
+pub mod locked_camera;
 #[allow(deprecated)]
 pub mod model_viewer;
 pub mod nameplate_occlude;
@@ -65,9 +79,7 @@ use tokio::runtime::Handle as RtHandle;
 use crate::launcher::Defaults;
 
 use self::bridge::NativeSource;
-use self::input::{
-    AutoRun, CameraAutoRecenter, CommandTx, HeadingTurnAccum, LocalPlayerPrediction,
-};
+use self::input::{AutoRun, CommandTx, HeadingTurnAccum, LocalPlayerPrediction};
 use self::launcher_ui::{LoginErrorMsg, PendingConnect};
 
 fn drive_feathers_cursor(
@@ -582,7 +594,6 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
 
     app.insert_resource(Time::<Fixed>::from_hz(60.0))
         .init_resource::<AutoRun>()
-        .init_resource::<CameraAutoRecenter>()
         .init_resource::<HeadingTurnAccum>()
         .init_resource::<LocalPlayerPrediction>()
         .init_resource::<entity_list_hud::EntityListScroll>()
@@ -982,7 +993,7 @@ fn classify_disconnect_reason(reason: &str) -> DisconnectKind {
 }
 
 // A zone change keeps AppPhase::InGame, so despawn_ingame_entities never runs there. The
-// generator that armed the distortion leaves with the old zone's actors, so the smear goes too.
+// generators that anchored haze fields leave with the old zone's actors, so the fields go too.
 fn discard_distortion_on_zone_change(
     events: Res<EventLog>,
     mut cursor: Local<u64>,
@@ -1026,6 +1037,7 @@ fn despawn_ingame_entities(
         ResMut<kuluu_render::ffxi_actor_render::SelfKnockback>,
         ResMut<kuluu_render::scheduler_runtime::PendingKnockbacks>,
         Option<ResMut<kuluu_render::distortion_pass::ActiveDistortion>>,
+        Option<ResMut<kuluu_render::rotation_drives::SelfAuthoredHeading>>,
     ),
     mut last_zone: ResMut<LastAutoLoadedZone>,
     mut last_atmo: ResMut<LastAtmosphereZone>,
@@ -1066,6 +1078,11 @@ fn despawn_ingame_entities(
     *zone_geom.11 = kuluu_render::scheduler_runtime::PendingKnockbacks::default();
     if let Some(distortion) = zone_geom.12.as_mut() {
         **distortion = kuluu_render::distortion_pass::ActiveDistortion::default();
+    }
+    // A published authored heading is one tick's worth of facing; carrying it into the next zone would
+    // re-aim the local player wherever they land.
+    if let Some(authored) = zone_geom.13.as_mut() {
+        **authored = kuluu_render::rotation_drives::SelfAuthoredHeading::default();
     }
     last_zone.file_id = None;
     last_atmo.file_id = None;
@@ -1501,40 +1518,61 @@ mod zone_teardown_tests {
         world
     }
 
+    fn live_field_fixture() -> kuluu_render::distortion_pass::LiveField {
+        use std::time::Instant;
+        kuluu_render::distortion_pass::LiveField {
+            center: Vec3::ZERO,
+            half_extent: Vec2::ONE,
+            haze_offset: 0.02,
+            started_at: Instant::now(),
+            duration_secs: 60.0,
+            envelope: None,
+            follow: None,
+            owned_by: None,
+        }
+    }
+
+    /// A facing an authored turn published is one tick's worth: carried across a zone change it would
+    /// re-aim the player wherever they land.
+    #[test]
+    fn teardown_discards_an_unspent_authored_heading() {
+        use kuluu_render::rotation_drives::SelfAuthoredHeading;
+
+        let mut world = world_with_teardown_resources();
+        let mut authored = SelfAuthoredHeading::default();
+        authored.publish(1.0);
+        world.insert_resource(authored);
+        world.run_system_once(despawn_ingame_entities).unwrap();
+
+        assert!(world.resource::<SelfAuthoredHeading>().0.is_none());
+    }
+
     #[test]
     fn teardown_discards_unexpired_distortion() {
         use kuluu_render::distortion_pass::ActiveDistortion;
-        use std::time::{Duration, Instant};
 
         let mut world = world_with_teardown_resources();
-        world.insert_resource(ActiveDistortion {
-            expires_at: Some(Instant::now() + Duration::from_secs(60)),
-            strength: 1.0,
-            ..Default::default()
-        });
+        let mut distortion = ActiveDistortion::default();
+        distortion.push(live_field_fixture());
+        world.insert_resource(distortion);
         world.run_system_once(despawn_ingame_entities).unwrap();
 
-        let distortion = world.resource::<ActiveDistortion>();
-        assert!(distortion.expires_at.is_none());
-        assert_eq!(distortion.strength, 0.0);
+        assert!(world.resource::<ActiveDistortion>().fields.is_empty());
     }
 
     #[test]
     fn zone_change_discards_unexpired_distortion() {
         use kuluu_render::distortion_pass::ActiveDistortion;
-        use std::time::{Duration, Instant};
 
         let mut world = World::new();
         world.init_resource::<super::EventLog>();
-        world.insert_resource(ActiveDistortion {
-            expires_at: Some(Instant::now() + Duration::from_secs(60)),
-            strength: 1.0,
-            ..Default::default()
-        });
+        let mut distortion = ActiveDistortion::default();
+        distortion.push(live_field_fixture());
+        world.insert_resource(distortion);
         world
             .run_system_once(super::discard_distortion_on_zone_change)
             .unwrap();
-        assert!(world.resource::<ActiveDistortion>().expires_at.is_some());
+        assert_eq!(world.resource::<ActiveDistortion>().fields.len(), 1);
 
         world
             .resource_mut::<super::EventLog>()
@@ -1545,9 +1583,7 @@ mod zone_teardown_tests {
         world
             .run_system_once(super::discard_distortion_on_zone_change)
             .unwrap();
-        let distortion = world.resource::<ActiveDistortion>();
-        assert!(distortion.expires_at.is_none());
-        assert_eq!(distortion.strength, 0.0);
+        assert!(world.resource::<ActiveDistortion>().fields.is_empty());
     }
 
     #[test]

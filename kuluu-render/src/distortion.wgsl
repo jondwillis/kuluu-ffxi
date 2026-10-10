@@ -1,43 +1,88 @@
-// Screen-space distortion (haze/smear) pass — retail's 0x22 Distortion element. It samples the
-// previous frame's processed output with a horizontal bias so motion leaves a directional ghost,
-// composited over the current frame at low alpha (research/xim GLDrawer.kt hazeSwitch +
-// XimParticleShader.kt frag_hazePosition; the 75/25 current/previous blend is approximated here by
-// sampling last frame's buffer directly).
-struct PassUniform {
-    offset: vec2<f32>,   // x = sec2 0x32 horizontalOffset, y = unused
-    intensity: f32,      // ghost alpha (retail forces ~0.25)
-    copy_mode: f32,      // >0.5 => pure capture (output the sampled texel at full alpha)
+// One haze field from a 0x22 `Distortion` generator element, drawn the way retail draws it: a four
+// triangle fan (center plus four ordered rim points) whose texture is this frame's scene copy. No
+// authored image is involved anywhere — see
+// `.agents/skills/retail-observe/references/2026-10-07-procedural-distortion.md`.
+//
+// Every vertex carries its own unshifted sampling coordinate, so the haze translation lives entirely
+// in the drawn position and never moves a sample: what lands inside the fan is scene content from
+// the original footprint, displaced. Vertex alpha (center = the element's current alpha, rim =
+// transparent) rasterizes into the coverage gradient — there is no gradient texture.
+
+struct FanVertex {
+    // Projected fan corner with the haze translation applied along both draw axes.
+    @location(0) pos_shifted: vec2f,
+    // The same corner projected WITHOUT the haze translation; the sample comes from here.
+    @location(1) sample_ndc: vec2f,
+    // Top-left of the field's projected bounding box (flat across the fan).
+    @location(2) foot_origin: vec2f,
+    // One texel of the intermediate capture in NDC on each axis (flat across the fan). Retail holds
+    // the capture to at most 255 texels per axis, so a big field samples coarse.
+    @location(3) capture_step: vec2f,
+    @location(4) vertex_alpha: f32,
+    @location(5) vertex_rgb: f32,
 };
 
-@group(0) @binding(0) var<uniform> u: PassUniform;
-@group(0) @binding(1) var src_tex: texture_2d<f32>;
-@group(0) @binding(2) var src_sampler: sampler;
+// Same-frame scene (a copy taken before any field wrote), filterable.
+@group(0) @binding(0) var scene: texture_2d<f32>;
+@group(0) @binding(1) var scene_sampler: sampler;
+
+const TEXTURE_FACTOR_ALPHA: f32 = 0.50196078431372549; // the copy pass's [128,128,128,128] factor / 255
+const COVERAGE_MULTIPLIER: f32 = 4.0;                  // final fan's source-alpha multiplier
 
 struct VsOut {
-    @builtin(position) pos: vec4<f32>,
-    @location(0) uv: vec2<f32>,
+    @builtin(position) clip: vec4f,
+    @location(1) sample_ndc: vec2f,
+    @location(2) foot_origin: vec2f,
+    @location(3) capture_step: vec2f,
+    @location(4) vertex_alpha: f32,
+    @location(5) vertex_rgb: f32,
 };
 
-// Full-screen triangle in clip space (covers the viewport with three verts, no index buffer).
 @vertex
-fn vs(@builtin(vertex_index) vi: u32) -> VsOut {
-    let p = array<vec2<f32>, 3>(
-        vec2(-1.0, -3.0),
-        vec2(-1.0, 1.0),
-        vec2(3.0, 1.0),
-    );
+fn vs(in: FanVertex) -> VsOut {
     var out: VsOut;
-    out.pos = vec4<f32>(p[vi], 0.0, 1.0);
-    out.uv = p[vi] * vec2(0.5, -0.5) + vec2(0.5);
+    out.clip = vec4f(in.pos_shifted, 0.0, 1.0);
+    out.sample_ndc = in.sample_ndc;
+    out.foot_origin = in.foot_origin;
+    out.capture_step = in.capture_step;
+    out.vertex_alpha = in.vertex_alpha;
+    out.vertex_rgb = in.vertex_rgb;
     return out;
 }
 
+fn scene_uv(ndc: vec2f) -> vec2f {
+    // NDC is y-up, the texture is y-down. Clamped so filtering cannot reach past the frame edge.
+    let uv = (ndc - vec2f(-1.0, 1.0)) / vec2f(2.0, -2.0);
+    return clamp(uv, vec2f(0.0), vec2f(1.0));
+}
+
 @fragment
-fn fs(in: VsOut) -> @location(0) vec4<f32> {
-    let uv = in.uv + u.offset;
-    let c = textureSample(src_tex, src_sampler, clamp(uv, vec2(0.0), vec2(1.0)));
-    if (u.copy_mode > 0.5) {
-        return vec4<f32>(c.rgb, 1.0);
+fn fs(
+    @location(1) sample_ndc: vec2f,
+    @location(2) foot_origin: vec2f,
+    @location(3) capture_step: vec2f,
+    @location(4) vertex_alpha: f32,
+    @location(5) vertex_rgb: f32,
+) -> @location(0) vec4f {
+    // Coverage is 4 x interpolated vertex alpha x the copy pass's texture factor, clamped by the
+    // pipeline. A rim texel has no alpha and costs nothing.
+    let coverage = clamp(COVERAGE_MULTIPLIER * vertex_alpha * TEXTURE_FACTOR_ALPHA, 0.0, 1.0);
+    if (coverage <= 0.0) {
+        discard;
     }
-    return vec4<f32>(c.rgb, c.a * u.intensity);
+
+    // Sample the centre of a capture texel, never between two of them: retail's intermediate is at
+    // most 255 texels across, and it is magnified back over the footprint from there.
+    let grid = floor((sample_ndc - foot_origin) / max(capture_step, vec2f(1e-6))) + vec2f(0.5);
+    let warped = textureSampleLevel(
+        scene,
+        scene_sampler,
+        scene_uv(foot_origin + grid * capture_step),
+        0.0,
+    );
+    // The fan's colour op is a doubled modulate of texture and vertex colour, so a corner carrying
+    // [128,128,128] returns the scene unmodified and only the coverage ramp decides how much of it
+    // shows (`.agents/skills/retail-observe/references/2026-10-07-procedural-distortion.md`,
+    // "Coverage, color and time").
+    return vec4f(clamp(2.0 * warped.rgb * vertex_rgb, vec3f(0.0), vec3f(1.0)), coverage);
 }

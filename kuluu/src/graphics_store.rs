@@ -248,11 +248,19 @@ pub fn persist_graphics_on_change(
     settings: Res<GraphicsSettings>,
     state: Res<GraphicsStateRes>,
     suspended: Option<Res<GraphicsPersistSuspended>>,
+    mut last_saved: Local<Option<GraphicsSettings>>,
 ) {
     if suspended.is_some_and(|s| s.0) {
         return;
     }
     if !settings.is_changed() {
+        return;
+    }
+    // Menu key handling deref-muts the resource even when a row ignores the
+    // key (a held movement key repeats through it while a menu is open), so
+    // change detection alone would rewrite graphics.json on every press.
+    // Only content differences are worth a disk write.
+    if last_saved.as_ref() == Some(&*settings) {
         return;
     }
     if let Err(e) = state.store.save(&settings) {
@@ -261,7 +269,9 @@ pub fn persist_graphics_on_change(
             error = %e,
             "graphics: failed to persist settings",
         );
+        return;
     }
+    *last_saved = Some(settings.clone());
 }
 
 #[cfg(test)]
@@ -400,5 +410,41 @@ mod tests {
         std::fs::write(store.path(), br#"{"ui_scale": NaN}"#).unwrap();
         assert!(store.load().is_err());
         let _ = std::fs::remove_file(store.path());
+    }
+
+    /// A settings write that changes nothing (a key a menu row ignores still marks the settings
+    /// changed) leaves graphics.json alone; a real change is written.
+    #[test]
+    fn only_a_real_settings_change_is_written() {
+        let store = GraphicsStore::new(tmp_path());
+        let mut app = App::new();
+        app.init_resource::<GraphicsSettings>()
+            .insert_resource(GraphicsStateRes {
+                store: store.clone(),
+            })
+            .add_systems(Update, persist_graphics_on_change);
+        app.update();
+        assert!(store.path().exists(), "the first settings are written");
+
+        std::fs::remove_file(store.path()).unwrap();
+        app.world_mut()
+            .resource_mut::<GraphicsSettings>()
+            .set_changed();
+        app.update();
+        assert!(
+            !store.path().exists(),
+            "a write that changed nothing rewrote graphics.json"
+        );
+
+        app.world_mut()
+            .resource_mut::<GraphicsSettings>()
+            .cycle(GraphicsField::MinimapRadar, 1);
+        app.update();
+        assert_eq!(
+            store.load().unwrap().expect("written").minimap_radar,
+            MinimapRadar::Enhanced,
+            "a real change is written"
+        );
+        std::fs::remove_file(store.path()).ok();
     }
 }

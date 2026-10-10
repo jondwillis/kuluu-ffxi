@@ -94,9 +94,24 @@ pub struct EventLog {
     pub pushed_total: u64,
 }
 
-const EVENT_LOG_CAP: usize = 64;
+pub const EVENT_LOG_CAP: usize = 64;
 
 impl EventLog {
+    /// The ring's entries paired with their `pushed_total`-based global index. Two consumers that each
+    /// hold a private cursor and drain different numbers of entries still agree on which event an entry
+    /// is, because the index comes from the log rather than from either reader — what lets one swing get
+    /// one answer where it matters twice (the sound arm here and the pose pass in
+    /// `ffxi_actor_render::dispatch_action_overlay`), without any shared state between them.
+    pub fn recent_with_index(
+        &self,
+    ) -> impl DoubleEndedIterator<Item = (u64, &ViewerEvent)> + ExactSizeIterator {
+        let base = self.pushed_total.saturating_sub(self.recent.len() as u64);
+        self.recent
+            .iter()
+            .enumerate()
+            .map(move |(i, ev)| (base + i as u64, ev))
+    }
+
     // `pushed_total` is the global index every consumer's drain cursor is expressed in, so it
     // must advance for events the ring has already dropped. Pushing straight into `recent`
     // makes a reader skip the event entirely.

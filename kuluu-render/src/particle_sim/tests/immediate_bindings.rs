@@ -98,6 +98,7 @@ fn spawn(link_bindings: bool) -> App {
         .init_asset::<Image>()
         .init_asset::<FfxiParticleMaterial>()
         .init_resource::<ParticleSimulator>()
+        .init_resource::<crate::distortion_pass::ActiveDistortion>()
         .add_message::<SchedulerStageEvent>()
         .add_message::<crate::scheduler_runtime::ParticleSpawnTrace>()
         .add_message::<crate::audio::SfxEvent>()
@@ -107,6 +108,7 @@ fn spawn(link_bindings: bool) -> App {
         .spawn((assets(link_bindings), Transform::IDENTITY))
         .id();
     app.world_mut().write_message(SchedulerStageEvent {
+        identity: Default::default(),
         actor,
         target: Some(actor),
         stage: particle_stage(SOURCE),

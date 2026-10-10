@@ -152,10 +152,10 @@ pub fn apply_entity_list_visibility(
     }
 }
 
-/// Mouse-wheel scrolling while the panel is on. No hover gate: in-game the
-/// wheel drives nothing else (zoom is PgUp/PgDown), and the launcher's scroll
-/// precedent scrolls visible regions globally too. The upper clamp happens in
-/// the update system, which knows the live entity count.
+/// Mouse-wheel scrolling while the panel is on. No hover gate: the launcher's
+/// scroll precedent scrolls visible regions globally too, and this dev overlay
+/// co-using a wheel notch with the camera zoom costs nothing it needs to avoid.
+/// The upper clamp happens in the update system, which knows the live entity count.
 pub fn entity_list_wheel_system(
     panels: Res<HudPanels>,
     mut wheel: MessageReader<MouseWheel>,

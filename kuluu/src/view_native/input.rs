@@ -50,6 +50,18 @@ pub struct MoveEnvParams<'w, 's> {
     /// The self actor's knockback: its lock and the shove the walker owes it.
     pub self_knockback: ResMut<'w, kuluu_render::ffxi_actor_render::SelfKnockback>,
     pub cutscene: Res<'w, kuluu_render::cutscene::CutsceneMode>,
+    pub mzb_in_flight: Res<'w, kuluu_render::dat_mzb::LoadMzbInFlight>,
+    /// View-window zoom (held PgUp/PgDn, `.`, `,`): these integrate the projection focal length,
+    /// which camera.rs converts and pushes each frame. The mouse wheel joins here too, not in
+    /// `mouse_camera_system` — retail's camera update spends keys first and the owed wheel frames
+    /// second, in one block (`FFXiMain.dll retail-2026-09` RVA 0x1F7DE..0x1F968, M34).
+    pub view_fov: ResMut<'w, kuluu_render::ViewFov>,
+    /// The mouse wheel's frames of zoom owed to spend here (retail's `[0x1067A298]` counter,
+    /// `FFXiMain.dll retail-2026-09`).
+    pub wheel_zoom: ResMut<'w, kuluu_render::WheelZoom>,
+    /// The facing one of kuluu-render's authored-turn integrators published for this player on its last
+    /// frame. Bundled here because this fn is at bevy's system-parameter ceiling.
+    pub authored_heading: ResMut<'w, kuluu_render::rotation_drives::SelfAuthoredHeading>,
 }
 
 /// Rising-edge memory for the pad stick, standing in for `just_pressed` where
@@ -62,22 +74,26 @@ pub struct PadEdges {
 
 #[derive(Resource, Default)]
 pub struct DispatchLocals {
-    /// Latched world-space run heading for pure W/S: (forward sign, motion
-    /// heading). Sampled from the camera frame when the key state changes,
-    /// then held fixed so the camera's auto-recenter can swing behind
-    /// without dragging the run direction with it. A Q/E carve rotates this
-    /// latch in place rather than resampling it.
-    pub steer_latch: Option<(i32, u8)>,
-    /// Which key family currently holds the turn axis (see [`TurnAxisOwner`]).
-    pub turn_owner: TurnAxisOwner,
+    /// Latched world-space run direction for a pure W/S run: (forward sign,
+    /// facing yaw), sampled from the camera frame when the key state changes
+    /// and held fixed afterwards, so the camera swinging round behind the body
+    /// never drags the run direction with it. A held Q/E turns it; it is kept
+    /// unquantized so the per-tick turn is not rounded to whole heading units.
+    pub steer_latch: Option<(i32, f32)>,
     /// Rising-edge memory for pad stick just_pressed emulation.
     pub pad_edges: PadEdges,
     pub walker: super::walker::Walker,
-    /// Damped bearing (heading-angle space) the locked body/camera turn
-    /// toward; persists across ticks so the look-at integrates instead of
-    /// re-deriving from the lagging server echo.
-    lock_bearing: Option<f32>,
+    /// Continuous body facing (radians) while a standing Q/E turn is held. The
+    /// body's wire heading is a u8, and re-deriving the facing from last tick's
+    /// quantized heading would round the 1.15-unit-per-tick turn down to a
+    /// 1-unit step; it reseeds from the server heading when no turn key is
+    /// held.
+    qe_facing: Option<f32>,
     identity: Option<(Option<u32>, Option<u16>, Option<u32>, u64)>,
+    /// Retail's both-zoom-keys flag (`FFXiMain.dll retail-2026-09`: `[0x10456D84]`, set at RVA
+    /// 0x1F806): while it stands the focal eases toward neutral instead of taking any zoom arm, and it
+    /// clears when that ease closes to under one focal unit (M34).
+    zoom_neutral_latch: bool,
 }
 
 #[derive(SystemParam)]
@@ -104,7 +120,7 @@ pub struct CameraInputParams<'w> {
 use kuluu_render::{
     heading_for_yaw, yaw_for_heading, Action, Bindings, CameraMode, CameraTransition, ChaseCamera,
     ChatBuffer, CursorLockRequest, InputMode, IsSelf, LockOn, LockOnToggle, MenuStack,
-    OperatorCamera, PassiveCursorState, SceneState, Target, WorldEntity,
+    OperatorCamera, PassiveCursorState, SceneState, Target, ViewFov, WorldEntity, ZoomArm,
 };
 use kuluu_snapshot::{Entity as WireEntity, EntityKind, Vec3 as WireVec3};
 use tokio::sync::mpsc;
@@ -115,30 +131,29 @@ use kuluu_session::state::{ActionKind, AgentCommand, FishingInput};
 // 2026-07-20: ~71 heading-units over a 2s hold ≈ 0.87 rad/s).
 pub const HEADING_TURN_RATE: f32 = 0.86;
 
-// Retail third person has no body-rotate key at all - its turn keys orbit the
-// camera and the body inherits the heading from the camera-relative move
-// vector. Its one true character-yaw rate is the autorun steer, two degrees per
-// movement tick applied to the autorun direction
+// First-person Q/E (and A/D) view-rotate rate: retail's character-yaw rate of
+// two degrees per movement tick
 // (research/XIClient/src/XIClient/source/World/Actor/ControllableActor.cpp,
-// ControllableActor::HandleThirdPersonControl, is_auto_running branch), which
-// is the same "turn the run, let the body follow" motion Q/E drives here.
+// ControllableActor::HandleThirdPersonControl, is_auto_running branch). Behind
+// the player Q/E turn at the camera orbit law's rate instead ([`qe_sweep`]).
 const RETAIL_AUTORUN_STEER_DEG_PER_TICK: f32 = 2.0;
 pub const ROTATE_KEY_RATE_RAD_PER_SEC: f32 =
     RETAIL_AUTORUN_STEER_DEG_PER_TICK * (std::f32::consts::PI / 180.0) * RETAIL_MOVE_TICKS_PER_SEC;
 
-// The same retail key also orbits the eye around its target, 1.6 degrees per
-// tick (research/XIClient/src/XIClient/source/World/Camera/CameraManager.cpp,
-// CameraManager::UpdatePlayerFollowingCamera scales the CameraControlX analog
-// value by 0.027924445 rad). Steering a retail autorun moves both, so the run
-// leads the eye only by the 0.4 deg/tick difference; Q/E is that pair with the
-// two halves named separately and drives the same orbit.
-const RETAIL_TURN_KEY_ORBIT_DEG_PER_TICK: f32 = 1.6;
-pub const ROTATE_KEY_ORBIT_RAD_PER_SEC: f32 =
-    RETAIL_TURN_KEY_ORBIT_DEG_PER_TICK * (std::f32::consts::PI / 180.0) * RETAIL_MOVE_TICKS_PER_SEC;
+// The aim laws (Q/E orbit, arrow keys and mouse position alike) are single-
+// sourced in kuluu_render::mouse. A held axis is digital ±1 here; how much a retail
+// keyboard key contributes to its action axis is unresolved (FFXiMain.dll
+// retail-2026-09 `GetAnalogKey` RVA 0x123970 dispatches per-action getters), so the
+// rate carries that unknown rather than an extra tuning factor.
+use kuluu_render::mouse::{
+    camera_height_pitch_rate_rad_per_sec, camera_orbit_yaw_rate_rad_per_sec,
+    FOLLOW_ACTOR_FREE_RUN_DEFAULT,
+};
 
-const CAMERA_YAW_RATE: f32 = HEADING_TURN_RATE * 4.0;
-
-const PITCH_STEP_HELD: f32 = 0.015;
+// Both pitch keys held eases toward vertical (0 rad); retail has no both-keys
+// tilt snap at all, this is a product choice mirroring zoom's neutral focal.
+const PITCH_BOTH_KEYS_TARGET: f32 = 0.0;
+const PITCH_BOTH_KEYS_DECAY: f32 = 0.25;
 
 const STRAFE_CANCEL_MS: u64 = 300;
 
@@ -170,24 +185,14 @@ const PAD_BACK_CANCEL_DEFLECTION: f32 = 0.5;
 
 const PREDICTION_RESYNC_YALMS: f32 = 5.0;
 
-// Retail body turn into a new camera-relative run direction takes ~0.5-0.7s
-// for 90° (HorizonXI video 2026-07-20, D-press frames). The carve rate of a
-// held A/D is then paced by the lazy camera follow (AUTO_RECENTER_RATE), not
-// by this lerp.
-const HEADING_LERP_RATE_RAD_PER_SEC: f32 = 2.5;
+// A pure exponential barely moves out of a wide gap, so the camera released
+// from a lock reads as a snap then a long glide on its way back behind the
+// body: turn at a constant max rate until the gap is this small, then let the
+// exponential settle in.
+pub(crate) const LOCK_CAM_MAX_TURN_RAD_PER_SEC: f32 = 4.5;
+pub(crate) const LOCK_CAM_ARRIVAL_GAP_RAD: f32 = 0.35;
 
-// S from a forward-facing stance is an instant about-face in retail
-// (HorizonXI video 2026-07-20), not a carved arc; turns sharper than this
-// snap instead of lerping.
-const ABOUT_FACE_SNAP_RAD: f32 = 2.0;
-
-/// Lock-on look-at is damped, not snapped: camera and body both turn toward
-/// the target bearing with framerate-independent exponential smoothing (the
-/// carve lerp's primitive). The camera tracks faster so the target stays
-/// framed while the body turns behind it; re-snapping the quantized bearing
-/// each tick would re-aim both every time it crossed a heading unit.
-const LOCK_CAM_DAMP_RAD_PER_SEC: f32 = 12.0;
-const LOCK_BODY_DAMP_RAD_PER_SEC: f32 = 8.0;
+const DIALOG_FLOOR_SNAP_EPSILON: f32 = 1e-3;
 
 #[derive(Resource, Clone)]
 pub struct CommandTx(pub mpsc::Sender<AgentCommand>);
@@ -246,36 +251,6 @@ pub fn advance_heading_turn(
     (whole as i32, float_delta)
 }
 
-/// The two turn families compete for one axis: A/D steer the run in the camera
-/// frame, Q/E rotate the body. Held together they would fight (one re-aims the
-/// run at the camera every tick, the other turns the body away from it), so the
-/// family that took the axis keeps it until its own keys come up.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub enum TurnAxisOwner {
-    #[default]
-    None,
-    Steer,
-    Rotate,
-}
-
-/// `prev` keeps the axis while its keys are still down; otherwise the one held
-/// family takes it. A same-frame tie with no incumbent goes to the steer keys.
-pub fn arbitrate_turn_axis(
-    prev: TurnAxisOwner,
-    steer_held: bool,
-    rotate_held: bool,
-) -> TurnAxisOwner {
-    match prev {
-        TurnAxisOwner::Steer if steer_held => TurnAxisOwner::Steer,
-        TurnAxisOwner::Rotate if rotate_held => TurnAxisOwner::Rotate,
-        _ => match (steer_held, rotate_held) {
-            (true, _) => TurnAxisOwner::Steer,
-            (false, true) => TurnAxisOwner::Rotate,
-            (false, false) => TurnAxisOwner::None,
-        },
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResolvedMoveInputs {
     pub forward: i32,
@@ -289,7 +264,7 @@ pub struct ResolvedMoveInputs {
 /// into it at full speed — S runs toward the camera, A/D never rotate in place
 /// (that's Q/E, and A/D only in first person), and there is no unlocked
 /// backpedal. Locked on, the character faces the target: A/D strafe and S
-/// backpedals instead.
+/// backpedals instead, and Q/E do nothing.
 #[allow(clippy::too_many_arguments)]
 pub fn resolve_move_inputs(
     forward_held: bool,
@@ -308,7 +283,7 @@ pub fn resolve_move_inputs(
         forward = forward.max(1);
     }
     let mut strafe = i32::from(strafe_right) - i32::from(strafe_left);
-    let rotate_dir = i32::from(rotate_right) - i32::from(rotate_left);
+    let rotate_dir = qe_dir(rotate_left, rotate_right, locked);
     let mut steer = 0;
     let turn = i32::from(turn_right) - i32::from(turn_left);
     if locked {
@@ -321,6 +296,38 @@ pub fn resolve_move_inputs(
         strafe,
         steer,
         rotate_dir,
+    }
+}
+
+/// Q/E's turn direction, Q negative; locked on they do nothing.
+fn qe_dir(rotate_left: bool, rotate_right: bool, locked: bool) -> i32 {
+    if locked {
+        0
+    } else {
+        i32::from(rotate_right) - i32::from(rotate_left)
+    }
+}
+
+/// The chase-yaw turn Q/E make over `dt` for a `rotate_dir` (Q negative): behind the player the camera
+/// orbit law's rate, which the body turns and a run steers at too; in first person, where the view is
+/// the facing, the view-rotate rate.
+fn qe_sweep(rotate_dir: i32, first_person: bool, distance: f32, dt: f32) -> f32 {
+    let axis = -rotate_dir as f32;
+    let rate = if first_person {
+        axis * ROTATE_KEY_RATE_RAD_PER_SEC
+    } else {
+        camera_orbit_yaw_rate_rad_per_sec(axis, FOLLOW_ACTOR_FREE_RUN_DEFAULT, Some(distance))
+    };
+    rate * dt
+}
+
+/// A Q/E `sweep` the player cannot take, so the camera turns alone: behind the player it follows round
+/// at the catch ([`ChaseCamera::turn_owed`]), in first person the view turns at once.
+fn turn_camera_alone(chase: &mut ChaseCamera, first_person: bool, sweep: f32) {
+    if first_person {
+        chase.yaw += sweep;
+    } else {
+        chase.turn_owed += sweep;
     }
 }
 
@@ -421,6 +428,23 @@ pub fn move_step_speed_yps(
 /// leaves them behind the floor on a staircase.
 pub fn ground_merge_pace_yps(move_yps: f32, step_yps: f32) -> f32 {
     move_yps.max(step_yps)
+}
+
+/// The pose intent handed to animation selection. research/xim Actor.kt getMovementDirection
+/// buckets the live velocity into Forward/Left/Right/Backward against a state-dependent reference:
+/// the target direction when locked, else the camera view while strafing (thresholds cos +0.25 /
+/// −0.75; no reference ⇒ forward run). kuluu reaches the same buckets structurally: the free
+/// walker turns the body onto travel each tick (camera_relative_motion_heading), so free motion is
+/// always the Forward bucket — run clip, never a side strafe — and once the locked body has
+/// squared to the target its input axes are already target-relative, which is what the buckets see.
+pub fn pose_intent(locked: bool, moving: bool, forward: i32, strafe: i32) -> (f32, f32) {
+    if locked {
+        (forward as f32, strafe as f32)
+    } else if moving {
+        (1.0, 0.0)
+    } else {
+        (0.0, 0.0)
+    }
 }
 
 /// World-space run heading for a camera-relative move: `forward` along the
@@ -538,6 +562,19 @@ impl DialogWalk {
         };
         (position, speed)
     }
+}
+
+/// Lift the dialog-driven (CS) feet to the MZB floor when it sits above them
+/// (wire z grows down); a floor at or below the feet is left alone, since the
+/// script's height is authoritative there and a downward snap reads as a fall.
+fn ground_dialog_feet_wire_z(
+    collision: &kuluu_render::dat_mzb::MzbCollisionGeometry,
+    position: Vec3,
+) -> f32 {
+    collision
+        .ground_or_recover_wire_z(position.x, position.y, position.z)
+        .filter(|floor_z| *floor_z < position.z - DIALOG_FLOOR_SNAP_EPSILON)
+        .unwrap_or(position.z)
 }
 
 pub fn handle_input_system(
@@ -869,25 +906,21 @@ pub fn engage_locks_target_system(
     }
 }
 
-/// Mirror the viewer's lock-on state into the reactor so it only squares the
-/// engaged target up while locked. Without this the reactor's per-tick facing
-/// snaps the player back toward the mob every 200ms even after the human
-/// unlocks (kuluu-j03o).
-pub fn sync_target_lock_system(
-    lock_on: Res<LockOn>,
-    cmd_tx: Res<CommandTx>,
-    mut last_sent: Local<Option<bool>>,
-) {
-    let locked = lock_on.is_active();
-    if *last_sent == Some(locked) {
+/// The human owns the player's facing: the camera lock never squares the
+/// body up (the first move after it engages does, in the movement system), so
+/// the reactor's per-tick auto-aim stays off for the whole session. Headless
+/// agents never run this system and keep the reactor's default facing, so
+/// their auto-attack still lands.
+pub fn sync_target_lock_system(cmd_tx: Res<CommandTx>, mut sent: Local<bool>) {
+    if *sent {
         return;
     }
     if cmd_tx
         .0
-        .try_send(AgentCommand::SetTargetLock { locked })
+        .try_send(AgentCommand::SetTargetLock { locked: false })
         .is_ok()
     {
-        *last_sent = Some(locked);
+        *sent = true;
     }
 }
 
@@ -923,12 +956,15 @@ fn snapshot_drives_movement(goal: Option<&kuluu_snapshot::ReactorGoal>) -> bool 
 /// fighting latency), applied in the yaw section before the idle early-return
 /// so aiming works while stopped.
 ///
-/// Q/E held with W/S turns the run itself: the latch becomes the rotating run
-/// heading, so neither the camera frame nor a camera pan re-aims it, and the
-/// body keeps travelling along it (carving) instead of the camera frame
-/// pulling it straight back every tick. A/D carve and camera panning
-/// recompute the run direction against the live camera every frame; anything
-/// else holds the latch.
+/// Q/E do nothing locked on. Standing they turn the player in place and leave
+/// the camera owing the same turn (ChaseCamera::turn_owed), so it follows
+/// round from wherever it sits; a player who cannot move (dead, resting or
+/// standing up, the weapon draw or sheathe, a knockback) turns the camera
+/// alone. Travelling they steer the player and the camera owes the same turn,
+/// paired as it is standing: the run holds its world direction and Q/E turn
+/// it, so neither the camera frame nor a camera pan re-aims it while they are
+/// held. A/D carve and camera panning recompute the run direction against the
+/// live camera every frame; anything else holds the latch.
 ///
 /// The one speed variable (yalms/s) paces the horizontal step and every
 /// vertical move inside the step band (walk mode merges slower than run).
@@ -989,6 +1025,13 @@ pub fn dispatch_movement_system(
     let move_intent = &mut stance.move_intent;
     // Default to stopped so every early return below reports no movement.
     **move_intent = kuluu_render::combat_stance::SelfMoveIntent::default();
+    // The authored heading is taken on every tick this system runs, acting or not, because that
+    // consumption is what bounds its life to one walker tick: a turn published just as a menu takes the
+    // keys, or just before a zone change, cannot resurface behind them.
+    let authored_facing = env
+        .authored_heading
+        .take()
+        .map(kuluu_render::combat_stance::heading_byte_for_rad);
 
     let identity = (
         state.snapshot.self_char_id,
@@ -1025,7 +1068,25 @@ pub fn dispatch_movement_system(
                 .dialog_walk
                 .get_or_insert_with(|| DialogWalk::new(current));
             let (position, speed) = walk.advance(current, target, time.delta_secs());
-            prediction.pos = position;
+            let zone_ready = kuluu_render::snapshot::effective_zone_file_id(&state.snapshot)
+                .is_some_and(|file| env.collision.source_file_id() == Some(file))
+                && !(env
+                    .mzb_in_flight
+                    .pending_in_slot(kuluu_render::dat_mzb::ZONE_SLOT_SUB_AREA)
+                    && env
+                        .collision
+                        .ground_step(
+                            bevy::math::Vec2::new(position.x, -position.y),
+                            -position.z,
+                            kuluu_render::dat_mzb::MAX_GROUND_STEP_UP,
+                        )
+                        .is_none());
+            let grounded_z = if zone_ready {
+                ground_dialog_feet_wire_z(&env.collision, position)
+            } else {
+                position.z
+            };
+            prediction.pos = Vec3::new(position.x, position.y, grounded_z);
             **move_intent = kuluu_render::combat_stance::SelfMoveIntent {
                 moving: speed > f32::EPSILON,
                 forward: 1.0,
@@ -1087,28 +1148,39 @@ pub fn dispatch_movement_system(
     let pad_back_started = pad_back && !locals.pad_edges.back_active;
     locals.pad_edges.back_active = pad_back;
 
-    let mut pitch_d = 0.0;
-    if !in_picker && bindings.pressed(Action::CameraPitchUp, keys) {
-        pitch_d += PITCH_STEP_HELD;
-    }
-    if !in_picker && bindings.pressed(Action::CameraPitchDown, keys) {
-        pitch_d -= PITCH_STEP_HELD;
-    }
-    pitch_d += pad_cam.y * PITCH_STEP_HELD;
-    if pitch_d != 0.0 {
-        let (lo, hi) = match *camera_mode {
-            CameraMode::Chase => (ChaseCamera::PITCH_MIN, ChaseCamera::PITCH_MAX),
-            CameraMode::FirstPerson => (ChaseCamera::FP_PITCH_MIN, ChaseCamera::FP_PITCH_MAX),
-        };
-        chase.pitch = (chase.pitch + pitch_d).clamp(lo, hi);
+    let (pitch_lo, pitch_hi) = match *camera_mode {
+        CameraMode::Chase => (ChaseCamera::PITCH_MIN, ChaseCamera::PITCH_MAX),
+        CameraMode::FirstPerson => (ChaseCamera::FP_PITCH_MIN, ChaseCamera::FP_PITCH_MAX),
+    };
+    // Retail turns the camera from its camera keys only while the actor runs free, which every lock
+    // handler clears: the key yaw (`FFXiMain.dll retail-2026-09` RVA 0x25E100 / 0x25E170) is taken only
+    // when the actor's free-run byte holds (RVA 0x1EFC8), and no key reaches the tilt. The analog axes,
+    // pad stick and mouse, keep turning a locked camera.
+    let camera_keys = !in_picker && lock_on.target_id.is_none();
+    let pitch_up = camera_keys && bindings.pressed(Action::CameraPitchUp, keys);
+    let pitch_down = camera_keys && bindings.pressed(Action::CameraPitchDown, keys);
+    let aim_rig = matches!(*camera_mode, CameraMode::Chase).then_some(chase.distance);
+    if pitch_up && pitch_down {
+        // Both pitch keys held: ease toward vertical — kuluu's product mirror of zoom's
+        // both-keys neutral snap (retail's own snap is focal, not tilt).
+        chase.pitch = (chase.pitch
+            + (PITCH_BOTH_KEYS_TARGET - chase.pitch) * PITCH_BOTH_KEYS_DECAY)
+            .clamp(pitch_lo, pitch_hi);
+    } else {
+        let height_axis = (i32::from(pitch_up) - i32::from(pitch_down)) as f32 + pad_cam.y;
+        let height_d = camera_height_pitch_rate_rad_per_sec(height_axis, chase.pitch, aim_rig);
+        if height_d != 0.0 {
+            chase.pitch = (chase.pitch + height_d * time.delta_secs()).clamp(pitch_lo, pitch_hi);
+        }
     }
 
     let mut yaw_d = 0.0;
-    let yaw_step = CAMERA_YAW_RATE * time.delta_secs();
-    if !in_picker && bindings.pressed(Action::CameraYawLeft, keys) {
+    let yaw_step = camera_orbit_yaw_rate_rad_per_sec(1.0, FOLLOW_ACTOR_FREE_RUN_DEFAULT, aim_rig)
+        * time.delta_secs();
+    if camera_keys && bindings.pressed(Action::CameraYawLeft, keys) {
         yaw_d -= yaw_step;
     }
-    if !in_picker && bindings.pressed(Action::CameraYawRight, keys) {
+    if camera_keys && bindings.pressed(Action::CameraYawRight, keys) {
         yaw_d += yaw_step;
     }
     yaw_d += pad_cam.x * yaw_step;
@@ -1117,35 +1189,56 @@ pub fn dispatch_movement_system(
     }
 
     if matches!(*camera_mode, CameraMode::Chase) && !in_picker && !env.minimap_hover.hovered {
-        let mut zoom_d = 0.0;
-        let step = ChaseCamera::KEYBOARD_ZOOM_RATE * time.delta_secs();
-        if bindings.pressed(Action::CameraZoomIn, keys) {
-            zoom_d -= step;
-        }
-        if bindings.pressed(Action::CameraZoomOut, keys) {
-            zoom_d += step;
-        }
-        // PgUp/PgDn drive the same chase zoom: Action::PageUp/PageDown are bound to those
-        // keys in every preset and were previously unconsumed.
-        if bindings.pressed(Action::PageUp, keys) {
-            zoom_d -= step;
-        }
-        if bindings.pressed(Action::PageDown, keys) {
-            zoom_d += step;
-        }
-        if zoom_d != 0.0 {
-            chase.distance =
-                (chase.distance + zoom_d).clamp(ChaseCamera::DIST_MIN, ChaseCamera::DIST_MAX);
+        // Retail's whole zoom block in one place: two keys (`0x4F` lengthens the focal toward 900,
+        // `0x50` shortens it toward 242), then — only if neither key ran — the frames the mouse wheel
+        // owes. Both arms apply the identical `tick × 6.0`, and a key frame throws the owed frames
+        // away; hitting a band end does too (`FFXiMain.dll retail-2026-09` RVA 0x1F7DE..0x1F968, M34).
+        // PgUp/PgDn drive the same pair: Action::PageUp/PageDown are bound to those keys in every
+        // preset and were previously unconsumed.
+        let zoom_in =
+            bindings.pressed(Action::CameraZoomIn, keys) || bindings.pressed(Action::PageUp, keys);
+        let zoom_out = bindings.pressed(Action::CameraZoomOut, keys)
+            || bindings.pressed(Action::PageDown, keys);
+        // Retail's tick: the 1/60 s frames elapsed since the last update (M29), so the focal moves at
+        // 360/s whatever rate the fixed step runs at.
+        let tick_frames = time.delta_secs() * kuluu_render::scheduler_runtime::ROUTINE_FPS;
+        if zoom_in && zoom_out {
+            // Both keys: raise retail's neutral flag and skip every arm this frame.
+            locals.zoom_neutral_latch = true;
+        } else if locals.zoom_neutral_latch {
+            let (focal, settled) = ViewFov::ease_to_neutral(env.view_fov.focal_length);
+            env.view_fov.focal_length = focal;
+            if settled {
+                locals.zoom_neutral_latch = false;
+            }
+        } else if zoom_in || zoom_out {
+            let (focal, _clamped) = ViewFov::step(
+                env.view_fov.focal_length,
+                tick_frames,
+                if zoom_in { ZoomArm::In } else { ZoomArm::Out },
+            );
+            env.view_fov.focal_length = focal;
+            // Every key frame discards the wheel backlog, clamped or not: both paths out of retail's
+            // key arm land on its clear-to-zero call.
+            env.wheel_zoom.clear();
+        } else if let Some(arm) = env.wheel_zoom.armed() {
+            let (focal, hit_band_end) = ViewFov::step(env.view_fov.focal_length, tick_frames, arm);
+            env.view_fov.focal_length = focal;
+            if hit_band_end {
+                // Reaching a band end discards the rest of the owed frames too.
+                env.wheel_zoom.clear();
+            }
         }
     }
 
-    if kuluu_render::hud::death_prompt::is_dead(&state) {
-        autorun.phantom_forward = false;
-        autorun.strafe_held_since = None;
-        return;
-    }
+    let locked = lock_on.target_id.is_some();
+    let first_person = matches!(*camera_mode, CameraMode::FirstPerson);
+    let rotate_left = bindings.pressed(Action::RotateLeft, keys);
+    let rotate_right = bindings.pressed(Action::RotateRight, keys);
 
-    if rest_stance.is_resting() {
+    let held_in_place = if kuluu_render::hud::death_prompt::is_dead(&state) {
+        true
+    } else if rest_stance.is_resting() {
         use kuluu_render::combat_stance::RestKind;
         let move_actions = [
             Action::MoveForward,
@@ -1154,8 +1247,6 @@ pub fn dispatch_movement_system(
             Action::StrafeRight,
             Action::TurnLeft,
             Action::TurnRight,
-            Action::RotateLeft,
-            Action::RotateRight,
         ];
         let pressed_move =
             move_actions.iter().any(|a| bindings.just_pressed(*a, keys)) || pad_move_started;
@@ -1167,15 +1258,21 @@ pub fn dispatch_movement_system(
             }
             rest_stance.begin_exit();
         }
-        autorun.phantom_forward = false;
-        autorun.strafe_held_since = None;
-        return;
-    }
-
-    // The stand-up clip runs before the character moves (retail's cost for
-    // breaking a rest); movement only starts if the keys are still held when it
-    // ends, so this gate reads `pressed` state fresh on the frame it lifts.
-    if rest_stance.exit_blocks_movement(time.delta_secs()) {
+        true
+    } else {
+        // The stand-up clip runs before the character moves (retail's cost for
+        // breaking a rest); movement only starts if the keys are still held when it
+        // ends, so this gate reads `pressed` state fresh on the frame it lifts.
+        rest_stance.exit_blocks_movement(time.delta_secs())
+    };
+    if held_in_place {
+        let sweep = qe_sweep(
+            qe_dir(rotate_left, rotate_right, locked),
+            first_person,
+            chase.distance,
+            time.delta_secs(),
+        );
+        turn_camera_alone(&mut chase, first_person, sweep);
         autorun.phantom_forward = false;
         autorun.strafe_held_since = None;
         return;
@@ -1216,31 +1313,19 @@ pub fn dispatch_movement_system(
         autorun.strafe_held_since = None;
     }
 
-    let locked = lock_on.target_id.is_some();
-    let first_person = matches!(*camera_mode, CameraMode::FirstPerson);
-
     let turn_left = bindings.pressed(Action::TurnLeft, keys);
     let turn_right = bindings.pressed(Action::TurnRight, keys);
-    let rotate_left = bindings.pressed(Action::RotateLeft, keys);
-    let rotate_right = bindings.pressed(Action::RotateRight, keys);
-    locals.turn_owner = arbitrate_turn_axis(
-        locals.turn_owner,
-        turn_left || turn_right || pad_move.x != 0.0,
-        rotate_left || rotate_right,
-    );
-    let steer_owns = locals.turn_owner != TurnAxisOwner::Rotate;
-    let rotate_owns = locals.turn_owner != TurnAxisOwner::Steer;
-    let pad_steer_x = if steer_owns { pad_move.x } else { 0.0 };
+    let pad_steer_x = pad_move.x;
 
     let mut resolved = resolve_move_inputs(
         bindings.pressed(Action::MoveForward, keys),
         bindings.pressed(Action::MoveBackward, keys),
-        turn_left && steer_owns,
-        turn_right && steer_owns,
+        turn_left,
+        turn_right,
         bindings.pressed(Action::StrafeLeft, keys),
         bindings.pressed(Action::StrafeRight, keys),
-        rotate_left && rotate_owns,
-        rotate_right && rotate_owns,
+        rotate_left,
+        rotate_right,
         autorun.phantom_forward,
         locked,
     );
@@ -1292,9 +1377,14 @@ pub fn dispatch_movement_system(
     } else {
         0.0
     };
-    let turn_rate = ROTATE_KEY_RATE_RAD_PER_SEC * (resolved.rotate_dir as f32 + fp_rotate);
-    let (player_rotate_u8, heading_delta_units) =
-        advance_heading_turn(&mut turn_accum.units, turn_rate, time.delta_secs());
+    // The body-rotate accumulator serves first person only; behind the player
+    // Q/E turn through `qe` below.
+    let fp_turn = (resolved.rotate_dir as f32 + fp_rotate) * f32::from(first_person);
+    let (player_rotate_u8, heading_delta_units) = advance_heading_turn(
+        &mut turn_accum.units,
+        ROTATE_KEY_RATE_RAD_PER_SEC * fp_turn,
+        time.delta_secs(),
+    );
     // Retail holds the player for the weapon draw and the sheathe (record:
     // .agents/skills/retail-observe/references/2026-09-21-action-confirm-and-locks.md,
     // "The one real player lock is the weapon draw and sheathe"). The
@@ -1332,20 +1422,36 @@ pub fn dispatch_movement_system(
     let steer_in_chase = (!first_person && !locked && (pf != 0.0 || ps != 0.0))
         && !engage_transition
         && !knockback.active;
-    // Deliberate camera pan (yaw keys / mouse drag) re-aims a pure W/S run;
-    // the latch only holds the run direction against the passive
-    // auto-recenter, not against the player actively steering the camera.
+    // Q/E's turn this tick behind the player; the draw hold and a knockback
+    // leave it to the camera alone.
+    let qe = if first_person {
+        0.0
+    } else {
+        qe_sweep(
+            resolved.rotate_dir,
+            false,
+            chase.distance,
+            time.delta_secs(),
+        )
+    };
+    let move_held = engage_transition || knockback.active;
+    if move_held {
+        turn_camera_alone(&mut chase, first_person, qe);
+    }
+    // A deliberate camera turn re-aims a pure W/S run in the live camera
+    // frame: the yaw keys and the mouse drag steer the body with the eye. The
+    // latch holds the run only against an idle camera, not against the player
+    // actively turning it, and a held Q/E keeps it, since they steer the run
+    // itself.
     let camera_panning = bindings.pressed(Action::CameraYawLeft, keys)
         || bindings.pressed(Action::CameraYawRight, keys)
         || pad_cam.x != 0.0
         || env.pointer.left
         || env.pointer.right
         || drive_c != 0;
-    let rotate_carve = steer_in_chase && resolved.rotate_dir != 0;
-    if !rotate_carve && (!steer_in_chase || ps != 0.0 || camera_panning) {
+    if !steer_in_chase || ((ps != 0.0 || camera_panning) && qe == 0.0) {
         locals.steer_latch = None;
     }
-
     let self_pos = state.snapshot.self_pos;
 
     let mounted = state.snapshot.self_mount.is_some();
@@ -1420,15 +1526,17 @@ pub fn dispatch_movement_system(
             })
     });
 
-    if player_rotate_u8 != 0 && first_person {
+    if player_rotate_u8 != 0 {
         chase.yaw -= heading_delta_units * std::f32::consts::TAU / 256.0;
     }
-    if !first_person && resolved.rotate_dir != 0 {
-        chase.yaw -= resolved.rotate_dir as f32 * ROTATE_KEY_ORBIT_RAD_PER_SEC * time.delta_secs();
-    }
 
-    if drive_c != 0 {
-        chase.yaw += drive_c as f32 * CAMERA_YAW_RATE * time.delta_secs();
+    let drive_axis = drive_c as f32;
+    if drive_axis != 0.0 {
+        chase.yaw += camera_orbit_yaw_rate_rad_per_sec(
+            drive_axis,
+            FOLLOW_ACTOR_FREE_RUN_DEFAULT,
+            (!first_person).then_some(chase.distance),
+        ) * time.delta_secs();
     }
     if let Some(handle) = env.stair_drive.as_ref() {
         if let Ok(mut d) = handle.0.lock() {
@@ -1439,32 +1547,35 @@ pub fn dispatch_movement_system(
     }
 
     if forward == 0 && strafe == 0 && player_rotate_u8 == 0 && !steer_in_chase && !shoved {
-        if snapshot_driven {
+        // Standing Q/E turns the body in place and the camera owes the same
+        // turn, so it follows round from wherever it sits instead of resetting
+        // behind the body.
+        let standing_qe_heading = if qe != 0.0 && !move_held {
+            let facing = locals
+                .qe_facing
+                .unwrap_or_else(|| yaw_for_heading(self_pos.heading))
+                + qe;
+            locals.qe_facing = Some(facing);
+            chase.turn_owed += qe;
+            Some(heading_for_yaw(facing))
+        } else {
+            locals.qe_facing = None;
+            None
+        };
+        // A routine turns a standing actor too, so an authored heading reaches the wire on its own: this
+        // gate answers to the keys alone and left every face-the-target routine with no path out.
+        let standing_heading = authored_facing.or(standing_qe_heading);
+        if snapshot_driven && standing_heading.is_none() {
             return;
         }
-        if let Some(bearing) = locked_bearing {
-            let damped = damp_lock_bearing(
-                &mut locals.lock_bearing,
-                bearing,
-                self_pos.heading,
-                LOCK_BODY_DAMP_RAD_PER_SEC,
-                time.delta_secs(),
-            );
-            damp_lock_camera(
-                &mut chase.yaw,
-                bearing,
-                LOCK_CAM_DAMP_RAD_PER_SEC,
-                time.delta_secs(),
-            );
-            let h = heading_for_angle(damped);
-            if h != self_pos.heading {
-                let _ = cmd_tx.0.try_send(AgentCommand::Move {
-                    x: basis_pos.x,
-                    y: basis_pos.y,
-                    z: basis_pos.z,
-                    heading: h,
-                });
-            }
+        let resolved_heading = standing_heading.unwrap_or(self_pos.heading);
+        if resolved_heading != self_pos.heading {
+            let _ = cmd_tx.0.try_send(AgentCommand::Move {
+                x: basis_pos.x,
+                y: basis_pos.y,
+                z: basis_pos.z,
+                heading: resolved_heading,
+            });
         }
         let res = super::walker::step(
             &env.collision,
@@ -1486,7 +1597,7 @@ pub fn dispatch_movement_system(
             basis_pos.x,
             basis_pos.y,
             res.feet_z,
-            self_pos.heading,
+            resolved_heading,
             speed_yps,
             &res,
         );
@@ -1500,30 +1611,34 @@ pub fn dispatch_movement_system(
                 x: basis_pos.x,
                 y: basis_pos.y,
                 z: feet_z,
-                heading: self_pos.heading,
+                heading: resolved_heading,
             });
         }
         prediction.pos = Vec3::new(basis_pos.x, basis_pos.y, feet_z);
         return;
     }
 
-    let was_moving = move_intent.moving;
     let moving = forward != 0 || strafe != 0 || steer_in_chase;
-    let (intent_forward, intent_strafe) = if locked {
-        (forward as f32, strafe as f32)
-    } else if moving {
-        (1.0, 0.0)
-    } else {
-        (0.0, 0.0)
-    };
+    let (intent_forward, intent_strafe) = pose_intent(locked, moving, forward, strafe);
+    // The lock flag travels with the intent: it is what arms the locked look-at downstream
+    // (kuluu-render's `locked_on`), so a tick where this fell back to its default left the head and
+    // chest off the target through the crossfade.
     **move_intent = kuluu_render::combat_stance::SelfMoveIntent {
         moving,
         forward: intent_forward,
         strafe: intent_strafe,
+        locked,
         ..default()
     };
 
-    let mut heading = self_pos.heading;
+    // An authored turn or rotation drive owns this tick's base facing, and every travel assignment below
+    // re-aims over it on a tick where the player travels. The heading then leaves through the Move
+    // command, which is how an authored self-turn reaches the wire (`kuluu-render`'s
+    // SchedulerRuntimePlugin documents why these integrators publish one schedule before this system runs).
+    let mut heading = match authored_facing {
+        Some(byte) => byte,
+        None => self_pos.heading,
+    };
     if player_rotate_u8 != 0 {
         let delta = player_rotate_u8.rem_euclid(256) as u8;
         heading = heading.wrapping_add(delta);
@@ -1537,77 +1652,61 @@ pub fn dispatch_movement_system(
     let mut turn_dx: f32 = 0.0;
     let mut turn_dy: f32 = 0.0;
     if steer_in_chase {
+        // A pure W/S run keeps its latched run direction and a held Q/E turns
+        // it, the camera owing the same turn; a held A/D or a deliberate camera
+        // pan re-aims the run in the live camera frame.
         let camera_forward_h = heading_for_yaw(chase.yaw);
         let pf_sign = if pf > 0.0 { 1 } else { -1 };
         let latched = match locals.steer_latch {
-            Some((f, h)) if f == pf_sign => Some(h),
+            Some((f, yaw)) if f == pf_sign => Some(yaw),
             _ => None,
         };
-        let continuous = ps != 0.0 || camera_panning;
-        let motion_h = if rotate_carve {
-            let base = latched.unwrap_or_else(|| {
-                camera_relative_motion_heading(camera_forward_h, pf_sign as f32, 0.0)
-            });
-            let h = base.wrapping_add(player_rotate_u8.rem_euclid(256) as u8);
-            locals.steer_latch = Some((pf_sign, h));
-            h
-        } else if continuous {
+        let motion_h = if qe != 0.0 {
+            let yaw = latched.unwrap_or_else(|| {
+                yaw_for_heading(camera_relative_motion_heading(camera_forward_h, pf, ps))
+            }) + qe;
+            locals.steer_latch = Some((pf_sign, yaw));
+            chase.turn_owed += qe;
+            heading_for_yaw(yaw)
+        } else if ps != 0.0 || camera_panning {
             camera_relative_motion_heading(camera_forward_h, pf, ps)
         } else {
-            latched.unwrap_or_else(|| {
-                let h = camera_relative_motion_heading(camera_forward_h, pf_sign as f32, 0.0);
-                locals.steer_latch = Some((pf_sign, h));
-                h
-            })
+            heading_for_yaw(latched.unwrap_or_else(|| {
+                let yaw = yaw_for_heading(camera_relative_motion_heading(
+                    camera_forward_h,
+                    pf_sign as f32,
+                    0.0,
+                ));
+                locals.steer_latch = Some((pf_sign, yaw));
+                yaw
+            }))
         };
 
         if raw_step > 0.0 {
-            let h_target = yaw_for_heading(motion_h);
-            let h_current = yaw_for_heading(heading);
-            let h_diff = wrap_signed_pi(h_target - h_current);
+            // The player has no turn rate: heading and position are logical,
+            // so facing is the travel direction on the tick it changes and
+            // the step goes the new way at once - the turn that shows is the
+            // animation's, not the walker's.
+            heading = motion_h;
 
-            // From standstill the model faces the run direction on the first
-            // step (HorizonXI video 2026-07-20); the carve lerp only applies
-            // to direction changes while already running.
-            heading = if !was_moving || h_diff.abs() >= ABOUT_FACE_SNAP_RAD {
-                motion_h
-            } else {
-                let h_alpha = 1.0 - (-HEADING_LERP_RATE_RAD_PER_SEC * time.delta_secs()).exp();
-                heading_for_yaw(h_current + h_diff * h_alpha)
-            };
-
-            // Translate along the body's current (lerped) heading, not the
-            // target run direction. Retail velocity is always body-aligned:
-            // a direction change carves an arc as the model turns. Stepping
-            // along motion_h while heading still lerps decouples facing from
-            // travel and reads as ice-skating.
             let (mv_x, mv_y) = heading_to_forward(heading);
             turn_dx = mv_x * raw_step;
             turn_dy = mv_y * raw_step;
         }
-
-        // Camera follow while carving is camera_polish_system's auto-recenter
-        // (the single camera-follow authority); adding a second tug here would
-        // tighten the carve circle below the retail-observed rate.
         forward = 0;
         strafe = 0;
     }
 
+    // Locked on, the walker re-aims at the target on every tick it moves; standing still changes
+    // nothing (lock-on itself never turns the body — that is the difference between `Target` and
+    // `Target locked`, and this function already returns above for a stationary player). Retail's
+    // facing while locked comes from target-tracking feeding the walker each frame
+    // (FFXiMain.dll retail-2026-09 target-track 0xA7B80, consumed by the steer branch that owns the
+    // heading and the camera spring reference — movement.md M32), so A/D circle the target instead
+    // of sliding along whatever axis the first move happened to pick. The previous rule here squared
+    // the body once per target and froze that heading (the play-test report for this row is P2).
     if let Some(bearing) = locked_bearing {
-        let damped = damp_lock_bearing(
-            &mut locals.lock_bearing,
-            bearing,
-            self_pos.heading,
-            LOCK_BODY_DAMP_RAD_PER_SEC,
-            time.delta_secs(),
-        );
-        damp_lock_camera(
-            &mut chase.yaw,
-            bearing,
-            LOCK_CAM_DAMP_RAD_PER_SEC,
-            time.delta_secs(),
-        );
-        heading = heading_for_angle(damped);
+        heading = heading_for_angle(bearing);
     }
 
     // Retail buckets the movement vector against the actor's own resolved
@@ -1966,33 +2065,6 @@ fn heading_for_angle(angle: f32) -> u8 {
     (normalized * 128.0 / std::f32::consts::PI).round() as u32 as u8
 }
 
-/// One step of the lock-on body's damped look-at: exponentially smooth the
-/// persistent bearing toward the target at a framerate-independent rate, so
-/// the facing turns instead of snapping. Seeds from the server's facing on
-/// the first tick (and after a zone change resets the locals).
-fn damp_lock_bearing(
-    damped: &mut Option<f32>,
-    bearing: f32,
-    seed_heading: u8,
-    rate: f32,
-    dt: f32,
-) -> f32 {
-    let seed = wrap_signed_pi(seed_heading as f32 * std::f32::consts::TAU / 256.0);
-    let cur = (*damped).unwrap_or(seed);
-    let alpha = 1.0 - (-rate * dt).exp();
-    let next = wrap_signed_pi(cur + wrap_signed_pi(bearing - cur) * alpha);
-    *damped = Some(next);
-    next
-}
-
-/// One step of the lock-on camera's damped look-at: turn the chase yaw toward
-/// the bearing's camera yaw at a framerate-independent rate.
-fn damp_lock_camera(chase_yaw: &mut f32, bearing: f32, rate: f32, dt: f32) {
-    let target_yaw = kuluu_render::yaw_for_heading(heading_for_angle(bearing));
-    let alpha = 1.0 - (-rate * dt).exp();
-    *chase_yaw += wrap_signed_pi(target_yaw - *chase_yaw) * alpha;
-}
-
 fn radius_for_wire_kind(kind: EntityKind) -> f32 {
     match kind {
         EntityKind::Pc => kuluu_session::state::MODEL_RADIUS_PC,
@@ -2146,156 +2218,23 @@ pub fn tab_cycle_invalidate_system(
     }
 }
 
-#[derive(Resource, Default)]
-pub struct CameraAutoRecenter {
-    pub forward_held_since: Option<Instant>,
-
-    /// A camera pan or yaw input holds the recenter off; any movement input
-    /// releases it. Retail's hold-off is a displacement count, not a key flag
-    /// — see [`AUTO_RECENTER_RATE`].
-    pub manual_override: bool,
-
-    /// The follow lags whatever turned the body (a Q/E rotate, an A/D carve,
-    /// an autorun steer), so the key comes up with the camera still off to the
-    /// side. It keeps closing that gap after the key lifts, until it sits
-    /// behind the character or the player takes the camera back.
-    pub settling: bool,
-}
-
-// Retail's camera swings behind a carving character at ~0.55 rad/s (HorizonXI
-// video 2026-07-20: ~150-180° over a ~5s held D). This lazy follow is what
-// makes a held A/D trace a wide circle — the camera-relative run direction
-// only rotates as fast as the camera catches up. Everything else follows at
-// the retail chase rate below.
-const CARVE_FOLLOW_RATE: f32 = 0.55;
-
-// Retail's chase camera (the Chase Cam config mode, FS_CONFIG_145) pulls the
-// eye toward the point directly behind the actor's facing by 2.5 percent of the
-// remaining offset per tick, and it runs off the actor's own rotation, not off a
-// held key - so it keeps closing after the turn key comes up
-// (research/XIClient/src/XIClient/source/World/Camera/CameraManager.cpp,
-// CameraManager::UpdatePlayerFollowingCamera). Per-tick fraction times the tick
-// rate is the continuous rate to first order.
-const RETAIL_CHASE_RECENTER_PER_TICK: f32 = 0.025;
-const AUTO_RECENTER_RATE: f32 = RETAIL_CHASE_RECENTER_PER_TICK * RETAIL_MOVE_TICKS_PER_SEC;
-
-/// Retail's window engages at 60 degrees off-centre; this one at 2.0 rad
-/// (~115 degrees) because our A/D carve is body-led — the body turns and the
-/// camera chases — where retail's turn keys are camera-led and the body
-/// follows the camera. A carve past 60 degrees would
-/// stall under retail's window until the carve matches that model. Retail
-/// plants the chase camera when the character deliberately runs toward it
-/// (unlocked S / about-face): the follow must not swing around to the
-/// character's back mid-run. A/D carves sit near ±π/2 and must still follow,
-/// so the hold only engages past this threshold.
-const RECENTER_HOLD_RAD: f32 = 2.0;
-
-pub fn recenter_follow_allowed(yaw_diff: f32) -> bool {
-    yaw_diff.abs() < RECENTER_HOLD_RAD
-}
-
-/// Retail stops the pull once the eye is within this dot product of the
-/// behind-the-actor direction (UpdatePlayerFollowingCamera again, the
-/// `> 0.5 && < 0.99` engagement window), about eight degrees: inside the
-/// window the follow holds the yaw where it is, it does not snap the
-/// remainder.
-const RETAIL_CHASE_RECENTER_SETTLED_DOT: f32 = 0.99;
-
-/// Returns the camera yaw after one follow step and whether it still has
-/// ground to cover.
-pub fn recenter_yaw_step(yaw: f32, target_yaw: f32, rate: f32, dt: f32) -> (f32, bool) {
-    let diff = wrap_signed_pi(target_yaw - yaw);
-    if !recenter_follow_allowed(diff) {
-        return (yaw, false);
-    }
-    if diff.cos() >= RETAIL_CHASE_RECENTER_SETTLED_DOT {
-        return (yaw, false);
-    }
-    let alpha = 1.0 - (-rate * dt).exp();
-    (yaw + diff * alpha, true)
-}
-
 const FP_LOCK_PITCH_RATE: f32 = 3.0;
 
 const TARGET_HEAD_OFFSET_Y: f32 = 1.5;
 
-/// Chase-camera polish. Recenter tracks the character while it is moving and
-/// for the tail it takes to finish swinging behind; idle and settled, the
-/// camera holds wherever the player left it (retail behavior). Only a steer
-/// that actually owns the turn axis carves: A/D suppressed by a Q/E hold does
-/// not slow the follow below the body's rotate rate.
+/// First-person lock-on pitch polish: the eye levels onto the target's head at
+/// a capped rate. The chase camera gets no polish - it is free and is never
+/// pulled toward the character's heading.
 pub fn camera_polish_system(
-    keys: Res<ButtonInput<KeyCode>>,
-    bindings: Res<Bindings>,
-    pad: Res<super::gamepad_input::PadStickIntent>,
     time: Res<Time>,
     mode: Res<InputMode>,
     camera_mode: Res<CameraMode>,
-    state: Res<SceneState>,
     lock_on: Res<LockOn>,
-    pointer: Res<kuluu_render::MousePointer>,
-    locals: Res<DispatchLocals>,
     mut chase: ResMut<ChaseCamera>,
-    mut recenter: ResMut<CameraAutoRecenter>,
     self_q: Query<&Transform, (With<IsSelf>, Without<OperatorCamera>)>,
     target_q: Query<(&WorldEntity, &Transform), Without<OperatorCamera>>,
 ) {
-    if !matches!(*mode, InputMode::World) {
-        recenter.forward_held_since = None;
-        return;
-    }
-
-    let yaw_input = bindings.pressed(Action::CameraYawLeft, &keys)
-        || bindings.pressed(Action::CameraYawRight, &keys)
-        || pad.camera.x != 0.0;
-    let drag_active = pointer.left || pointer.right;
-    if yaw_input || drag_active {
-        recenter.manual_override = true;
-        recenter.settling = false;
-    }
-    let movement_input = bindings.pressed(Action::MoveForward, &keys)
-        || bindings.pressed(Action::MoveBackward, &keys)
-        || bindings.pressed(Action::StrafeLeft, &keys)
-        || bindings.pressed(Action::StrafeRight, &keys)
-        || bindings.pressed(Action::TurnLeft, &keys)
-        || bindings.pressed(Action::TurnRight, &keys)
-        || bindings.pressed(Action::RotateLeft, &keys)
-        || bindings.pressed(Action::RotateRight, &keys)
-        || pad.movement != Vec2::ZERO;
-    if movement_input {
-        recenter.manual_override = false;
-        recenter.settling = true;
-    }
-
-    // Locked on, the camera is the lock look-at's (damp_lock_camera in
-    // dispatch_movement_system); a second yaw writer here made the two
-    // alternate every frame while strafing.
-    if lock_on.is_active() {
-        recenter.settling = false;
-    }
-    if (movement_input || recenter.settling)
-        && !lock_on.is_active()
-        && !yaw_input
-        && !drag_active
-        && !recenter.manual_override
-        && matches!(*camera_mode, CameraMode::Chase)
-    {
-        let carving = locals.turn_owner != TurnAxisOwner::Rotate
-            && (bindings.pressed(Action::TurnLeft, &keys)
-                || bindings.pressed(Action::TurnRight, &keys)
-                || pad.movement.x != 0.0);
-        let rate = if carving {
-            CARVE_FOLLOW_RATE
-        } else {
-            AUTO_RECENTER_RATE
-        };
-        let target_yaw = yaw_for_heading(state.snapshot.self_pos.heading);
-        let (yaw, settling) = recenter_yaw_step(chase.yaw, target_yaw, rate, time.delta_secs());
-        chase.yaw = yaw;
-        recenter.settling = settling;
-    }
-
-    if !matches!(*camera_mode, CameraMode::FirstPerson) {
+    if !matches!(*mode, InputMode::World) || !matches!(*camera_mode, CameraMode::FirstPerson) {
         return;
     }
     let Some(target_id) = lock_on.target_id else {
@@ -2369,6 +2308,8 @@ mod tests {
             .init_resource::<kuluu_render::dat_mzb::MzbCollisionGeometry>()
             .init_resource::<kuluu_render::dat_mzb::LastAutoLoadedZone>()
             .init_resource::<kuluu_render::dat_mzb::LoadMzbInFlight>()
+            .init_resource::<kuluu_render::ViewFov>()
+            .init_resource::<kuluu_render::WheelZoom>()
             .init_resource::<super::super::walker::obstacles::ObstacleSet>()
             .init_resource::<kuluu_render::elevators::ZoneElevators>()
             .init_resource::<kuluu_render::hud::HudPanels>()
@@ -2381,6 +2322,7 @@ mod tests {
             .init_resource::<kuluu_render::scene::TrackedEntities>()
             .init_resource::<kuluu_render::ffxi_actor_render::SelfKnockback>()
             .init_resource::<kuluu_render::cutscene::CutsceneMode>()
+            .init_resource::<kuluu_render::rotation_drives::SelfAuthoredHeading>()
             .init_resource::<super::super::walker::debug::FieldDebug>()
             .add_systems(
                 Update,
@@ -3029,6 +2971,43 @@ mod tests {
         let mut in_flight = LoadMzbInFlight::default();
         in_flight.tasks.insert((0, None, None), (Vec::new(), task));
         in_flight
+    }
+
+    /// The CS (dialog-driven) feet lift to the MZB floor when the scripted
+    /// height sits below it, and hold the scripted height when the floor is at
+    /// or below the feet (a downward snap would read as a fall the script did
+    /// not author).
+    #[test]
+    fn dialog_feet_lift_to_the_floor_when_the_scripted_height_sits_below_it() {
+        // Floor at bevy y = 10.0 (wire z = -10.0).
+        const FLOOR_BEVY_Y: f32 = 10.0;
+        let collision = slab_collision(FLOOR_BEVY_Y);
+
+        // Feet 0.2 yalms in the floor: wire z = -9.8 (bevy y = 9.8), within
+        // MAX_GROUND_STEP_UP of the floor, so ground_step resolves it.
+        let in_floor = Vec3::new(0.0, 0.0, -9.8);
+        let lifted = ground_dialog_feet_wire_z(&collision, in_floor);
+        assert!(
+            (lifted - (-FLOOR_BEVY_Y)).abs() < 1e-3,
+            "feet below the floor must lift to it, got {lifted}"
+        );
+
+        // Feet already on the floor: wire z = -10.0 (bevy y = 10.0).
+        let on_floor = Vec3::new(0.0, 0.0, -FLOOR_BEVY_Y);
+        let held = ground_dialog_feet_wire_z(&collision, on_floor);
+        assert!(
+            (held - on_floor.z).abs() < 1e-3,
+            "feet already on the floor must not re-snap, got {held}"
+        );
+
+        // Feet above the floor: wire z = -10.5 (bevy y = 10.5), floating. The
+        // floor is below the feet, so a downward snap is refused.
+        let above = Vec3::new(0.0, 0.0, -10.5);
+        let floating = ground_dialog_feet_wire_z(&collision, above);
+        assert!(
+            (floating - above.z).abs() < 1e-3,
+            "feet above the floor must not snap down, got {floating}"
+        );
     }
 
     /// The wedge repro: feet at wire z = 0 (bevy y = 0) with the only floor a
@@ -3939,6 +3918,109 @@ mod tests {
         assert_eq!(r.steer, 0);
     }
 
+    /// The lock flag must reach animation selection through the pose intent: it alone arms the
+    /// locked look-at in the pose pass, which keeps the head and chest on the target through a side
+    /// step. Without it a walker that squares correctly on the target still leaves them off it.
+    #[test]
+    fn locked_side_step_reports_the_lock_in_pose_intent() {
+        use kuluu_render::combat_stance::SelfMoveIntent;
+        let mut drive = MoveDrive::new();
+        // The latch state the toggle system would leave behind; this harness drives dispatch directly.
+        *drive.app.world_mut().resource_mut::<LockOn>() = LockOn { target_id: Some(1) };
+        drive.press(KeyCode::KeyD);
+        for _ in 0..SETTLE_TICKS {
+            drive.tick();
+            let intent = *drive.app.world().resource::<SelfMoveIntent>();
+            assert!(intent.moving, "held D keeps the actor moving");
+            assert_ne!(
+                intent.strafe, 0.0,
+                "locked turn-right travels on the strafe axis"
+            );
+            assert!(
+                intent.locked,
+                "a locked-on side step must arm the locked look-at in pose intent"
+            );
+        }
+
+        drive.release(KeyCode::KeyD);
+        drive.tick();
+        *drive.app.world_mut().resource_mut::<LockOn>() = LockOn::default();
+        drive.press(KeyCode::KeyD);
+        for _ in 0..3 {
+            drive.tick();
+            assert!(
+                !drive.app.world().resource::<SelfMoveIntent>().locked,
+                "free motion never arms the locked look-at"
+            );
+        }
+    }
+
+    /// A lock takes the camera keys away, as retail's does: the arrows neither turn nor tilt a locked
+    /// camera, while the pad stick, one of the analog axes retail keeps reading, still turns it. Unlocked,
+    /// the arrows turn and tilt it again.
+    #[test]
+    fn camera_keys_leave_a_locked_camera_alone() {
+        const ARROWS: [KeyCode; 4] = [
+            KeyCode::ArrowLeft,
+            KeyCode::ArrowRight,
+            KeyCode::ArrowUp,
+            KeyCode::ArrowDown,
+        ];
+        let mut drive = MoveDrive::new();
+        let aim = |drive: &MoveDrive| {
+            let chase = drive.app.world().resource::<ChaseCamera>();
+            (chase.yaw, chase.pitch)
+        };
+        let hold = |drive: &mut MoveDrive, key: KeyCode| {
+            drive.press(key);
+            drive.tick();
+            drive.tick();
+            drive.release(key);
+            drive.tick();
+        };
+
+        *drive.app.world_mut().resource_mut::<LockOn>() = LockOn { target_id: Some(1) };
+        let locked = aim(&drive);
+        for key in ARROWS {
+            hold(&mut drive, key);
+            assert_eq!(aim(&drive), locked, "{key:?} moved the locked camera");
+        }
+        drive
+            .app
+            .world_mut()
+            .resource_mut::<super::super::gamepad_input::PadStickIntent>()
+            .camera = Vec2::X;
+        drive.tick();
+        assert_ne!(
+            drive.camera_yaw(),
+            locked.0,
+            "the stick turns a locked camera"
+        );
+        drive
+            .app
+            .world_mut()
+            .resource_mut::<super::super::gamepad_input::PadStickIntent>()
+            .camera = Vec2::ZERO;
+        drive.tick();
+
+        *drive.app.world_mut().resource_mut::<LockOn>() = LockOn::default();
+        for key in ARROWS {
+            let before = aim(&drive);
+            hold(&mut drive, key);
+            assert_ne!(aim(&drive), before, "{key:?} turns a free camera");
+        }
+    }
+
+    #[test]
+    fn locked_rotate_keys_decode_to_nothing() {
+        let r = resolve(MoveKeys {
+            rotate_left: true,
+            locked: true,
+            ..Default::default()
+        });
+        assert_eq!(r.rotate_dir, 0);
+    }
+
     #[test]
     fn rotate_and_steer_decode_to_separate_axes() {
         let r = resolve(MoveKeys {
@@ -3948,45 +4030,6 @@ mod tests {
         });
         assert_eq!(r.rotate_dir, -1);
         assert_eq!(r.steer, 1);
-    }
-
-    /// A/D down first: a later Q/E press is dead until A/D comes up; Q/E down
-    /// first is the mirror case. Nothing held releases the axis; a same-frame
-    /// tie goes to the steer keys.
-    #[test]
-    fn turn_axis_stays_with_the_family_that_took_it() {
-        let owner = arbitrate_turn_axis(TurnAxisOwner::None, true, false);
-        assert_eq!(owner, TurnAxisOwner::Steer);
-        assert_eq!(
-            arbitrate_turn_axis(owner, true, true),
-            TurnAxisOwner::Steer,
-            "A/D held keeps the axis while Q/E is pressed"
-        );
-        assert_eq!(
-            arbitrate_turn_axis(owner, false, true),
-            TurnAxisOwner::Rotate,
-            "releasing A/D hands the axis to the held Q/E"
-        );
-
-        let owner = arbitrate_turn_axis(TurnAxisOwner::None, false, true);
-        assert_eq!(owner, TurnAxisOwner::Rotate);
-        assert_eq!(
-            arbitrate_turn_axis(owner, true, true),
-            TurnAxisOwner::Rotate
-        );
-        assert_eq!(
-            arbitrate_turn_axis(owner, true, false),
-            TurnAxisOwner::Steer
-        );
-
-        assert_eq!(
-            arbitrate_turn_axis(TurnAxisOwner::Rotate, false, false),
-            TurnAxisOwner::None
-        );
-        assert_eq!(
-            arbitrate_turn_axis(TurnAxisOwner::None, true, true),
-            TurnAxisOwner::Steer
-        );
     }
 
     /// Drives the real movement system one retail tick at a time, mirroring each
@@ -4043,8 +4086,31 @@ mod tests {
             self.app.world().resource::<AutoRun>().phantom_forward
         }
 
+        /// Publishes an authored facing the way `kuluu-render`'s rotation integrators do, so what the
+        /// test measures is the walker's own consumption of it.
+        fn publish_authored(&mut self, heading: u8) {
+            let mut authored =
+                self.app
+                    .world_mut()
+                    .resource_mut::<kuluu_render::rotation_drives::SelfAuthoredHeading>();
+            authored.publish(kuluu_render::combat_stance::heading_to_rad(heading));
+        }
+
+        /// The facing still waiting to be taken, if any.
+        fn authored_residue(&self) -> Option<u8> {
+            self.app
+                .world()
+                .resource::<kuluu_render::rotation_drives::SelfAuthoredHeading>()
+                .0
+                .map(kuluu_render::combat_stance::heading_byte_for_rad)
+        }
+
         fn camera_yaw(&self) -> f32 {
             self.app.world().resource::<ChaseCamera>().yaw
+        }
+
+        fn turn_owed(&self) -> f32 {
+            self.app.world().resource::<ChaseCamera>().turn_owed
         }
 
         fn tick(&mut self) -> (u8, Vec2) {
@@ -4076,36 +4142,36 @@ mod tests {
     /// Long enough for the body to settle onto its run heading before the
     /// rotate key joins it.
     const SETTLE_TICKS: usize = 10;
-    /// Half a second of held rotate: ~40 heading units at the Q/E key rate,
-    /// far past the couple of units of lerp round-trip noise.
+    /// Half a second of held rotate.
     const ROTATE_TICKS: usize = 30;
-    /// Four seconds of movement ticks: an exponential close of the widest
-    /// followable gap finishes well inside this, so overrunning it means the
-    /// follow has stalled rather than merely being slow.
-    const SETTLE_TICK_BUDGET: u32 = 4 * RETAIL_MOVE_TICKS_PER_SEC as u32;
 
-    fn turned_units(from: u8, to: u8) -> i32 {
-        let raw = i32::from(to) - i32::from(from);
-        (raw + 128).rem_euclid(256) - 128
+    /// Orbit radians the eye sweeps over `ROTATE_TICKS` of held Q, at the rig
+    /// radius this harness runs with.
+    fn orbit_radians() -> f32 {
+        let rig = Some(ChaseCamera::default().distance);
+        camera_orbit_yaw_rate_rad_per_sec(1.0, FOLLOW_ACTOR_FREE_RUN_DEFAULT, rig)
+            * ROTATE_TICKS as f32
+            / RETAIL_MOVE_TICKS_PER_SEC
     }
 
-    /// Heading units a standing character sweeps over `ROTATE_TICKS` of held Q -
-    /// the rotate-in-place rate every moving case is measured against.
-    fn standing_rotate_units() -> i32 {
-        let mut drive = MoveDrive::new();
-        let (start, _) = drive.tick();
-        drive.press(KeyCode::KeyQ);
-        let ticks = drive.run(ROTATE_TICKS);
-        turned_units(start, ticks.last().expect("ticks").0)
+    /// One wire heading unit in radians: the most the u8 heading rounds a turn's two ends by together.
+    const HEADING_UNIT_RAD: f32 = std::f32::consts::TAU / 256.0;
+
+    /// The turn from one wire heading to another, in facing-yaw radians.
+    fn turned(from: u8, to: u8) -> f32 {
+        wrap_signed_pi(yaw_for_heading(to) - yaw_for_heading(from))
     }
 
-    /// Q held with `move_key` must turn the run at the rotate-in-place rate while
-    /// every tick still travels a full run step along the body's own heading.
-    fn assert_rotating_run(move_key: KeyCode) {
+    /// A W/S run keeps going once it starts, and a held Q steers it: the run
+    /// turns left by the key sweep every tick while every tick still travels a
+    /// full run step in the current heading direction, and the camera owes the
+    /// same turn, paired with it.
+    fn assert_steering_run(move_key: KeyCode) {
         let mut drive = MoveDrive::new();
         drive.press(move_key);
         let settled = drive.run(SETTLE_TICKS);
         let (start_heading, start_pos) = *settled.last().expect("settle ticks");
+        let yaw_start = drive.camera_yaw();
         drive.press(KeyCode::KeyQ);
         let ticks = drive.run(ROTATE_TICKS);
 
@@ -4122,117 +4188,150 @@ mod tests {
             let along = step.normalize().dot(Vec2::new(fx, fy));
             assert!(
                 along > 0.999,
-                "{move_key:?}+Q must travel along the body heading, got {along}"
+                "{move_key:?}+Q must travel in its current heading direction, got {along}"
             );
         }
 
-        let turned = turned_units(start_heading, ticks.last().expect("ticks").0);
-        let standing = standing_rotate_units();
+        let (end_heading, _) = *ticks.last().expect("ticks");
+        let body_turned = turned(start_heading, end_heading);
         assert!(
-            (turned - standing).abs() <= 2,
-            "{move_key:?}+Q turned {turned} units, rotate-in-place turns {standing}"
+            (body_turned - orbit_radians()).abs() < HEADING_UNIT_RAD,
+            "{move_key:?}+Q steered the run {body_turned} rad, want {} rad",
+            orbit_radians()
+        );
+        assert_eq!(drive.camera_yaw(), yaw_start);
+        assert!(
+            (drive.turn_owed() - orbit_radians()).abs() < 1e-4,
+            "{move_key:?}+Q left the camera owing {} rad, want {} rad",
+            drive.turn_owed(),
+            orbit_radians()
         );
     }
 
     #[test]
-    fn rotate_key_turns_a_forward_run() {
-        assert_rotating_run(KeyCode::KeyW);
+    fn rotate_key_steers_a_forward_run() {
+        assert_steering_run(KeyCode::KeyW);
     }
 
     #[test]
-    fn rotate_key_turns_a_backward_run() {
-        assert_rotating_run(KeyCode::KeyS);
+    fn rotate_key_steers_a_backward_run() {
+        assert_steering_run(KeyCode::KeyS);
     }
 
-    /// Both turn families held: the trajectory must match the one the
-    /// first-pressed family produces on its own. Both standing and running:
-    /// standing exposes a stray steer starting a sideways run, running
-    /// exposes a stray rotate bending the carve.
-    fn assert_turn_axis_owner(first: KeyCode, second: KeyCode) {
-        for run_key in [None, Some(KeyCode::KeyW)] {
-            let trajectory = |late: Option<KeyCode>| {
-                let mut drive = MoveDrive::new();
-                if let Some(key) = run_key {
-                    drive.press(key);
-                }
-                drive.press(first);
-                drive.run(SETTLE_TICKS);
-                if let Some(key) = late {
-                    drive.press(key);
-                }
-                drive.run(ROTATE_TICKS)
-            };
-            assert_eq!(
-                trajectory(None),
-                trajectory(Some(second)),
-                "{second:?} pressed after {first:?} (run key {run_key:?}) must not \
-                 touch the turn axis"
-            );
-        }
-    }
-
+    /// Standing, a held Q turns the body left in place by the key sweep each
+    /// tick and leaves the camera owing the same turn, for the chase camera to
+    /// follow round with; the camera yaw itself is not set here, so nothing
+    /// resets it behind the body.
     #[test]
-    fn held_steer_locks_out_a_later_rotate() {
-        assert_turn_axis_owner(KeyCode::KeyA, KeyCode::KeyQ);
-    }
-
-    #[test]
-    fn held_rotate_locks_out_a_later_steer() {
-        assert_turn_axis_owner(KeyCode::KeyQ, KeyCode::KeyA);
-    }
-
-    #[test]
-    fn a_held_rotate_key_sweeps_the_retail_autorun_steer() {
-        let mut accum = 0.0_f32;
-        let mut units = 0;
-        for _ in 0..RETAIL_MOVE_TICKS_PER_SEC as usize {
-            units += advance_heading_turn(
-                &mut accum,
-                ROTATE_KEY_RATE_RAD_PER_SEC,
-                1.0 / RETAIL_MOVE_TICKS_PER_SEC,
-            )
-            .0;
-        }
-        let degrees = units as f32 * 360.0 / 256.0;
-        let want = RETAIL_AUTORUN_STEER_DEG_PER_TICK * RETAIL_MOVE_TICKS_PER_SEC;
+    fn a_held_rotate_key_turns_a_standing_body_and_the_camera_owes_the_turn() {
+        let mut drive = MoveDrive::new();
+        drive.run(SETTLE_TICKS);
+        let (start_heading, _) = drive.tick();
+        let yaw_start = drive.camera_yaw();
+        drive.press(KeyCode::KeyQ);
+        let ticks = drive.run(ROTATE_TICKS);
+        let (end_heading, _) = *ticks.last().expect("ticks");
+        let body_turned = turned(start_heading, end_heading);
         assert!(
-            (degrees - want).abs() < 1.0,
-            "a second of held Q/E sweeps {degrees} degrees, retail steers {want}"
+            (body_turned - orbit_radians()).abs() < HEADING_UNIT_RAD,
+            "the body turned {body_turned} rad, want {} rad",
+            orbit_radians()
+        );
+        assert_eq!(drive.camera_yaw(), yaw_start);
+        assert!(
+            (drive.turn_owed() - orbit_radians()).abs() < 1e-4,
+            "the camera owes {} rad, want {} rad",
+            drive.turn_owed(),
+            orbit_radians()
         );
     }
 
-    /// The two retail rates are within a fifth of each other, so a ratio that
-    /// missed by this much would have to be a different pairing entirely.
-    const ORBIT_RATIO_TOLERANCE: f32 = 0.05;
-
+    /// Locked on, Q/E do nothing: the body keeps its heading and the camera
+    /// neither turns nor owes a turn.
     #[test]
-    fn a_held_rotate_key_orbits_the_camera_with_the_body() {
+    fn rotate_keys_do_nothing_locked_on() {
+        const TARGET_ID: u32 = 2;
+        const TARGET_DIST: f32 = 10.0;
+        let mut drive = MoveDrive::new();
+        drive
+            .app
+            .world_mut()
+            .resource_mut::<SceneState>()
+            .snapshot
+            .entities
+            .push(ent(TARGET_ID, 0.0, TARGET_DIST));
+        *drive.app.world_mut().resource_mut::<LockOn>() = LockOn {
+            target_id: Some(TARGET_ID),
+        };
+        let (start_heading, _) = drive.tick();
+        let yaw_start = drive.camera_yaw();
+        for key in [KeyCode::KeyQ, KeyCode::KeyE] {
+            drive.press(key);
+            let ticks = drive.run(ROTATE_TICKS);
+            drive.release(key);
+            assert!(
+                ticks.iter().all(|(heading, _)| *heading == start_heading),
+                "{key:?} turned a locked-on body"
+            );
+        }
+        assert_eq!(drive.camera_yaw(), yaw_start, "Q/E turned a locked camera");
+        assert_eq!(drive.turn_owed(), 0.0);
+    }
+
+    /// Resting, Q turns the camera alone: the player stays down, facing where
+    /// it faced, and the camera owes the key sweep.
+    #[test]
+    fn a_rotate_key_turns_only_the_camera_while_resting() {
+        use kuluu_render::combat_stance::{RestKind, RestStance};
+        let mut drive = MoveDrive::new();
+        let (start_heading, _) = drive.tick();
+        drive.app.world_mut().resource_mut::<RestStance>().kind = RestKind::Sit;
+        drive.press(KeyCode::KeyQ);
+        let ticks = drive.run(ROTATE_TICKS);
+        assert!(
+            drive.app.world().resource::<RestStance>().is_resting(),
+            "Q stood the player up"
+        );
+        assert!(
+            ticks.iter().all(|(heading, _)| *heading == start_heading),
+            "Q turned a resting body"
+        );
+        assert!(
+            (drive.turn_owed() - orbit_radians()).abs() < 1e-4,
+            "the camera owes {} rad, want {} rad",
+            drive.turn_owed(),
+            orbit_radians()
+        );
+    }
+
+    /// A mid-run re-aim (A joining a W run) is instant: the player has no
+    /// turn rate, so the heading is the new run direction on the very first
+    /// tick - no carved arc, no settle.
+    #[test]
+    fn a_mid_run_reaim_is_instant_not_carved() {
         let mut drive = MoveDrive::new();
         drive.press(KeyCode::KeyW);
         drive.run(SETTLE_TICKS);
-        let (start, _) = drive.tick();
-        let yaw_start = drive.camera_yaw();
-        drive.press(KeyCode::KeyQ);
-        let (end, _) = *drive.run(ROTATE_TICKS).last().expect("ticks");
-
-        let body = turned_units(start, end) as f32 * std::f32::consts::TAU / 256.0;
-        let orbit = -(drive.camera_yaw() - yaw_start);
-        let ratio = orbit / body;
-        let want = ROTATE_KEY_ORBIT_RAD_PER_SEC / ROTATE_KEY_RATE_RAD_PER_SEC;
+        let (pre_heading, _) = drive.tick();
+        drive.press(KeyCode::KeyA);
+        let first = drive.tick();
+        let first_turn =
+            wrap_signed_pi(yaw_for_heading(first.0) - yaw_for_heading(pre_heading)).abs();
         assert!(
-            (ratio - want).abs() < ORBIT_RATIO_TOLERANCE,
-            "the eye orbited {ratio} of the body turn, retail pairs them at {want}"
+            (first_turn - std::f32::consts::FRAC_PI_4).abs() < std::f32::consts::TAU / 256.0,
+            "the re-aim must be complete on the first tick, turned {first_turn} rad"
         );
     }
 
-    /// The cancel grace is wall-clock, not tick-driven, so the held Q this
-    /// test would cancel on has to outlast it in real time.
+    /// The cancel grace is wall-clock, not tick-driven, so the held Q has to
+    /// outlast it in real time.
     #[test]
-    fn rotate_aims_an_autorun_instead_of_cancelling_it() {
+    fn rotate_keeps_an_autorun_running_instead_of_cancelling_it() {
         let mut drive = MoveDrive::new();
         drive.engage_autorun();
         drive.run(SETTLE_TICKS);
-        let (start, _) = drive.tick();
+        let (start_heading, _) = drive.tick();
+        let yaw_start = drive.camera_yaw();
         drive.press(KeyCode::KeyQ);
         let mut turning = drive.run(ROTATE_TICKS / 2);
         std::thread::sleep(Duration::from_millis(STRAFE_CANCEL_MS * 2));
@@ -4242,13 +4341,19 @@ mod tests {
 
         assert!(
             drive.autorun_engaged(),
-            "a held Q must steer the autorun, not cancel it"
+            "a held Q must keep the autorun running, not cancel it"
         );
-        let turned = turned_units(start, turning.last().expect("ticks").0);
+        // `turning` is every Q-hold tick (both halves): the held Q steers the
+        // autorun by the key sweep and the camera owes the same turn.
+        let (end_turning, _) = *turning.last().expect("ticks");
+        let body_turned = turned(start_heading, end_turning);
         assert!(
-            (turned - standing_rotate_units()).abs() <= 2,
-            "autorun+Q turned {turned} units"
+            (body_turned - orbit_radians()).abs() < HEADING_UNIT_RAD,
+            "the autorun steered {body_turned} rad, want {} rad",
+            orbit_radians()
         );
+        assert_eq!(drive.camera_yaw(), yaw_start);
+        assert!((drive.turn_owed() - orbit_radians()).abs() < 1e-4);
         let (_, before_release) = *turning.last().expect("ticks");
         let (_, settled) = *after.last().expect("ticks");
         assert!(
@@ -4288,121 +4393,6 @@ mod tests {
                 "cam={cam}"
             );
         }
-    }
-
-    #[test]
-    fn recenter_holds_camera_when_running_toward_it() {
-        // S about-face: heading is a full π from the camera yaw — camera stays put.
-        assert!(!recenter_follow_allowed(std::f32::consts::PI));
-        assert!(!recenter_follow_allowed(-std::f32::consts::PI));
-        assert!(!recenter_follow_allowed(2.5));
-    }
-
-    #[test]
-    fn recenter_follows_carves_and_forward_travel() {
-        // A/D carves sit near ±π/2; forward travel near 0. Both must follow.
-        assert!(recenter_follow_allowed(0.0));
-        assert!(recenter_follow_allowed(std::f32::consts::FRAC_PI_2));
-        assert!(recenter_follow_allowed(-std::f32::consts::FRAC_PI_2));
-    }
-
-    /// The gap a held Q/E leaves at the moment of release: the body outruns
-    /// its own camera orbit, and the follow closes that difference.
-    #[test]
-    fn recenter_finishes_squarely_behind_after_the_turn_key_lifts() {
-        let dt = RETAIL_MOVE_TICKS_PER_SEC.recip();
-        let target = std::f32::consts::FRAC_PI_2;
-        let mut yaw = target
-            - (ROTATE_KEY_RATE_RAD_PER_SEC - ROTATE_KEY_ORBIT_RAD_PER_SEC) / AUTO_RECENTER_RATE;
-        let mut ticks = 0u32;
-        let settled = loop {
-            let (next, settling) = recenter_yaw_step(yaw, target, AUTO_RECENTER_RATE, dt);
-            if settling {
-                assert!(
-                    (next - target).abs() < (yaw - target).abs(),
-                    "the follow stalled at {yaw} short of {target}"
-                );
-            }
-            yaw = next;
-            ticks += 1;
-            if !settling {
-                break true;
-            }
-            if ticks > SETTLE_TICK_BUDGET {
-                break false;
-            }
-        };
-        assert!(settled, "the follow never finished: {yaw} vs {target}");
-        assert!(
-            (target - yaw).cos() >= RETAIL_CHASE_RECENTER_SETTLED_DOT,
-            "the camera must come to rest inside the settled window: {yaw} vs {target}"
-        );
-    }
-
-    #[test]
-    fn recenter_step_leaves_the_planted_about_face_camera_alone() {
-        let dt = RETAIL_MOVE_TICKS_PER_SEC.recip();
-        let (yaw, settling) = recenter_yaw_step(0.0, std::f32::consts::PI, AUTO_RECENTER_RATE, dt);
-        assert_eq!(yaw, 0.0);
-        assert!(!settling, "a planted camera has nothing left to settle");
-    }
-
-    #[test]
-    fn recenter_step_inside_the_settled_window_holds_the_yaw() {
-        let dt = RETAIL_MOVE_TICKS_PER_SEC.recip();
-        let target = std::f32::consts::FRAC_PI_2;
-        let yaw = target - 0.05;
-        assert!((target - yaw).cos() >= RETAIL_CHASE_RECENTER_SETTLED_DOT);
-        let (next, settling) = recenter_yaw_step(yaw, target, AUTO_RECENTER_RATE, dt);
-        assert_eq!(
-            next, yaw,
-            "a settled follow must not snap the last few degrees"
-        );
-        assert!(!settling);
-    }
-
-    /// With a target locked and a steer key held, the auto-recenter leaves
-    /// chase.yaw alone: the lock look-at owns the yaw (the strafe stutter).
-    #[test]
-    fn recenter_does_not_touch_the_yaw_while_locked_on() {
-        let mut app = App::new();
-        app.init_resource::<ButtonInput<KeyCode>>()
-            .init_resource::<Bindings>()
-            .init_resource::<SceneState>()
-            .init_resource::<InputMode>()
-            .init_resource::<CameraMode>()
-            .init_resource::<LockOn>()
-            .init_resource::<kuluu_render::MousePointer>()
-            .init_resource::<DispatchLocals>()
-            .init_resource::<ChaseCamera>()
-            .init_resource::<CameraAutoRecenter>()
-            .init_resource::<super::super::gamepad_input::PadStickIntent>()
-            .add_systems(Update, camera_polish_system);
-        let time: Time = Time::default();
-        app.insert_resource(time);
-        app.world_mut()
-            .resource_mut::<SceneState>()
-            .snapshot
-            .self_pos
-            .heading = 0;
-        let target_yaw = yaw_for_heading(0);
-        app.world_mut().resource_mut::<ChaseCamera>().yaw = target_yaw - 0.5;
-        app.world_mut().resource_mut::<LockOn>().target_id = Some(7);
-        let initial_yaw = app.world().resource::<ChaseCamera>().yaw;
-        for _ in 0..8 {
-            app.world_mut()
-                .resource_mut::<Time>()
-                .advance_by(Duration::from_secs_f32(RETAIL_MOVE_TICKS_PER_SEC.recip()));
-            app.world_mut()
-                .resource_mut::<ButtonInput<KeyCode>>()
-                .press(KeyCode::KeyA);
-            app.update();
-        }
-        assert_eq!(
-            app.world().resource::<ChaseCamera>().yaw,
-            initial_yaw,
-            "the recenter must leave the locked camera's yaw to the lock look-at"
-        );
     }
 
     #[test]
@@ -4453,6 +4443,37 @@ mod tests {
         assert_eq!(merge_dir(1, -0.4), 1);
         assert_eq!(merge_dir(-1, 0.9), -1);
         assert_eq!(merge_dir(0, 0.0), 0);
+    }
+
+    /// The H key toggles the lock while A/D stay held: the reference frame is
+    /// the target bearing when locked, but the free walker turns the body onto
+    /// the travel direction, so a held A is a left strafe (mvl) when locked and
+    /// a forward run when free. The frames follow the movement semantics, not a
+    /// shared camera frame (research/xim Actor.kt getMovementDirection).
+    #[test]
+    fn pose_intent_frames_locked_movement_in_the_target_frame() {
+        // Locked: input is the target frame — W runs toward, A strafes left,
+        // S backpedals, D strafes right.
+        assert_eq!(pose_intent(true, true, 1, 0), (1.0, 0.0));
+        assert_eq!(pose_intent(true, true, 0, -1), (0.0, -1.0));
+        assert_eq!(pose_intent(true, true, -1, 0), (-1.0, 0.0));
+        assert_eq!(pose_intent(true, true, 0, 1), (0.0, 1.0));
+    }
+
+    #[test]
+    fn pose_intent_frames_free_movement_in_the_heading_frame() {
+        // Free: the walker turns the body onto the travel direction
+        // (camera_relative_motion_heading), so whatever the camera-relative
+        // axes are, the body travels forward of its heading — the run clip,
+        // never a side strafe.
+        assert_eq!(pose_intent(false, true, 1, 0), (1.0, 0.0));
+        assert_eq!(pose_intent(false, true, 0, -1), (1.0, 0.0));
+        assert_eq!(pose_intent(false, true, -1, 0), (1.0, 0.0));
+        assert_eq!(pose_intent(false, true, 1, 1), (1.0, 0.0));
+        // Not moving is always the standstill: the keys are zero, and the
+        // free branch never reports travel without it.
+        assert_eq!(pose_intent(true, false, 0, 0), (0.0, 0.0));
+        assert_eq!(pose_intent(false, false, 1, -1), (0.0, 0.0));
     }
 
     #[test]
@@ -4906,6 +4927,97 @@ mod tests {
 
         let entities = vec![ent(1, 100.0, 0.0), ent(2, 200.0, 0.0)];
         assert_eq!(first_pick(&entities, None, culled_proj), None);
+    }
+
+    /// Most authored turns fire on a player who is not travelling, so an authored facing has to reach the
+    /// wire command with no key held — and it is owed exactly one tick, because the walker takes it.
+    #[test]
+    fn an_authored_facing_turns_a_standing_player_once() {
+        const AUTHORED_BYTE: u8 = 64;
+        let mut drive = MoveDrive::new();
+        let start = drive.tick().0;
+        assert_eq!(
+            drive.authored_residue(),
+            None,
+            "nothing pending before the routine fires"
+        );
+
+        drive.publish_authored(AUTHORED_BYTE);
+        let (heading, pos) = drive.tick();
+        assert_eq!(
+            heading, AUTHORED_BYTE,
+            "an authored facing turns the standing body and goes out on the wire"
+        );
+        assert_eq!(drive.authored_residue(), None, "the tick consumed it");
+        assert_eq!(
+            drive.tick().1,
+            pos,
+            "a turn in place moves nobody: the facing is not a step"
+        );
+        assert_ne!(
+            heading, start,
+            "and it really did turn from where the player stood"
+        );
+    }
+
+    #[test]
+    fn grounding_a_standing_turn_keeps_the_authored_heading() {
+        const AUTHORED_BYTE: u8 = 64;
+        const FLOOR_RISE: f32 = 0.2;
+        const FLOOR_SETTLE_TICKS: usize = 3;
+        let mut drive = MoveDrive::new();
+        drive.app.insert_resource(slab_collision(FLOOR_RISE));
+        drive.publish_authored(AUTHORED_BYTE);
+        let (heading, _) = drive.tick();
+        assert_eq!(
+            heading, AUTHORED_BYTE,
+            "the floor correction must preserve the turn"
+        );
+        assert!(drive
+            .run(FLOOR_SETTLE_TICKS)
+            .iter()
+            .all(|(h, _)| *h == AUTHORED_BYTE));
+        let feet = drive
+            .app
+            .world()
+            .resource::<SceneState>()
+            .snapshot
+            .self_pos
+            .pos
+            .z;
+        assert!(
+            (feet + FLOOR_RISE).abs() < DIALOG_FLOOR_SNAP_EPSILON,
+            "grounding must also apply: {feet}"
+        );
+    }
+
+    /// Travelling owns its own heading: an authored turn that lands on a tick where the player is moving
+    /// publishes a facing, and the travel assignment re-aims over it rather than fighting the step.
+    #[test]
+    fn travel_re_aims_over_an_authored_facing() {
+        let mut drive = MoveDrive::new();
+        drive.press(KeyCode::KeyW);
+        let ticks = drive.run(SETTLE_TICKS + 2);
+        let (travelled, travelled_pos) = *ticks.last().expect("a settled run has ticks");
+
+        // A settled run holds its heading tick after tick, so this one answers for itself: the authored
+        // byte is half a turn off the run and none of it reaches the wire.
+        drive.publish_authored(travelled.wrapping_add(128));
+        let (heading, pos) = drive.tick();
+        assert_eq!(
+            heading, travelled,
+            "the run keeps its facing whatever the routine published"
+        );
+        assert_eq!(
+            drive.authored_residue(),
+            None,
+            "taken even though it was not used"
+        );
+        let step = pos - travelled_pos;
+        assert!(
+            step.length() > 0.0,
+            "and the run is still travelling its own way"
+        );
     }
 }
 

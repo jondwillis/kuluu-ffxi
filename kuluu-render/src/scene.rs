@@ -37,6 +37,10 @@ pub struct BakedActor {
     pub min_mesh_y: f32,
 
     pub actor_height: f32,
+
+    /// The skeleton's authored height span (`ffxi_dat::skel::Skeleton::height_span`), when the actor was
+    /// built from one that carries it.
+    pub skeleton_span: Option<f32>,
 }
 
 #[derive(Component, Clone, Copy, Debug)]

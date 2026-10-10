@@ -12,6 +12,18 @@
         "matcher": "manual|auto"
       }
     ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "command": "python3 \"$(git rev-parse --show-toplevel)/.agents/hooks/codex-project-hook.py\" PostToolUse",
+            "timeout": 30,
+            "type": "command"
+          }
+        ],
+        "matcher": "Bash|Edit|Write|NotebookEdit|view_image"
+      }
+    ],
     "PreCompact": [
       {
         "hooks": [
@@ -22,6 +34,18 @@
           }
         ],
         "matcher": "manual|auto"
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "command": "python3 \"$(git rev-parse --show-toplevel)/.agents/hooks/codex-project-hook.py\" PreToolUse",
+            "timeout": 30,
+            "type": "command"
+          }
+        ],
+        "matcher": "Bash"
       }
     ],
     "SessionStart": [
@@ -36,6 +60,17 @@
         "matcher": "startup|resume|clear"
       }
     ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "command": "python3 \"$(git rev-parse --show-toplevel)/.agents/hooks/codex-project-hook.py\" Stop",
+            "timeout": 30,
+            "type": "command"
+          }
+        ]
+      }
+    ],
     "UserPromptSubmit": [
       {
         "hooks": [
@@ -43,41 +78,6 @@
             "command": "bd codex-hook UserPromptSubmit",
             "statusMessage": "Refreshing Beads context",
             "type": "command"
-          }
-        ]
-      }
-    ],
-    "PreToolUse": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python3 \"$(git rev-parse --show-toplevel)/.agents/hooks/codex-project-hook.py\" PreToolUse",
-            "timeout": 30
-          }
-        ],
-        "matcher": "Bash"
-      }
-    ],
-    "PostToolUse": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python3 \"$(git rev-parse --show-toplevel)/.agents/hooks/codex-project-hook.py\" PostToolUse",
-            "timeout": 30
-          }
-        ],
-        "matcher": "Bash|Edit|Write|NotebookEdit|view_image"
-      }
-    ],
-    "Stop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python3 \"$(git rev-parse --show-toplevel)/.agents/hooks/codex-project-hook.py\" Stop",
-            "timeout": 30
           }
         ]
       }
