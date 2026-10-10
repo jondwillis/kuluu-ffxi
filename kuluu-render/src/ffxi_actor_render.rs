@@ -3100,6 +3100,19 @@ fn reset_actor_pose_state(actor: &mut FfxiRenderActor, elapsed_frames: f32, name
     actor.death_phase = actor_state::DeathPhase::Unobserved;
 }
 
+/// Whether this request replaces one side step with its opposite, the only re-gait whose crossfade
+/// turns through the target under lock.
+fn flips_side_step(previous: &Option<(DatId, bool)>, next: DatId) -> bool {
+    let Some((previous, _)) = previous else {
+        return false;
+    };
+    let side = |id: &DatId| id.as_str().strip_prefix("mv")?.chars().next();
+    matches!(
+        (side(previous), side(&next)),
+        (Some('l'), Some('r')) | (Some('r'), Some('l'))
+    )
+}
+
 /// Runs inside the parallel per-actor pass: it touches only the actor's own fields, leaving the
 /// pose in `world_pose` for the serial registry copy.
 fn advance_actor_pose(
@@ -3476,6 +3489,7 @@ fn advance_actor_pose(
                     .join(" "),
             );
         }
+        let previous_selection = *current_clip;
         *current_clip = Some((selected_id, use_battle));
         // Any outstanding low-priority request belongs to the selection that made it.
         for pending in pending_idle_registrations.iter_mut() {
@@ -3512,7 +3526,11 @@ fn advance_actor_pose(
                 transition_in_time: action.map_or(LOCOMOTION_XFADE_IN, |a| a.transition_in),
                 transition_out_time: action.map_or(LOCOMOTION_XFADE_OUT, |a| a.transition_out),
                 in_step: action.is_none() && matches!(selected_tier, PoseTier::Locomotion),
-                turn_toward_target: *locked_on,
+                // The long way through bind belongs to one situation only: a locked flip from one side
+                // step to its opposite (`a_crossfade_toward_the_target_turns_through_it_and_any_other_the_short_way`
+                // in ffxi-actor). Any other locked re-gait keeps the short route: measured on Hume M, routing
+                // wide pairs long-way swings the chest chain 30+ deg/tick past anything the gait itself reaches.
+                turn_toward_target: *locked_on && flips_side_step(&previous_selection, selected_id),
                 ..Default::default()
             };
             // Fishing resolution clips (fsh2..fsh6) have no ActionPlayback, so without an
@@ -7826,6 +7844,87 @@ mod pose_resolution_tests {
             .fold(0.0_f32, f32::max)
     }
 
+    /// A locked release from a side step into the gait must not move any bone further in one tick
+    /// than that same bone ever moves inside the running gait alone. Locked re-gaits used to route every
+    /// crossfade through the long way (`HeldArc::set_out`'s toward-target flip), which swung the chest
+    /// chain past 30 deg/tick over its own reach — the flicker at strafe end. Only flips between opposite
+    /// side steps keep that routing (`a_crossfade_toward_the_target_turns_through_it_and_any_other_the_short_way`).
+    #[test]
+    fn releasing_a_locked_side_step_never_overswings_the_gaits_own_reach() {
+        // Headroom over each bone's own gait maximum: the release tick carries a small clip-swap pop
+        // in every mode, locked or not; the long-way swing it must stay under sat 3x past this.
+        const OVERSWING_MARGIN_DEG: f32 = 12.0;
+
+        let Some(loaded) = load_hume_m() else { return };
+        let disp = |a: &Mat4, b: &Mat4| -> f32 {
+            let one = |ua: Vec3, ub: Vec3| ua.dot(ub).clamp(-1.0, 1.0).acos().to_degrees();
+            (one(a.x_axis.truncate(), b.x_axis.truncate())
+                + one(a.y_axis.truncate(), b.y_axis.truncate())
+                + one(a.z_axis.truncate(), b.z_axis.truncate()))
+                / 3.0
+        };
+
+        for locked in [true, false] {
+            let mut ceiling = vec![0.0f32; loaded.skeleton.joints.len()];
+            let mut events: Vec<(f32, i32, usize, f32)> = Vec::new();
+            for run_ticks in [35_u32, 47] {
+                // Ceilings from pure-run ticks across two drives at different phases.
+                let mut actor = make_render_actor(&loaded, 0, Vec::new(), 1, 0.0, 1.0);
+                actor.locked_on = locked;
+                let mut prev: Option<Vec<Mat4>> = None;
+                for tick in 0..(run_ticks + 25 + 28) {
+                    let release_at = run_ticks + 25;
+                    actor.inputs = inputs_for_pose(
+                        if tick < run_ticks {
+                            PoseState::Run
+                        } else if tick < release_at {
+                            PoseState::StrafeLeft
+                        } else {
+                            PoseState::Run
+                        },
+                        false,
+                    );
+                    advance_actor_pose(
+                        &mut actor,
+                        1.0,
+                        crate::look_at_gates::LookState::Aiming,
+                        Some(LookAtInput {
+                            pose_rotation: Quat::IDENTITY,
+                            actor_world: Vec3::ZERO,
+                            target_attach_world: Vec3::new(0.0, 1.2, 3.0),
+                        }),
+                        None,
+                        false,
+                        None,
+                    );
+                    let now = actor.world_pose().to_vec();
+                    if let Some(p) = &prev {
+                        for bone in 0..loaded.skeleton.joints.len() {
+                            let d = disp(&p[bone], &now[bone]);
+                            if tick < run_ticks {
+                                ceiling[bone] = ceiling[bone].max(d);
+                            } else if (release_at.saturating_sub(3)..release_at + 24)
+                                .contains(&tick)
+                            {
+                                let excess = d - ceiling[bone];
+                                if excess > OVERSWING_MARGIN_DEG {
+                                    events.push((excess, tick as i32 - release_at as i32, bone, d));
+                                }
+                            }
+                        }
+                    }
+                    prev = Some(now);
+                }
+            }
+            events.sort_by(|a, c| c.0.total_cmp(&a.0));
+            assert!(
+                events.is_empty(),
+                "locked={}: {} release ticks swung a bone past its own gait reach; worst:",
+                locked,
+                events.len()
+            );
+        }
+    }
     /// Releasing side step into forward hands over with no snap: across the tick where the locomotion
     /// blend lands and the first frames after it, no bone moves further per tick than the running gait
     /// ever covers alone. The release's blend wiring goes with it — every layer crossfades for exactly
