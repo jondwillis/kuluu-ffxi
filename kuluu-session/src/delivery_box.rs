@@ -149,7 +149,7 @@ impl DeliveryBoxSession {
             },
             pbx::command::GET => {
                 let slot = r.post_work_no.max(0) as u8;
-                if let Some(item) = item_of(r).or_else(|| self.slots[slot as usize].clone()) {
+                if let Some(item) = item_of(r).or_else(|| self.cached_slot(slot)) {
                     // Retail wording, observed on HorizonXI 2026-07-18: "You
                     // take the <item> out of delivery slot <n>." — 1-based
                     // slot (.agents/skills/retail-observe/references/2026-07-17-moghouse-menu.md).
@@ -164,7 +164,7 @@ impl DeliveryBoxSession {
             }
             pbx::command::REJECT => {
                 let slot = r.post_work_no.max(0) as u8;
-                if let Some(item) = item_of(r).or_else(|| self.slots[slot as usize].clone()) {
+                if let Some(item) = item_of(r).or_else(|| self.cached_slot(slot)) {
                     out.notices.push(format!(
                         "The {} was returned to {}.",
                         parcel_name(&item),
@@ -242,6 +242,10 @@ impl DeliveryBoxSession {
         };
         out.notices.push(text);
         out.settled = true;
+    }
+
+    fn cached_slot(&self, slot: u8) -> Option<DeliveryItem> {
+        self.slots.get(slot as usize).and_then(Clone::clone)
     }
 
     fn set_slot(
@@ -648,5 +652,18 @@ mod tests {
             .updates
             .iter()
             .any(|(_, u)| matches!(u, DeliveryBoxUpdate::Closed)));
+    }
+
+    #[test]
+    fn slot_past_the_box_does_not_panic() {
+        for command in [pbx::command::GET, pbx::command::REJECT] {
+            let mut s = DeliveryBoxSession::default();
+            s.open = Some(DeliveryBoxNo::Incoming);
+            let mut r = result(command, DeliveryBoxNo::Incoming, pbx::result::OK);
+            r.post_work_no = i8::MAX;
+            let out = s.on_result(&r);
+            assert!(out.notices.is_empty());
+            assert!(s.slots().iter().all(Option::is_none));
+        }
     }
 }
