@@ -3559,7 +3559,15 @@ fn advance_actor_pose(
                     })
                     .map(|c| {
                         let len = c.animation.length_in_frames();
-                        (len - c.current_frame.rem_euclid(len)).max(1.0)
+                        // The window never runs shorter than a gait handover fade: releasing near the
+                        // seam sized a 1-tick crossfade, which dies inside its own registration tick
+                        // before blending anything - measured at frame 23 of a 24-frame side step,
+                        // where 21 joints including both arms (28/29) stepped 20-32 deg in the swap
+                        // against gait steps under 5 (`a_locked_stop_hands_over_at_gait_speed_from_any_phase`).
+                        // At the fade floor the outgoing layer loops through its own seam while it
+                        // fades; seam continuity makes that wrap invisible.
+                        let until_seam = len - c.current_frame.rem_euclid(len);
+                        until_seam.max(LOCOMOTION_XFADE_IN)
                     });
                 let accepted = if action_just_ended {
                     coordinator.register_idle_animation_eager(clip.clone())
@@ -8149,22 +8157,26 @@ mod pose_resolution_tests {
     }
 
     /// A locked stop runs the outgoing gait's current cycle to its loop seam before the blend lets go:
-    /// sizing the crossfade from each slot's own playhead (see `register_idle_animation_running_out`)
-    /// so none of the swing is skipped. Measured at three release phases of the 24-frame side-step -
-    /// the tick the blend dies on, the outgoing layer stands exactly one step short of its wrap point;
-    /// before this rule it died a fixed 7.5 ticks after selection wherever that happened to land, and
-    /// the last frames of the chest's swing snapped instead of blending.
+    /// sizing the crossfade from each slot's own playhead, floored at one gait handover fade (see
+    /// `register_idle_animation_running_out`), so none of the swing is skipped and a near-seam release
+    /// still blends. Measured across four release phases of the 24-frame side-step: the outgoing layer
+    /// renders every frame from its last unblended strafe tick up to the seam inclusive, then at most
+    /// one more fade through it (`LOCOMOTION_XFADE_IN`) before the blend dies. Before this rule it died
+    /// a fixed 7.5 ticks after selection wherever that landed (mid-swing snaps), or inside its own
+    /// registration tick when the seam was close (an unblended swap, see
+    /// `a_locked_stop_hands_over_at_gait_speed_from_any_phase`).
     #[test]
     fn a_locked_stop_runs_the_gait_cycle_out_before_blending_away() {
         let Some(loaded) = load_hume_m() else { return };
 
-        for strafe_ticks in [28_u32, 35, 40] {
+        for strafe_ticks in [23_u32, 28, 35, 40] {
             let mut actor = make_render_actor(&loaded, 0, Vec::new(), 1, 0.0, 1.0);
             actor.locked_on = true;
             let release_at = strafe_ticks;
             let mut last_prev_frame: Option<f32> = None;
             let mut died_at: Option<u32> = None;
-            for tick in 0..release_at + 40 {
+            let mut last_strafe_frame = -1.0_f32;
+            for tick in 0..release_at + 45 {
                 actor.inputs = inputs_for_pose(
                     if tick < release_at {
                         PoseState::StrafeLeft
@@ -8186,6 +8198,12 @@ mod pose_resolution_tests {
                     false,
                     None,
                 );
+                if tick == release_at - 1 {
+                    last_strafe_frame = actor.coordinator.animations[2]
+                        .as_ref()
+                        .and_then(|a| a.current_animation.as_ref())
+                        .map_or(-1.0, |c| c.current_frame);
+                }
                 if let Some(tr) = actor.coordinator.animations[2]
                     .as_ref()
                     .and_then(|a| a.transition.as_ref())
@@ -8196,13 +8214,23 @@ mod pose_resolution_tests {
                 } else if tick >= release_at && died_at.is_none() {
                     // The transition just died; the outgoing side's last observed step was one tick ago.
                     let prev_frame = last_prev_frame.unwrap_or_default();
-                    let seam_left = actor.coordinator.animations[2]
-                        .as_ref()
-                        .and_then(|a| a.current_animation.as_ref())
-                        .map_or(0.0, |_| 24.0 - prev_frame.rem_euclid(24.0));
+                    assert!(last_strafe_frame >= 0.0, "no strafe frame captured");
+                    let seam = 24.0 - last_strafe_frame.rem_euclid(24.0);
+                    let want = seam.max(LOCOMOTION_XFADE_IN);
+                    // The outgoing layer's frame tape wraps at its loop, so the distance it
+                    // rendered is ambiguous by one cycle; either unwrapping that matches the
+                    // window says the blend carried it to (and no further past) the seam.
+                    let travelled_ok = [
+                        prev_frame - last_strafe_frame,
+                        prev_frame + 24.0 - last_strafe_frame,
+                    ]
+                    .iter()
+                    .any(|t| (t - want).abs() <= 1.5);
                     assert!(
-                        seam_left.abs() <= 1.5 || prev_frame.rem_euclid(24.0).abs() < 1.6,
-                        "strafe={strafe_ticks}: the stop blend let go at frame {prev_frame:.1} of the                          side-step cycle (seam gap {seam_left:.1}); it must run out to the loop seam",
+                        travelled_ok,
+                        "strafe={strafe_ticks}: outgoing ended at frame {prev_frame:.1} from \
+                         {last_strafe_frame:.1}; it must run to its seam ({seam:.1}) and pass at most \
+                         one fade over it (window {want:.1})",
                     );
                     died_at = Some(tick);
                 }
@@ -8210,6 +8238,99 @@ mod pose_resolution_tests {
             assert!(
                 died_at.is_some(),
                 "strafe={strafe_ticks}: stop blend never completed"
+            );
+        }
+    }
+
+    /// Every phase of a locked stop hands over at gait speed: across the whole handover window,
+    /// no parented joint moves further in one tick than it ever does while the side step runs.
+    /// Measured before this rule held for every phase: stopping with the playhead near its loop
+    /// seam (frame 23 of a 24-frame cycle) sized a 1-tick crossfade, which dies inside its own
+    /// registration tick without ever blending - spine joint 25 stepped 21.7 deg in one frame
+    /// there while the same joint's gait step tops out near 3. Mid-cycle phases blended clean.
+    /// The window is therefore never shorter than a gait handover fade (`LOCOMOTION_XFADE_IN`),
+    /// and the outgoing layer loops through its own seam while it fades - seam-continuous clips
+    /// make that wrap invisible.
+    #[test]
+    fn a_locked_stop_hands_over_at_gait_speed_from_any_phase() {
+        // Headroom over each joint's own gait step, parent-relative: measured 4.6 deg worst on
+        // blended handovers and 21.7 on the unblended swap; ceiling + this margin separates them.
+        const STEP_MARGIN_DEG: f32 = 8.0;
+
+        let Some(loaded) = load_hume_m() else { return };
+        let disp = |a: &Mat4, b: &Mat4| -> f32 {
+            let one = |ua: Vec3, ub: Vec3| ua.dot(ub).clamp(-1.0, 1.0).acos().to_degrees();
+            (one(a.x_axis.truncate(), b.x_axis.truncate())
+                + one(a.y_axis.truncate(), b.y_axis.truncate())
+                + one(a.z_axis.truncate(), b.z_axis.truncate()))
+                / 3.0
+        };
+        let parented: Vec<usize> = (0..loaded.skeleton.joints.len())
+            .filter(|j| loaded.skeleton.joints[*j].parent.is_some() && *j != 2)
+            .collect();
+
+        for strafe_ticks in [23_u32, 35, 47] {
+            let mut actor = make_render_actor(&loaded, 0, Vec::new(), 1, 0.0, 1.0);
+            actor.locked_on = true;
+            let release_at = strafe_ticks;
+            let mut ceiling = vec![0.0f32; loaded.skeleton.joints.len()];
+            let mut previous: Option<Vec<Mat4>> = None;
+            let mut worst: Vec<(usize, f32, u32)> = Vec::new();
+            for tick in 0..release_at + 45 {
+                actor.inputs = inputs_for_pose(
+                    if tick < release_at {
+                        PoseState::StrafeLeft
+                    } else {
+                        PoseState::Idle
+                    },
+                    false,
+                );
+                advance_actor_pose(
+                    &mut actor,
+                    1.0,
+                    crate::look_at_gates::LookState::Aiming,
+                    Some(LookAtInput {
+                        pose_rotation: Quat::IDENTITY,
+                        actor_world: Vec3::ZERO,
+                        target_attach_world: Vec3::new(0.0, 1.2, 3.0),
+                    }),
+                    None,
+                    false,
+                    None,
+                );
+                // Parent-relative placements only: the root's own turn is not a joint moving.
+                let pose = actor.world_pose().to_vec();
+                let locals: Vec<(usize, Mat4)> = parented
+                    .iter()
+                    .map(|j| {
+                        let p = loaded.skeleton.joints[*j].parent.unwrap();
+                        (*j, pose[p].inverse() * pose[*j])
+                    })
+                    .collect();
+                if let Some(prev_mats) = &previous {
+                    for (j, l) in &locals {
+                        let pp = loaded.skeleton.joints[*j].parent.unwrap();
+                        let prev_local = prev_mats[pp].inverse() * prev_mats[*j];
+                        let d = disp(&prev_local, l);
+                        if tick <= release_at - 2 {
+                            ceiling[*j] = ceiling[*j].max(d);
+                        } else if d > ceiling[*j] + STEP_MARGIN_DEG {
+                            worst.push((*j, d - ceiling[*j], tick));
+                        }
+                    }
+                }
+                previous = Some(pose);
+            }
+            worst.sort_by(|a, c| c.1.total_cmp(&a.1));
+            assert!(
+                worst.is_empty(),
+                "strafe={strafe_ticks}: {} handover ticks swung a joint past its own gait step; worst: {:?}",
+                worst.len(),
+                worst
+                    .iter()
+                    .take(3)
+                    .map(|(j, d, t)| format!("joint {j} +{d:.1} deg at tick +{}", t - release_at))
+                    .collect::<Vec<_>>()
             );
         }
     }
