@@ -91,7 +91,11 @@ pub struct FfxiRenderRoot(pub Entity);
 pub const FRAME_RATE: f32 =
     crate::scheduler_runtime::ROUTINE_FPS / crate::scheduler_runtime::SKELETON_FRAME_DIVISOR;
 
-pub const LOCOMOTION_XFADE_IN: f32 = 9.0;
+/// The blend retail's motion queue runs when a locomotion request retakes a slot (`FFXiMain.dll
+/// retail-2026-09` RVA 0xC85F8..0xC8613, [`research/cow_ffxi_disassembly/Disassembly_Docs/
+/// locomotion_motion_camera_k_pass.md`] K6). A shorter blend lands the incoming gait ahead of its
+/// in-step point, so every bone races through the handover.
+pub const LOCOMOTION_XFADE_IN: f32 = 16.0;
 
 pub const LOCOMOTION_XFADE_OUT: f32 = 7.5;
 
@@ -7796,6 +7800,153 @@ mod pose_resolution_tests {
         assert!(
             (frame - (start + 1.0)).abs() < 1e-4,
             "the side step should run on from frame {start}, got {frame}"
+        );
+    }
+
+    /// This frame's sampled bone rotations, before world mounting and the look-at bends.
+    fn rotation_snapshot(actor: &FfxiRenderActor) -> Vec<Option<[f32; 4]>> {
+        (0..actor.pose_scratch.bone_count())
+            .map(|bone| actor.pose_scratch.get(bone).map(|record| record.rotation))
+            .collect()
+    }
+
+    /// The largest rotation any single bone covers between two consecutive pose samples, in degrees.
+    fn max_pose_delta(previous: &[Option<[f32; 4]>], current: &[Option<[f32; 4]>]) -> f32 {
+        previous
+            .iter()
+            .zip(current)
+            .filter_map(|(past, now)| match (past, now) {
+                (Some(past), Some(now)) => Some((past, now)),
+                _ => None,
+            })
+            .map(|(past, now)| {
+                let dot: f32 = past.iter().zip(now).fold(0.0, |sum, (a, b)| sum + a * b);
+                (2.0 * dot.abs().clamp(0.0, 1.0).acos()).to_degrees()
+            })
+            .fold(0.0_f32, f32::max)
+    }
+
+    /// Releasing side step into forward hands over with no snap: across the tick where the locomotion
+    /// blend lands and the first frames after it, no bone moves further per tick than the running gait
+    /// ever covers alone. The release's blend wiring goes with it — every layer crossfades for exactly
+    /// `LOCOMOTION_XFADE_IN`, once, settling inside its own window.
+    #[test]
+    fn releasing_a_side_step_hands_off_without_a_pose_snap() {
+        // The window that holds the landing tick and the frames straight after it.
+        const HANDOFF_WATCH_TICKS: u32 = 4;
+        const HANDOFF_POSE_SLEW_RATIO_LIMIT: f32 = 1.5;
+
+        let Some(loaded) = load_hume_m() else { return };
+        let mut actor = make_render_actor(&loaded, 0, Vec::new(), 1, 0.0, 1.0);
+        let mut previous: Option<Vec<Option<[f32; 4]>>> = None;
+        let mut step_pose = |actor: &mut FfxiRenderActor, state| {
+            actor.inputs = inputs_for_pose(state, false);
+            advance_actor_pose_standalone(actor, 1.0, None);
+            let now = rotation_snapshot(actor);
+            let delta = previous
+                .as_ref()
+                .map_or(0.0, |past| max_pose_delta(past, &now));
+            previous = Some(now);
+            delta
+        };
+
+        // The baseline: a running gait ticking alone, no crossfade anywhere near it.
+        let mut baseline_slew = 0.0_f32;
+        for _ in 0..40 {
+            baseline_slew = baseline_slew.max(step_pose(&mut actor, PoseState::Run));
+        }
+
+        // Release at several points of the side step's cycle, including a release that cuts across
+        // the side step's own entry blend.
+        let window = LOCOMOTION_XFADE_IN as u32 + 2;
+        for strafe_ticks in [2_u32, 9, 16, 23] {
+            for _ in 0..strafe_ticks {
+                step_pose(&mut actor, PoseState::StrafeLeft);
+            }
+            let mut handoff_slew = 0.0_f32;
+            for tick in 0..window {
+                let delta = step_pose(&mut actor, PoseState::Run);
+                if tick >= window - HANDOFF_WATCH_TICKS {
+                    handoff_slew = handoff_slew.max(delta);
+                }
+                if tick == 0 {
+                    let blending: Vec<f32> = actor
+                        .coordinator
+                        .animations
+                        .iter()
+                        .flatten()
+                        .filter_map(|a| a.transition.as_ref())
+                        .map(|t| t.transition_duration)
+                        .collect();
+                    assert!(
+                        !blending.is_empty()
+                            && blending
+                                .iter()
+                                .all(|d| *d == LOCOMOTION_XFADE_IN),
+                        "every layer the release re-gaits should blend for {LOCOMOTION_XFADE_IN}, got {blending:?}"
+                    );
+                }
+            }
+            assert!(
+                !actor.coordinator.is_transitioning(),
+                "the gait blend outlived its window after {strafe_ticks} ticks of side step"
+            );
+            assert!(
+                handoff_slew <= baseline_slew * HANDOFF_POSE_SLEW_RATIO_LIMIT,
+                "the pose swung {handoff_slew:.1} deg/tick across the handoff, {:.2}x the run's own \
+                 {baseline_slew:.1}",
+                handoff_slew / baseline_slew.max(0.001)
+            );
+        }
+    }
+
+    /// Releasing a locked side step ramps the torso look weight down on the gait blend's clock, so
+    /// chest and legs settle on (nearly) the same tick — one shared ramp constant, pinned here
+    /// because their separate easing is exactly what desynced once.
+    #[test]
+    fn the_locked_torso_settles_on_the_gaits_blend_clock() {
+        const RELEASE_TICK_TOLERANCE: i32 = 1;
+
+        let keyed = |id: &[u8; 4]| {
+            let mut clip = synth_anim(id, 8);
+            clip.key_frame_sets.insert(
+                0,
+                vec![ffxi_dat::skel_anim::KeyFrameTransform::default(); clip.num_frames],
+            );
+            clip
+        };
+        let clips = vec![keyed(b"idl0"), keyed(b"run0"), keyed(b"mvl0")];
+        let mut actor = render_actor_with_skeleton_clips(1, clips);
+        actor.locked_on = true;
+
+        for _ in 0..(LOCOMOTION_XFADE_IN as u32 + 8) {
+            actor.inputs = inputs_for_pose(PoseState::StrafeLeft, false);
+            advance_actor_pose_standalone(&mut actor, 1.0, None);
+        }
+        assert_eq!(actor.locked_torso_weight, 1.0, "saturated by the strafe");
+
+        // Still locked, forward: the side step ends by selection, starting both ramps together.
+        let mut torso_released = None;
+        let mut blend_settled = None;
+        for tick in 1..=(LOCOMOTION_XFADE_IN as i32 + 4) {
+            actor.inputs = inputs_for_pose(PoseState::Run, false);
+            advance_actor_pose_standalone(&mut actor, 1.0, None);
+            if torso_released.is_none() && actor.locked_torso_weight == 0.0 {
+                torso_released = Some(tick);
+            }
+            if blend_settled.is_none() && !actor.coordinator.is_transitioning() {
+                blend_settled = Some(tick);
+            }
+        }
+        let (torso, gait) = match (torso_released, blend_settled) {
+            (Some(torso), Some(gait)) => (torso, gait),
+            _ => panic!(
+                "release never finished: torso {torso_released:?}, gait blend {blend_settled:?}"
+            ),
+        };
+        assert!(
+            (torso - gait).abs() <= RELEASE_TICK_TOLERANCE,
+            "the legs settled on tick {gait} but the chest kept easing to tick {torso}"
         );
     }
 
