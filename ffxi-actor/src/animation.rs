@@ -706,6 +706,45 @@ impl SkeletonAnimator {
         self.current_animation = Some(ctx);
     }
 
+    /// A handover that settles instead of playing out. The outgoing side is snapshotted at the tick of
+    /// registration and never advances again - a stop asks for rest, so nothing may swing further than
+    /// it already was (see `register_idle_animation_matched`). The incoming clip enters at `start_frame`,
+    /// chosen by the caller to match that frozen pose, and rises over `fade_frames`. Slot 5 behaves as in
+    /// [`Self::set_next_animation`]: replaced outright, no blend.
+    pub fn set_settled_animation(
+        &mut self,
+        animation: SkeletonAnimation,
+        loop_params: LoopParams,
+        start_frame: f32,
+        fade_frames: f32,
+    ) {
+        let mut ctx = SkeletonAnimationContext::new(animation, loop_params, None);
+        let length = ctx.animation.length_in_frames();
+        if length > 0.0 {
+            ctx.current_frame = start_frame.rem_euclid(length);
+        }
+        if self.current_animation.is_none() || fade_frames <= 0.0 || self.animation_slot == 5 {
+            self.transition = None;
+            self.current_animation = Some(ctx);
+            return;
+        }
+        let previous = match &self.transition {
+            // Interrupting a live blend: freeze the composite on screen, exactly as a retarget during a
+            // blend does in `set_next_animation`.
+            Some(t) => PreviousSide::Frozen(AnimationSnapshot::from_transition(t)),
+            None => PreviousSide::Frozen(AnimationSnapshot::from_context(
+                self.current_animation.as_ref().unwrap(),
+            )),
+        };
+        self.transition = Some(AnimationTransition::new(
+            previous,
+            fresh_copy(&ctx),
+            fade_frames,
+            false,
+        ));
+        self.current_animation = Some(ctx);
+    }
+
     pub fn get_joint_transform(&self, joint: usize) -> Option<KeyFrameTransform> {
         self.sample(joint, true)
     }
@@ -835,6 +874,34 @@ impl SkeletonAnimationCoordinator {
     /// current clip's own transition-out window.
     pub fn register_idle_animation_eager(&mut self, animation: SkeletonAnimation) -> bool {
         self.register_animation(animation, LoopParams::low_priority_loop(), None, |_| true)
+    }
+
+    /// The idle registration for a stop: the outgoing pose is frozen where it stands and the incoming
+    /// clip takes its playhead from the key frame closest to that pose. A held gait is still playing at
+    /// the tick the movement ends, and letting it run under the crossfade winds limbs back past what
+    /// they were holding before landing in idle - measured on Hume M at 15-30 deg of fresh swing after
+    /// release against holds of 20 deg or less (`stopping_a_held_movement_never_winds_the_arms_up_
+    /// after_release`, kuluu-render). A stop settles: it matches key frames and smooths, and plays no
+    /// animation further.
+    pub fn register_idle_animation_matched(
+        &mut self,
+        animation: SkeletonAnimation,
+        start_frame: f32,
+        fade_frames: f32,
+    ) -> bool {
+        let slot = animation.id.final_digit().unwrap_or(0) as usize;
+        let slot = slot.min(7);
+        let animator = self.get_or_put(slot);
+        if !ready_for_transition_out(animator, true) {
+            return false;
+        }
+        animator.set_settled_animation(
+            animation,
+            LoopParams::low_priority_loop(),
+            start_frame,
+            fade_frames,
+        );
+        true
     }
 
     /// This frame's transform for one bone. Ownership is per bone, never per slot: retail samples every

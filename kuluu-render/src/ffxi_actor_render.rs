@@ -29,7 +29,7 @@ use ffxi_dat::datid::DatId;
 use ffxi_dat::resource_dir::ResourceDir;
 use ffxi_dat::scheduler::{Scheduler, StageKind};
 use ffxi_dat::skel::Skeleton;
-use ffxi_dat::skel_anim::SkeletonAnimation;
+use ffxi_dat::skel_anim::{KeyFrameTransform, SkeletonAnimation};
 use ffxi_dat::skel_mesh::{MeshBuffer, MeshType, SkelMesh};
 use ffxi_dat::texture::{decode_texture, DecodedTexture};
 use ffxi_dat::{walk_tree, ChunkKind, ChunkNode, DatRoot};
@@ -91,7 +91,11 @@ pub struct FfxiRenderRoot(pub Entity);
 pub const FRAME_RATE: f32 =
     crate::scheduler_runtime::ROUTINE_FPS / crate::scheduler_runtime::SKELETON_FRAME_DIVISOR;
 
-pub const LOCOMOTION_XFADE_IN: f32 = 9.0;
+/// The blend retail's motion queue runs when a locomotion request retakes a slot (`FFXiMain.dll
+/// retail-2026-09` RVA 0xC85F8..0xC8613, [`research/cow_ffxi_disassembly/Disassembly_Docs/
+/// locomotion_motion_camera_k_pass.md`] K6). A shorter blend lands the incoming gait ahead of its
+/// in-step point, so every bone races through the handover.
+pub const LOCOMOTION_XFADE_IN: f32 = 16.0;
 
 pub const LOCOMOTION_XFADE_OUT: f32 = 7.5;
 
@@ -1565,6 +1569,13 @@ pub struct FfxiRenderActor {
     /// buffer is not reallocated per frame.
     pose_scratch: BonePoseScratch,
 
+    /// Per joint, who wrote it at the last pose pass — and when a keyed joint loses its last live
+    /// writer mid-playback ([`BoneRelease::Released`]), its final record glides to rest instead of
+    /// vanishing into bind in one frame. Measured on Hume M: the second-layer locomotion clips cover
+    /// joints 38..47 but `idl2` keys only {38,40,42,43,44,47}, so a locked stop handed those away at
+    /// blend completion as a one-frame ~30 deg snap past the gait's own reach — the flicker at side-step end.
+    release_states: Vec<BoneRelease>,
+
     /// The `(handle joint, hand bone)` pairs this actor's equipped weapons resolve to; empty unless
     /// the model loaded with a weapon naming a handle. Applied while display-engaged - see
     /// [`weapon_handle_overrides`].
@@ -2322,6 +2333,7 @@ pub fn make_render_actor(
         world_pose: Vec::new(),
         pose_work: PoseScratch::default(),
         pose_scratch: BonePoseScratch::new(),
+        release_states: Vec::new(),
         weapon_handles: loaded.weapon_handles.clone(),
         point_light_selection: None,
     }
@@ -3078,8 +3090,9 @@ fn reset_actor_pose_state(actor: &mut FfxiRenderActor, elapsed_frames: f32, name
     actor.wire_animation = ffxi_proto::decode::animation::NONE;
     actor.coordinator.clear();
     // A carried record belongs to the clip that wrote it, so a reset drops them with the layers: the
-    // next pose pass starts from the bind pose again.
+    // next pose pass starts from the bind pose again. Released records are held poses too.
     actor.pose_scratch.clear();
+    actor.release_states.clear();
     actor.current_clip = None;
     actor.registered_slots = [None; 8];
     actor.pending_idle_registrations = [None; 8];
@@ -3094,6 +3107,52 @@ fn reset_actor_pose_state(actor: &mut FfxiRenderActor, elapsed_frames: f32, name
         name,
     );
     actor.death_phase = actor_state::DeathPhase::Unobserved;
+}
+
+/// Who wrote a joint at the last pose pass (see `FfxiRenderActor::release_states`).
+#[derive(Clone, Copy)]
+enum BoneRelease {
+    /// Sampled a record this frame — or the last frame, kept for the release edge.
+    Held(KeyFrameTransform),
+    /// Every live layer that keyed it is gone mid-playback: its held record rides to rest over
+    /// `LOCOMOTION_XFADE_IN`, so the handover settles like every other gait blend lands.
+    Released {
+        from: KeyFrameTransform,
+        elapsed_frames: f32,
+    },
+    /// Nothing has keyed it yet, or its glide landed: bind composes it until a record returns.
+    Rest,
+}
+
+/// A released record at fraction `t` of its settle. Animation records are multiplicative overlays on the
+/// bind data (`update_joint`, ffxi-actor/src/skeleton_instance.rs), so rest is the default record itself:
+/// rotation takes the short arc home, translation and scale give their offsets back.
+fn settled_toward_rest(from: &KeyFrameTransform, t: f32) -> KeyFrameTransform {
+    let [x, y, z, w] = from.rotation;
+    let held = Quat::from_xyzw(x, y, z, w);
+    if !held.is_finite() {
+        return KeyFrameTransform::default();
+    }
+    let glide_back = |values: &[f32; 3], rest: f32| values.map(|v| v + (rest - v) * t);
+    let home = held.slerp(Quat::IDENTITY, t).to_array();
+    KeyFrameTransform {
+        rotation: [home[0], home[1], home[2], home[3]],
+        translation: glide_back(&from.translation, 0.0),
+        scale: glide_back(&from.scale, 1.0),
+    }
+}
+
+/// Whether this request replaces one side step with its opposite, the only re-gait whose crossfade
+/// turns through the target under lock.
+fn flips_side_step(previous: &Option<(DatId, bool)>, next: DatId) -> bool {
+    let Some((previous, _)) = previous else {
+        return false;
+    };
+    let side = |id: &DatId| id.as_str().strip_prefix("mv")?.chars().next();
+    matches!(
+        (side(previous), side(&next)),
+        (Some('l'), Some('r')) | (Some('r'), Some('l'))
+    )
 }
 
 /// Runs inside the parallel per-actor pass: it touches only the actor's own fields, leaving the
@@ -3140,6 +3199,7 @@ fn advance_actor_pose(
         world_pose,
         pose_work,
         pose_scratch,
+        release_states,
         weapon_handles,
         rejected_clips,
         rejected_routines,
@@ -3472,6 +3532,7 @@ fn advance_actor_pose(
                     .join(" "),
             );
         }
+        let previous_selection = *current_clip;
         *current_clip = Some((selected_id, use_battle));
         // Any outstanding low-priority request belongs to the selection that made it.
         for pending in pending_idle_registrations.iter_mut() {
@@ -3485,8 +3546,28 @@ fn advance_actor_pose(
                 if slot_keeps_clip(coordinator, registered_slots, slot, (clip.id, from_battle)) {
                     continue;
                 }
+                // A stop settles instead of playing out: the locomotion on screen is frozen at this
+                // tick and idle rises from its own key frame closest to that pose. Letting the held
+                // gait keep running under the crossfade made limbs wind back past what they were
+                // holding before landing forward in idle - 15-30 deg of fresh swing after release
+                // against holds of 20 deg or less, on spine and arm joints alike
+                // (`stopping_a_held_movement_never_winds_the_arms_up_after_release`).
+                let settled_from = coordinator.animations[slot]
+                    .as_ref()
+                    .and_then(|a| a.current_animation.as_ref())
+                    .filter(|c| {
+                        let id = c.animation.id.as_str();
+                        id.starts_with("mv") || id.starts_with("run") || id.starts_with("wlk")
+                    })
+                    .and_then(|outgoing| matched_idle_start(outgoing, clip));
                 let accepted = if action_just_ended {
                     coordinator.register_idle_animation_eager(clip.clone())
+                } else if let Some(frame) = settled_from {
+                    coordinator.register_idle_animation_matched(
+                        clip.clone(),
+                        frame,
+                        LOCOMOTION_XFADE_IN,
+                    )
                 } else {
                     coordinator.register_idle_animation(clip.clone(), true)
                 };
@@ -3508,7 +3589,11 @@ fn advance_actor_pose(
                 transition_in_time: action.map_or(LOCOMOTION_XFADE_IN, |a| a.transition_in),
                 transition_out_time: action.map_or(LOCOMOTION_XFADE_OUT, |a| a.transition_out),
                 in_step: action.is_none() && matches!(selected_tier, PoseTier::Locomotion),
-                turn_toward_target: *locked_on,
+                // The long way through bind belongs to one situation only: a locked flip from one side
+                // step to its opposite (`a_crossfade_toward_the_target_turns_through_it_and_any_other_the_short_way`
+                // in ffxi-actor). Any other locked re-gait keeps the short route: measured on Hume M, routing
+                // wide pairs long-way swings the chest chain 30+ deg/tick past anything the gait itself reaches.
+                turn_toward_target: *locked_on && flips_side_step(&previous_selection, selected_id),
                 ..Default::default()
             };
             // Fishing resolution clips (fsh2..fsh6) have no ActionPlayback, so without an
@@ -3688,11 +3773,67 @@ fn advance_actor_pose(
         (*locked_torso_weight - torso_step).max(0.0)
     };
 
+    // The release edge: joints with a record this tick keep one; joints whose last writer retired
+    // mid-playback ride theirs to rest over the gait handover window instead of dropping into bind in
+    // one frame (`FfxiRenderActor::release_states` — the leg/hem pop at side-step end). Rest is where an
+    // unkeyed joint composes anyway; the glide only decides how fast it gets there.
+    if release_states.len() != skeleton.joints.len() {
+        release_states.resize(skeleton.joints.len(), BoneRelease::Rest);
+    }
+    let elapsed_frames_step = elapsed_frames.min(LOCOMOTION_XFADE_IN);
+    let mut settling: Vec<(usize, KeyFrameTransform)> = Vec::new();
+    for (bone, state) in release_states
+        .iter_mut()
+        .enumerate()
+        .take(skeleton.joints.len())
+    {
+        *state = match (pose_scratch.get(bone), *state) {
+            (Some(record), _) => BoneRelease::Held(record),
+            (None, BoneRelease::Rest) => BoneRelease::Rest,
+            (None, BoneRelease::Held(from)) => {
+                settling.push((bone, from));
+                BoneRelease::Released {
+                    from,
+                    elapsed_frames: 0.0,
+                }
+            }
+            (
+                None,
+                BoneRelease::Released {
+                    from,
+                    elapsed_frames,
+                },
+            ) => {
+                // Clamped so a long frame lands on rest exactly once rather than extrapolating.
+                let settled = (elapsed_frames + elapsed_frames_step).min(LOCOMOTION_XFADE_IN);
+                settling.push((
+                    bone,
+                    settled_toward_rest(&from, settled / LOCOMOTION_XFADE_IN),
+                ));
+                if settled >= LOCOMOTION_XFADE_IN {
+                    BoneRelease::Rest
+                } else {
+                    BoneRelease::Released {
+                        from,
+                        elapsed_frames: settled,
+                    }
+                }
+            }
+        };
+    }
+
     pose_world_mounted_into(
         world_pose,
         pose_work,
         skeleton,
-        |joint| pose_scratch.get(joint),
+        |joint| {
+            pose_scratch.get(joint).or_else(|| {
+                settling
+                    .iter()
+                    .find(|(bone, _)| *bone == joint)
+                    .map(|(_, record)| *record)
+            })
+        },
         RootTransform {
             facing_dir: *facing_dir,
             skew: 0.0,
@@ -3767,6 +3908,44 @@ fn advance_actor_pose(
             world_pose,
         );
     }
+}
+
+/// The idle clip's own key frame whose shared keys sit closest to where the outgoing layer stands this
+/// tick - summed degrees of rotation over every joint both clips key (`register_idle_animation_matched`).
+/// None when they share nothing to compare, which leaves the plain idle handover in place.
+fn matched_idle_start(
+    outgoing: &ffxi_actor::animation::SkeletonAnimationContext,
+    idle: &SkeletonAnimation,
+) -> Option<f32> {
+    let joints: Vec<u32> = idle.key_frame_sets.keys().copied().collect();
+    let outgoing_poses: Vec<(u32, KeyFrameTransform)> = joints
+        .iter()
+        .filter_map(|j| Some((*j, outgoing.get_joint_transform(*j as usize)?)))
+        .collect();
+    if outgoing_poses.is_empty() {
+        return None;
+    }
+    let mut best: Option<(f32, f32)> = None; // (total angle from the frozen pose, frame)
+    for frame in 0..idle.length_in_frames().floor() as u32 {
+        let mut total = 0.0_f32;
+        for (joint, from) in &outgoing_poses {
+            let Some(to) = idle.get_joint_transform(*joint, frame as f32) else {
+                continue;
+            };
+            // Shortest rotation between the two authored quaternions, per joint.
+            let dot: f32 = from
+                .rotation
+                .iter()
+                .zip(&to.rotation)
+                .map(|(a, b)| a * b)
+                .sum();
+            total += (2.0 * dot.abs().clamp(0.0, 1.0).acos()).to_degrees();
+        }
+        if best.is_none_or(|(best_total, _)| total < best_total) {
+            best = Some((total, frame as f32));
+        }
+    }
+    best.map(|(_, frame)| frame)
 }
 
 /// `KULUU_BONE_LOG` — a play-test probe for "which bone ended up where": one line per posed frame
@@ -7796,6 +7975,672 @@ mod pose_resolution_tests {
         assert!(
             (frame - (start + 1.0)).abs() < 1e-4,
             "the side step should run on from frame {start}, got {frame}"
+        );
+    }
+
+    /// This frame's sampled bone rotations, before world mounting and the look-at bends.
+    fn rotation_snapshot(actor: &FfxiRenderActor) -> Vec<Option<[f32; 4]>> {
+        (0..actor.pose_scratch.bone_count())
+            .map(|bone| actor.pose_scratch.get(bone).map(|record| record.rotation))
+            .collect()
+    }
+
+    /// The largest rotation any single bone covers between two consecutive pose samples, in degrees.
+    fn max_pose_delta(previous: &[Option<[f32; 4]>], current: &[Option<[f32; 4]>]) -> f32 {
+        previous
+            .iter()
+            .zip(current)
+            .filter_map(|(past, now)| match (past, now) {
+                (Some(past), Some(now)) => Some((past, now)),
+                _ => None,
+            })
+            .map(|(past, now)| {
+                let dot: f32 = past.iter().zip(now).fold(0.0, |sum, (a, b)| sum + a * b);
+                (2.0 * dot.abs().clamp(0.0, 1.0).acos()).to_degrees()
+            })
+            .fold(0.0_f32, f32::max)
+    }
+
+    /// A locked release from a side step into the gait must not move any bone further in one tick
+    /// than that same bone ever moves inside the running gait alone. Locked re-gaits used to route every
+    /// crossfade through the long way (`HeldArc::set_out`'s toward-target flip), which swung the chest
+    /// chain past 30 deg/tick over its own reach — the flicker at strafe end. Only flips between opposite
+    /// side steps keep that routing (`a_crossfade_toward_the_target_turns_through_it_and_any_other_the_short_way`).
+    #[test]
+    fn releasing_a_locked_side_step_never_overswings_the_gaits_own_reach() {
+        // Headroom over each bone's own gait maximum: the release tick carries a small clip-swap pop
+        // in every mode, locked or not; the long-way swing it must stay under sat 3x past this.
+        const OVERSWING_MARGIN_DEG: f32 = 12.0;
+
+        let Some(loaded) = load_hume_m() else { return };
+        let disp = |a: &Mat4, b: &Mat4| -> f32 {
+            let one = |ua: Vec3, ub: Vec3| ua.dot(ub).clamp(-1.0, 1.0).acos().to_degrees();
+            (one(a.x_axis.truncate(), b.x_axis.truncate())
+                + one(a.y_axis.truncate(), b.y_axis.truncate())
+                + one(a.z_axis.truncate(), b.z_axis.truncate()))
+                / 3.0
+        };
+
+        for locked in [true, false] {
+            let mut ceiling = vec![0.0f32; loaded.skeleton.joints.len()];
+            let mut events: Vec<(f32, i32, usize, f32)> = Vec::new();
+            for run_ticks in [35_u32, 47] {
+                // Ceilings from pure-run ticks across two drives at different phases.
+                let mut actor = make_render_actor(&loaded, 0, Vec::new(), 1, 0.0, 1.0);
+                actor.locked_on = locked;
+                let mut prev: Option<Vec<Mat4>> = None;
+                for tick in 0..(run_ticks + 25 + 28) {
+                    let release_at = run_ticks + 25;
+                    actor.inputs = inputs_for_pose(
+                        if tick < run_ticks {
+                            PoseState::Run
+                        } else if tick < release_at {
+                            PoseState::StrafeLeft
+                        } else {
+                            PoseState::Run
+                        },
+                        false,
+                    );
+                    advance_actor_pose(
+                        &mut actor,
+                        1.0,
+                        crate::look_at_gates::LookState::Aiming,
+                        Some(LookAtInput {
+                            pose_rotation: Quat::IDENTITY,
+                            actor_world: Vec3::ZERO,
+                            target_attach_world: Vec3::new(0.0, 1.2, 3.0),
+                        }),
+                        None,
+                        false,
+                        None,
+                    );
+                    let now = actor.world_pose().to_vec();
+                    if let Some(p) = &prev {
+                        for bone in 0..loaded.skeleton.joints.len() {
+                            let d = disp(&p[bone], &now[bone]);
+                            if tick < run_ticks {
+                                ceiling[bone] = ceiling[bone].max(d);
+                            } else if (release_at.saturating_sub(3)..release_at + 24)
+                                .contains(&tick)
+                            {
+                                let excess = d - ceiling[bone];
+                                if excess > OVERSWING_MARGIN_DEG {
+                                    events.push((excess, tick as i32 - release_at as i32, bone, d));
+                                }
+                            }
+                        }
+                    }
+                    prev = Some(now);
+                }
+            }
+            events.sort_by(|a, c| c.0.total_cmp(&a.0));
+            assert!(
+                events.is_empty(),
+                "locked={}: {} release ticks swung a bone past its own gait reach; worst:",
+                locked,
+                events.len()
+            );
+        }
+    }
+    /// A locked stop must not hand a joint back in one frame. The second-layer locomotion clips key
+    /// joints 38..47 while `idl2` keys only {38,40,42,43,44,47}, so every stop releases joints
+    /// {39,41,45,46} mid-playback; their final records now ride to rest over the gait handover window
+    /// (`BoneRelease`). Joint 46's pose is watched relative to its parent against the bind-local
+    /// placement. The tick after the stop blend dies was measured at -15.9 deg with no glide (identical
+    /// across drives and modes), then frozen for good; a live side-step steps at most ~10 deg/tick by
+    /// its own motion, so the boundary is asserted continuous while gait ticks are left alone.
+    #[test]
+    fn releasing_a_locked_stop_glides_released_joints_to_rest() {
+        // Between the honest gait's largest single step (~10) and the measured snap (15.9): what the
+        // eye caught at side-step end was that boundary jump, not the gait.
+        const MAX_BOUNDARY_STEP_DEG: f32 = 12.0;
+
+        let Some(loaded) = load_hume_m() else { return };
+        let disp = |a: &Mat4, b: &Mat4| -> f32 {
+            let one = |ua: Vec3, ub: Vec3| ua.dot(ub).clamp(-1.0, 1.0).acos().to_degrees();
+            (one(a.x_axis.truncate(), b.x_axis.truncate())
+                + one(a.y_axis.truncate(), b.y_axis.truncate())
+                + one(a.z_axis.truncate(), b.y_axis.truncate()))
+                / 3.0
+        };
+
+        // The joint's placement under bind composition (no records at all), parent-relative: the rest
+        // position a released bone settles to.
+        let mut bind_pose = Vec::new();
+        ffxi_actor::skeleton_instance::pose_world_into(
+            &mut bind_pose,
+            &mut PoseScratch::default(),
+            &loaded.skeleton,
+            |_| None as Option<KeyFrameTransform>,
+            RootTransform {
+                facing_dir: 0.0,
+                skew: 0.0,
+                slope_oriented: false,
+                scale: Vec3::ONE,
+            },
+            &[],
+        );
+        let parent = loaded.skeleton.joints[46].parent.unwrap();
+        let rest_local = bind_pose[parent].inverse() * bind_pose[46];
+
+        for (locked, aim) in [(true, true), (false, false)] {
+            // Three strafe lengths put the release at different points of the side-step loop.
+            for strafe_ticks in [23_u32, 35, 47] {
+                let mut actor = make_render_actor(&loaded, 0, Vec::new(), 1, 0.0, 1.0);
+                actor.locked_on = locked;
+                let release_at = strafe_ticks;
+                let mut previous: Option<(u32, f32)> = None;
+                let mut was_transitioning = false;
+                for tick in 0..release_at + 24 {
+                    actor.inputs = inputs_for_pose(
+                        if tick < release_at {
+                            PoseState::StrafeLeft
+                        } else {
+                            PoseState::Idle
+                        },
+                        false,
+                    );
+                    advance_actor_pose(
+                        &mut actor,
+                        1.0,
+                        crate::look_at_gates::LookState::Aiming,
+                        if aim {
+                            Some(LookAtInput {
+                                pose_rotation: Quat::IDENTITY,
+                                actor_world: Vec3::ZERO,
+                                target_attach_world: Vec3::new(0.0, 1.2, 3.0),
+                            })
+                        } else {
+                            None
+                        },
+                        None,
+                        false,
+                        None,
+                    );
+                    let transitioning = actor.coordinator.is_transitioning();
+                    if tick >= release_at.saturating_sub(1) {
+                        let now = actor.world_pose();
+                        let dev_from_rest = disp(&rest_local, &(now[parent].inverse() * now[46]));
+                        // Assert exactly at the blend-death boundary: the frame's step against the one
+                        // before it. Live-gait ticks stay unmeasured - a running side-step legitimately
+                        // steps ~10 deg/tick by its own motion, and that is not what this pins.
+                        if was_transitioning && !transitioning {
+                            if let Some((prev_tick, prev_dev)) = previous {
+                                let step = (dev_from_rest - prev_dev).abs();
+                                assert!(
+                                    step <= MAX_BOUNDARY_STEP_DEG,
+                                    "locked={locked} aim={aim} strafe={strafe_ticks}: joint 46 moved                                      {step:.1} deg against its rest placement on the blend-death tick                                      ({prev_tick}->{tick}); released records must glide to rest over                                      the gait handover window",
+                                );
+                            }
+                        }
+                        previous = Some((tick, dev_from_rest));
+                    }
+                    was_transitioning = transitioning;
+                }
+            }
+        }
+    }
+
+    /// Every phase of a locked stop hands over at gait speed: across the whole handover window,
+    /// no parented joint moves further in one tick than it ever does while the side step runs.
+    /// Measured before this rule held for every phase: stopping with the playhead near its loop
+    /// seam (frame 23 of a 24-frame cycle) sized a 1-tick crossfade, which dies inside its own
+    /// registration tick without ever blending - spine joint 25 stepped 21.7 deg in one frame
+    /// there while the same joint's gait step tops out near 3. Mid-cycle phases blended clean.
+    /// A stop now hands over settled: the held pose is frozen at the release tick and idle rises
+    /// from its matching key frame (`a_stop_freezes_the_gait_it_leaves`), so every phase blends -
+    /// none can collapse to a swap or play fresh gait frames.
+    #[test]
+    fn a_locked_stop_hands_over_at_gait_speed_from_any_phase() {
+        // Headroom over each joint's own gait step, parent-relative: measured 4.6 deg worst on
+        // blended handovers and 21.7 on the unblended swap; ceiling + this margin separates them.
+        const STEP_MARGIN_DEG: f32 = 8.0;
+
+        let Some(loaded) = load_hume_m() else { return };
+        let disp = |a: &Mat4, b: &Mat4| -> f32 {
+            let one = |ua: Vec3, ub: Vec3| ua.dot(ub).clamp(-1.0, 1.0).acos().to_degrees();
+            (one(a.x_axis.truncate(), b.x_axis.truncate())
+                + one(a.y_axis.truncate(), b.y_axis.truncate())
+                + one(a.z_axis.truncate(), b.z_axis.truncate()))
+                / 3.0
+        };
+        let parented: Vec<usize> = (0..loaded.skeleton.joints.len())
+            .filter(|j| loaded.skeleton.joints[*j].parent.is_some() && *j != 2)
+            .collect();
+
+        for strafe_ticks in [23_u32, 35, 47] {
+            let mut actor = make_render_actor(&loaded, 0, Vec::new(), 1, 0.0, 1.0);
+            actor.locked_on = true;
+            let release_at = strafe_ticks;
+            let mut ceiling = vec![0.0f32; loaded.skeleton.joints.len()];
+            let mut previous: Option<Vec<Mat4>> = None;
+            let mut worst: Vec<(usize, f32, u32)> = Vec::new();
+            for tick in 0..release_at + 45 {
+                actor.inputs = inputs_for_pose(
+                    if tick < release_at {
+                        PoseState::StrafeLeft
+                    } else {
+                        PoseState::Idle
+                    },
+                    false,
+                );
+                advance_actor_pose(
+                    &mut actor,
+                    1.0,
+                    crate::look_at_gates::LookState::Aiming,
+                    Some(LookAtInput {
+                        pose_rotation: Quat::IDENTITY,
+                        actor_world: Vec3::ZERO,
+                        target_attach_world: Vec3::new(0.0, 1.2, 3.0),
+                    }),
+                    None,
+                    false,
+                    None,
+                );
+                // Parent-relative placements only: the root's own turn is not a joint moving.
+                let pose = actor.world_pose().to_vec();
+                let locals: Vec<(usize, Mat4)> = parented
+                    .iter()
+                    .map(|j| {
+                        let p = loaded.skeleton.joints[*j].parent.unwrap();
+                        (*j, pose[p].inverse() * pose[*j])
+                    })
+                    .collect();
+                if let Some(prev_mats) = &previous {
+                    for (j, l) in &locals {
+                        let pp = loaded.skeleton.joints[*j].parent.unwrap();
+                        let prev_local = prev_mats[pp].inverse() * prev_mats[*j];
+                        let d = disp(&prev_local, l);
+                        if tick <= release_at - 2 {
+                            ceiling[*j] = ceiling[*j].max(d);
+                        } else if d > ceiling[*j] + STEP_MARGIN_DEG {
+                            worst.push((*j, d - ceiling[*j], tick));
+                        }
+                    }
+                }
+                previous = Some(pose);
+            }
+            worst.sort_by(|a, c| c.1.total_cmp(&a.1));
+            assert!(
+                worst.is_empty(),
+                "strafe={strafe_ticks}: {} handover ticks swung a joint past its own gait step; worst: {:?}",
+                worst.len(),
+                worst
+                    .iter()
+                    .take(3)
+                    .map(|(j, d, t)| format!("joint {j} +{d:.1} deg at tick +{}", t - release_at))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// A stop freezes the locomotion it leaves. The registration that hands a slot from a held gait
+    /// clip to idle must carry its outgoing side as a snapshot - `PreviousSide::Frozen` - so nothing
+    /// plays after the intent ends: whatever swing a joint had left becomes where the settle starts,
+    /// not something more of the gait gets played through it (`stopping_a_held_movement_never_winds_
+    /// the_arms_up_after_release`: "MATCH the key frame instead of playing animations"). A live side
+    /// here would let the arm finish the cycle's wind-up after release and land forward - the exact
+    /// reported error. Re-gaits (movement to movement) keep their live crossfade untouched.
+    #[test]
+    fn a_stop_freezes_the_gait_it_leaves() {
+        let Some(loaded) = load_hume_m() else { return };
+        let mut actor = make_render_actor(&loaded, 0, Vec::new(), 1, 0.0, 1.0);
+        actor.locked_on = true;
+        let release_at: u32 = 9;
+        for tick in 0..release_at + 2 {
+            actor.inputs = inputs_for_pose(
+                if tick < release_at {
+                    PoseState::StrafeLeft
+                } else {
+                    PoseState::Idle
+                },
+                false,
+            );
+            advance_actor_pose(
+                &mut actor,
+                1.0,
+                crate::look_at_gates::LookState::Aiming,
+                Some(LookAtInput {
+                    pose_rotation: Quat::IDENTITY,
+                    actor_world: Vec3::ZERO,
+                    target_attach_world: Vec3::new(0.0, 1.2, 3.0),
+                }),
+                None,
+                false,
+                None,
+            );
+            if tick != release_at {
+                continue;
+            }
+            for slot in 0..3 {
+                let animator = actor.coordinator.animations[slot]
+                    .as_ref()
+                    .expect("the side step runs every slot");
+                assert!(
+                    animator.current_animation.as_ref().is_some_and(|c| c
+                        .animation
+                        .id
+                        .as_str()
+                        .starts_with("idl")),
+                    "slot {slot}: the stop should have installed the idle"
+                );
+                let transition = animator.transition.as_ref().unwrap_or_else(|| {
+                    panic!("slot {slot}: a settled handover should be blending")
+                });
+                assert!(
+                    matches!(
+                        transition.previous, ffxi_actor::animation::PreviousSide::Frozen(_)
+                    ),
+                    "slot {slot}: the held side step kept playing into the stop instead of freezing \
+                     at the release tick"
+                );
+            }
+        }
+    }
+
+    /// Releasing a held movement settles: while the pose comes to rest, no joint may wind further
+    /// from its bind placement than it ever was under the hold's own control or within anything the
+    /// two contents themselves reach. Two laws, both measured on Hume M (see constants): a stop must
+    /// not start a fresh back-swing after the intent ends - releasing with an arm mid-cycle used to
+    /// watch that arm finish the cycle's wind-up first (`prev LIVE` tape rolling through its loop
+    /// seam under the fade) before jumping forward into idle: "arms go too far backwards then snap
+    /// to idle forward". The handover matches the incoming key frame to the outgoing pose and lets
+    /// it settle there instead of playing either animation further.
+    #[test]
+    fn stopping_a_held_movement_never_winds_the_arms_up_after_release() {
+        // Winding past anything both clip contents reach: measured bulges of 6-13 deg mid-blend when
+        // the two sides' arm phases disagree; a matched settle stays under 2. Tighter than that is
+        // clip-interpolation noise, and the live-playing offender sat far above.
+        const ENVELOPE_MARGIN_DEG: f32 = 4.0;
+        // Winding past where the joint was at the moment of release while settling toward rest:
+        // measured +7 deg spine overshoots when the gait plays on through its wind-up frames; a
+        // matched settle must not need to move away from the released pose further than a step.
+        const RELEASE_HEADROOM_DEG: f32 = 4.0;
+
+        let Some(loaded) = load_hume_m() else { return };
+        let mut bind_pose = Vec::new();
+        ffxi_actor::skeleton_instance::pose_world_into(
+            &mut bind_pose,
+            &mut PoseScratch::default(),
+            &loaded.skeleton,
+            |_| None as Option<KeyFrameTransform>,
+            RootTransform {
+                facing_dir: 0.0,
+                skew: 0.0,
+                slope_oriented: false,
+                scale: Vec3::ONE,
+            },
+            &[],
+        );
+        let joints = &loaded.skeleton.joints;
+        // Axis-agnostic distance from bind, per joint, parent-relative so the root never counts.
+        let dev_from_bind = |pose: &[Mat4], bone: usize| -> Option<f32> {
+            let p = joints.get(bone)?.parent?;
+            let one = |ua: Vec3, ub: Vec3| ua.dot(ub).clamp(-1.0, 1.0).acos().to_degrees();
+            let local = pose[p].inverse() * pose[bone];
+            let b = bind_pose[p].inverse() * bind_pose[bone];
+            let r = b.inverse() * local;
+            Some(
+                (one(r.x_axis.truncate(), b.x_axis.truncate())
+                    + one(r.y_axis.truncate(), b.y_axis.truncate())
+                    + one(r.z_axis.truncate(), b.z_axis.truncate()))
+                    / 3.0,
+            )
+        };
+
+        let scenarios: [(&str, PoseState, &[u32], bool); 4] = [
+            ("strafeL", PoseState::StrafeLeft, &[6_u32, 17, 23], true),
+            ("run", PoseState::Run, &[12_u32, 18, 30], true),
+            ("walk", PoseState::Walk, &[9_u32], false),
+            ("run-free", PoseState::Run, &[24_u32], false),
+        ];
+        let n = joints.len();
+
+        for (label, gait, holds, locked) in scenarios {
+            // Steady drives first: the contents' own reach, per joint.
+            let mut drive = make_render_actor(&loaded, 0, Vec::new(), 1, 0.0, 1.0);
+            drive.locked_on = locked;
+            let mut env_hold = vec![(f32::MIN, f32::MAX); n];
+            let mut env_idle = vec![(f32::MIN, f32::MAX); n];
+            for tick in 0..96 {
+                drive.inputs =
+                    inputs_for_pose(if tick < 80 { gait } else { PoseState::Idle }, false);
+                advance_actor_pose(
+                    &mut drive,
+                    1.0,
+                    if locked {
+                        crate::look_at_gates::LookState::Aiming
+                    } else {
+                        crate::look_at_gates::LookState::IdleNoTarget
+                    },
+                    locked.then_some(LookAtInput {
+                        pose_rotation: Quat::IDENTITY,
+                        actor_world: Vec3::ZERO,
+                        target_attach_world: Vec3::new(0.0, 1.2, 3.0),
+                    }),
+                    None,
+                    false,
+                    None,
+                );
+                let pose = drive.world_pose().to_vec();
+                for bone in 0..n {
+                    let Some(d) = dev_from_bind(&pose, bone) else {
+                        continue;
+                    };
+                    let band = if (60..80).contains(&tick) {
+                        &mut env_hold
+                    } else if tick >= 89 {
+                        &mut env_idle
+                    } else {
+                        continue;
+                    };
+                    band[bone].0 = band[bone].0.min(d);
+                    band[bone].1 = band[bone].1.max(d);
+                }
+            }
+
+            let mut violations: Vec<(f32, String)> = Vec::new();
+            for release_at in holds {
+                let mut actor = make_render_actor(&loaded, 0, Vec::new(), 1, 0.0, 1.0);
+                actor.locked_on = locked;
+                let mut held_tail_max = vec![0.0f32; n];
+                // The window the settling owns: one handover fade plus the released-record glide.
+                // Past it the pose is idle's own content, which this law does not speak to.
+                let settle_end = *release_at + LOCOMOTION_XFADE_IN as u32 * 2;
+                for tick in 0..settle_end + 1 {
+                    actor.inputs = inputs_for_pose(
+                        if tick < *release_at {
+                            gait
+                        } else {
+                            PoseState::Idle
+                        },
+                        false,
+                    );
+                    advance_actor_pose(
+                        &mut actor,
+                        1.0,
+                        if locked {
+                            crate::look_at_gates::LookState::Aiming
+                        } else {
+                            crate::look_at_gates::LookState::IdleNoTarget
+                        },
+                        locked.then_some(LookAtInput {
+                            pose_rotation: Quat::IDENTITY,
+                            actor_world: Vec3::ZERO,
+                            target_attach_world: Vec3::new(0.0, 1.2, 3.0),
+                        }),
+                        None,
+                        false,
+                        None,
+                    );
+                    let pose = actor.world_pose().to_vec();
+                    for bone in 0..n {
+                        let Some(d) = dev_from_bind(&pose, bone) else {
+                            continue;
+                        };
+                        // The hold's last ticks: how far the joint already was when intent ended.
+                        if (release_at.saturating_sub(2)..*release_at).contains(&tick) {
+                            held_tail_max[bone] = held_tail_max[bone].max(d);
+                            continue;
+                        }
+                        if tick < *release_at {
+                            continue;
+                        }
+                        let past_content =
+                            d - (env_hold[bone].1.max(env_idle[bone].1) + ENVELOPE_MARGIN_DEG);
+                        if past_content > 0.0 {
+                            violations.push((past_content, format!("{label} stop {release_at} joint {bone} tick +{}: dev {:.1} (content reach {:.1})", tick - release_at, d, env_hold[bone].1.max(env_idle[bone].1))));
+                        }
+                        // ...and while the handover is alive, a joint may move toward where idle
+                        // itself holds it but no further: fresh swing measured against the released
+                        // pose (the gait playing on) sat far past both, and so does any bulge the
+                        // blend could sneak between the two poses.
+                        if tick - *release_at < LOCOMOTION_XFADE_IN as u32 {
+                            let ceiling =
+                                held_tail_max[bone].max(env_idle[bone].1) + RELEASE_HEADROOM_DEG;
+                            let past_release = d - ceiling;
+                            if past_release > 0.0 {
+                                violations.push((past_release, format!("{label} stop {release_at} joint {bone} tick +{}: dev {:.1} (held {:.1})", tick - release_at, d, held_tail_max[bone])));
+                            }
+                        }
+                    }
+                }
+            }
+            violations.sort_by(|a, c| c.0.total_cmp(&a.0));
+            assert!(
+                violations.is_empty(),
+                "{label}: {} settling ticks wound a joint past its release or its content; worst:{}",
+                violations.len(),
+                violations
+                    .iter()
+                    .take(6)
+                    .map(|(_, v)| format!("\n  {v}"))
+                    .collect::<String>()
+            );
+        }
+    }
+
+    /// Releasing side step into forward hands over with no snap: across the tick where the locomotion
+    /// blend lands and the first frames after it, no bone moves further per tick than the running gait
+    /// ever covers alone. The release's blend wiring goes with it — every layer crossfades for exactly
+    /// `LOCOMOTION_XFADE_IN`, once, settling inside its own window.
+    #[test]
+    fn releasing_a_side_step_hands_off_without_a_pose_snap() {
+        // The window that holds the landing tick and the frames straight after it.
+        const HANDOFF_WATCH_TICKS: u32 = 4;
+        const HANDOFF_POSE_SLEW_RATIO_LIMIT: f32 = 1.5;
+
+        let Some(loaded) = load_hume_m() else { return };
+        let mut actor = make_render_actor(&loaded, 0, Vec::new(), 1, 0.0, 1.0);
+        let mut previous: Option<Vec<Option<[f32; 4]>>> = None;
+        let mut step_pose = |actor: &mut FfxiRenderActor, state| {
+            actor.inputs = inputs_for_pose(state, false);
+            advance_actor_pose_standalone(actor, 1.0, None);
+            let now = rotation_snapshot(actor);
+            let delta = previous
+                .as_ref()
+                .map_or(0.0, |past| max_pose_delta(past, &now));
+            previous = Some(now);
+            delta
+        };
+
+        // The baseline: a running gait ticking alone, no crossfade anywhere near it.
+        let mut baseline_slew = 0.0_f32;
+        for _ in 0..40 {
+            baseline_slew = baseline_slew.max(step_pose(&mut actor, PoseState::Run));
+        }
+
+        // Release at several points of the side step's cycle, including a release that cuts across
+        // the side step's own entry blend.
+        let window = LOCOMOTION_XFADE_IN as u32 + 2;
+        for strafe_ticks in [2_u32, 9, 16, 23] {
+            for _ in 0..strafe_ticks {
+                step_pose(&mut actor, PoseState::StrafeLeft);
+            }
+            let mut handoff_slew = 0.0_f32;
+            for tick in 0..window {
+                let delta = step_pose(&mut actor, PoseState::Run);
+                if tick >= window - HANDOFF_WATCH_TICKS {
+                    handoff_slew = handoff_slew.max(delta);
+                }
+                if tick == 0 {
+                    let blending: Vec<f32> = actor
+                        .coordinator
+                        .animations
+                        .iter()
+                        .flatten()
+                        .filter_map(|a| a.transition.as_ref())
+                        .map(|t| t.transition_duration)
+                        .collect();
+                    assert!(
+                        !blending.is_empty()
+                            && blending
+                                .iter()
+                                .all(|d| *d == LOCOMOTION_XFADE_IN),
+                        "every layer the release re-gaits should blend for {LOCOMOTION_XFADE_IN}, got {blending:?}"
+                    );
+                }
+            }
+            assert!(
+                !actor.coordinator.is_transitioning(),
+                "the gait blend outlived its window after {strafe_ticks} ticks of side step"
+            );
+            assert!(
+                handoff_slew <= baseline_slew * HANDOFF_POSE_SLEW_RATIO_LIMIT,
+                "the pose swung {handoff_slew:.1} deg/tick across the handoff, {:.2}x the run's own \
+                 {baseline_slew:.1}",
+                handoff_slew / baseline_slew.max(0.001)
+            );
+        }
+    }
+
+    /// Releasing a locked side step ramps the torso look weight down on the gait blend's clock, so
+    /// chest and legs settle on (nearly) the same tick — one shared ramp constant, pinned here
+    /// because their separate easing is exactly what desynced once.
+    #[test]
+    fn the_locked_torso_settles_on_the_gaits_blend_clock() {
+        const RELEASE_TICK_TOLERANCE: i32 = 1;
+
+        let keyed = |id: &[u8; 4]| {
+            let mut clip = synth_anim(id, 8);
+            clip.key_frame_sets.insert(
+                0,
+                vec![ffxi_dat::skel_anim::KeyFrameTransform::default(); clip.num_frames],
+            );
+            clip
+        };
+        let clips = vec![keyed(b"idl0"), keyed(b"run0"), keyed(b"mvl0")];
+        let mut actor = render_actor_with_skeleton_clips(1, clips);
+        actor.locked_on = true;
+
+        for _ in 0..(LOCOMOTION_XFADE_IN as u32 + 8) {
+            actor.inputs = inputs_for_pose(PoseState::StrafeLeft, false);
+            advance_actor_pose_standalone(&mut actor, 1.0, None);
+        }
+        assert_eq!(actor.locked_torso_weight, 1.0, "saturated by the strafe");
+
+        // Still locked, forward: the side step ends by selection, starting both ramps together.
+        let mut torso_released = None;
+        let mut blend_settled = None;
+        for tick in 1..=(LOCOMOTION_XFADE_IN as i32 + 4) {
+            actor.inputs = inputs_for_pose(PoseState::Run, false);
+            advance_actor_pose_standalone(&mut actor, 1.0, None);
+            if torso_released.is_none() && actor.locked_torso_weight == 0.0 {
+                torso_released = Some(tick);
+            }
+            if blend_settled.is_none() && !actor.coordinator.is_transitioning() {
+                blend_settled = Some(tick);
+            }
+        }
+        let (torso, gait) = match (torso_released, blend_settled) {
+            (Some(torso), Some(gait)) => (torso, gait),
+            _ => panic!(
+                "release never finished: torso {torso_released:?}, gait blend {blend_settled:?}"
+            ),
+        };
+        assert!(
+            (torso - gait).abs() <= RELEASE_TICK_TOLERANCE,
+            "the legs settled on tick {gait} but the chest kept easing to tick {torso}"
         );
     }
 
