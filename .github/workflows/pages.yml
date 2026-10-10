@@ -32,7 +32,7 @@ jobs:
           cp site/* _site/
           cp kuluu/assets/branding/png/kuluu-32.png kuluu/assets/branding/png/kuluu-256.png \
              kuluu/assets/branding/social/github-preview.png _site/assets/
-      - uses: actions/configure-pages@v5
+      - uses: actions/configure-pages@v6
       - uses: actions/upload-pages-artifact@v3
         with:
           path: _site
