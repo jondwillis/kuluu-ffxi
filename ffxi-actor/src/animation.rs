@@ -837,6 +837,24 @@ impl SkeletonAnimationCoordinator {
         self.register_animation(animation, LoopParams::low_priority_loop(), None, |_| true)
     }
 
+    /// A stop handover whose crossfade length the caller sized from the outgoing layer's own playhead.
+    /// `register_idle_animation` inherits whatever out-window the previous request happened to store,
+    /// and a fixed tick count ends the fade wherever it lands - cutting the last frames of the gait's
+    /// swing off mid-motion (the chest snap at strafe end). A stop instead runs the outgoing clip's
+    /// current cycle to its loop seam while blending, so no authored frame is skipped.
+    pub fn register_idle_animation_running_out(
+        &mut self,
+        animation: SkeletonAnimation,
+        transition: TransitionParams,
+    ) -> bool {
+        self.register_animation(
+            animation,
+            LoopParams::low_priority_loop(),
+            Some(transition),
+            |a| ready_for_transition_out(a, true),
+        )
+    }
+
     /// This frame's transform for one bone. Ownership is per bone, never per slot: retail samples every
     /// active layer into the shared pose scratch (`.data 0x1045F030`) with each sample overwriting only
     /// the bones its clip keys, walking layer indices descending (`mov edi,4` … `dec edi` / `jge`,

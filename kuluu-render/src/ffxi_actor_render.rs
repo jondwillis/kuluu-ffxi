@@ -3546,8 +3546,33 @@ fn advance_actor_pose(
                 if slot_keeps_clip(coordinator, registered_slots, slot, (clip.id, from_battle)) {
                     continue;
                 }
+                // A stop must not skip the gait's remaining frames: size this handover's crossfade
+                // from each slot's own outgoing playhead to its next loop seam (the shipped cycles are
+                // seam-continuous, end key == start key), so the side-step finishes its swing while
+                // blending instead of having its last frames cut off - the chest snap at strafe end.
+                let running_out = coordinator.animations[slot]
+                    .as_ref()
+                    .and_then(|a| a.current_animation.as_ref())
+                    .filter(|c| {
+                        let id = c.animation.id.as_str();
+                        id.starts_with("mv") || id.starts_with("run") || id.starts_with("wlk")
+                    })
+                    .map(|c| {
+                        let len = c.animation.length_in_frames();
+                        (len - c.current_frame.rem_euclid(len)).max(1.0)
+                    });
                 let accepted = if action_just_ended {
                     coordinator.register_idle_animation_eager(clip.clone())
+                } else if let Some(until_seam) = running_out {
+                    coordinator.register_idle_animation_running_out(
+                        clip.clone(),
+                        TransitionParams {
+                            transition_in_time: until_seam,
+                            transition_out_time: LOCOMOTION_XFADE_OUT,
+                            in_step: true,
+                            ..Default::default()
+                        },
+                    )
                 } else {
                     coordinator.register_idle_animation(clip.clone(), true)
                 };
@@ -8120,6 +8145,72 @@ mod pose_resolution_tests {
                     was_transitioning = transitioning;
                 }
             }
+        }
+    }
+
+    /// A locked stop runs the outgoing gait's current cycle to its loop seam before the blend lets go:
+    /// sizing the crossfade from each slot's own playhead (see `register_idle_animation_running_out`)
+    /// so none of the swing is skipped. Measured at three release phases of the 24-frame side-step -
+    /// the tick the blend dies on, the outgoing layer stands exactly one step short of its wrap point;
+    /// before this rule it died a fixed 7.5 ticks after selection wherever that happened to land, and
+    /// the last frames of the chest's swing snapped instead of blending.
+    #[test]
+    fn a_locked_stop_runs_the_gait_cycle_out_before_blending_away() {
+        let Some(loaded) = load_hume_m() else { return };
+
+        for strafe_ticks in [28_u32, 35, 40] {
+            let mut actor = make_render_actor(&loaded, 0, Vec::new(), 1, 0.0, 1.0);
+            actor.locked_on = true;
+            let release_at = strafe_ticks;
+            let mut last_prev_frame: Option<f32> = None;
+            let mut died_at: Option<u32> = None;
+            for tick in 0..release_at + 40 {
+                actor.inputs = inputs_for_pose(
+                    if tick < release_at {
+                        PoseState::StrafeLeft
+                    } else {
+                        PoseState::Idle
+                    },
+                    false,
+                );
+                advance_actor_pose(
+                    &mut actor,
+                    1.0,
+                    crate::look_at_gates::LookState::Aiming,
+                    Some(LookAtInput {
+                        pose_rotation: Quat::IDENTITY,
+                        actor_world: Vec3::ZERO,
+                        target_attach_world: Vec3::new(0.0, 1.2, 3.0),
+                    }),
+                    None,
+                    false,
+                    None,
+                );
+                if let Some(tr) = actor.coordinator.animations[2]
+                    .as_ref()
+                    .and_then(|a| a.transition.as_ref())
+                {
+                    if let ffxi_actor::animation::PreviousSide::Live(ctx) = &tr.previous {
+                        last_prev_frame = Some(ctx.current_frame);
+                    }
+                } else if tick >= release_at && died_at.is_none() {
+                    // The transition just died; the outgoing side's last observed step was one tick ago.
+                    let prev_frame = last_prev_frame.unwrap_or_default();
+                    let seam_left = actor.coordinator.animations[2]
+                        .as_ref()
+                        .and_then(|a| a.current_animation.as_ref())
+                        .map_or(0.0, |_| 24.0 - prev_frame.rem_euclid(24.0));
+                    assert!(
+                        seam_left.abs() <= 1.5 || prev_frame.rem_euclid(24.0).abs() < 1.6,
+                        "strafe={strafe_ticks}: the stop blend let go at frame {prev_frame:.1} of the                          side-step cycle (seam gap {seam_left:.1}); it must run out to the loop seam",
+                    );
+                    died_at = Some(tick);
+                }
+            }
+            assert!(
+                died_at.is_some(),
+                "strafe={strafe_ticks}: stop blend never completed"
+            );
         }
     }
 
