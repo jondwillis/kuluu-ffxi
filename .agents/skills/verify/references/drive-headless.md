@@ -348,7 +348,8 @@ confirm the log tail ends with exit-watchdog checkpoints; the map side records t
 (`chars.last_logout`). Measured here: `/shutdown` sent → process gone ~40 s later.
 
 - **Never terminate a client that this run did not start.** Check the recorded PID and executable before cleanup.
-- If the client cannot process `/shutdown`, save its log and record verification as blocked.
+- If the client cannot process `/shutdown`, save its log.
+  Record verification as blocked.
   For a pre-server animation room, use its normal window exit first.
   If normal exit fails, terminate only the process that this run started:
 
