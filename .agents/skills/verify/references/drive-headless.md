@@ -279,7 +279,7 @@ line per TCP connection:
 | `{"query":"knobs"}` | what this build can drive: cases, env knobs and clock spacing — on a live session, where the offline `animtest --knobs` answer cannot see runtime state |
 | `{"key":"printscreen"}` | in-app GPU readback → numbered `screenshot-<n>.png` **in the working directory**; move each into your dated folder immediately. Names accepted by `KeyMsg::resolve`: `printscreen`, `prtsc`, `prtscn` |
 | `{"text":"//warp 123.4 -56.7"}` then `{"key":"enter"}` | dev commands take a **double** slash (`//warp`, `//whereami`, `//zones`, `//pathto`, `//endevent`); single `/cmd` is rejected with a suggestion |
-| `{"text":"/shutdown"}` then `{"key":"enter"}` | normal player logout — LeaveGame wait (~30 s; skipped at GM rank), then the client closes itself. This is how every run ends; see §Cleanup |
+| `{"text":"/shutdown"}` then `{"key":"enter"}` | normal player logout — LeaveGame wait (~30 s; skipped at GM rank), then the client closes itself. See §Cleanup for ownership checks and failure recovery. |
 
 - **Positioning:** `//pathto <x> <y>` (wire coords) is the reliable mover; raw walking into
   props wastes cycles. `//zones` lists zonelines with rects — warping *into* a rect does not
@@ -333,7 +333,7 @@ InEvent. If those symptoms return, check that header/sync invariant first.
 
 ## Cleanup and ownership
 
-End every run as every player does — chat command, never a kill:
+For a responsive live session, use the player logout command:
 
 ```bash
 # send() is the §B key-drive helper (printf one JSON line > /dev/tcp/127.0.0.1/<port>)
@@ -347,11 +347,18 @@ it) — **and then the client closes itself.** Wait for your own PID to disappea
 confirm the log tail ends with exit-watchdog checkpoints; the map side records the logout
 (`chars.last_logout`). Measured here: `/shutdown` sent → process gone ~40 s later.
 
-- **Never kill a kuluu — not even one you launched.** `taskkill`/`kill -TERM` skips LeaveGame, and
-  depending on how the socket dies the map server holds the char while the next lobby login times
-  out; `references/stack.md` owns that failure mode and its single-row repair — including why the
-  `WHERE` clause is not optional. If your own client ignores `/shutdown`, treat it as wedged,
-  stop, and report — do not kill it.
+- **Never terminate a client that this run did not start.** Check the recorded PID and executable before cleanup.
+- If the client cannot process `/shutdown`, save its log and record verification as blocked.
+  For a pre-server animation room, use its normal window exit first.
+  If normal exit fails, terminate only the process that this run started:
+
+  ```bash
+  taskkill //PID "$OWNED_PID"      # Windows Git Bash
+  kill -TERM "$OWNED_PID"         # Unix
+  ```
+
+  Report the termination. Termination can leave the map server holding the character and delay the next login.
+  `references/stack.md` gives the single-row repair. Keep its required `WHERE` clause.
 - **`/exit` closes the window now** instead of completing LeaveGame; never normal cleanup on a
   live session.
 - Nothing typed in char chat stops the shared server (an earlier note here claiming otherwise was
