@@ -9119,14 +9119,21 @@ mod pose_resolution_tests {
         // eye caught at side-step end was that boundary jump, not the gait.
         const MAX_BOUNDARY_STEP_DEG: f32 = 12.0;
 
-        let Some(loaded) = load_hume_m() else { return };
         let disp = |a: &Mat4, b: &Mat4| -> f32 {
             let one = |ua: Vec3, ub: Vec3| ua.dot(ub).clamp(-1.0, 1.0).acos().to_degrees();
             (one(a.x_axis.truncate(), b.x_axis.truncate())
                 + one(a.y_axis.truncate(), b.y_axis.truncate())
-                + one(a.z_axis.truncate(), b.y_axis.truncate()))
+                + one(a.z_axis.truncate(), b.z_axis.truncate()))
                 / 3.0
         };
+
+        assert_eq!(disp(&Mat4::IDENTITY, &Mat4::IDENTITY), 0.0);
+        let quarter_turn = Mat4::from_rotation_x(std::f32::consts::FRAC_PI_2);
+        let boundary_step =
+            (disp(&Mat4::IDENTITY, &quarter_turn) - disp(&Mat4::IDENTITY, &Mat4::IDENTITY)).abs();
+        assert!(boundary_step > MAX_BOUNDARY_STEP_DEG);
+
+        let Some(loaded) = load_hume_m() else { return };
 
         // The joint's placement under bind composition (no records at all), parent-relative: the rest
         // position a released bone settles to.
