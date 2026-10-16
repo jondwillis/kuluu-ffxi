@@ -1,4 +1,25 @@
+include!(concat!(env!("OUT_DIR"), "/spell_group_table.rs"));
 include!(concat!(env!("OUT_DIR"), "/spell_skill_table.rs"));
+
+/// `vendor/server/scripts/enum/magic.lua` xi.magic.spellGroup — the values stored in
+/// [`SPELL_GROUP`] (scraped from vendor/server/sql/spell_list.sql field 3).
+pub const GROUP_SONG: u8 = 1;
+pub const GROUP_BLACK: u8 = 2;
+pub const GROUP_BLUE: u8 = 3;
+pub const GROUP_NINJUTSU: u8 = 4;
+pub const GROUP_SUMMONING: u8 = 5;
+pub const GROUP_WHITE: u8 = 6;
+pub const GROUP_GEOMANCY: u8 = 7;
+pub const GROUP_TRUST: u8 = 8;
+
+/// The spell's school per the LSB server data, on xi.magic.spellGroup numbering.
+pub fn group(spell_id: u32) -> Option<u8> {
+    let id = u16::try_from(spell_id).ok()?;
+    SPELL_GROUP
+        .binary_search_by_key(&id, |&(k, _)| k)
+        .ok()
+        .map(|i| SPELL_GROUP[i].1)
+}
 
 const SKILL_DIVINE: u8 = 32;
 const SKILL_HEALING: u8 = 33;
@@ -78,6 +99,30 @@ mod tests {
     #[test]
     fn unknown_spell_is_none() {
         assert_eq!(cast_suffix(0xFFFF), None);
+    }
+
+    // xi.magic.spellGroup (vendor/server/scripts/enum/magic.lua) via the scraped `group` column.
+    #[test]
+    fn spell_groups_follow_the_lsb_enum() {
+        assert_eq!(group(1), Some(GROUP_WHITE)); // cure
+        assert_eq!(group(144), Some(GROUP_BLACK)); // fire
+        assert_eq!(group(368), Some(GROUP_SONG)); // foe requiem
+        assert_eq!(group(320), Some(GROUP_NINJUTSU)); // katon ichi
+        assert_eq!(group(288), Some(GROUP_SUMMONING)); // fire spirit
+        assert_eq!(group(603), Some(GROUP_BLUE)); // wild oats
+        assert_eq!(group(768), Some(GROUP_GEOMANCY)); // indi-regen
+        assert_eq!(group(896), Some(GROUP_TRUST)); // shantotto
+    }
+
+    #[test]
+    fn unknown_spell_group_is_none() {
+        assert_eq!(group(0xFFFF), None);
+    }
+
+    #[test]
+    fn group_table_is_nonempty_and_sorted() {
+        assert!(SPELL_GROUP.len() >= 891);
+        assert!(SPELL_GROUP.windows(2).all(|w| w[0].0 < w[1].0));
     }
 
     // vendor/server/src/map/enums/four_cc.h FourCC BlueMagicCast — the literal constants LSB sends.

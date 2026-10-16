@@ -167,6 +167,7 @@ fn quantity_overlay_production_capture() {
                     next_use_vana_ts: None,
                     use_delay_end_vana_ts: None,
                     ready: None,
+                    extdata: None,
                 })
             })
             .collect(),

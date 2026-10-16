@@ -1786,6 +1786,15 @@ impl FfxiRenderActor {
         self.current_clip = None;
     }
 
+    /// The motion family this actor plays wherever it would stand idle; `None` keeps its own idle.
+    pub fn set_idle_family(&mut self, family: Option<DatId>) {
+        self.event_idle = family;
+    }
+
+    pub fn idle_family(&self) -> Option<DatId> {
+        self.event_idle
+    }
+
     /// A scheduler Motion stage's action is in flight on this model.
     pub fn has_action(&self) -> bool {
         self.action.is_some()
@@ -6178,7 +6187,9 @@ pub fn tick_live_ffxi_actors(
             }
             let snap = index.by_id.get(&world_id);
 
-            if zone_changed || (!is_self && snap.is_none()) {
+            if zone_changed
+                || (!is_self && snap.is_none() && !crate::scene::is_furniture_actor_id(world_id))
+            {
                 reset_actor_pose_state(
                     &mut actor,
                     elapsed_frames,
@@ -7327,6 +7338,33 @@ mod pose_resolution_tests {
 
     use super::*;
     use ffxi_actor::actor_state::ActorAnimInputs;
+
+    /// Mean angle between two frames' axis triples, in degrees — the metric every pose-boundary
+    /// threshold below reads. One definition on purpose: these thresholds compare consecutive
+    /// samples of it, so a copy that pairs `z` against `y` offsets the metric by ~30 deg and
+    /// silently retunes every assertion that consumes it.
+    fn axis_disp(a: &Mat4, b: &Mat4) -> f32 {
+        let one = |ua: Vec3, ub: Vec3| ua.dot(ub).clamp(-1.0, 1.0).acos().to_degrees();
+        (one(a.x_axis.truncate(), b.x_axis.truncate())
+            + one(a.y_axis.truncate(), b.y_axis.truncate())
+            + one(a.z_axis.truncate(), b.z_axis.truncate()))
+            / 3.0
+    }
+
+    /// The metric's own sanity, so a mis-paired axis cannot masquerade as measured motion: a
+    /// quarter turn about X leaves that axis alone and swings the other two right angles each.
+    #[test]
+    fn axis_disp_pairs_each_axis_with_its_own() {
+        let identity = axis_disp(&Mat4::IDENTITY, &Mat4::IDENTITY);
+        assert!(identity <= 1e-6, "identity measured {identity} deg");
+        let quarter_turn_about_x = Mat4::from_rotation_x(std::f32::consts::FRAC_PI_2);
+        let two_axes_at_right_angles = std::f32::consts::FRAC_PI_2.to_degrees() * 2.0 / 3.0;
+        let measured = axis_disp(&Mat4::IDENTITY, &quarter_turn_about_x);
+        assert!(
+            (measured - two_axes_at_right_angles).abs() < 1e-3,
+            "expected {two_axes_at_right_angles} deg, measured {measured}"
+        );
+    }
 
     fn resolved_clip_ids(actor: &LoadedActor, inputs: &ActorAnimInputs) -> Vec<String> {
         let animations = actor.all_animations();
@@ -9037,13 +9075,6 @@ mod pose_resolution_tests {
         const OVERSWING_MARGIN_DEG: f32 = 12.0;
 
         let Some(loaded) = load_hume_m() else { return };
-        let disp = |a: &Mat4, b: &Mat4| -> f32 {
-            let one = |ua: Vec3, ub: Vec3| ua.dot(ub).clamp(-1.0, 1.0).acos().to_degrees();
-            (one(a.x_axis.truncate(), b.x_axis.truncate())
-                + one(a.y_axis.truncate(), b.y_axis.truncate())
-                + one(a.z_axis.truncate(), b.z_axis.truncate()))
-                / 3.0
-        };
 
         for locked in [true, false] {
             let mut ceiling = vec![0.0f32; loaded.skeleton.joints.len()];
@@ -9081,7 +9112,7 @@ mod pose_resolution_tests {
                     let now = actor.world_pose().to_vec();
                     if let Some(p) = &prev {
                         for bone in 0..loaded.skeleton.joints.len() {
-                            let d = disp(&p[bone], &now[bone]);
+                            let d = axis_disp(&p[bone], &now[bone]);
                             if tick < run_ticks {
                                 ceiling[bone] = ceiling[bone].max(d);
                             } else if (release_at.saturating_sub(3)..release_at + 24)
@@ -9120,13 +9151,6 @@ mod pose_resolution_tests {
         const MAX_BOUNDARY_STEP_DEG: f32 = 12.0;
 
         let Some(loaded) = load_hume_m() else { return };
-        let disp = |a: &Mat4, b: &Mat4| -> f32 {
-            let one = |ua: Vec3, ub: Vec3| ua.dot(ub).clamp(-1.0, 1.0).acos().to_degrees();
-            (one(a.x_axis.truncate(), b.x_axis.truncate())
-                + one(a.y_axis.truncate(), b.y_axis.truncate())
-                + one(a.z_axis.truncate(), b.y_axis.truncate()))
-                / 3.0
-        };
 
         // The joint's placement under bind composition (no records at all), parent-relative: the rest
         // position a released bone settles to.
@@ -9184,7 +9208,8 @@ mod pose_resolution_tests {
                     let transitioning = actor.coordinator.is_transitioning();
                     if tick >= release_at.saturating_sub(1) {
                         let now = actor.world_pose();
-                        let dev_from_rest = disp(&rest_local, &(now[parent].inverse() * now[46]));
+                        let dev_from_rest =
+                            axis_disp(&rest_local, &(now[parent].inverse() * now[46]));
                         // Assert exactly at the blend-death boundary: the frame's step against the one
                         // before it. Live-gait ticks stay unmeasured - a running side-step legitimately
                         // steps ~10 deg/tick by its own motion, and that is not what this pins.
@@ -9221,13 +9246,6 @@ mod pose_resolution_tests {
         const STEP_MARGIN_DEG: f32 = 8.0;
 
         let Some(loaded) = load_hume_m() else { return };
-        let disp = |a: &Mat4, b: &Mat4| -> f32 {
-            let one = |ua: Vec3, ub: Vec3| ua.dot(ub).clamp(-1.0, 1.0).acos().to_degrees();
-            (one(a.x_axis.truncate(), b.x_axis.truncate())
-                + one(a.y_axis.truncate(), b.y_axis.truncate())
-                + one(a.z_axis.truncate(), b.z_axis.truncate()))
-                / 3.0
-        };
         let parented: Vec<usize> = (0..loaded.skeleton.joints.len())
             .filter(|j| loaded.skeleton.joints[*j].parent.is_some() && *j != 2)
             .collect();
@@ -9274,7 +9292,7 @@ mod pose_resolution_tests {
                     for (j, l) in &locals {
                         let pp = loaded.skeleton.joints[*j].parent.unwrap();
                         let prev_local = prev_mats[pp].inverse() * prev_mats[*j];
-                        let d = disp(&prev_local, l);
+                        let d = axis_disp(&prev_local, l);
                         if tick <= release_at - 2 {
                             ceiling[*j] = ceiling[*j].max(d);
                         } else if d > ceiling[*j] + STEP_MARGIN_DEG {
@@ -9332,13 +9350,6 @@ mod pose_resolution_tests {
             side_only.contains(&36),
             "Mithra's side step should be all that keys her upper body's root; side-only joints {side_only:?}"
         );
-        let disp = |a: &Mat4, b: &Mat4| -> f32 {
-            let one = |ua: Vec3, ub: Vec3| ua.dot(ub).clamp(-1.0, 1.0).acos().to_degrees();
-            (one(a.x_axis.truncate(), b.x_axis.truncate())
-                + one(a.y_axis.truncate(), b.y_axis.truncate())
-                + one(a.z_axis.truncate(), b.z_axis.truncate()))
-                / 3.0
-        };
         let local = |pose: &[Mat4], joint: usize| -> Mat4 {
             pose[loaded.skeleton.joints[joint].parent.unwrap()].inverse() * pose[joint]
         };
@@ -9387,20 +9398,22 @@ mod pose_resolution_tests {
                 if let Some(past) = &previous {
                     if tick + 5 >= idle_ticks {
                         for &joint in &parented {
-                            steps[joint].push(disp(&local(past, joint), &local(&pose, joint)));
+                            steps[joint].push(axis_disp(&local(past, joint), &local(&pose, joint)));
                         }
                     }
                     if tick == release_at {
                         held = side_only
                             .iter()
-                            .map(|&joint| (joint, disp(&local(&bind, joint), &local(past, joint))))
+                            .map(|&joint| {
+                                (joint, axis_disp(&local(&bind, joint), &local(past, joint)))
+                            })
                             .filter(|&(_, turned)| turned >= HELD_TURN_MIN_DEG)
                             .collect();
                     }
                 }
                 if tick == release_at + settle_ticks / 2 {
                     for &(joint, turned) in &held {
-                        let left = disp(&local(&bind, joint), &local(&pose, joint));
+                        let left = axis_disp(&local(&bind, joint), &local(&pose, joint));
                         assert!(
                             left <= turned * (1.0 - HALF_SETTLE_SHARE_MOVED),
                             "strafe={strafe_ticks}: half way through the settle joint {joint} still stands \
@@ -9637,16 +9650,9 @@ mod pose_resolution_tests {
         // Axis-agnostic distance from bind, per joint, parent-relative so the root never counts.
         let dev_from_bind = |pose: &[Mat4], bone: usize| -> Option<f32> {
             let p = joints.get(bone)?.parent?;
-            let one = |ua: Vec3, ub: Vec3| ua.dot(ub).clamp(-1.0, 1.0).acos().to_degrees();
             let local = pose[p].inverse() * pose[bone];
             let b = bind_pose[p].inverse() * bind_pose[bone];
-            let r = b.inverse() * local;
-            Some(
-                (one(r.x_axis.truncate(), b.x_axis.truncate())
-                    + one(r.y_axis.truncate(), b.y_axis.truncate())
-                    + one(r.z_axis.truncate(), b.z_axis.truncate()))
-                    / 3.0,
-            )
+            Some(axis_disp(&(b.inverse() * local), &b))
         };
 
         let scenarios: [(&str, PoseState, &[u32], bool); 4] = [

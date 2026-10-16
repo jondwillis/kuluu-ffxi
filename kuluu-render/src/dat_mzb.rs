@@ -3051,6 +3051,7 @@ fn spawn_mzb_overlay(
                     slot: req.slot,
                     sub_area_link: s.sub_area_link,
                     voyage_backdrop: s.voyage_backdrop,
+                    static_model: None,
                 });
             }
             push_system_msg(

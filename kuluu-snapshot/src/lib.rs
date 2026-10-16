@@ -858,6 +858,13 @@ pub struct SceneSnapshot {
     pub entities: Vec<Entity>,
     pub party: Vec<PartyMember>,
 
+    /// An incoming party/alliance invite (s2c 0x0DC) not yet answered with c2s
+    /// GROUP_SOLICIT_RES. Retail parks this in the static party state that the
+    /// Party row's helper reads to open `prtyjoin` instead of a roster window
+    /// (FFXiMain.dll retail-2026-09 RVA 0x2016E0; vault main_menu.md section 24).
+    #[serde(default)]
+    pub party_invite: Option<PartyInvite>,
+
     /// Monotonically increasing counter, bumped on every zone change. Forces
     /// the party-frame content key to differ after a zone transition even when
     /// the party data is byte-identical.
@@ -1051,6 +1058,620 @@ pub struct SceneSnapshot {
     /// `None` is the ordinary home-point-only menu.
     #[serde(default)]
     pub death_menu_offer: Option<DeathMenuOffer>,
+
+    /// The player-trade session from the s2c 0x021/0x022/0x023/0x025 family
+    /// (vendor/server/src/map/items/transactions/player_trade.cpp; vault
+    /// main_menu.md §25). Trailing on purpose: the postcard pin stays an append.
+    #[serde(default)]
+    pub trade: Option<Box<TradeWindow>>,
+
+    /// The last completed player-search result set (the `scresult` singleton's
+    /// data in retail; vault main_menu.md §26). Kept across frames until a new
+    /// query replaces it, exactly like the retail model window holds its rows.
+    #[serde(default)]
+    pub search: Option<Box<SearchResults>>,
+
+    /// The two link-shell slots as s2c 0x0E0 last reported them (vault main_menu.md §27; the
+    /// server pushes both at login and again after every equip/unequip/create). Trailing on
+    /// purpose, so the postcard pin stays an append.
+    #[serde(default)]
+    pub linkshells: LinkShells,
+
+    /// The last s2c 0x06F answer to our synthesis ask (vault main_menu.md §28;
+    /// the `cmbhlst` list's feedback row). Kept until the next ask answers, so
+    /// a closed craft window still shows what happened. Trailing on purpose.
+    #[serde(default)]
+    pub synth_result: Option<SynthOutcome>,
+    /// The s2c 0x056 mission/quest log battery (vault main_menu.md §30).
+    #[serde(default)]
+    pub missions: Missions,
+
+    /// The automaton as s2c 0x044 EXTENDED_JOB PUP last reported it — the
+    /// pupequip variant's data source for a Puppetmaster (vault main_menu.md
+    /// §39; layout vendor/server/src/map/packets/s2c/0x044_extended_job_pup.h).
+    /// LSB sends it at login while PUP is main or sub, so its presence mirrors
+    /// the DLL's Equipment-row job gate exactly. Trailing on purpose.
+    #[serde(default)]
+    pub automaton: Option<Box<AutomatonInfo>>,
+
+    /// The monstrosity session as s2c 0x044 EXTENDED_JOB MON last reported it
+    /// — the `mp_mncst` ("Customization") variant's data source; `Some` is also
+    /// kuluu's stand for the DLL's Monstrosity predicate 0x97D50 on the Equipment
+    /// row (vault main_menu.md §39). Trailing on purpose.
+    #[serde(default)]
+    pub monstrosity: Option<MonstrosityInfo>,
+
+    /// The character's locally-held macros — the mcrmenu family's data model.
+    /// Retail keeps them purely client-side (vault main_menu.md §34 wire law:
+    /// LSB ships no macro packets [V-negative]); capacity is grounded by the DAT
+    /// grids: two palette windows `mcr1pall`/`mcr2pall` whose chunks hold 20
+    /// keytop widgets each (vault main_menu.md §41). Only filled slots appear.
+    /// Trailing on purpose.
+    #[serde(default)]
+    pub macros: Vec<MacroSlot>,
+
+    /// The four `SAVE_CONF` bitfield bytes the server last reported for this
+    /// character (s2c 0x0B4 GP_SERV_COMMAND_CONFIG; layout vendor/server/src/
+    /// common/mmo.h — decode with ffxi_proto::config::parse_config_flags; vault
+    /// main_menu.md §42). `None` until the packet arrives (it follows login's
+    /// gameok per vendor/server/src/map/packets/c2s/0x00c_gameok.cpp). Trailing
+    /// on purpose.
+    #[serde(default)]
+    pub config_confdata: Option<[u8; 4]>,
+
+    /// The whole job roster as s2c 0x01B JOB_INFO last reported it — the data
+    /// source for myroom's `jobchang` (Change Jobs) home-view row, whose pick
+    /// list offers every unlocked job and whose commit c2s 0x100 MYROOM_JOB is
+    /// validated against exactly this bitmask (vendor/server/src/map/packets/
+    /// c2s/0x100_myroom_job.cpp; vault main_menu.md §53). Trailing on purpose.
+    #[serde(default)]
+    pub jobs: Option<JobList>,
+
+    /// The s2c 0x062 CLISTATUS2 skill block, kept as the raw words so each Status
+    /// window can apply its own family's encoding (combat/magic vs craft — see
+    /// `ffxi_proto::decode::CharSkillLevels`). `None` until a zone-in carries one.
+    #[serde(default)]
+    pub char_skills: Option<CharSkills>,
+
+    /// The player's own emote display order (bead kuluu-o9qt7.34): the retail `emote`
+    /// window is a **user-arranged list** — its fill reads a per-user blob at open
+    /// (FFXiMain.dll retail-2026-09 `.text 0x2259C6` through the user-file helper family),
+    /// and `abisortw`'s select drives the swap law in `hud::menu::rearrange_emote_order`.
+    /// Entries are emote ids, most-preferred first; unknown ids drop and every id the
+    /// store omits keeps its default place behind the arranged ones. Empty = never
+    /// arranged (trailing additive field).
+    #[serde(default)]
+    pub emote_order: Vec<u8>,
+
+    /// The raw body of the last s2c 0x113 `GP_SERV_COMMAND_CURRENCIES_1` report (bead
+    /// kuluu-o9qt7.35). Kept RAW on purpose: each list row reads through the client's own
+    /// getter table (`kuluu_render::hud::currency_law`, FFXiMain.dll retail-2026-09 fill helper
+    /// `.text 0x2297C0`; vault main_menu.md §59 addendum 27), so decoding into typed fields
+    /// here would fork that law. `None` until a report lands — and nothing is cached: every
+    /// Currencies-window open re-requests (`.text 0xFD520`).
+    #[serde(default)]
+    pub currencies_1: Option<Vec<u8>>,
+
+    /// The raw body of the last s2c 0x118 `GP_SERV_COMMAND_CURRENCIES_2` report — same law as
+    /// [`Self::currencies_1`], answered under c2s 0x115 (`.text 0xFD550`).
+    #[serde(default)]
+    pub currencies_2: Option<Vec<u8>>,
+
+    /// Which Mog House arrangement mode the client has entered ([`MYROOM_MODE_NORMAL`],
+    /// [`MYROOM_MODE_LAYOUT`], ...). Client-side state, never wire data:
+    /// retail keeps it in its myroom manager's own word (+0x1C), read back at `.text FFXiMain.dll
+    /// retail-2026-09 0x1D34FA`. 0 = normal play, 1 = layout (`/layout`), 2 = gardening (`/garden`),
+    /// 3 = flowerpot item pick, 4 = select one piece; anything else is rejected before dispatch.
+    #[serde(default)]
+    pub myroom_mode: u8,
+
+    /// s2c 0x063 GP_SERV_COMMAND_MISCDATA subtype **Merits** (0x02) — the Status window's
+    /// Merit Points row gate and readout source (bead kuluu-o9qt7.43; vault main_menu.md
+    /// §59 addendum 36). `None` until that record arrives; retail enables row id 7 exactly when
+    /// one has been received AND its `can_use_merit_mode` bit is set (the client stores the pair
+    /// at .data FFXiMain.dll retail-2026-09 0x485824 bit1 + 0x485829 & 0x20, gate body
+    /// `.text 0x148E88`). Trailing on purpose.
+    #[serde(default)]
+    pub merits: Option<MisdataMerits>,
+
+    /// The Unity ranking tables (s2c 0x063 type 7) and the s2c 0x110 request mark
+    /// (.agents/skills/retail-observe/references/2026-10-15-unity-and-fp-windows.md).
+    #[serde(default)]
+    pub unity: UnityState,
+
+    /// The last s2c 0x08E alter ego points block; `None` until one arrives this session.
+    #[serde(default)]
+    pub alter_ego_points: Option<AlterEgoPoints>,
+
+    /// An s2c 0x119 has arrived this session, which readies the Status data the Unity and alter
+    /// ego point windows wait for.
+    #[serde(default)]
+    pub status_data_ready: bool,
+
+    /// s2c 0x00A `LoginState` at the last zone-in (LSB `SAVE_LOGIN_STATE`,
+    /// vendor/server/src/map/packets/s2c/0x00a_login.h).
+    #[serde(default)]
+    pub login_state: u32,
+
+    /// s2c 0x00A `IsMonstrosity` was nonzero at the last zone-in.
+    #[serde(default)]
+    pub login_is_monstrosity: bool,
+
+    /// The merits s2c 0x08C stored, keyed by merit index (the wire id halved)
+    /// (.agents/skills/retail-observe/references/2026-10-15-merit-and-job-point-windows.md).
+    #[serde(default)]
+    pub merit_entries: std::collections::BTreeMap<u16, MeritEntry>,
+
+    /// Job point type state from s2c 0x08D, keyed by type id (`job * 32 + slot`).
+    #[serde(default)]
+    pub job_point_types: std::collections::BTreeMap<u16, JobPointType>,
+
+    /// An s2c 0x08D has been processed this session.
+    #[serde(default)]
+    pub job_points_received: bool,
+
+    /// The last s2c 0x063 JobPoints record; `None` until one arrives.
+    #[serde(default)]
+    pub job_points: Option<JobPointsRecord>,
+
+    /// The last s2c 0x063 GP_SERV_COMMAND_MISCDATA subtype **Homepoints** (0x06) — the
+    /// fast-travel access masks retail copies wholesale into .data FFXiMain.dll retail-2026-09
+    /// 0x4858C4 and reads only through per-field bit-test wrappers gating map icons (bead
+    /// kuluu-o9qt7.45; vault main_menu.md §59 addendum 37). `None` until that record arrives.
+    /// Trailing on purpose.
+    #[serde(default)]
+    pub homepoints: Option<HomepointMasks>,
+}
+
+/// One merit s2c 0x08C stored: the cost of its next upgrade and its current upgrade count
+/// (vendor/server/src/map/packets/s2c/0x08c_merit.h `merit_t`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeritEntry {
+    pub next: u8,
+    pub count: u8,
+}
+
+/// One job point type's level and next cost from s2c 0x08D
+/// (vendor/server/src/map/packets/s2c/0x08d_job_points.h `jobpoint_t`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobPointType {
+    pub level: u8,
+    pub next: u16,
+}
+
+/// [`SceneSnapshot::myroom_mode`] in normal play and in layout mode (`/layout`).
+pub const MYROOM_MODE_NORMAL: u8 = 0;
+pub const MYROOM_MODE_LAYOUT: u8 = 1;
+
+/// Jobs one s2c 0x063 JobPoints record reports, indexed by job
+/// (vendor/server/src/map/packets/s2c/0x063_miscdata_job_points.h `jobs[24]`).
+pub const JOB_POINT_JOBS: usize = 24;
+
+/// One job's capacity points, unspent and spent job points.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobPointsJob {
+    pub capacity_points: u16,
+    pub current_jp: u16,
+    pub total_jp_spent: u16,
+}
+
+/// One s2c 0x063 JobPoints record: the access byte and every job's totals
+/// (vendor/server/src/map/packets/s2c/0x063_miscdata_job_points.h).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobPointsRecord {
+    pub access: u8,
+    pub jobs: [JobPointsJob; JOB_POINT_JOBS],
+}
+
+/// Mask words per array of [`HomepointMasks`] — LSB sizes each at 4
+/// (vendor/server/src/map/packets/s2c/0x063_miscdata_homepoints.h).
+pub const HOMEPOINT_MASK_WORDS: usize = 4;
+
+/// One s2c 0x063 Homepoints record: the fast-travel access masks, bit `i & 31` of word `i >> 5`
+/// per group (vendor/server/src/map/packets/s2c/0x063_miscdata_homepoints.h; retail's wrapper law
+/// `.text FFXiMain.dll retail-2026-09 0x1CBC70`..`0x1CBDB0`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HomepointMasks {
+    pub home_point: [u32; HOMEPOINT_MASK_WORDS],
+    pub survival_guide: [u32; HOMEPOINT_MASK_WORDS],
+    pub waypoint: [u32; HOMEPOINT_MASK_WORDS],
+    pub telepoint: u32,
+    pub atmos: u32,
+    pub eschan_portal: u32,
+}
+
+/// Upgrade slots of an alter ego points block, indexed by upgrade id
+/// (vendor/server/src/map/packets/s2c/0x08e_alter_ego_points.h `Upgrades[32]` / `Costs[32]`).
+pub const ALTER_EGO_UPGRADE_SLOTS: usize = 32;
+
+/// One s2c 0x08E alter ego points block: the balance and, by upgrade id, each upgrade's current
+/// level and next cost (vendor/server/src/map/packets/s2c/0x08e_alter_ego_points.h).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AlterEgoPoints {
+    pub points: u16,
+    pub upgrades: [u8; ALTER_EGO_UPGRADE_SLOTS],
+    pub costs: [u16; ALTER_EGO_UPGRADE_SLOTS],
+}
+
+/// The Unity Concords one ranking result set reports
+/// (vendor/server/src/map/packets/s2c/0x063_miscdata_unity.h `members[11]` / `points[11]`).
+pub const UNITY_CONCORDS: usize = 11;
+
+/// The two ranking result sets, LSB `UNITY_RESULTSET` 0 and 1.
+pub const UNITY_RESULT_SETS: usize = 2;
+
+/// One Unity ranking result set as LSB lays it out: Concord u (1..=11) at index u - 1.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnityRankingSet {
+    /// Chunk 1, LSB `members[11]`.
+    pub members: [u32; UNITY_CONCORDS],
+    /// Chunk 2, LSB `points[11]`.
+    pub points: [u32; UNITY_CONCORDS],
+    /// The set's last chunk arrived since the last c2s 0x116 for it.
+    pub complete: bool,
+}
+
+/// Unity ranking data plus the c2s 0x117 request mark
+/// (.agents/skills/retail-observe/references/2026-10-15-unity-and-fp-windows.md).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnityState {
+    pub rankings: [UnityRankingSet; UNITY_RESULT_SETS],
+    /// An s2c 0x110 arrived since the last c2s 0x117.
+    pub quest_armed: bool,
+}
+
+/// The raw 0x062 block: `CommandRecast[31]` then `skill_base[64]`
+/// (vendor/server/src/map/packets/s2c/0x062_clistatus2.h). Retail keeps exactly these
+/// words in its character blob and reads them per window
+/// (FFXiMain.dll retail-2026-09 skill table RVA 0x4856A4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CharSkills {
+    pub command_recast: [u32; CharSkills::COMMAND_RECAST_COUNT],
+    /// Indexed by skill id: combat 1..=31, magic 32..=47, craft 48..=62. Serde only
+    /// codes arrays up to 32 long, so the 64 words travel through [`skill_words`]
+    /// as a fixed-length sequence.
+    #[serde(with = "skill_words")]
+    pub skills: [u16; CharSkills::SKILL_COUNT],
+}
+
+/// One s2c 0x063 MISCDATA **Merits** record (bead kuluu-o9qt7.43). LSB defines it as
+/// `GP_SERV_COMMAND_MISCDATA::MERITS` (vendor/server/src/map/packets/s2c/0x063_miscdata_merits.h):
+/// limitPoints u16, then a bit-word {merit points 7 bits, BLU bonus 6 bits,
+/// can-use-merit-mode, xp-capped-or-merit-mode, merit-mode-enabled}, then maxMeritPoints u8.
+/// Retail's client copies the two dwords to .data FFXiMain.dll retail-2026-09
+/// **0x485826**/**0x48582A** (dispatcher `.text 0x99270`, case subtype 0x02 at `.text 0x99290`)
+/// and flags receipt by OR-ing bit 1 into **0x485824**; the Status Merit Points gate
+/// (.text `.text 0x148E88`) then tests that flag plus `can_use_merit_mode`
+/// (bit 13 of the word = mask 0x20 of byte 0x485829 — vault main_menu.md §59 addendum 36).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MisdataMerits {
+    /// Merit (limit) points available to spend.
+    pub limit_points: u16,
+    /// Unspent merit points, 0..=127 per the 7-bit field.
+    pub merit_points: u8,
+    /// BLU spell-point bonus, 0..=63 per the 6-bit field.
+    pub blu_bonus: u8,
+    /// Level >= 75 and holds the Limit Breaker key item — retail's gate for row id 7.
+    pub can_use_merit_mode: bool,
+    /// XP is capped or merit mode is on.
+    pub xp_capped_or_merit_mode: bool,
+    /// Merit mode enabled and current job eligible.
+    pub merit_mode_enabled: bool,
+    /// Maximum merit points for the character.
+    pub max_merit_points: u8,
+}
+
+/// Fixed-length (de)serialisation for the 64-word `skill_base`: serde's built-in
+/// array impls stop at 32, and postcard encodes a fixed tuple with no length byte,
+/// so this costs nothing on the wire.
+mod skill_words {
+    use serde::de::{SeqAccess, Visitor};
+    use serde::{Deserializer, Serializer};
+
+    const LEN: usize = crate::CharSkills::SKILL_COUNT;
+
+    pub fn serialize<S: Serializer>(words: &[u16; LEN], s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeTuple;
+        let mut tup = s.serialize_tuple(LEN)?;
+        for w in words {
+            tup.serialize_element(w)?;
+        }
+        tup.end()
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u16; LEN], D::Error> {
+        struct SkillWordsVisitor;
+
+        impl<'de> Visitor<'de> for SkillWordsVisitor {
+            type Value = [u16; LEN];
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "{LEN} skill words")
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                let mut out = [0u16; LEN];
+                for (i, slot) in out.iter_mut().enumerate() {
+                    *slot = seq
+                        .next_element::<u16>()?
+                        .ok_or_else(|| serde::de::Error::invalid_length(i, &"64 skill words"))?;
+                }
+                Ok(out)
+            }
+        }
+
+        d.deserialize_tuple(LEN, SkillWordsVisitor)
+    }
+}
+
+impl CharSkills {
+    pub const COMMAND_RECAST_COUNT: usize = 31;
+    pub const SKILL_COUNT: usize = 64;
+
+    /// An all-zero block, i.e. every combat/magic skill at level 0 and no craft
+    /// row hidden — only used as a default before a real packet arrives.
+    pub fn zeroed() -> Self {
+        Self {
+            command_recast: [0; Self::COMMAND_RECAST_COUNT],
+            skills: [0; Self::SKILL_COUNT],
+        }
+    }
+}
+
+/// The automaton record folded from one s2c 0x044 EXTENDED_JOB PUP frame
+/// (vendor/server/src/map/packets/s2c/0x044_extended_job_pup.h; vault
+/// main_menu.md §39). `head` is the LSB `AutomatonHead` enum value (0 = none;
+/// 1..6 per vendor/server/src/map/enums/automaton.h), `frame` the
+/// `AutomatonFrame` value (0x20..0x23), and each `attachments` byte carries one
+/// slot's low-byte item id in DAT row order (`AutomatonSlot`: Head=0, Frame=1,
+/// Attachment1..12 = 2..13 per vendor/server/src/map/packets/c2s/
+/// 0x102_extended_job.h). Unlocked masks follow the packet's uint32 fields.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutomatonInfo {
+    pub is_sub_job: bool,
+    pub head: u8,
+    pub frame: u8,
+    pub attachments: [u8; 12],
+    pub unlocked_heads: u32,
+    pub unlocked_frames: u32,
+}
+
+/// The monstrosity record folded from one s2c 0x044 EXTENDED_JOB MON frame
+/// (vendor/server/src/map/packets/s2c/0x044_extended_job_mon.h; vault
+/// main_menu.md §39): current species id plus the 12 equipped-instinct words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MonstrosityInfo {
+    pub species: u16,
+    pub equipped_instincts: [u16; 12],
+}
+
+/// One filled macro slot of the client-local store (vault main_menu.md §41):
+/// `block` 0..=1 picks `mcr1pall`/`mcr2pall`, `index` 0..=19 the keytop column
+/// in that window's grid, and `text` the stored chat line — a macro is sent as
+/// if typed when used (the pager/candidate law of handler FFXiMain.dll
+/// retail-2026-09 RVA 0x1A6EB0 pages result candidates through the same bodies).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MacroSlot {
+    pub block: u8,
+    pub index: u8,
+    pub text: String,
+}
+
+/// The job roster record folded from one s2c 0x01B JOB_INFO frame (vendor/
+/// server/src/map/packets/s2c/0x01b_job_info.h): `unlocked` is the LSB
+/// `jobs.unlocked` bitmask (bit position = JOBTYPE id, bit 0 unused), and
+/// `job_levels` is indexed the same way. LSB's MYROOM_JOB validator tests each
+/// non-zero index against this mask before changing jobs (vendor/server/src/
+/// map/packets/c2s/0x100_myroom_job.cpp — vault main_menu.md §53).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobList {
+    pub unlocked: u32,
+    pub sub_job_unlocked: bool,
+    /// Indexed by JOBTYPE id; entries past the packet's job count stay 0.
+    pub job_levels: Vec<u8>,
+}
+
+/// One synthesis answer (subset of the s2c 0x06F GP_SERV_COMMAND_COMBINE_ANS
+/// body). `result` is a SynthesisResult code
+/// (vendor/server/src/map/enums/synthesis_result.h); LSB never fills the
+/// packet's `grade`, so kuluu carries it through untouched. `broken_items`
+/// lists each ingredient id that broke, at its recipe position (the BreakNo
+/// law in vendor/server/src/map/packets/s2c/0x06f_combine_ans.cpp).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SynthOutcome {
+    pub result: u8,
+    pub grade: i8,
+    /// `Count` — quantity gained (0 unless the synthesis produced an item).
+    pub count: u8,
+    /// `ItemNo` — the item produced; 0 while nothing came of the ask.
+    pub item_no: u16,
+    pub broken_items: Vec<u16>,
+}
+
+/// One OTHER-port frame of the s2c 0x056 battery: `uint32 Data[8]` verbatim under
+/// its Port (port enums in vendor/server/src/map/enums/mission_log.h +
+/// quest_log.h; vault main_menu.md §30).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionLogEntry {
+    pub port: u16,
+    pub data: [u32; 8],
+}
+
+/// The s2c 0x056 main-port (0xFFFF) fields verbatim — same law as
+/// `ffxi_proto::mission::MissionMain` (vendor/server/src/map/packets/s2c/
+/// 0x056_mission.{h,cpp}; vault main_menu.md §30).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionInfo {
+    pub nation: u32,
+    pub nation_mission: u32,
+    pub rotz: u32,
+    pub cop: u32,
+    /// `statusUpper << 16 | statusLower` as LSB builds it.
+    pub cop2: u32,
+    pub addon_acp: u8,
+    pub addon_amk: u8,
+    pub addon_asa: u8,
+    pub tales_beginning: u16,
+    pub soa: u32,
+    pub rov: u32,
+}
+
+/// The whole s2c 0x056 battery as folded from login + later updates (vault
+/// main_menu.md §30); logs carry every OTHER port last reported.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Missions {
+    pub info: Option<MissionInfo>,
+    /// Raw `Expansion_TVR` from the 0xFFFE-port frame; 0 while unreported.
+    pub tvr: u32,
+    pub logs: Vec<MissionLogEntry>,
+}
+
+/// One staged slot of a player-trade offer. A gil row keeps `item_no` at the
+/// 0xFFFF sentinel (`ffxi_proto::decode::TRADE_GIL_ITEM_NO`) with `qty` as the
+/// amount — LSB's own reading (player_trade.cpp canReceive sums sentinel slots
+/// as offered gil; an empty view carries the same sentinel with qty 0).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TradeOffer {
+    pub item_no: u16,
+    pub qty: u32,
+}
+
+/// The live player-to-player trade. One window per side in retail (`trade` +
+/// `gift`, vault main_menu.md §25); kuluu mirrors the pair as one state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TradeWindow {
+    /// The partner's char id (UniqueNo on the wire).
+    pub partner_id: u32,
+    /// True while we are the invited side and have not answered s2c 0x021 yet;
+    /// the window then shows its answer rows instead of slots.
+    #[serde(default)]
+    pub incoming_pending: bool,
+    /// True once the server confirmed Start to both sides — slot staging is
+    /// legal only in this phase (retail gates its select rows on it likewise).
+    #[serde(default)]
+    pub active: bool,
+    /// Our offer slots, list position = TradeIndex (slot 0 is gil, per LSB's
+    /// `GilSlot = 0`); at most ffxi_proto::decode::TRADE_SLOT_COUNT entries.
+    #[serde(default)]
+    pub my_slots: Vec<Option<TradeOffer>>,
+    /// Partner's offer slots as pushed by s2c 0x023, same index law.
+    #[serde(default)]
+    pub partner_slots: Vec<Option<TradeOffer>>,
+    /// Our Make is sent-and-waiting (retail sets its state to confirmed at send
+    /// time, select id 9 → state 4; vault main_menu.md §25).
+    #[serde(default)]
+    pub my_confirmed: bool,
+    /// Partner pressed confirm (s2c RES Make addressed to us names it; any slot
+    /// change from either side un-confirms both per player_trade.cpp setSlot).
+    #[serde(default)]
+    pub partner_confirmed: bool,
+}
+
+/// One player row from a `CSearchListPacket` (vendor/server/src/search/packets/
+/// search_list.cpp AddPlayer; vault main_menu.md §26). The optionality follows
+/// the wire law: fields vanish while flags1 & 0x4000 hides a player's shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchPlayer {
+    pub name: String,
+    /// Zone id where the server last saw them (`Area` entry).
+    pub zone: u16,
+    #[serde(default)]
+    pub nation: Option<u8>,
+    #[serde(default)]
+    pub main_job: Option<u8>,
+    #[serde(default)]
+    pub sub_job: Option<u8>,
+    #[serde(default)]
+    pub main_level: Option<u8>,
+    #[serde(default)]
+    pub sub_level: Option<u8>,
+    #[serde(default)]
+    pub race: Option<u8>,
+    #[serde(default)]
+    pub rank: Option<u8>,
+    pub flags1: u16,
+    /// 20-bit `Id` entry (the chars.id on the server side).
+    pub id: u32,
+    /// seacom comment type, present only when non-zero.
+    #[serde(default)]
+    pub comment_type: Option<u32>,
+    pub flags2: u32,
+    /// Language bits (`Language` entry).
+    pub languages: u16,
+}
+
+/// One link-shell slot's equipped pearl (the s2c 0x0E0 model in vault main_menu.md §27).
+/// `category`/`item_index` stay 0 while nothing is equipped: LSB leaves both zeroed when
+/// `equipLocation(SLOT_LINK1/SLOT_LINK2)` has no entry, and reads them back the same way.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LinkShellSlot {
+    /// Container holding the pearl (`Category`).
+    pub category: u8,
+    /// Slot inside that container (`ItemIndex`); 0 means the shell slot is empty.
+    pub item_index: u8,
+}
+
+impl LinkShellSlot {
+    pub const EMPTY: Self = Self {
+        category: 0,
+        item_index: 0,
+    };
+
+    /// A pearl sits in this slot (the s2c 0x0E0 law above).
+    pub fn is_occupied(&self) -> bool {
+        self.item_index != 0
+    }
+}
+
+/// Both link-shell slots — `LinkshellNum` 1 and 2, the only two the server tracks.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LinkShells {
+    pub one: LinkShellSlot,
+    pub two: LinkShellSlot,
+}
+
+impl LinkShells {
+    /// Slot by `LinkshellId` (1/2); anything else is out of range and ignored.
+    pub fn slot_mut(&mut self, linkshell_id: u8) -> Option<&mut LinkShellSlot> {
+        match linkshell_id {
+            1 => Some(&mut self.one),
+            2 => Some(&mut self.two),
+            _ => None,
+        }
+    }
+
+    pub fn slot(&self, linkshell_id: u8) -> Option<&LinkShellSlot> {
+        match linkshell_id {
+            1 => Some(&self.one),
+            2 => Some(&self.two),
+            _ => None,
+        }
+    }
+}
+
+/// Everything one player search returned across its result frames, plus the
+/// server-declared total (which may exceed what was sent).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchResults {
+    pub total: u16,
+    /// Concatenation of every non-final frame in arrival order, then the final.
+    pub players: Vec<SearchPlayer>,
+}
+
+impl TradeWindow {
+    /// Fresh outgoing window after our TRADE_REQ went out — retail opens its
+    /// windows on send (helper 0x13FE70's success path, vault main_menu.md §25).
+    pub fn outgoing(partner_id: u32) -> Self {
+        Self {
+            partner_id,
+            incoming_pending: false,
+            active: false,
+            my_slots: Vec::new(),
+            partner_slots: Vec::new(),
+            my_confirmed: false,
+            partner_confirmed: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1156,6 +1777,14 @@ impl SceneSnapshot {
 pub struct MyRoom {
     pub model: u16,
     pub sub_map: u8,
+    /// Whether the Mog House door is currently open to visitors. Retail keeps it as one client
+    /// byte (game-state `+0x40C40`, getter FFXiMain.dll retail-2026-09 `.text 0xF96E0`) whose only
+    /// writer is the s2c 0x067 entity update (`.text 0xF9740`, called at `.text 0x9D075`) — and LSB
+    /// ships no such packet, so kuluu owns the byte and flips it optimistically together with the
+    /// MYROOM_IS Open/Close it sends. Reset law is LSB's note: zoning or moving floors clears the
+    /// open flag (vendor/server/src/map/packets/c2s/0x0cb_myroom_is.cpp).
+    #[serde(default)]
+    pub door_open: bool,
 }
 
 /// On-screen fishing arrow during the active mini-game state.
@@ -1227,6 +1856,13 @@ pub struct CharStats {
     // Self-stat block from s2c 0x061 (CLISTATUS). `bonus` is the signed gear/buff
     // delta retail renders as "+N"; `resist` is the 8 elemental defenses. New fields
     // default so older postcard frames still deserialize.
+    /// EXP between the current and next level, straight from s2c 0x061's
+    /// exp_now/exp_next pair (vendor/server/src/map/packets/s2c/0x061_clistatus.h
+    /// CLISTATUS); retail draws both in the `level` box under the persona panel.
+    #[serde(default)]
+    pub exp_now: i16,
+    #[serde(default)]
+    pub exp_next: i16,
     #[serde(default)]
     pub hp_max: u32,
     #[serde(default)]
@@ -1239,6 +1875,39 @@ pub struct CharStats {
     pub bonus: [i16; 7],
     #[serde(default)]
     pub resist: [i16; 8],
+    /// `su_lv` from s2c 0x061 — the superior level, shown as `Su` on the persona
+    /// panel (FFXiMain.dll retail-2026-09 RVA 0x147287) and used to refuse gear whose
+    /// `su` exceeds it.
+    #[serde(default)]
+    pub su_lv: u8,
+    /// bit 0 of s2c 0x061 `mastery_info.flags`: master-level play unlocked. Retail
+    /// greys the Status window's Master Levels row without it (and without a level-99
+    /// main job) — FFXiMain.dll retail-2026-09 `.text 0x148B20`.
+    #[serde(default)]
+    pub master_level_unlocked: bool,
+    /// s2c 0x061 packet +0x60 — per-slot equip-block mask. The client's equip legality check
+    /// refuses when an item's record slot mask intersects it (FFXiMain.dll retail-2026-09
+    /// `.text 0xFD350` reads the stored dword; intersection test at `.text 0x132111`).
+    #[serde(default)]
+    pub equip_slot_block: u32,
+    /// `mjob_no` from s2c 0x061 — main job 23 (MON) refuses the alter ego point upgrades
+    /// (.agents/skills/retail-observe/references/2026-10-15-unity-and-fp-windows.md).
+    #[serde(default)]
+    pub mjob_no: u8,
+    /// `unity_info.Faction` / `unity_info.Points` and `unity_points1` / `unity_points2` from
+    /// s2c 0x061 (vendor/server/src/map/packets/s2c/0x061_clistatus.h CLISTATUS).
+    #[serde(default)]
+    pub unity_faction: u8,
+    #[serde(default)]
+    pub unity_points: u32,
+    #[serde(default)]
+    pub unity_points1: u16,
+    #[serde(default)]
+    pub unity_points2: u16,
+    /// `mjob_lv` from s2c 0x061, the main job level the merit and job point windows gate on
+    /// (.agents/skills/retail-observe/references/2026-10-15-merit-and-job-point-windows.md).
+    #[serde(default)]
+    pub mjob_lv: u8,
 }
 
 /// Mirror of `kuluu`'s browsed-bazaar model (s2c 0x105 rows keyed by the
@@ -1394,6 +2063,15 @@ pub struct InventoryItem {
     /// `GP_SERV_COMMAND_ITEM_ATTR` ready flag; `None` for non-charged items.
     #[serde(default)]
     pub ready: Option<bool>,
+
+    /// The record's whole 24-byte Attr, verbatim as s2c 0x020 carried it, or `None` when no Attr
+    /// record has been seen for the slot. Kept raw rather than pre-chewed because the bytes answer
+    /// several unrelated questions and only the consumer knows which one it is asking: charge/recast
+    /// fields above, and the Mog House furniture layer/pose that the two Mog House shelves use
+    /// (vendor/server/src/map/items/exdata/furniture.h; FFXiMain.dll retail-2026-09 keeps them on the
+    /// record at `.text 0xEC630` and reads pose straight out of them at `.text 0x1CCFD1`).
+    #[serde(default)]
+    pub extdata: Option<[u8; 24]>,
 }
 
 #[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -1590,6 +2268,19 @@ pub struct ShopState {
     pub pending_sale: Option<ShopSale>,
 }
 
+/// A pending party/alliance invite, from GroupSolicitReq (s2c 0x0DC,
+/// vendor/server/src/map/packets/s2c/0x0dc_group_solicit_req.h).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartyInvite {
+    /// Inviter's char id (`UniqueNo`).
+    pub char_id: u32,
+    /// Inviter's display name (`sName`).
+    pub name: String,
+    /// True when Kind is PartyKind::Alliance (5); party invites are false.
+    #[serde(default)]
+    pub alliance: bool,
+}
+
 /// A sale appraised by s2c 0x03D and not yet confirmed with c2s 0x085.
 /// vendor/server/src/map/packets/s2c/0x03d_shop_sell.cpp, c2s/0x085_shop_sell_set.cpp
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -1626,6 +2317,19 @@ pub struct SceneDelta {
     pub entities_upserted: Vec<Entity>,
     pub entities_removed: Vec<u32>,
     pub party_upserted: Vec<PartyMember>,
+    /// `Some(Some(_))` installs a pending invite (s2c 0x0DC); `Some(None)`
+    /// clears it (answered, withdrawn via 0x0DE, or resolved locally).
+    /// Boxed like `TranslatedFrame::Snapshot` already boxes its payload: the
+    /// nested Option would otherwise push this delta past clippy's
+    /// large_enum_variant budget on every consumer frame.
+    #[serde(default)]
+    pub set_party_invite: Option<Option<Box<PartyInvite>>>,
+
+    /// Replace-or-clear the whole trade window state (last-writer-wins like
+    /// `set_party_invite`): every s2c trade event lands as a rebuilt snapshot of
+    /// it, mirroring how LSB's own views re-push each changed slot.
+    #[serde(default)]
+    pub set_trade: Option<Option<Box<TradeWindow>>>,
     pub chat_appended: Vec<ChatLine>,
     pub diagnostics: Option<Diagnostics>,
 
@@ -1634,6 +2338,34 @@ pub struct SceneDelta {
     /// arrive as a full snapshot, which every producer today sends anyway).
     #[serde(default)]
     pub myroom: Option<MyRoom>,
+
+    /// Replace-or-clear the whole search result set (`set_trade` law): one
+    /// completed query lands as one rebuilt frame (vault main_menu.md §26).
+    #[serde(default)]
+    pub set_search: Option<Option<Box<SearchResults>>>,
+
+    /// Replace both link-shell slots (`set_search` law): each s2c 0x0E0 describes one slot, and the
+    /// merge rebuilds the pair (vault main_menu.md §27).
+    #[serde(default)]
+    pub set_linkshells: Option<LinkShells>,
+
+    /// One synthesis answer replaces the previous one whole (s2c 0x06F; vault
+    /// main_menu.md §28).
+    #[serde(default)]
+    pub set_synth_result: Option<SynthOutcome>,
+    /// Last-writer-wins the whole battery fold (vault main_menu.md §30).
+    #[serde(default)]
+    pub set_missions: Option<Missions>,
+
+    /// One s2c 0x044 PUP frame replaces the automaton record whole (vault
+    /// main_menu.md §39).
+    #[serde(default)]
+    pub set_automaton: Option<Option<Box<AutomatonInfo>>>,
+
+    /// One s2c 0x044 MON frame replaces the monstrosity record whole (vault
+    /// main_menu.md §39).
+    #[serde(default)]
+    pub set_monstrosity: Option<Option<MonstrosityInfo>>,
 }
 
 /// [`ViewerEvent::ZoneChanged::to`] for the half of a zone change that only
@@ -2184,6 +2916,35 @@ mod tests {
 
     fn sample_snapshot() -> SceneSnapshot {
         SceneSnapshot {
+            // Never arranged: the sample keeps the emote display order (bead
+            // kuluu-o9qt7.34) in its untouched, default-list state.
+            emote_order: Vec::new(),
+            currencies_1: None,
+            currencies_2: None,
+            // No 0x062 block in the sample: the Status skill rows read as
+            // "nothing received yet", exactly like a fresh zone-in.
+            char_skills: None,
+            merits: None,
+            unity: UnityState::default(),
+            alter_ego_points: None,
+            status_data_ready: false,
+            login_state: 0,
+            login_is_monstrosity: false,
+            merit_entries: Default::default(),
+            job_point_types: Default::default(),
+            job_points_received: false,
+            job_points: None,
+            // A received Homepoints record, so the sample exercises the mask words in serde and
+            // postcard alike (bead kuluu-o9qt7.45).
+            homepoints: Some(HomepointMasks {
+                home_point: [0x1, 0x2, 0x3, 0x4],
+                survival_guide: [0x10, 0x20, 0x40, 0x80],
+                waypoint: [0xFFFF_FFFF, 0, 0, 0],
+                telepoint: 0xDEAD_BEEF,
+                atmos: 0xCAFE_BABE,
+                eschan_portal: 0xF00D_D00D,
+            }),
+            party_invite: None,
             stage: Stage::InZone,
             char_name: Some("Sylvie".into()),
             zone_id: Some(230),
@@ -2288,7 +3049,10 @@ mod tests {
             myroom: Some(MyRoom {
                 model: 257,
                 sub_map: 0,
+                door_open: false,
             }),
+            // Nothing being arranged in the sample (bead kuluu-o9qt7.39).
+            myroom_mode: 0,
             mh_2f_unlocked: None,
             sub_area: None,
             voyage: None,
@@ -2298,6 +3062,16 @@ mod tests {
             check_message: None,
             widescan: WidescanList::default(),
             death_menu_offer: None,
+            trade: None,
+            search: None,
+            linkshells: LinkShells::default(),
+            synth_result: None,
+            missions: Missions::default(),
+            automaton: None,
+            monstrosity: None,
+            macros: Vec::new(),
+            config_confdata: None,
+            jobs: None,
         }
     }
 
@@ -2573,7 +3347,8 @@ mod tests {
                     s.myroom,
                     Some(MyRoom {
                         model: 257,
-                        sub_map: 0
+                        sub_map: 0,
+                        door_open: false
                     })
                 );
                 assert_eq!(s.auction, sample_auction());
@@ -2856,12 +3631,48 @@ mod tests {
             "check_message",
             "widescan",
             "death_menu_offer",
+            "party_invite",
+            "trade",
+            "search",
+            "linkshells",
+            "synth_result",
+            "missions",
+            "automaton",
+            "monstrosity",
+            "macros",
+            "config_confdata",
+            "jobs",
+            "char_skills",
+            "merits",
+            "emote_order",
+            "currencies_1",
+            "currencies_2",
+            "myroom_mode",
+            "unity",
+            "alter_ego_points",
+            "status_data_ready",
+            "login_state",
+            "login_is_monstrosity",
+            "merit_entries",
+            "job_point_types",
+            "job_points_received",
+            "job_points",
+            "homepoints",
         ];
         want.sort();
         assert_eq!(got, want, "SceneSnapshot fields changed: additive-only, update this pin deliberately and rebuild relay consumers together");
     }
 
-    const SNAPSHOT_DEFAULT_POSTCARD_HEX: &str = "0000000000000000000000000000000019190000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
+    // Re-pinned for each trailing additive field since §25-era party_invite/trade
+    // (then search, then linkshells, then missions (Option tag + u32 + Vec length)): every append is exactly
+    // the bytes its default encodes to; no earlier field moved. §59 addendum 31 appends
+    // myroom_mode (u8) as exactly one more zero byte at the tail. §59 addendum 36 appends
+    // merits (`Option<MisdataMerits>`) as exactly one more `None` tag byte. The Unity / alter ego
+    // point fields append 51 zero bytes: `unity` (two sets of 11 + 11 varint zeros and a flag, then
+    // the quest flag), the `alter_ego_points` `None` tag, and three scalar zeros. The merit and job
+    // point fields append four zero bytes: two empty map lengths, a flag and a `None` tag. §59
+    // addendum 37 appends homepoints (`Option<HomepointMasks>`) as exactly one more `None` tag byte.
+    const SNAPSHOT_DEFAULT_POSTCARD_HEX: &str = "0000000000000000000000000000000019190000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
 
     /// Postcard is positional, not self-describing: field ORDER and TYPES are
     /// the wire format. Any reorder/retype (and any append) changes these

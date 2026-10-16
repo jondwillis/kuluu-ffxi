@@ -15,15 +15,20 @@ pub fn event_map_sync_system(
     mut mode: ResMut<InputMode>,
     mut map_state: ResMut<kuluu_render::hud::map_screen::MapScreenState>,
     mut markers: ResMut<kuluu_render::hud::map_screen::MapMarkers>,
+    dynamic_menu: Res<kuluu_render::hud::menu::DynamicMenu>,
 ) {
     let total = events.pushed_total;
     let len = events.recent.len() as u64;
     let first_global = total - len;
     for i in (*cursor).max(first_global)..total {
         match &events.recent[(i - first_global) as usize] {
-            kuluu_snapshot::ViewerEvent::MapOpen { map_id, .. } => {
-                open_event_map(*map_id, state.snapshot.zone_id, &mut mode, &mut map_state)
-            }
+            kuluu_snapshot::ViewerEvent::MapOpen { map_id, .. } => open_event_map(
+                *map_id,
+                state.snapshot.zone_id,
+                &mut mode,
+                &mut map_state,
+                &dynamic_menu.window_cursors,
+            ),
             kuluu_snapshot::ViewerEvent::MapMarkerPlaced {
                 map_id,
                 x_milli,
@@ -45,13 +50,14 @@ fn open_event_map(
     live_zone: Option<u16>,
     mode: &mut InputMode,
     map_state: &mut kuluu_render::hud::map_screen::MapScreenState,
+    window_cursors: &CursorMemory,
 ) {
     let already_open = matches!(
         mode,
         InputMode::Menu(stack) if stack.current().is_some_and(|l| l.kind == MenuKind::Map)
     );
     if !already_open {
-        let mut stack = MenuStack::root();
+        let mut stack = MenuStack::open_main_menu(window_cursors);
         stack.push(MenuKind::Map);
         *mode = InputMode::Menu(stack);
     }
@@ -113,6 +119,7 @@ mod tests {
         world.insert_resource(InputMode::World);
         world.insert_resource(MapScreenState::default());
         world.insert_resource(MapMarkers::default());
+        world.insert_resource(kuluu_render::hud::menu::DynamicMenu::default());
         world.clear_trackers();
         world
     }
@@ -125,10 +132,19 @@ mod tests {
             ResMut<InputMode>,
             ResMut<MapScreenState>,
             ResMut<MapMarkers>,
+            Res<kuluu_render::hud::menu::DynamicMenu>,
         )>::new(world);
-        let (scene, events, cursor, mode, map_state, markers) =
+        let (scene, events, cursor, mode, map_state, markers, dynamic_menu) =
             state.get_mut(world).expect("event-map params");
-        event_map_sync_system(scene, events, cursor, mode, map_state, markers);
+        event_map_sync_system(
+            scene,
+            events,
+            cursor,
+            mode,
+            map_state,
+            markers,
+            dynamic_menu,
+        );
     }
 
     fn mode_is_map_open(world: &World) -> bool {

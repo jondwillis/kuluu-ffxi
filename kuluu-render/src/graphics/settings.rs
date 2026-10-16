@@ -683,6 +683,44 @@ pub struct GraphicsSettings {
     #[serde(default)]
     pub mob_hp_under: bool,
 
+    /// Rows in the Status panel answer (FFXiMain.dll retail-2026-09: the live
+    /// Status selector is `statcom2`, whose select handler RVA 0x148D00 drives
+    /// the detail table RVA 0x3716B8 — profile/joblevel/btlskill/mgcskill/
+    /// trdskill/masterle/merit pages; the persona WINDOW itself is the
+    /// display-only piece, answers none at RVA 0x12AC60). Interactive is the
+    /// retail default (owner ruling 2026-10-14 after an earlier reading had
+    /// shipped the panel dead); OFF opts into the old persona-passive kuluu
+    /// behavior. Persisted here so the choice sticks.
+    #[serde(default = "default_interactive_status_rows")]
+    pub interactive_status_rows: bool,
+
+    /// Retail+ gate for re-selecting the item already in an equip slot to unequip it. The retail
+    /// equipment window's command-event handler has no toggle-off branch - every select case equips
+    /// (FFXiMain.dll retail-2026-09 RVA 0x1322B0, jump table 0x132608; vault main_menu.md
+    /// §20). The unequip-on-reselect behavior rides on LSB
+    /// leniency (vendor/server/src/map/utils/charutils.cpp EquipItem: slotID of zero = unequip) and
+    /// is OFF by default, i.e. retail's idempotent re-equip.
+    #[serde(default)]
+    pub reselect_unequip: bool,
+
+    /// Retail+ gate for opening kuluu's flat spell list instead of retail's two-window Magic flow.
+    /// The real Magic row opens `mgcmenu`, whose handler maps eight category rows (item ids {4..B})
+    /// to internal school ids via jump table 0x13F7CC before pushing the filter into the `magic`
+    /// spell-list window (FFXiMain.dll retail-2026-09 RVA 0x13F750; vault main_menu.md §21). Kuluu's
+    /// single flat list has no retail counterpart, so it survives as an OFF-by-default option: when
+    /// this is off the Magic row drills picker → school-filtered list.
+    #[serde(default)]
+    pub magic_flat_list: bool,
+
+    /// Retail+ gate for opening kuluu's flat ability list instead of retail's two-window
+    /// Abilities flow. The real Abilities row opens `abimenu`, whose six rows hand the pick
+    /// to a filtered ability-list window (job abilities / weapon skills / ranged /
+    /// mount → `menu    mount` / pet) before anything is used
+    /// (FFXiMain.dll retail-2026-09 RVA 0x13FA70; vault main_menu.md §23). Kuluu's single
+    /// flat list has no retail counterpart, so it survives as an OFF-by-default option.
+    #[serde(default)]
+    pub abilities_flat_list: bool,
+
     /// Retail+ gate: the player character ignores knockback displacement (the push and the
     /// flinch ride on, only the travel is dropped). OFF by default — retail knocks players back.
     /// The `enhanced-ignore-knockback-self` feature is its compile-time half: without it this
@@ -855,6 +893,9 @@ pub fn retail_default_fov_deg() -> f32 {
     (2.0 * (RETAIL_PROJECTION_HALF_HEIGHT / RETAIL_DEFAULT_FOCAL_LENGTH).atan()).to_degrees()
 }
 
+fn default_interactive_status_rows() -> bool {
+    true
+}
 fn default_shadowed_lights() -> u32 {
     DEFAULT_SHADOWED_LIGHTS
 }
@@ -1004,6 +1045,10 @@ impl GraphicsSettings {
                 dlss_menu_enabled: false,
                 job_display: false,
                 mob_hp_under: false,
+                interactive_status_rows: true,
+                reselect_unequip: false,
+                magic_flat_list: false,
+                abilities_flat_list: false,
                 ignore_knockback_self: false,
                 texture_filtering: TextureFiltering::Vanilla,
                 bloom_intensity: 0.0,
@@ -1052,6 +1097,10 @@ impl GraphicsSettings {
                 dlss_menu_enabled: false,
                 job_display: false,
                 mob_hp_under: false,
+                interactive_status_rows: true,
+                reselect_unequip: false,
+                magic_flat_list: false,
+                abilities_flat_list: false,
                 ignore_knockback_self: false,
                 texture_filtering: TextureFiltering::Vanilla,
                 bloom_intensity: 0.0,
@@ -1100,6 +1149,10 @@ impl GraphicsSettings {
                 dlss_menu_enabled: false,
                 job_display: false,
                 mob_hp_under: false,
+                interactive_status_rows: true,
+                reselect_unequip: false,
+                magic_flat_list: false,
+                abilities_flat_list: false,
                 ignore_knockback_self: false,
                 texture_filtering: TextureFiltering::Aniso2x,
                 bloom_intensity: 0.04,
@@ -1148,6 +1201,10 @@ impl GraphicsSettings {
                 dlss_menu_enabled: false,
                 job_display: false,
                 mob_hp_under: false,
+                interactive_status_rows: true,
+                reselect_unequip: false,
+                magic_flat_list: false,
+                abilities_flat_list: false,
                 ignore_knockback_self: false,
                 texture_filtering: TextureFiltering::Aniso4x,
                 bloom_intensity: 0.08,
@@ -1200,6 +1257,10 @@ impl GraphicsSettings {
                 dlss_menu_enabled: false,
                 job_display: false,
                 mob_hp_under: false,
+                interactive_status_rows: true,
+                reselect_unequip: false,
+                magic_flat_list: false,
+                abilities_flat_list: false,
                 ignore_knockback_self: false,
                 texture_filtering: TextureFiltering::Aniso8x,
                 bloom_intensity: 0.12,
@@ -1249,6 +1310,10 @@ impl GraphicsSettings {
                 dlss_menu_enabled: false,
                 job_display: false,
                 mob_hp_under: false,
+                interactive_status_rows: true,
+                reselect_unequip: false,
+                magic_flat_list: false,
+                abilities_flat_list: false,
                 ignore_knockback_self: false,
                 texture_filtering: TextureFiltering::Aniso16x,
                 bloom_intensity: 0.16,

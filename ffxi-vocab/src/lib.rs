@@ -6,6 +6,7 @@
 pub mod ability_names;
 pub mod action_anim;
 pub mod cast_time;
+pub mod craft;
 pub mod emote_anim;
 pub mod emote_names;
 pub mod equip_info;
@@ -21,6 +22,7 @@ pub mod msg_area;
 pub mod msg_basic;
 pub mod msg_channel;
 pub mod msg_system;
+pub mod quest_lattice;
 pub mod recast;
 pub mod skill_names;
 pub mod spell_names;

@@ -322,7 +322,7 @@ pub(crate) fn list_rows(
     sort: &SortOptions,
 ) -> Vec<DynamicMenuRow> {
     match mode {
-        ItemScreenMode::Inventory => menu::inventory_rows(snap, bag, sort.auto),
+        ItemScreenMode::Inventory => menu::inventory_rows(snap, bag, sort),
         ItemScreenMode::Usable => menu::usable_item_rows(snap),
     }
 }
@@ -1193,7 +1193,10 @@ mod tests {
         ]);
         let mut active = ItemScreenContainer(c::LOC_INVENTORY);
         let mut focus = ItemMenuFocus::default();
-        let sort = SortOptions { auto: true };
+        let sort = SortOptions {
+            auto: true,
+            ..SortOptions::default()
+        };
         assert_eq!(
             select_active_window(&snap, &mut active, &mut focus, &sort),
             Some(c::LOC_MOGCASE)
@@ -1223,7 +1226,10 @@ mod tests {
         let snap = snapshot_with_bags(&[(c::LOC_INVENTORY, 30)]);
         let mut active = ItemScreenContainer(c::LOC_INVENTORY);
         let mut focus = ItemMenuFocus::default();
-        let sort = SortOptions { auto: false };
+        let sort = SortOptions {
+            auto: false,
+            ..SortOptions::default()
+        };
         assert_eq!(
             select_active_window(&snap, &mut active, &mut focus, &sort),
             None

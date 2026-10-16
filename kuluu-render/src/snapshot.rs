@@ -45,6 +45,35 @@ pub struct SceneState {
     /// advance, and an auto-enter fire in that window would make the session
     /// dismiss the frame the manual advance just opened.
     pub last_manual_dialog_advance: Option<Instant>,
+
+    /// Steps of a macro started from the mcrmenu family (bead kuluu-o9qt7.19.4).
+    /// Retail feeds a used keytop's lines one at a time into the chat pipeline
+    /// (vault main_menu.md §41/§56); the text_input walker submits the next step
+    /// per frame through exactly the typed-line seam, so nothing here bypasses
+    /// what a player typing the same line would hit. Kept in order; pop from
+    /// the front (`pop_next_macro_step` is the consumer's door).
+    pub pending_macro_steps: Vec<String>,
+}
+
+impl SceneState {
+    /// Starts a macro run: the queued remainder is replaced wholesale (one run
+    /// at a time — like retail's single in-flight use path, not two half-runs).
+    pub fn queue_macro_steps(&mut self, steps: Vec<String>) {
+        self.pending_macro_steps = steps;
+    }
+
+    /// Pops the next queued step (`None` when idle). Public read is only via
+    /// this and `pending_macro_len`, keeping the drain site the sole consumer.
+    pub fn pop_next_macro_step(&mut self) -> Option<String> {
+        if self.pending_macro_steps.is_empty() {
+            return None;
+        }
+        Some(self.pending_macro_steps.remove(0))
+    }
+
+    pub fn pending_macro_len(&self) -> usize {
+        self.pending_macro_steps.len()
+    }
 }
 
 pub const LOCAL_TOAST_CAP: usize = 256;
@@ -230,6 +259,41 @@ pub fn apply_delta(snap: &mut SceneSnapshot, delta: &SceneDelta) {
     }
 
     upsert_party(&mut snap.party, &delta.party_upserted);
+    if let Some(invite) = &delta.set_party_invite {
+        snap.party_invite = invite.as_deref().cloned();
+    }
+    // The whole trade window is re-pushed on every slot view (the same law as
+    // set_party_invite, mirroring LSB's per-slot view refresh; vault
+    // main_menu.md §25), so replacement — not merge — is correct here.
+    if let Some(trade) = &delta.set_trade {
+        snap.trade = trade.clone();
+    }
+    // One finished query replaces the whole result set (scresult law, vault
+    // main_menu.md §26); a full snapshot carries it through directly.
+    if let Some(search) = &delta.set_search {
+        snap.search = search.clone();
+    }
+    // Both shell slots ride one field: each s2c 0x0E0 rebuilds the pair whole
+    // before it reaches the delta (vault main_menu.md §27).
+    if let Some(linkshells) = &delta.set_linkshells {
+        snap.linkshells = *linkshells;
+    }
+    // The last synthesis answer is replaced whole by the next one (s2c 0x06F;
+    // vault main_menu.md §28).
+    if let Some(synth_result) = &delta.set_synth_result {
+        snap.synth_result = Some(synth_result.clone());
+    }
+    if let Some(missions) = &delta.set_missions {
+        snap.missions = missions.clone();
+    }
+    // One s2c 0x044 frame replaces each extended-job record whole; the inner
+    // Option can clear it (vault main_menu.md §39).
+    if let Some(automaton) = &delta.set_automaton {
+        snap.automaton = automaton.clone();
+    }
+    if let Some(monstrosity) = &delta.set_monstrosity {
+        snap.monstrosity = *monstrosity;
+    }
 
     for line in &delta.chat_appended {
         snap.chat.push(line.clone());
@@ -461,6 +525,7 @@ mod tests {
                 myroom: Some(MyRoom {
                     model: 256,
                     sub_map: 0,
+                    door_open: false,
                 }),
                 ..Default::default()
             },
@@ -469,7 +534,8 @@ mod tests {
             snap.myroom,
             Some(MyRoom {
                 model: 256,
-                sub_map: 0
+                sub_map: 0,
+                door_open: false
             })
         );
 
@@ -478,7 +544,8 @@ mod tests {
             snap.myroom,
             Some(MyRoom {
                 model: 256,
-                sub_map: 0
+                sub_map: 0,
+                door_open: false
             }),
             "None delta must not clear myroom"
         );
@@ -496,6 +563,7 @@ mod tests {
         snap.myroom = Some(MyRoom {
             model: 257,
             sub_map: 0,
+            door_open: false,
         });
         assert_eq!(
             effective_zone_file_id(&snap),
@@ -830,5 +898,22 @@ mod tests {
     fn resolve_self_returns_none_for_empty_party() {
         let party: Vec<PartyMember> = vec![];
         assert!(resolve_self(&party, Some(42)).is_none());
+    }
+
+    /// One run at a time (bead kuluu-o9qt7.19.4): queueing replaces any
+    /// remainder, and pops come front-first so steps keep their order.
+    #[test]
+    fn macro_run_queue_replaces_and_pops_in_order() {
+        let mut state = SceneState::default();
+        assert_eq!(state.pop_next_macro_step(), None);
+
+        state.queue_macro_steps(vec!["a".into(), "b".into(), "c".into()]);
+        state.queue_macro_steps(vec!["x".into()]);
+        assert_eq!(state.pending_macro_len(), 1, "the new run replaces the old");
+
+        state.queue_macro_steps(vec!["a".into(), "b".into()]);
+        assert_eq!(state.pop_next_macro_step().as_deref(), Some("a"));
+        assert_eq!(state.pop_next_macro_step().as_deref(), Some("b"));
+        assert_eq!(state.pop_next_macro_step(), None);
     }
 }

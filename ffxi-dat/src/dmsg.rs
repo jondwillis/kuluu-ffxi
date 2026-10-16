@@ -698,6 +698,159 @@ fn push_param(out: &mut String, bytes: &[u8], i: &mut usize, name: &str) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// `d_msg` catalog container: the ROM/165 GetText tables behind every config-family
+// `windowpsNNN` caption (vault main_menu.md §43).
+// ---------------------------------------------------------------------------
+
+/// Catalog-format string DAT — the layout of the GetText catalogs (e.g. table 0x0E,
+/// file id [`crate::menu_windows::CAPTION_CATALOG_TABLE_14_FILE_ID`], n=1099 measured on
+/// retail-2026-09, vault main_menu.md §43). Not a DialogTable: the file opens with the
+/// plain ASCII banner `d_msg`, carries six header words at +0x14,
+/// and one XOR-0xFF-obscured region covering an offset table (optional) plus entry
+/// blocks. Law mirrors the vault tool semantic_resolver.py `parse_d_msg` (itself re-expressed
+/// from cexi's ROM_165_84 notes), verified against 75.DAT and its JP twins in §43.
+#[derive(Debug, Clone)]
+pub struct DmsgTable {
+    strings: Vec<String>,
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum DmsgError {
+    #[error("not a d_msg catalog: file too short ({0} bytes)")]
+    TooShort(usize),
+    #[error("not a d_msg catalog: banner {got:?}")]
+    BadBanner { got: [u8; 5] },
+    #[error("corrupt d_msg catalog: numStrings {num_strings} implausible")]
+    ImplausibleCount { num_strings: u32 },
+    #[error("corrupt d_msg catalog: truncated header")]
+    TruncatedHeader,
+}
+
+const DMSG_BANNER: &[u8] = b"d_msg";
+/// Six u32s — (fileSize, tableOffset, tableSize, blockSize, reserved, numStrings) —
+/// sit at +4 from this word offset (vault semantic_resolver.py law).
+const DMSG_HEADER_WORDS_AT: usize = 0x14;
+const DMSG_XOR_MASK: u8 = 0xFF;
+const DMSG_STRING_MARKER: u32 = 1;
+const DMSG_ENTRY_METADATA_BYTES: usize = 0x18;
+
+fn read_u32(buf: &[u8], at: usize) -> Option<u32> {
+    buf.get(at..at + 4)
+        .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+}
+
+impl DmsgTable {
+    pub fn parse(buf: &[u8]) -> Result<Self, DmsgError> {
+        if buf.len() < 0x40 {
+            return Err(DmsgError::TooShort(buf.len()));
+        }
+        let got: [u8; 5] = buf[..5].try_into().expect("length checked above");
+        if got != *DMSG_BANNER {
+            return Err(DmsgError::BadBanner { got });
+        }
+        let mut header = [0u32; 6];
+        for (i, w) in header.iter_mut().enumerate() {
+            *w = read_u32(buf, DMSG_HEADER_WORDS_AT + i * 4).ok_or(DmsgError::TruncatedHeader)?;
+        }
+        // File offsets are u32 words in the header; widen once so all later
+        // arithmetic is usize and every read stays bounds-checked.
+        let (file_size, table_offset, table_size, block_size, _reserved, num_strings) = {
+            let [a, b, c, d, e, f] = header;
+            (a, b as usize, c, d as usize, e, f)
+        };
+        if num_strings == 0 || num_strings > 1_000_000 {
+            return Err(DmsgError::ImplausibleCount { num_strings });
+        }
+        let mut b = buf.to_vec();
+        let xor_end = b.len().min(file_size as usize);
+        if table_offset < xor_end {
+            for byte in &mut b[table_offset..xor_end] {
+                *byte ^= DMSG_XOR_MASK;
+            }
+        }
+        let num_strings = num_strings as usize;
+        // Offset-table layout: {u32 off, u32 unk} pairs at table_offset, blocks
+        // placed after the whole pair table.
+        let pair_base = table_offset.checked_add(num_strings * 8);
+        let strings: Vec<String> = (0..num_strings)
+            .map(|i| {
+                let start = if table_size != 0 {
+                    match (pair_base, read_u32(&b, table_offset + i * 8)) {
+                        (Some(base), Some(off)) => base.checked_add(off as usize),
+                        _ => None,
+                    }
+                } else {
+                    block_size
+                        .checked_mul(i)
+                        .and_then(|d| table_offset.checked_add(d))
+                };
+                start.map_or_else(String::new, |s| first_string(&b, s))
+            })
+            .collect();
+        Ok(Self { strings })
+    }
+
+    /// Entry count (the catalog's `numStrings`).
+    pub fn len(&self) -> usize {
+        self.strings.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.strings.is_empty()
+    }
+
+    /// Caption for a GetText index, or `None` beyond the table. A present but
+    /// empty block reads as `Some("")`, matching the tool's blank entries.
+    pub fn text(&self, index: usize) -> Option<&str> {
+        self.strings.get(index).map(String::as_str)
+    }
+}
+
+/// In a catalog that pairs its strings by id, entry `2n` names id `n`.
+pub fn paired_name_entry(id: u16) -> usize {
+    2 * usize::from(id)
+}
+
+/// In a catalog that pairs its strings by id, entry `2n + 1` describes id `n`.
+pub fn paired_description_entry(id: u16) -> usize {
+    paired_name_entry(id) + 1
+}
+
+/// Entry block law (vault semantic_resolver.py): u32 count (0 = empty entry),
+/// u32 offset from block start to {u32 marker==1, 0x18 metadata bytes,
+/// NUL-terminated latin1 text}.
+fn first_string(b: &[u8], start: usize) -> String {
+    let Some(count) = read_u32(b, start) else {
+        return String::new();
+    };
+    if count == 0 {
+        return String::new();
+    }
+    let Some(off) = read_u32(b, start + 4) else {
+        return String::new();
+    };
+    let Some(p) = usize::try_from(off).ok().and_then(|o| start.checked_add(o)) else {
+        return String::new();
+    };
+    if read_u32(b, p) != Some(DMSG_STRING_MARKER) {
+        return String::new();
+    }
+    let q = match p.checked_add(4 + DMSG_ENTRY_METADATA_BYTES) {
+        Some(q) if q < b.len() => q,
+        _ => return String::new(),
+    };
+    let text_end = b[q..]
+        .iter()
+        .position(|&byte| byte == 0)
+        .unwrap_or(b.len() - q);
+    // The catalogs are latin1 (EN runs are ASCII; JP twins keep their bytes).
+    b[q..q + text_end]
+        .iter()
+        .map(|&byte| byte as char)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1295,5 +1448,115 @@ mod tests {
         assert!(!dat.is_empty());
         let any_text = (0..dat.len()).any(|i| dat.text(i).is_some_and(|t| !t.is_empty()));
         assert!(any_text, "expected at least one non-empty dialog string");
+    }
+
+    /// One entry block as the catalogs pack them: count, offset from block start,
+    /// marker word, 0x18 metadata bytes, latin1 text.
+    fn dmsg_block(text: &str) -> Vec<u8> {
+        if text.is_empty() {
+            return vec![0u8; 4 + 4];
+        }
+        let mut b = Vec::new();
+        b.extend_from_slice(&1u32.to_le_bytes()); // count
+        b.extend_from_slice(&8u32.to_le_bytes()); // off -> marker right after
+        b.extend_from_slice(&DMSG_STRING_MARKER.to_le_bytes());
+        b.extend_from_slice(&[0u8; DMSG_ENTRY_METADATA_BYTES]);
+        b.extend_from_slice(text.as_bytes());
+        b.push(0);
+        b
+    }
+
+    fn dmsg_header(
+        file_size: u32,
+        table_offset: u32,
+        table_size: u32,
+        block_size: u32,
+        num_strings: u32,
+    ) -> Vec<u8> {
+        let mut file = b"d_msg".to_vec();
+        file.resize(0x40, 0);
+        for (i, w) in [
+            file_size,
+            table_offset,
+            table_size,
+            block_size,
+            0,
+            num_strings,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            file[0x14 + i * 4..0x18 + i * 4].copy_from_slice(&w.to_le_bytes());
+        }
+        file
+    }
+
+    /// Write `bytes` at an absolute offset, growing the file with zeros.
+    fn put(file: &mut Vec<u8>, at: usize, bytes: &[u8]) {
+        if at + bytes.len() > file.len() {
+            file.resize(at + bytes.len(), 0);
+        }
+        file[at..at + bytes.len()].copy_from_slice(bytes);
+    }
+
+    #[test]
+    fn dmsg_fixed_block_layout_roundtrips() {
+        // tableSize == 0: blocks at tableOffset + blockSize*i, region XOR-0xFF.
+        let block_size = 0x60usize;
+        let table_offset = 0x40usize;
+        let file_len = table_offset + 3 * block_size;
+        let mut file = dmsg_header(
+            file_len as u32,
+            table_offset as u32,
+            0,
+            block_size as u32,
+            3,
+        );
+        file.resize(file_len, 0);
+        for (i, entry) in ["Alpha", "", "Gamma"].into_iter().enumerate() {
+            put(&mut file, table_offset + i * block_size, &dmsg_block(entry));
+        }
+        for byte in &mut file[table_offset..] {
+            *byte ^= DMSG_XOR_MASK;
+        }
+        let dat = DmsgTable::parse(&file).expect("synthetic catalog parses");
+        assert_eq!(dat.len(), 3);
+        assert_eq!(dat.text(0), Some("Alpha"));
+        assert_eq!(dat.text(1), Some(""));
+        assert_eq!(dat.text(2), Some("Gamma"));
+        assert_eq!(dat.text(3), None);
+    }
+
+    #[test]
+    fn dmsg_offset_table_layout_roundtrips() {
+        // tableSize != 0: {off, unk} pairs at tableOffset, blocks after them.
+        let mut file = dmsg_header(0x400, 0x40, 1, 0, 2);
+        let base = 0x40 + 2 * 8;
+        put(&mut file, 0x40, &0u32.to_le_bytes());
+        put(&mut file, 0x44, &0u32.to_le_bytes()); // entry 0: off 0
+        put(&mut file, 0x48, &64u32.to_le_bytes());
+        put(&mut file, 0x4C, &0u32.to_le_bytes()); // entry 1: off 64
+        let one = dmsg_block("One");
+        let two = dmsg_block("Two");
+        put(&mut file, base, &one);
+        put(&mut file, base + 64, &two);
+        let file_len = (base + 64 + two.len() + 8).next_multiple_of(0x10);
+        file.resize(file_len, 0);
+        file[0x14..0x18].copy_from_slice(&(file_len as u32).to_le_bytes());
+        for byte in &mut file[0x40..] {
+            *byte ^= DMSG_XOR_MASK;
+        }
+        let dat = DmsgTable::parse(&file).expect("synthetic offset-table catalog parses");
+        assert_eq!(dat.text(0), Some("One"));
+        assert_eq!(dat.text(1), Some("Two"));
+    }
+
+    #[test]
+    fn dmsg_rejects_a_dialog_table_banner() {
+        let file = vec![b'x'; 64];
+        assert_eq!(
+            DmsgTable::parse(&file).err(),
+            Some(DmsgError::BadBanner { got: *b"xxxxx" })
+        );
     }
 }

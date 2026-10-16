@@ -26,13 +26,16 @@ pub use codec::{
     build_subpacket_auc_info, build_subpacket_auc_lot_cancel, build_subpacket_auc_lot_check,
     build_subpacket_auc_lot_in, build_subpacket_auc_work_check, build_subpacket_bazaar_buy,
     build_subpacket_bazaar_exit, build_subpacket_bazaar_list, build_subpacket_buffcancel,
-    build_subpacket_camp, build_subpacket_emote_list_req, build_subpacket_equip_inspect,
-    build_subpacket_equip_set, build_subpacket_fishing, build_subpacket_item_move,
-    build_subpacket_item_stack, build_subpacket_item_use, build_subpacket_motion,
-    build_subpacket_myroom_job, build_subpacket_pbx, build_subpacket_reqlogout,
-    build_subpacket_reqsubmapnum, build_subpacket_shop_buy, build_subpacket_shop_sell_req,
-    build_subpacket_shop_sell_set, build_subpacket_tracking_end, build_subpacket_tracking_list,
-    build_subpacket_tracking_start, log_action_sent,
+    build_subpacket_camp, build_subpacket_currencies, build_subpacket_emote_list_req,
+    build_subpacket_equip_inspect, build_subpacket_equip_set, build_subpacket_fishing,
+    build_subpacket_item_move, build_subpacket_item_stack, build_subpacket_item_use,
+    build_subpacket_motion, build_subpacket_myroom_bankin, build_subpacket_myroom_is,
+    build_subpacket_myroom_job, build_subpacket_myroom_layout, build_subpacket_myroom_layout_done,
+    build_subpacket_myroom_plant_add, build_subpacket_myroom_plant_check,
+    build_subpacket_myroom_plant_crop, build_subpacket_myroom_plant_stop, build_subpacket_pbx,
+    build_subpacket_reqlogout, build_subpacket_reqsubmapnum, build_subpacket_shop_buy,
+    build_subpacket_shop_sell_req, build_subpacket_shop_sell_set, build_subpacket_tracking_end,
+    build_subpacket_tracking_list, build_subpacket_tracking_start, log_action_sent,
 };
 
 struct NpcNameResolver {
@@ -102,7 +105,7 @@ pub enum CharSelection {
 
 /// Self Mog House / job state the send loop needs synchronously for the local
 /// menus (the folded `SessionState` lives in another task).
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 struct SelfMogState {
     myroom: Option<crate::state::MyRoomInfo>,
     mog_zone_flag: bool,
@@ -110,6 +113,9 @@ struct SelfMogState {
     /// `myroom`: a MYROOM login with the `MYROOM_NONE` sentinel model still
     /// spawns at the forced origin and must skip the zoneline seed repair.
     in_myroom: bool,
+    /// The last 0x00A's `LoginState` is any Mog House state
+    /// ([`decode::ServerLoginMyroom::login_in_mog_house`]), which the arrangement gates read.
+    login_in_mog_house: bool,
     mh_2f_unlocked: Option<bool>,
     job_info: Option<crate::state::JobInfoState>,
     /// Per-container capacities from the last 0x01C ITEM_MAX, indexed by LSB
@@ -122,6 +128,12 @@ struct SelfMogState {
     /// 0x055; the c2s 0x064 mark-seen reply must carry the table's full
     /// updated LookItemFlag bitset.
     key_item_tables: [KeyItemTableFlags; decode::ScenarioItem::TABLE_COUNT],
+    /// The arrangement mode this client is in — kuluu's analogue of the myroom manager's own mode word
+    /// (+0x1C), which FFXiMain.dll retail-2026-09 reads back at `.text 0x1D34FA`. Values are the `MODE_*`
+    /// constants of [`crate::myroom_layout`]; kept here because the send path must test it synchronously
+    /// before accepting another arrangement request. Every accepted change is also emitted as an
+    /// [`AgentEvent::MyroomModeChanged`] so the folded SessionState mirrors it.
+    layout_mode: u8,
 }
 
 /// The open NPC shop window. The shop has no close packet (research/XiPackets
@@ -311,6 +323,61 @@ pub async fn run(
         cli_lang: 0,
     };
 
+    // The client-local macro store (bead kuluu-o9qt7.19.2): the wire never
+    // carries macros (vault main_menu.md §41), so world entry is where saved
+    // slots come back — a missing file simply means empty, an unreadable one
+    // must not kill the session.
+    let macro_store = match crate::macro_store::MacroStore::default_path() {
+        Ok(path) => Some(crate::macro_store::MacroStore::new(path)),
+        Err(e) => {
+            tracing::warn!(error = %e, "no config dir for the client-local macro store");
+            None
+        }
+    };
+    let macro_char_key = crate::macro_store::PersistedMacros::key(char_name_for_bootstrap);
+    if let Some(store) = &macro_store {
+        match store.load() {
+            Ok(persisted) => {
+                let slots = persisted.slots_for(char_name_for_bootstrap);
+                if !slots.is_empty() {
+                    let _ = event_tx.send(AgentEvent::MacrosLoaded { slots });
+                }
+            }
+            Err(e) => tracing::warn!(
+                error = %e,
+                path = %store.path().display(),
+                "macro store unreadable — starting with empty macros"
+            ),
+        }
+    }
+
+    // The emote display order is the same client-local user-file law (bead
+    // kuluu-o9qt7.34): retail's `emote` fill reads its own blob at open
+    // (FFXiMain.dll retail-2026-09 `.text 0x2259C6`) and no packet carries it
+    // [V-negative], so world entry re-reads the store file exactly like macros.
+    let emote_store = match crate::emote_store::EmoteStore::default_path() {
+        Ok(path) => Some(crate::emote_store::EmoteStore::new(path)),
+        Err(e) => {
+            tracing::warn!(error = %e, "no config dir for the client-local emote store");
+            None
+        }
+    };
+    if let Some(store) = &emote_store {
+        match store.load() {
+            Ok(persisted) => {
+                let ids = persisted.order_for(char_name_for_bootstrap);
+                if !ids.is_empty() {
+                    let _ = event_tx.send(AgentEvent::EmoteOrderLoaded { ids });
+                }
+            }
+            Err(e) => tracing::warn!(
+                error = %e,
+                path = %store.path().display(),
+                "emote store unreadable — starting with the default emote order"
+            ),
+        }
+    }
+
     let mut current_seed = key3;
     let mut iteration: u32 = 0;
 
@@ -343,6 +410,9 @@ pub async fn run(
             spawn_fallback.take(),
             &mut cmd_rx,
             &event_tx,
+            macro_store.as_ref(),
+            &macro_char_key,
+            emote_store.as_ref(),
             spell_table.clone(),
         )
         .await?;
@@ -401,6 +471,13 @@ async fn run_map_session(
     spawn_fallback: Option<Vec3>,
     cmd_rx: &mut mpsc::Receiver<AgentCommand>,
     event_tx: &broadcast::Sender<AgentEvent>,
+    // Client-local macro store + key (bead kuluu-o9qt7.19.2) — carried down to
+    // the command pump, which commits edits without ever touching the wire.
+    macro_store: Option<&crate::macro_store::MacroStore>,
+    macro_char_key: &str,
+    // Client-local emote display order store (bead kuluu-o9qt7.34) — carried
+    // down the same way, committed without ever touching the wire.
+    emote_store: Option<&crate::emote_store::EmoteStore>,
     spell_table: Option<std::sync::Arc<ffxi_dat::spell_info::SpellTable>>,
 ) -> Result<MapOutcome> {
     map.send_bootstrap(bootstrap).await?;
@@ -693,6 +770,9 @@ async fn run_map_session(
         self_act_index,
         cmd_rx,
         event_tx.clone(),
+        macro_store.cloned(),
+        macro_char_key.to_string(),
+        emote_store.cloned(),
         cfg.user_driven_events,
         name_cache,
         target_cache,
@@ -896,6 +976,17 @@ fn classify_char_npc(
 /// Dedup'd warning for sub-packet payloads that fail to decode in
 /// [`handle_sub_packet`]: WARN on the first failure per opcode (per process),
 /// DEBUG thereafter, so a malformed stream cannot spam the log (kuluu-zkuf).
+/// Slot-view law for the trade lists (s2c 0x23/0x25 → offer rows): LSB writes
+/// the GIL sentinel `item_no` with quantity 0 to clear a slot, and the same
+/// sentinel with a quantity IS the gil offer (player_trade.cpp; vault
+/// main_menu.md §25).
+fn trade_slot_view(item_no: u16, qty: u32) -> Option<kuluu_snapshot::TradeOffer> {
+    if item_no == decode::TRADE_GIL_ITEM_NO && qty == 0 {
+        return None;
+    }
+    Some(kuluu_snapshot::TradeOffer { item_no, qty })
+}
+
 fn warn_decode_err(opcode: u16, err: impl std::fmt::Display) {
     if first_decode_err(opcode) {
         tracing::warn!(
@@ -1017,14 +1108,31 @@ fn handle_sub_packet(
                 mog.in_myroom = login.myroom.is_some_and(|m| {
                     m.login_state == decode::ServerLoginMyroom::LOGIN_STATE_MYROOM
                 });
+                mog.login_in_mog_house = login
+                    .myroom
+                    .is_some_and(|m| decode::ServerLoginMyroom::login_in_mog_house(m.login_state));
+                // A fresh myroom cluster always starts with the door shut: retail's open byte is
+                // game-state-only and LSB resets it on zoning/floor change
+                // (vendor/server/src/map/packets/c2s/0x0cb_myroom_is.cpp).
                 mog.myroom = login.myroom.and_then(|m| {
                     m.myroom_model().map(|model| crate::state::MyRoomInfo {
                         model,
                         sub_map: m.sub_map_number,
                         exit_bit: m.exit_bit,
+                        door_open: false,
                     })
                 });
                 mog.mog_zone_flag = login.myroom.is_some_and(|m| m.mog_zone_flag != 0);
+                // A zone-in rebuilds retail's myroom manager wholesale, mode word included: arrangement
+                // never carries across a zone, and neither do unacknowledged furniture edits.
+                let left_mode =
+                    std::mem::replace(&mut mog.layout_mode, crate::myroom_layout::MODE_NORMAL);
+                if left_mode != crate::myroom_layout::MODE_NORMAL {
+                    let _ = event_tx.send(AgentEvent::MyroomModeChanged {
+                        previous: left_mode,
+                        next: crate::myroom_layout::MODE_NORMAL,
+                    });
+                }
                 if let Some(ev) = login.zone_in_event {
                     tracing::info!(
                         event_id = ev.event_para,
@@ -1056,6 +1164,11 @@ fn handle_sub_packet(
                     to: login.zone_no,
                     myroom: mog.myroom,
                     mog_zone_flag: mog.mog_zone_flag,
+                });
+
+                let _ = event_tx.send(AgentEvent::LoginStateSynced {
+                    login_state: login.myroom.map_or(0, |m| m.login_state),
+                    is_monstrosity: login.is_monstrosity,
                 });
 
                 if let Some(v) = login.voyage {
@@ -1115,6 +1228,15 @@ fn handle_sub_packet(
                     let _ = event_tx.send(AgentEvent::WeatherUpdated {
                         weather_number: w.weather_number,
                     });
+                }
+
+                // Retail keeps this base together with a clock stamp taken right
+                // after it (FFXiMain.dll retail-2026-09 RVA 0xFB3EE, `.text
+                // 0xFB3FA`) and only sums the two when `/playtime` runs (handler
+                // FFXiMain.dll retail-2026-09 RVA 0x7CAB0), so our fold stores the
+                // pair and adds elapsed at report time.
+                if let Some(seconds) = login.play_time {
+                    let _ = event_tx.send(AgentEvent::PlayTimeSynced { seconds });
                 }
 
                 if let Some(music) = login.music_num {
@@ -1752,8 +1874,62 @@ fn handle_sub_packet(
                         attack: cs.attack,
                         defense: cs.defense,
                         resist: cs.def_elem,
+                        exp_now: cs.exp_now,
+                        exp_next: cs.exp_next,
                         ilvl: cs.ilvl,
+                        su_lv: cs.su_lv,
+                        equip_slot_block: cs.equip_slot_block,
+                        master_level_unlocked: cs.master_level_unlocked,
+                        mjob_no: cs.mjob_no,
+                        unity_faction: cs.unity_faction,
+                        unity_points: cs.unity_points,
+                        unity_points1: cs.unity_points1,
+                        unity_points2: cs.unity_points2,
+                        mjob_lv: cs.mjob_lv,
                     },
+                });
+            }
+        }
+        // The Status window's Combat/Magic/Craft rows read nothing else, and open
+        // greyed until a block arrives with something in them (FFXiMain.dll
+        // retail-2026-09 `.text 0x148B50` disables ids 3/4/5 on open).
+        s2c::CLISTATUS2 => {
+            if let Ok(skills) = decode::CharSkillLevels::decode(sub.data)
+                .inspect_err(|e| warn_decode_err(sub.opcode, e))
+            {
+                let _ = event_tx.send(AgentEvent::CharSkillsUpdated {
+                    skills: kuluu_snapshot::CharSkills {
+                        command_recast: skills.command_recast,
+                        skills: skills.skills,
+                    },
+                });
+            }
+        }
+        // The Currencies reports fold as raw blocks (bead kuluu-o9qt7.35): the DLL keeps them
+        // undecoded too, and its one-shot reply handlers (.text 0x99640/.text 0x99660) replace
+        // each stored report wholesale — exactly what `CurrenciesLoaded` folds into.
+        op @ (s2c::CURRENCIES_1 | s2c::CURRENCIES_2) => {
+            // Minimum body lengths are what the client's own widest getters consume — mode-1
+            // reads reach word +0xF8 (body 0xF6), mode-2 dword +0x9C (body 0x9C); LSB sends
+            // both blocks longer still. A truncated datagram never folds (same law as the
+            // neighbouring 0x062 gate).
+            const MODE1_MIN_BODY: usize = 0xF6;
+            const MODE2_MIN_BODY: usize = 0x9C;
+            let mode = u8::from(op == s2c::CURRENCIES_2);
+            let min_body = if mode == 1 {
+                MODE2_MIN_BODY
+            } else {
+                MODE1_MIN_BODY
+            };
+            if sub.data.len() < min_body {
+                warn_decode_err(
+                    sub.opcode,
+                    anyhow!("currency report truncated: {} < {min_body}", sub.data.len()),
+                );
+            } else {
+                let _ = event_tx.send(AgentEvent::CurrenciesLoaded {
+                    mode,
+                    body: sub.data.to_vec(),
                 });
             }
         }
@@ -1794,7 +1970,40 @@ fn handle_sub_packet(
             }
         }
         s2c::MISCDATA => {
-            if let Some((icons, expiries)) = decode_miscdata_status_icons(sub.data) {
+            // 0x063 subtypes dispatch on the record-type word at body+0 — retail's client runs
+            // the same switch (dispatcher .text FFXiMain.dll retail-2026-09 `0x99270`, jump
+            // table over subtype−2; vault main_menu.md §59 addendum 36).
+            let is_merits = sub
+                .data
+                .get(..2)
+                .is_some_and(|b| u16::from_le_bytes([b[0], b[1]]) == MISCDATA_SUBTYPE_MERITS);
+            if is_merits {
+                if let Some(merits) = decode_miscdata_merits(sub.data) {
+                    let _ = event_tx.send(AgentEvent::MeritsUpdated { merits });
+                }
+            } else if let Some(unity) = decode::MiscdataUnity::decode(sub.data) {
+                if let Ok(chunk) = unity.inspect_err(|e| warn_decode_err(sub.opcode, e)) {
+                    let _ = event_tx.send(AgentEvent::UnityRankingChunk {
+                        result_set: chunk.result_set,
+                        data_type: chunk.data_type,
+                        concord_values: chunk.concord_values,
+                    });
+                }
+            } else if let Some(record) = decode::MiscdataJobPoints::decode(sub.data) {
+                if let Ok(record) = record.inspect_err(|e| warn_decode_err(sub.opcode, e)) {
+                    let _ = event_tx.send(AgentEvent::JobPointsRecordUpdated {
+                        record: job_points_record(&record),
+                    });
+                }
+            } else if let Some(record) = decode::MiscdataHomepoints::decode(sub.data) {
+                // Subtype 6 Homepoints — retail's arm rep-movsds the mask block into .data
+                // FFXiMain.dll retail-2026-09 0x4858C4 and raises its flag (`.text 0x99330`).
+                if let Ok(record) = record.inspect_err(|e| warn_decode_err(sub.opcode, e)) {
+                    let _ = event_tx.send(AgentEvent::HomepointsUpdated {
+                        masks: homepoint_masks(&record),
+                    });
+                }
+            } else if let Some((icons, expiries)) = decode_miscdata_status_icons(sub.data) {
                 let _ = event_tx.send(AgentEvent::StatusIconsUpdated { icons, expiries });
             }
         }
@@ -1812,6 +2021,63 @@ fn handle_sub_packet(
         s2c::ABIL_RECAST => {
             let recasts = decode_abil_recast(sub.data);
             let _ = event_tx.send(AgentEvent::AbilityRecastsUpdated { recasts });
+        }
+        s2c::ALTER_EGO_POINTS => {
+            if let Ok(packet) = decode::AlterEgoPoints::decode(sub.data)
+                .inspect_err(|e| warn_decode_err(sub.opcode, e))
+            {
+                let _ = event_tx.send(AgentEvent::AlterEgoPointsUpdated {
+                    points: kuluu_snapshot::AlterEgoPoints {
+                        points: packet.points,
+                        upgrades: packet.upgrades,
+                        costs: packet.costs,
+                    },
+                });
+            }
+        }
+        s2c::MERIT => {
+            if let Ok(list) =
+                decode::MeritList::decode(sub.data).inspect_err(|e| warn_decode_err(sub.opcode, e))
+            {
+                let entries = list
+                    .entries
+                    .iter()
+                    .map(|e| crate::state::MeritWire {
+                        index: e.index,
+                        next: e.next,
+                        count: e.count,
+                    })
+                    .collect();
+                let _ = event_tx.send(AgentEvent::MeritsListed { entries });
+            }
+        }
+        s2c::JOB_POINTS => {
+            if let Ok(list) = decode::JobPointList::decode(sub.data)
+                .inspect_err(|e| warn_decode_err(sub.opcode, e))
+            {
+                let entries = list
+                    .entries
+                    .iter()
+                    .map(|e| crate::state::JobPointWire {
+                        index: e.index,
+                        job_no: e.job_no,
+                        next: e.next,
+                        level: e.level,
+                    })
+                    .collect();
+                let _ = event_tx.send(AgentEvent::JobPointsListed { entries });
+            }
+        }
+        s2c::UNITY => {
+            if let Ok(quest) =
+                decode::UnityQuest::decode(sub.data).inspect_err(|e| warn_decode_err(sub.opcode, e))
+            {
+                let _ = event_tx.send(AgentEvent::UnityQuestUpdated {
+                    sparks: quest.sparks,
+                    deeds: quest.deeds,
+                    plaudits: quest.plaudits,
+                });
+            }
         }
         // Wide-scan (tracking): the server frames a list with 0x0F6 ListStart, a
         // run of 0x0F4 entries, then 0x0F6 ListEnd; 0x0F5 streams the tracked
@@ -1905,6 +2171,104 @@ fn handle_sub_packet(
                 let _ = event_tx.send(AgentEvent::ChatLine { line });
             }
         }
+        s2c::GROUP_COMLINK => match ffxi_proto::linkshell::parse_group_comlink(sub.data) {
+            Ok(c) => {
+                let _ = event_tx.send(AgentEvent::LinkShellSlotChanged {
+                    linkshell_slot: c.linkshell_slot,
+                    category: c.category,
+                    item_index: c.item_index,
+                });
+            }
+            Err(e) => warn_decode_err(sub.opcode, &e),
+        },
+        // The synthesis answer (vault main_menu.md §28): one-shot feedback for our own ask.
+        s2c::COMBINE_ANS => match ffxi_proto::synth::parse_combine_ans(sub.data) {
+            Ok(a) => {
+                let _ = event_tx.send(AgentEvent::SynthCompleted {
+                    outcome: kuluu_snapshot::SynthOutcome {
+                        result: a.result,
+                        grade: a.grade,
+                        count: a.count,
+                        item_no: a.item_no,
+                        broken_items: a.break_nos.into_iter().filter(|&id| id != 0).collect(),
+                    },
+                });
+            }
+            Err(e) => warn_decode_err(sub.opcode, &e),
+        },
+        // The mission/quest log battery (vault main_menu.md section 30): every frame folds whole per port.
+        s2c::MISSION => match ffxi_proto::mission::parse_mission_frame(sub.data) {
+            Ok(ffxi_proto::mission::MissionFrame::Main(m)) => {
+                let _ = event_tx.send(AgentEvent::MissionInfoUpdated {
+                    info: kuluu_snapshot::MissionInfo {
+                        nation: m.nation,
+                        nation_mission: m.nation_mission,
+                        rotz: m.rotz,
+                        cop: m.cop,
+                        cop2: m.cop2,
+                        addon_acp: m.addon_acp,
+                        addon_amk: m.addon_amk,
+                        addon_asa: m.addon_asa,
+                        tales_beginning: m.tales_beginning,
+                        soa: m.soa,
+                        rov: m.rov,
+                    },
+                });
+            }
+            Ok(ffxi_proto::mission::MissionFrame::Tvr(tvr)) => {
+                let _ = event_tx.send(AgentEvent::MissionTvrUpdated { tvr });
+            }
+            Ok(ffxi_proto::mission::MissionFrame::Other(o)) => {
+                let _ = event_tx.send(AgentEvent::MissionLogUpdated {
+                    entry: kuluu_snapshot::MissionLogEntry {
+                        port: o.port,
+                        data: o.data,
+                    },
+                });
+            }
+            Err(e) => warn_decode_err(sub.opcode, &e),
+        },
+        // The extended-job family (vault main_menu.md §39): LSB sends these at
+        // login per SendExtendedJobPackets in vendor/server/src/map/utils/
+        // charutils.cpp — MON while a monstrosity session is active, else one
+        // PUP frame per main/sub Puppetmaster slot.
+        s2c::EXTENDED_JOB => match ffxi_proto::puppet::parse_extended_job(sub.data) {
+            Some(ffxi_proto::puppet::ExtendedJobFrame::Pup(pup)) => {
+                let _ = event_tx.send(AgentEvent::AutomatonUpdated {
+                    automaton: kuluu_snapshot::AutomatonInfo {
+                        is_sub_job: pup.is_sub_job,
+                        head: pup.head,
+                        frame: pup.frame,
+                        attachments: pup.attachments,
+                        unlocked_heads: pup.unlocked_heads,
+                        unlocked_frames: pup.unlocked_frames,
+                    },
+                });
+            }
+            Some(ffxi_proto::puppet::ExtendedJobFrame::Mon(mon)) => {
+                let _ = event_tx.send(AgentEvent::MonstrosityUpdated {
+                    monstrosity: kuluu_snapshot::MonstrosityInfo {
+                        species: mon.species,
+                        equipped_instincts: mon.equipped_instincts,
+                    },
+                });
+            }
+            // BLU spell sets and any other extended job are recognized but not
+            // modeled yet (vault main_menu.md §39 covers PUP/MON only).
+            Some(ffxi_proto::puppet::ExtendedJobFrame::Other { .. }) | None => {}
+        },
+        // The server restates the whole SAVE_CONF prefix on login gameok, after
+        // every c2s CONFIG, and on party pushes (vendor/server/src/map/packets/
+        // s2c/0x0b4_config.h senders; vault main_menu.md §42). kuluu keeps the
+        // four named bytes verbatim; bit law decode lives in ffxi_proto::config.
+        s2c::CONFIG => match ffxi_proto::config::parse_config_flags(sub.data) {
+            Some(_) if sub.data.len() >= 4 => {
+                let mut confdata = [0u8; 4];
+                confdata.copy_from_slice(&sub.data[..4]);
+                let _ = event_tx.send(AgentEvent::ConfigUpdated { confdata });
+            }
+            Some(_) | None => {}
+        },
         s2c::EQUIP_INSPECT => match decode::EquipInspect::decode(sub.data) {
             Ok(decode::EquipInspect::Equipment(eq)) => {
                 let _ = event_tx.send(AgentEvent::CheckEquipReceived {
@@ -2043,6 +2407,71 @@ fn handle_sub_packet(
                 });
             }
         }
+        s2c::GROUP_SOLICIT_REQ => {
+            if let Ok(sol) = decode::GroupSolicitReq::decode(sub.data)
+                .inspect_err(|e| warn_decode_err(sub.opcode, e))
+            {
+                tracing::info!(
+                    char_id = sol.unique_no,
+                    name = %sol.name,
+                    "0x0DC GROUP_SOLICIT_REQ (party invite)"
+                );
+                let _ = event_tx.send(AgentEvent::PartySolicitReceived {
+                    char_id: sol.unique_no,
+                    name: sol.name,
+                    alliance: matches!(sol.kind, decode::GroupKind::Alliance),
+                });
+            }
+        }
+        s2c::GROUP_SOLICIT_NO => {
+            tracing::info!("0x0DE GROUP_SOLICIT_NO (withdraw pending invite)");
+            let _ = event_tx.send(AgentEvent::PartySolicitWithdrawn);
+        }
+        s2c::ITEM_TRADE_REQ => {
+            if let Ok(req) = decode::ItemTradeReq::decode(sub.data)
+                .inspect_err(|e| warn_decode_err(sub.opcode, e))
+            {
+                tracing::info!(
+                    char_id = req.unique_no,
+                    "0x021 ITEM_TRADE_REQ (trade invite)"
+                );
+                let _ = event_tx.send(AgentEvent::TradeIncoming {
+                    char_id: req.unique_no,
+                });
+            }
+        }
+        s2c::ITEM_TRADE_RES => {
+            if let Ok(res) = decode::ItemTradeRes::decode(sub.data)
+                .inspect_err(|e| warn_decode_err(sub.opcode, e))
+            {
+                tracing::info!(?res.kind, "0x022 ITEM_TRADE_RES");
+                let _ = event_tx.send(AgentEvent::TradeRes { kind: res.kind });
+            }
+        }
+        s2c::ITEM_TRADE_LIST => {
+            if let Ok(row) = decode::ItemTradeList::decode(sub.data)
+                .inspect_err(|e| warn_decode_err(sub.opcode, e))
+            {
+                // Empty-slot views carry the GIL sentinel with quantity 0
+                // (player_trade.cpp pushSlotView / mylist ctor law).
+                let offer = trade_slot_view(row.item_no, row.item_num);
+                let _ = event_tx.send(AgentEvent::TradePartnerSlotSet {
+                    trade_index: row.trade_index,
+                    offer,
+                });
+            }
+        }
+        s2c::ITEM_TRADE_MYLIST => {
+            if let Ok(row) = decode::ItemTradeMyList::decode(sub.data)
+                .inspect_err(|e| warn_decode_err(sub.opcode, e))
+            {
+                let offer = trade_slot_view(row.item_no, row.item_num);
+                let _ = event_tx.send(AgentEvent::TradeMySlotSet {
+                    trade_index: row.trade_index,
+                    offer,
+                });
+            }
+        }
         s2c::GROUP_LIST => {
             if let Ok((attrs, extra)) = decode::PartyAttrs::decode_group_list(sub.data)
                 .inspect_err(|e| warn_decode_err(sub.opcode, e))
@@ -2168,6 +2597,8 @@ fn handle_sub_packet(
                             next_use_vana_ts: None,
                             use_delay_end_vana_ts: None,
                             ready: None,
+
+                            extdata: None,
                         },
                     },
                 });
@@ -2209,6 +2640,9 @@ fn handle_sub_packet(
                             next_use_vana_ts: ci.map(|c| c.next_use_vana_ts),
                             use_delay_end_vana_ts: ci.map(|c| c.use_delay_end_vana_ts),
                             ready: ci.map(|c| c.ready),
+                            // Retail keeps the whole Attr on the record because several subsystems
+                            // read different parts of it (FFXiMain.dll retail-2026-09 `.text 0xEC630`).
+                            extdata: Some(a.extdata),
                         },
                     },
                 });
@@ -2677,6 +3111,13 @@ async fn keepalive_loop(
     mut self_act_index: Option<u16>,
     cmd_rx: &mut mpsc::Receiver<AgentCommand>,
     event_tx: broadcast::Sender<AgentEvent>,
+    // Client-local macro store + this character's key in it (bead
+    // kuluu-o9qt7.19.2); one cheap clone per map connection.
+    macro_store: Option<crate::macro_store::MacroStore>,
+    macro_char_key: String,
+    // Client-local emote store (bead kuluu-o9qt7.34); its key is derived from
+    // `character_name` with the same lowercasing law as the macro store.
+    emote_store: Option<crate::emote_store::EmoteStore>,
     user_driven_events: bool,
     mut name_cache: std::collections::HashMap<u32, String>,
     mut target_cache: std::collections::HashMap<u16, u32>,
@@ -2772,6 +3213,9 @@ async fn keepalive_loop(
 
     let mut auction = crate::auction::AuctionFlow::default();
     let ah_search_inflight = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Player searches ride the same search-server socket family but may run
+    // alongside an AH browse (retail has no cross-lock between them).
+    let player_search_inflight = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     // Delivery-box recipient entry: `awaiting_recipient` is set while the
     // name-entry frame is up (the next TextInput answers it);
@@ -3237,6 +3681,23 @@ async fn keepalive_loop(
                             });
                         }
                     }
+                    Some(AgentCommand::PartyInviteRespond { accept }) => {
+                        // c2s 0x074: Res byte Decline = 0 / Accept = 1
+                        // (vendor/server/src/map/packets/c2s/0x074_group_solicit_res.h).
+                        let payload = build_subpacket_group_solicit_res(sub_seq, accept);
+                        sub_seq = sub_seq.wrapping_add(1);
+                        if let Err(e) = map
+                            .send_encrypted(&payload, datagram_header_id(sub_seq), server_last_seq)
+                            .await
+                        {
+                            tracing::warn!(error = %e, "party invite answer send failed");
+                        } else {
+                            // Retail clears its pending-solicit state the moment
+                            // prtyjoin answers (vault main_menu.md section 24), so
+                            // do the same here rather than waiting for a follow-up.
+                            let _ = event_tx.send(AgentEvent::PartySolicitWithdrawn);
+                        }
+                    }
                     Some(AgentCommand::CustomMenuRespond { title, option }) => {
                         // The customMenu is fully client-driven: the server holds
                         // the context and only awaits the `_CUSTOM_MENU` tell, so
@@ -3253,6 +3714,106 @@ async fn keepalive_loop(
                         }
                         cutscene.end(crate::event_dialog::EventSessionExit::ScriptEnded, &event_tx);
                         let _ = event_tx.send(AgentEvent::EventEnded);
+                    }
+                    Some(AgentCommand::TradeRequest { char_id, act_index }) => {
+                        let payload = build_subpacket_trade_req(sub_seq, char_id, act_index);
+                        sub_seq = sub_seq.wrapping_add(1);
+                        if let Err(e) = map
+                            .send_encrypted(&payload, datagram_header_id(sub_seq), server_last_seq)
+                            .await
+                        {
+                            tracing::warn!(error = %e, "trade request send failed");
+                        } else {
+                            // Retail opens its trade windows on send (vault
+                            // main_menu.md §25).
+                            let _ = event_tx.send(AgentEvent::TradeOutgoingOpened { char_id });
+                        }
+                    }
+                    Some(AgentCommand::TradeRespond { accept }) => {
+                        let kind = if accept { 0 } else { 1 }; // Start / Cancell
+                        let payload = build_subpacket_trade_res(sub_seq, kind, 0);
+                        sub_seq = sub_seq.wrapping_add(1);
+                        if let Err(e) = map
+                            .send_encrypted(&payload, datagram_header_id(sub_seq), server_last_seq)
+                            .await
+                        {
+                            tracing::warn!(error = %e, "trade answer send failed");
+                        }
+                    }
+                    Some(AgentCommand::TradeStage {
+                        trade_index,
+                        item_no,
+                        qty,
+                        bag_slot,
+                    }) => {
+                        let payload =
+                            build_subpacket_trade_list(sub_seq, qty, item_no, bag_slot, trade_index);
+                        sub_seq = sub_seq.wrapping_add(1);
+                        if let Err(e) = map
+                            .send_encrypted(&payload, datagram_header_id(sub_seq), server_last_seq)
+                            .await
+                        {
+                            tracing::warn!(error = %e, "trade stage send failed");
+                        }
+                    }
+                    Some(AgentCommand::TradeSetGil { qty }) => {
+                        // GIL sentinel item id on slot 0 — LSB validate() pins
+                        // gil to that exact pairing (0x034_trade_list.cpp).
+                        let payload = build_subpacket_trade_list(
+                            sub_seq,
+                            qty,
+                            decode::TRADE_GIL_ITEM_NO,
+                            0,
+                            0,
+                        );
+                        sub_seq = sub_seq.wrapping_add(1);
+                        if let Err(e) = map
+                            .send_encrypted(&payload, datagram_header_id(sub_seq), server_last_seq)
+                            .await
+                        {
+                            tracing::warn!(error = %e, "trade gil send failed");
+                        }
+                    }
+                    Some(AgentCommand::TradeClearSlot { trade_index }) => {
+                        // qty 0 is setSlot's release path.
+                        let payload = build_subpacket_trade_list(
+                            sub_seq,
+                            0,
+                            decode::TRADE_GIL_ITEM_NO,
+                            0,
+                            trade_index,
+                        );
+                        sub_seq = sub_seq.wrapping_add(1);
+                        if let Err(e) = map
+                            .send_encrypted(&payload, datagram_header_id(sub_seq), server_last_seq)
+                            .await
+                        {
+                            tracing::warn!(error = %e, "trade clear send failed");
+                        }
+                    }
+                    Some(AgentCommand::TradeConfirm) => {
+                        let payload = build_subpacket_trade_res(sub_seq, 2, 0); // Kind Make
+                        sub_seq = sub_seq.wrapping_add(1);
+                        if let Err(e) = map
+                            .send_encrypted(&payload, datagram_header_id(sub_seq), server_last_seq)
+                            .await
+                        {
+                            tracing::warn!(error = %e, "trade confirm send failed");
+                        } else {
+                            // Retail marks its own window confirmed at Make-send,
+                            // before any echo (vault main_menu.md §25).
+                            let _ = event_tx.send(AgentEvent::TradeMadeLocally);
+                        }
+                    }
+                    Some(AgentCommand::TradeCancel) => {
+                        let payload = build_subpacket_trade_res(sub_seq, 1, 0); // Kind Cancell
+                        sub_seq = sub_seq.wrapping_add(1);
+                        if let Err(e) = map
+                            .send_encrypted(&payload, datagram_header_id(sub_seq), server_last_seq)
+                            .await
+                        {
+                            tracing::warn!(error = %e, "trade cancel send failed");
+                        }
                     }
                     Some(AgentCommand::Action {
                         target_id,
@@ -3697,6 +4258,36 @@ async fn keepalive_loop(
                             });
                         }
                     }
+                    // The server echoes a fresh s2c 0x0B4 CONFIG after every
+                    // c2s CONFIG regardless of change (always-push law in
+                    // vendor/server/src/map/packets/c2s/0x0dc_config.cpp), so no
+                    // optimistic fold here — the echo lands via the route arm
+                    // (vault main_menu.md §42).
+                    Some(AgentCommand::SetConfigFlag { flag, on }) => {
+                        let payload = build_subpacket_config(sub_seq, flag, on);
+                        sub_seq = sub_seq.wrapping_add(1);
+                        if let Err(e) = map
+                            .send_encrypted(&payload, datagram_header_id(sub_seq), server_last_seq)
+                            .await
+                        {
+                            tracing::warn!(error = %e, "config send failed");
+                        }
+                    }
+                    // The `conf12wi` store-0xBF pair announce (c2s 0x088 — no LSB
+                    // handler exists for the id, so there is no echo to wait for;
+                    // retail fires it from helper FFXiMain.dll retail-2026-09 RVA
+                    // 0x1A8030 past its gates, which already ran in the menu seam;
+                    // vault main_menu.md §59 addendum 16).
+                    Some(AgentCommand::AnnounceConfigBfPair { mode }) => {
+                        let payload = build_subpacket_conf_bf_announce(sub_seq, mode);
+                        sub_seq = sub_seq.wrapping_add(1);
+                        if let Err(e) = map
+                            .send_encrypted(&payload, datagram_header_id(sub_seq), server_last_seq)
+                            .await
+                        {
+                            tracing::warn!(error = %e, "bf pair announce send failed");
+                        }
+                    }
                     Some(AgentCommand::OpenBazaar {
                         target_id,
                         target_index,
@@ -3776,6 +4367,39 @@ async fn keepalive_loop(
                             server_host.clone(),
                             AhSearchQuery::History { item_id, stack },
                         );
+                    }
+                    Some(AgentCommand::PlayerSearch { filters, all_pages }) => {
+                        spawn_player_search(
+                            &player_search_inflight,
+                            &event_tx,
+                            server_host.clone(),
+                            filters,
+                            all_pages,
+                        );
+                    }
+                    // One synthesis attempt (c2s 0x096, vault main_menu.md §28). The
+                    // HashNo byte stays 0: LSB's validate()/process never read it.
+                    Some(AgentCommand::Synthesize {
+                        crystal_id,
+                        crystal_slot,
+                        ingredients,
+                    }) => {
+                        if ingredients.is_empty() || ingredients.len() > 8 {
+                            continue; // the server's Items 1..=8 validate law
+                        }
+                        let payload = build_subpacket_combine_ask(
+                            sub_seq,
+                            crystal_id,
+                            crystal_slot,
+                            &ingredients,
+                        );
+                        sub_seq = sub_seq.wrapping_add(1);
+                        if let Err(e) = map
+                            .send_encrypted(&payload, datagram_header_id(sub_seq), server_last_seq)
+                            .await
+                        {
+                            tracing::warn!(error = %e, "synth ask send failed");
+                        }
                     }
                     Some(AgentCommand::AhBid {
                         item_id,
@@ -4251,6 +4875,446 @@ async fn keepalive_loop(
                             &event_tx,
                         )
                         .await;
+                    }
+                    Some(AgentCommand::MogHouseDoorSelect) => {
+                        // The retail select arm (FFXiMain.dll retail-2026-09 `.text 0x14556C`) sends
+                        // Open for a shut door and Close for an open one, pairing Kind with
+                        // PARAM2::Unk1/Unk2; both come from the client's own door byte because LSB
+                        // implements neither kind and never acknowledges one, so kuluu flips its copy
+                        // in the same step instead of waiting on a reply.
+                        let open_door = mog.myroom.is_some_and(|m| m.door_open);
+                        if let Some(room) = mog.myroom.as_mut() {
+                            room.door_open = !room.door_open;
+                        }
+                        let (kind, param2) = codec::moghouse_door_packet(open_door);
+                        send_myroom_is(map, kind, 0, param2, &mut sub_seq, server_last_seq, &event_tx)
+                            .await;
+                    }
+                    Some(AgentCommand::MogHouseRemodel { style }) => {
+                        // Param1 stays 0: LSB never reads it (validate/process only use
+                        // Kind/Param2 — vendor/server/src/map/packets/c2s/
+                        // 0x0cb_myroom_is.cpp; bead kuluu-o9qt7.13.5).
+                        send_myroom_is(
+                            map,
+                            codec::MYROOM_IS_KIND_REMODEL,
+                            0,
+                            style,
+                            &mut sub_seq,
+                            server_last_seq,
+                            &event_tx,
+                        )
+                        .await;
+                    }
+                    Some(
+                        AgentCommand::MyroomLayout {
+                            item_no,
+                            slot,
+                            container,
+                            floor,
+                            col,
+                            level,
+                            row,
+                            rotation,
+                        },
+                    ) => {
+                        // No optimistic pose write: the placement's truth is the ITEM_ATTR that LSB
+                        // pushes back for the same record, and kuluu reads furniture state from that
+                        // Attr alone (crate::myroom_furniture).
+                        let layout = codec::MyroomLayoutRequest {
+                            item_no,
+                            slot,
+                            container,
+                            floor,
+                            col,
+                            level,
+                            row,
+                            rotation,
+                        };
+                        let payload = build_subpacket_myroom_layout(sub_seq, &layout);
+                        send_myroom_request(
+                            map,
+                            payload,
+                            "MYROOM_LAYOUT",
+                            &mut sub_seq,
+                            server_last_seq,
+                            &event_tx,
+                        )
+                        .await;
+                    }
+                    Some(AgentCommand::MyroomLayoutDone) => {
+                        let payload = build_subpacket_myroom_layout_done(sub_seq);
+                        send_myroom_request(
+                            map,
+                            payload,
+                            "MYROOM_LAYOUT(end)",
+                            &mut sub_seq,
+                            server_last_seq,
+                            &event_tx,
+                        )
+                        .await;
+                    }
+                    Some(AgentCommand::MyroomBankin {
+                        item_no,
+                        slot,
+                        container,
+                    }) => {
+                        let payload = build_subpacket_myroom_bankin(sub_seq, item_no, slot, container);
+                        send_myroom_request(
+                            map,
+                            payload,
+                            "MYROOM_BANKIN",
+                            &mut sub_seq,
+                            server_last_seq,
+                            &event_tx,
+                        )
+                        .await;
+                    }
+                    Some(AgentCommand::MyroomPlantAdd {
+                        plant_item_no,
+                        add_item_no,
+                        plant_slot,
+                        add_slot,
+                        plant_container,
+                        add_container,
+                    }) => {
+                        let payload = build_subpacket_myroom_plant_add(
+                            sub_seq,
+                            plant_item_no,
+                            add_item_no,
+                            plant_slot,
+                            add_slot,
+                            plant_container,
+                            add_container,
+                        );
+                        send_myroom_request(
+                            map,
+                            payload,
+                            "MYROOM_PLANT_ADD",
+                            &mut sub_seq,
+                            server_last_seq,
+                            &event_tx,
+                        )
+                        .await;
+                    }
+                    Some(AgentCommand::MyroomPlantCheck {
+                        plant_item_no,
+                        plant_slot,
+                        plant_container,
+                    }) => {
+                        let payload = build_subpacket_myroom_plant_check(
+                            sub_seq,
+                            plant_item_no,
+                            plant_slot,
+                            plant_container,
+                        );
+                        send_myroom_request(
+                            map,
+                            payload,
+                            "MYROOM_PLANT_CHECK",
+                            &mut sub_seq,
+                            server_last_seq,
+                            &event_tx,
+                        )
+                        .await;
+                    }
+                    Some(AgentCommand::MyroomPlantCrop {
+                        plant_item_no,
+                        plant_slot,
+                        plant_container,
+                        cancel,
+                    }) => {
+                        let payload = build_subpacket_myroom_plant_crop(
+                            sub_seq,
+                            plant_item_no,
+                            plant_slot,
+                            plant_container,
+                            cancel,
+                        );
+                        send_myroom_request(
+                            map,
+                            payload,
+                            "MYROOM_PLANT_CROP",
+                            &mut sub_seq,
+                            server_last_seq,
+                            &event_tx,
+                        )
+                        .await;
+                    }
+                    Some(AgentCommand::MyroomPlantStop {
+                        plant_item_no,
+                        plant_slot,
+                        plant_container,
+                    }) => {
+                        let payload = build_subpacket_myroom_plant_stop(
+                            sub_seq,
+                            plant_item_no,
+                            plant_slot,
+                            plant_container,
+                        );
+                        send_myroom_request(
+                            map,
+                            payload,
+                            "MYROOM_PLANT_STOP",
+                            &mut sub_seq,
+                            server_last_seq,
+                            &event_tx,
+                        )
+                        .await;
+                    }
+                    Some(AgentCommand::MyroomMode { mode }) => {
+                        // The refusal chain runs here too, so a refused request never reaches the
+                        // wire; the client already printed or buzzed its signal. Leaving layout mode
+                        // for normal play owes the all-zero c2s 0x0FA.
+                        let house = mog.myroom.map(|room| crate::myroom_layout::HouseView {
+                            map_number: room.model,
+                            sub_map: room.sub_map,
+                            door_open: room.door_open,
+                        });
+                        let gates = crate::myroom_layout::ArrangeGates::for_house(
+                            mog.layout_mode,
+                            house,
+                            mog.login_in_mog_house,
+                        );
+                        match crate::myroom_layout::plan_arrange(
+                            crate::myroom_layout::ArrangeRequest::from_slash(mode),
+                            &gates,
+                            None,
+                        ) {
+                            Ok(transition) => {
+                                if transition.announces_layout_end {
+                                    let payload = build_subpacket_myroom_layout_done(sub_seq);
+                                    send_myroom_request(
+                                        map,
+                                        payload,
+                                        "MYROOM_LAYOUT(end)",
+                                        &mut sub_seq,
+                                        server_last_seq,
+                                        &event_tx,
+                                    )
+                                    .await;
+                                }
+                                mog.layout_mode = transition.next;
+                                tracing::debug!(
+                                    previous = transition.previous,
+                                    next = transition.next,
+                                    closes = transition.closes.len(),
+                                    reopens_myroom = transition.reopens_myroom,
+                                    "myroom arrangement mode changed"
+                                );
+                                let _ = event_tx.send(AgentEvent::MyroomModeChanged {
+                                    previous: transition.previous,
+                                    next: transition.next,
+                                });
+                            }
+                            Err(refusal) => {
+                                tracing::debug!(
+                                    ?refusal,
+                                    signal = ?refusal.signal(),
+                                    "myroom arrangement request refused"
+                                );
+                            }
+                        }
+                    }
+                    Some(AgentCommand::CommitMacros { slots }) => {
+                        // Macros are client-local (vault main_menu.md §41 [V-
+                        // negative wire]): no packet here — normalize under the
+                        // DAT capacity law, rewrite this character's entry in
+                        // the store file, then fold so runtime and file agree by
+                        // construction. A failed write warns but keeps the
+                        // session running (the next commit retries); a folded
+                        // edit that never hit disk survives until that retry.
+                        let normalized =
+                            crate::macro_store::normalize_macro_slots(&slots);
+                        match &macro_store {
+                            None => tracing::warn!("CommitMacros dropped: no store path"),
+                            Some(store) => {
+                                let mut persisted = store.load().unwrap_or_else(|e| {
+                                    tracing::warn!(error = %e, "macro store unreadable for commit — rewriting from scratch");
+                                    crate::macro_store::PersistedMacros::default()
+                                });
+                                persisted
+                                    .by_character
+                                    .insert(macro_char_key.clone(), normalized.clone());
+                                if let Err(e) = store.save(&persisted) {
+                                    tracing::warn!(
+                                        error = %e,
+                                        path = %store.path().display(),
+                                        "macro commit not persisted (runtime still updated)"
+                                    );
+                                }
+                                let _ = event_tx.send(AgentEvent::MacrosLoaded { slots: normalized });
+                            }
+                        }
+                    }
+                    Some(AgentCommand::CommitEmoteOrder { ids }) => {
+                        // The emote order is client-local like macros — retail
+                        // rewrites its user blob at swap time and never sends it
+                        // (FFXiMain.dll retail-2026-09 `.text 0x2259C6` fill law,
+                        // no wire [V-negative]): rewrite this character's entry,
+                        // then fold so runtime and file agree by construction.
+                        match &emote_store {
+                            None => tracing::warn!("CommitEmoteOrder dropped: no store path"),
+                            Some(store) => {
+                                let mut persisted = store.load().unwrap_or_else(|e| {
+                                    tracing::warn!(error = %e, "emote store unreadable for commit — rewriting from scratch");
+                                    crate::emote_store::PersistedEmoteOrder::default()
+                                });
+                                persisted
+                                    .by_character
+                                    .insert(
+                                        crate::emote_store::PersistedEmoteOrder::key(&character_name),
+                                        ids.clone(),
+                                    );
+                                if let Err(e) = store.save(&persisted) {
+                                    tracing::warn!(
+                                        error = %e,
+                                        path = %store.path().display(),
+                                        "emote-order commit not persisted (runtime still updated)"
+                                    );
+                                }
+                                let _ = event_tx.send(AgentEvent::EmoteOrderLoaded { ids });
+                            }
+                        }
+                    }
+                    Some(AgentCommand::RequestCurrencies { mode }) => {
+                        // LSB rejects both report requests while an event is open
+                        // (`.blockedBy({BlockedState::InEvent})`, vendor/server/src/map/packets/
+                        // c2s/0x10f_currencies_1.cpp) — skip the press instead of burning a seq
+                        // slot on a silent drop; the retail window simply shows the next report
+                        // when re-opened after the event (nothing is cached either way).
+                        if in_event(&dialog_session, &pending_event_end) {
+                            tracing::debug!(mode, "skipping currency request while in event");
+                        } else {
+                            let payload = build_subpacket_currencies(sub_seq, mode == 1);
+                            sub_seq = sub_seq.wrapping_add(1);
+                            if let Err(e) = map
+                                .send_encrypted(
+                                    &payload,
+                                    datagram_header_id(sub_seq),
+                                    server_last_seq,
+                                )
+                                .await
+                            {
+                                tracing::warn!(error = %e, mode, "currency request send failed");
+                            }
+                        }
+                    }
+                    // c2s 0x116 / 0x117 are refused while an event is open
+                    // (`.blockedBy({BlockedState::InEvent})`, vendor/server/src/map/packets/c2s/
+                    // 0x116_unity_menu.cpp, 0x117_unity_quest.cpp): skip them then, so the folded
+                    // request marks stay set for the next window open.
+                    Some(AgentCommand::RequestUnityRanking { result_set }) => {
+                        if in_event(&dialog_session, &pending_event_end) {
+                            tracing::debug!(result_set, "skipping unity ranking request in event");
+                        } else {
+                            let payload =
+                                build_subpacket_unity_menu(sub_seq, u32::from(result_set));
+                            sub_seq = sub_seq.wrapping_add(1);
+                            match map
+                                .send_encrypted(
+                                    &payload,
+                                    datagram_header_id(sub_seq),
+                                    server_last_seq,
+                                )
+                                .await
+                            {
+                                Ok(()) => {
+                                    let _ = event_tx
+                                        .send(AgentEvent::UnityRankingRequested { result_set });
+                                }
+                                Err(e) => {
+                                    tracing::warn!(error = %e, result_set, "unity menu send failed");
+                                }
+                            }
+                        }
+                    }
+                    Some(AgentCommand::RequestUnityQuest) => {
+                        if in_event(&dialog_session, &pending_event_end) {
+                            tracing::debug!("skipping unity quest request in event");
+                        } else {
+                            let payload = build_subpacket_unity_quest(sub_seq);
+                            sub_seq = sub_seq.wrapping_add(1);
+                            match map
+                                .send_encrypted(
+                                    &payload,
+                                    datagram_header_id(sub_seq),
+                                    server_last_seq,
+                                )
+                                .await
+                            {
+                                Ok(()) => {
+                                    let _ = event_tx.send(AgentEvent::UnityQuestRequested);
+                                }
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "unity quest send failed");
+                                }
+                            }
+                        }
+                    }
+                    Some(AgentCommand::SetUnityChat { mode }) => {
+                        let payload = build_subpacket_unity_toggle(sub_seq, mode);
+                        sub_seq = sub_seq.wrapping_add(1);
+                        if let Err(e) = map
+                            .send_encrypted(&payload, datagram_header_id(sub_seq), server_last_seq)
+                            .await
+                        {
+                            tracing::warn!(error = %e, mode, "unity toggle send failed");
+                        }
+                    }
+                    Some(AgentCommand::RequestAlterEgoPoints) => {
+                        let payload = build_subpacket_alter_ego_points_request(sub_seq);
+                        sub_seq = sub_seq.wrapping_add(1);
+                        if let Err(e) = map
+                            .send_encrypted(&payload, datagram_header_id(sub_seq), server_last_seq)
+                            .await
+                        {
+                            tracing::warn!(error = %e, "alter ego points request send failed");
+                        }
+                    }
+                    // LSB refuses c2s 0x0C1 in an event or an abnormal status
+                    // (vendor/server/src/map/packets/c2s/0x0c1_alter_ego_points.cpp validate).
+                    Some(AgentCommand::UpgradeAlterEgo { upgrade_id }) => {
+                        if in_event(&dialog_session, &pending_event_end) {
+                            tracing::debug!(upgrade_id, "skipping alter ego upgrade in event");
+                        } else {
+                            let payload = build_subpacket_alter_ego_points(sub_seq, upgrade_id);
+                            sub_seq = sub_seq.wrapping_add(1);
+                            if let Err(e) = map
+                                .send_encrypted(
+                                    &payload,
+                                    datagram_header_id(sub_seq),
+                                    server_last_seq,
+                                )
+                                .await
+                            {
+                                tracing::warn!(error = %e, upgrade_id, "alter ego upgrade send failed");
+                            }
+                        }
+                    }
+                    // LSB refuses c2s 0x0BE, 0x0BF and 0x0C0 in an event
+                    // (`.blockedBy({BlockedState::InEvent})`, vendor/server/src/map/packets/c2s/
+                    // 0x0be_merits.cpp, 0x0bf_job_points_spend.cpp, 0x0c0_job_points_req.cpp).
+                    Some(
+                        command @ (AgentCommand::SetMeritMode { .. }
+                        | AgentCommand::EditMerit { .. }
+                        | AgentCommand::SpendJobPoint { .. }
+                        | AgentCommand::RequestJobPoints),
+                    ) => {
+                        if in_event(&dialog_session, &pending_event_end) {
+                            tracing::debug!(?command, "skipping merit / job point send in event");
+                        } else if let Some(payload) = merit_command_payload(&command, sub_seq) {
+                            sub_seq = sub_seq.wrapping_add(1);
+                            if let Err(e) = map
+                                .send_encrypted(
+                                    &payload,
+                                    datagram_header_id(sub_seq),
+                                    server_last_seq,
+                                )
+                                .await
+                            {
+                                tracing::warn!(error = %e, ?command, "merit / job point send failed");
+                            }
+                        }
                     }
                     Some(AgentCommand::MarkKeyItemsSeen { table_index, ids }) => {
                         // LSB blockedBy(InEvent) rejects 0x064 while an event is
@@ -7018,6 +8082,64 @@ fn status_icon_expiry_unix(timestamp: u32, now_unix: u64) -> u32 {
     (now_unix + remaining as u64) as u32
 }
 
+/// s2c 0x063 MISCDATA subtype Merits = **2** (`GP_SERV_COMMAND_MISCDATA_TYPE::Merits`,
+/// vendor/server/src/map/packets/s2c/0x063_miscdata.h); retail's dispatcher case arm
+/// .text FFXiMain.dll retail-2026-09 `0x99290` stores the two dwords and raises flag bit 1.
+const MISCDATA_SUBTYPE_MERITS: u16 = 0x0002;
+
+/// Decode one MISCDATA Merits record — LSB `GP_SERV_COMMAND_MISCDATA::MERITS`
+/// (vendor/server/src/map/packets/s2c/0x063_miscdata_merits.h): body {type u16, unknown06
+/// u16, limitPoints u16, bit-word u16 {merit points bits 0..6, BLU bonus bits 7..12,
+/// can-use-merit-mode bit 13, xp-capped-or-merit-mode bit 14, merit-mode-enabled bit 15},
+/// maxMeritPoints u8}. Retail copies body dwords +4/+8 straight to its store
+/// (.text FFXiMain.dll retail-2026-09 `0x99290` — [0x485826]/[0x48582A]), where the Status
+/// Merit Points gate reads limitPoints + byte 0x485829 bit-mask 0x20 = can-use-merit-mode
+/// (gate body `.text 0x148E88`; bead kuluu-o9qt7.43).
+fn decode_miscdata_merits(data: &[u8]) -> Option<kuluu_snapshot::MisdataMerits> {
+    const BODY_MIN: usize = 9;
+    if data.len() < BODY_MIN
+        || !matches!(
+            u16::from_le_bytes([data[0], data[1]]),
+            MISCDATA_SUBTYPE_MERITS
+        )
+    {
+        return None;
+    }
+    let limit_points = u16::from_le_bytes([data[4], data[5]]);
+    let bits = u16::from_le_bytes([data[6], data[7]]);
+    Some(kuluu_snapshot::MisdataMerits {
+        limit_points,
+        merit_points: (bits & 0x7F) as u8,
+        blu_bonus: ((bits >> 7) & 0x3F) as u8,
+        can_use_merit_mode: bits & (1 << 13) != 0,
+        xp_capped_or_merit_mode: bits & (1 << 14) != 0,
+        merit_mode_enabled: bits >> 15 != 0,
+        max_merit_points: data[8],
+    })
+}
+
+fn homepoint_masks(record: &decode::MiscdataHomepoints) -> kuluu_snapshot::HomepointMasks {
+    kuluu_snapshot::HomepointMasks {
+        home_point: record.home_point,
+        survival_guide: record.survival_guide,
+        waypoint: record.waypoint,
+        telepoint: record.telepoint,
+        atmos: record.atmos,
+        eschan_portal: record.eschan_portal,
+    }
+}
+
+fn job_points_record(record: &decode::MiscdataJobPoints) -> kuluu_snapshot::JobPointsRecord {
+    kuluu_snapshot::JobPointsRecord {
+        access: record.access,
+        jobs: record.jobs.map(|job| kuluu_snapshot::JobPointsJob {
+            capacity_points: job.capacity_points,
+            current_jp: job.current_jp,
+            total_jp_spent: job.total_jp_spent,
+        }),
+    }
+}
+
 fn decode_miscdata_status_icons(data: &[u8]) -> Option<(Vec<u16>, Vec<u32>)> {
     const TYPE_OFFSET: usize = 0;
     const ICONS_OFFSET: usize = 4;
@@ -7358,6 +8480,44 @@ fn spawn_ah_search(
     });
 }
 
+/// Runs one player-search round-trip off the session loop (vault
+/// main_menu.md section 26). Serialized like [`spawn_ah_search`]; TCP_SEARCH
+/// needs no paging request — LSB queues every result frame with the reply.
+fn spawn_player_search(
+    inflight: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    event_tx: &broadcast::Sender<AgentEvent>,
+    host: String,
+    filters: Vec<ffxi_proto::search::SearchFilter>,
+    all_pages: bool,
+) {
+    use std::sync::atomic::Ordering;
+    if inflight.swap(true, Ordering::AcqRel) {
+        let _ = event_tx.send(AgentEvent::Error {
+            message: "player search already in flight".into(),
+        });
+        return;
+    }
+    let inflight = inflight.clone();
+    let event_tx = event_tx.clone();
+    tokio::spawn(async move {
+        let event = match crate::search_client::player_search(&host, &filters, all_pages).await {
+            Ok(pages) => AgentEvent::PlayerSearchCompleted {
+                total: pages.total,
+                players: pages
+                    .hits
+                    .iter()
+                    .map(crate::search_client::search_hit_to_view)
+                    .collect(),
+            },
+            Err(e) => AgentEvent::Error {
+                message: format!("player search: {e:#}"),
+            },
+        };
+        inflight.store(false, Ordering::Release);
+        let _ = event_tx.send(event);
+    });
+}
+
 async fn send_pbx(
     map: &mut MapClient,
     op: &crate::state::DeliveryBoxOp,
@@ -7502,6 +8662,33 @@ async fn send_mog_house_exit(
     }
 }
 
+/// Send one c2s 0x0CB MYROOM_IS with the caller-chosen Kind/Param bytes — every
+/// sender in retail routes through the helper FFXiMain.dll retail-2026-09 .text 0xF0A40
+/// (its three call sites: door arm .text 0x145585/0x145593 and the roomlist remodel
+/// driver .text 0x1D6AF5; vault main_menu.md §59 addendum 20).
+async fn send_myroom_is(
+    map: &mut MapClient,
+    kind: u8,
+    param1: u8,
+    param2: u16,
+    sub_seq: &mut u16,
+    server_last_seq: u16,
+    event_tx: &broadcast::Sender<AgentEvent>,
+) {
+    let payload = build_subpacket_myroom_is(*sub_seq, kind, param1, param2);
+    tracing::info!(kind, param1, param2, "sending 0x0CB MYROOM_IS");
+    *sub_seq = sub_seq.wrapping_add(1);
+    if let Err(e) = map
+        .send_encrypted(&payload, datagram_header_id(*sub_seq), server_last_seq)
+        .await
+    {
+        tracing::warn!(error = %e, "myroom_is send failed");
+        let _ = event_tx.send(AgentEvent::Error {
+            message: format!("MyRoomIs send: {e}"),
+        });
+    }
+}
+
 async fn send_myroom_job(
     map: &mut MapClient,
     main_job: Option<u8>,
@@ -7520,6 +8707,31 @@ async fn send_myroom_job(
         tracing::warn!(error = %e, "myroom_job send failed");
         let _ = event_tx.send(AgentEvent::Error {
             message: format!("ChangeJob send: {e}"),
+        });
+    }
+}
+
+/// One outbound Mog House furniture/plant request (c2s 0x0FA..0x0FF): send it as its own sub-packet
+/// and report a wire failure like every other sender does. Retail emits these one at a time from the
+/// layout flush (`.text FFXiMain.dll retail-2026-09 0x1CE7A0` clears each object's dirty byte only
+/// after its helper returns success), so kuluu never batches two into one datagram deliberately.
+async fn send_myroom_request(
+    map: &mut MapClient,
+    payload: Vec<u8>,
+    label: &'static str,
+    sub_seq: &mut u16,
+    server_last_seq: u16,
+    event_tx: &broadcast::Sender<AgentEvent>,
+) {
+    tracing::info!(label, bytes = payload.len(), "sending myroom request");
+    *sub_seq = sub_seq.wrapping_add(1);
+    if let Err(e) = map
+        .send_encrypted(&payload, datagram_header_id(*sub_seq), server_last_seq)
+        .await
+    {
+        tracing::warn!(error = %e, label, "myroom request send failed");
+        let _ = event_tx.send(AgentEvent::Error {
+            message: format!("{label} send: {e}"),
         });
     }
 }

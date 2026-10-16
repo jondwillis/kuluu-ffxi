@@ -103,6 +103,20 @@ pub fn extract_texture_name(body: &[u8]) -> Option<String> {
     extract_texture_tokens(body).map(|(_, id)| id)
 }
 
+/// A texture's whole name: namespace then local token, as stored.
+pub type QualifiedTextureName = [u8; QUALIFIED_NAME_LEN];
+
+pub const QUALIFIED_NAME_LEN: usize = 2 * imginfo::TOKEN_LEN;
+
+/// The IMG chunk's 16 name bytes verbatim, the form a static model matches its parts against
+/// (.agents/skills/retail-observe/references/2026-10-15-mog-house-arrange.md A2).
+pub fn texture_name_raw(body: &[u8]) -> Option<QualifiedTextureName> {
+    if body.len() < imginfo::NAME_END || !imginfo::NAMED_HEADER_FLAGS.contains(&body[0]) {
+        return None;
+    }
+    body[1..imginfo::NAME_END].try_into().ok()
+}
+
 mod imginfo {
 
     pub const FLG_DXT: u8 = 0xA1;
@@ -749,6 +763,20 @@ pub(crate) mod tests {
             (128, 128),
             "the constant offsets must land on the retail Width/Height words"
         );
+    }
+
+    #[test]
+    fn the_raw_name_is_the_16_bytes_after_the_type_byte() {
+        assert_eq!(
+            texture_name_raw(&RETAIL_0X81_IMG_HEADER).as_ref(),
+            Some(b"effect  smoke01 ")
+        );
+        let blank = img_body_named(b"                ");
+        assert_eq!(texture_name_raw(&blank), Some(*b"                "));
+        assert_eq!(texture_name_raw(&blank[..imginfo::NAME_END - 1]), None);
+        let mut unnamed = img_body_named(QUALIFIED_FIR);
+        unnamed[0] = 0;
+        assert_eq!(texture_name_raw(&unnamed), None);
     }
 
     #[test]

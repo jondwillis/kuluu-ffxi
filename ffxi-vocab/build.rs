@@ -21,11 +21,16 @@ const LSB_ITEM_BASIC_SQL: &str = "../vendor/server/sql/item_basic.sql";
 const LSB_ITEM_EQUIPMENT_SQL: &str = "../vendor/server/sql/item_equipment.sql";
 const LSB_ITEM_USABLE_SQL: &str = "../vendor/server/sql/item_usable.sql";
 const LSB_ITEM_WEAPON_SQL: &str = "../vendor/server/sql/item_weapon.sql";
+const LSB_SYNTH_RECIPES_SQL: &str = "../vendor/server/sql/synth_recipes.sql";
+const LSB_SYNTHUTILS_CPP: &str = "../vendor/server/src/map/utils/synthutils.cpp";
+const LSB_ITEMS_H: &str = "../vendor/server/src/map/items.h";
 const LSB_STATUS_EFFECTS_YAML: &str = "../vendor/server/data/status_effects.yaml";
 const LSB_STATUS_EFFECT_FLAG_YAML: &str = "../vendor/server/data/enums/status_effect_flag.yaml";
 const LSB_ZONE_ENUM_YAML: &str = "../vendor/server/data/enums/zone.yaml";
 const LSB_ZONES_DATA_DIR: &str = "../vendor/server/data/zones";
 const LSB_EMOTE_H: &str = "../vendor/server/src/map/enums/emote.h";
+const LSB_QUESTS_LUA: &str = "../vendor/server/scripts/globals/quests.lua";
+const LSB_QUEST_LOG_LUA: &str = "../vendor/server/scripts/enum/quest_log.lua";
 
 /// Smallest row count each scrape can return and still plausibly have parsed
 /// its source; the argument is the count the pinned vendor tree yields today
@@ -46,6 +51,7 @@ mod floor {
     pub const JOB_NAME: usize = scrape_floor(23);
     pub const SPELL: usize = scrape_floor(890);
     pub const SPELL_SKILL: usize = scrape_floor(771);
+    pub const SPELL_GROUP: usize = scrape_floor(891);
     pub const SPELL_VALID_TARGET: usize = scrape_floor(891);
     pub const SPELL_ANIMATION: usize = scrape_floor(891);
     pub const SPELL_CAST_TIME: usize = scrape_floor(891);
@@ -67,10 +73,15 @@ mod floor {
     pub const MOB_SKILL_ANIMATION: usize = scrape_floor(4344);
     pub const EMOTE: usize = scrape_floor(51);
     pub const TRANSPORT: usize = scrape_floor(24);
+    pub const SYNTH_RECIPE: usize = scrape_floor(4390);
+    pub const SYNTH_CRYSTAL_GROUP: usize = scrape_floor(8);
+    pub const QUEST_ENTRY: usize = scrape_floor(1084);
 }
 
 fn main() -> Result<()> {
     scrape_transport()?;
+    scrape_synth()?;
+    scrape_quests()?;
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed={LSB_MSG_BASIC_H}");
     println!("cargo:rerun-if-changed={LSB_MSG_LUA}");
@@ -84,6 +95,9 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed={LSB_ITEM_EQUIPMENT_SQL}");
     println!("cargo:rerun-if-changed={LSB_ITEM_USABLE_SQL}");
     println!("cargo:rerun-if-changed={LSB_ITEM_WEAPON_SQL}");
+    println!("cargo:rerun-if-changed={LSB_SYNTH_RECIPES_SQL}");
+    println!("cargo:rerun-if-changed={LSB_SYNTHUTILS_CPP}");
+    println!("cargo:rerun-if-changed={LSB_ITEMS_H}");
     println!("cargo:rerun-if-changed={LSB_STATUS_EFFECTS_YAML}");
     println!("cargo:rerun-if-changed={LSB_STATUS_EFFECT_FLAG_YAML}");
     println!("cargo:rerun-if-changed={LSB_EMOTE_H}");
@@ -244,6 +258,27 @@ fn main() -> Result<()> {
         LSB_SPELL_LIST_SQL,
         spell_skill_entries.len(),
         floor::SPELL_SKILL,
+    )?;
+
+    // vendor/server/sql/spell_list.sql field 3 `group`, the xi.magic.spellGroup number
+    // (vendor/server/scripts/enum/magic.lua), which drives retail's Magic category picker.
+    let spell_group_entries: Vec<(u16, u8)> = parse_u16_pair_rows(&spell_src, "spell_list", 3)?
+        .into_iter()
+        // Every group fits in the xi.magic.spellGroup enum (0..=8); a wider value means the
+        // SQL grew past that law, so saturate and let the count floor catch mass drift.
+        .map(|(id, group)| (id, u8::try_from(group).unwrap_or(u8::MAX)))
+        .collect();
+    write_u16_u8_table(
+        &out_dir.join("spell_group_table.rs"),
+        "SPELL_GROUP",
+        LSB_SPELL_LIST_SQL,
+        &spell_group_entries,
+    )?;
+    check_scrape_count(
+        "spell-group entries",
+        LSB_SPELL_LIST_SQL,
+        spell_group_entries.len(),
+        floor::SPELL_GROUP,
     )?;
 
     let spell_target_entries = parse_u16_pair_rows(&spell_src, "spell_list", 7)?;
@@ -1300,4 +1335,452 @@ fn scrape_transport() -> Result<()> {
         output,
     )?;
     Ok(())
+}
+
+/// Mirror of the recipe table LSB loads at boot (`LoadSynthRecipes` reads
+/// vendor/server/sql/synth_recipes.sql) plus the crystal element groups from its
+/// `crystalProps`. The server resolves a synth ask by keying against these exact
+/// rows (`resolveRecipe`, `SynthRecipe::ingredientKey` in
+/// vendor/server/src/map/utils/synthutils.cpp), so kuluu can only offer what the
+/// table carries, and an ask must name ingredients in the row's own order.
+fn scrape_synth() -> Result<()> {
+    println!("cargo:rerun-if-changed={LSB_SYNTH_RECIPES_SQL}");
+    println!("cargo:rerun-if-changed={LSB_SYNTHUTILS_CPP}");
+    let items_src =
+        fs::read_to_string(LSB_ITEMS_H).with_context(|| format!("reading {LSB_ITEMS_H}"))?;
+    let synthutils_src = fs::read_to_string(LSB_SYNTHUTILS_CPP)
+        .with_context(|| format!("reading {LSB_SYNTHUTILS_CPP}"))?;
+
+    let mut output = String::from("pub const SYNTH_CRYSTAL_GROUPS: &[CrystalGroup] = &[\n");
+    let groups = scrape_crystal_groups(&synthutils_src, &items_src)?;
+    for (element, crystals) in &groups {
+        let ids = crystals
+            .iter()
+            .map(u16::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        output.push_str(&format!(
+            "    CrystalGroup {{ element: {}, crystals: [{ids}] }},\n",
+            rust_string_literal(element)
+        ));
+    }
+    output.push_str("];\n");
+    check_scrape_count(
+        "crystal element groups",
+        LSB_SYNTHUTILS_CPP,
+        groups.len(),
+        floor::SYNTH_CRYSTAL_GROUP,
+    )?;
+
+    let recipe_src = fs::read_to_string(LSB_SYNTH_RECIPES_SQL)
+        .with_context(|| format!("reading {LSB_SYNTH_RECIPES_SQL}"))?;
+    output.push_str("\npub const SYNTH_RECIPES: &[SynthRecipe] = &[\n");
+    let mut count = 0usize;
+    for (id, f) in sql_rows(&recipe_src, "synth_recipes")? {
+        if f.len() != RECIPE_COLUMNS {
+            bail!(
+                "synth_recipes row {id} has {} columns, expected {RECIPE_COLUMNS}",
+                f.len()
+            );
+        }
+        let num = |name: &str, i: usize| -> Result<u64> {
+            f[i].trim()
+                .parse::<u64>()
+                .with_context(|| format!("synth_recipes row {id} column `{name}` is {:?}", f[i]))
+        };
+        let num8 = |name: &str, i: usize| -> Result<u8> {
+            u8::try_from(num(name, i)?).with_context(|| format!("column `{name}` of row {id}"))
+        };
+        let num16 = |name: &str, i: usize| -> Result<u16> {
+            u16::try_from(num(name, i)?).with_context(|| format!("column `{name}` of row {id}"))
+        };
+
+        // CRAFT_DESYNTHESIS (vendor/server/src/map/items/craft_state.h) is the
+        // only mode LSB branches on for this column.
+        let desynth = match num("Desynth", 1)? {
+            0 => false,
+            1 => true,
+            value => bail!("synth_recipes row {id} has Desynth {value}, expected 0/1"),
+        };
+        let key_item = u32::try_from(num("KeyItem", 2)?)
+            .with_context(|| format!("column `KeyItem` of row {id}"))?;
+
+        // The eight skill columns (Wood..Cook) and Ingredient1..8 keep their SQL
+        // column order — that order is what `ingredientKey` joins and what the
+        // per-skill difficulty check reads.
+        let skills = (0..8usize)
+            .map(|k| num8(&format!("skill {}", k + 1), 3 + k))
+            .collect::<Result<Vec<u8>>>()?;
+        let crystal = num16("Crystal", 11)?;
+        let hq_crystal = num16("HQCrystal", 12)?;
+        let ingredients = (0..8usize)
+            .map(|k| num16(&format!("Ingredient{}", k + 1), 13 + k))
+            .collect::<Result<Vec<u16>>>()?;
+        let result = num16("Result", 21)?;
+        let results_hq = (0..3usize)
+            .map(|k| num16(&format!("ResultHQ{}", k + 1), 22 + k))
+            .collect::<Result<Vec<u16>>>()?;
+        // ResultQty, then the three HQ quantities.
+        let qty = (0..4usize)
+            .map(|k| num8(&format!("ResultQty{k}"), 25 + k))
+            .collect::<Result<Vec<u8>>>()?;
+
+        let name = unquote_dump_string(f[29])
+            .with_context(|| format!("synth_recipes row {id} has a non-string ResultName"))?;
+        let content_tag = if f[30].trim() == "NULL" {
+            None
+        } else {
+            Some(unquote_dump_string(f[30]).with_context(|| {
+                format!("synth_recipes row {id} has a bad content_tag {:?}", f[30])
+            })?)
+        };
+
+        let list = |v: &[u16]| v.iter().map(u16::to_string).collect::<Vec<_>>().join(", ");
+        output.push_str(&format!(
+            "    SynthRecipe {{ id: {id}, desynth: {desynth}, key_item: {key_item}, skill_required: [{}], crystal: {crystal}, hq_crystal: {hq_crystal}, ingredients: [{}], result: {result}, result_hq: [{}], qty: [{}], name: {}, content_tag: {} }},\n",
+            skills.iter().map(u8::to_string).collect::<Vec<_>>().join(", "),
+            list(&ingredients),
+            list(&results_hq),
+            qty.iter().map(u8::to_string).collect::<Vec<_>>().join(", "),
+            rust_string_literal(&name),
+            match &content_tag {
+                None => "None".to_string(),
+                Some(tag) => format!("Some({})", rust_string_literal(tag)),
+            },
+        ));
+        count += 1;
+    }
+    output.push_str("];\n");
+    check_scrape_count(
+        "synth recipes",
+        LSB_SYNTH_RECIPES_SQL,
+        count,
+        floor::SYNTH_RECIPE,
+    )?;
+
+    let out_dir = PathBuf::from(std::env::var("OUT_DIR")?);
+    fs::write(out_dir.join("craft_table.rs"), output)?;
+    Ok(())
+}
+
+/// Column count of the `synth_recipes` CREATE TABLE in synth_recipes.sql.
+const RECIPE_COLUMNS: usize = 31;
+
+/// Scrape the quest id lattice LSB hands the client: `xi.quest.id.<area>` in
+/// scripts/globals/quests.lua, keyed by the `xi.questLog` enum indices
+/// (scripts/enum/quest_log.lua) — the same 0..10 log order the s2c 0x056 quest
+/// ports address (vault main_menu.md §31).
+fn scrape_quests() -> Result<()> {
+    println!("cargo:rerun-if-changed={LSB_QUESTS_LUA}");
+    println!("cargo:rerun-if-changed={LSB_QUEST_LOG_LUA}");
+    let enum_src = fs::read_to_string(LSB_QUEST_LOG_LUA)
+        .with_context(|| format!("reading {LSB_QUEST_LOG_LUA}"))?;
+    let mut areas: Vec<(u8, String)> = Vec::new();
+    for line in lua_table_body(&enum_src, "xi.questLog")?.lines() {
+        if let Some((key, value)) = line.split_once('=') {
+            let key = key.trim().to_string();
+            let digits = value
+                .trim_end_matches(',')
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            if key.is_empty() || !key.chars().all(|c| c.is_ascii_uppercase() || c == '_') {
+                continue;
+            }
+            // `NONE = -1` names the sentinel, not a log; every other entry is an index.
+            let id: i64 = digits
+                .parse()
+                .with_context(|| format!("xi.questLog entry `{key}` has value {digits:?}"))?;
+            if id < 0 {
+                continue;
+            }
+            let id =
+                u8::try_from(id).with_context(|| format!("xi.questLog entry `{key}` = {id}"))?;
+            if areas.iter().any(|(_, k)| *k == key) {
+                bail!("duplicate xi.questLog entry `{key}");
+            }
+            areas.push((id, key));
+        }
+    }
+    check_scrape_count("quest log areas", LSB_QUEST_LOG_LUA, areas.len(), 11)?;
+
+    let src =
+        fs::read_to_string(LSB_QUESTS_LUA).with_context(|| format!("reading {LSB_QUESTS_LUA}"))?;
+    let mut rows: Vec<(u8, u16, String)> = Vec::new();
+    let mut current: Option<u8> = None;
+    for line in src.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("[xi.quest.area[xi.questLog.") {
+            let name = rest
+                .split("]]")
+                .next()
+                .context("malformed xi.quest.area header")?;
+            let (idx, _) = areas
+                .iter()
+                .find(|(_, k)| *k == name)
+                .with_context(|| format!("quest area `{name}` is not in {LSB_QUEST_LOG_LUA}"))?;
+            current = Some(*idx);
+            continue;
+        }
+        if trimmed.starts_with('}') {
+            // Closing brace of an area block, the xi.quest.id table, or one of
+            // the file's earlier tables; in every case no entry is inside it.
+            current = None;
+            continue;
+        }
+        let Some(log) = current else { continue };
+        if trimmed.is_empty() || trimmed.starts_with("--") {
+            continue;
+        }
+        let Some((key, value)) = trimmed.split_once('=') else {
+            continue;
+        };
+        if !key
+            .trim()
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+            || key.trim().is_empty()
+        {
+            continue;
+        }
+        let digits = value
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .trim_end_matches(',');
+        let Ok(id) = digits.parse::<u16>() else {
+            continue;
+        };
+        // The wire law is a 256-bit field per log (Data[8]); an id past that
+        // could never be addressed, so the scrape must notice before kuluu does.
+        if id > 255 {
+            bail!(
+                "quest `{}` in area {log} has id {id}, outside the s2c 0x056 bitmask",
+                key.trim()
+            );
+        }
+        rows.push((log, id, prettify_snake_case(key.trim())));
+    }
+    check_scrape_count(
+        "quest lattice entries",
+        LSB_QUESTS_LUA,
+        rows.len(),
+        floor::QUEST_ENTRY,
+    )?;
+
+    rows.sort_by_key(|(log, id, _)| (*log, *id));
+    if rows
+        .windows(2)
+        .any(|w| (w[0].0, w[0].1) == (w[1].0, w[1].1))
+    {
+        bail!("duplicate quest ids inside one log area");
+    }
+
+    let mut out = String::new();
+    out.push_str("// AUTO-GENERATED by ffxi-vocab/build.rs from scripts/globals/quests.lua\n");
+    out.push_str("// and scripts/enum/quest_log.lua. Do not edit by hand.\n");
+    let names = areas
+        .iter()
+        .map(|(_, key)| rust_string_literal(&prettify_snake_case(key)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    out.push_str(&format!(
+        "/// Quest-log area names in the s2c 0x056 port order (`xi.questLog`).\n\
+         pub const QUEST_AREA_NAMES: [&str; {}] = [{names}];\n",
+        areas.len()
+    ));
+    out.push_str("pub const QUEST_LATTICE: &[(u8, u16, &str)] = &[\n");
+    for (log, id, name) in &rows {
+        out.push_str(&format!(
+            "    ({log}, {id}, {}),\n",
+            rust_string_literal(name)
+        ));
+    }
+    out.push_str("];");
+    let out_dir = PathBuf::from(std::env::var("OUT_DIR").context("OUT_DIR not set")?);
+    fs::write(out_dir.join("quest_lattice_table.rs"), &out)?;
+    Ok(())
+}
+
+/// The text between `table = {` and its closing brace, for simple enum-style lua tables.
+fn lua_table_body<'a>(src: &'a str, table: &str) -> Result<&'a str> {
+    let start = src
+        .find(table)
+        .with_context(|| format!("{table} table not found"))?;
+    let after_eq = start + src[start..].find('=').context("no `=` after table name")?;
+    let open = after_eq
+        + src[after_eq..]
+            .find('{')
+            .context("no `{` after table name")?;
+    let close = src[open..]
+        .find('}')
+        .map(|i| open + i)
+        .context("no closing brace")?;
+    Ok(&src[open + 1..close])
+}
+
+/// Every active `INSERT INTO `<table>` VALUES (...)` row in order: column-0 id +
+/// raw fields (commented-out recipes start with a `-- ` prefix and never match).
+/// mysqldump escapes quotes inside strings as `\'`, which the shared
+/// lsb_scrape splitters do not skip, so this family walks its own scanner.
+fn sql_rows<'a>(src: &'a str, table: &str) -> Result<Vec<(u32, Vec<&'a str>)>> {
+    let needle = format!("INSERT INTO `{table}` VALUES ");
+    let mut rows = Vec::new();
+    for line in src.lines() {
+        let Some(rest) = line.trim().strip_prefix(needle.as_str()) else {
+            continue;
+        };
+        let mut cursor = rest;
+        while let Some(open) = cursor.find('(') {
+            cursor = &cursor[open + 1..];
+            let Some((tuple, after)) = split_backslash_tuple(cursor) else {
+                break;
+            };
+            // A trailing `;` ends the statement; anything past it is a line
+            // comment (many recipes carry `(typo?)`-style notes that would
+            // otherwise read as another tuple).
+            if after.starts_with(';') {
+                let fields = split_backslash_fields(tuple);
+                let id = fields
+                    .first()
+                    .and_then(|s| s.trim().parse::<u32>().ok())
+                    .with_context(|| {
+                        format!("{table} row without a numeric ID: {}", tuple.len())
+                    })?;
+                rows.push((id, fields));
+                break;
+            }
+            cursor = after;
+            let fields = split_backslash_fields(tuple);
+            let id = fields
+                .first()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+                .with_context(|| format!("{table} row without a numeric ID: {}", tuple.len()))?;
+            rows.push((id, fields));
+        }
+    }
+    if rows.is_empty() {
+        bail!("parsed zero rows from `INSERT INTO {table}` — SQL format may have changed");
+    }
+    Ok(rows)
+}
+
+/// `(...)` body up to the closing paren, treating `\x` as one escaped unit even
+/// inside strings (the mysqldump escape law).
+fn split_backslash_tuple(s: &str) -> Option<(&str, &str)> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    let mut in_string = false;
+    while i < bytes.len() {
+        if in_string && bytes[i] == b'\\' {
+            i += 2;
+            continue;
+        }
+        match bytes[i] {
+            b'\'' => in_string = !in_string,
+            b')' if !in_string => return Some((&s[..i], &s[i + 1..])),
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+fn split_backslash_fields(tuple: &str) -> Vec<&str> {
+    let bytes = tuple.as_bytes();
+    let mut fields = Vec::new();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    let mut in_string = false;
+    while i < bytes.len() {
+        if in_string && bytes[i] == b'\\' {
+            i += 2;
+            continue;
+        }
+        match bytes[i] {
+            b'\'' => in_string = !in_string,
+            b',' if !in_string => {
+                fields.push(&tuple[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    fields.push(&tuple[start..]);
+    fields
+}
+
+/// Unquote one mysqldump string field: strip the surrounding quotes and collapse
+/// every `\x` escape to its bare character.
+fn unquote_dump_string(field: &str) -> Option<String> {
+    let inner = field.trim().strip_prefix('\'')?.strip_suffix('\'')?;
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            out.push(chars.next()?);
+        } else {
+            out.push(c);
+        }
+    }
+    Some(out)
+}
+
+/// The `case NAME:` chains before each `return { ELEMENT_X, .. };` of
+/// `crystalProps` (vendor/server/src/map/utils/synthutils.cpp) are one element's
+/// crystal tiers; names resolve through the constants in items.h.
+fn scrape_crystal_groups(synthutils_src: &str, items_src: &str) -> Result<Vec<(String, Vec<u16>)>> {
+    let mut ids = std::collections::HashMap::new();
+    for line in items_src.lines() {
+        let Some((name, value)) = line
+            .trim()
+            .strip_suffix(',')
+            .and_then(|t| t.split_once('='))
+        else {
+            continue;
+        };
+        let Ok(value) = value.trim().parse::<u64>() else {
+            continue;
+        };
+        ids.entry(name.trim().to_string()).or_insert(value);
+    }
+
+    let start = synthutils_src
+        .find("auto crystalProps(uint16 itemId)")
+        .context("`crystalProps` not found in synthutils.cpp — did LSB rename it?")?;
+    let mut groups = Vec::new();
+    let mut pending: Vec<u16> = Vec::new();
+    for line in synthutils_src[start..].lines() {
+        let trimmed = line.trim();
+        if let Some(name) = trimmed
+            .strip_prefix("case ")
+            .and_then(|s| s.strip_suffix(':'))
+        {
+            let raw = *ids
+                .get(name)
+                .with_context(|| format!("crystal `{name}` is not an items.h constant"))?;
+            pending.push(
+                u16::try_from(raw).with_context(|| format!("crystal `{name}` overflows u16"))?,
+            );
+        } else if trimmed.starts_with("return { ELEMENT_") {
+            let element = trimmed
+                .split("ELEMENT_")
+                .nth(1)
+                .and_then(|s| s.split(',').next())
+                .with_context(|| format!("malformed crystalProps return: {trimmed}"))?
+                .to_string();
+            anyhow::ensure!(
+                pending.len() == 3,
+                "crystal element {element} carries {} tiers, expected 3",
+                pending.len()
+            );
+            groups.push((element, std::mem::take(&mut pending)));
+        } else if trimmed.starts_with("return {") {
+            // The final `return { 0, SynthesisEffect::None };` ends crystalProps.
+            break;
+        }
+    }
+    Ok(groups)
 }

@@ -161,7 +161,7 @@ pub fn spawn_menu_help_bar(mut commands: Commands) {
 /// retail-style phrasing pending captures (tracked on kuluu-5ndh).
 fn root_entry_help(label: &str) -> &'static str {
     match label {
-        "Magic" => "Cast magic.",
+        menu::ROOT_MAGIC_LIST => "Cast magic.",
         "Abilities" => "Use abilities.",
         "Items" => "Use an item.",
         "Key Items" => "Check key items.",
@@ -170,10 +170,21 @@ fn root_entry_help(label: &str) -> &'static str {
         "Party" => "Organize your party.",
         "Search" => "Search for players.",
         "Map" => "Display the map.",
+        "Synthesis" => "Craft items.",
+        "Trade" => "Offer a trade to your target.",
+        "Linkshell" => "Organize linkshells.",
+        "Region Info" => "Display region information.",
+        "Missions" => "Check your current mission.",
+        "Quests" => "Check quests.",
+        "View House" => "Visit another player's house.",
+        menu::ROOT_SET_BAZAAR => "Sell items from your storage.",
+        "Help Desk" => "Contact the Help Desk.",
         menu::ROOT_COMMUNICATION => "Communicate with other players.",
-        "Macros" => "Edit macros.",
+        menu::ROOT_MACRO_PALETTE => "Edit macros.",
         "Graphics" => "Adjust graphics settings.",
         "Config" => "Change the configuration.",
+        "Interface" => "Adjust interface settings.",
+        "Controls" => "Rebind control keys.",
         menu::ROOT_CURRENT_TIME => "Check the current time.",
         "Debug" => "Toggle debug panels.",
         menu::ROOT_LOG_OUT => "Log out of the game.",
@@ -199,8 +210,40 @@ fn entry_help(kind: MenuKind, cursor: usize, dynamic: &DynamicMenu) -> String {
             _ => "Select an action.".to_string(),
         },
         MenuKind::ItemDropConfirm { .. } => ITEM_DROP_CONFIRM_HELP.to_string(),
-        MenuKind::EmoteList => "Select an emote.".to_string(),
+        // The remodel prompt's question is GetText table-12 text, read from the DAT at load — so it
+        // renders nothing until that catalog loads instead of being typed into the client (.text
+        // FFXiMain.dll retail-2026-09 0x1D6B85; bead kuluu-o9qt7.13.5.2).
+        MenuKind::RoomListConfirm { .. } => dynamic.roomlist_prompt.clone().unwrap_or_default(),
+        // While the swap state word is pending, retail replaces this whole help line
+        // with the DAT table-0x0E prompts (ids 931/932 through the caption catalog;
+        // FFXiMain.dll retail-2026-09 `.text 0x225FA2`; bead kuluu-o9qt7.34) — so does
+        // kuluu, reading the strings [`DynamicMenu`] copied from the DAT.
+        MenuKind::EmoteList => match dynamic.emote_sort_state {
+            menu::EmoteSortState::AwaitFirst => dynamic
+                .emote_sort_prompts
+                .first()
+                .cloned()
+                .flatten()
+                .unwrap_or_default(),
+            menu::EmoteSortState::AwaitSecond(_) => dynamic
+                .emote_sort_prompts
+                .get(1)
+                .cloned()
+                .flatten()
+                .unwrap_or_default(),
+            menu::EmoteSortState::Off => "Select an emote.".to_string(),
+        },
         MenuKind::Status => "Select a category.".to_string(),
+        // .agents/skills/retail-observe/references/2026-10-15-unity-and-fp-windows.md, "Unity
+        // leader variant": DAT text, empty until the catalog loads.
+        MenuKind::UnityLeaders => dynamic.unity_fp.leader_help.clone().unwrap_or_default(),
+        // .agents/skills/retail-observe/references/2026-10-15-merit-and-job-point-windows.md:
+        // `sortyn` shows the raise or lower help line from DAT, empty until the catalog loads.
+        MenuKind::Merit(crate::hud::merit_windows::MeritWindow::SortConfirm { raise, .. }) => {
+            dynamic.merit.sort_help[usize::from(!raise)]
+                .clone()
+                .unwrap_or_default()
+        }
         _ => "Select an option.".to_string(),
     }
 }
@@ -302,6 +345,13 @@ pub fn update_menu_help_bar(
     let (content, is_menu) = match &*mode {
         InputMode::Menu(stack) => (
             stack.active_level().map(|l| {
+                if let MenuKind::Arrange(window) = l.kind {
+                    return BarContent {
+                        title: dynamic.arrange.help_title(),
+                        counter: String::new(),
+                        hint: dynamic.arrange.window_help(window),
+                    };
+                }
                 let option = (l.kind == MenuKind::Items)
                     .then(|| item_focus.sort_selection())
                     .flatten();
@@ -336,6 +386,16 @@ pub fn update_menu_help_bar(
                 hint: crate::hud::check_view::job_ribbon(
                     scene.snapshot.check.as_ref().filter(|c| c.target_id == id),
                 ),
+            }),
+            false,
+        ),
+        // .agents/skills/retail-observe/references/2026-10-15-mog-house-arrange.md B1: layout mode's
+        // help bar title and help are DAT text, empty until the catalogs load.
+        InputMode::Arrange => (
+            Some(BarContent {
+                title: dynamic.arrange.help_title(),
+                counter: String::new(),
+                hint: dynamic.arrange.help_text(),
             }),
             false,
         ),
@@ -474,6 +534,8 @@ mod tests {
             next_use_vana_ts: None,
             use_delay_end_vana_ts: None,
             ready: None,
+
+            extdata: None,
         };
         let snap = SceneSnapshot {
             containers: vec![ContainerView {
@@ -581,5 +643,40 @@ mod tests {
         assert_eq!(buff_bar_content(&snap, 9).unwrap().hint, "Protect");
         let empty = SceneSnapshot::default();
         assert!(buff_bar_content(&empty, 0).is_none());
+    }
+
+    /// Help-line replacement law (bead kuluu-o9qt7.34): while the emote window's swap
+    /// state word is pending, retail swaps this line for its DAT prompts — and back when
+    /// settled (.text FFXiMain.dll retail-2026-09 0x225FA2; cancel arm 0x225E34).
+    #[test]
+    fn emote_list_help_line_follows_the_swap_state() {
+        let mut dynamic = DynamicMenu::default();
+        assert_eq!(
+            entry_help(MenuKind::EmoteList, 0, &dynamic),
+            "Select an emote."
+        );
+        dynamic.emote_sort_prompts = [Some("P1".to_string()), Some("P2".to_string())];
+        dynamic.emote_sort_state = menu::EmoteSortState::AwaitFirst;
+        assert_eq!(entry_help(MenuKind::EmoteList, 0, &dynamic), "P1");
+        dynamic.emote_sort_state = menu::EmoteSortState::AwaitSecond(6);
+        assert_eq!(entry_help(MenuKind::EmoteList, 3, &dynamic), "P2");
+        dynamic.emote_sort_state = menu::EmoteSortState::Off;
+        assert_eq!(
+            entry_help(MenuKind::EmoteList, 0, &dynamic),
+            "Select an emote."
+        );
+    }
+
+    #[test]
+    fn unity_leader_rows_share_the_dat_help_line() {
+        let mut dynamic = DynamicMenu::default();
+        assert_eq!(entry_help(MenuKind::UnityLeaders, 0, &dynamic), "");
+        dynamic.unity_fp.leader_help = Some("leader help".to_string());
+        for cursor in [0, crate::hud::unity_fp::layout::LEADER_ROWS - 1] {
+            assert_eq!(
+                entry_help(MenuKind::UnityLeaders, cursor, &dynamic),
+                "leader help"
+            );
+        }
     }
 }

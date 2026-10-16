@@ -428,6 +428,7 @@ mod tests {
                     .init_resource::<kuluu_render::combat_stance::RestStance>()
                     .init_resource::<kuluu_render::combat_stance::WalkMode>()
                     .init_resource::<kuluu_render::hud_hide::HudHidden>()
+                    .init_resource::<kuluu_render::hud::menu::DynamicMenu>()
                     .add_message::<bevy::window::WindowCloseRequested>()
                     .add_message::<ScreenshotRequest>()
                     .add_systems(PreUpdate, key_drive_system)

@@ -447,6 +447,8 @@ impl MmbRenderState {
 #[derive(Debug, Clone)]
 pub struct MmbModel {
     pub texture_name: String,
+    /// The part's 16 texture-name bytes verbatim; [`Self::texture_name`] keeps only the local half.
+    pub texture_name_raw: crate::texture::QualifiedTextureName,
     pub blending: u16,
     /// Decoded view of `blending`; see [`MmbRenderState`].
     pub render_state: MmbRenderState,
@@ -588,6 +590,9 @@ pub fn parse_models(decrypted: &[u8]) -> Vec<MmbModel> {
                     .collect();
                 s.trim_end().to_string()
             };
+            let mut texture_name_raw = [0u8; crate::texture::QUALIFIED_NAME_LEN];
+            texture_name_raw
+                .copy_from_slice(&decrypted[off..off + crate::texture::QUALIFIED_NAME_LEN]);
             let vertexsize =
                 u16::from_le_bytes([decrypted[off + 16], decrypted[off + 17]]) as usize;
             let blending = u16::from_le_bytes([decrypted[off + 18], decrypted[off + 19]]);
@@ -712,6 +717,7 @@ pub fn parse_models(decrypted: &[u8]) -> Vec<MmbModel> {
             if !indices.is_empty() && !vertices.is_empty() {
                 models.push(MmbModel {
                     texture_name,
+                    texture_name_raw,
                     blending,
                     render_state: MmbRenderState::from_blending(blending),
                     vertex_blend_enabled: d3 == CONFIG_VERTEX_BLEND,
@@ -1211,6 +1217,13 @@ mod tests {
         assert_eq!(decoded[0].indices, JOINED_TRIANGLES);
         assert!(!decoded[0].vertex_blend_enabled);
         assert_eq!(decoded[0].vertices[0].rgba, EXPECTED_RGBA);
+    }
+
+    #[test]
+    fn a_part_keeps_its_whole_texture_name() {
+        let decoded = parse_models(&legacy_mmb(MESH_TYPE_STATIC_STRIP, &JOINED_STRIP));
+        assert_eq!(&decoded[0].texture_name_raw, b"cloud   canopy  ");
+        assert_eq!(decoded[0].texture_name, "canopy");
     }
 
     #[test]

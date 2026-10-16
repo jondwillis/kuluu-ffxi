@@ -4,6 +4,7 @@ use bevy::input::keyboard::{Key, KeyCode};
 use bevy::input::ButtonInput;
 use bevy::prelude::Resource;
 
+pub mod links;
 pub mod pad;
 pub mod presets;
 
@@ -89,6 +90,71 @@ pub enum Action {
     FishingReelLeft,
     FishingReelRight,
     FishingCancel,
+}
+
+impl Action {
+    /// kuluu's Controls-page name for the action (bead kuluu-o9qt7.26.1). The
+    /// page lists one row per entry of the live store, so every variant needs a
+    /// name — no wildcard arm, and adding an action must add its label here.
+    /// Retail's own key-assignment rows are numeric ids law'd in
+    /// [`crate::hud::controls_law`]; kuluu deliberately does NOT map them onto
+    /// these names (only the Confirm/Cancel link groups in the `links` module
+    /// overlap), so the page is a kuluu-only surface (page 3).
+    pub const fn display_name(&self) -> &'static str {
+        match self {
+            Action::MoveForward => "Move forward",
+            Action::MoveBackward => "Move backward",
+            Action::RotateLeft => "Rotate left",
+            Action::RotateRight => "Rotate right",
+            Action::TurnLeft => "Turn left",
+            Action::TurnRight => "Turn right",
+            Action::StrafeLeft => "Strafe left",
+            Action::StrafeRight => "Strafe right",
+            Action::CameraYawLeft => "Camera pan left",
+            Action::CameraYawRight => "Camera pan right",
+            Action::CameraPitchUp => "Camera up",
+            Action::CameraPitchDown => "Camera down",
+            Action::CameraZoomIn => "Zoom in",
+            Action::CameraZoomOut => "Zoom out",
+            Action::ToggleAutorun => "Autorun",
+            Action::ToggleLockOn => "Lock on",
+            Action::ToggleFirstPerson => "First person",
+            Action::TogglePassiveCursor => "Passive cursor",
+            Action::ToggleHud => "Hide HUD",
+            Action::Screenshot => "Screenshot",
+            Action::CycleTarget => "Cycle target",
+            Action::ClearTarget => "Clear target",
+            Action::TargetSelf => "Target self",
+            Action::TargetParty2 => "Target party 2",
+            Action::TargetParty3 => "Target party 3",
+            Action::TargetParty4 => "Target party 4",
+            Action::TargetParty5 => "Target party 5",
+            Action::TargetParty6 => "Target party 6",
+            Action::SelectActiveWindow => "Active window",
+            Action::Sit => "Sit",
+            Action::Heal => "Heal",
+            Action::ToggleWalk => "Walk / run",
+            Action::OpenChat => "Open chat",
+            Action::OpenChatCommand => "Chat command",
+            Action::OpenMenu => "Open menu",
+            Action::ConfirmAction => "Confirm",
+            Action::NavUp => "Cursor up",
+            Action::NavDown => "Cursor down",
+            Action::NavLeft => "Cursor left",
+            Action::NavRight => "Cursor right",
+            Action::NavConfirm => "Menu confirm",
+            Action::NavCancel => "Menu cancel",
+            Action::PageUp => "Page up",
+            Action::PageDown => "Page down",
+            Action::ChatSubmit => "Send chat",
+            Action::ChatExit => "Leave chat",
+            Action::ChatBackspace => "Chat erase",
+            Action::FishingHook => "Fishing: hook",
+            Action::FishingReelLeft => "Fishing: reel left",
+            Action::FishingReelRight => "Fishing: reel right",
+            Action::FishingCancel => "Fishing: cancel",
+        }
+    }
 }
 
 #[derive(
@@ -408,6 +474,22 @@ fn keycode_label(key: KeyCode) -> Option<&'static str> {
         KeyCode::Slash => "/",
         KeyCode::Period => ".",
         KeyCode::Comma => ",",
+        // The presets bind F1..F6 (party targets) and the HUD keys, so the
+        // Controls page needs their names too (bead kuluu-o9qt7.26.1).
+        KeyCode::F1 => "F1",
+        KeyCode::F2 => "F2",
+        KeyCode::F3 => "F3",
+        KeyCode::F4 => "F4",
+        KeyCode::F5 => "F5",
+        KeyCode::F6 => "F6",
+        KeyCode::F7 => "F7",
+        KeyCode::F8 => "F8",
+        KeyCode::F9 => "F9",
+        KeyCode::F10 => "F10",
+        KeyCode::F11 => "F11",
+        KeyCode::F12 => "F12",
+        KeyCode::ScrollLock => "ScrLk",
+        KeyCode::PrintScreen => "PrtSc",
         _ => return None,
     })
 }

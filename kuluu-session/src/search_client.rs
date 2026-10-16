@@ -9,7 +9,7 @@ use anyhow::{bail, Context, Result};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use ffxi_proto::search::{self, AhHistory, AhListing, SearchCrypto};
+use ffxi_proto::search::{self, AhHistory, AhListing, SearchCrypto, SearchFilter, SearchHit};
 
 /// vendor/server/settings/default/network.lua SEARCH_PORT.
 pub const SEARCH_PORT: u16 = 54002;
@@ -109,6 +109,89 @@ async fn ah_history_inner(host: &str, item_id: u16, stack: bool) -> Result<AhHis
     Ok(search::parse_ah_history(&body)?)
 }
 
+/// One player search's frames merged (vendor/server/src/search/search_handler.cpp
+/// HandleSearchRequest queues every result frame up front — no follow-up request,
+/// unlike AH paging; vault main_menu.md §26).
+pub struct PlayerSearchPages {
+    pub total: u16,
+    pub hits: Vec<SearchHit>,
+}
+
+pub async fn player_search(
+    host: &str,
+    filters: &[SearchFilter],
+    all_pages: bool,
+) -> Result<PlayerSearchPages> {
+    tokio::time::timeout(
+        SEARCH_TIMEOUT,
+        player_search_inner(host, filters, all_pages),
+    )
+    .await
+    .context("player search timed out")?
+}
+
+async fn player_search_inner(
+    host: &str,
+    filters: &[SearchFilter],
+    all_pages: bool,
+) -> Result<PlayerSearchPages> {
+    let mut stream = connect(host).await?;
+    drain_player_search(&mut stream, filters, all_pages, next_client_key()).await
+}
+
+/// Read result frames until the final flag. LSB never pages player search on
+/// demand (search_handler.cpp HandleSearchRequest sends every frame at once),
+/// but a hostile or confused socket must not spin us: the cap is far above any
+/// legal answer (the server table has hundreds of players, twenty per frame).
+async fn drain_player_search<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    filters: &[SearchFilter],
+    all_pages: bool,
+    client_key: u32,
+) -> Result<PlayerSearchPages> {
+    let mut crypto = SearchCrypto::new();
+    stream
+        .write_all(&crypto.encode_player_search_request(filters, all_pages, client_key))
+        .await
+        .context("sending player search request")?;
+
+    const MAX_SEARCH_FRAMES: usize = 64;
+    let mut hits = Vec::new();
+    let mut total;
+    for _ in 0..MAX_SEARCH_FRAMES {
+        let frame = read_frame(stream).await?;
+        let body = crypto.decrypt_response(&frame)?;
+        let page = search::parse_search_list(&body)?;
+        hits.extend(page.players);
+        total = page.total_count;
+        if page.is_final {
+            return Ok(PlayerSearchPages { total, hits });
+        }
+    }
+    anyhow::bail!("player search exceeded {MAX_SEARCH_FRAMES} result frames")
+}
+
+/// Project one wire hit onto the snapshot row type (keeps ffxi-proto out of the
+/// fold; every field carries through 1:1).
+pub fn search_hit_to_view(hit: &SearchHit) -> kuluu_snapshot::SearchPlayer {
+    kuluu_snapshot::SearchPlayer {
+        name: hit.name.clone(),
+        zone: hit.zone,
+        nation: hit.nation,
+        main_job: hit.main_job,
+        sub_job: hit.sub_job,
+        main_level: hit.main_level,
+        sub_level: hit.sub_level,
+        race: hit.race,
+        rank: hit.rank,
+        flags1: hit.flags1,
+        id: hit.id,
+        comment_type: hit.comment_type,
+        flags2: hit.flags2,
+        languages: hit.languages,
+    }
+}
+
 async fn connect(host: &str) -> Result<TcpStream> {
     TcpStream::connect((host, SEARCH_PORT))
         .await
@@ -141,11 +224,12 @@ async fn read_frame<R: AsyncRead + Unpin>(stream: &mut R) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
 
+    use super::search_hit_to_view;
     use ffxi_proto::search::{
-        AH_LIST_ITEMS_OFFSET, AH_LIST_ITEMS_PER_PACKET, AH_LIST_ITEM_SIZE, AH_LIST_RESPONSE_TYPE,
-        AH_LIST_TOTAL_COUNT_OFFSET, RESPONSE_BODY_SIZE_OFFSET, RESPONSE_FINAL_FLAG,
-        RESPONSE_FLAGS_OFFSET, RESPONSE_TYPE_OFFSET, SEARCH_BASE_KEY, TCP_AH_REQUEST,
-        TCP_AH_REQUEST_MORE,
+        SearchFilter, AH_LIST_ITEMS_OFFSET, AH_LIST_ITEMS_PER_PACKET, AH_LIST_ITEM_SIZE,
+        AH_LIST_RESPONSE_TYPE, AH_LIST_TOTAL_COUNT_OFFSET, RESPONSE_BODY_SIZE_OFFSET,
+        RESPONSE_FINAL_FLAG, RESPONSE_FLAGS_OFFSET, RESPONSE_TYPE_OFFSET, SEARCH_BASE_KEY,
+        TCP_AH_REQUEST, TCP_AH_REQUEST_MORE, TCP_SEARCH, TCP_SEARCH_ALL,
     };
     use ffxi_proto::{blowfish, md5};
 
@@ -327,6 +411,96 @@ mod tests {
         let bad_len = (search::MIN_FRAME_LEN as u16 - 1).to_le_bytes();
         client.write_all(&bad_len).await.unwrap();
         assert!(read_frame(&mut server).await.is_err());
+    }
+
+    /// A `CSearchListPacket` body straight out of the AddPlayer packer (the
+    /// fixture pinned in ffxi-proto search::player_search_tests — two players,
+    /// second hidden via flags1 & 0x4000). Carried as hex so this test is a
+    /// wire artifact, not our encoder talking to itself.
+    fn search_body_fixture() -> Vec<u8> {
+        let hex = "00000000000000005c008080000002000000000000000000\
+                   2001e2df8823389194c44b2529400cc0084812345700000000580000000\
+                   2e0006022054199bf7679d876e5b01000c8000800063700000000440000\
+                   001ec0001bd5b70001";
+        hex.chars()
+            .collect::<String>()
+            .as_bytes()
+            .chunks(2)
+            .map(|c| u8::from_str_radix(std::str::from_utf8(c).unwrap(), 16).unwrap())
+            .collect()
+    }
+
+    impl FakeSearchServer {
+        /// Wrap a ready CSearchListPacket body in the same response envelope as
+        /// `page` (magic, MD5 trailer, encipher, key echo).
+        fn search_frame(&self, body: &[u8]) -> Vec<u8> {
+            let len = body.len() + 28;
+            let mut frame = vec![0u8; len];
+            frame[..body.len()].copy_from_slice(body);
+            frame[0..2].copy_from_slice(&(len as u16).to_le_bytes());
+            frame[4..8].copy_from_slice(&ffxi_proto::search::MAGIC_IXFF.to_le_bytes());
+            let hash = md5::md5(&frame[8..len - 0x14]);
+            frame[len - 0x14..len - 0x14 + 16].copy_from_slice(&hash);
+            self.cipher(&mut frame, 24, false);
+            frame[len - 4..].copy_from_slice(&self.key[16..20]);
+            frame
+        }
+    }
+
+    /// The wire law behind the Search row (vault main_menu.md §26): one request,
+    /// every queued result frame merged until the final flag — no follow-up.
+    #[tokio::test]
+    async fn player_search_merges_every_frame_until_final() {
+        let body = search_body_fixture();
+        assert_eq!(body[RESPONSE_FLAGS_OFFSET] & RESPONSE_FINAL_FLAG, 0x80);
+
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let serve = tokio::spawn(async move {
+            let mut lsb = FakeSearchServer::new();
+            let mut req = read_request(&mut server).await;
+            let first_type = lsb.accept(&mut req);
+            // Two frames for the same query: the first not final.
+            let mut part = body.clone();
+            part[RESPONSE_FLAGS_OFFSET] = 0;
+            server.write_all(&lsb.search_frame(&part)).await.unwrap();
+            server.write_all(&lsb.search_frame(&body)).await.unwrap();
+            first_type
+        });
+
+        let pages = drain_player_search(
+            &mut client,
+            &[SearchFilter::Name("bob".into())],
+            false,
+            0xC0FF_EE01,
+        )
+        .await
+        .expect("player search");
+        assert_eq!(serve.await.unwrap(), TCP_SEARCH);
+        assert_eq!(pages.total, 2, "total read off the frames' count field");
+        assert_eq!(pages.hits.len(), 4, "both frames merged");
+        let first = search_hit_to_view(&pages.hits[0]);
+        assert_eq!(first.name, "bob");
+        assert_eq!((first.main_level, first.sub_level), (Some(75), Some(37)));
+    }
+
+    /// TCP_SEARCH_ALL carries the same law with a different type byte (the
+    /// /sea all form — every page at once).
+    #[tokio::test]
+    async fn search_all_requests_use_the_all_type() {
+        let body = search_body_fixture();
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let serve = tokio::spawn(async move {
+            let mut lsb = FakeSearchServer::new();
+            let mut req = read_request(&mut server).await;
+            let t = lsb.accept(&mut req);
+            server.write_all(&lsb.search_frame(&body)).await.unwrap();
+            t
+        });
+        let pages = drain_player_search(&mut client, &[], true, 3)
+            .await
+            .expect("search all");
+        assert_eq!(serve.await.unwrap(), TCP_SEARCH_ALL);
+        assert_eq!(pages.hits.len(), 2, "single final frame stands alone");
     }
 
     #[test]

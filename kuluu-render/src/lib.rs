@@ -56,6 +56,9 @@ pub mod look_resolver;
 pub mod minimap;
 pub mod moon_material;
 pub mod mouse;
+pub mod myroom_arrange;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod myroom_furniture;
 pub mod nameplate;
 pub mod nameplate_billboard;
 pub mod nameplate_color;
@@ -203,6 +206,12 @@ impl<S: SceneSource + Resource + Component<Mutability = bevy::ecs::component::Mu
 
         #[cfg(not(target_arch = "wasm32"))]
         app.add_plugins((dat_mmb::DatOverlayPlugin, transport::TransportPlugin));
+
+        #[cfg(not(target_arch = "wasm32"))]
+        app.add_plugins((
+            myroom_furniture::MyroomFurniturePlugin,
+            myroom_arrange::systems::MyroomArrangePlugin,
+        ));
 
         #[cfg(not(target_arch = "wasm32"))]
         app.add_plugins(audio::AudioPlugin);

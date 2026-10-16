@@ -59,3 +59,25 @@ row. Read a pin's date with `git -C vendor/<name> log -1 --format=%cs`.
 `recastnavigation-rs/`, `cab/` and `bevy_pbr/` are patched copies of crates.io
 releases wired through `[patch.crates-io]` in the workspace `Cargo.toml`,
 which states each patch's reason. Grep `KULUU PATCH` for the changed lines.
+
+## Local tools (git-ignored)
+
+`vendor/rea/` holds [REA](https://github.com/morluto/rea), a Ghidra reader
+served over MCP, for agents that read FFXiMain.dll. It is not a build input and
+nothing in the workspace depends on it. `scripts/install-rea.ps1` installs it
+on Windows; every download is pinned and SHA-256 checked:
+
+| Tool | Pin |
+| --- | --- |
+| rea-agents | 6.4.0 (npm, `--ignore-scripts`) |
+| Ghidra | 12.1.4 (`ghidra_12.1.4_PUBLIC_20260921.zip`) |
+| Temurin JDK | 21.0.12.1+1 |
+| Node.js | 24.21.0, used only by REA |
+
+REA serves 170 tools. A session loads it per run with `--mcp-config
+vendor/rea/rea.mcp.json --settings vendor/rea/rea-loop-settings.json`, which
+keeps the 13 read tools named in `scripts/rea-vendor.py` and removes the rest
+from the model's context. Never register it globally or run REA's own `setup`.
+`scripts/rea-vendor.py smoke` and `wiring` check an install; without a Claude
+Code CLI on PATH, `wiring` SKIPs (exit 0) — the rest of the install stands. How agents use it:
+[rea.md](../.agents/skills/retail-grounding/references/rea.md).

@@ -44,6 +44,10 @@ offsets or lengths.
   alone is not a function identification. Respect normal tool-install and
   execution permissions; absence of a preferred tool is not a reason to claim
   the binary was verified.
+- If `vendor/rea` is installed (see [vendor/README.md](../../../../vendor/README.md)),
+  Ghidra reads of the full unpacked PE are available as `mcp__rea__*` tools:
+  decompiled code, callers and callees, xrefs, strings and bytes. Read
+  [rea.md](rea.md) before the first call.
 
 ## Make the conclusion reproducible
 

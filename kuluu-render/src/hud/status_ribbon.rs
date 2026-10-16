@@ -409,23 +409,48 @@ pub mod timers {
         ));
     }
 
+    /// `conf12wi` rows 11/12 write this option store (the arm is `cmp ax,0xB; sete` at
+    /// .text FFXiMain.dll retail-2026-09 0x19BAB7), and both ribbon countdown branches bail on a
+    /// zero value: the getter call at `.text 0x227F9C` jumps past its draw block when the store is
+    /// empty, exactly like the second one at `.text 0x228086`. The chips themselves are untouched —
+    /// only their countdown label disappears (vault main_menu.md §59 addendum 48).
+    pub const CONFIG_STORE_STATUS_ICON_TIMERS: u32 = 0xC3;
+
+    /// Retail keeps the option's boot value in its record table (`[rec+0x20]`), which is built at
+    /// runtime and unread from the file, so only an explicitly stored zero counts as off. Absent or
+    /// non-zero leaves the countdown drawn, matching what selecting row 11 does.
+    fn timers_displayed(menus: Option<&crate::hud::menu::DynamicMenu>) -> bool {
+        !matches!(
+            menus.and_then(|menu| menu
+                .config_option_values
+                .get(&CONFIG_STORE_STATUS_ICON_TIMERS)),
+            Some(0)
+        )
+    }
+
     pub fn update_status_timers(
         state: Res<SceneState>,
         clock: Res<crate::vana_time::VanaClock>,
+        menus: Option<Res<crate::hud::menu::DynamicMenu>>,
         chips: Query<(&StatusChip, &Children)>,
         mut timer_q: Query<&mut Text, With<StatusChipTimer>>,
     ) {
+        let show_timer = timers_displayed(menus.as_deref());
         let now = clock.earth_unix_secs_now() as u32;
         let expiries = &state.snapshot.status_icon_expiries;
         for (chip, children) in chips.iter() {
-            let want = expiries
-                .get(chip.slot)
-                .copied()
-                .filter(|&e| e != 0)
-                .map(|e| e.saturating_sub(now))
-                .filter(|&r| r > 0)
-                .map(ribbon_timer)
-                .unwrap_or_default();
+            let want = if show_timer {
+                expiries
+                    .get(chip.slot)
+                    .copied()
+                    .filter(|&e| e != 0)
+                    .map(|e| e.saturating_sub(now))
+                    .filter(|&r| r > 0)
+                    .map(ribbon_timer)
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
             for child in children.iter() {
                 if let Ok(mut text) = timer_q.get_mut(child) {
                     if **text != want {
@@ -510,6 +535,75 @@ pub mod timers {
                 chip_timer_texts(app.world_mut())[..2],
                 [MID_BUCKET_LABEL, ""]
             );
+        }
+
+        /// Selecting row 12 writes a zero into the timer store, and retail's two countdown
+        /// branches bail on it (`.text FFXiMain.dll retail-2026-09 0x227F9C` / `.text 0x228086`) while the
+        /// chips themselves stay up.
+        #[test]
+        fn a_stored_zero_hides_the_countdown_and_keeps_the_icons() {
+            let clock = crate::vana_time::VanaClock::anchored_at_hour(12.0);
+            let now = clock.earth_unix_secs_now() as u32;
+            let mut app = App::new();
+            let mut menus = crate::hud::menu::DynamicMenu::default();
+            menus
+                .config_option_values
+                .insert(CONFIG_STORE_STATUS_ICON_TIMERS, 0);
+            app.init_resource::<Assets<Image>>()
+                .init_resource::<SceneState>()
+                .insert_resource(clock)
+                .insert_resource(menus);
+            app.world_mut()
+                .run_system_once(spawn_status_ribbon)
+                .unwrap();
+
+            {
+                let mut state = app.world_mut().resource_mut::<SceneState>();
+                state.snapshot.status_icons = vec![10];
+                state.snapshot.status_icon_expiries = vec![now + MID_BUCKET_REMAINING_SECS];
+            }
+            app.world_mut()
+                .run_system_once(update_status_timers)
+                .unwrap();
+
+            // `chip_timer_texts` walks every chip and demands a countdown node under it, so
+            // reaching the assertion at all proves the icons themselves stayed up.
+            let labels = chip_timer_texts(app.world_mut());
+            assert!(
+                !labels.is_empty() && labels.iter().all(|label| label.is_empty()),
+                "a hidden timer must leave every slot blank, got {labels:?}"
+            );
+        }
+
+        /// The other row of the pair writes a one, and an option store nobody has ever touched
+        /// behaves the same way: the countdown stays.
+        #[test]
+        fn selecting_display_timers_keeps_the_countdown() {
+            let clock = crate::vana_time::VanaClock::anchored_at_hour(12.0);
+            let now = clock.earth_unix_secs_now() as u32;
+            let mut menus = crate::hud::menu::DynamicMenu::default();
+            menus
+                .config_option_values
+                .insert(CONFIG_STORE_STATUS_ICON_TIMERS, 1);
+            let mut app = App::new();
+            app.init_resource::<Assets<Image>>()
+                .init_resource::<SceneState>()
+                .insert_resource(clock)
+                .insert_resource(menus);
+            app.world_mut()
+                .run_system_once(spawn_status_ribbon)
+                .unwrap();
+
+            {
+                let mut state = app.world_mut().resource_mut::<SceneState>();
+                state.snapshot.status_icons = vec![10];
+                state.snapshot.status_icon_expiries = vec![now + MID_BUCKET_REMAINING_SECS];
+            }
+            app.world_mut()
+                .run_system_once(update_status_timers)
+                .unwrap();
+
+            assert_eq!(chip_timer_texts(app.world_mut())[..1], [MID_BUCKET_LABEL]);
         }
 
         fn chip_timer_texts(world: &mut World) -> Vec<String> {

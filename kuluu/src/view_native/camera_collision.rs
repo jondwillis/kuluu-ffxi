@@ -259,7 +259,10 @@ pub fn resolve_camera(
     step: Res<kuluu_render::camera::CameraStepSmoothing>,
     time: Res<Time>,
     scene_state: Res<SceneState>,
-    cutscene: Res<kuluu_render::cutscene::CutsceneMode>,
+    (cutscene, arrange): (
+        Res<kuluu_render::cutscene::CutsceneMode>,
+        Option<Res<kuluu_render::myroom_arrange::ArrangeCameraHold>>,
+    ),
     zone_bvh: Res<ZoneCollisionBvh>,
     self_q: Query<
         (&Transform, Option<&BakedActor>, Option<&Children>),
@@ -290,7 +293,8 @@ pub fn resolve_camera(
     // A running event holding the camera owns the operator camera (the
     // cutscene camera route advances or freezes it after this system): the
     // chase must not attach to the player while the script owns the view.
-    if cutscene.camera_locked {
+    // Mog House layout mode holds it the same way while arranging.
+    if cutscene.camera_locked || arrange.is_some_and(|hold| hold.0) {
         *smoothed_effective = None;
         *leash_state = LeashState::default();
         chase.turn_owed = 0.0;

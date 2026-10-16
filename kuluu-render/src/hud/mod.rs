@@ -7,6 +7,8 @@ pub mod chat_input;
 pub mod chat_panel;
 pub mod check_view;
 pub mod compass;
+pub mod controls_law;
+pub mod currency_law;
 #[cfg(feature = "enhanced-death-countdown")]
 pub mod death_countdown;
 pub mod death_prompt;
@@ -14,8 +16,10 @@ pub mod delivery;
 pub mod diagnostics;
 pub mod dialog;
 pub mod digit_spinner;
+pub mod dock;
 pub mod entity_hover_card;
 pub mod equipment_screen;
+pub mod gettext;
 pub mod item_dat_root;
 pub mod item_detail;
 pub mod item_grid;
@@ -31,11 +35,15 @@ pub mod graphics_debug;
 pub mod map_screen;
 pub mod menu;
 pub mod menu_help_bar;
+pub mod merit_windows;
 pub mod mesh_debug;
 pub mod network_status;
 pub mod overlay;
 pub mod panel_column;
 pub mod quick_action;
+// Reads the region map DATs through `crate::minimap` (wasm-gated), like `map_screen`.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod region_map;
 pub mod stair_debug;
 // (roster mockup deleted — real party/self HUD is party_frame.rs)
 pub mod party_frame;
@@ -49,6 +57,8 @@ pub mod target_action_menu;
 pub mod target_panel;
 pub mod trade;
 pub mod treasure_pool;
+pub mod unity_fp;
+pub mod unity_fp_view;
 pub mod vana_clock;
 pub mod weather_icon;
 pub mod zone_flash;
@@ -153,6 +163,7 @@ pub fn spawn_bottom_left_stack(
                 row_gap: Val::Px(4.0),
                 ..default()
             },
+            ZIndex(style::CHAT_STACK_Z),
         ))
         .with_children(|p| {
             chat_panel::spawn_chat_panels_as_children(p);
@@ -249,6 +260,13 @@ impl Plugin for HudPlugin {
         app.init_resource::<vana_clock::VanaClockVisible>();
 
         app.init_resource::<menu::DynamicMenu>();
+        app.init_resource::<menu::MagicSchoolTable>();
+        app.init_resource::<menu::ConfigDatRows>();
+        app.init_resource::<dock::DockBoard>();
+        app.init_resource::<menu::CommandSelectorCaptions>();
+        app.init_resource::<menu::EquipRecords>();
+        app.init_resource::<unity_fp::UnityFpDat>();
+        app.init_resource::<merit_windows::MeritDat>();
 
         app.init_resource::<overlay::ActiveOverlay>();
         app.init_resource::<chat_panel::ActiveChatTab>();
@@ -269,6 +287,8 @@ impl Plugin for HudPlugin {
 
         app.init_resource::<status_ribbon::StatusIconCache>();
         app.init_resource::<status_ribbon::StatusIconDatRoot>();
+        #[cfg(not(target_arch = "wasm32"))]
+        app.init_resource::<region_map::ViewedRegionMap>();
 
         app.init_resource::<item_dat_root::ItemDatRoot>();
         app.init_resource::<item_dat_root::ItemIconCache>();
@@ -290,7 +310,6 @@ impl Plugin for HudPlugin {
 
         app.init_resource::<check_view::CheckTarget>();
         app.init_resource::<bazaar_view::BazaarScreenState>();
-        app.init_resource::<status_panel::StatusProfileOpen>();
         app.init_resource::<party_frame::PartyFrameSettings>();
 
         app.init_resource::<trade::TradeState>();
@@ -391,11 +410,46 @@ impl Plugin for HudPlugin {
             Update,
             menu::refresh_dynamic_menu_rows.before(menu::update_main_menu),
         );
+        app.add_systems(
+            Update,
+            (
+                menu::settle_opened_windows
+                    .after(menu::refresh_dynamic_menu_rows)
+                    .before(menu::update_main_menu)
+                    .before(menu::update_menu_stack_windows)
+                    .before(unity_fp_view::update_unity_fp_windows),
+                menu::persist_window_cursors,
+            ),
+        );
+        app.add_systems(
+            Update,
+            (
+                menu::update_menu_stack_windows,
+                status_panel::update_status_level_box,
+                unity_fp_view::update_unity_fp_windows,
+                merit_windows::merit_window_upkeep,
+            )
+                .after(menu::refresh_dynamic_menu_rows),
+        );
 
         app.add_systems(
             Update,
             panel_column::layout_panel_column_system
                 .after(target_panel::update_target_panel_system),
+        );
+        app.add_systems(
+            Update,
+            (
+                dock::dock_windows_system
+                    .after(target_panel::update_target_panel_system)
+                    .after(party_frame::update_party_frame_system)
+                    .before(menu::update_main_menu)
+                    .before(menu::update_menu_stack_windows)
+                    .before(unity_fp_view::update_unity_fp_windows),
+                dock::place_target_window
+                    .after(dock::dock_windows_system)
+                    .before(panel_column::layout_panel_column_system),
+            ),
         );
 
         app.add_systems(
@@ -414,6 +468,9 @@ impl Plugin for HudPlugin {
                 target_action_menu::target_action_mouse_hover_system,
                 target_action_menu::target_action_mouse_click_system,
                 item_screen::update_item_screen_layout,
+                menu::update_status_detail_window
+                    .after(menu::refresh_dynamic_menu_rows)
+                    .before(menu::update_main_menu),
                 item_screen::update_item_screen.after(menu::refresh_dynamic_menu_rows),
                 item_screen::update_item_scrollbar.after(item_screen::update_item_screen),
                 item_screen::update_bag_tabs.after(item_screen::update_item_screen),
@@ -443,7 +500,8 @@ impl Plugin for HudPlugin {
                 map_screen::update_map_screen_markers,
                 map_screen::update_map_widescan_dots.after(map_screen::update_map_view),
                 map_screen::update_map_placed_markers,
-                map_screen::update_map_panel,
+                map_screen::update_map_panel.after(dock::dock_windows_system),
+                region_map::update_region_map,
             ),
         );
         app.add_systems(Update, apply_dev_hud_visibility);
@@ -492,6 +550,11 @@ impl Plugin for HudPlugin {
                 item_screen::item_row_mouse_hover_system,
                 item_screen::item_row_mouse_click_system,
                 item_screen::sort_option_mouse_system,
+                (
+                    item_detail::sync_inventory_sort_options_system,
+                    item_detail::mirror_inventory_sort_options_system,
+                )
+                    .chain(),
                 item_detail::auto_consolidate_inventory_system,
                 item_screen::bag_tab_mouse_system,
                 dialog::dialog_mouse_hover_system,
@@ -579,15 +642,20 @@ pub fn add_hud_spawners<L: bevy::ecs::schedule::ScheduleLabel + Clone>(app: &mut
             check_view::spawn_check_view,
             bazaar_view::spawn_bazaar_view,
             status_panel::spawn_status_panel,
+            menu::spawn_status_detail_window,
             equipment_screen::spawn_equipment_screen,
             delivery::spawn_delivery_screen,
             auction::spawn_auction_screen,
             shop::spawn_shop_panel,
+            unity_fp_view::spawn_unity_fp_windows,
         ),
     );
     // Depends on `crate::minimap` (wasm-gated).
     #[cfg(not(target_arch = "wasm32"))]
-    app.add_systems(schedule, map_screen::spawn_map_screen);
+    app.add_systems(
+        schedule,
+        (map_screen::spawn_map_screen, region_map::spawn_region_map),
+    );
 }
 
 #[cfg(test)]
@@ -609,6 +677,30 @@ mod tests {
         assert_eq!(
             world.query::<&compass::CompassLabel>().iter(&world).count(),
             4
+        );
+    }
+
+    /// Bevy stacks UI roots by (GlobalZIndex, ZIndex) and leaves ties to archetype order, so only
+    /// the chat stack's own lower layer keeps a menu that reaches the log drawn over it.
+    #[test]
+    fn menus_draw_over_the_chat_stack() {
+        fn layer<F: bevy::ecs::query::QueryFilter>(world: &mut World) -> (i32, i32) {
+            let (global, local) = world
+                .query_filtered::<(Option<&GlobalZIndex>, Option<&ZIndex>), F>()
+                .single(world)
+                .expect("one root");
+            (
+                global.copied().unwrap_or_default().0,
+                local.copied().unwrap_or_default().0,
+            )
+        }
+        let mut world = World::new();
+        #[cfg(not(target_arch = "wasm32"))]
+        world.init_resource::<Assets<bevy::image::Image>>();
+        world.run_system_once(spawn_bottom_left_stack).unwrap();
+        world.run_system_once(menu::spawn_main_menu).unwrap();
+        assert!(
+            layer::<With<BottomLeftStack>>(&mut world) < layer::<With<menu::MainMenu>>(&mut world)
         );
     }
 }
