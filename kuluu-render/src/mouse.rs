@@ -80,8 +80,10 @@ pub fn camera_height_pitch_rate_rad_per_sec(
     )
 }
 
-/// Same screen-space convention as `mouse_aim_axis`; kuluu drives aim from this while a drag is
-/// engaged, and from `mouse_aim_axis` otherwise (see the mode note there).
+/// Same screen-space convention as `mouse_aim_axis`; kuluu drives drag aim from this. The parked-
+/// cursor path beside it comes from the block behind store 0x8F (gate FFXiMain.dll retail-2026-09
+/// .text 0x124CC5, ±1 bands hugging the tracked screen rect at .text 0x124CEA..0x124D2A) and is
+/// consumed through [`edge_pan_axis`].
 pub fn mouse_drag_aim_axis(
     cursor: Vec2,
     anchor: Vec2,
@@ -102,8 +104,8 @@ pub fn mouse_drag_aim_axis(
 /// Y `0x126100`; FFXiMain.dll retail-2026-09), and that handler emits virtual
 /// arrow presses (dispatcher seed 0x125360, actions 0x16..0x19) which the same
 /// integration as the real arrows consumes — no per-pixel radian sensitivity
-/// exists on this path. Returns the saturated `(yaw+, pitch-up+)` aim axis from
-/// `cursor`, a top-left-origin y-down window-relative position in logical pixels
+/// exists on this path. Returns the saturated `(yaw+, pitch-up+)` aim axis from `cursor`, a
+/// top-left-origin y-down window-relative position in logical pixels
 /// like `CursorMoved::position`, against the same-unit `window_size`; degenerate
 /// sizes return ZERO.
 /// Which of those two accessors retail uses is decided by the mouse state byte of
@@ -200,6 +202,8 @@ impl Plugin for MousePlugin {
             // A host adding only this plugin gets both resources its systems use.
             .init_resource::<ViewFov>()
             .init_resource::<WheelZoom>()
+            .init_resource::<RetailCameraInversion>()
+            .init_resource::<RetailEdgeRotate>()
             .add_systems(PreUpdate, collect_mouse_system)
             // Retail's wheel never moves the focal itself. The message handler only adds frames
             // owed (RVA 0x25E210); a frame function drains one per frame (RVA 0x25E240 through thunk
@@ -211,9 +215,14 @@ impl Plugin for MousePlugin {
                 wheel_zoom_accumulate_system.after(collect_mouse_system),
             )
             .add_systems(PostUpdate, wheel_zoom_drain_system)
+            .add_systems(Update, sync_camera_inversion_system)
+            .add_systems(Update, sync_edge_rotate_system)
             .add_systems(
                 Update,
-                mouse_camera_system.run_if(crate::cutscene::player_camera_allowed),
+                mouse_camera_system
+                    .run_if(crate::cutscene::player_camera_allowed)
+                    .after(sync_camera_inversion_system)
+                    .after(sync_edge_rotate_system),
             );
     }
 }
@@ -345,12 +354,147 @@ pub fn collect_mouse_system(
     }
 }
 
+/// The Mouse & Camera page's four axis-inversion flags. Each flag is one of its radio pairs, and the
+/// store holds 0 for the "reset … to the default setting" row and 1 for the "invert … on the X/Y
+/// axis" row (store ids [`crate::hud::menu::CONFIG_STORE_3P_INVERT_X`] and friends). Retail acts on
+/// a set flag by negating that aim delta with −1.0f (.rdata RVA 0x32A3F0) — third-person from .text
+/// FFXiMain.dll retail-2026-09 RVA 0x1EF7C/0x1EF9B, first person from RVA 0x20F8B/0x20FAA.
+#[derive(Resource, Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RetailCameraInversion {
+    pub third_person_x: bool,
+    pub third_person_y: bool,
+    pub first_person_x: bool,
+    pub first_person_y: bool,
+}
+
+fn inversion_flag(menu: &crate::hud::menu::DynamicMenu, store_id: u32) -> bool {
+    menu.config_option_values
+        .get(&store_id)
+        .is_some_and(|value| *value != 0)
+}
+
+/// Copy the four Mouse & Camera inversion stores into [`RetailCameraInversion`]. A store nobody wrote
+/// reads as not inverted, which is what retail's reset value means.
+pub fn sync_camera_inversion_system(
+    menu: Option<Res<crate::hud::menu::DynamicMenu>>,
+    mut inversion: ResMut<RetailCameraInversion>,
+) {
+    let Some(menu) = menu else { return };
+    if !menu.is_changed() && !inversion.is_added() {
+        return;
+    }
+    let next = RetailCameraInversion {
+        third_person_x: inversion_flag(&menu, crate::hud::menu::CONFIG_STORE_3P_INVERT_X),
+        third_person_y: inversion_flag(&menu, crate::hud::menu::CONFIG_STORE_3P_INVERT_Y),
+        first_person_x: inversion_flag(&menu, crate::hud::menu::CONFIG_STORE_FP_INVERT_X),
+        first_person_y: inversion_flag(&menu, crate::hud::menu::CONFIG_STORE_FP_INVERT_Y),
+    };
+    if next != *inversion {
+        *inversion = next;
+    }
+}
+
+/// The screen-edge rotation band width: retail fires an axis when the cursor reaches `bound + 1`
+/// from inside (guards at .text FFXiMain.dll retail-2026-09 RVA 0x124CE4/0x124CF4 and
+/// 0x124D08..0x124D2A against the tracked screen rect's four word bounds).
+pub const EDGE_PAN_BAND_PX: f32 = 1.0;
+
+/// The discrete edge-park axis, in the same `(yaw+, pitch-up+)` convention as `mouse_aim_axis`: an
+/// axis reads ±1 while the cursor sits within [`EDGE_PAN_BAND_PX`] of that screen border (the two
+/// axes are independent, so a corner parks both), 0 elsewhere; degenerate sizes read ZERO. Retail's
+/// own block stores −1/+1 per side in that sign order (`mov` bf800000 at .text FFXiMain.dll
+/// retail-2026-09 RVA 0x124CEA etc.); the downstream pitch flip it applied is untraced image-wide,
+/// so kuluu keeps its own up-positive convention and lets `apply_camera_inversion` gate the sign.
+pub fn edge_pan_axis(cursor: Vec2, window_size: Vec2) -> Vec2 {
+    if window_size.x <= 0.0 || window_size.y <= 0.0 {
+        return Vec2::ZERO;
+    }
+    let mut axis = Vec2::ZERO;
+    if cursor.x <= EDGE_PAN_BAND_PX {
+        axis.x = -1.0;
+    }
+    if cursor.x >= window_size.x - 1.0 - EDGE_PAN_BAND_PX {
+        // The +1 side is tested after the −1 side, exactly retail's instruction order; a band
+        // overlap on a degenerate width resolves to the later test.
+        axis.x = 1.0;
+    }
+    if cursor.y <= EDGE_PAN_BAND_PX {
+        axis.y = 1.0;
+    }
+    if cursor.y >= window_size.y - 1.0 - EDGE_PAN_BAND_PX {
+        axis.y = -1.0;
+    }
+    axis
+}
+
+/// Whether the Mouse & Camera page switched screen-edge rotation on. Only a written value of **0**
+/// (row id 3 "The camera will rotate…") enables it: retail's gate skips the whole edge block for any
+/// non-zero store (.text FFXiMain.dll retail-2026-09 RVA 0x124CC5), and its boot default is
+/// table-driven/unfound, so an unwritten store keeps kuluu's current (off) behaviour.
+#[derive(Resource, Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RetailEdgeRotate {
+    pub enabled: bool,
+}
+
+pub fn sync_edge_rotate_system(
+    menu: Option<Res<crate::hud::menu::DynamicMenu>>,
+    mut edge: ResMut<RetailEdgeRotate>,
+) {
+    let Some(menu) = menu else { return };
+    if !menu.is_changed() && !edge.is_added() {
+        return;
+    }
+    let enabled = menu
+        .config_option_values
+        .get(&crate::hud::menu::CONFIG_STORE_EDGE_ROTATE)
+        .is_some_and(|value| *value == 0);
+    if enabled != edge.enabled {
+        edge.enabled = enabled;
+    }
+}
+
+/// Negate the aim axis the page asked to invert. Only the sign changes, so saturation, the orbit-rate
+/// law and the pitch clamps all stay in front of it.
+pub fn apply_camera_inversion(
+    axis: Vec2,
+    mode: CameraMode,
+    inversion: &RetailCameraInversion,
+) -> Vec2 {
+    let (flip_x, flip_y) = match mode {
+        CameraMode::Chase => (inversion.third_person_x, inversion.third_person_y),
+        CameraMode::FirstPerson => (inversion.first_person_x, inversion.first_person_y),
+    };
+    Vec2::new(
+        if flip_x { -axis.x } else { axis.x },
+        if flip_y { -axis.y } else { axis.y },
+    )
+}
+
+/// Spend an aim axis on the rig through the orbit and eye-rise laws, inside the mode's pitch band.
+pub fn orbit_chase_by_axis(axis: Vec2, mode: CameraMode, chase: &mut ChaseCamera, delta_secs: f32) {
+    let rig = match mode {
+        CameraMode::Chase => Some(chase.distance),
+        CameraMode::FirstPerson => None,
+    };
+    chase.yaw +=
+        camera_orbit_yaw_rate_rad_per_sec(axis.x, FOLLOW_ACTOR_FREE_RUN_DEFAULT, rig) * delta_secs;
+    let (lo, hi) = match mode {
+        CameraMode::Chase => (ChaseCamera::PITCH_MIN, ChaseCamera::PITCH_MAX),
+        CameraMode::FirstPerson => (ChaseCamera::FP_PITCH_MIN, ChaseCamera::FP_PITCH_MAX),
+    };
+    chase.pitch = (chase.pitch
+        + camera_height_pitch_rate_rad_per_sec(axis.y, chase.pitch, rig) * delta_secs)
+        .clamp(lo, hi);
+}
+
 pub fn mouse_camera_system(
     pointer: Res<MousePointer>,
     camera_mode: Res<CameraMode>,
     input_mode: Res<InputMode>,
     state: Res<SceneState>,
     move_intent: Option<Res<crate::combat_stance::SelfMoveIntent>>,
+    inversion: Option<Res<RetailCameraInversion>>,
+    edge_rotate: Option<Res<RetailEdgeRotate>>,
     windows: Query<&Window, With<PrimaryWindow>>,
     time: Res<Time>,
     mut chase: ResMut<ChaseCamera>,
@@ -376,23 +520,31 @@ pub fn mouse_camera_system(
         if let (Some((Some(anchor), saturation)), Some(cursor), Ok(window)) =
             (drag, pointer.cursor_pos, windows.single())
         {
-            let axis = mouse_drag_aim_axis(cursor, anchor, window.size(), saturation);
-            let rig = match mode {
-                CameraMode::Chase => Some(chase.distance),
-                CameraMode::FirstPerson => None,
-            };
-            chase.yaw +=
-                camera_orbit_yaw_rate_rad_per_sec(axis.x, FOLLOW_ACTOR_FREE_RUN_DEFAULT, rig)
-                    * time.delta_secs();
-
-            let (lo, hi) = match mode {
-                CameraMode::Chase => (ChaseCamera::PITCH_MIN, ChaseCamera::PITCH_MAX),
-                CameraMode::FirstPerson => (ChaseCamera::FP_PITCH_MIN, ChaseCamera::FP_PITCH_MAX),
-            };
-            chase.pitch = (chase.pitch
-                + camera_height_pitch_rate_rad_per_sec(axis.y, chase.pitch, rig)
-                    * time.delta_secs())
-            .clamp(lo, hi);
+            let inversion = inversion.as_deref().copied().unwrap_or_default();
+            let axis = apply_camera_inversion(
+                mouse_drag_aim_axis(cursor, anchor, window.size(), saturation),
+                mode,
+                &inversion,
+            );
+            orbit_chase_by_axis(axis, mode, &mut chase, time.delta_secs());
+        }
+    }
+    // Parked-cursor rotation is the other aim feed and never runs beside a drag: retail's edge
+    // block demands the mouse window mode byte read 0..2, while an engaged drag holds it at 4 or 5
+    // (FFXiMain.dll retail-2026-09 .text 0x124B3C gate at 0x124CC5).
+    if !drag_active
+        && matches!(*input_mode, InputMode::World)
+        && edge_rotate.is_some_and(|edge| edge.enabled)
+    {
+        if let (Some(cursor), Ok(window)) = (pointer.cursor_pos, windows.single()) {
+            let axis = apply_camera_inversion(
+                edge_pan_axis(cursor, window.size()),
+                mode,
+                &inversion.as_deref().copied().unwrap_or_default(),
+            );
+            if axis != Vec2::ZERO {
+                orbit_chase_by_axis(axis, mode, &mut chase, time.delta_secs());
+            }
         }
     }
 
@@ -1028,6 +1180,199 @@ mod tests {
         assert_eq!(
             mouse_drag_aim_axis(Vec2::ZERO, Vec2::ZERO, Vec2::ZERO, DRAG_SATURATION_FRACTION),
             Vec2::ZERO
+        );
+    }
+
+    #[test]
+    fn an_inverted_page_entry_negates_only_that_rig_and_axis() {
+        let inversion = RetailCameraInversion {
+            third_person_x: true,
+            first_person_y: true,
+            ..RetailCameraInversion::default()
+        };
+        assert_eq!(
+            apply_camera_inversion(Vec2::new(1.0, -2.0), CameraMode::Chase, &inversion),
+            Vec2::new(-1.0, -2.0)
+        );
+        assert_eq!(
+            apply_camera_inversion(Vec2::new(1.0, -2.0), CameraMode::FirstPerson, &inversion),
+            Vec2::new(1.0, 2.0)
+        );
+    }
+
+    /// The Mouse & Camera page writes the store; the live flag follows it — and the pair's reset row
+    /// (value 0) takes the inversion away again.
+    #[test]
+    fn camera_inversion_follows_the_config_stores() {
+        let mut menu = crate::hud::menu::DynamicMenu::default();
+        menu.config_option_values
+            .insert(crate::hud::menu::CONFIG_STORE_3P_INVERT_Y, 1);
+
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .insert_resource(menu)
+            .init_resource::<RetailCameraInversion>()
+            .add_systems(Update, sync_camera_inversion_system);
+        app.update();
+
+        assert_eq!(
+            *app.world().resource::<RetailCameraInversion>(),
+            RetailCameraInversion {
+                third_person_y: true,
+                ..RetailCameraInversion::default()
+            }
+        );
+
+        app.world_mut()
+            .resource_mut::<crate::hud::menu::DynamicMenu>()
+            .config_option_values
+            .insert(crate::hud::menu::CONFIG_STORE_3P_INVERT_Y, 0);
+        app.update();
+        assert_eq!(
+            *app.world().resource::<RetailCameraInversion>(),
+            RetailCameraInversion::default(),
+            "the reset row restores the default"
+        );
+    }
+
+    #[test]
+    fn edge_pan_axis_bands_hug_the_screen_borders() {
+        let size = Vec2::new(800.0, 600.0);
+        assert_eq!(edge_pan_axis(Vec2::new(400.0, 300.0), size), Vec2::ZERO);
+
+        // The −1 side fires through bound+1 and the +1 side from (size−1)−1, two pixels deep each.
+        assert_eq!(
+            edge_pan_axis(Vec2::new(1.0, 300.0), size),
+            Vec2::new(-1.0, 0.0)
+        );
+        assert_eq!(edge_pan_axis(Vec2::new(2.0, 300.0), size), Vec2::ZERO);
+        assert_eq!(
+            edge_pan_axis(Vec2::new(798.0, 300.0), size),
+            Vec2::new(1.0, 0.0)
+        );
+        assert_eq!(edge_pan_axis(Vec2::new(797.0, 300.0), size), Vec2::ZERO);
+
+        // Top band reads pitch-up, bottom pitch-down; a corner parks both axes at once.
+        assert_eq!(
+            edge_pan_axis(Vec2::new(400.0, 1.0), size),
+            Vec2::new(0.0, 1.0)
+        );
+        assert_eq!(
+            edge_pan_axis(Vec2::new(400.0, 598.0), size),
+            Vec2::new(0.0, -1.0)
+        );
+        assert_eq!(
+            edge_pan_axis(Vec2::new(799.0, 599.0), size),
+            Vec2::new(1.0, -1.0)
+        );
+
+        // Degenerate sizes must not fire from a cursor that exists nowhere.
+        assert_eq!(edge_pan_axis(Vec2::ZERO, Vec2::ZERO), Vec2::ZERO);
+    }
+
+    /// Only the rotate row (`conf7` id 3, store value 0) switches the feed on; the "will not rotate"
+    /// row (value 1) and an unwritten store both keep it off.
+    #[test]
+    fn edge_rotate_follows_the_config_store() {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .insert_resource(crate::hud::menu::DynamicMenu::default())
+            .init_resource::<RetailEdgeRotate>()
+            .add_systems(Update, sync_edge_rotate_system);
+        app.update();
+        assert!(
+            !app.world().resource::<RetailEdgeRotate>().enabled,
+            "an unwritten store keeps retail's edge rotation off"
+        );
+
+        app.world_mut()
+            .resource_mut::<crate::hud::menu::DynamicMenu>()
+            .config_option_values
+            .insert(crate::hud::menu::CONFIG_STORE_EDGE_ROTATE, 0);
+        app.update();
+        assert!(app.world().resource::<RetailEdgeRotate>().enabled);
+
+        app.world_mut()
+            .resource_mut::<crate::hud::menu::DynamicMenu>()
+            .config_option_values
+            .insert(crate::hud::menu::CONFIG_STORE_EDGE_ROTATE, 1);
+        app.update();
+        assert!(!app.world().resource::<RetailEdgeRotate>().enabled);
+    }
+
+    #[test]
+    fn a_parked_cursor_rotates_only_when_edge_rotate_is_on() {
+        let parked = || MousePointer {
+            cursor_pos: Some(Vec2::new(799.0, 300.0)),
+            ..Default::default()
+        };
+
+        // Without the config row the same parked cursor turns nothing.
+        let mut app = aim_test_app(parked());
+        app.update();
+        app.update();
+        assert_eq!(
+            app.world().resource::<ChaseCamera>().yaw,
+            ChaseCamera::default().yaw,
+            "edge rotation stays off until the Mouse & Camera page switches it on"
+        );
+
+        let mut app = aim_test_app(parked());
+        app.insert_resource(RetailEdgeRotate { enabled: true });
+        app.update();
+        app.update();
+        let chase = app.world().resource::<ChaseCamera>();
+        assert!(
+            chase.yaw > ChaseCamera::default().yaw,
+            "parked right turns yaw +"
+        );
+        assert_eq!(chase.pitch, ChaseCamera::default().pitch);
+
+        // A mid-screen cursor with the feed on is still no aim at all.
+        let mut app = aim_test_app(MousePointer {
+            cursor_pos: Some(Vec2::new(400.0, 300.0)),
+            ..Default::default()
+        });
+        app.insert_resource(RetailEdgeRotate { enabled: true });
+        app.update();
+        app.update();
+        assert_eq!(
+            app.world().resource::<ChaseCamera>().yaw,
+            ChaseCamera::default().yaw
+        );
+
+        // The page's X-inversion row flips the parked rotation like any other aim delta.
+        let mut app = aim_test_app(MousePointer {
+            cursor_pos: Some(Vec2::new(1.0, 300.0)),
+            ..Default::default()
+        });
+        app.insert_resource(RetailEdgeRotate { enabled: true });
+        app.insert_resource(RetailCameraInversion {
+            third_person_x: true,
+            ..RetailCameraInversion::default()
+        });
+        app.update();
+        app.update();
+        assert!(app.world().resource::<ChaseCamera>().yaw > ChaseCamera::default().yaw);
+
+        // A drag owns the cursor: its absence of motion must not be re-added by the edge feed.
+        let mut app = aim_test_app(MousePointer {
+            right: true,
+            right_dragged: true,
+            right_track: DragTrack {
+                press_pos: Some(Vec2::new(799.0, 300.0)),
+                ..Default::default()
+            },
+            cursor_pos: Some(Vec2::new(799.0, 300.0)),
+            ..Default::default()
+        });
+        app.insert_resource(RetailEdgeRotate { enabled: true });
+        app.update();
+        app.update();
+        assert_eq!(
+            app.world().resource::<ChaseCamera>().yaw,
+            ChaseCamera::default().yaw,
+            "the drag axis is zero at its own press point, and the edge feed never joins it"
         );
     }
 }

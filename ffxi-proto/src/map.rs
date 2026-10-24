@@ -9,12 +9,26 @@ pub const MAX_DATAGRAM: usize = 2500;
 pub mod c2s {
     pub const LOGIN: u16 = 0x00A;
 
+    // GP_CLI_COMMAND_CONFIG — change client option flags (bitfield mask +
+    // SetFlg; vendor/server/src/map/packets/c2s/0x0dc_config.h). Direction
+    // sibling of s2c GROUP_SOLICIT_REQ at the same number: the two never
+    // collide because each lives in its own direction's table.
+    pub const CONFIG: u16 = 0x0DC;
+
     // GP_CLI_COMMAND_CLISTATUS, vendor/server/src/map/packets/c2s/0x061_clistatus.h.
     // Requests the local player's status block; the server answers with
     // SendLocalPlayerPackets (charutils.cpp) — s2c GROUP_ATTR (0x0DF) for self +
     // CLISTATUS + ... This is how a solo player gets its own group entry after
     // zone-in/login: LSB pushes no 0x0DD/0x0DF to players without a party.
     pub const CLISTATUS: u16 = 0x061;
+
+    // GP_CLI_COMMAND_CURRENCIES_1 / _2, vendor/server/src/map/packets/c2s/
+    // 0x10f_currencies_1.h + 0x115_currencies_2.h: header-only requests (`GP_CLI_PACKET`
+    // with no fields) for the two Currencies lists; LSB answers each with its s2c
+    // CURRENCIES reply below (FFXiMain.dll retail-2026-09 `.text 0xFD520`/`.text 0xFD550`,
+    // vault main_menu.md §59 addendum 27). Direction siblings of s2c FISH at 0x115.
+    pub const CURRENCIES_1: u16 = 0x10F;
+    pub const CURRENCIES_2: u16 = 0x115;
 
     pub const GAMEOK: u16 = 0x00C;
     pub const NETEND: u16 = 0x00D;
@@ -76,6 +90,46 @@ pub mod c2s {
     // GP_CLI_COMMAND_MYROOM_JOB, vendor/server/src/map/packets/c2s/0x100_myroom_job.h.
     // Mog House job change: MainJobIndex u8, SupportJobIndex u8 (0 = keep current).
     pub const MYROOM_JOB: u16 = 0x100;
+
+    // GP_CLI_COMMAND_MYROOM_IS, vendor/server/src/map/packets/c2s/0x0cb_myroom_is.h.
+    // Mog House door + remodel traffic: Kind u8 @4 (GP_CLI_COMMAND_MYROOM_IS_KIND:
+    // Open=1, Close=2, Remodel=5), Param1 u8 @5, Param2 u16 @6
+    // (GP_CLI_COMMAND_MYROOM_IS_PARAM2: Unk1=0 opening the door, Unk2=1 closing it,
+    // 615..618 remodel styles). The DLL's only sender for this opcode is the helper
+    // FFXiMain.dll retail-2026-09 .text 0xF0A40, which commits exactly those four
+    // body bytes. Body-value constants live in kuluu-session/src/session/codec.rs —
+    // build.rs checks every u16 const below for opcode drift.
+    pub const MYROOM_IS: u16 = 0x0CB;
+
+    // The Mog House layout/planting family. Every one of them is built by a dedicated helper in
+    // FFXiMain.dll retail-2026-09 (`.text 0xF0CC0` Layout, `.text 0xF0C80` the all-zero closing
+    // variant, `.text 0xF0D40` Bankin, `.text 0xF0DA0` PlantAdd, `.text 0xF0E10` PlantCheck,
+    // `.text 0xF0E70` PlantCrop, `.text 0xF0ED0` PlantStop); the field tables below come from LSB's
+    // own packet structs. Vault main_menu.md §59 addendum 30.
+
+    /// GP_CLI_COMMAND_MYROOM_LAYOUT — place/move one piece of furniture, or (all-zero) announce that
+    /// layout mode ended (vendor/server/src/map/packets/c2s/0x0fa_myroom_layout.h).
+    pub const MYROOM_LAYOUT: u16 = 0x0FA;
+
+    /// GP_CLI_COMMAND_MYROOM_BANKIN — take a placed piece back into the Mog House shelf
+    /// (vendor/server/src/map/packets/c2s/0x0fb_myroom_bankin.h).
+    pub const MYROOM_BANKIN: u16 = 0x0FB;
+
+    /// GP_CLI_COMMAND_MYROOM_PLANT_ADD — sow a seed or feed a plant
+    /// (vendor/server/src/map/packets/c2s/0x0fc_myroom_plant_add.h).
+    pub const MYROOM_PLANT_ADD: u16 = 0x0FC;
+
+    /// GP_CLI_COMMAND_MYROOM_PLANT_CHECK — examine a plant
+    /// (vendor/server/src/map/packets/c2s/0x0fd_myroom_plant_check.h).
+    pub const MYROOM_PLANT_CHECK: u16 = 0x0FD;
+
+    /// GP_CLI_COMMAND_MYROOM_PLANT_CROP — harvest a plant
+    /// (vendor/server/src/map/packets/c2s/0x0fe_myroom_plant_crop.h).
+    pub const MYROOM_PLANT_CROP: u16 = 0x0FE;
+
+    /// GP_CLI_COMMAND_MYROOM_PLANT_STOP — stop drying/harvesting a plant
+    /// (vendor/server/src/map/packets/c2s/0x0ff_myroom_plant_stop.h).
+    pub const MYROOM_PLANT_STOP: u16 = 0x0FF;
 
     // GP_CLI_COMMAND_ITEM_STACK, vendor/server/src/map/packets/c2s/0x03a_item_stack.h.
     // "Sort" for a container: the server consolidates same-id partial stacks.
@@ -144,6 +198,30 @@ pub mod c2s {
     // BuyNum u32 (validator range 1..=99).
     pub const BAZAAR_BUY: u16 = 0x106;
 
+    // GP_CLI_COMMAND_BAZAAR_CLOSE, vendor/server/src/map/packets/c2s/0x10b_bazaar_close.h:
+    // what the client sends when it ENTERS its own `Set Prices` menu (LSB names the id
+    // after XiPackets, not after what it does). AllListClearFlg u32 @4, validated always
+    // 0; the handler raises `isSettingBazaarPrices` and clears BazaarCustomers.
+    pub const BAZAAR_PRICES_ENTER: u16 = 0x10B;
+
+    // GP_CLI_COMMAND_BAZAAR_ITEMSET, vendor/server/src/map/packets/c2s/0x10a_bazaar_itemset.h:
+    // price one LOC_INVENTORY slot of our own stall. ItemIndex u8 @4, padding u8[3],
+    // Price u32 @8 (validator range 0..=99_999_999; 0 frees the item again). The server
+    // answers ITEM_ATTR + ITEM_SAME for that slot.
+    pub const BAZAAR_ITEMSET: u16 = 0x10A;
+
+    // GP_CLI_COMMAND_BAZAAR_OPEN, vendor/server/src/map/packets/c2s/0x109_bazaar_open.h:
+    // header only, sent when the client LEAVES its `Set Prices` menu; clears
+    // `isSettingBazaarPrices` and raises UPDATE_HP so the stall re-publishes.
+    pub const BAZAAR_PRICES_DONE: u16 = 0x109;
+
+    // GP_CLI_COMMAND_INSPECT_MESSAGE, vendor/server/src/map/packets/c2s/0x0de_inspect_message.h:
+    // the only writer of our bazaar comment. Body is a fixed uint8[123] buffer (plus one
+    // pad byte to fill the last word) and LSB stores at most its first 120 bytes verbatim;
+    // there is no ack, and the string comes back to us only as s2c 0x0CA when someone
+    // checks us. Not to be confused with c2s 0x0E0 SET_USERMSG (the Seacom seek message).
+    pub const INSPECT_MESSAGE: u16 = 0x0DE;
+
     // GP_CLI_COMMAND_TROPHY_ENTRY, vendor/server/src/map/packets/c2s/0x041_trophy_entry.h.
     // Cast lots on a pool item: TrophyItemIndex u8, PropertyItemIndex u8,
     // padding u8[2]. The server rolls the number itself — the client sends no
@@ -163,6 +241,87 @@ pub mod c2s {
     // GROUP_LIST (0x0DD) for every member. The retail client sends this on zone-in
     // to guarantee the party HUD gets a clean refresh.
     pub const GROUP_LIST_REQ: u16 = 0x076;
+
+    // GP_CLI_COMMAND_GROUP_LEAVE, vendor/server/src/map/packets/c2s/0x06f_group_leave.h.
+    // Leave one's own party/alliance: PartyKind Kind (Party = 0, Alliance = 5).
+    pub const GROUP_LEAVE: u16 = 0x06F;
+
+    // GP_CLI_COMMAND_GROUP_BREAKUP, vendor/server/src/map/packets/c2s/0x070_group_breakup.h.
+    // Leader disbands the group: PartyKind Kind.
+    pub const GROUP_BREAKUP: u16 = 0x070;
+
+    // GP_CLI_COMMAND_GROUP_SOLICIT_RES, vendor/server/src/map/packets/c2s/0x074_group_solicit_res.h.
+    // Answer to a pending invite from the party window (prtyjoin YES/NO): Res u8
+    // (Decline = 0, Accept = 1) + padding[3].
+    pub const GROUP_SOLICIT_RES: u16 = 0x074;
+
+    // GP_CLI_COMMAND_TRADE_REQ, vendor/server/src/map/packets/c2s/0x032_trade_req.h.
+    // Ask a target to trade: UniqueNo u32 + ActIndex u16 + padding u16. The server
+    // pushes the target s2c ITEM_TRADE_REQ; nothing comes back to us until they answer.
+    pub const TRADE_REQ: u16 = 0x032;
+
+    // GP_CLI_COMMAND_TRADE_RES, vendor/server/src/map/packets/c2s/0x033_trade_res.h.
+    // Kind u32 ([`crate::decode::TradeResReqKind`]: Start=0/Cancell=1/Make=2/MakeCancel=3)
+    // + TradeCounter u16 (the window's refresh counter, s2c 0x23 carries it).
+    pub const TRADE_RES: u16 = 0x033;
+
+    // GP_CLI_COMMAND_TRADE_LIST, vendor/server/src/map/packets/c2s/0x034_trade_list.h.
+    // Stage one slot of our offer: ItemNum u32 (qty; gil amount when ItemNo is GIL)
+    // + ItemNo u16 + ItemIndex u8 (bag slot) + TradeIndex u8 (slot 0 = gil).
+    pub const TRADE_LIST: u16 = 0x034;
+
+    // GP_CLI_COMMAND_COMBINE_ASK, vendor/server/src/map/packets/c2s/0x096_combine_ask.h.
+    // One synthesis attempt: crystal item id + its bag slot, then up to 8
+    // ingredient (id, bag-slot) pairs in the recipe row's own order ([`crate::synth`]).
+    pub const COMBINE_ASK: u16 = 0x096;
+
+    // GP_CLI_COMMAND_ALTER_EGO_POINTS, vendor/server/src/map/packets/c2s/0x0c1_alter_ego_points.h:
+    // CategoryIndex u16 + padding u16, spending alter ego points on one upgrade id.
+    pub const ALTER_EGO_POINTS: u16 = 0x0C1;
+
+    // GP_CLI_COMMAND_UNITY_MENU, vendor/server/src/map/packets/c2s/0x116_unity_menu.h: Kind u32,
+    // the ranking result set (0 or 1).
+    pub const UNITY_MENU: u16 = 0x116;
+
+    // GP_CLI_COMMAND_UNITY_QUEST, vendor/server/src/map/packets/c2s/0x117_unity_quest.h: Kind u32,
+    // which LSB requires to be 0.
+    pub const UNITY_QUEST: u16 = 0x117;
+
+    // GP_CLI_COMMAND_UNITY_TOGGLE, vendor/server/src/map/packets/c2s/0x118_unity_toggle.h: Mode u8
+    // (GP_CLI_COMMAND_UNITY_TOGGLE_MODE Inactive 0 / Active 1) + 3 padding bytes.
+    // Direction sibling of s2c CURRENCIES_2 at 0x118.
+    pub const UNITY_TOGGLE: u16 = 0x118;
+
+    // GP_CLI_COMMAND_MERITS, vendor/server/src/map/packets/c2s/0x0be_merits.h: Kind u8, Param1 u8,
+    // Param2 u16, Param3 u32 ([`super::merits_wire`] names Kind and Param1).
+    pub const MERITS: u16 = 0x0BE;
+
+    // GP_CLI_COMMAND_JOB_POINTS_SPEND, vendor/server/src/map/packets/c2s/0x0bf_job_points_spend.h:
+    // Index u16 (the job point type id) + padding00 u16.
+    pub const JOB_POINTS_SPEND: u16 = 0x0BF;
+
+    // GP_CLI_COMMAND_JOB_POINTS_REQ, vendor/server/src/map/packets/c2s/0x0c0_job_points_req.h:
+    // header only; LSB answers with s2c 0x08D once the character holds JOB_BREAKER.
+    pub const JOB_POINTS_REQ: u16 = 0x0C0;
+}
+
+// vendor/server/src/map/packets/c2s/0x0be_merits.h GP_CLI_COMMAND_MERITS_KIND / _PARAM1.
+pub mod merits_wire {
+    include!(concat!(env!("OUT_DIR"), "/merits_wire.rs"));
+}
+
+/// Client opcodes the retail client sends that LSB's `PacketC2S` enum does not name
+/// (vendor/server/src/map/enums/packet_c2s.h), so build.rs has no upstream id to check them against.
+pub mod c2s_unnamed {
+    /// The header-only alter ego points request
+    /// (.agents/skills/retail-observe/references/2026-10-15-unity-and-fp-windows.md); LSB has no
+    /// handler for it.
+    pub const ALTER_EGO_POINTS_REQUEST: u16 = 0x0C2;
+}
+
+/// vendor/server/src/map/packets/c2s/0x118_unity_toggle.h GP_CLI_COMMAND_UNITY_TOGGLE_MODE.
+pub mod unity_toggle_mode {
+    include!(concat!(env!("OUT_DIR"), "/unity_toggle_mode.rs"));
 }
 
 /// Wide-scan (tracking) State bytes shared by the s2c 0x0F5/0x0F6 decoders and
@@ -475,9 +634,22 @@ pub mod s2c {
     // Self-character stat block: HP/MP max, base+gear stats, attack/defense, resists, iLv.
     pub const CLISTATUS: u16 = 0x061;
 
+    // GP_SERV_COMMAND_CLISTATUS2, vendor/server/src/map/packets/s2c/0x062_clistatus2.h.
+    // The skill block behind the Status window's Combat/Magic/Craft rows:
+    // CommandRecast[31] then skill_base[64], indexed by skill id.
+    pub const CLISTATUS2: u16 = 0x062;
+
     // GP_SERV_COMMAND_FISH, vendor/server/src/map/enums/packet_s2c.h. Sent to start
     // the fishing mini-game with the hooked fish's stats.
     pub const FISH: u16 = 0x115;
+
+    // GP_SERV_COMMAND_CURRENCIES_1 / _2, vendor/server/src/map/packets/s2c/
+    // 0x113_currencies_1.h + 0x118_currencies_2.h: the currency reports answering the
+    // header-only c2s requests above. Kuluu keeps them RAW — the client-side getter law
+    // (`kuluu_render::hud::currency_law`) reads fields out of the block directly, exactly
+    // as the DLL does; field layout cross-check is in vault main_menu.md §59 addendum 27.
+    pub const CURRENCIES_1: u16 = 0x113;
+    pub const CURRENCIES_2: u16 = 0x118;
 
     pub const CHAT: u16 = 0x017;
 
@@ -505,6 +677,42 @@ pub mod s2c {
     pub const ITEM_LIST: u16 = 0x01F;
 
     pub const ITEM_ATTR: u16 = 0x020;
+
+    // GP_SERV_COMMAND_ITEM_TRADE_REQ, vendor/server/src/map/packets/s2c/0x021_item_trade_req.h.
+    // Someone asked to trade: UniqueNo + ActIndex. Answer with c2s TRADE_RES (0x033).
+    pub const ITEM_TRADE_REQ: u16 = 0x021;
+
+    // GP_SERV_COMMAND_ITEM_TRADE_RES, vendor/server/src/map/packets/s2c/0x022_item_trade_res.h.
+    // Trade state changes: Kind sees [`crate::decode::TradeResKind`] (Start opens both
+    // windows after the target accepted; End closes them after commit).
+    pub const ITEM_TRADE_RES: u16 = 0x022;
+
+    // GP_SERV_COMMAND_ITEM_TRADE_LIST, vendor/server/src/map/packets/s2c/0x023_item_trade_list.h.
+    // One slot of the PARTNER's trade offer refreshed (TradeIndex 0 is their gil).
+    pub const ITEM_TRADE_LIST: u16 = 0x023;
+
+    // GP_SERV_COMMAND_ITEM_TRADE_MYLIST, vendor/server/src/map/packets/s2c/0x025_item_trade_mylist.h.
+    // One slot of MY trade offer refreshed (server echo after c2s TRADE_LIST).
+    pub const ITEM_TRADE_MYLIST: u16 = 0x025;
+
+    // GP_SERV_COMMAND_COMBINE_ANS, vendor/server/src/map/packets/s2c/0x06f_combine_ans.h.
+    // The answer to a synthesis ask (result code, gained item, broken
+    // ingredients; [`crate::synth::parse_combine_ans`]).
+    pub const COMBINE_ANS: u16 = 0x06F;
+    // GP_SERV_COMMAND_MISSION, vendor/server/src/map/packets/s2c/0x056_mission.h;
+    // vault main_menu.md section 30.
+    pub const MISSION: u16 = 0x056;
+
+    // GP_SERV_COMMAND_CONFIG — the server's copy of the client option flags
+    // (SAVE_CONF prefix; vendor/server/src/map/packets/s2c/0x0b4_config.h).
+    // Answered back after every c2s CONFIG, on login gameok, and on party law
+    // pushes (party.cpp) [V].
+    pub const CONFIG: u16 = 0x0B4;
+
+    // GP_SERV_COMMAND_EXTENDED_JOB — BLU/PUP/MON extended info
+    // (vendor/server/src/map/packets/s2c/0x044_extended_job_pup.h and friends;
+    // vault main_menu.md §39). Parse with [`crate::puppet::parse_extended_job`].
+    pub const EXTENDED_JOB: u16 = 0x044;
 
     pub const BATTLE2: u16 = 0x028;
 
@@ -534,6 +742,22 @@ pub mod s2c {
     pub const AUC: u16 = 0x04C;
 
     pub const MISCDATA: u16 = 0x063;
+
+    // GP_SERV_PACKET_ALTER_EGO_POINTS, vendor/server/src/map/packets/s2c/0x08e_alter_ego_points.h.
+    // The alter ego point balance with each upgrade's level and cost ([`crate::decode::AlterEgoPoints`]).
+    pub const ALTER_EGO_POINTS: u16 = 0x08E;
+
+    // GP_SERV_COMMAND_UNITY, vendor/server/src/map/packets/s2c/0x110_unity.h
+    // ([`crate::decode::UnityQuest`]). Direction sibling of c2s FISHING_2 at 0x110.
+    pub const UNITY: u16 = 0x110;
+
+    // GP_SERV_COMMAND_MERIT, vendor/server/src/map/packets/s2c/0x08c_merit.h
+    // ([`crate::decode::MeritList`]).
+    pub const MERIT: u16 = 0x08C;
+
+    // GP_SERV_COMMAND_JOB_POINTS, vendor/server/src/map/packets/s2c/0x08d_job_points.h
+    // ([`crate::decode::JobPointList`]).
+    pub const JOB_POINTS: u16 = 0x08D;
 
     pub const SYSTEMMES: u16 = 0x053;
 
@@ -612,6 +836,15 @@ pub mod s2c {
 
     pub const GROUP_ATTR: u16 = 0x0DF;
 
+    // GP_SERV_COMMAND_GROUP_SOLICIT_REQ, vendor/server/src/map/packets/s2c/0x0dc_group_solicit_req.h.
+    // Incoming party/alliance invite; answered with c2s GROUP_SOLICIT_RES (0x074).
+    pub const GROUP_SOLICIT_REQ: u16 = 0x0DC;
+
+    // GP_SERV_COMMAND_GROUP_SOLICIT_NO, vendor/server/src/map/packets/s2c/0x0de_group_solicit_no.h.
+    // The server withdrawing/noting a failed solicit; the client drops its pending
+    // invite window state (retail closes `prtyjoin` and flags `alarm`).
+    pub const GROUP_SOLICIT_NO: u16 = 0x0DE;
+
     // GP_SERV_COMMAND_EQUIP_INSPECT, vendor/server/src/map/enums/packet_s2c.h.
     // /check answer for a PC target: EQUIPMENT batches then one GENERAL packet
     // (vendor/server/src/map/packets/c2s/0x0dd_equip_inspect.cpp GP_CLI_COMMAND_EQUIP_INSPECT::process).
@@ -638,6 +871,11 @@ pub mod s2c {
     // GP_SERV_COMMAND_BAZAAR_SELL, vendor/server/src/map/packets/s2c/0x109_bazaar_sell.h.
     // Another customer bought a row of the bazaar we are browsing.
     pub const BAZAAR_SELL: u16 = 0x109;
+
+    // GP_SERV_COMMAND_GROUP_COMLINK, vendor/server/src/map/packets/s2c/0x0e0_group_comlink.h.
+    // Which inventory item is now the pearl equipped in linkshell slot 1 or 2; pushed for both
+    // slots at login and after every equip/unequip/create (vault main_menu.md §27).
+    pub const GROUP_COMLINK: u16 = 0x0E0;
 
     // vendor/server/src/map/packets/s2c/0x10e_reqsubmapnum.h GP_SERV_COMMAND_REQSUBMAPNUM.
     pub const REQSUBMAPNUM: u16 = super::event_query_wire::S2C_REQSUBMAPNUM;
@@ -675,6 +913,67 @@ pub mod s2c {
 
 #[cfg(test)]
 mod tests {
+    /// The Unity / alter ego point opcodes are LSB's own enum entries, and 0x0C2 is the one
+    /// the record names with no LSB entry at all.
+    #[test]
+    fn unity_and_alter_ego_opcodes_match_lsb_packet_enums() {
+        use crate::packet_names::{c2s_name, s2c_name};
+        assert_eq!(s2c_name(super::s2c::UNITY), Some("UNITY"));
+        assert!(
+            s2c_name(super::s2c::ALTER_EGO_POINTS).is_some_and(|n| n.ends_with("ALTER_EGO_POINTS"))
+        );
+        assert_eq!(
+            c2s_name(super::c2s::ALTER_EGO_POINTS),
+            Some("ALTER_EGO_POINTS")
+        );
+        assert_eq!(c2s_name(super::c2s_unnamed::ALTER_EGO_POINTS_REQUEST), None);
+        assert_eq!(c2s_name(super::c2s::UNITY_MENU), Some("UNITY_MENU"));
+        assert_eq!(c2s_name(super::c2s::UNITY_QUEST), Some("UNITY_QUEST"));
+        assert_eq!(c2s_name(super::c2s::UNITY_TOGGLE), Some("UNITY_TOGGLE"));
+    }
+
+    #[test]
+    fn merit_and_job_point_opcodes_match_lsb_packet_enums() {
+        use crate::packet_names::{c2s_name, s2c_name};
+        assert_eq!(s2c_name(super::s2c::MERIT), Some("MERIT"));
+        assert_eq!(s2c_name(super::s2c::JOB_POINTS), Some("JOB_POINTS"));
+        assert_eq!(c2s_name(super::c2s::MERITS), Some("MERITS"));
+        assert_eq!(
+            c2s_name(super::c2s::JOB_POINTS_SPEND),
+            Some("JOB_POINTS_SPEND")
+        );
+        assert_eq!(c2s_name(super::c2s::JOB_POINTS_REQ), Some("JOB_POINTS_REQ"));
+    }
+
+    /// The record's c2s 0x0BE bodies: ChangeMode is Kind 2 with Param1 0 (EXP) or 1 (Limit
+    /// Points), EditMode is Kind 3 with Param1 1 (raise) or 0 (lower)
+    /// (.agents/skills/retail-observe/references/2026-10-15-merit-and-job-point-windows.md). The
+    /// scraped LSB enums agree.
+    #[test]
+    fn merits_kind_and_param1_match_the_record() {
+        use super::merits_wire::{kind, param1};
+        const RECORD_PINNED_CHANGE_MODE: u8 = 2;
+        const RECORD_PINNED_EDIT_MODE: u8 = 3;
+        const RECORD_PINNED_LOWER_OR_EXP: u8 = 0;
+        const RECORD_PINNED_RAISE_OR_LIMIT: u8 = 1;
+        assert_eq!(kind::CHANGE_MODE, RECORD_PINNED_CHANGE_MODE);
+        assert_eq!(kind::EDIT_MODE, RECORD_PINNED_EDIT_MODE);
+        assert_eq!(param1::LOWER, RECORD_PINNED_LOWER_OR_EXP);
+        assert_eq!(param1::RAISE, RECORD_PINNED_RAISE_OR_LIMIT);
+    }
+
+    /// The record's c2s 0x118 Mode: the Unity chat panel's item 1 sends 1 (on), item 2 sends 0
+    /// (off) (.agents/skills/retail-observe/references/2026-10-15-unity-and-fp-windows.md). The
+    /// scraped LSB enum agrees.
+    #[test]
+    fn unity_toggle_modes_match_the_record() {
+        use super::unity_toggle_mode::{ACTIVE, INACTIVE};
+        const RECORD_PINNED_ACTIVE: u8 = 1;
+        const RECORD_PINNED_INACTIVE: u8 = 0;
+        assert_eq!(ACTIVE, RECORD_PINNED_ACTIVE);
+        assert_eq!(INACTIVE, RECORD_PINNED_INACTIVE);
+    }
+
     #[test]
     fn pinned_emote_ids_match_scraped_table() {
         use super::emote;

@@ -136,6 +136,14 @@ const ROW_CLEARANCE_PX: f32 = 2.0;
 
 pub const ICONS_PER_ROW: usize = 16;
 
+/// Retail hangs the icon row under the help line box from its left edge, this far below it.
+const GAP_BELOW_HELP_LINE_PX: f32 = 6.0;
+
+/// The icon row's top-left corner, from the help line box's rectangle.
+pub fn ribbon_origin() -> Vec2 {
+    crate::hud::menu_help_bar::help_line_bottom_left() + Vec2::new(0.0, GAP_BELOW_HELP_LINE_PX)
+}
+
 #[cfg(feature = "enhanced-buff-timers")]
 use timers::{cell_pitch_px, timer_line_px};
 
@@ -155,6 +163,7 @@ pub fn spawn_status_ribbon(mut commands: Commands, mut images: ResMut<Assets<Ima
     let icon_gap = pitch - ICON_SIZE_PX;
     let timer_line = timer_line_px();
     let row_width = ICONS_PER_ROW as f32 * pitch;
+    let origin = ribbon_origin();
 
     commands
         .spawn((
@@ -162,10 +171,8 @@ pub fn spawn_status_ribbon(mut commands: Commands, mut images: ResMut<Assets<Ima
             StatusRibbon,
             Node {
                 position_type: PositionType::Absolute,
-
-                // Below the menu help bar so chips never overlap it when open.
-                top: Val::Px(crate::hud::menu_help_bar::BAR_HEIGHT + 6.0),
-                left: Val::Px(8.0),
+                top: Val::Px(origin.y),
+                left: Val::Px(origin.x),
                 width: Val::Px(row_width),
                 flex_direction: FlexDirection::Row,
                 flex_wrap: FlexWrap::Wrap,
@@ -210,20 +217,49 @@ pub fn spawn_status_ribbon(mut commands: Commands, mut images: ResMut<Assets<Ima
         });
 }
 
+/// The ribbon hangs under the help line, which is exactly where a Command-menu window lands once one
+/// opens. Owner ruling 2026-10-20, pointing at a buff icon left poking out of the Profile window's
+/// top border: while a menu stack holds the screen the status icons are hidden rather than half
+/// covered. Buff inspection runs through `InputMode::PassiveCursor`, which is not a menu stack, so
+/// clicking a buff off the ribbon still works.
+pub fn status_icons_hidden(mode: &crate::input_mode::InputMode) -> bool {
+    matches!(
+        mode,
+        crate::input_mode::InputMode::Menu(_) | crate::input_mode::InputMode::SubTarget(_)
+    )
+}
+
 pub fn update_status_ribbon(
     state: Res<SceneState>,
     dat_root: Res<StatusIconDatRoot>,
     mut cache: ResMut<StatusIconCache>,
     mut images: ResMut<Assets<Image>>,
-    mut chips: Query<(
-        &StatusChip,
-        &Children,
-        &mut Node,
-        &mut ImageNode,
-        &mut BackgroundColor,
-    )>,
+    mode: Res<crate::input_mode::InputMode>,
+    // The ribbon node itself; hiding it takes its chips with it, and the per-chip display law below
+    // stays untouched so coming back out of a menu restores exactly what was there.
+    mut ribbon_q: Query<&mut Node, With<StatusRibbon>>,
+    mut chips: Query<
+        (
+            &StatusChip,
+            &Children,
+            &mut Node,
+            &mut ImageNode,
+            &mut BackgroundColor,
+        ),
+        Without<StatusRibbon>,
+    >,
     mut text_q: Query<&mut Text, With<StatusChipFallback>>,
 ) {
+    let want_display = if status_icons_hidden(&mode) {
+        Display::None
+    } else {
+        Display::Flex
+    };
+    for mut ribbon in ribbon_q.iter_mut() {
+        if ribbon.display != want_display {
+            ribbon.display = want_display;
+        }
+    }
     if !state.dirty {
         return;
     }
@@ -409,23 +445,48 @@ pub mod timers {
         ));
     }
 
+    /// `conf12wi` rows 11/12 write this option store (the arm is `cmp ax,0xB; sete` at
+    /// .text FFXiMain.dll retail-2026-09 0x19BAB7), and both ribbon countdown branches bail on a
+    /// zero value: the getter call at `.text 0x227F9C` jumps past its draw block when the store is
+    /// empty, exactly like the second one at `.text 0x228086`. The chips themselves are untouched —
+    /// only their countdown label disappears (vault main_menu.md §59 addendum 48).
+    pub const CONFIG_STORE_STATUS_ICON_TIMERS: u32 = 0xC3;
+
+    /// Retail keeps the option's boot value in its record table (`[rec+0x20]`), which is built at
+    /// runtime and unread from the file, so only an explicitly stored zero counts as off. Absent or
+    /// non-zero leaves the countdown drawn, matching what selecting row 11 does.
+    fn timers_displayed(menus: Option<&crate::hud::menu::DynamicMenu>) -> bool {
+        !matches!(
+            menus.and_then(|menu| menu
+                .config_option_values
+                .get(&CONFIG_STORE_STATUS_ICON_TIMERS)),
+            Some(0)
+        )
+    }
+
     pub fn update_status_timers(
         state: Res<SceneState>,
         clock: Res<crate::vana_time::VanaClock>,
+        menus: Option<Res<crate::hud::menu::DynamicMenu>>,
         chips: Query<(&StatusChip, &Children)>,
         mut timer_q: Query<&mut Text, With<StatusChipTimer>>,
     ) {
+        let show_timer = timers_displayed(menus.as_deref());
         let now = clock.earth_unix_secs_now() as u32;
         let expiries = &state.snapshot.status_icon_expiries;
         for (chip, children) in chips.iter() {
-            let want = expiries
-                .get(chip.slot)
-                .copied()
-                .filter(|&e| e != 0)
-                .map(|e| e.saturating_sub(now))
-                .filter(|&r| r > 0)
-                .map(ribbon_timer)
-                .unwrap_or_default();
+            let want = if show_timer {
+                expiries
+                    .get(chip.slot)
+                    .copied()
+                    .filter(|&e| e != 0)
+                    .map(|e| e.saturating_sub(now))
+                    .filter(|&r| r > 0)
+                    .map(ribbon_timer)
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
             for child in children.iter() {
                 if let Ok(mut text) = timer_q.get_mut(child) {
                     if **text != want {
@@ -510,6 +571,75 @@ pub mod timers {
                 chip_timer_texts(app.world_mut())[..2],
                 [MID_BUCKET_LABEL, ""]
             );
+        }
+
+        /// Selecting row 12 writes a zero into the timer store, and retail's two countdown
+        /// branches bail on it (`.text FFXiMain.dll retail-2026-09 0x227F9C` / `.text 0x228086`) while the
+        /// chips themselves stay up.
+        #[test]
+        fn a_stored_zero_hides_the_countdown_and_keeps_the_icons() {
+            let clock = crate::vana_time::VanaClock::anchored_at_hour(12.0);
+            let now = clock.earth_unix_secs_now() as u32;
+            let mut app = App::new();
+            let mut menus = crate::hud::menu::DynamicMenu::default();
+            menus
+                .config_option_values
+                .insert(CONFIG_STORE_STATUS_ICON_TIMERS, 0);
+            app.init_resource::<Assets<Image>>()
+                .init_resource::<SceneState>()
+                .insert_resource(clock)
+                .insert_resource(menus);
+            app.world_mut()
+                .run_system_once(spawn_status_ribbon)
+                .unwrap();
+
+            {
+                let mut state = app.world_mut().resource_mut::<SceneState>();
+                state.snapshot.status_icons = vec![10];
+                state.snapshot.status_icon_expiries = vec![now + MID_BUCKET_REMAINING_SECS];
+            }
+            app.world_mut()
+                .run_system_once(update_status_timers)
+                .unwrap();
+
+            // `chip_timer_texts` walks every chip and demands a countdown node under it, so
+            // reaching the assertion at all proves the icons themselves stayed up.
+            let labels = chip_timer_texts(app.world_mut());
+            assert!(
+                !labels.is_empty() && labels.iter().all(|label| label.is_empty()),
+                "a hidden timer must leave every slot blank, got {labels:?}"
+            );
+        }
+
+        /// The other row of the pair writes a one, and an option store nobody has ever touched
+        /// behaves the same way: the countdown stays.
+        #[test]
+        fn selecting_display_timers_keeps_the_countdown() {
+            let clock = crate::vana_time::VanaClock::anchored_at_hour(12.0);
+            let now = clock.earth_unix_secs_now() as u32;
+            let mut menus = crate::hud::menu::DynamicMenu::default();
+            menus
+                .config_option_values
+                .insert(CONFIG_STORE_STATUS_ICON_TIMERS, 1);
+            let mut app = App::new();
+            app.init_resource::<Assets<Image>>()
+                .init_resource::<SceneState>()
+                .insert_resource(clock)
+                .insert_resource(menus);
+            app.world_mut()
+                .run_system_once(spawn_status_ribbon)
+                .unwrap();
+
+            {
+                let mut state = app.world_mut().resource_mut::<SceneState>();
+                state.snapshot.status_icons = vec![10];
+                state.snapshot.status_icon_expiries = vec![now + MID_BUCKET_REMAINING_SECS];
+            }
+            app.world_mut()
+                .run_system_once(update_status_timers)
+                .unwrap();
+
+            assert_eq!(chip_timer_texts(app.world_mut())[..1], [MID_BUCKET_LABEL]);
         }
 
         fn chip_timer_texts(world: &mut World) -> Vec<String> {
@@ -679,6 +809,32 @@ mod tests {
             texts.len(),
             MAX_VISIBLE,
             "only the icon-id fallback text belongs under a chip"
+        );
+    }
+
+    /// The icon row hangs from the help line box: its left edge, the gap below its bottom.
+    #[test]
+    fn ribbon_hangs_under_the_help_line_box() {
+        use bevy::ecs::system::RunSystemOnce;
+        let anchor = crate::hud::menu_help_bar::help_line_bottom_left();
+        let origin = ribbon_origin();
+        assert_eq!(origin.x, anchor.x, "starts at the help line's left edge");
+        assert_eq!(origin.y, anchor.y + GAP_BELOW_HELP_LINE_PX);
+
+        let mut app = App::new();
+        app.init_resource::<Assets<Image>>();
+        app.world_mut()
+            .run_system_once(spawn_status_ribbon)
+            .unwrap();
+        let world = app.world_mut();
+        let ribbon = world
+            .query_filtered::<&Node, With<StatusRibbon>>()
+            .single(world)
+            .expect("ribbon spawned")
+            .clone();
+        assert_eq!(
+            (ribbon.left, ribbon.top),
+            (Val::Px(origin.x), Val::Px(origin.y))
         );
     }
 

@@ -10,6 +10,10 @@ use bevy::prelude::*;
 /// the other pop-up windows (target-action / quick-action at 20, trade at 25).
 pub const WINDOW_Z: i32 = 20;
 
+/// The chat stack draws under every other HUD window, so a menu that reaches the log covers it
+/// instead of moving it.
+pub const CHAT_STACK_Z: i32 = -1;
+
 /// Retail stacks the self, target, and party panels in one right-hand column, so
 /// their width, inset, and gap are a shared contract, not independent tunings.
 /// `hud::panel_column` owns the stacking; panels never position themselves
@@ -45,6 +49,25 @@ pub mod theme {
     pub const WARN: Color = Color::srgb(1.0, 0.82, 0.30);
     pub const GOOD: Color = Color::srgb(0.45, 0.90, 0.55);
     pub const FAINT: Color = Color::srgb(0.44, 0.48, 0.58);
+    /// A row the client will not answer. Retail keeps the same glyph colour and halves
+    /// its intensity — ARGB 0x80808080 becomes 0x80404040 on a gated roomlist row
+    /// (FFXiMain.dll retail-2026-09 `.text 0x1D6A1A`), and the same halving covers the
+    /// `statcom2` rows disabled at open (`.text 0x148B50`). Half of TEXT.
+    pub const TEXT_DISABLED: Color = Color::srgb(0.455, 0.46, 0.475);
+    /// A persona attribute row's positive adjustment span: retail pushes the raw ARGB
+    /// 0x80408040 when `bp_adj` is above zero (FFXiMain.dll retail-2026-09 `.text 0x147530`).
+    pub const ATTR_ADJUST_UP: Color = Color::srgb(0.251, 0.502, 0.251);
+    /// A persona attribute row's negative adjustment span — retail pushes ARGB
+    /// 0x80804040 when `bp_adj` is below zero (FFXiMain.dll retail-2026-09 `.text 0x14754C`).
+    pub const ATTR_ADJUST_DOWN: Color = Color::srgb(0.502, 0.251, 0.251);
+    /// An item row wearable right now. Retail's per-row colour resolvers paint ARGB
+    /// 0x80909040 when the equip legality check answers true (FFXiMain.dll retail-2026-09
+    /// `.text 0x1DE18D`, repeated at `.text 0x20F788` and `.text 0x1EC8DA`).
+    pub const TEXT_EQUIP_OK: Color = Color::srgb(0.565, 0.565, 0.251);
+    /// An item row whose id already stands in one of the equip slots the client scans —
+    /// ARGB 0x80509050 (FFXiMain.dll retail-2026-09 `.text 0x1DE173`, scan helper
+    /// `.text 0x131FA0`), which takes precedence over the wearable-now lime.
+    pub const TEXT_EQUIP_SAME_KIND: Color = Color::srgb(0.314, 0.565, 0.314);
 }
 
 /// The row prefix marking the cursor in every list menu — "> " on the selected
@@ -65,12 +88,17 @@ pub fn text_font(size: f32) -> TextFont {
     }
 }
 
+/// The inset a framed window leaves between its border and its content. A window that sizes itself
+/// to its rows needs the same numbers, so they live here rather than only inside `window_frame`.
+pub const WINDOW_PAD_X_PX: f32 = 10.0;
+pub const WINDOW_PAD_Y_PX: f32 = 8.0;
+
 /// A framed window panel: translucent navy fill, steel-blue 1px border,
 /// column layout. Every game window's outer chrome goes through this.
 pub fn window_frame() -> (Node, BackgroundColor, BorderColor) {
     (
         Node {
-            padding: UiRect::axes(Val::Px(10.0), Val::Px(8.0)),
+            padding: UiRect::axes(Val::Px(WINDOW_PAD_X_PX), Val::Px(WINDOW_PAD_Y_PX)),
             border: UiRect::all(Val::Px(1.0)),
             flex_direction: FlexDirection::Column,
             row_gap: Val::Px(2.0),

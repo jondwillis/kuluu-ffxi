@@ -277,7 +277,11 @@ fn ffximain_dll_tables_resolve_for_every_playable_race_and_zone() {
 const MIN_APPS: usize = 9;
 /// File ids claimed by more than one ROM: horizonxi-2023's ROM10 re-ships 72
 /// of the base ROM's files; retail-2026-09 has no ROM10 and no overlap.
-const MULTI_CLAIM_PINS: &[(&str, usize)] = &[("horizonxi-2023", 72), ("retail-2026-09", 0)];
+const MULTI_CLAIM_PINS: &[(&str, usize)] = &[
+    ("horizonxi-2023", 72),
+    ("retail-2026-09", 0),
+    ("retail-2026-10", 0),
+];
 
 /// The per-ROM table pair as the install lays it out (`VTABLE.DAT`/`FTABLE.DAT`
 /// for the base ROM, `ROMn/VTABLEn.DAT` otherwise), read independently of the
@@ -480,8 +484,11 @@ const KEYITEM_OBTAINED_PREFIX: &str = "Obtained key item:";
 /// vendor/server/scripts/zones/Southern_San_dOria/IDs.lua (CLIENT_VER
 /// 30260904_1) pins 6442, which retail-2026-09 matches exactly;
 /// horizonxi-2023 sits 5 below it.
-const KEYITEM_OBTAINED_PINS: &[(&str, usize)] =
-    &[("horizonxi-2023", 6437), ("retail-2026-09", 6442)];
+const KEYITEM_OBTAINED_PINS: &[(&str, usize)] = &[
+    ("horizonxi-2023", 6437),
+    ("retail-2026-09", 6442),
+    ("retail-2026-10", 6442),
+];
 /// The US sheet's frame group; the JP sheet's is `menu    frames  `. Measured
 /// on both rows.
 const FRAMES_US: &str = "menu    framesus";
@@ -546,8 +553,11 @@ fn dialog_tables_parse_and_the_fixed_tables_open() {
 const PORT_SAN_DORIA: u16 = 232;
 /// Port San d'Oria's installed fishing base per row; the vendored LSB pin's
 /// `FISHING_MESSAGE_OFFSET` for the zone is 7264.
-const PORT_SAN_DORIA_FISHING_BASE_PINS: &[(&str, u16)] =
-    &[("horizonxi-2023", 7255), ("retail-2026-09", 7268)];
+const PORT_SAN_DORIA_FISHING_BASE_PINS: &[(&str, u16)] = &[
+    ("horizonxi-2023", 7255),
+    ("retail-2026-09", 7268),
+    ("retail-2026-10", 7268),
+];
 /// Zones whose NOROD line is read back through the session's chat path:
 /// West Ronfaure, Lower Jeuno, Mog Garden (vendor/server/sql/zone_settings.sql).
 const NOROD_CHAT_ZONES: [u16; 3] = [100, 245, 280];
@@ -725,6 +735,7 @@ fn excode_client_matches_the_rom_inventory_pinned_for_this_row() {
             ("horizonxi-2023", expansion_display::ALL_KNOWN),
             ("retail-2019-base", expansion_display::ALL_KNOWN),
             ("retail-2026-09", expansion_display::ALL_KNOWN),
+            ("retail-2026-10", expansion_display::ALL_KNOWN),
         ],
     ) else {
         return;

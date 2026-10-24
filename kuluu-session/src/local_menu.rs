@@ -773,6 +773,12 @@ fn mog_menu() -> Menu {
 /// Retail Storage submenu order: Safe, Safe 2, Storage, Locker, Satchel, Sack,
 /// Case, Wardrobe 1-8. The label→container pairs live here (the emitter);
 /// consumers map labels back via [`storage_row_container`].
+///
+/// This list *is* the `menu    mogcont` window: its FFXiMain.dll
+/// retail-2026-09 RVA 0x14EC40 handler answers select items 1..0xF and each
+/// branch's argument is one of exactly these container ids — every LSB storage
+/// container except INVENTORY, TEMPITEMS and RECYCLEBIN (vault main_menu.md §32;
+/// display order per the HorizonXI capture above).
 pub fn storage_rows() -> [(&'static str, u8); 15] {
     use ffxi_proto::map::container as c;
     [
@@ -1055,6 +1061,7 @@ mod tests {
             model: 257,
             sub_map,
             exit_bit,
+            door_open: false,
         }
     }
 
@@ -1148,6 +1155,9 @@ mod tests {
             unlocked: 0b1_1011,
             sub_job_unlocked: true,
             job_levels,
+            can_thumbs_up_mentor: false,
+            mentor_rank: 0,
+            mastery_rank: 0,
         }
     }
 
@@ -1658,5 +1668,22 @@ mod tests {
         assert_eq!(f.choices, f2.choices);
         assert!(matches!(s.advance(Some(99)), Advance::Close));
         assert!(!s.active());
+    }
+
+    #[test]
+    fn storage_rows_are_exactly_the_mogcont_container_set() {
+        // The mogcont handler (FFXiMain.dll retail-2026-09 RVA 0x14EC40, jump
+        // table 0x14ED80) covers items 1..0xF and every branch's argument is a
+        // container id; across all branches that set is exactly ids 1..=16
+        // minus TEMPITEMS — Safe, Safe 2, Storage, Locker, Satchel, Sack, Case
+        // and Wardrobe 1-8 (vault main_menu.md §32).
+        use ffxi_proto::map::container as c;
+        let mut got: Vec<u8> = storage_rows().iter().map(|&(_, id)| id).collect();
+        got.sort_unstable();
+        got.dedup();
+        let want: Vec<u8> = (c::LOC_MOGSAFE..=c::LOC_WARDROBE8)
+            .filter(|&id| id != c::LOC_TEMPITEMS)
+            .collect();
+        assert_eq!(got, want);
     }
 }

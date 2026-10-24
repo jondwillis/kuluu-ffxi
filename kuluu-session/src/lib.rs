@@ -10,6 +10,7 @@ pub mod auth_client;
 pub mod config_dir;
 pub mod debug_control;
 pub mod delivery_box;
+pub mod emote_store;
 pub mod event_dialog;
 pub mod fishing;
 pub mod goal_store;
@@ -17,7 +18,10 @@ pub mod local_menu;
 
 pub mod lobby_client;
 pub mod lobby_wire;
+pub mod macro_store;
 pub mod map_client;
+pub mod myroom_furniture;
+pub mod myroom_layout;
 pub mod net_health;
 pub mod pol_inhouse;
 pub mod reactor;

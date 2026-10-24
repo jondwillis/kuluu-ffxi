@@ -56,6 +56,9 @@ pub mod look_resolver;
 pub mod minimap;
 pub mod moon_material;
 pub mod mouse;
+pub mod myroom_arrange;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod myroom_furniture;
 pub mod nameplate;
 pub mod nameplate_billboard;
 pub mod nameplate_color;
@@ -205,6 +208,12 @@ impl<S: SceneSource + Resource + Component<Mutability = bevy::ecs::component::Mu
         app.add_plugins((dat_mmb::DatOverlayPlugin, transport::TransportPlugin));
 
         #[cfg(not(target_arch = "wasm32"))]
+        app.add_plugins((
+            myroom_furniture::MyroomFurniturePlugin,
+            myroom_arrange::systems::MyroomArrangePlugin,
+        ));
+
+        #[cfg(not(target_arch = "wasm32"))]
         app.add_plugins(audio::AudioPlugin);
 
         app.add_plugins(weather::WeatherPlugin);
@@ -306,12 +315,15 @@ impl<S: SceneSource + Resource + Component<Mutability = bevy::ecs::component::Mu
             .init_resource::<nameplate_billboard::BillboardFont>()
             .init_resource::<nameplate_billboard::NameplateBillboardDebug>()
             .init_resource::<ui_font::UiFont>()
+            .init_resource::<ui_font::UiFontItalic>()
             .add_plugins(nameplate_color::NameColorPlugin)
             .add_plugins(nameplate_icons::NameplateIconsPlugin)
             .add_plugins(PickingPlugin)
             .add_plugins(CursorPlugin)
             .add_message::<ToastEvent>()
-            .add_systems(Startup, ui_font::load_ui_font)
+            // In Startup: a `TextFont` that names a handle (the Status caption's oblique)
+            // needs the asset registered before the HUD spawns.
+            .add_systems(Startup, ui_font::load_ui_fonts)
             .add_systems(Update, ui_font::apply_ui_font)
             .add_systems(PreUpdate, ingest_system::<S>.run_if(resource_exists::<S>))
             .add_systems(PostUpdate, drain_toast_events)

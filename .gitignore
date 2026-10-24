@@ -56,6 +56,9 @@ vendor/xi-tinkerer/
 # RZN MapViewer — STRICT cite-only, all-rights-reserved. Never copy/derive/link.
 vendor/RZN-mapviewer/
 
+# REA, the Ghidra reader for agents: local install from scripts/install-rea.ps1, pins in vendor/README.md.
+vendor/rea/
+
 # XIM browser FFXI client (GPL-3) — read-only reference, NEVER commit.
 research/xim/
 # Phoenix server (GPL-3) — private upstream, clone locally.

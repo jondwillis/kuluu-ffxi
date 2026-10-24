@@ -21,18 +21,18 @@ pub fn key_items_mark_seen_system(
     cmd_tx: Res<CommandTx>,
     mut viewed: ResMut<KeyItemsViewed>,
 ) {
-    let cursor_in_key_items = match &*mode {
+    // ur/150: the hub is one level of the family; while it holds focus there
+    // are no item rows to mark, and each bucket list marks as its own cursor
+    // visits. Any Key Items surface counts.
+    let view_cursor = match &*mode {
         InputMode::Menu(stack) => stack
             .current()
-            .filter(|l| l.kind == MenuKind::KeyItems)
-            .map(|l| l.cursor),
+            .filter(|l| matches!(l.kind, MenuKind::KeyItems | MenuKind::KeyItemList { .. })),
         _ => None,
     };
-    match cursor_in_key_items {
-        Some(cursor) => {
-            if let Some(DynamicMenuAction::KeyItem { id }) =
-                entry_action(MenuKind::KeyItems, cursor, &dynamic)
-            {
+    match view_cursor.map(|l| (l.kind, l.cursor)) {
+        Some((kind, cursor)) => {
+            if let Some(DynamicMenuAction::KeyItem { id }) = entry_action(kind, cursor, &dynamic) {
                 if scene.snapshot.key_items_seen.binary_search(&id).is_err() {
                     viewed.0.insert(id);
                 }

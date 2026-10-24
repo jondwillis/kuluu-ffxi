@@ -142,12 +142,57 @@ pub struct CliStatus {
     pub mjob_lv: u8,
     pub sjob_no: u8,
     pub sjob_lv: u8,
+    /// Current- and next-level EXP thresholds carried straight from the wire so
+    /// the `level` box under the persona panel answers (LSB
+    /// vendor/server/src/map/packets/s2c/0x061_clistatus.h CLISTATUS exp_now/exp_next).
+    pub exp_now: i16,
+    pub exp_next: i16,
     pub bp_base: [u16; Self::BP_COUNT],
     pub bp_adj: [i16; Self::BP_COUNT],
     pub attack: u16,
     pub defense: u16,
     pub def_elem: [i16; Self::DEF_ELEM_COUNT],
+    /// `ilvl` — the amount above 99 (0 renders as `---`). Retail's persona line is
+    /// `99 + ilvl`, and it reads this byte at packet +0x55
+    /// (FFXiMain.dll retail-2026-09 RVA 0x147287).
     pub ilvl: u8,
+    /// `su_lv` — the character's superior level (vendor/server/src/map/packets/s2c/0x061_clistatus.h
+    /// CLISTATUS su_lv, packet +0x52 in retail's view). It gates equipment
+    /// (CanEquip compares an item's `su` against it) and fills the persona panel's
+    /// `Su` line (FFXiMain.dll retail-2026-09 RVA 0x147287).
+    pub su_lv: u8,
+    /// The per-slot equip-block mask (s2c 0x061 packet +0x60; see
+    /// [`Self::EQUIP_SLOT_BLOCK_OFFSET`] for the client law it feeds).
+    pub equip_slot_block: u32,
+    /// bit 0 of `mastery_info.flags` — master-level play unlocked for this character.
+    /// Retail greys the Status window's Master Levels row unless this bit is set
+    /// *and* the main job is level 99 (FFXiMain.dll retail-2026-09 `.text 0x148B20`,
+    /// `cmp al,0x63` + `test byte ptr […],1`).
+    pub master_level_unlocked: bool,
+    /// `unity_info.Faction`: the character's Unity Concord, 0 for none
+    /// (vendor/server/src/map/packets/s2c/0x061_clistatus.h unityinfo_t).
+    pub unity_faction: u8,
+    /// `unity_info.Points`: the 17-bit Unity accolades total LSB fills from `unity_accolades`.
+    pub unity_points: u32,
+    /// `unity_points1` / `unity_points2`: LSB's current and previous week accolades / 1000
+    /// (vendor/server/src/map/packets/s2c/0x061_clistatus.cpp).
+    pub unity_points1: u16,
+    pub unity_points2: u16,
+    /// `designation` — the title id the character wears right now (LSB fills it from
+    /// `profile.title`, vendor/server/src/map/packets/s2c/0x061_clistatus.cpp). Display text comes
+    /// from [`ffxi_vocab::title_names`]; 0 means "wearing nothing".
+    pub title_id: u16,
+    /// `rank` — the conquest rank of the character's nation (`profile.rank[nation]`).
+    pub conquest_rank: u16,
+    /// `rankbar` — standing toward the next conquest rank (`profile.rankpoints`). Retail draws this
+    /// as the bar under `Rank:` in the Status Profile window.
+    pub conquest_rank_bar: u16,
+    /// `BindZoneNo` — zone id of the character's home point (`profile.home_point.destination`).
+    /// 0 means none set; a name comes from the zone table.
+    pub home_point_zone: u16,
+    /// `nation` — allegiance of the character: 0 San d'Oria, 1 Bastok, 2 Windurst
+    /// (`profile.nation`).
+    pub nation: u8,
 }
 
 impl CliStatus {
@@ -158,13 +203,46 @@ impl CliStatus {
     const MJOB_LV_OFFSET: usize = 9;
     const SJOB_NO_OFFSET: usize = 10;
     const SJOB_LV_OFFSET: usize = 11;
+    // CLISTATUS keeps `int16_t exp_now/exp_next` between the sub-job bytes and
+    // `bp_base[7]` (vendor/server/src/map/packets/s2c/0x061_clistatus.h).
+    const EXP_NOW_OFFSET: usize = 12;
+    const EXP_NEXT_OFFSET: usize = 14;
     const BP_BASE_OFFSET: usize = 16;
     const BP_ADJ_OFFSET: usize = 30;
     const ATTACK_OFFSET: usize = 44;
     const DEFENSE_OFFSET: usize = 46;
     const DEF_ELEM_OFFSET: usize = 48;
     const ILVL_OFFSET: usize = 81;
-    const NEEDED: usize = Self::ILVL_OFFSET + 1;
+    // vendor/server/src/map/packets/s2c/0x061_clistatus.h CLISTATUS su_lv (packet +0x52)
+    pub(crate) const SU_LV_OFFSET: usize = 0x4E;
+    // ... masteryinfo_t flags byte (packet +0x66): the master-level unlock.
+    pub(crate) const MASTERY_INFO_FLAGS_OFFSET: usize = 0x62;
+    /// The dword at `unity_chat_color_flag` (packet +0x60). Despite that XiPackets name, its
+    /// consumer is equipment law: the client copies it straight into game state (+0x40DF0) from
+    /// this packet's parse (FFXiMain.dll retail-2026-09 `.text 0xF0982`) and reads it back through
+    /// `.text 0xFD350`; the equip legality check refuses when an item's record slot mask intersects
+    /// it (`.text 0x132111` in RVA 0x132050, and again at `.text 0x1321AC`). Per-slot bits; a
+    /// zero dword blocks nothing.
+    pub(crate) const EQUIP_SLOT_BLOCK_OFFSET: usize = 0x5C;
+    /// MASTER_LEVEL_UNLOCK_BIT — bit 0 of `mastery_info.flags`.
+    pub(crate) const MASTER_LEVEL_UNLOCK_BIT: u8 = 1;
+    // vendor/server/src/map/packets/s2c/0x061_clistatus.h unityinfo_t bitfield word
+    pub(crate) const UNITY_INFO_OFFSET: usize = 0x54;
+    pub(crate) const UNITY_FACTION_SHIFT: u32 = 0;
+    pub(crate) const UNITY_FACTION_MASK: u32 = 0x1F;
+    pub(crate) const UNITY_POINTS_SHIFT: u32 = 10;
+    pub(crate) const UNITY_POINTS_MASK: u32 = 0x1_FFFF;
+    pub(crate) const UNITY_POINTS1_OFFSET: usize = 0x58;
+    pub(crate) const UNITY_POINTS2_OFFSET: usize = 0x5A;
+    // The allegiance block of the Status Profile window: designation (title), rank, rankbar,
+    // BindZoneNo (home point) and nation sit in one run here
+    // (vendor/server/src/map/packets/s2c/0x061_clistatus.h CLISTATUS).
+    pub(crate) const TITLE_ID_OFFSET: usize = 0x40;
+    pub(crate) const CONQUEST_RANK_OFFSET: usize = 0x42;
+    pub(crate) const CONQUEST_RANK_BAR_OFFSET: usize = 0x44;
+    pub(crate) const HOME_POINT_ZONE_OFFSET: usize = 0x46;
+    pub(crate) const NATION_OFFSET: usize = 0x4C;
+    const NEEDED: usize = Self::MASTERY_INFO_FLAGS_OFFSET + 1;
 
     /// STR, DEX, VIT, AGI, INT, MND, CHR.
     pub const BP_COUNT: usize = 7;
@@ -188,6 +266,7 @@ impl CliStatus {
         for (i, e) in def_elem.iter_mut().enumerate() {
             *e = rdi16(Self::DEF_ELEM_OFFSET + i * 2);
         }
+        let unity_info = rd32(Self::UNITY_INFO_OFFSET);
         Ok(Self {
             hp_max: rd32(Self::HP_MAX_OFFSET),
             mp_max: rd32(Self::MP_MAX_OFFSET),
@@ -195,15 +274,229 @@ impl CliStatus {
             mjob_lv: body[Self::MJOB_LV_OFFSET],
             sjob_no: body[Self::SJOB_NO_OFFSET],
             sjob_lv: body[Self::SJOB_LV_OFFSET],
+            exp_now: rdi16(Self::EXP_NOW_OFFSET),
+            exp_next: rdi16(Self::EXP_NEXT_OFFSET),
             bp_base,
             bp_adj,
             attack: rd16(Self::ATTACK_OFFSET),
             defense: rd16(Self::DEFENSE_OFFSET),
             def_elem,
             ilvl: body[Self::ILVL_OFFSET],
+            su_lv: body[Self::SU_LV_OFFSET],
+            equip_slot_block: rd32(Self::EQUIP_SLOT_BLOCK_OFFSET),
+            master_level_unlocked: body[Self::MASTERY_INFO_FLAGS_OFFSET]
+                & Self::MASTER_LEVEL_UNLOCK_BIT
+                != 0,
+            unity_faction: ((unity_info >> Self::UNITY_FACTION_SHIFT) & Self::UNITY_FACTION_MASK)
+                as u8,
+            unity_points: (unity_info >> Self::UNITY_POINTS_SHIFT) & Self::UNITY_POINTS_MASK,
+            unity_points1: rd16(Self::UNITY_POINTS1_OFFSET),
+            unity_points2: rd16(Self::UNITY_POINTS2_OFFSET),
+            title_id: rd16(Self::TITLE_ID_OFFSET),
+            conquest_rank: rd16(Self::CONQUEST_RANK_OFFSET),
+            conquest_rank_bar: rd16(Self::CONQUEST_RANK_BAR_OFFSET),
+            home_point_zone: rd16(Self::HOME_POINT_ZONE_OFFSET),
+            nation: body[Self::NATION_OFFSET],
         })
     }
 }
+
+pin_s2c_offset!(
+    CliStatus::TITLE_ID_OFFSET,
+    lsb::STATUSDATA_DESIGNATION,
+    "CLISTATUS.designation"
+);
+pin_s2c_offset!(
+    CliStatus::CONQUEST_RANK_OFFSET,
+    lsb::STATUSDATA_RANK,
+    "CLISTATUS.rank"
+);
+pin_s2c_offset!(
+    CliStatus::CONQUEST_RANK_BAR_OFFSET,
+    lsb::STATUSDATA_RANKBAR,
+    "CLISTATUS.rankbar"
+);
+pin_s2c_offset!(
+    CliStatus::HOME_POINT_ZONE_OFFSET,
+    lsb::STATUSDATA_BIND_ZONE_NO,
+    "CLISTATUS.BindZoneNo"
+);
+pin_s2c_offset!(
+    CliStatus::NATION_OFFSET,
+    lsb::STATUSDATA_NATION,
+    "CLISTATUS.nation"
+);
+
+pin_s2c_offset!(
+    CliStatus::UNITY_INFO_OFFSET,
+    crate::s2c_layout::clistatus::STATUSDATA_UNITY_INFO,
+    "CLISTATUS.unity_info"
+);
+pin_s2c_offset!(
+    CliStatus::UNITY_POINTS1_OFFSET,
+    crate::s2c_layout::clistatus::STATUSDATA_UNITY_POINTS1,
+    "CLISTATUS.unity_points1"
+);
+pin_s2c_offset!(
+    CliStatus::UNITY_POINTS2_OFFSET,
+    crate::s2c_layout::clistatus::STATUSDATA_UNITY_POINTS2,
+    "CLISTATUS.unity_points2"
+);
+const _: () = {
+    use crate::s2c_layout::clistatus as lsb;
+    assert!(
+        CliStatus::UNITY_FACTION_SHIFT == lsb::STATUSDATA_UNITY_INFO_FACTION_SHIFT
+            && CliStatus::UNITY_FACTION_MASK == lsb::STATUSDATA_UNITY_INFO_FACTION_MASK,
+        "LSB moved unityinfo_t.Faction: the decoder bits are stale"
+    );
+    assert!(
+        CliStatus::UNITY_POINTS_SHIFT == lsb::STATUSDATA_UNITY_INFO_POINTS_SHIFT
+            && CliStatus::UNITY_POINTS_MASK == lsb::STATUSDATA_UNITY_INFO_POINTS_MASK,
+        "LSB moved unityinfo_t.Points: the decoder bits are stale"
+    );
+};
+
+/// One visible skill row after the encoding is applied: a level, and whether the
+/// word says it is capped at the character's ceiling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SkillRow {
+    pub level: u16,
+    /// Bit 15 of the raw word. Retail paints such a row blue (ARGB 0x802060A0)
+    /// instead of the ordinary grey — the arithmetic is `mask = 0xff9fe020` then
+    /// `base + mask` over the base colour 0x80808080, which lands on exactly that
+    /// value (FFXiMain.dll retail-2026-09 `.text 0x14857A..0x14858C`).
+    pub capped: bool,
+}
+
+/// One visible craft row: level and rank, both decoded out of the packed word.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CraftRow {
+    pub level: u16,
+    /// The low 5 bits — the rank index the client maps to its abbreviation.
+    pub rank: u8,
+    pub capped: bool,
+}
+
+/// s2c 0x062 GP_SERV_COMMAND_CLISTATUS2 — the skill block behind the Status
+/// window's Combat Skill (ids 1..31), Magic Skill (32..47) and Craft Skill
+/// (48..62) rows. Retail copies these 64 words straight into its character blob
+/// (FFXiMain.dll retail-2026-09 skill table RVA 0x4856A4; the handler at `.text
+/// 0x99400` reads them from packet +0x80) and nothing else writes that table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CharSkillLevels {
+    /// `CommandRecast[31]` — per-command recast timers, same order as the array
+    /// LSB fills (vendor/server/src/map/packets/s2c/0x062_clistatus2.h).
+    pub command_recast: [u32; Self::COMMAND_RECAST_COUNT],
+    /// `skill_base[64]`, indexed by skill id. Combat ids run 1..=31, magic
+    /// 32..=47 and craft 48..=62; the two families encode the word differently.
+    pub skills: [u16; Self::SKILL_COUNT],
+}
+
+impl CharSkillLevels {
+    // vendor/server/src/map/packets/s2c/0x062_clistatus2.h GP_SERV_COMMAND_CLISTATUS2 CommandRecast
+    pub const COMMAND_RECAST_OFFSET: usize = 0x0;
+    pub const COMMAND_RECAST_COUNT: usize = 31;
+    // ... skill_base (packet +0x80 in retail's view).
+    pub const SKILL_BASE_OFFSET: usize = 0x7C;
+    pub const SKILL_COUNT: usize = 64;
+
+    /// A combat/magic word that is *exactly* this says the character cannot have
+    /// the skill at all, and the row is not drawn — a mere bit-15 set does not,
+    /// which is why the check cannot be `raw & 0x8000 != 0`
+    /// (FFXiMain.dll retail-2026-09 `.text 0x148564`: `and eax,0x8000`, then
+    /// `test edi,0x7fff` and skip only when that is also zero).
+    pub const SKILL_HIDDEN: u16 = 0x8000;
+    pub const SKILL_CAP_BIT: u16 = 0x8000;
+    pub const SKILL_LEVEL_MASK: u16 = 0x7FFF;
+
+    /// Craft words hide on a different sentinel and pack level+rank in one word
+    /// (FFXiMain.dll retail-2026-09 `.text 0x148930` `cmp bx,0xffff` for the skip,
+    /// and the row builder at RVA 0x1488A0 for the unpacking).
+    pub const CRAFT_HIDDEN: u16 = 0xFFFF;
+    pub const CRAFT_LEVEL_SHIFT: u32 = 5;
+    pub const CRAFT_LEVEL_MASK: u16 = 0x3FF;
+    pub const CRAFT_RANK_MASK: u8 = 0x1F;
+
+    /// Combat-skill ids shown by `btlskill`: 1..=31.
+    pub const COMBAT_SKILL_RANGE: std::ops::RangeInclusive<usize> = 1..=31;
+    /// Magic-skill ids shown by `mgcskill`: 32..=47.
+    pub const MAGIC_SKILL_RANGE: std::ops::RangeInclusive<usize> = 32..=47;
+    /// Craft-skill ids shown by `trdskill`: 48..=62.
+    pub const CRAFT_SKILL_RANGE: std::ops::RangeInclusive<usize> = 48..=62;
+
+    pub fn decode(body: &[u8]) -> Result<Self, DecodeError> {
+        const MIN_LEN: usize = CharSkillLevels::SKILL_BASE_OFFSET
+            + CharSkillLevels::SKILL_COUNT * std::mem::size_of::<u16>();
+        if body.len() < MIN_LEN {
+            return Err(DecodeError::Truncated(MIN_LEN, body.len()));
+        }
+        let mut command_recast = [0u32; Self::COMMAND_RECAST_COUNT];
+        for (i, slot) in command_recast.iter_mut().enumerate() {
+            *slot = u32::from_le_bytes(
+                body[Self::COMMAND_RECAST_OFFSET + i * 4..Self::COMMAND_RECAST_OFFSET + i * 4 + 4]
+                    .try_into()
+                    .unwrap(),
+            );
+        }
+        let mut skills = [0u16; Self::SKILL_COUNT];
+        for (i, slot) in skills.iter_mut().enumerate() {
+            *slot = u16::from_le_bytes(
+                body[Self::SKILL_BASE_OFFSET + i * 2..Self::SKILL_BASE_OFFSET + i * 2 + 2]
+                    .try_into()
+                    .unwrap(),
+            );
+        }
+        Ok(Self {
+            command_recast,
+            skills,
+        })
+    }
+
+    /// The combat/magic reading of one word: `None` when the character cannot have
+    /// the skill, otherwise its level and cap flag.
+    pub fn noncraft_row(raw: u16) -> Option<SkillRow> {
+        (raw != Self::SKILL_HIDDEN).then_some(SkillRow {
+            level: raw & Self::SKILL_LEVEL_MASK,
+            capped: raw & Self::SKILL_CAP_BIT != 0,
+        })
+    }
+
+    /// The craft reading of one word: `None` when the row is hidden, otherwise the
+    /// unpacked level/rank pair.
+    pub fn craft_row(raw: u16) -> Option<CraftRow> {
+        (raw != Self::CRAFT_HIDDEN).then_some(CraftRow {
+            level: (raw >> Self::CRAFT_LEVEL_SHIFT) & Self::CRAFT_LEVEL_MASK,
+            rank: (raw & Self::CRAFT_RANK_MASK as u16) as u8,
+            capped: raw & Self::SKILL_CAP_BIT != 0,
+        })
+    }
+}
+
+pin_s2c_offset!(
+    CharSkillLevels::COMMAND_RECAST_OFFSET,
+    crate::s2c_layout::clistatus2::COMMAND_RECAST,
+    "GP_SERV_COMMAND_CLISTATUS2.CommandRecast"
+);
+pin_s2c_offset!(
+    CharSkillLevels::SKILL_BASE_OFFSET,
+    crate::s2c_layout::clistatus2::SKILL_BASE,
+    "GP_SERV_COMMAND_CLISTATUS2.skill_base"
+);
+pin_s2c_offset!(
+    CliStatus::SU_LV_OFFSET,
+    lsb::STATUSDATA_SU_LV,
+    "CLISTATUS.su_lv"
+);
+pin_s2c_offset!(
+    CliStatus::MASTERY_INFO_FLAGS_OFFSET,
+    lsb::STATUSDATA_MASTERY_INFO_FLAGS,
+    "CLISTATUS.mastery_info.flags"
+);
+pin_s2c_offset!(
+    CliStatus::EQUIP_SLOT_BLOCK_OFFSET,
+    lsb::STATUSDATA_UNITY_CHAT_COLOR_FLAG,
+    "CLISTATUS.unity_chat_color_flag (the equip-block dword)"
+);
 
 /// s2c 0x01B GP_SERV_COMMAND_JOB_INFO — per-job levels + unlocked-jobs bitmask for
 /// the self character. Body offsets follow the GP_MYROOM_DANCER struct in
@@ -222,6 +515,13 @@ pub struct JobInfo {
     pub hp_max: i32,
     pub mp_max: i32,
     pub sjobflg: u8,
+    /// The tail of the packet, past the dancer block. Retail prints `Mastery Rank: n` and a
+    /// `Mentor:` marker in the Status Profile window from these two bytes; the third bit says whether
+    /// the character may give a mentor a thumbs-up
+    /// (vendor/server/src/map/packets/s2c/0x01b_job_info.h PacketData).
+    pub can_thumbs_up_mentor: bool,
+    pub mentor_rank: u8,
+    pub mastery_rank: u8,
 }
 
 impl JobInfo {
@@ -235,6 +535,10 @@ impl JobInfo {
     pub(crate) const MP_MAX_OFFSET: usize = 0x3C;
     pub(crate) const SJOBFLG_OFFSET: usize = 0x40;
     pub(crate) const JOB_LEVELS_OFFSET: usize = 0x44;
+    // Past the dancer block (0x5C) and `encumbrance`: three bytes of mentorship/rank state.
+    pub(crate) const CAN_THUMBS_UP_MENTOR_OFFSET: usize = 0x60;
+    pub(crate) const MENTOR_RANK_OFFSET: usize = 0x61;
+    pub(crate) const MASTERY_RANK_OFFSET: usize = 0x62;
     pub(crate) const MIN_LEN: usize = Self::JOB_LEVELS_OFFSET + Self::MAX_JOBTYPE;
 
     pub fn decode(body: &[u8]) -> Result<Self, DecodeError> {
@@ -242,6 +546,9 @@ impl JobInfo {
             return Err(DecodeError::Truncated(Self::MIN_LEN, body.len()));
         }
         let rdi32 = |o: usize| i32::from_le_bytes([body[o], body[o + 1], body[o + 2], body[o + 3]]);
+        // The tail fields are optional for us, so they read zero on a short body instead of
+        // short-circuiting the decode the dancer block already satisfied.
+        let byte_or_zero = |o: usize| body.get(o).copied().unwrap_or(0);
         let unlocked = u32::from_le_bytes(
             body[Self::UNLOCKED_OFFSET..Self::UNLOCKED_OFFSET + 4]
                 .try_into()
@@ -260,9 +567,30 @@ impl JobInfo {
             hp_max: rdi32(Self::HP_MAX_OFFSET),
             mp_max: rdi32(Self::MP_MAX_OFFSET),
             sjobflg: body[Self::SJOBFLG_OFFSET],
+            // A body that stops at the dancer block keeps the ranks zero rather than failing the
+            // decode: the job list and Mog-menu law downstream never asked for the tail.
+            can_thumbs_up_mentor: byte_or_zero(Self::CAN_THUMBS_UP_MENTOR_OFFSET) != 0,
+            mentor_rank: byte_or_zero(Self::MENTOR_RANK_OFFSET),
+            mastery_rank: byte_or_zero(Self::MASTERY_RANK_OFFSET),
         })
     }
 }
+
+pin_s2c_offset!(
+    JobInfo::CAN_THUMBS_UP_MENTOR_OFFSET,
+    crate::s2c_layout::job_info::CAN_THUMBS_UP_MENTOR,
+    "JOB_INFO.can_thumbs_up_mentor"
+);
+pin_s2c_offset!(
+    JobInfo::MENTOR_RANK_OFFSET,
+    crate::s2c_layout::job_info::MENTOR_RANK,
+    "JOB_INFO.mentor_rank"
+);
+pin_s2c_offset!(
+    JobInfo::MASTERY_RANK_OFFSET,
+    crate::s2c_layout::job_info::MASTERY_RANK,
+    "JOB_INFO.mastery_rank"
+);
 
 pin_s2c_offset!(
     CliStatus::HP_MAX_OFFSET,
@@ -346,13 +674,15 @@ mod cli_status_tests {
 
     #[test]
     fn clistatus_reads_stat_block_offsets() {
-        let mut buf = vec![0u8; 84];
+        let mut buf = vec![0u8; CliStatus::NEEDED];
         buf[0..4].copy_from_slice(&1946u32.to_le_bytes()); // hp_max
         buf[4..8].copy_from_slice(&1295u32.to_le_bytes()); // mp_max
         buf[8] = 5; // mjob_no (RDM)
         buf[9] = 75; // mjob_lv
         buf[10] = 4; // sjob_no (BLM)
         buf[11] = 37; // sjob_lv
+        buf[12..14].copy_from_slice(&806i16.to_le_bytes()); // exp_now
+        buf[14..16].copy_from_slice(&1750i16.to_le_bytes()); // exp_next
         for i in 0..7 {
             buf[16 + i * 2..18 + i * 2].copy_from_slice(&((10 + i as u16) * 5).to_le_bytes());
             buf[30 + i * 2..32 + i * 2].copy_from_slice(&((i as i16 + 1) * 7).to_le_bytes());
@@ -361,6 +691,10 @@ mod cli_status_tests {
         buf[46..48].copy_from_slice(&1006u16.to_le_bytes()); // defense
         buf[48..50].copy_from_slice(&(-15i16).to_le_bytes()); // fire resist
         buf[81] = 119; // ilvl
+        buf[CliStatus::SU_LV_OFFSET] = 3; // su_lv (packet +0x52)
+        buf[CliStatus::EQUIP_SLOT_BLOCK_OFFSET..CliStatus::EQUIP_SLOT_BLOCK_OFFSET + 4]
+            .copy_from_slice(&0xDEAD_00F0u32.to_le_bytes());
+        buf[CliStatus::MASTERY_INFO_FLAGS_OFFSET] = CliStatus::MASTER_LEVEL_UNLOCK_BIT;
 
         let cs = CliStatus::decode(&buf).expect("decodes");
         assert_eq!(cs.hp_max, 1946);
@@ -369,6 +703,8 @@ mod cli_status_tests {
         assert_eq!(cs.mjob_lv, 75);
         assert_eq!(cs.sjob_no, 4);
         assert_eq!(cs.sjob_lv, 37);
+        assert_eq!(cs.exp_now, 806, "EXP between levels (level box)");
+        assert_eq!(cs.exp_next, 1750);
         assert_eq!(cs.bp_base[0], 50, "STR base");
         assert_eq!(cs.bp_base[6], 80, "CHR base");
         assert_eq!(cs.bp_adj[0], 7, "STR gear delta");
@@ -376,10 +712,41 @@ mod cli_status_tests {
         assert_eq!(cs.defense, 1006);
         assert_eq!(cs.def_elem[0], -15, "fire resist signed");
         assert_eq!(cs.ilvl, 119);
+        assert_eq!(cs.su_lv, 3, "superior level (persona `Su` + equip gate)");
+        assert_eq!(
+            cs.equip_slot_block, 0xDEAD_00F0,
+            "per-slot equip-block dword (fifth legality test)"
+        );
+        assert!(cs.master_level_unlocked, "mastery_info flags bit 0");
         assert!(
-            CliStatus::decode(&buf[..80]).is_err(),
+            CliStatus::decode(&buf[..CliStatus::NEEDED - 1]).is_err(),
             "truncation rejected"
         );
+    }
+
+    /// The Unity fields the `ut_point` readout and the Unity panel draw
+    /// (.agents/skills/retail-observe/references/2026-10-15-unity-and-fp-windows.md): Faction is
+    /// the low 5 bits of `unity_info`, Points the 17 bits from bit 10.
+    #[test]
+    fn clistatus_reads_unity_info_bitfield_and_weekly_points() {
+        const FACTION: u32 = 7;
+        const RANK: u32 = 3;
+        const ACCOLADES: u32 = 0x1_2345;
+        const UNUSED_HIGH_BITS: u32 = 0x1F << 27;
+        let word =
+            FACTION | (RANK << 5) | (ACCOLADES << CliStatus::UNITY_POINTS_SHIFT) | UNUSED_HIGH_BITS;
+        let mut buf = vec![0u8; CliStatus::NEEDED];
+        buf[CliStatus::UNITY_INFO_OFFSET..CliStatus::UNITY_INFO_OFFSET + 4]
+            .copy_from_slice(&word.to_le_bytes());
+        buf[CliStatus::UNITY_POINTS1_OFFSET..CliStatus::UNITY_POINTS1_OFFSET + 2]
+            .copy_from_slice(&42u16.to_le_bytes());
+        buf[CliStatus::UNITY_POINTS2_OFFSET..CliStatus::UNITY_POINTS2_OFFSET + 2]
+            .copy_from_slice(&17u16.to_le_bytes());
+        let cs = CliStatus::decode(&buf).expect("decodes");
+        assert_eq!(u32::from(cs.unity_faction), FACTION);
+        assert_eq!(cs.unity_points, ACCOLADES);
+        assert_eq!(cs.unity_points1, 42);
+        assert_eq!(cs.unity_points2, 17);
     }
 }
 
@@ -616,5 +983,110 @@ mod char_status_tests {
             &((9u32 << CharStatus::BALLISTA_FLG_SHIFT) | PET_INDEX_NOISE).to_le_bytes(),
         );
         assert_eq!(CharStatus::decode(&body).unwrap().allegiance, 9);
+    }
+}
+
+#[cfg(test)]
+mod skill_tests {
+    use super::*;
+
+    fn body_with(skills: [(usize, u16); 3], recast0: u32) -> Vec<u8> {
+        let mut body =
+            vec![0u8; CharSkillLevels::SKILL_BASE_OFFSET + CharSkillLevels::SKILL_COUNT * 2];
+        body[0..4].copy_from_slice(&recast0.to_le_bytes());
+        for (id, word) in skills {
+            body[CharSkillLevels::SKILL_BASE_OFFSET + id * 2
+                ..CharSkillLevels::SKILL_BASE_OFFSET + id * 2 + 2]
+                .copy_from_slice(&word.to_le_bytes());
+        }
+        body
+    }
+
+    #[test]
+    fn char_skill_levels_decodes_both_arrays() {
+        const RECAST0: u32 = 4_200;
+        const HAND_TO_HAND: u16 = 301;
+        /// A level carried at id 32, the first id of the magic family
+        /// (`mgcskill` shows ids 32..=47).
+        const DIVINE_MAGIC: u16 = 300;
+
+        // The three window families partition the array by id.
+        assert_eq!(
+            (
+                CharSkillLevels::COMBAT_SKILL_RANGE,
+                CharSkillLevels::MAGIC_SKILL_RANGE,
+                CharSkillLevels::CRAFT_SKILL_RANGE,
+            ),
+            ((1..=31), (32..=47), (48..=62))
+        );
+        let body = body_with(
+            [
+                (1, HAND_TO_HAND),
+                (*CharSkillLevels::MAGIC_SKILL_RANGE.start(), DIVINE_MAGIC),
+                (48, CharSkillLevels::CRAFT_HIDDEN),
+            ],
+            RECAST0,
+        );
+        let decoded = CharSkillLevels::decode(&body).unwrap();
+        assert_eq!(decoded.command_recast[0], RECAST0);
+        assert_eq!(decoded.skills[1], HAND_TO_HAND);
+        assert_eq!(decoded.skills[32], DIVINE_MAGIC);
+
+        // Truncation is an error, not a silently missing array.
+        let short = vec![0u8; body.len() - 1];
+        assert!(CharSkillLevels::decode(&short).is_err());
+    }
+
+    /// The hidden rule is equality against the sentinel, not bit 15: a capped skill
+    /// keeps its level and only changes colour (FFXiMain.dll retail-2026-09
+    /// `.text 0x148564`).
+    #[test]
+    fn noncraft_skill_words_hide_only_at_the_exact_sentinel() {
+        assert_eq!(
+            CharSkillLevels::noncraft_row(CharSkillLevels::SKILL_HIDDEN),
+            None
+        );
+        let capped = CharSkillLevels::noncraft_row(0x8000 | 125).unwrap();
+        assert_eq!((capped.level, capped.capped), (125, true));
+        let plain = CharSkillLevels::noncraft_row(301).unwrap();
+        assert_eq!((plain.level, plain.capped), (301, false));
+    }
+
+    /// Craft words pack level and rank into one word and hide on 0xFFFF instead.
+    #[test]
+    fn craft_skill_words_unpack_level_and_rank() {
+        assert_eq!(
+            CharSkillLevels::craft_row(CharSkillLevels::CRAFT_HIDDEN),
+            None
+        );
+        const LEVEL: u16 = 220;
+        const RANK: u8 = 11;
+        let raw = (LEVEL << CharSkillLevels::CRAFT_LEVEL_SHIFT) | (RANK as u16);
+        let row = CharSkillLevels::craft_row(raw).unwrap();
+        assert_eq!((row.level, row.rank, row.capped), (LEVEL, RANK, false));
+
+        let capped_raw = raw | CharSkillLevels::SKILL_CAP_BIT;
+        let capped = CharSkillLevels::craft_row(capped_raw).unwrap();
+        assert_eq!(
+            (capped.level, capped.rank, capped.capped),
+            (LEVEL, RANK, true)
+        );
+    }
+
+    /// `su_lv` and the master-level bit are what gate equipment legality and the
+    /// Status window's Master Levels row; they must read from their own bytes.
+    #[test]
+    fn cli_status_reads_superior_level_and_master_unlock() {
+        const SU_LV: u8 = 4;
+        let mut body = vec![0u8; CliStatus::NEEDED];
+        body[CliStatus::SU_LV_OFFSET] = SU_LV;
+        let plain = CliStatus::decode(&body).unwrap();
+        assert_eq!(plain.su_lv, SU_LV);
+        assert!(!plain.master_level_unlocked);
+
+        // Noise in the neighbouring mastery bytes must not leak into bit 0.
+        body[CliStatus::MASTERY_INFO_FLAGS_OFFSET] = CliStatus::MASTER_LEVEL_UNLOCK_BIT;
+        let unlocked = CliStatus::decode(&body).unwrap();
+        assert!(unlocked.master_level_unlocked);
     }
 }

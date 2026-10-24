@@ -553,8 +553,11 @@ mod tests {
     /// KNOWN_CLIENTS row.
     #[test]
     fn real_dat_framesus_blend_factor_counts() {
-        const FRAMESUS_QUADS_BY_CLIENT: &[(&str, usize)] =
-            &[("horizonxi-2023", 2433), ("retail-2026-09", 2464)];
+        const FRAMESUS_QUADS_BY_CLIENT: &[(&str, usize)] = &[
+            ("horizonxi-2023", 2433),
+            ("retail-2026-09", 2464),
+            ("retail-2026-10", 2464),
+        ];
         const FRAMESUS_ZERO_SOURCE_QUADS: usize = 163;
 
         let Some(root) = crate::archive::open_test_install() else {

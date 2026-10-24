@@ -488,7 +488,8 @@ pub fn merge_dir(keyboard: i32, pad: f32) -> i32 {
 }
 
 /// Modes that plant the character: an NPC dialog or a shop/box/counter screen
-/// owns them until it closes. `Chat` is deliberately absent -- retail keeps
+/// owns them until it closes, and Mog House layout mode with its windows holds
+/// them while arranging. `Chat` is deliberately absent -- retail keeps
 /// auto-run going while the input line is focused.
 pub fn mode_cancels_autorun(mode: &InputMode) -> bool {
     matches!(
@@ -499,7 +500,7 @@ pub fn mode_cancels_autorun(mode: &InputMode) -> bool {
             | InputMode::Bazaar
             | InputMode::Auction
             | InputMode::Shop
-    )
+    ) || kuluu_render::myroom_arrange::arranging(mode)
 }
 
 /// Modes whose keystrokes belong to a text buffer, not to movement or camera.
@@ -592,6 +593,7 @@ pub fn handle_input_system(
     mut walk_mode: ResMut<kuluu_render::combat_stance::WalkMode>,
     mut tab_stack: ResMut<TabCycleStack>,
     mut hud_capture: HudCaptureParams,
+    dynamic_menu: Res<kuluu_render::hud::menu::DynamicMenu>,
 ) {
     let camera_mode = &mut camera.mode;
     let chase = &mut camera.chase;
@@ -615,7 +617,10 @@ pub fn handle_input_system(
         return;
     }
 
-    if !matches!(*mode, InputMode::Chat(_)) && just(Action::ToggleFirstPerson) {
+    if !matches!(*mode, InputMode::Chat(_))
+        && !kuluu_render::myroom_arrange::arranging(&mode)
+        && just(Action::ToggleFirstPerson)
+    {
         chase.yaw = kuluu_render::yaw_for_heading(state.snapshot.self_pos.heading);
         camera_transition.begin(**camera_mode, chase.distance);
         cursor_lock.locked = false;
@@ -678,7 +683,7 @@ pub fn handle_input_system(
         return;
     }
     if just(Action::OpenMenu) {
-        *mode = InputMode::Menu(MenuStack::root());
+        *mode = InputMode::Menu(MenuStack::open_main_menu(&dynamic_menu.window_cursors));
         return;
     }
 
@@ -4518,6 +4523,22 @@ mod tests {
     fn world_mode_neither_cancels_autorun_nor_swallows_keys() {
         assert!(!mode_cancels_autorun(&InputMode::World));
         assert!(!mode_swallows_keys(&InputMode::World));
+    }
+
+    /// Layout mode and its windows keep the character planted; an ordinary menu does not.
+    #[test]
+    fn arranging_cancels_autorun_and_a_plain_menu_does_not() {
+        let mut windows = kuluu_render::input_mode::MenuStack::root();
+        windows.levels[0].kind =
+            kuluu_render::MenuKind::Arrange(kuluu_render::myroom_arrange::ArrangeWindow::Shelf {
+                second_shelf: false,
+            });
+        for mode in [InputMode::Arrange, InputMode::Menu(windows)] {
+            assert!(mode_cancels_autorun(&mode), "{mode:?}");
+            assert!(!mode_swallows_keys(&mode), "{mode:?}");
+        }
+        let plain = InputMode::Menu(kuluu_render::input_mode::MenuStack::root());
+        assert!(!mode_cancels_autorun(&plain));
     }
 
     #[test]

@@ -100,6 +100,7 @@ fn main() {
         .add_audio_source::<kuluu_render::audio::PcmAudio>()
         .init_resource::<kuluu_render::audio::BgmSlots>()
         .init_resource::<kuluu_render::audio::AudioMuteState>()
+        .init_resource::<kuluu_render::audio::RetailConfigVolumes>()
         // The standalone demo has no session boundary; decoded audio lives until exit.
         .init_resource::<kuluu_render::audio::SfxCache>()
         .add_message::<kuluu_render::snapshot::ToastEvent>()

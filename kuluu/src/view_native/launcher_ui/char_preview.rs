@@ -19,7 +19,7 @@ use crate::view_native::launcher_backdrop::PREVIEW_RENDER_LAYER;
 pub(super) struct CharPreviewRoot;
 
 #[derive(Component)]
-pub(super) struct CharPreviewParent;
+pub(crate) struct CharPreviewParent;
 
 #[derive(Component)]
 pub(super) struct CharPreviewActorRoot;

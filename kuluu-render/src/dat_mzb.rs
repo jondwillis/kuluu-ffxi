@@ -38,6 +38,43 @@ pub fn zone_draw_distance(rec: Option<&ffxi_dat::weather::WeatherRecord>, draw_s
 
 pub const MMB_LOAD_DISTANCE_MARGIN: f32 = 1.25;
 
+/// What the zone stream is bounded by: the character in game, and on launcher
+/// screens (where no character exists yet) the camera that views that geometry.
+/// With neither anchor every placement an MZB lists queues at once instead of
+/// arriving nearest-first inside the draw distance.
+#[derive(bevy::ecs::system::SystemParam)]
+pub struct ZoneViewAnchor<'w, 's> {
+    anchors: Query<
+        'w,
+        's,
+        (Option<&'static IsSelf>, &'static GlobalTransform),
+        Or<(With<IsSelf>, With<crate::weather::ZoneViewCamera>)>,
+    >,
+}
+
+impl ZoneViewAnchor<'_, '_> {
+    /// Where the stream is anchored and whether it tracks the character (who can
+    /// walk into the next queue entry on any frame) instead of a fixed view that
+    /// only ever sits in front of an attract-mode background.
+    pub fn stream(&self) -> Option<(Vec3, bool)> {
+        if let Some(t) = self
+            .anchors
+            .iter()
+            .find_map(|(is_self, t)| is_self.is_some().then_some(t))
+        {
+            return Some((t.translation(), true));
+        }
+        self.anchors
+            .iter()
+            .next()
+            .map(|(_, t)| (t.translation(), false))
+    }
+
+    pub fn pos(&self) -> Option<Vec3> {
+        self.stream().map(|(pos, _)| pos)
+    }
+}
+
 const MZB_TERRAIN_PALETTE_INDEX_MASK: u8 = 0x0F;
 const MZB_TERRAIN_PALETTE: [[f32; 3]; 16] = [
     [0.85, 0.55, 0.40],
@@ -314,7 +351,13 @@ impl ZoneGeomCache {
         Some(geom)
     }
 
-    fn insert(&mut self, key: ZoneGeomKey, geom: LoadedZoneGeom) {
+    /// Whether a parsed block is resident. A warming zone that was dropped by
+    /// the LRU cap is not ready to flip to.
+    pub fn contains(&self, key: ZoneGeomKey) -> bool {
+        self.entries.iter().any(|(k, _)| *k == key)
+    }
+
+    pub fn insert(&mut self, key: ZoneGeomKey, geom: LoadedZoneGeom) {
         if let Some(pos) = self.entries.iter().position(|(k, _)| *k == key) {
             self.entries.remove(pos);
         }
@@ -2618,13 +2661,13 @@ pub fn spawn_zone_water(
     mut images: ResMut<Assets<Image>>,
     mut water_mat: ResMut<ZoneWaterMaterial>,
     draw: Res<DrawDistance>,
-    self_q: Query<&GlobalTransform, With<IsSelf>>,
+    anchor: ZoneViewAnchor<'_, '_>,
 ) {
     if pending.specs.is_empty() {
         return;
     }
 
-    let self_pos = self_q.single().ok().map(|t| t.translation());
+    let self_pos = anchor.pos();
     if let Some(self_pos) = self_pos {
         pending.specs.make_contiguous().sort_by(|a, b| {
             water_dist_sq_xz(a, self_pos).total_cmp(&water_dist_sq_xz(b, self_pos))
@@ -3051,6 +3094,7 @@ fn spawn_mzb_overlay(
                     slot: req.slot,
                     sub_area_link: s.sub_area_link,
                     voyage_backdrop: s.voyage_backdrop,
+                    static_model: None,
                 });
             }
             push_system_msg(

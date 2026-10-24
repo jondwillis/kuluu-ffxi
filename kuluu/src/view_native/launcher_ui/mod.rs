@@ -642,6 +642,7 @@ pub(crate) fn register(
     lobby: Arc<LobbyClient>,
     defaults: Defaults,
     runtime: RtHandle,
+    models: bool,
 ) {
     let mut form = LoginForm::default();
     if let Some(u) = defaults.user {
@@ -935,8 +936,9 @@ pub(crate) fn register(
                 .before(char_list::redraw_char_list_system)
                 .before(char_preview::refresh_preview_on_cursor_change),
             char_list::redraw_char_list_system,
-            char_preview::refresh_preview_on_cursor_change,
-            char_preview::poll_pending_preview,
+            // `-cpu-mode`: menus only, so no actor DAT is read for a preview.
+            char_preview::refresh_preview_on_cursor_change.run_if(move || models),
+            char_preview::poll_pending_preview.run_if(move || models),
         )
             .run_if(in_state(LauncherState::CharList)),
     );
@@ -984,7 +986,7 @@ pub(crate) fn register(
         login::error_keyboard_system.run_if(in_state(LauncherState::LoginError)),
     );
 
-    char_create_preview::register(app);
+    char_create_preview::register(app, models);
 
     updater::register(app);
 

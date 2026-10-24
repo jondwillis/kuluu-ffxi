@@ -46,6 +46,12 @@ struct Args {
     #[arg(long)]
     require_dat: bool,
 
+    /// Skip the work that is not gameplay: the launcher screens stream no zone
+    /// behind them, so login and character-select keep every frame. Global so it
+    /// reads the same before or after `play`.
+    #[arg(long = "cpu-mode", global = true)]
+    cpu_mode: bool,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -143,6 +149,20 @@ enum Command {
     },
 }
 
+/// clap answers to `--cpu-mode`; the single-dash spellings are what get typed
+/// by hand, and a leading `-` with more than one letter parses as short-flag
+/// clustering otherwise.
+fn accept_single_dash_cpu_mode(args: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
+    const SPELLINGS: [&str; 3] = ["-cpumode", "-cpu-mode", "--cpumode"];
+    const CANONICAL: &str = "--cpu-mode";
+    args.into_iter()
+        .map(|arg| match arg.to_str() {
+            Some(text) if SPELLINGS.contains(&text) => std::ffi::OsString::from(CANONICAL),
+            _ => arg,
+        })
+        .collect()
+}
+
 fn main() -> Result<()> {
     rustls::crypto::ring::default_provider()
         .install_default()
@@ -155,6 +175,7 @@ fn main() -> Result<()> {
     } else {
         cli_args
     };
+    let cli_args = accept_single_dash_cpu_mode(cli_args);
     let args = Args::parse_from(cli_args);
 
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
@@ -560,6 +581,7 @@ fn run_gui_main_thread(
         data_port,
         view_port,
         map_host_override,
+        cpu_mode,
         command,
         ..
     } = args;
@@ -606,6 +628,7 @@ fn run_gui_main_thread(
         dat_root,
         unfocused,
         mute,
+        cpu_mode,
     })
     .context("native viewer")
 }

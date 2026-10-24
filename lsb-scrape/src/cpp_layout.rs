@@ -565,7 +565,19 @@ impl Layouts {
                 Tok::Word(w)
                     if decl.is_empty() && (w == "struct" || w == "class" || w == "union") =>
                 {
+                    let record = match toks.get(i + 1) {
+                        Some(Tok::Word(name)) => Some(format!("{scope}{name}")),
+                        _ => None,
+                    };
                     i = self.scan_record(toks, i, end, scope)?;
+                    let had_body = i
+                        .checked_sub(1)
+                        .is_some_and(|close| toks.get(close) == Some(&Tok::Punct('}')));
+                    let body_declares_member =
+                        had_body && matches!(toks.get(i), Some(Tok::Word(_)));
+                    if let (Some(record), true) = (record, body_declares_member) {
+                        decl.push(Tok::Word(record));
+                    }
                 }
                 Tok::Word(w) if decl.is_empty() && w == "enum" => {
                     i = self.scan_enum(toks, i, end, scope)?;
@@ -989,6 +1001,27 @@ mod tests {
         assert_eq!(s.offset_of("lv").unwrap(), 5);
         assert_eq!(s.offset_of("z").unwrap(), 6);
         assert_eq!(s.size, 8);
+    }
+
+    /// LSB declares some arrays of a struct it defines on the spot
+    /// (vendor/server/src/map/packets/s2c/0x063_miscdata_job_points.h `JobPointData jobs[24]`);
+    /// a forward declaration or a body closed by `;` declares no member.
+    #[test]
+    fn a_record_defined_in_its_member_declaration_is_that_member_type() {
+        let mut l = Layouts::new();
+        l.scan(
+            "struct S { uint8_t lead; struct Fwd; struct Row { uint16_t a; uint16_t b; } rows[3]; \
+             struct Tag { uint8_t t; }; uint8_t tail; };",
+        )
+        .unwrap();
+        let s = l.layout("S").unwrap();
+        assert_eq!(s.offset_of("rows").unwrap(), 2);
+        let rows = s.field("rows").unwrap();
+        assert_eq!((rows.count, rows.stride), (Some(3), 4));
+        assert_eq!(s.offset_of("rows.b").unwrap(), 4);
+        assert_eq!(s.offset_of("tail").unwrap(), 14);
+        assert_eq!(s.size, 16);
+        assert!(s.field("t").is_err(), "a body closed by `;` adds no member");
     }
 
     #[test]

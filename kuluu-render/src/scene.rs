@@ -236,6 +236,19 @@ pub fn mount_actor_rider(world_id: u32) -> Option<u32> {
     (world_id & MOUNT_ACTOR_ID_BIT != 0).then_some(world_id & !MOUNT_ACTOR_ID_BIT)
 }
 
+/// Actors the client makes for placed Mog House furniture (NPC-look pieces and mannequins), one id per seat:
+/// above every LSB unique_no and clear of [`MOUNT_ACTOR_ID_BIT`]. The snapshot never carries them, so the
+/// entity sync leaves them to the furniture module.
+pub const FURNITURE_ACTOR_IDS: std::ops::Range<u32> = 0x6000_0000..0x6001_0000;
+
+pub fn furniture_actor_id(seat: usize) -> u32 {
+    FURNITURE_ACTOR_IDS.start + seat as u32
+}
+
+pub fn is_furniture_actor_id(world_id: u32) -> bool {
+    FURNITURE_ACTOR_IDS.contains(&world_id)
+}
+
 pub fn setup_world(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
@@ -601,7 +614,7 @@ pub fn sync_entities_system(
         .by_id
         .keys()
         .copied()
-        .filter(|id| !seen.contains(id))
+        .filter(|id| !seen.contains(id) && !is_furniture_actor_id(*id))
         .collect();
     for id in stale {
         if let Some(bevy_e) = tracked.by_id.remove(&id) {
@@ -1021,6 +1034,28 @@ mod tests {
             assert_ne!(mount, rider);
             assert_eq!(mount_actor_rider(mount), Some(rider));
         }
+    }
+
+    #[test]
+    fn furniture_actor_ids_stay_clear_of_server_and_mount_ids() {
+        const SERVER_ID_TYPE_SHIFT: u32 = 28;
+        const SERVER_ID_ZONE_SHIFT: u32 = 12;
+        const SERVER_ID_MAX_TYPE: u32 = 4;
+        const SERVER_ID_MAX_ZONE: u32 = 0xFFFF;
+        const SERVER_ID_MAX_TARGID: u32 = 0xFFF;
+        let max_server_id = (SERVER_ID_MAX_TYPE << SERVER_ID_TYPE_SHIFT)
+            | (SERVER_ID_MAX_ZONE << SERVER_ID_ZONE_SHIFT)
+            | SERVER_ID_MAX_TARGID;
+        assert!(FURNITURE_ACTOR_IDS.start > max_server_id);
+        assert!(!is_furniture_actor_id(max_server_id));
+        let last_seat = 2 * ffxi_dat::furniture::SEATS_PER_SHELF;
+        for seat in [0, last_seat] {
+            let id = furniture_actor_id(seat);
+            assert!(is_furniture_actor_id(id));
+            assert_eq!(mount_actor_rider(id), None);
+        }
+        let mounted = mount_actor_id(furniture_actor_id(0));
+        assert!(!is_furniture_actor_id(mounted));
     }
 
     fn dummy_materials() -> EntityMaterials {

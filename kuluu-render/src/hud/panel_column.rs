@@ -21,6 +21,11 @@ impl ColumnPanel {
     pub const TARGET: Self = Self { order: 2 };
 }
 
+/// A column panel that docks: while it holds (`true`) the dock law places it and the column leaves
+/// it out.
+#[derive(Component, Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct DockHeld(pub bool);
+
 /// `ComputedNode::size` is physical pixels; `Node::bottom` is logical.
 fn logical_height(computed: &ComputedNode) -> f32 {
     computed.size().y * computed.inverse_scale_factor()
@@ -35,10 +40,20 @@ fn logical_height(computed: &ComputedNode) -> f32 {
 /// it; a genuine content change lands one frame late, which is invisible,
 /// and a flip-flopping reading does not move anything.
 pub fn layout_panel_column_system(
-    mut panels: Query<(Entity, &ColumnPanel, &mut Node, &ComputedNode)>,
+    mut panels: Query<(
+        Entity,
+        &ColumnPanel,
+        &mut Node,
+        &ComputedNode,
+        Option<&DockHeld>,
+    )>,
     mut last_seen: Local<std::collections::HashMap<Entity, f32>>,
 ) {
-    let mut stack: Vec<_> = panels.iter_mut().collect();
+    let mut stack: Vec<_> = panels
+        .iter_mut()
+        .filter(|(.., held)| !held.is_some_and(|held| held.0))
+        .map(|(entity, slot, node, computed, _)| (entity, slot, node, computed))
+        .collect();
     stack.sort_by_key(|(_, slot, _, _)| **slot);
 
     let mut heights: Vec<f32> = Vec::with_capacity(stack.len());
@@ -154,6 +169,24 @@ mod tests {
             bottom_of(&app, target),
             Val::Px(style::PANEL_COLUMN_BOTTOM_PX + 90.0 + style::PANEL_COLUMN_GAP_PX),
             "a hidden roster must not reserve its height"
+        );
+    }
+
+    /// A docked panel holding its own placement is not stacked; one that does not hold is.
+    #[test]
+    fn a_held_panel_is_left_to_the_dock() {
+        let mut app = column_app();
+        spawn_panel(&mut app, ColumnPanel::SELF_HUD, 90.0, Display::Flex);
+        let target = spawn_panel(&mut app, ColumnPanel::TARGET, 60.0, Display::Flex);
+        app.world_mut().entity_mut(target).insert(DockHeld(true));
+        app.update();
+        assert_eq!(bottom_of(&app, target), Val::Auto);
+
+        app.world_mut().entity_mut(target).insert(DockHeld(false));
+        app.update();
+        assert_eq!(
+            bottom_of(&app, target),
+            Val::Px(style::PANEL_COLUMN_BOTTOM_PX + 90.0 + style::PANEL_COLUMN_GAP_PX)
         );
     }
 

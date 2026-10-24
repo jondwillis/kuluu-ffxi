@@ -807,10 +807,7 @@ pub fn apply_chat_layout(
             &UiGlobalTransform,
             Option<&InheritedVisibility>,
         ),
-        Or<(
-            With<super::panel_column::ColumnPanel>,
-            With<super::menu::MainMenu>,
-        )>,
+        With<super::panel_column::ColumnPanel>,
     >,
     tools: Query<&ComputedNode, With<super::ChatTools>>,
     mut nodes: Query<
@@ -822,7 +819,6 @@ pub fn apply_chat_layout(
                 With<ChatTabBar>,
             )>,
             Without<super::panel_column::ColumnPanel>,
-            Without<super::menu::MainMenu>,
         ),
     >,
 ) {
@@ -1183,24 +1179,245 @@ mod tests {
     }
 
     #[test]
-    fn menus_only_reserve_space_when_they_reach_the_chat_stack() {
+    fn an_obstacle_only_reserves_space_when_it_reaches_the_chat_stack() {
         let viewport = Vec2::new(1920.0, 1080.0);
-        let menu = Rect::from_corners(Vec2::new(1200.0, 48.0), Vec2::new(1912.0, 700.0));
-        let compact = available_chat_region(viewport, 220.0, 0.0, &[menu]);
+        let obstacle = Rect::from_corners(Vec2::new(1200.0, 48.0), Vec2::new(1912.0, 700.0));
+        let compact = available_chat_region(viewport, 220.0, 0.0, &[obstacle]);
         assert_eq!(compact.width(), viewport.x);
-        let expanded = available_chat_region(viewport, 700.0, 100.0, &[menu]);
-        assert!(expanded.max.x <= menu.min.x || expanded.min.y >= menu.max.y);
+        let expanded = available_chat_region(viewport, 700.0, 100.0, &[obstacle]);
+        assert!(expanded.max.x <= obstacle.min.x || expanded.min.y >= obstacle.max.y);
         assert!(expanded.height() > 100.0);
     }
 
     #[test]
     fn toolbar_space_is_preserved_when_choosing_between_free_regions() {
         let viewport = Vec2::new(800.0, 450.0);
-        let menu = Rect::from_corners(Vec2::new(500.0, 48.0), Vec2::new(792.0, 350.0));
-        let region = available_chat_region(viewport, 400.0, 180.0, &[menu]);
-        assert!(region.max.x < menu.min.x);
+        let obstacle = Rect::from_corners(Vec2::new(500.0, 48.0), Vec2::new(792.0, 350.0));
+        let region = available_chat_region(viewport, 400.0, 180.0, &[obstacle]);
+        assert!(region.max.x < obstacle.min.x);
         assert!(region.height() > 180.0);
         assert!(region.min.y >= CHAT_TOP_CLEARANCE_PX);
+    }
+
+    const SURFACE_WIDTH: u32 = 1000;
+    const SURFACE_HEIGHT: u32 = 720;
+    const IN_ZONE: u16 = 1;
+    /// Frames for an opened menu to show its host and for the chat layout to meet it.
+    const SETTLE_FRAMES: usize = 2;
+
+    fn surface() -> Vec2 {
+        Vec2::new(SURFACE_WIDTH as f32, SURFACE_HEIGHT as f32)
+    }
+
+    /// Stands in for the UI layout these tests do not run: the log is as tall as the panel height
+    /// the chat layout gave it and stands on the bottom inset.
+    fn lay_out_the_log(mut logs: Query<(&ChatArea, &mut ComputedNode, &mut UiGlobalTransform)>) {
+        let bottom = surface().y - crate::hud::BOTTOM_LEFT_INSET_PX;
+        for (area, mut computed, mut transform) in &mut logs {
+            *computed = ComputedNode {
+                size: Vec2::new(surface().x, area.panel_height),
+                inverse_scale_factor: 1.0,
+                ..default()
+            };
+            *transform =
+                UiGlobalTransform::from_xy(surface().x / 2.0, bottom - area.panel_height / 2.0);
+        }
+    }
+
+    /// The chat layout, the dock law and the menu on one in-zone screen with no menu open; the
+    /// menu's host is laid out over the whole screen and visible, as the UI lays it out.
+    fn chat_screen() -> (App, Entity, Entity) {
+        use crate::hud::menu::{
+            spawn_main_menu, update_main_menu, update_menu_stack_windows, ConfigDatRows,
+            DynamicMenu, MainMenu,
+        };
+        let mut app = App::new();
+        app.init_resource::<GraphicsSettings>()
+            .init_resource::<UiScale>()
+            .init_resource::<InputMode>()
+            .init_resource::<SceneState>()
+            .init_resource::<crate::hud::HudPanels>()
+            .init_resource::<crate::hud::network_status::NetStatusVisible>()
+            .init_resource::<DynamicMenu>()
+            .init_resource::<ConfigDatRows>()
+            .init_resource::<crate::hud::menu::PooledSeats>()
+            .init_resource::<crate::hud::dock::DockBoard>()
+            .add_systems(Startup, spawn_main_menu)
+            .add_systems(
+                Update,
+                // The real HUD's pair of draw passes (ur/102): framed children ride
+                // their own pooled surfaces under the selector.
+                (
+                    apply_chat_layout,
+                    lay_out_the_log,
+                    crate::hud::dock::dock_windows_system,
+                    update_main_menu,
+                    update_menu_stack_windows,
+                )
+                    .chain(),
+            );
+        #[cfg(not(target_arch = "wasm32"))]
+        app.init_resource::<crate::audio::AudioMuteState>();
+        app.world_mut()
+            .resource_mut::<SceneState>()
+            .snapshot
+            .zone_id = Some(IN_ZONE);
+        app.world_mut().spawn((
+            Window {
+                resolution: bevy::window::WindowResolution::new(SURFACE_WIDTH, SURFACE_HEIGHT),
+                ..default()
+            },
+            bevy::window::PrimaryWindow,
+        ));
+        let stack = app
+            .world_mut()
+            .spawn((crate::hud::BottomLeftStack, Node::default()))
+            .id();
+        let log = app
+            .world_mut()
+            .spawn((ChatPanelGroup, ChatArea::default(), Node::default()))
+            .id();
+        app.update();
+        let host = app
+            .world_mut()
+            .query_filtered::<Entity, With<MainMenu>>()
+            .single(app.world())
+            .expect("the menu host");
+        app.world_mut().entity_mut(host).insert((
+            ComputedNode {
+                size: surface(),
+                inverse_scale_factor: 1.0,
+                ..default()
+            },
+            UiGlobalTransform::from_xy(surface().x / 2.0, surface().y / 2.0),
+            InheritedVisibility::VISIBLE,
+        ));
+        (app, stack, log)
+    }
+
+    fn open_menu(app: &mut App, stack: crate::input_mode::MenuStack) {
+        app.insert_resource(InputMode::Menu(stack));
+        for _ in 0..SETTLE_FRAMES {
+            app.update();
+        }
+        let host_shown = app
+            .world_mut()
+            .query_filtered::<&Node, With<crate::hud::menu::MainMenu>>()
+            .single(app.world())
+            .is_ok_and(|node| node.display != Display::None);
+        assert!(host_shown, "the menu shows its full-screen host");
+    }
+
+    /// Where the log is: the stack's width, the log's panel height and the top edge the dock law
+    /// reads.
+    fn log_place(app: &App, stack: Entity, log: Entity) -> (Val, f32, Option<f32>) {
+        let world = app.world();
+        (
+            world.get::<Node>(stack).expect("the stack").width,
+            world.get::<ChatArea>(log).expect("the log").panel_height,
+            crate::hud::dock::node_anchor(
+                world.get::<ComputedNode>(log).expect("laid out"),
+                world.get::<UiGlobalTransform>(log).expect("laid out"),
+            )
+            .map(|anchor| anchor.top),
+        )
+    }
+
+    #[test]
+    fn an_open_menu_leaves_the_chat_log_in_place() {
+        let (mut app, stack, log) = chat_screen();
+        let closed = log_place(&app, stack, log);
+        assert_eq!(
+            closed,
+            (
+                Val::Px(surface().x),
+                PANEL_MAX_HEIGHT_PX,
+                Some(surface().y - crate::hud::BOTTOM_LEFT_INSET_PX - PANEL_MAX_HEIGHT_PX)
+            )
+        );
+        open_menu(&mut app, crate::input_mode::MenuStack::root());
+        assert_eq!(log_place(&app, stack, log), closed);
+    }
+
+    #[test]
+    fn a_column_panel_still_narrows_the_chat_log() {
+        const PANEL_HEIGHT: f32 = 120.0;
+        let (mut app, stack, log) = chat_screen();
+        let panel_left = surface().x - style::PANEL_COLUMN_RIGHT_PX - style::PANEL_WIDTH_PX;
+        app.world_mut().spawn((
+            crate::hud::panel_column::ColumnPanel::ROSTER,
+            Node::default(),
+            ComputedNode {
+                size: Vec2::new(style::PANEL_WIDTH_PX, PANEL_HEIGHT),
+                inverse_scale_factor: 1.0,
+                ..default()
+            },
+            UiGlobalTransform::from_xy(
+                panel_left + style::PANEL_WIDTH_PX / 2.0,
+                surface().y - style::PANEL_COLUMN_BOTTOM_PX - PANEL_HEIGHT / 2.0,
+            ),
+            InheritedVisibility::VISIBLE,
+        ));
+        app.update();
+        let narrowed = log_place(&app, stack, log);
+        assert_eq!(narrowed.0, Val::Px(panel_left - CHAT_WINDOW_GAP_PX));
+        assert_eq!(narrowed.1, PANEL_MAX_HEIGHT_PX);
+        open_menu(&mut app, crate::input_mode::MenuStack::root());
+        assert_eq!(log_place(&app, stack, log), narrowed);
+    }
+
+    /// A log-slot window docks against the log where it sits with no menu open
+    /// (.agents/skills/retail-observe/references/2026-10-15-menu-docking-and-flags.md).
+    /// ur/102 retarget: every stacked window is its own pooled surface (slot ==
+    /// stack index), so the emote window hangs on its own `MenuStackWindow` while
+    /// the Commands column keeps painting untouched - same dock law and value as
+    /// when the pane itself carried the window.
+    #[test]
+    fn a_docked_window_hangs_above_the_chat_log_with_a_menu_open() {
+        use crate::hud::menu::{ConfigDatRows, MainMenuPane, MenuStackWindow, EMOTE_LIST_WINDOW};
+        use crate::input_mode::{MenuKind, MenuStack};
+        const EMOTE_FRAME: (i16, i16, i16) = (16, 120, 100);
+        let (mut app, stack, log) = chat_screen();
+        app.world_mut()
+            .resource_mut::<ConfigDatRows>()
+            .frames
+            .insert(EMOTE_LIST_WINDOW.into(), EMOTE_FRAME);
+        let closed = log_place(&app, stack, log);
+        let log_top = closed.2.expect("the log is laid out");
+        let mut emotes = MenuStack::root();
+        emotes.push(MenuKind::EmoteList);
+        open_menu(&mut app, emotes);
+        assert_eq!(log_place(&app, stack, log), closed);
+        let mut hung: Vec<(Val, Val)> = app
+            .world_mut()
+            .query::<(&Node, &MenuStackWindow)>()
+            .iter(app.world())
+            .filter(|(node, _)| node.display != Display::None)
+            .map(|(node, _)| (node.top, node.bottom))
+            .collect();
+        assert_eq!(
+            hung.len(),
+            1,
+            "exactly one pooled window - the emote list on its own surface"
+        );
+        let (top, bottom) = hung.remove(0);
+        assert_eq!(
+            (top, bottom),
+            (
+                Val::Auto,
+                Val::Px(surface().y - (log_top - crate::hud::dock::DOCK_GAP))
+            )
+        );
+        let pane = app
+            .world_mut()
+            .query_filtered::<&Node, With<MainMenuPane>>()
+            .single(app.world())
+            .expect("the pane");
+        assert_ne!(
+            pane.display,
+            Display::None,
+            "ur/102: the Commands column keeps painting under a docked child"
+        );
     }
 
     fn drop_line() -> ChatLine {

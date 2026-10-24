@@ -70,10 +70,11 @@ impl PadPressed {
     }
 }
 
-/// A pad-synthesized key event for `text_input_system`'s raw-event handlers,
-/// carried on its own message channel so Bevy's `keyboard_input_system` never
-/// sees it (a synthetic press in the global `KeyboardInput` queue also lands
-/// in `ButtonInput<KeyCode>` the next frame, with no release to clear it).
+/// A synthesized key event for `text_input_system`'s raw-event handlers - a pad role or the
+/// right button's cancel tap - carried on its own message channel so Bevy's
+/// `keyboard_input_system` never sees it (a synthetic press in the global
+/// `KeyboardInput` queue also lands in `ButtonInput<KeyCode>` the next frame,
+/// with no release to clear it).
 #[derive(Message, Debug, Clone)]
 pub struct PadKeyEvent(pub KeyboardInput);
 
@@ -363,7 +364,10 @@ fn bound_key(bindings: &Bindings, action: Action) -> Option<KeyCode> {
     Some(bind.key)
 }
 
-fn emit_pad_key(
+/// A pad press is a key tap: its release goes out with it, because nothing else ever releases a
+/// synthesized key and the arrange editor follows which keys are held. The right button's cancel tap (text_input's
+/// `right_button_cancel_system`) rides here too, so one seam owns synthetic taps.
+pub(crate) fn emit_pad_key(
     writer: &mut MessageWriter<PadKeyEvent>,
     window: Entity,
     bindings: &Bindings,
@@ -375,14 +379,20 @@ fn emit_pad_key(
     let Some(logical_key) = kuluu_render::keybinds::logical_key_for(key_code) else {
         return;
     };
-    writer.write(PadKeyEvent(KeyboardInput {
+    let press = KeyboardInput {
         key_code,
         logical_key,
         state: ButtonState::Pressed,
         text: None,
         repeat: false,
         window,
-    }));
+    };
+    let release = KeyboardInput {
+        state: ButtonState::Released,
+        ..press.clone()
+    };
+    writer.write(PadKeyEvent(press));
+    writer.write(PadKeyEvent(release));
 }
 
 /// Retail-layout digital dispatch: each configured [`PadAction`] fires its
@@ -682,5 +692,88 @@ mod tests {
             Some(Action::OpenChat)
         );
         assert_eq!(pad_action_effect(PadAction::OpenChat, false).key, None);
+    }
+
+    fn chair_at(slot: u8, col: i8) -> kuluu_render::myroom_arrange::DrawnPiece {
+        use ffxi_dat::furniture::{seat_index, FurniturePose, FurnitureProperty, KIND_FURNISHING};
+        use ffxi_proto::map::container::LOC_MOGSAFE;
+        let pose = FurniturePose {
+            col,
+            ..FurniturePose::default()
+        };
+        kuluu_render::myroom_arrange::DrawnPiece {
+            seat: seat_index(LOC_MOGSAFE, slot),
+            info: kuluu_render::myroom_arrange::PieceInfo {
+                container: LOC_MOGSAFE,
+                slot,
+                item_no: u16::from(slot),
+                kind: KIND_FURNISHING,
+                planted: false,
+                storage: 0,
+                recorded: Some(pose),
+            },
+            property: FurnitureProperty {
+                flags: 0,
+                model: 0,
+                width: 1,
+                depth: 1,
+                height: 0,
+            },
+            pose,
+        }
+    }
+
+    /// A d-pad arrow reaches the raw-key readers as a press and its release, so layout mode does
+    /// not keep it held: Up then Right moves the selection right, not diagonally
+    /// (.agents/skills/retail-observe/references/2026-10-15-mog-house-arrange.md B3).
+    #[test]
+    fn a_pad_arrow_is_released_with_its_press() {
+        use bevy::ecs::system::RunSystemOnce;
+        use kuluu_render::myroom_arrange::{
+            arrange_key, arrange_key_of, ArrangeFrame, HouseKey, KeyPhase,
+        };
+        let mut dynamic = kuluu_render::hud::menu::DynamicMenu::default();
+        let (start, east) = (chair_at(1, 4), chair_at(2, 8));
+        dynamic.arrange.update(&ArrangeFrame {
+            house: Some(HouseKey {
+                zone_generation: 1,
+                floor: ffxi_dat::furniture::FLOOR_2F,
+                map_number: 0,
+            }),
+            arrangeable: true,
+            myroom_mode: kuluu_snapshot::MYROOM_MODE_LAYOUT,
+            drawn: vec![start, east],
+            ..ArrangeFrame::default()
+        });
+        assert_eq!(dynamic.arrange.selection(), Some(start.seat));
+
+        let mut app = App::new();
+        app.add_message::<PadKeyEvent>();
+        let window = app.world_mut().spawn_empty().id();
+        for action in [Action::NavUp, Action::NavRight] {
+            app.world_mut()
+                .run_system_once(move |mut writer: MessageWriter<PadKeyEvent>| {
+                    emit_pad_key(&mut writer, window, &Bindings::default(), action);
+                })
+                .expect("the pad key system runs");
+            let events: Vec<KeyboardInput> = app
+                .world_mut()
+                .resource_mut::<Messages<PadKeyEvent>>()
+                .drain()
+                .map(|event| event.0)
+                .collect();
+            let states: Vec<ButtonState> = events.iter().map(|event| event.state).collect();
+            assert_eq!(
+                states,
+                [ButtonState::Pressed, ButtonState::Released],
+                "{action:?}"
+            );
+            for event in events {
+                let key = arrange_key_of(event.key_code).expect("an arrow");
+                let phase = KeyPhase::of(event.state == ButtonState::Pressed, event.repeat);
+                arrange_key(&mut dynamic, key, phase);
+            }
+        }
+        assert_eq!(dynamic.arrange.selection(), Some(east.seat));
     }
 }

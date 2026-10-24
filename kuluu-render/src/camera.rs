@@ -682,10 +682,11 @@ pub fn firstperson_camera_system(
     mode: Res<CameraMode>,
     chase: Res<ChaseCamera>,
     step: Res<CameraStepSmoothing>,
+    arrange: Option<Res<crate::myroom_arrange::ArrangeCameraHold>>,
     q_self: Query<(&Transform, Option<&BakedActor>), (With<IsSelf>, Without<OperatorCamera>)>,
     mut q_cam: Query<&mut Transform, (With<OperatorCamera>, Without<IsSelf>)>,
 ) {
-    if !matches!(*mode, CameraMode::FirstPerson) {
+    if !matches!(*mode, CameraMode::FirstPerson) || arrange.is_some_and(|hold| hold.0) {
         return;
     }
     let Ok((self_t, baked)) = q_self.single() else {

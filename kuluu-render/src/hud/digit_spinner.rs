@@ -86,6 +86,17 @@ pub fn spawn_row<M: bevy::prelude::Component>(
     slots: impl Iterator<Item = SpinnerSlot>,
     mark: impl Fn(SpinnerSlot) -> M,
 ) {
+    spawn_row_px(parent, slots, SPINNER_TEXT_PX, mark);
+}
+
+/// [`spawn_row`] at a caller's own type size, for surfaces whose whole chrome is set
+/// smaller than the standard menu scale (the bazaar law window is).
+pub fn spawn_row_px<M: bevy::prelude::Component>(
+    parent: &mut bevy::prelude::ChildSpawnerCommands,
+    slots: impl Iterator<Item = SpinnerSlot>,
+    text_px: f32,
+    mark: impl Fn(SpinnerSlot) -> M,
+) {
     use bevy::prelude::*;
     parent
         .spawn(Node {
@@ -98,7 +109,7 @@ pub fn spawn_row<M: bevy::prelude::Component>(
                 row.spawn((
                     mark(slot),
                     Text::new(""),
-                    crate::hud::item_ui::text_font(SPINNER_TEXT_PX),
+                    crate::hud::item_ui::text_font(text_px),
                     TextColor(crate::hud::item_ui::theme::TEXT),
                     BackgroundColor(Color::NONE),
                 ));
@@ -133,6 +144,9 @@ pub struct DigitSpinner {
     /// Bitmask of 10^p places the user has stepped (retail tints just-edited
     /// digits orange).
     pub edited: u16,
+    /// Whether a digit has been typed into this amount yet. The first one starts the amount over,
+    /// so a field that opened on an existing price does not have to be cleared by hand.
+    pub typed_once: bool,
 }
 
 fn pow10(p: u32) -> u32 {
@@ -160,6 +174,7 @@ impl DigitSpinner {
             min: 0,
             place: 0,
             edited: 0,
+            typed_once: false,
         }
     }
 
@@ -200,6 +215,28 @@ impl DigitSpinner {
 
     pub fn is_all(&self) -> bool {
         self.value == self.cap
+    }
+
+    /// A digit typed at the keyboard. The first keystroke replaces the amount (which is what
+    /// makes a field opened on an existing price editable in one pass); every later one shifts the
+    /// amount left and lands in the ones column, so typing `500` gives 500. The cap clamps from
+    /// above; the floor never truncates a partially typed small amount.
+    pub fn type_digit(&mut self, digit: u8) {
+        let value = if self.typed_once {
+            (self.value as u64 * 10 + digit as u64).min(self.cap as u64) as u32
+        } else {
+            (digit as u32).min(self.cap)
+        };
+        self.value = value;
+        self.typed_once = true;
+    }
+
+    /// The last typed digit falls off, so a mistype is undone rather than restarted. Only digits
+    /// that were typed can be taken back this way.
+    pub fn untype_digit(&mut self) {
+        if self.typed_once {
+            self.value /= 10;
+        }
     }
 
     /// Toward higher place values, stopping at the widest the cap allows.

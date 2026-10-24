@@ -1,4 +1,5 @@
 use bevy::prelude::*;
+use bevy::tasks::{futures_lite::future, AsyncComputeTaskPool, Task};
 use kuluu_render::components::CameraOccluder;
 use kuluu_render::dat_mzb::{DrawDistance, MzbCollisionGeometry};
 
@@ -343,11 +344,33 @@ pub fn build_zone_collision_bvh_system(
     mut zone_bvh: ResMut<ZoneCollisionBvh>,
     time: Res<Time>,
     mut debounce: Local<Option<f32>>,
+    mut building: Local<Option<(u64, Task<CollisionBvh>)>>,
+    mut generation: Local<u64>,
 ) {
+    let changed = geom.is_changed();
+    if changed {
+        *generation += 1;
+    }
+    // A whole zone's tree is the largest single build in the load; on the main
+    // thread it is a hitch long enough to drop every foreground frame around it.
+    if let Some((built_generation, task)) = building.as_mut() {
+        let Some(bvh) = future::block_on(future::poll_once(task)) else {
+            return;
+        };
+        let stale = *built_generation != *generation;
+        *building = None;
+        zone_bvh.0 = Some(bvh);
+        if stale {
+            // Geometry moved on while the tree was being built, so this one does
+            // not cover what is loaded now.
+            *debounce = Some(0.0);
+        }
+        return;
+    }
     // Zone geometry streams in chunk-by-chunk; rebuilding the full BVH on
     // every chunk stalls the main thread for the whole load. Wait until the
     // geometry has been quiet before building once.
-    if geom.is_changed() {
+    if changed {
         *debounce = Some(0.0);
         return;
     }
@@ -365,14 +388,14 @@ pub fn build_zone_collision_bvh_system(
     }
     let tris = geom.camera_triangles();
     let tri_count = tris.len();
-    let bvh = CollisionBvh::from_world_triangles(tris);
+    let task =
+        AsyncComputeTaskPool::get().spawn(async move { CollisionBvh::from_world_triangles(tris) });
+    *building = Some((*generation, task));
     debug!(
         triangles = tri_count,
         skipped = geom.tri_count() - tri_count,
-        nodes = bvh.nodes.len(),
-        "built zone-level MZB collision BVH"
+        "building zone-level MZB collision BVH off the main thread"
     );
-    zone_bvh.0 = Some(bvh);
 }
 
 fn build_bvh_with_leaf_offsets(triangles: Vec<[Vec3; 3]>) -> CollisionBvh {

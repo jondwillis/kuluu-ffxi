@@ -1,4 +1,5 @@
 pub mod action;
+pub mod alter_ego;
 pub mod anim;
 pub mod archive;
 pub mod autotranslate_names;
@@ -14,7 +15,10 @@ pub mod event_dat;
 pub mod event_locate;
 pub mod footstep;
 pub mod ftable;
+pub mod furniture;
+pub mod furniture_arrange;
 pub mod generator;
+pub mod gettext;
 /// Sourced directly from ffxi-install rather than a crate dependency: an
 /// ffxi-install crate dependency would drag its unconditional native deps
 /// (unrar in particular, a C++ build via cc-rs) into every ffxi-dat consumer,
@@ -28,11 +32,15 @@ pub mod key_item;
 pub mod kind;
 pub mod main_dll;
 pub mod map_image;
+pub mod menu_windows;
+pub mod merits;
+pub mod mission_dat;
 pub mod mmb;
 pub mod mzb;
 pub mod npc_names;
 pub mod particle_gen;
 pub mod pol1;
+pub mod quest_dat;
 pub mod resource_dir;
 pub mod scheduler;
 pub mod sep;
@@ -48,6 +56,7 @@ pub mod ui_element;
 pub mod vos2;
 pub mod vtable;
 pub mod weather;
+pub mod xistring;
 pub mod zone_dat;
 pub mod zone_interaction;
 

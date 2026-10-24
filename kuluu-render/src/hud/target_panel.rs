@@ -44,6 +44,7 @@ pub fn spawn_target_panel(mut commands: Commands) {
             crate::components::InGameEntity,
             TargetPanel,
             crate::hud::panel_column::ColumnPanel::TARGET,
+            crate::hud::panel_column::DockHeld::default(),
             Node {
                 position_type: PositionType::Absolute,
 

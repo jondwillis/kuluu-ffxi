@@ -39,5 +39,6 @@ fn main() -> anyhow::Result<()> {
         dat_root: None,
         unfocused: true,
         mute: true,
+        cpu_mode: false,
     })
 }

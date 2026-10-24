@@ -194,14 +194,16 @@ mod tests {
         assert_eq!(
             mog_house_display_name(MyRoom {
                 model: 256,
-                sub_map: 0
+                sub_map: 0,
+                door_open: false
             }),
             "Mog House 1F"
         );
         assert_eq!(
             mog_house_display_name(MyRoom {
                 model: 615,
-                sub_map: ffxi_proto::decode::ServerLoginMyroom::SUB_MAP_2F
+                sub_map: ffxi_proto::decode::ServerLoginMyroom::SUB_MAP_2F,
+                door_open: false
             }),
             "Mog House 2F"
         );

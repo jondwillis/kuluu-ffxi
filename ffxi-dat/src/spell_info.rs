@@ -83,6 +83,23 @@ impl MagicType {
             MagicType::Trust => "fa",
         })
     }
+
+    /// The numeric magicType the DAT stores, which is also what the client's
+    /// mgcmenu categories filter on (vault main_menu.md §21: its internal school ids are
+    /// these numbers). `None` has no bucket.
+    pub fn bucket_id(self) -> Option<u8> {
+        match self {
+            MagicType::None => None,
+            MagicType::WhiteMagic => Some(1),
+            MagicType::BlackMagic => Some(2),
+            MagicType::Summoning => Some(3),
+            MagicType::Ninjutsu => Some(4),
+            MagicType::Songs => Some(5),
+            MagicType::BlueMagic => Some(6),
+            MagicType::Geomancy => Some(7),
+            MagicType::Trust => Some(8),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

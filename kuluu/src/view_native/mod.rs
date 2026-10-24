@@ -15,6 +15,7 @@ pub fn animtest_knobs() -> Option<serde_json::Value> {
 
 mod app_icon;
 pub mod auto_target;
+mod backdrop_preload;
 pub mod bridge;
 pub mod camera_collision;
 pub mod collision_bvh;
@@ -337,6 +338,9 @@ pub struct NativeRunArgs {
 
     /// Start muted (`play --mute`).
     pub mute: bool,
+
+    /// `-cpu-mode`: the launcher screens stream no zone behind them.
+    pub cpu_mode: bool,
 }
 
 /// Builds and runs the native app.
@@ -369,6 +373,7 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
         relay_listen,
         unfocused,
         mute,
+        cpu_mode,
         #[cfg(unix)]
         agent_listen,
         dat_root,
@@ -617,7 +622,7 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
         app.insert_resource(launcher_ui::CliOverridesPresent);
     }
 
-    launcher_ui::register(&mut app, &server, auth, lobby, defaults, runtime);
+    launcher_ui::register(&mut app, &server, auth, lobby, defaults, runtime, !cpu_mode);
 
     app.add_systems(OnEnter(AppPhase::Connecting), bridge_connecting);
 
@@ -738,6 +743,10 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
     });
     app.insert_resource(crate::marker_store::load_or_default());
 
+    // Every Config-page choice lives in one client-side option table, and retail keeps that
+    // table across logout through its `cnf.dat` user file (vault main_menu.md §59 addendum 47).
+    app.insert_resource(crate::config_options_store::load_or_default());
+
     // The room's systems and resources must stay out of a default build entirely: an unregistered
     // plugin is inert, but registering it puts tester state into every session.
     #[cfg(feature = "debug-animation_room")]
@@ -748,7 +757,9 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
         HudPlugin,
         MousePlugin,
         navmesh_overlay::NavmeshOverlayPlugin,
-        launcher_backdrop::LauncherBackdropPlugin,
+        launcher_backdrop::LauncherBackdropPlugin {
+            background: !cpu_mode,
+        },
         zone_transition::ZoneTransitionOverlayPlugin,
     ))
     .insert_resource(ZoneNameResolver::new(kuluu_nav::zone_name))
@@ -815,9 +826,13 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
             text_input::shop_mode_sync_system,
             text_input::shop_mouse_activate_system,
             input::handle_input_system,
+            // The right button's synthesized Esc must sit in the queue ahead of the surface it cancels.
+            text_input::right_button_cancel_system,
             text_input::text_input_system,
             text_input::auto_enter_cs_system,
             text_input::mouse_nav_dispatch_system,
+            // ur/76: the mission log's caption-band arrows step members; own system, own widgets.
+            text_input::mission_log_arrow_press_system,
             input::dispatch_target_change_system,
             input::engage_locks_target_system,
             input::sync_target_lock_system,
@@ -828,6 +843,19 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
         )
             .chain()
             .after(kuluu_render::chase_camera_system)
+            // A window docks in the frame it opens, not one frame later at its record y.
+            .before(kuluu_render::hud::dock::dock_windows_system)
+            .run_if(in_state(AppPhase::InGame)),
+    );
+
+    // Registered on its own: the group above stands at bevy's `.chain()` arity
+    // ceiling, so a new sync system cannot join it. It still runs before the key
+    // handler, which is what makes `Set Prices` take the frame cleanly.
+    app.add_systems(
+        Update,
+        text_input::bazaar_price_mode_sync_system
+            .after(text_input::bazaar_mode_sync_system)
+            .before(input::handle_input_system)
             .run_if(in_state(AppPhase::InGame)),
     );
 
@@ -855,6 +883,15 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
         Update,
         input::reset_interaction_flags_on_zone_change.run_if(in_state(AppPhase::InGame)),
     );
+    app.add_systems(
+        Update,
+        (
+            text_input::unity_chat_send_system,
+            text_input::arrange_request_send_system,
+        )
+            .after(text_input::text_input_system)
+            .run_if(in_state(AppPhase::InGame)),
+    );
 
     app.add_systems(
         Update,
@@ -864,6 +901,10 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
     );
 
     app.add_systems(Update, crate::graphics_store::persist_graphics_on_change);
+    app.add_systems(
+        Update,
+        crate::config_options_store::persist_config_options_on_change,
+    );
     app.add_systems(Update, crate::audio_store::persist_audio_on_change);
     app.add_systems(Update, crate::marker_store::sync_markers);
 

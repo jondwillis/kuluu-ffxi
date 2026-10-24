@@ -83,6 +83,11 @@ const ITEM_TYPE_OFFSET: usize = ITEM_STACK_OFFSET + 2;
 /// layout places it at this plus `ItemBlockLayout::header_shift`.
 const ITEM_EQUIPMENT_TAIL_OFFSET: usize = 0x0E;
 
+/// A furnishing, flowerpot or mannequin carries its element (u16) where the
+/// equipment tail starts, then its storage slot count (i32)
+/// (vendor/POLUtils/PlayOnline.FFXI/Things/Item.cs `StorageSlots_`).
+const ITEM_FURNISHING_STORAGE_OFFSET: usize = ITEM_EQUIPMENT_TAIL_OFFSET + 2;
+
 /// Where the string-table probe starts: the first offset past the common
 /// header on either layout.
 const STRING_TABLE_PROBE_START: usize = 0x10;
@@ -135,6 +140,13 @@ pub struct ItemStatic {
 
     pub level: u8,
 
+    /// The item's **superior level** requirement, record +0x18 (low byte of the dword after the job
+    /// mask). Retail reads it from the record the item object keeps at +0xB4 when deciding whether an
+    /// equip is legal (FFXiMain.dll retail-2026-09 `.text 0x132050`, superior check reaches helper
+    /// `.text 0x1CC600`), and s2c 0x061 carries the character's own `su_lv` at packet +0x52. 0 for
+    /// items with no superior requirement and for every non-equipment record.
+    pub superior_level: u8,
+
     pub flags: u16,
 
     pub max_charges: u8,
@@ -142,6 +154,9 @@ pub struct ItemStatic {
     pub recast_base: u32,
 
     pub item_type: u8,
+
+    /// The Storage slots a placed furnishing, flowerpot or mannequin adds; 0 for every other item.
+    pub storage_slots: u32,
 
     pub icon: Option<GraphicImage>,
 }
@@ -173,7 +188,7 @@ fn decode_item_static(block: &[u8], layout: ItemBlockLayout) -> Option<ItemStati
     let type_off = ITEM_TYPE_OFFSET + layout.header_shift();
     let item_type = read_u16_le(block.get(type_off..type_off + 2)?);
 
-    let (slot_mask, races_mask, jobs_mask, level, max_charges, recast_base) =
+    let (slot_mask, races_mask, jobs_mask, level, superior_level, max_charges, recast_base) =
         if is_equipment(stored_id) {
             let mut off = ITEM_EQUIPMENT_TAIL_OFFSET + layout.header_shift();
             let level = read_u16_le(block.get(off..off + 2)?);
@@ -186,6 +201,12 @@ fn decode_item_static(block: &[u8], layout: ItemBlockLayout) -> Option<ItemStati
             let jobs = read_u32_le(block.get(off..off + 4)?);
             off += 4;
 
+            // The dword right after the job mask carries the **superior level** in its low byte —
+            // item record +0x18, read straight out of the record by the equip legality check
+            // (FFXiMain.dll retail-2026-09 `.text 0x132050` walks races → jobs → level → superior,
+            // reaching the record at object +0xB4 with `level u16 +0xC, slots +0xE, races +0x10,
+            // jobs u32 +0x14, su u8 +0x18`). The remaining three bytes stay unread.
+            let superior_level = *block.get(off)?;
             off += 4;
 
             if is_weapon(stored_id) {
@@ -201,12 +222,23 @@ fn decode_item_static(block: &[u8], layout: ItemBlockLayout) -> Option<ItemStati
                 races,
                 jobs,
                 (level.min(u8::MAX as u16)) as u8,
+                superior_level,
                 max_charges,
                 reuse_delay,
             )
         } else {
-            (0, 0, 0, 0, 0, 0)
+            (0, 0, 0, 0, 0, 0, 0)
         };
+
+    let item_type = item_type.min(u8::MAX as u16) as u8;
+    let storage_slots = if crate::furniture::is_furniture_kind(item_type) {
+        let off = ITEM_FURNISHING_STORAGE_OFFSET + layout.header_shift();
+        block
+            .get(off..off + 4)
+            .map_or(0, |b| u32::try_from(read_i32_le(b)).unwrap_or(0))
+    } else {
+        0
+    };
 
     let strings = read_item_strings(block).unwrap_or_default();
     let icon = decode_icon(block);
@@ -220,10 +252,12 @@ fn decode_item_static(block: &[u8], layout: ItemBlockLayout) -> Option<ItemStati
         jobs_mask,
         races_mask,
         level,
+        superior_level,
         flags,
         max_charges,
         recast_base,
-        item_type: item_type.min(u8::MAX as u16) as u8,
+        item_type,
+        storage_slots,
         icon,
     })
 }
@@ -542,6 +576,88 @@ fn read_u32_le(b: &[u8]) -> u32 {
 }
 
 #[inline]
+fn read_i32_le(b: &[u8]) -> i32 {
+    i32::from_le_bytes([b[0], b[1], b[2], b[3]])
+}
+
+#[inline]
 fn read_u16_le(b: &[u8]) -> u16 {
     u16::from_le_bytes([b[0], b[1]])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BLOCK_LEN: usize = 0x300;
+    const GENERAL_ITEM_ID: u32 = 0x0100;
+    const STORAGE: i32 = 7;
+
+    #[test]
+    fn furniture_kinds_read_their_storage_slots_after_the_element_word() {
+        for layout in [ItemBlockLayout::Legacy, ItemBlockLayout::Retail2026] {
+            let block = |kind: u16| {
+                let mut block = vec![0u8; BLOCK_LEN];
+                block[..4].copy_from_slice(&GENERAL_ITEM_ID.to_le_bytes());
+                let type_at = ITEM_TYPE_OFFSET + layout.header_shift();
+                block[type_at..type_at + 2].copy_from_slice(&kind.to_le_bytes());
+                let at = ITEM_FURNISHING_STORAGE_OFFSET + layout.header_shift();
+                block[at..at + 4].copy_from_slice(&STORAGE.to_le_bytes());
+                block
+            };
+            let furnishing = u16::from(crate::furniture::KIND_MANNEQUIN);
+            let item = decode_item_static(&block(furnishing), layout).unwrap();
+            assert_eq!(item.storage_slots, STORAGE as u32, "{}", layout.name());
+            let other = u16::from(crate::furniture::KIND_FURNISHING - 1);
+            assert_eq!(
+                decode_item_static(&block(other), layout)
+                    .unwrap()
+                    .storage_slots,
+                0
+            );
+        }
+    }
+
+    /// Gated on a retail install: the superior-level requirement lives at record **+0x18** — the low
+    /// byte of the dword right after the job mask (FFXiMain.dll retail-2026-09 `.text 0x132050` walks
+    /// races → jobs → level → superior out of that same record; bead kuluu-o9qt7.3.4). Walking every
+    /// equipment id must find items carrying one, with plausible values; if this test finds none the
+    /// offset or the layout walk is wrong rather than the install being odd.
+    #[test]
+    fn real_install_reports_superior_requirements_with_plausible_values() {
+        let Some(root) = crate::archive::open_test_install() else {
+            return;
+        };
+        let table = ItemTable::open_from_root(&root);
+        assert!(
+            !table.is_empty(),
+            "the install's item DATs did not open for the superior-level scan"
+        );
+        let mut found = 0usize;
+        let mut sample: Vec<(u16, u8, String)> = Vec::new();
+        let mut implausible: Vec<String> = Vec::new();
+        for id in 0x2800u16..=0x6FFF {
+            let Some(item) = table.lookup(id) else {
+                continue;
+            };
+            if item.superior_level == 0 {
+                continue;
+            }
+            found += 1;
+            if !(1..=99).contains(&item.superior_level) {
+                implausible.push(format!("{id}: su {} ({})", item.superior_level, item.name));
+            }
+            if sample.len() < 5 {
+                sample.push((id, item.superior_level, item.name.clone()));
+            }
+        }
+        assert!(
+            found > 0,
+            "no equipment record reported a superior level — the +0x18 read is wrong"
+        );
+        assert!(
+            implausible.is_empty(),
+            "implausible su values: {implausible:?}"
+        );
+    }
 }

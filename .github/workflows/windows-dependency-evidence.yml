@@ -1,0 +1,52 @@
+name: Windows dependency evidence
+
+on:
+  pull_request:
+    paths:
+      - Cargo.lock
+      - kuluu-session/src/auth_binary.rs
+      - kuluu/build.rs
+      - kuluu/assets/branding/**
+      - scripts/windows-dependency-evidence.py
+      - .github/workflows/windows-dependency-evidence.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Windows ${{ matrix.dependency }}
+    runs-on: windows-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        dependency: [mac_address, embed-resource]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Read pinned toolchain
+        id: toolchain
+        shell: pwsh
+        run: |
+          $pin = python -c "import tomllib; print(tomllib.load(open('rust-toolchain.toml', 'rb'))['toolchain']['channel'])"
+          "channel=$pin" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
+      - name: Run production dependency probe
+        shell: pwsh
+        run: >-
+          python scripts/windows-dependency-evidence.py
+          --dependency ${{ matrix.dependency }}
+          --output "${{ runner.temp }}/dependency-evidence/${{ matrix.dependency }}"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: windows-${{ matrix.dependency }}-evidence
+          path: |
+            ${{ runner.temp }}/dependency-evidence/${{ matrix.dependency }}/evidence.json
+            ${{ runner.temp }}/dependency-evidence/${{ matrix.dependency }}/*.log
+          if-no-files-found: error

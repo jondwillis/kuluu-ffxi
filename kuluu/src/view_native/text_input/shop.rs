@@ -33,7 +33,9 @@ pub fn shop_mode_sync_system(
     }
 
     let Some(shop) = state.snapshot.shop.as_ref() else {
-        if screen.dismissed || matches!(*mode, InputMode::Shop) {
+        if matches!(*mode, InputMode::Shop) && !screen.dismissed {
+            screen.close();
+        } else if screen.dismissed {
             screen.reset();
         }
         if matches!(*mode, InputMode::Shop) {
@@ -56,7 +58,7 @@ pub fn shop_mode_sync_system(
 
     if !matches!(*mode, InputMode::Shop) {
         if matches!(*mode, InputMode::World) {
-            screen.reset();
+            screen.open();
             *mode = InputMode::Shop;
         }
         return;
@@ -464,6 +466,8 @@ mod tests {
                 ..
             })
         ));
+        assert!(!screen.confirm_yes, "the priced confirm opens on No");
+        handle_confirm_key(&Key::ArrowUp, &bindings, &mut screen, &mut scene, &tx);
         handle_confirm_key(&Key::Enter, &bindings, &mut screen, &mut scene, &tx);
         assert!(rx.try_recv().is_err());
         scene.snapshot.shop.as_mut().unwrap().pending_sale = Some(kuluu_snapshot::ShopSale {
