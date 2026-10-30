@@ -36,6 +36,10 @@ workspace crates.
   `docs/` (DAT, animation, zone mesh, event bytecode, audio, VFX,
   FFXiMain unpacking). Successor of cexi-docs. Format cross-reference for
   `ffxi-dat` / `ffxi-audio`.
+- `xi-on-anything/` — [xi-on-anything](https://github.com/rubymatrix/xi-on-anything),
+  the tooling that recompiles this machine's installed `FFXiMain.dll` to C. Its
+  generated output is gitignored and regenerated on demand; see tier 1 below and
+  [vendor/rea/INSTALL.md](../vendor/rea/INSTALL.md).
 - `XIClient/` — [XIClient](https://gitlab.com/Aenge/XIClient), a from-scratch
   playable C++ FFXI client (no license — all rights reserved). Reference for
   client architecture and vanilla behavior only.
@@ -54,6 +58,15 @@ the higher tier:
    `retail-2026-09` (patch `30260904_1`, the oracle) and `horizonxi-2023`
    (`30230905_0`, the HorizonXI pin); name the row, not a date, beside
    anything verified on it.
+
+   `xi-on-anything/generated/all/` ranks with this tier for bit-level and
+   runtime-policy questions: the complete installed DLL as C, one function per
+   `f_<VA>` (VA = RVA + 0x10000000), every memory access spelling its offset,
+   every direct call resolved, and `table.c` mapping each address to its
+   function so indirect calls are traceable too. Look things up there rather
+   than disassembling; the procedure is
+   [vendor/rea/INSTALL.md](../vendor/rea/INSTALL.md).
+   Build: regenerated from this machine's install - record `generated/build.json`.
 2. **`XIClient/`** — disassembly-grounded; the best community reference for
    **bit-level format accuracy** (field widths, in-memory-only bits). No
    license: read-only. Its reconstructions remain community evidence; cite them

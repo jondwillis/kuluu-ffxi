@@ -69,7 +69,7 @@ pub fn spawn_diagnostics(mut commands: Commands) {
             spawn_separator(p);
             spawn_label_value(p, "fps=", DiagFpsValue, "—");
             spawn_separator(p);
-            spawn_label_value(p, "draws=", DiagDrawValue, "—");
+            spawn_label_value(p, "meshes=", DiagDrawValue, "—");
 
             p.spawn(Node {
                 flex_grow: 1.0,

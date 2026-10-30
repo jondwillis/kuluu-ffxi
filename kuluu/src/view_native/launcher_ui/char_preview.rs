@@ -19,7 +19,7 @@ use crate::view_native::launcher_backdrop::PREVIEW_RENDER_LAYER;
 pub(super) struct CharPreviewRoot;
 
 #[derive(Component)]
-pub(super) struct CharPreviewParent;
+pub(crate) struct CharPreviewParent;
 
 #[derive(Component)]
 pub(super) struct CharPreviewActorRoot;
@@ -122,7 +122,7 @@ pub(super) fn spawn_preview(mut commands: Commands) {
 }
 
 pub(super) fn tag_preview_meshes(
-    trigger: On<Add, Mesh3d>,
+    trigger: On<Add<Mesh3d>>,
     parents: Query<&ChildOf>,
     preview_parents: Query<(), With<CharPreviewParent>>,
     mut commands: Commands,

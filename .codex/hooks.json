@@ -58,6 +58,15 @@
           }
         ],
         "matcher": "startup|resume|clear"
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "root=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0; common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || exit 0; for hook in \"$root/.agents/hooks/ste100-reminder.py\" \"$(dirname \"$common\")/.agents/hooks/ste100-reminder.py\"; do if [ -f \"$hook\" ]; then python3 \"$hook\"; exit $?; fi; done",
+            "timeout": 10
+          }
+        ]
       }
     ],
     "Stop": [
@@ -78,6 +87,15 @@
             "command": "bd codex-hook UserPromptSubmit",
             "statusMessage": "Refreshing Beads context",
             "type": "command"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "root=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0; common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || exit 0; for hook in \"$root/.agents/hooks/ste100-reminder.py\" \"$(dirname \"$common\")/.agents/hooks/ste100-reminder.py\"; do if [ -f \"$hook\" ]; then python3 \"$hook\"; exit $?; fi; done",
+            "timeout": 10
           }
         ]
       }

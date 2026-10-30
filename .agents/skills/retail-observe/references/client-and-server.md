@@ -1,135 +1,66 @@
-# Getting a client running, against whichever server
+# Select a client, loader, and server
 
-The retail client is just a directory of files plus a loader that starts it and
-tells it where the server is. Nothing about observing it depends on a particular
-server or a particular private-server launcher, so treat those as two
-independent choices:
+Select the client installation and server independently.
+A private-server installation can include its own launcher, loader, and addons.
+Keep installation files outside the checkout.
 
-- **which client install** -- a retail install, or a private server's install
-  (retail files plus an overlay: Ashita, a bootloader, addons);
-- **which server** -- a private server such as HorizonXI, or a local
-  LandSandBoat stack you run yourself.
-
-The interesting pairing is a **retail client against a local LSB stack**: the
-oracle and the remake then face the same server, so a behavioral difference is
-the client's, not the server's. That is the comparison worth setting up when a
-parity question is subtle.
-
-## Finding an install
-
-Ask, do not assume a path. This repository keeps a registry of named installs:
+## Find the installation
 
 ```bash
-kuluu install list          # each install with its KNOWN_CLIENTS row
-kuluu install path NAME     # the directory to use
+kuluu install list
+kuluu install path NAME
 ```
 
-`FFXI_OBSERVE_INSTALL` accepts either a directory or `kuluu:NAME`, which asks
-that registry. A macOS/Linux wrapper (FFXI on Mac, Whisky, a Proton prefix)
-keeps its own per-world folder -- point at that directory the same way. The
-checkout itself ships no game files, and captures of retail DATs are
-SE-copyrighted reference material that stays local.
+Use the returned path in the selected [host procedure](../SKILL.md#select-one-host-procedure).
+The macOS Wine procedure uses `macos.py setup --install PATH`; its profile is private JSON.
+The Linux shell procedure also accepts `FFXI_OBSERVE_INSTALL=kuluu:NAME`.
+A complete installation includes `FINAL FANTASY XI/FFXiMain.dll`, the DAT files, and the PlayOnline viewer.
 
-A usable install contains the retail tree (`SquareEnix/FINAL FANTASY XI` with
-`FFXiMain.dll` beside `VTABLE.DAT`, and `SquareEnix/PlayOnlineViewer`), plus
-whatever overlay the server needs.
+## Select a compatible loader
 
-## The loaders, and what each one is for
-
-| Loader | Role |
+| Loader | Purpose |
 |---|---|
-| `pol.exe` / `polboot.exe` | the PlayOnline viewer boot path, as retail ships it |
-| `xiloader.exe` | the community loader: takes a **server address** and starts the client against it. This is the decoupling point |
-| `Ashita-cli.exe` + a boot config | injects Ashita, then starts the client. Private servers that ship addons use this |
-| a server-branded loader | wraps the above with the server's own ticket/session flow |
+| `pol.exe` / `polboot.exe` | PlayOnline viewer startup |
+| `xiloader.exe` | Original client against a community server |
+| Ashita or a server-branded launcher | Server-specific authentication, configuration, or addons |
 
-`xiloader` is the one that makes the client server-agnostic. Its options are
-self-documenting (`xiloader --help`) and include `--server`, `--serverport`,
-`--dataport`, `--authport`, `--lang`, plus a hairpin fix for reaching a server
-through your own NAT. `observe.sh launch --server HOST` appends `--server`,
-which assumes an xiloader-style loader; for `pol.exe` or a branded loader, put
-whatever it needs in `loader_args` instead.
+Use the selected loader's help for its supported arguments.
+Do not apply xiloader arguments to another launcher.
+For macOS Wine commands, use [host-macos.md](host-macos.md); do not create a second shell profile.
 
-## Against a local LandSandBoat stack
+Check these independent compatibility requirements:
 
-```bash
-FFXI_OBSERVE_INSTALL=kuluu:NAME \
-FFXI_OBSERVE_LOADER=_bootloader/xiloader.exe \
-scripts/observe.sh launch --server 127.0.0.1
-```
+- Match the loader version to the server's accepted version.
+  LSB defines `SupportedXiloaderVersion` in `vendor/server/src/login/auth_session.h`.
+- Match the loader to the installed `polcore.dll`.
+  A missing loader patch pattern can prevent launch even when the server accepts the loader version.
+  xiloader 2.1.2 failed on the 2026-09 viewer with `Failed to locate profileServerPortAddress2!`.
+- Match the client version to the server settings.
+  Use the installation registry's client profile instead of assuming that all installations contain the same build.
+- Match auth, lobby, profile, and data ports to the selected server.
 
-Bring the stack up with the [verify](../../verify/SKILL.md) skill -- it owns the
-recipe, including the fact that the map server must advertise an address the
-client can actually reach. Credentials for a local stack are throwaway test
-accounts you own, so an agent may drive that login end to end; `xiloader` also
-prompts in its console if you would rather not pass them.
+## Local LSB
 
-Two things to get right before blaming the client:
+Use the [verify skill](../../verify/SKILL.md) to prepare the local stack.
+The map server must advertise an address the client can reach.
+The account and character must exist before character selection can succeed.
+Agents can drive authorized local test accounts without a credential handoff.
 
-- **Ports.** Non-default auth/lobby/data ports on the server need the matching
-  `--authport`/`--serverport`/`--dataport` here. The repository's own constants
-  are the source for those values; do not re-type a port literal you can import.
-- **Loader era, separately from client era.** LSB's login server checks the
-  loader's own version before it checks anything else, and refuses an older one
-  outright (`SupportedXiloaderVersion` in `vendor/server/src/login/auth_session.h`;
-  the client sees "Expected xiloader version mismatch"). The loader shipped with
-  a private server's bootloader bundle can be years behind that. Take the
-  matching release from LandSandBoat/xiloader rather than assuming the one
-  already in the install will do.
-- **The loader also has to match `polcore.dll`.** `xiloader` boots the client by
-  byte-pattern-scanning the PlayOnline viewer's `polcore.dll` and writing the
-  profile server port into it. Those patterns track a particular polcore
-  vintage, so a *newer* client can fail where an older one works: against the
-  2026-09 retail viewer, xiloader 2.1.2 finds its first pattern and not the
-  second, and stops at "Failed to locate profileServerPortAddress2!" -- while
-  the same loader patches a 2024-era polcore cleanly. Check a candidate before
-  launching by scanning the viewer's `polcore.dll` for the patterns in that
-  release's `SetProfileServerPort`; pattern absence is the whole diagnosis.
-- **Client era.** A server expects a client of a particular vintage, and the
-  installed build is a fact you can check: `kuluu install list` names each
-  install's `KNOWN_CLIENTS` row (see `KNOWN_CLIENTS` in
-  `ffxi-dat/src/client_profile.rs`). A mismatch shows up as handshake or packet
-  surprises, not as a clear error, and it also means an address or offset noted
-  for one build does not transfer to another.
+For the optional OrbStack connect/profile supplement, use the single procedure in [host-macos.md](host-macos.md#optional-local-orbstack-server-supplement).
+Do not start duplicate services on occupied ports.
+A rejected client version does not prove that input or capture is broken.
 
-## Against a private server
+## Private servers and display settings
 
-Follow that server's own launcher: it usually authenticates, patches, then hands
-a short-lived session to its loader. Two standing rules:
+Follow the server's supported launcher and authorized login procedure.
+Keep credentials out of profiles and logs.
+A crashed session can retain its login slot; wait for server cleanup before another login attempt.
 
-- **Credentials are the human's.** Someone else's server, someone else's account
-  -- hand off rather than typing stored secrets, and never store them in a
-  profile. Once a launcher session persists, a re-login usually needs no
-  credentials at all, which is why switching characters is fully drivable.
-- **Do not fight a ghost session.** A crashed prior session can hold the slot for
-  minutes; wait it out rather than logging out of a session you cannot restore
-  without the password.
+FFXI stores display settings in the Windows registry, including the Wine prefix's registry.
+If no game window appears, check the background resolution in FFXI Config before changing the observation tools.
+Use windowed mode for window-targeted captures.
+Configuration applications have separate window titles; use the host procedure's discovery commands when needed.
 
-## Client configuration traps
-
-The client reads resolution and graphics settings from the Windows registry --
-the guest's registry in a VM, the prefix's registry under Wine -- which is why
-installs ship registry-seeding tools and why the settings survive reinstalling
-the game files.
-
-- **Background resolution too high opens no window at all.** 4096 squared wedged
-  the loader; 2048 squared works. Set it in the launcher or FFXI Config before
-  suspecting the observe tooling.
-- **Run the client windowed** while driving it. Fullscreen exclusive mode makes
-  window-targeted capture unreliable on every host.
-- The standalone config tools (FFXI Config, gamepad config) are separate Win32
-  windows with their own titles; drive them with `FFXI_OBSERVE_WINDOW_TITLE`, and
-  be aware that on some hosts they ignore pid-targeted input (see the host
-  reference).
-
-## After launch, prove it is really up
-
-```bash
-scripts/observe.sh status     # does a window resolve, and where
-scripts/observe.sh ocr        # what is actually on screen right now
-```
-
-A window that resolves is not the same as a client that is responding: a
-mid-load client, or a Wine app orphaned from its server, still composites a
-window and still captures. `ocr` twice with an input in between, and treat "no
-change at all" as a stalled client rather than a missed keypress.
+A listed window can be loading or unresponsive.
+Verify input with a fresh capture of a reversible action.
+Stop if repeated input causes no visible change, or another driver is active.

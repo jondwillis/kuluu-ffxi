@@ -46,6 +46,12 @@ struct Args {
     #[arg(long)]
     require_dat: bool,
 
+    /// Skip the work that is not gameplay: the launcher screens stream no zone
+    /// behind them, so login and character-select keep every frame. Global so it
+    /// reads the same before or after `play`.
+    #[arg(long = "cpu-mode", global = true)]
+    cpu_mode: bool,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -81,14 +87,6 @@ enum Command {
         /// Skip the opening new-character cutscene (matches the GUI default).
         #[arg(long, default_value_t = true)]
         skip_intro_cs: bool,
-    },
-
-    /// Print the animation room's drive knobs (case names, env variables, auto-fire clock) and
-    /// exit. Needs no server and no install, so a driver enumerates what this build can do instead
-    /// of transcribing it; a build without the room says that rather than printing an empty list.
-    Animtest {
-        #[arg(long)]
-        knobs: bool,
     },
 
     Play {
@@ -143,6 +141,20 @@ enum Command {
     },
 }
 
+/// clap answers to `--cpu-mode`; the single-dash spellings are what get typed
+/// by hand, and a leading `-` with more than one letter parses as short-flag
+/// clustering otherwise.
+fn accept_single_dash_cpu_mode(args: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
+    const SPELLINGS: [&str; 3] = ["-cpumode", "-cpu-mode", "--cpumode"];
+    const CANONICAL: &str = "--cpu-mode";
+    args.into_iter()
+        .map(|arg| match arg.to_str() {
+            Some(text) if SPELLINGS.contains(&text) => std::ffi::OsString::from(CANONICAL),
+            _ => arg,
+        })
+        .collect()
+}
+
 fn main() -> Result<()> {
     rustls::crypto::ring::default_provider()
         .install_default()
@@ -155,6 +167,7 @@ fn main() -> Result<()> {
     } else {
         cli_args
     };
+    let cli_args = accept_single_dash_cpu_mode(cli_args);
     let args = Args::parse_from(cli_args);
 
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
@@ -241,23 +254,6 @@ fn main() -> Result<()> {
     rt.block_on(async move { run_command_async(args, auth).await })
 }
 
-/// The knob report of the build actually running. Room-less builds answer with `compiled_in` false
-/// and the features to add, which is a usable answer; silence is not.
-fn animtest_knob_json() -> String {
-    #[cfg(feature = "native-window")]
-    let knobs: Option<serde_json::Value> = kuluu::view_native::animtest_knobs();
-    #[cfg(not(feature = "native-window"))]
-    let knobs: Option<serde_json::Value> = None;
-    knobs.unwrap_or_else(|| {
-        serde_json::json!({
-            "surface": "animation_room",
-            "compiled_in": false,
-            "hint": "rebuild with --features native-window,debug-animation_room to drive the room",
-        })
-    })
-    .to_string()
-}
-
 fn resolve_dat_root(require_dat: bool) -> Result<Option<std::sync::Arc<ffxi_dat::DatRoot>>> {
     match ffxi_dat::DatRoot::from_env_or_default() {
         Ok(root) => {
@@ -299,13 +295,6 @@ fn resolve_dat_root(require_dat: bool) -> Result<Option<std::sync::Arc<ffxi_dat:
 /// DebugControl to land on (relay::serve takes None for it).
 async fn run_command_async(args: Args, auth: auth_client::AuthClient) -> Result<()> {
     match args.command {
-        Command::Animtest { knobs } => {
-            if !knobs {
-                bail!("animtest takes a flag — try `kuluu animtest --knobs`");
-            }
-            println!("{}", animtest_knob_json());
-            return Ok(());
-        }
         Command::Install { .. } | Command::SteamShortcut { .. } => {
             unreachable!("handled before the runtime starts")
         }
@@ -403,7 +392,6 @@ async fn run_command_async(args: Args, auth: auth_client::AuthClient) -> Result<
                         let initial_state = session::InitialState {
                             auth: session,
                             handoff,
-                            key3,
                         };
                         (u, p, slot.char_id, slot.name, initial_state)
                     }
@@ -560,6 +548,7 @@ fn run_gui_main_thread(
         data_port,
         view_port,
         map_host_override,
+        cpu_mode,
         command,
         ..
     } = args;
@@ -606,6 +595,7 @@ fn run_gui_main_thread(
         dat_root,
         unfocused,
         mute,
+        cpu_mode,
     })
     .context("native viewer")
 }

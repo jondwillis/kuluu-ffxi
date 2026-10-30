@@ -290,10 +290,11 @@ impl LobbyHandle {
         spec: &CharCreateSpec,
     ) -> Result<Self> {
         let name_check = build_view_name_check(&spec.name, &mut self.wire);
+        wire_note(&mut self.wire, VIEW_CMD_NAME_CHECK);
         self.view.write_all(&name_check).await?;
         self.view.flush().await?;
         tracing::debug!(name = %spec.name, "lobby handle: 0x22 name check sent");
-        read_create_reply(&mut self.view, "name check")
+        read_create_reply(&mut self.view, "name check", &mut self.wire)
             .await
             .context("0x22 name check response")?;
         self.wire.on_key_advancing_reply();
@@ -313,6 +314,7 @@ impl LobbyHandle {
             skip_intro_cs,
             &mut self.wire,
         );
+        wire_note(&mut self.wire, VIEW_CMD_REGISTER_CHAR);
         self.view.write_all(&register_char).await?;
         self.view.flush().await?;
         tracing::debug!(
@@ -324,7 +326,7 @@ impl LobbyHandle {
             skip_intro_cs = skip_intro_cs != 0,
             "lobby handle: 0x21 register sent"
         );
-        read_create_reply(&mut self.view, "register character")
+        read_create_reply(&mut self.view, "register character", &mut self.wire)
             .await
             .context("0x21 register character response")?;
         self.wire.on_key_advancing_reply();
@@ -356,6 +358,7 @@ impl LobbyHandle {
 
     pub async fn delete_character(mut self, auth: &AuthSession, char_id: u32) -> Result<Self> {
         let pkt = build_delete_char(char_id, 0, &mut self.wire);
+        wire_note(&mut self.wire, VIEW_CMD_DELETE_CHAR);
         self.view.write_all(&pkt).await?;
         self.view.flush().await?;
         tracing::debug!(char_id, "lobby handle: 0x14 delete-char sent");
@@ -415,6 +418,7 @@ impl LobbyHandle {
         req_select: Vec<u8>,
         key3: [u8; 20],
     ) -> Result<MapHandoff> {
+        wire_note(&mut self.wire, VIEW_CMD_SELECT);
         self.view.write_all(&req_select).await?;
         self.view.flush().await?;
         tracing::info!(char_id, "lobby: 0x07 select sent");
@@ -438,11 +442,23 @@ impl LobbyHandle {
         self.data.flush().await?;
         tracing::info!("lobby: 0xA2 handoff sent");
 
+        // LSB overwrites the loader's key3 placeholder at the moment it reads
+        // the 0xA2 (vendor/server/src/login/data_session.cpp case 0xA2); the
+        // mirror predicts the same seed from the stepped counter.
+        let map_seed = self.wire.lsb_map_seed().unwrap_or(key3);
+        tracing::info!(
+            handoff_key_counter = format_args!(
+                "0x{:08X}",
+                u32::from_le_bytes(map_seed[16..20].try_into().unwrap())
+            ),
+            "lobby: predicted map key counter (cow-connect logs its own as 'key counter')"
+        );
+
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let handoff = lobby_io(
             "lpkt_next_login (view)",
-            read_lpkt_next_login(&mut self.view, char_id, &key3),
+            read_lpkt_next_login(&mut self.view, char_id, &map_seed),
         )
         .await?;
         tracing::info!(
@@ -510,6 +526,7 @@ impl LobbyClient {
         let excode_client = self.excode_client.unwrap_or_else(client_excode_client);
         let mut wire = LobbyWire::for_session(auth);
         let login = build_lobby_login(&wire, &version_code, excode_client);
+        wire.note_view_request(VIEW_CMD_LOBBY_LOGIN as u8);
         view.write_all(&login).await?;
         view.flush().await?;
         tracing::info!(
@@ -520,6 +537,7 @@ impl LobbyClient {
             "lobby: 0x26 lobby login sent"
         );
         let key = lobby_io("0x05 key (view)", read_key_reply(&mut view)).await?;
+        wire.begin_lobby_counter(key.key);
         wire.on_login_good(key.key);
         tracing::info!(
             key = format_args!("{:#010x}", key.key),
@@ -611,10 +629,11 @@ impl LobbyClient {
         tracing::debug!("create_character: lobby open complete");
 
         let name_check = build_view_name_check(&spec.name, &mut wire);
+        wire_note(&mut wire, VIEW_CMD_NAME_CHECK);
         view.write_all(&name_check).await?;
         view.flush().await?;
         tracing::debug!(name = %spec.name, "create_character: 0x22 name check sent");
-        read_create_reply(&mut view, "name check")
+        read_create_reply(&mut view, "name check", &mut wire)
             .await
             .context("0x22 name check response")?;
         wire.on_key_advancing_reply();
@@ -628,6 +647,7 @@ impl LobbyClient {
             spec.skip_intro_cs,
             &mut wire,
         );
+        wire_note(&mut wire, VIEW_CMD_REGISTER_CHAR);
         view.write_all(&register_char).await?;
         view.flush().await?;
         tracing::debug!(
@@ -639,9 +659,10 @@ impl LobbyClient {
             skip_intro_cs = spec.skip_intro_cs != 0,
             "create_character: 0x21 register sent"
         );
-        read_create_reply(&mut view, "register character")
+        read_create_reply(&mut view, "register character", &mut wire)
             .await
             .context("0x21 register character response")?;
+        wire.on_key_advancing_reply();
 
         Ok(())
     }
@@ -902,7 +923,15 @@ const VIEW_REPLY_RESULT_SIZE: usize = 0x20;
 const VIEW_REPLY_ERROR_SIZE: usize = 0x24;
 const VIEW_REPLY_ERROR_RESULT: u8 = 0x04;
 
-async fn read_create_reply(stream: &mut TcpStream, stage: &str) -> Result<()> {
+fn wire_note(wire: &mut LobbyWire, code: u32) {
+    wire.note_view_request(code as u8);
+}
+
+async fn read_create_reply(
+    stream: &mut TcpStream,
+    stage: &str,
+    wire: &mut LobbyWire,
+) -> Result<()> {
     let mut size_bytes = [0u8; 4];
     stream
         .read_exact(&mut size_bytes)
@@ -926,6 +955,7 @@ async fn read_create_reply(stream: &mut TcpStream, stage: &str) -> Result<()> {
     match (size, result) {
         (0x20, 0x03) => Ok(()),
         (0x24, 0x04) => {
+            wire.note_error_frame();
             let err = u16::from_le_bytes(rest[28..30].try_into().unwrap());
             bail!(
                 "{stage}: server rejected with loginErrors code {err} ({})",
@@ -1113,7 +1143,7 @@ const NEXT_LOGIN_SERVER_PORT_OFFSET: usize = 60;
 async fn read_lpkt_next_login(
     stream: &mut TcpStream,
     char_id: u32,
-    key3: &[u8; 20],
+    map_seed: &[u8; 20],
 ) -> Result<MapHandoff> {
     let mut buf = vec![0u8; NEXT_LOGIN_PACKET_SIZE as usize];
     stream
@@ -1170,7 +1200,7 @@ async fn read_lpkt_next_login(
         character_name,
         server_ip,
         server_port,
-        session_key_seed: *key3,
+        session_key_seed: *map_seed,
     })
 }
 
@@ -1182,7 +1212,7 @@ mod tests {
     use tokio::net::TcpListener;
 
     fn lsb_wire(session_hash: [u8; 16]) -> LobbyWire {
-        LobbyWire::LandSandBoat { session_hash }
+        LobbyWire::fresh_lsb_session(session_hash)
     }
 
     fn pol_session() -> AuthSession {
@@ -1304,12 +1334,16 @@ mod tests {
         | expansion_display::CHAINS_OF_PROMATHIA
         | expansion_display::BASE_GAME) as u32;
 
+    /// vendor/server/src/login/view_session.cpp view_session::read_func case
+    /// 0x26 `packet.key` — the word the counter mirror adopts from.
+    const SERVER_LOBBY_KEY_ON_WIRE: u32 = 0xAD5DE04F;
+
     fn key_packet(excode_server: u32) -> Vec<u8> {
         let mut buf = vec![0u8; KEY_PACKET_SIZE];
         buf[0..4].copy_from_slice(&(KEY_PACKET_SIZE as u32).to_le_bytes());
         buf[4..8].copy_from_slice(&IXFF_TERMINATOR.to_le_bytes());
         buf[8..12].copy_from_slice(&VIEW_RESP_KEY.to_le_bytes());
-        buf[KEY_OFFSET..KEY_OFFSET + 4].copy_from_slice(&0xAD5D_E04Fu32.to_le_bytes());
+        buf[KEY_OFFSET..KEY_OFFSET + 4].copy_from_slice(&SERVER_LOBBY_KEY_ON_WIRE.to_le_bytes());
         buf[KEY_EXCODE_SERVER_OFFSET..KEY_EXCODE_SERVER_OFFSET + 4]
             .copy_from_slice(&excode_server.to_le_bytes());
         buf
@@ -1522,9 +1556,7 @@ mod tests {
 
     #[test]
     fn lsb_sessions_leave_the_auth_code_zero() {
-        let wire = LobbyWire::LandSandBoat {
-            session_hash: SESSION_HASH,
-        };
+        let wire = lsb_wire(SESSION_HASH);
         let buf = build_lobby_login(&wire, "30230905_0", 0);
         assert_eq!(&buf[12..28], &SESSION_HASH);
         assert!(buf
@@ -1649,6 +1681,13 @@ mod tests {
         data.write_all(&DATA_ACK_SELECT).await.ok()?;
         let mut req_handoff = [0u8; IXFF_HEADER_SIZE];
         data.read_exact(&mut req_handoff).await.ok()?;
+        // The 0xA2's key3 fields are placeholders: LSB copies them without
+        // validating, overwrites the first 16 with its own md5(session_hash),
+        // and stamps its counter + HANDOFF_KEY_COUNTER_STEPS at [16..20]
+        // (vendor/server/src/login/data_session.cpp case 0xA2). What must be on
+        // the wire is exactly what xiloader puts there, our KEY3 untouched; the
+        // predicted seed is checked downstream in handoff.session_key_seed.
+        assert_eq!(&req_handoff[1..21], &KEY3);
         view.write_all(&next_login_packet(
             select_char_id(&select),
             ROSTER_CHAR_NAME,
@@ -1687,6 +1726,15 @@ mod tests {
             .expect("handshake");
         assert_eq!(handoff.char_id, ROSTER_CHAR_ID);
         assert_eq!(handoff.server_port, HANDOFF_SERVER_PORT);
+        // vendor/server/src/login/data_session.cpp case 0xA2: seed = MD5 of the
+        // account session hash, counter word = the adopted 0x05 key field +1,
+        // then +1 (chr_info2 reply) +1 (select request) +3 handoff steps.
+        let mut expected_seed = [0u8; 20];
+        expected_seed[..16].copy_from_slice(&ffxi_proto::md5::md5(&SESSION_HASH));
+        let word =
+            SERVER_LOBBY_KEY_ON_WIRE + 1 + 1 + 1 + crate::lobby_wire::HANDOFF_KEY_COUNTER_STEPS;
+        expected_seed[16..20].copy_from_slice(&word.to_le_bytes());
+        assert_eq!(handoff.session_key_seed, expected_seed);
 
         let select = server
             .await
@@ -1727,9 +1775,7 @@ mod tests {
     #[test]
     fn view_select_carries_the_roster_name_where_lsb_reads_it() {
         let chars = [slot(1, "Alpha"), slot(ROSTER_CHAR_ID, ROSTER_CHAR_NAME)];
-        let mut wire = LobbyWire::LandSandBoat {
-            session_hash: SESSION_HASH,
-        };
+        let mut wire = lsb_wire(SESSION_HASH);
         let packet = build_view_select_by_id(&chars, ROSTER_CHAR_ID, &mut wire).unwrap();
         assert_eq!(&packet[12..28], &SESSION_HASH);
 
@@ -1741,9 +1787,7 @@ mod tests {
     #[test]
     fn an_unknown_id_reports_the_account_roster() {
         let chars = [slot(1, "Alpha"), slot(2, "Bravo")];
-        let mut wire = LobbyWire::LandSandBoat {
-            session_hash: SESSION_HASH,
-        };
+        let mut wire = lsb_wire(SESSION_HASH);
         let err = build_view_select_by_id(&chars, 9, &mut wire)
             .unwrap_err()
             .to_string();

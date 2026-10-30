@@ -1,10 +1,3 @@
-//! A line-oriented walker for the block-style YAML LandSandBoat writes by
-//! hand under vendor/server/data: two-space block indentation, `key: scalar`,
-//! `key:` opening a nested block, `- item` sequences of scalars or maps,
-//! one-line `[a, b]` flow sequences and `#` comments. Anything outside that
-//! subset (flow maps, anchors, block scalars, quoted keys) is an error, never
-//! a guess, so a format drift fails the build instead of thinning a table.
-
 use anyhow::{bail, Context, Result};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -229,20 +222,74 @@ fn split_key(text: &str) -> Option<(String, &str)> {
     Some((key.to_string(), rest.trim()))
 }
 
+fn flow_items(inner: &str) -> Result<Vec<&str>> {
+    let mut items = Vec::new();
+    let mut brackets = Vec::new();
+    let mut quote = None;
+    let mut start = 0;
+    for (at, c) in inner.char_indices() {
+        if let Some(open) = quote {
+            if c == open {
+                quote = None;
+            }
+            continue;
+        }
+        match c {
+            '\'' | '"' => quote = Some(c),
+            '[' => brackets.push(']'),
+            '{' => brackets.push('}'),
+            ']' | '}' if brackets.pop() != Some(c) => {
+                bail!("unmatched flow delimiter in {inner:?}")
+            }
+            ',' if brackets.is_empty() => {
+                let item = inner[start..at].trim();
+                if item.is_empty() {
+                    bail!("empty flow item in {inner:?}");
+                }
+                items.push(item);
+                start = at + c.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    if quote.is_some() || !brackets.is_empty() {
+        bail!("unterminated flow value {inner:?}");
+    }
+    let last = inner[start..].trim();
+    if !last.is_empty() {
+        items.push(last);
+    }
+    Ok(items)
+}
+
 fn parse_value(value: &str) -> Result<Yaml> {
     if let Some(inner) = value.strip_prefix('[') {
         let inner = inner
             .strip_suffix(']')
             .with_context(|| format!("unterminated flow sequence {value:?}"))?;
-        let items = inner
-            .split(',')
-            .map(str::trim)
-            .filter(|item| !item.is_empty())
-            .map(|item| Ok(Yaml::Scalar(unquote(item)?.into_owned())))
-            .collect::<Result<Vec<Yaml>>>()?;
-        return Ok(Yaml::Seq(items));
+        return Ok(Yaml::Seq(
+            flow_items(inner)?
+                .into_iter()
+                .map(parse_value)
+                .collect::<Result<_>>()?,
+        ));
     }
-    if value.starts_with(['{', '&', '*', '|', '>']) {
+    if let Some(inner) = value.strip_prefix('{') {
+        let inner = inner
+            .strip_suffix('}')
+            .with_context(|| format!("unterminated flow map {value:?}"))?;
+        let mut entries = Vec::new();
+        for item in flow_items(inner)? {
+            let (key, value) = split_key(item)
+                .with_context(|| format!("expected flow map entry, found {item:?}"))?;
+            if value.is_empty() || entries.iter().any(|(existing, _)| existing == &key) {
+                bail!("empty or duplicate flow map entry {item:?}");
+            }
+            entries.push((key, parse_value(value)?));
+        }
+        return Ok(Yaml::Map(entries));
+    }
+    if value.starts_with(['&', '*', '|', '>']) {
         bail!("unsupported YAML syntax in value {value:?}");
     }
     Ok(Yaml::Scalar(unquote(value)?.into_owned()))
@@ -394,6 +441,16 @@ transport:
 ";
 
     #[test]
+    fn walks_flow_maps_in_zone_sequences() {
+        let root =
+            parse_yaml("areas:\n  - {center: [1, 2, 3], radius: 4, label: 'a, b'}\n").unwrap();
+        let area = &root.get("areas").unwrap().as_seq().unwrap()[0];
+        assert_eq!(area.list::<u32>("center").unwrap(), Some(vec![1, 2, 3]));
+        assert_eq!(area.field::<u32>("radius").unwrap(), Some(4));
+        assert_eq!(area.get("label").unwrap().as_str(), Some("a, b"));
+    }
+
+    #[test]
     fn walks_the_zone_file_shape() {
         let root = parse_yaml(ZONE_FILE).unwrap();
         assert_eq!(
@@ -493,7 +550,9 @@ transport:
 
     #[test]
     fn rejects_what_it_does_not_understand() {
-        assert!(parse_yaml("a: {b: 1}\n").is_err());
+        assert!(parse_yaml("a: {b: [1, 2}\n").is_err());
+        assert!(parse_yaml("a: {b: 1, b: 2}\n").is_err());
+        assert!(parse_yaml("a: [1,,2]\n").is_err());
         assert!(parse_yaml("a: &anchor 1\n").is_err());
         assert!(parse_yaml("a: |\n  text\n").is_err());
         assert!(parse_yaml("a:\n\tb: 1\n").is_err());

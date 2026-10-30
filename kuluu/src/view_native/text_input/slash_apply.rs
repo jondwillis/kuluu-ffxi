@@ -24,6 +24,337 @@ fn minimap_retail_desc(state: &kuluu_render::minimap::MinimapState, zone: Option
     )
 }
 
+/// The one applied Current Time outcome (retail runner law, vault main_menu.md §12): toggles the
+/// widget and prints both time lines. Shared by the menu row's TextCommand seam and typed `/clock`.
+pub(super) fn activate_current_time(
+    vana_clock: &kuluu_render::vana_time::VanaClock,
+    vana_clock_visible: &mut kuluu_render::hud::vana_clock::VanaClockVisible,
+    scene_state: &mut SceneState,
+) {
+    vana_clock_visible.0 = !vana_clock_visible.0;
+    for line in kuluu_render::hud::vana_clock::current_time_chat_lines(vana_clock) {
+        push_system_chat_line(scene_state, line);
+    }
+}
+
+/// The applied `SetVanaClock` outcome (bead kuluu-o9qt7.28): the shared primitive behind both
+/// `apply_slash_outcome`'s arm and the menu rows' seam, so typed `/clock [show|hide|toggle]`
+/// and the Current Time row land identical state and chat lines.
+pub(super) fn set_current_time(
+    setting: Option<bool>,
+    vana_clock: &kuluu_render::vana_time::VanaClock,
+    vana_clock_visible: &mut kuluu_render::hud::vana_clock::VanaClockVisible,
+    scene_state: &mut SceneState,
+) {
+    if let Some(next) = setting {
+        vana_clock_visible.0 = next;
+        for line in kuluu_render::hud::vana_clock::current_time_chat_lines(vana_clock) {
+            push_system_chat_line(scene_state, line);
+        }
+    } else {
+        activate_current_time(vana_clock, vana_clock_visible, scene_state);
+    }
+}
+
+/// The chat echo `apply_slash_outcome`'s OpenMenu arm prints for a menu kind; the menu rows'
+/// seam (bead kuluu-o9qt7.28) echoes through this same table so both surfaces read alike.
+pub(super) fn menu_open_label(kind: MenuKind) -> std::borrow::Cow<'static, str> {
+    match kind {
+        kuluu_render::MenuKind::Magic => "Magic".into(),
+        // The picker keeps the Magic caption; a filtered list echoes its school
+        // (vault main_menu.md §21 numbers).
+        kuluu_render::MenuKind::MagicGroups => "Magic".into(),
+        kuluu_render::MenuKind::MagicGroup(school) => format!("MagicList({school})").into(),
+        kuluu_render::MenuKind::Abilities => "Abilities".into(),
+        // Same pair law for the abimenu picker and its filtered list
+        // (vault main_menu.md §23).
+        kuluu_render::MenuKind::AbilitiesGroups => "Abilities".into(),
+        kuluu_render::MenuKind::AbilitiesGroup(group) => format!("AbilityList({group})").into(),
+        kuluu_render::MenuKind::Items => "Items".into(),
+        // ur/150: the bucket hub echoes `Key Items`; a bucket list echoes its
+        // own name, like MagicGroup echoes its school above.
+        kuluu_render::MenuKind::KeyItems => "Key Items".into(),
+        kuluu_render::MenuKind::KeyItemList { category } => {
+            kuluu_render::hud::menu::KEY_ITEM_CATEGORY_LABELS
+                .get(category as usize)
+                .copied()
+                .unwrap_or("Key Items")
+                .to_string()
+                .into()
+        }
+        // ur/152: Examine and the description window echo the item's own name,
+        // like a bucket list echoes its category above.
+        kuluu_render::MenuKind::KeyItemExamine { id }
+        | kuluu_render::MenuKind::KeyItemText { id } => {
+            kuluu_render::hud::menu::key_item_row_label(id).into()
+        }
+        kuluu_render::MenuKind::UsableItems => "Items (usable)".into(),
+        kuluu_render::MenuKind::Equipment => "Equipment".into(),
+        kuluu_render::MenuKind::Root => "Root".into(),
+        kuluu_render::MenuKind::Config => "Config".into(),
+        kuluu_render::MenuKind::Controls => "Controls".into(),
+        kuluu_render::MenuKind::Debug => "Debug".into(),
+        kuluu_render::MenuKind::Graphics => "Graphics".into(),
+        kuluu_render::MenuKind::GraphicsDlss => "DLSS Config".into(),
+        kuluu_render::MenuKind::Status => "Status".into(),
+
+        kuluu_render::MenuKind::Communication => "Communication".into(),
+        kuluu_render::MenuKind::EmoteList => "Emote List".into(),
+        // Echoes the retail window name (`menu    abisortw`, registry 256): no DAT title
+        // exists [V-negative] and kuluu never opens it as a focused level on its own —
+        // it rides below an EmoteList push (bead kuluu-o9qt7.34).
+        kuluu_render::MenuKind::AbilitySort { .. } => "abisortw".into(),
+        // Page-1 row 10's window (vault main_menu.md §27): retail opens `menu    link5`,
+        // which is the same surface a `/menu linkshell` style entry reaches here.
+        kuluu_render::MenuKind::Linkshell => "Link Shell".into(),
+        kuluu_render::MenuKind::SynthLauncher => "Synthesis".into(),
+        kuluu_render::MenuKind::CraftList => "Craft List".into(),
+        kuluu_render::MenuKind::RegionInfo { .. } => "Region Info".into(),
+        kuluu_render::MenuKind::MissionList => "Missions".into(),
+        kuluu_render::MenuKind::MissionDetail { log, .. } => format!("MissionLog({log})").into(),
+        // The ur/80 text drill echoes its payload like the quest01 detail does.
+        kuluu_render::MenuKind::MissionText { log, id } => {
+            format!("MissionText({log}#{id})").into()
+        }
+        // Bazaar row's stall picker (vault main_menu.md §33).
+        kuluu_render::MenuKind::BazaarStalls => "Bazaar".into(),
+        // …and the second row of that panel, which opens the comment field over the chat log.
+        kuluu_render::MenuKind::BazaarComment => "Edit Comment".into(),
+        kuluu_render::MenuKind::MacrosPalette => "Macros".into(),
+        kuluu_render::MenuKind::RetailConfig => "Config".into(),
+        // A config page window inherits the hub's caption (vault main_menu.md §47).
+        kuluu_render::MenuKind::RetailConfigPage(_) => "Config".into(),
+        // …and so does a config sub-window (vault main_menu.md §47).
+        kuluu_render::MenuKind::RetailConfigSub(_) => "Config".into(),
+        kuluu_render::MenuKind::HelpDeskPanel => "Help Desk".into(),
+        // A statcom2 companion inherits the Status caption (its retail window
+        // titles come from their own sheet, not a menu title token; vault
+        // main_menu.md §59).
+        kuluu_render::MenuKind::StatusDetail { .. } => "Status".into(),
+        // The Unity and alter ego point windows echo the Status row that opens them.
+        kind @ (kuluu_render::MenuKind::UnityMenu
+        | kuluu_render::MenuKind::UnityChat
+        | kuluu_render::MenuKind::UnityRankingChooser
+        | kuluu_render::MenuKind::UnityRanking { .. }
+        | kuluu_render::MenuKind::UnityLeaders
+        | kuluu_render::MenuKind::AlterEgoCategories
+        | kuluu_render::MenuKind::AlterEgoUpgrades { .. }
+        | kuluu_render::MenuKind::AlterEgoConfirm { .. }
+        | kuluu_render::MenuKind::Merit(_)
+        | kuluu_render::MenuKind::Arrange(_)) => kuluu_render::hud::menu::menu_title(kind).into(),
+        // commenu Friend List widget (vault main_menu.md §37).
+        kuluu_render::MenuKind::FriendList => "Friend List".into(),
+        // Equipment-row variants (vault main_menu.md §39): pupequip
+        // keeps the parent caption; mp_mncst is catalog-titled.
+        kuluu_render::MenuKind::AutomatonEquip => "Equipment".into(),
+        kuluu_render::MenuKind::MpCustomize => "Customization".into(),
+        // The Map-row myroom variant inherits its parent caption (the
+        // `myro` DAT record has no title token; vault main_menu.md §40).
+        kuluu_render::MenuKind::HomeView => "Map".into(),
+        // `mogcont`'s own DAT title token is the View House row caption (catalog 107; §32), so the
+        // box list wears that string as well.
+        kuluu_render::MenuKind::MogContainers => kuluu_render::hud::menu::ROOT_VIEW_HOUSE.into(),
+        // …and the roomlist pair likewise inherits the Remodel row's caption
+        // (`roomlist` carries no title token — widget captions are −1 [V-neg]; bead
+        // kuluu-o9qt7.13.5, vault main_menu.md §59 addendum 20/21).
+        kuluu_render::MenuKind::RoomList | kuluu_render::MenuKind::RoomListConfirm { .. } => {
+            "Remodel".into()
+        }
+        // The Change Jobs drill family echoes its DAT caption (window 'jobchang',
+        // widgets catalog-titled 65/66; vault main_menu.md §53).
+        kuluu_render::MenuKind::JobChange | kuluu_render::MenuKind::JobPick { .. } => {
+            "Change Jobs".into()
+        }
+        // mcrselec/mcres20 and the line editor likewise inherit `Macros`
+        // (§41 title law).
+        kuluu_render::MenuKind::MacroSelect
+        | kuluu_render::MenuKind::MacroEdit { .. }
+        | kuluu_render::MenuKind::MacroEditor { .. }
+        | kuluu_render::MenuKind::MacroResult => "Macros".into(),
+        // …while the book options window echoes its own band word, and a pallet names its book.
+        kuluu_render::MenuKind::MacroBookOptions { .. }
+        | kuluu_render::MenuKind::EquipSetOptions { .. } => "Options".into(),
+        kuluu_render::MenuKind::MacroPallet { book } => {
+            format!("Macro Set Book{:02} (#{})", book + 1, book + 1).into()
+        }
+        // The /quest seam (vault main_menu.md §31; ur/87 hub first).
+        kuluu_render::MenuKind::QuestMenu | kuluu_render::MenuKind::QuestList { .. } => {
+            "Quests".into()
+        }
+        kuluu_render::MenuKind::QuestDetail { log, id } => format!("QuestLog({log},{id})").into(),
+
+        kuluu_render::MenuKind::ItemAction { item_no, .. } => {
+            format!("ItemAction({item_no})").into()
+        }
+        kuluu_render::MenuKind::ItemDropConfirm { item_no, .. } => {
+            format!("ItemDropConfirm({item_no})").into()
+        }
+        kuluu_render::MenuKind::EquipSlot(slot) => format!("EquipSlot({slot})").into(),
+        kuluu_render::MenuKind::Map => "Map".into(),
+        // One surface for the prtyN family (vault main_menu.md section 24).
+        kuluu_render::MenuKind::Party => "Party".into(),
+        // One surface for the trade/gift pair and its bag picker
+        // (vault main_menu.md section 25).
+        kuluu_render::MenuKind::Trade => "Trade".into(),
+        kuluu_render::MenuKind::TradePick { trade_index } => {
+            format!("TradePick({trade_index})").into()
+        }
+        // One surface for the searchma/scresult family
+        // (vault main_menu.md section 26).
+        kuluu_render::MenuKind::Search => "Search".into(),
+        kuluu_render::MenuKind::PowerPrompt { shut_down } => if shut_down {
+            "ShutDownPrompt"
+        } else {
+            "LogOutPrompt"
+        }
+        .into(),
+        // The Config family's reset dialog echoes the family caption (its retail body
+        // text is a DAT string, catalog table 0xb id 0x8F; vault main_menu.md §59
+        // addenda 7–8).
+        kuluu_render::MenuKind::KeyAssignResetPrompt => "Config".into(),
+    }
+}
+
+/// Why `/layout` would be refused right now: the session's own refusal chain over the snapshot's
+/// view of the house (.agents/skills/retail-observe/references/2026-10-15-mog-house-arrange.md B1).
+pub(super) fn layout_refusal(
+    snap: &kuluu_snapshot::SceneSnapshot,
+) -> Option<kuluu_session::myroom_layout::Refusal> {
+    use kuluu_session::myroom_layout as layout;
+    let house = snap.myroom.map(|room| layout::HouseView {
+        map_number: room.model,
+        sub_map: room.sub_map,
+        door_open: room.door_open,
+    });
+    let gates = layout::ArrangeGates::for_house(
+        snap.myroom_mode,
+        house,
+        ffxi_proto::decode::ServerLoginMyroom::login_in_mog_house(snap.login_state),
+    );
+    layout::plan_arrange(
+        layout::ArrangeRequest::from_slash(layout::MODE_LAYOUT),
+        &gates,
+        None,
+    )
+    .err()
+}
+
+/// `/layout`, typed or run by the myroom Layout row, refuses on the client: it prints the client
+/// message or plays the buzzer and nothing goes to the session (which runs the same chain before the
+/// wire). Returns whether `command` was a refused `/layout`.
+pub(super) fn layout_refused(
+    command: &AgentCommand,
+    scene_state: &mut SceneState,
+    dynamic: &mut kuluu_render::hud::menu::DynamicMenu,
+) -> bool {
+    use kuluu_session::myroom_layout::{RefusalSignal, MODE_LAYOUT};
+    if !matches!(command, AgentCommand::MyroomMode { mode } if *mode == MODE_LAYOUT) {
+        return false;
+    }
+    let Some(refusal) = layout_refusal(&scene_state.snapshot) else {
+        return false;
+    };
+    match refusal.signal() {
+        RefusalSignal::Buzzer => dynamic
+            .ui_sounds
+            .push(kuluu_render::hud::menu::UiSound::Buzzer),
+        RefusalSignal::Message(id) => {
+            let line = dynamic.arrange.texts.client_message(id);
+            push_system_chat_line(scene_state, line);
+        }
+        RefusalSignal::Silent => {}
+    }
+    true
+}
+
+/// The single text-command runner for the Commands-menu rows (bead kuluu-o9qt7.28): a row's
+/// literal goes through `parse_slash` — the one classifier/alias layer typed input uses
+/// (FFXiMain.dll retail-2026-09 RVA 0x80DC0, vault main_menu.md §12) — and the outcome is
+/// applied through this function's subset of `apply_slash_outcome`'s arms. The parse arguments
+/// all ride the snapshot; the fishing gate comes from `gate_from_snapshot`, so keyboard rows,
+/// mouse clicks and typed input resolve identically without caller-side plumbing.
+///
+/// The subset covers every outcome the three row literals can produce (Current Time →
+/// `SetVanaClock`, Key Items/Quests → `OpenMenu`), plus `Command(s)` pass-through and
+/// `SystemMessage`; the myroom Layout row's `/layout` refuses here as typed ([`layout_refused`]).
+/// Two typed-only apply effects are intentionally absent here: the heal/rest
+/// stance mirror and the enhanced shutdown-counter writer, both driven by `/logout`-family rows
+/// that answer through PowerPrompt instead of this seam.
+pub(super) fn apply_menu_text_command(
+    cmd: &str,
+    command_surface: &crate::view_native::command_surface::CommandSurface,
+    stack: &mut MenuStack,
+    vana_clock: &kuluu_render::vana_time::VanaClock,
+    vana_clock_visible: &mut kuluu_render::hud::vana_clock::VanaClockVisible,
+    scene_state: &mut SceneState,
+    cmd_tx: &Sender<AgentCommand>,
+    self_pos: kuluu_snapshot::Vec3,
+    target_id: Option<u32>,
+    dynamic: &mut kuluu_render::hud::menu::DynamicMenu,
+) {
+    let battle_target = match scene_state.snapshot.current_goal {
+        Some(kuluu_snapshot::ReactorGoal::Engaged { target_id, .. }) => Some(target_id),
+        _ => None,
+    };
+    let outcome = parse_slash(
+        cmd,
+        command_surface,
+        &scene_state.snapshot.entities,
+        self_pos,
+        target_id,
+        scene_state.snapshot.zone_id,
+        scene_state.snapshot.self_char_id,
+        &scene_state.snapshot.party,
+        kuluu_render::fishing_spot::gate_from_snapshot(&scene_state.snapshot),
+        battle_target,
+        scene_state.snapshot.self_pet_targid,
+    );
+    match outcome {
+        SlashOutcome::SetVanaClock(setting) => {
+            set_current_time(setting, vana_clock, vana_clock_visible, scene_state);
+        }
+        SlashOutcome::OpenMenu(kind) => {
+            let label = menu_open_label(kind);
+            push_system_chat_line(scene_state, format!("[menu] opened {label}"));
+            stack.push(kind);
+        }
+        SlashOutcome::SystemMessage(text) => {
+            for line in text.split('\n') {
+                push_system_chat_line(scene_state, line.to_string());
+            }
+        }
+        SlashOutcome::Command(command) => {
+            if layout_refused(&command, scene_state, dynamic) {
+                return;
+            }
+            if let Some(toast) = reqlogout_ack_text(&command) {
+                push_system_chat_line(scene_state, toast.into());
+            }
+            if let Err(e) = cmd_tx.try_send(command) {
+                push_system_chat_line(scene_state, format!("command dropped (channel issue): {e}"));
+            }
+        }
+        SlashOutcome::Commands(commands) => {
+            for command in commands {
+                if let Some(toast) = reqlogout_ack_text(&command) {
+                    push_system_chat_line(scene_state, toast.into());
+                }
+                if let Err(e) = cmd_tx.try_send(command) {
+                    push_system_chat_line(
+                        scene_state,
+                        format!("command dropped (channel issue): {e}"),
+                    );
+                }
+            }
+        }
+        _ => {
+            // No row literal reaches these today; keep the old shim's refusal line for any
+            // future row whose command needs an apply effect this seam does not own.
+            push_system_chat_line(scene_state, format!("[menu] {cmd} — not implemented"));
+        }
+    }
+}
+
 /// Apply a parsed slash-command outcome. Disengage (/disengage, /cancel)
 /// releases the camera lock like the H toggle; the lock is a client-side
 /// latch the wire cancel does not touch. Quit sends ReqLogout and Disconnect
@@ -44,12 +375,16 @@ pub(super) fn apply_slash_outcome(
     #[cfg(unix)] agent_paused: Option<&crate::view_native::AgentPaused>,
     session_event_tx: Option<&crate::view_native::SessionEventTx>,
     slash_writers: &mut SlashWriters,
+    dynamic_menu: &mut kuluu_render::hud::menu::DynamicMenu,
     draw_distance: &mut kuluu_render::dat_mzb::DrawDistance,
 ) {
     #[cfg(not(unix))]
     let _ = session_event_tx;
     match outcome {
         SlashOutcome::Command(cmd) => {
+            if layout_refused(&cmd, scene_state, dynamic_menu) {
+                return;
+            }
             if let Some(toast) = reqlogout_ack_text(&cmd) {
                 push_system_chat_line(scene_state, toast.into());
             }
@@ -108,6 +443,41 @@ pub(super) fn apply_slash_outcome(
             scene_state.snapshot.weather = Some(w);
             push_system_chat_line(scene_state, format!("weather override: {w:?}"));
         }
+        // The client-side config-option store write (`/furcc`, `/layoutctrl`). Retail's
+        // setters (.text FFXiMain.dll retail-2026-09 `.text 0x1938F0` for key 6, `.text
+        // 0x193830` for key 0xC1) are plain stores — no packet, no cache flush — and each
+        // setter arm immediately echoes through the chat emitter (`.text 0x129DE0`) with a
+        // GetText table-9 id; kuluu renders that id from DAT via `client_message`.
+        SlashOutcome::ConfigSet {
+            store_id,
+            value,
+            message_id,
+        } => {
+            dynamic_menu.config_option_values.insert(store_id, value);
+            let line = dynamic_menu.client_message(slash_writers.dat_root.0.as_deref(), message_id);
+            push_system_chat_line(scene_state, line);
+        }
+        // …and the query arm both handlers fall through to for a bare or unrecognized
+        // word (store getters `.text 0x193890`/`.text 0x193850`; `test al,al` picks the
+        // non-zero/zero message — bead kuluu-o9qt7.41). Absent keys read as zero.
+        SlashOutcome::ConfigQuery {
+            store_id,
+            nonzero_message_id,
+            zero_message_id,
+            write_back_normalized,
+        } => {
+            // `/statusparty`'s merge point (.text FFXiMain.dll retail-2026-09 0x7EB1C) re-runs
+            // the setter with the bool-normalized value; `config_query` carries that law plus
+            // the plain-read getters for furcc/layoutctrl.
+            let current = dynamic_menu.config_query(store_id, write_back_normalized);
+            let message_id = if current != 0 {
+                nonzero_message_id
+            } else {
+                zero_message_id
+            };
+            let line = dynamic_menu.client_message(slash_writers.dat_root.0.as_deref(), message_id);
+            push_system_chat_line(scene_state, line);
+        }
         SlashOutcome::SetSitStance(toggle) => {
             use crate::view_native::slash_commands::SitToggle;
             use kuluu_render::combat_stance::RestKind;
@@ -161,6 +531,7 @@ pub(super) fn apply_slash_outcome(
                 slot: kuluu_render::dat_mzb::ZONE_SLOT_MAIN,
                 sub_area_link: 0,
                 voyage_backdrop: false,
+                static_model: None,
             });
             let label = match entity_id {
                 Some(id) => format!("/load_mmb_on {id} {file_id} {chunk_idx}: spawning…"),
@@ -323,6 +694,7 @@ pub(super) fn apply_slash_outcome(
         SlashOutcome::SetDevHud(setting) => {
             let next = setting.unwrap_or(!slash_writers.hud_verbosity.dev_hud);
             slash_writers.hud_verbosity.dev_hud = next;
+            slash_writers.hud_panels.perf = next;
             push_system_chat_line(
                 scene_state,
                 format!("/devhud: {}", if next { "on" } else { "off" }),
@@ -357,11 +729,13 @@ pub(super) fn apply_slash_outcome(
             );
         }
         SlashOutcome::SetVanaClock(setting) => {
-            let next = setting.unwrap_or(!slash_writers.vana_clock_visible.0);
-            slash_writers.vana_clock_visible.0 = next;
-            push_system_chat_line(
+            // The single applied clock outcome (bead kuluu-o9qt7.28): the widget flips and both
+            // retail time lines print, whether typed or driven by the Current Time menu row.
+            set_current_time(
+                setting,
+                &slash_writers.vana_clock,
+                &mut slash_writers.vana_clock_visible,
                 scene_state,
-                format!("/clock: {}", if next { "shown" } else { "hidden" }),
             );
         }
         SlashOutcome::SetRenderScale(setting) => {
@@ -779,33 +1153,7 @@ pub(super) fn apply_slash_outcome(
             }
         }
         SlashOutcome::OpenMenu(kind) => {
-            let label: std::borrow::Cow<'static, str> = match kind {
-                kuluu_render::MenuKind::Magic => "Magic".into(),
-                kuluu_render::MenuKind::Abilities => "Abilities".into(),
-                kuluu_render::MenuKind::Items => "Items".into(),
-                kuluu_render::MenuKind::KeyItems => "Key Items".into(),
-                kuluu_render::MenuKind::UsableItems => "Items (usable)".into(),
-                kuluu_render::MenuKind::Equipment => "Equipment".into(),
-                kuluu_render::MenuKind::Root => "Root".into(),
-                kuluu_render::MenuKind::Config => "Config".into(),
-                kuluu_render::MenuKind::Controls => "Controls".into(),
-                kuluu_render::MenuKind::Debug => "Debug".into(),
-                kuluu_render::MenuKind::Graphics => "Graphics".into(),
-                kuluu_render::MenuKind::GraphicsDlss => "DLSS Config".into(),
-                kuluu_render::MenuKind::Status => "Status".into(),
-
-                kuluu_render::MenuKind::Communication => "Communication".into(),
-                kuluu_render::MenuKind::EmoteList => "Emote List".into(),
-
-                kuluu_render::MenuKind::ItemAction { item_no, .. } => {
-                    format!("ItemAction({item_no})").into()
-                }
-                kuluu_render::MenuKind::ItemDropConfirm { item_no, .. } => {
-                    format!("ItemDropConfirm({item_no})").into()
-                }
-                kuluu_render::MenuKind::EquipSlot(slot) => format!("EquipSlot({slot})").into(),
-                kuluu_render::MenuKind::Map => "Map".into(),
-            };
+            let label = menu_open_label(kind);
             push_system_chat_line(scene_state, format!("[menu] opened {label}"));
         }
         SlashOutcome::OpenSubTarget { .. } => {
@@ -1246,5 +1594,91 @@ mod reqlogout_ack_tests {
             text: "hi".into(),
         };
         assert!(reqlogout_ack_text(&other).is_none());
+    }
+}
+
+#[cfg(test)]
+mod layout_refusal_tests {
+    use super::*;
+    use ffxi_proto::decode::ServerLoginMyroom as Login;
+    use kuluu_render::hud::menu::{DynamicMenu, UiSound};
+    use kuluu_session::myroom_layout::{
+        Refusal, MESSAGE_NOT_ARRANGEABLE, MODE_GARDEN, MODE_LAYOUT, MODE_NORMAL,
+    };
+
+    fn upstairs(door_open: bool) -> SceneState {
+        let mut scene = SceneState::default();
+        scene.snapshot.login_state = Login::LOGIN_STATE_POLEXIT_MYROOM;
+        scene.snapshot.myroom = Some(kuluu_snapshot::MyRoom {
+            model: 0,
+            sub_map: Login::SUB_MAP_2F,
+            door_open,
+        });
+        scene
+    }
+
+    fn layout() -> AgentCommand {
+        AgentCommand::MyroomMode { mode: MODE_LAYOUT }
+    }
+
+    #[test]
+    fn layout_goes_through_upstairs_with_the_door_shut() {
+        let mut scene = upstairs(false);
+        let mut dynamic = DynamicMenu::default();
+        assert_eq!(layout_refusal(&scene.snapshot), None);
+        assert!(!layout_refused(&layout(), &mut scene, &mut dynamic));
+        assert!(scene.local_toasts.is_empty() && dynamic.ui_sounds.is_empty());
+    }
+
+    #[test]
+    fn an_open_door_or_layout_mode_already_on_buzzes() {
+        let mut scene = upstairs(true);
+        let mut dynamic = DynamicMenu::default();
+        assert_eq!(layout_refusal(&scene.snapshot), Some(Refusal::DoorOpen));
+        assert!(layout_refused(&layout(), &mut scene, &mut dynamic));
+        assert_eq!(dynamic.ui_sounds, vec![UiSound::Buzzer]);
+        assert!(scene.local_toasts.is_empty());
+
+        let mut scene = upstairs(false);
+        scene.snapshot.myroom_mode = MODE_LAYOUT;
+        assert_eq!(
+            layout_refusal(&scene.snapshot),
+            Some(Refusal::AlreadyArranging)
+        );
+    }
+
+    #[test]
+    fn outside_a_house_layout_prints_the_not_arrangeable_message() {
+        let mut scene = SceneState::default();
+        let mut dynamic = DynamicMenu::default();
+        assert_eq!(
+            layout_refusal(&scene.snapshot),
+            Some(Refusal::NotArrangeable)
+        );
+        assert!(layout_refused(&layout(), &mut scene, &mut dynamic));
+        let printed: Vec<&str> = scene
+            .local_toasts
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect();
+        assert_eq!(
+            printed,
+            vec![dynamic
+                .arrange
+                .texts
+                .client_message(MESSAGE_NOT_ARRANGEABLE)]
+        );
+        assert!(dynamic.ui_sounds.is_empty());
+    }
+
+    #[test]
+    fn only_entering_layout_mode_runs_the_client_refusals() {
+        let mut scene = SceneState::default();
+        let mut dynamic = DynamicMenu::default();
+        for mode in [MODE_NORMAL, MODE_GARDEN] {
+            let command = AgentCommand::MyroomMode { mode };
+            assert!(!layout_refused(&command, &mut scene, &mut dynamic));
+        }
+        assert!(scene.local_toasts.is_empty());
     }
 }

@@ -22,13 +22,7 @@ name = "kuluu"
 path = "src/main.rs"
 
 [[example]]
-name = "room-no-install"
-required-features = ["native-window", "debug-animation_room"]
-
-[[example]]
-# Headless replay of the single-authority walker over real MZB geometry
-# (plan §4). Needs the viewer feature: the walker lives in `view_native`.
-name = "zz-field-walk"
+name = "dev-diagnostics-capture"
 required-features = ["native-window"]
 
 [features]
@@ -47,6 +41,7 @@ default = ["native-window"]
 # main thread on macOS, so main.rs handles the dispatch specially when
 # this feature is active.
 native-window = [
+    "dep:cpu-time",
     "dep:winit",
     "dep:bevy",
     "dep:bevy_framepace",
@@ -87,12 +82,6 @@ enhanced-shutdown-counter = ["kuluu-render?/enhanced-shutdown-counter"]
 enhanced-engage-move-lock-off = ["kuluu-render?/enhanced-engage-move-lock-off"]
 # Enhanced (non-retail): the player ignores knockback travel. See kuluu-render.
 enhanced-ignore-knockback-self = ["kuluu-render?/enhanced-ignore-knockback-self"]
-# Debug pre-server animation room: an AnimationTest button in the launcher titlebar
-# loads a worm+Hume scene and fires dam0 hit cases through the production VFX pipeline
-# with on-screen + stderr logging, before any server login. Kuluu-local (no render side),
-# so no sub-features; opt-in with an explicit `--features debug-animation_room`, which
-# the room-no-install example requires. Vanilla builds omit it.
-debug-animation_room = []
 # Enhanced (non-retail) `//targetname` slash command: target the nearest
 # NPC/mob/pet by exact name. Kuluu-local (no render side), so no sub-features;
 # opt-in with an explicit `--features enhanced-targetname`. Vanilla builds omit it.
@@ -144,6 +133,7 @@ ffxi-dat = { path = "../ffxi-dat" }
 ffxi-install = { path = "../ffxi-install" }
 
 anyhow.workspace = true
+cpu-time = { version = "1.0", optional = true }
 clap.workspace = true
 dirs = "7"
 # Already linked transitively via ffxi-nav-recast with the identical
@@ -183,12 +173,11 @@ bevy = { workspace = true, optional = true, features = [
     # primitives + `ValueChange` event), but we list both so a future split
     # doesn't silently lose widget support.
     "bevy_feathers",
+    "bevy_scene",
+    "sysinfo_plugin",
     "bevy_ui_widgets",
 ] }
-# Frame-rate limiter for the native window. The 0.21.x req is satisfied by
-# the workspace [patch.crates-io] git pin (upstream's Bevy 0.19 migration PR,
-# which keeps the 0.21.0 crate version); see kuluu-u11r.
-# `default-features = false` strips the debug overlay we don't need.
+# The workspace patch in vendor/bevy_framepace supports Bevy 0.20.
 bevy_framepace = { version = "0.22", optional = true, default-features = false }
 # System clipboard. Used by `//copy` to push recent system-toast lines to
 # the OS clipboard. Optional + gated on `native-window` because the
@@ -203,7 +192,7 @@ arboard = { version = "3", optional = true, default-features = false }
 # Cocoa / Win32 dialogs. `tokio` satisfies the portal backend's
 # async-runtime requirement; the launcher calls the *blocking* API from
 # the winit main thread (never inside a tokio runtime), so no nesting.
-rfd = { version = "0.15", optional = true, default-features = false, features = [
+rfd = { version = "0.16", optional = true, default-features = false, features = [
     "xdg-portal",
     "tokio",
 ] }

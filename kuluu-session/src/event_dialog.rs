@@ -644,6 +644,14 @@ impl DialogSession {
             .as_ref()
             .map_or((0, 0), |r| (r.current_opcode(), r.exec_pointer()));
         let line = cutscene_error_line(active.event_id, zone, op, ep, reason);
+        let pending_holds: Vec<String> = self
+            .pending_motion_holds
+            .iter()
+            .map(|((actor, key), (_, issues, armed, deadline))| {
+                let (age, dl) = (armed.elapsed().as_secs_f64(), deadline.as_secs_f64());
+                format!("{actor:?}/{key:?} age={age:.2}s dl={dl:.2}s issues={issues}")
+            })
+            .collect();
         tracing::error!(
             event_id = active.event_id,
             zone,
@@ -651,6 +659,9 @@ impl DialogSession {
             ep,
             reason = reason.as_str(),
             unique_no = format!("0x{:08X}", active.unique_no),
+            park = ?self.runner.as_ref().map(|r| r.park()),
+            pending_holds = %if pending_holds.is_empty() { "none".to_string() } else { pending_holds.join(" | ") },
+            scene_actions = self.scene_actions.len(),
             "event stalled; cancelling with an error in chat"
         );
         let mut advance = self.drive(|runner, strings| {
@@ -753,6 +764,31 @@ impl DialogSession {
     /// caller can match on the variant without borrowing the runner.
     pub fn pending_tag(&self) -> Option<PendingTag> {
         self.runner.as_ref().and_then(|r| r.pending_tag().cloned())
+    }
+
+    pub(crate) fn trace_step(&self, advance: &Advance) {
+        let (Some(runner), Some(active)) = (self.runner.as_ref(), self.active.as_ref()) else {
+            return;
+        };
+        let outcome = match advance {
+            Advance::Frame(_) => "frame",
+            Advance::Ended { .. } => "ended",
+            Advance::Waiting => "waiting",
+            Advance::AwaitServerAck(_) => "server_ack",
+        };
+        tracing::trace!(
+            target: "event_trace",
+            unique_no = active.unique_no,
+            act_index = active.act_index,
+            event_id = active.event_id,
+            outcome,
+            park = ?runner.park(),
+            exec_pointer = runner.exec_pointer(),
+            pending_tag = ?runner.pending_tag(),
+            progress = runner.progress_stamp(),
+            pending_motion_holds = ?self.pending_motion_holds,
+            "prepared event step"
+        );
     }
 
     /// True exactly once per up→down transition of the displayed frame: call it
@@ -935,6 +971,13 @@ impl DialogSession {
     /// release the VM's hold when the last one lands. No-op when nothing is
     /// pending for the pair (stray report, event already ended).
     pub fn motion_done(&mut self, actor: CutsceneActor, key: FourCc) {
+        tracing::trace!(
+            target: "event_trace",
+            ?actor,
+            ?key,
+            pending = self.pending_motion_holds.contains_key(&(actor, key)),
+            "renderer motion completion"
+        );
         let Some(entry) = self.pending_motion_holds.get_mut(&(actor, key)) else {
             return;
         };
@@ -1095,21 +1138,46 @@ pub enum ResolvedCue {
     Scene(CutsceneCue),
     /// 0x5D rides the existing [`AgentEvent::MusicVolumeChanged`] instead of
     /// the cue stream.
-    MusicVolume { volume: u8, fade_frames: u16 },
+    MusicVolume {
+        volume: u8,
+        fade_frames: u16,
+    },
     /// 0x5C rides the existing [`AgentEvent::MusicChanged`] (the song) and
     /// [`AgentEvent::MusicVolumeChanged`] (its start volume) on the named BGM
     /// slot instead of the cue stream (research/XiEvents/OpCodes/0x005C.md).
-    MusicSong { slot: u8, track: u16, volume: u8 },
-
-    SoundVolume {
-        mask: u8,
+    MusicSong {
+        slot: u8,
+        track: u16,
         volume: u8,
-        fade_frames: u16,
+    },
+
+    /// 0x69 SETSOUNDVOLUME / 0x6A CHANGESOUNDVOLUME ride their own
+    /// [`AgentEvent`]s: retail drives the selected mixer channels of its sound
+    /// engine (mask bits) to full or silence at once, or eases them to a
+    /// per-mille target — an event-scoped scale on the client's buses, not a
+    /// BGM slot volume (`.agents/skills/retail-observe/references/
+    /// 2026-10-28-event-opcode-no-skip-pass.md`).
+    SoundVolumeSet {
+        mask: u8,
+        enabled: bool,
+    },
+    SoundVolumeChange {
+        mask: u8,
+        volume_thousandths: i32,
     },
     /// 0xC8/0x8B/0x8A ride their own map AgentEvents: the Map screen is client
     /// UI state, not scene state.
     /// research/XiEvents/OpCodes/0x00C8.md
     Map(MapOp),
+    /// 0x92/0x94 flag-word bits and 0x81 visual-half byte ride the publish-only
+    /// [`AgentEvent::ActorRenderFlagChanged`]: no source names these bits' visual
+    /// role, so nothing applies them
+    /// (`.agents/skills/retail-observe/references/2026-10-28-event-opcode-no-skip-pass.md`).
+    ActorRenderFlag {
+        actor: CutsceneActor,
+        bit: u32,
+        value: bool,
+    },
     /// 0x6E/0x63 ride the existing [`AgentEvent::EntityEmoted`] (the same event
     /// a server MOTIONMES sends): the renderer's emote dispatcher already plays
     /// the DAT routine, so no new wire shape is needed
@@ -1134,6 +1202,12 @@ pub enum MapOp {
         y_milli: i32,
         label: String,
     },
+    /// 0x8D OPEN_MAP_PROPS: the prop-label layer state of a zone's map window;
+    /// both raw work operands (kuluu has no label layer to show them on yet).
+    Props { select: i32, value: i32 },
+    /// 0x34/0x35 MAPLOAD / MAPLOAD_KEEP, third pass: tear the window's data
+    /// down and re-open it for `map_id`.
+    Reload { map_id: u16 },
     /// Close the Map screen.
     Close,
 }
@@ -1300,15 +1374,16 @@ pub fn resolve_cue(cue: EventCue, event_entity: u32, zone: u16, player_id: u32) 
                 volume,
             }
         }
-        EventCue::SoundVolume {
+        EventCue::SoundVolumeSet { mask, enabled } => {
+            return ResolvedCue::SoundVolumeSet { mask, enabled }
+        }
+        EventCue::SoundVolumeChange {
             mask,
-            volume,
-            fade_frames,
+            volume_thousandths,
         } => {
-            return ResolvedCue::SoundVolume {
+            return ResolvedCue::SoundVolumeChange {
                 mask,
-                volume,
-                fade_frames,
+                volume_thousandths,
             }
         }
         EventCue::MapOpen { map_id, tutorial } => {
@@ -1338,6 +1413,29 @@ pub fn resolve_cue(cue: EventCue, event_entity: u32, zone: u16, player_id: u32) 
             });
         }
         EventCue::MapClose => return ResolvedCue::Map(MapOp::Close),
+        // 0x8D passes both word operands to retail's shared map-window helper
+        // as (select, value) with the mode bit fixed; kuluu stores the pair.
+        EventCue::MapPropsState { select, value } => {
+            return ResolvedCue::Map(MapOp::Props { select, value })
+        }
+        // 0x34/0x35 publish their reload on the third pass of the VM's held
+        // sequence; `map_id` is the work-named window id.
+        EventCue::MapReload { map_id } => {
+            return ResolvedCue::Map(MapOp::Reload {
+                map_id: map_id as u16,
+            })
+        }
+        EventCue::ActorRenderFlag {
+            actor: target,
+            bit,
+            value,
+        } => {
+            return ResolvedCue::ActorRenderFlag {
+                actor: actor(target),
+                bit,
+                value,
+            }
+        }
         EventCue::Emote {
             actor,
             emote_id,
@@ -1467,8 +1565,19 @@ impl CutsceneScope {
                 });
                 let _ = event_tx.send(AgentEvent::MusicVolumeChanged { slot, volume });
             }
-            ResolvedCue::SoundVolume { .. } => {
-                tracing::warn!("unsupported event sound-volume cue ignored");
+            // The two channel-volume ops cross as their own AgentEvents so the
+            // renderer's buses can scale them for the length of the cutscene.
+            ResolvedCue::SoundVolumeSet { mask, enabled } => {
+                let _ = event_tx.send(AgentEvent::EventSoundChannelsSet { mask, enabled });
+            }
+            ResolvedCue::SoundVolumeChange {
+                mask,
+                volume_thousandths,
+            } => {
+                let _ = event_tx.send(AgentEvent::EventSoundChannelsChange {
+                    mask,
+                    volume_thousandths,
+                });
             }
             ResolvedCue::Map(op) => {
                 let ev = match op {
@@ -1484,9 +1593,22 @@ impl CutsceneScope {
                         y_milli,
                         label,
                     },
+                    MapOp::Props { select, value } => {
+                        AgentEvent::EventMapPropsState { select, value }
+                    }
+                    MapOp::Reload { map_id } => AgentEvent::MapReloadRequested { map_id },
                     MapOp::Close => AgentEvent::MapClosed,
                 };
                 let _ = event_tx.send(ev);
+            }
+            ResolvedCue::ActorRenderFlag { actor, bit, value } => {
+                tracing::debug!(
+                    ?actor,
+                    bit,
+                    value,
+                    "event script wrote an actor render flag"
+                );
+                let _ = event_tx.send(AgentEvent::ActorRenderFlagChanged { actor, bit, value });
             }
             ResolvedCue::Emote {
                 actor_id,
@@ -3849,7 +3971,7 @@ pub(crate) mod tests {
 
     #[test]
     fn substitutes_key_item_and_item_markers_with_scraped_names() {
-        // Key item 1 = Zeruhn Report (vendor/server/scripts/enum/key_item.lua),
+        // Key item 1 = Zeruhn Report (vendor/server/data/enums/key_item.yaml),
         // item 4509 = Flask of Distilled Water (vendor/server/sql/item_basic.sql).
         let text = "Obtained key item: {KeyItem:0}. Also {Item:1}.".to_string();
         assert_eq!(
@@ -4029,19 +4151,138 @@ pub(crate) mod tests {
         );
     }
 
+    /// 0x69/0x6A cross as their own [`AgentEvent`]s and touch no music-slot
+    /// volume on the way (`.agents/skills/retail-observe/references/
+    /// 2026-10-28-event-opcode-no-skip-pass.md`).
     #[test]
-    fn unsupported_sound_volume_does_not_apply_partial_music_changes() {
+    fn the_channel_volume_ops_cross_as_their_own_agent_events() {
         let (tx, mut rx) = broadcast::channel(16);
         let mut scope = CutsceneScope::default();
         scope.push(
-            ResolvedCue::SoundVolume {
+            ResolvedCue::SoundVolumeSet {
                 mask: ffxi_event::SOUND_TYPE_MASTER,
-                volume: 0,
-                fade_frames: 60,
+                enabled: false,
             },
             &tx,
         );
-        assert!(drain(&mut rx).is_empty());
+        scope.push(
+            ResolvedCue::SoundVolumeChange {
+                mask: ffxi_event::SOUND_TYPE_SYSTEM,
+                volume_thousandths: 500,
+            },
+            &tx,
+        );
+
+        let events = drain(&mut rx);
+        assert!(
+            matches!(
+                events.as_slice(),
+                [AgentEvent::EventSoundChannelsSet { mask, enabled },
+                 AgentEvent::EventSoundChannelsChange { mask: mask2, volume_thousandths }]
+                    if *mask == ffxi_event::SOUND_TYPE_MASTER
+                        && !enabled
+                        && *mask2 == ffxi_event::SOUND_TYPE_SYSTEM
+                        && *volume_thousandths == 500
+            ),
+            "{events:?}"
+        );
+    }
+
+    /// 0x8D carries both raw work operands to the map host; nothing else moves.
+    #[test]
+    fn the_prop_label_state_crosses_to_the_map_host() {
+        let cue = resolve_cue(
+            EventCue::MapPropsState {
+                select: 2,
+                value: 1,
+            },
+            0,
+            1,
+            0,
+        );
+        assert_eq!(
+            cue,
+            ResolvedCue::Map(MapOp::Props {
+                select: 2,
+                value: 1
+            })
+        );
+
+        let (tx, mut rx) = broadcast::channel(8);
+        let mut scope = CutsceneScope::default();
+        scope.push(cue, &tx);
+        let events = drain(&mut rx);
+        assert!(
+            matches!(
+                events.as_slice(),
+                [AgentEvent::EventMapPropsState {
+                    select: 2,
+                    value: 1
+                }]
+            ),
+            "{events:?}"
+        );
+    }
+
+    /// The reload the VM publishes on its third pass names its window id.
+    #[test]
+    fn the_mapload_reload_carries_the_work_named_window_id() {
+        let cue = resolve_cue(EventCue::MapReload { map_id: 42 }, 0, 1, 0);
+        assert_eq!(cue, ResolvedCue::Map(MapOp::Reload { map_id: 42 }));
+
+        let (tx, mut rx) = broadcast::channel(8);
+        let mut scope = CutsceneScope::default();
+        scope.push(cue, &tx);
+        let events = drain(&mut rx);
+        assert!(
+            matches!(
+                events.as_slice(),
+                [AgentEvent::MapReloadRequested { map_id: 42 }]
+            ),
+            "{events:?}"
+        );
+    }
+
+    /// The three render-flag ops cross resolved-but-unapplied, each with its own
+    /// bit index (flags-word bits 16/17; the visual-half byte keeps its opcode's
+    /// index through [`EventCue::RENDER_FLAG_VISUAL_BYTE`]).
+    #[test]
+    fn render_flag_writes_cross_published_and_unapplied() {
+        for bit in [16, 17, EventCue::RENDER_FLAG_VISUAL_BYTE] {
+            let cue = resolve_cue(
+                EventCue::ActorRenderFlag {
+                    actor: ActorLookup::EVENT_ENTITY,
+                    bit,
+                    value: true,
+                },
+                0x010E_602F,
+                0,
+                0,
+            );
+            assert_eq!(
+                cue,
+                ResolvedCue::ActorRenderFlag {
+                    actor: CutsceneActor::Entity {
+                        server_id: 0x010E_602F
+                    },
+                    bit,
+                    value: true,
+                }
+            );
+
+            let (tx, mut rx) = broadcast::channel(8);
+            let mut scope = CutsceneScope::default();
+            scope.push(cue, &tx);
+            let events = drain(&mut rx);
+            assert!(
+                matches!(
+                    events.as_slice(),
+                    [AgentEvent::ActorRenderFlagChanged { bit: got, value: true, .. }]
+                        if *got == bit
+                ),
+                "{events:?}"
+            );
+        }
     }
 
     /// The VM leaves its actor operands unresolved on purpose: the local
@@ -4202,5 +4443,183 @@ pub(crate) mod tests {
         let mut session = DialogSession::new(None, "tester".into());
         session.apply_pending_str(&[[0u8; 16]; 4]);
         assert!(session.runner.is_none());
+    }
+
+    /// The live zone-235 event-22 shape: a wildcard master stub that is just
+    /// END, several owner blocks, and one owner whose script arms the pending
+    /// tag (0x43 case 0) and parks on its poll (case 1). The session must see
+    /// `AwaitServerAck` so it sends the c2s half (which releases the owner via
+    /// EVENTUCOFF), announce that tag once rather than every tick, and run the
+    /// owners to end after the ack. Before this was pinned the event sat in
+    /// Park::Hold with no session-tracked hold and cancelled as "animation
+    /// never finished" seconds after zone-in.
+    #[test]
+    fn owner_childs_send_tag_surfaces_through_the_session_and_runs_on_after_the_ack() {
+        const EVENT: u16 = 9010;
+        const ZONE: u16 = 248;
+        // The trigger names no block of its own (LSB sends the raw charid for
+        // an event without a target entity, so does zone 235 live).
+        const PLAYER_ID: u32 = 7;
+        let master = ffxi_dat::event_dat::EventBlock {
+            actor: ffxi_dat::event_dat::ZONE_PLAYER_ACTOR,
+            event_ids: vec![ffxi_dat::event_dat::EVENT_ID_WILDCARD],
+            event_offsets: vec![0],
+            references: vec![],
+            event_data: vec![0x00], // the wildcard stub is bare END
+        };
+        let owner_a = ffxi_dat::event_dat::EventBlock {
+            actor: 0x010E_B0A5,
+            event_ids: vec![EVENT],
+            event_offsets: vec![0],
+            references: vec![],
+            // EVENTHIDE then END - a second non-END owner, which is what makes
+            // block_for_event fall through to the master's wildcard entry.
+            event_data: vec![0x4E, 0x01, 0xF8, 0xFF, 0xFF, 0x7F, 0x00],
+        };
+        let owner_b = ffxi_dat::event_dat::EventBlock {
+            actor: 0x010E_B001,
+            event_ids: vec![EVENT],
+            event_offsets: vec![0],
+            references: vec![],
+            // SENDTAG case 0 arms the global tag; case 1 polls it; END.
+            event_data: vec![0x43, 0x00, 0x43, 0x01, 0x00],
+        };
+        let mut session = DialogSession::new(None, "Test".into());
+        session.loaded_event_zone = Some(ZONE);
+        session.loaded_string_zone = Some(ZONE);
+        session.event_dat = Some(Arc::new(EventDat {
+            blocks: vec![master, owner_a, owner_b],
+        }));
+        session.strings = Some(StringDat::parse(&synth_dat(&[b"test"])).unwrap());
+        session.set_player_position(ffxi_event::vm::scene::EventPosition::default());
+        let trigger = EventTrigger {
+            event_zone: ZONE,
+            text_zone: ZONE,
+            unique_no: PLAYER_ID,
+            act_index: 0,
+            event_id: EVENT,
+            params: vec![],
+            npc_name: None,
+        };
+        let Begin::AwaitServerAck(tag) = session.begin(trigger) else {
+            panic!(
+                "the owner's send-tag poll must surface as a pending tag, got {:?}",
+                session.active_end()
+            );
+        };
+        assert!(
+            matches!(tag, ffxi_event::PendingTag::SendTag { .. }),
+            "{tag:?}"
+        );
+        // The parked tag is announced once: the owner yields AwaitServerAck on
+        // every step of its poll, and re-announcing would resend the c2s half
+        // each tick.
+        for _ in 0..3 {
+            assert!(
+                matches!(session.tick(0.5), Advance::Waiting),
+                "a tick must not re-surface the already-reported tag"
+            );
+        }
+        // The server's ack (EVENTUCOFF EventRecvPending) releases the owner;
+        // it runs past its poll to END, and with every stack drained the
+        // event ends.
+        let Advance::Ended {
+            end_para, error, ..
+        } = session.ack_server()
+        else {
+            panic!("the acked owner drains to the event end");
+        };
+        assert_eq!((end_para, error.is_some()), (0, false));
+        assert!(session.active_end().is_none());
+    }
+
+    /// Diagnostic probe: play both chocobo-rental cutscenes end to end through
+    /// the session exactly as the live pump does - scene attached, motion holds
+    /// armed from the DATs - reporting every finish so nothing parks. Prints
+    /// each frame/cue/stop for Bastok Mines 61 (Azette) and Southern San d'Oria
+    /// 599 (Camereine). Runs only with `FFXI_DAT_PATH`; prints facts, pins none.
+    #[test]
+    fn zz_probe_rental_pair() {
+        let Ok(root) = DatRoot::from_env() else {
+            eprintln!("SKIP zz_probe: no FFXI_DAT_PATH install");
+            return;
+        };
+        let root = std::sync::Arc::new(root);
+        for (zone, event, npc_id, who) in [
+            (234u16, 61u16, 0x010E_A032u32, "bastok-mines azette"),
+            (230u16, 599u16, 0x010E_602Fu32, "sandoria-camereine"),
+        ] {
+            println!("==== {who}: zone {zone} event {event} ====");
+            let mut session = DialogSession::new(Some(root.clone()), "Garfield".into());
+            session.set_player_position(ffxi_event::vm::scene::EventPosition::default());
+            let mut opened_frame = false;
+            match session.begin(EventTrigger {
+                event_zone: zone,
+                text_zone: zone,
+                unique_no: npc_id,
+                act_index: 0,
+                event_id: event,
+                params: vec![200, 5000, 1],
+                npc_name: None,
+            }) {
+                Begin::Frame(f) => {
+                    let _ = &f.strings;
+                    opened_frame = true;
+                    println!("begin -> Frame {:?}", f.prompt);
+                }
+                Begin::Ended { end_para } => println!("begin -> Ended {end_para}"),
+                Begin::Undriveable { stopped_op, reason } => {
+                    println!("begin -> Undriveable op={stopped_op:?} {reason:?}");
+                    continue;
+                }
+                Begin::Waiting => println!("begin -> Waiting"),
+                Begin::AwaitServerAck(t) => println!("begin -> AwaitServerAck({t:?})"),
+            }
+            let mut pending_answer = opened_frame;
+            for step in 0..512 {
+                let early_cues = session.take_cues();
+                if !early_cues.is_empty() {
+                    println!("cues[{step}] {early_cues:?}");
+                }
+                if session.active_end().is_none() {
+                    break;
+                }
+                let pending: Vec<_> = session.pending_motion_holds.keys().copied().collect();
+                for (actor, key) in pending {
+                    println!("  [{step}] report done {actor:?}/{key:?}");
+                    session.motion_done(actor, key);
+                }
+                let advance = if pending_answer {
+                    let a = session.advance(Some(0));
+                    if let Advance::Frame(f) = &a {
+                        println!("  reframe[{step}] {:?}", f.prompt);
+                    }
+                    a
+                } else {
+                    session.tick(1.0 / 60.0)
+                };
+                pending_answer = false;
+                match &advance {
+                    Advance::Frame(f) => {
+                        println!(
+                            "frame[{step}] prompt={:?} choices={:?}",
+                            f.prompt, f.choices
+                        );
+                        pending_answer = true;
+                    }
+                    Advance::Ended {
+                        end_para, error, ..
+                    } => {
+                        println!("ended[{step}] {end_para} error={error:?}");
+                        break;
+                    }
+                    Advance::AwaitServerAck(t) => {
+                        println!("await ack[{step}] {t:?}");
+                        session.ack_server();
+                    }
+                    Advance::Waiting => {}
+                }
+            }
+        }
     }
 }

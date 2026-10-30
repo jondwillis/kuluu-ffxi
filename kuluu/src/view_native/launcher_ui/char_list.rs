@@ -1,10 +1,10 @@
-use bevy::ecs::spawn::Spawn;
-use bevy::feathers::controls::{button_bundle, ButtonBundleProps, ButtonVariant};
+use bevy::feathers::controls::{ButtonVariant, FeathersButton};
+use bevy::feathers::font_styles::InheritableFont;
 use bevy::feathers::theme::ThemedText;
 use bevy::input::keyboard::{Key, KeyboardInput};
 use bevy::input::ButtonState;
 use bevy::input_focus::{FocusCause, InputFocus, InputFocusVisible};
-use bevy::picking::events::{Over, Pointer};
+use bevy::picking::events::PointerOver;
 use bevy::prelude::*;
 use bevy::ui_widgets::Activate;
 
@@ -131,14 +131,17 @@ pub(super) fn spawn_char_list_ui(
                     // One visually-connected pill: select chip + Delete.
                     panel.spawn(row()).with_children(|r| {
                         r.spawn(chip_group()).with_children(|chip| {
-                            chip.spawn(button_bundle(
-                                ButtonBundleProps {
-                                    variant,
-                                    ..default()
-                                },
-                                CharRowButton(idx),
-                                Spawn((Text::new(label), ThemedText)),
-                            ))
+                            chip.spawn_empty().apply_scene(bsn! {
+                                @FeathersButton {
+                                    @variant: variant,
+                                    @caption: bsn! {
+                                        Text::new(label)
+                                        ThemedText
+                                    },
+                                }
+                                Node { flex_grow: 1.0 }
+                                InheritableFont { font: {Handle::<Font>::default()} }
+                            }).insert(CharRowButton(idx))
                             .insert_if(DefaultFocusTarget, || idx == initial_cursor)
                             .observe(
                                 move |_ev: On<Activate>,
@@ -154,7 +157,7 @@ pub(super) fn spawn_char_list_ui(
                                 },
                             )
                             .observe(
-                                move |ev: On<Pointer<Over>>,
+                                move |ev: On<PointerOver>,
                                       mut cursor: ResMut<CharCursor>,
                                       mut focus: ResMut<InputFocus>| {
                                     if cursor.0 != idx {
@@ -164,11 +167,16 @@ pub(super) fn spawn_char_list_ui(
                                 },
                             );
 
-                            chip.spawn(button_bundle(
-                                ButtonBundleProps::default(),
-                                (),
-                                Spawn((Text::new("Delete"), ThemedText)),
-                            ))
+                            chip.spawn_empty().apply_scene(bsn! {
+                                @FeathersButton {
+                                    @caption: bsn! {
+                                        Text::new("Delete")
+                                        ThemedText
+                                    },
+                                }
+                                Node { flex_grow: 1.0 }
+                                InheritableFont { font: {Handle::<Font>::default()} }
+                            })
                             .observe(
                                 move |_ev: On<Activate>,
                                       chars: Res<CharListData>,
@@ -192,14 +200,17 @@ pub(super) fn spawn_char_list_ui(
                     } else {
                         ButtonVariant::Normal
                     };
-                    r.spawn(button_bundle(
-                        ButtonBundleProps {
-                            variant: new_variant,
-                            ..default()
-                        },
-                        CharRowButton(new_char_index),
-                        Spawn((Text::new("+ New character"), ThemedText)),
-                    ))
+                    r.spawn_empty().apply_scene(bsn! {
+                        @FeathersButton {
+                            @variant: new_variant,
+                            @caption: bsn! {
+                                Text::new("+ New character")
+                                ThemedText
+                            },
+                        }
+                        Node { flex_grow: 1.0 }
+                        InheritableFont { font: {Handle::<Font>::default()} }
+                    }).insert(CharRowButton(new_char_index))
                     .insert_if(DefaultFocusTarget, || new_char_index == initial_cursor)
                     .observe(
                         move |_ev: On<Activate>,
@@ -306,7 +317,7 @@ pub(super) fn redraw_char_list_system(
 
 /// The row highlight and the 3D preview key off [`CharCursor`], not
 /// `InputFocus`, so the pad's focus ring has to drag the cursor along - the
-/// same thing the `Pointer<Over>` observer does for the mouse. Hover stays
+/// same thing the `PointerOver` observer does for the mouse. Hover stays
 /// authoritative between focus changes.
 pub(super) fn sync_cursor_to_focus_system(
     focus: Res<InputFocus>,
@@ -365,30 +376,41 @@ pub(super) fn spawn_delete_confirm_ui(mut commands: Commands, sel: Res<SelectedC
                 ));
 
                 panel.spawn(row()).with_children(|r| {
-                    r.spawn(button_bundle(
-                        ButtonBundleProps {
-                            variant: ButtonVariant::Primary,
-                            ..default()
-                        },
-                        (),
-                        Spawn((Text::new("Confirm delete"), ThemedText)),
-                    ))
-                    .observe(
-                        |_ev: On<Activate>, mut next: ResMut<NextState<LauncherState>>| {
-                            next.set(LauncherState::CharDeleteInFlight);
-                        },
-                    );
+                    r.spawn_empty()
+                        .apply_scene(bsn! {
+                            @FeathersButton {
+                                @variant: ButtonVariant::Primary,
+                                @caption: bsn! {
+                                    Text::new("Confirm delete")
+                                    ThemedText
+                                },
+                            }
+                            Node { flex_grow: 1.0 }
+                            InheritableFont { font: {Handle::<Font>::default()} }
+                        })
+                        .observe(
+                            |_ev: On<Activate>, mut next: ResMut<NextState<LauncherState>>| {
+                                next.set(LauncherState::CharDeleteInFlight);
+                            },
+                        );
 
-                    r.spawn(button_bundle(
-                        ButtonBundleProps::default(),
-                        DefaultFocusTarget,
-                        Spawn((Text::new("Cancel"), ThemedText)),
-                    ))
-                    .observe(
-                        |_ev: On<Activate>, mut next: ResMut<NextState<LauncherState>>| {
-                            next.set(LauncherState::CharList);
-                        },
-                    );
+                    r.spawn_empty()
+                        .apply_scene(bsn! {
+                            @FeathersButton {
+                                @caption: bsn! {
+                                    Text::new("Cancel")
+                                    ThemedText
+                                },
+                            }
+                            Node { flex_grow: 1.0 }
+                            InheritableFont { font: {Handle::<Font>::default()} }
+                        })
+                        .insert(DefaultFocusTarget)
+                        .observe(
+                            |_ev: On<Activate>, mut next: ResMut<NextState<LauncherState>>| {
+                                next.set(LauncherState::CharList);
+                            },
+                        );
                 });
             });
         });

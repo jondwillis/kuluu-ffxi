@@ -209,7 +209,7 @@ const ZONE_MAP_FILE_TABLE_BASE_MASK: u8 = 0x0F;
 /// retail-2026-09 RVA 0x1f7480, horizonxi-2023 RVA 0x1f3bb0). Byte 6 == 0 or a
 /// nibble without an arm answers "no key item"; a negative byte 6 answers
 /// `ZONE_MAP_NEGATIVE_KEY_ITEM` whatever the nibble. Every row naming one lands
-/// on a MAP_OF_* id of vendor/server/scripts/enum/key_item.lua on both builds.
+/// on a MAP_OF_* id of vendor/server/data/enums/key_item.yaml on both builds.
 const ZONE_MAP_KEY_ITEM_BASES: [u16; 3] = [0x180, 0x73F, 0x8FD];
 const ZONE_MAP_KEY_ITEM_BASE_SHIFT: u8 = 4;
 const ZONE_MAP_NEGATIVE_KEY_ITEM: u16 = 0x17F;
@@ -1409,7 +1409,7 @@ mod tests {
 
     /// Gated on an install (self-skips). The key items the high nibble and
     /// byte 6 name are LSB's MAP_OF_THE_SAN_DORIA_AREA, MAP_OF_AL_ZAHBI and
-    /// MAP_OF_RALA_WATERWAYS_U (vendor/server/scripts/enum/key_item.lua), one
+    /// MAP_OF_RALA_WATERWAYS_U (vendor/server/data/enums/key_item.yaml), one
     /// per key-item base; 655 rows name one on both known clients.
     #[test]
     fn real_dll_zone_map_key_items_are_the_lsb_map_key_items() {

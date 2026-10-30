@@ -1,5 +1,5 @@
-use bevy::ecs::spawn::Spawn;
-use bevy::feathers::controls::{button_bundle, checkbox_bundle, ButtonBundleProps, ButtonVariant};
+use bevy::feathers::controls::{ButtonVariant, FeathersButton, FeathersCheckbox};
+use bevy::feathers::font_styles::InheritableFont;
 use bevy::feathers::theme::ThemedText;
 use bevy::input::keyboard::{Key, KeyboardInput};
 use bevy::input::ButtonState;
@@ -212,10 +212,16 @@ fn build_login_ui(
                     );
 
                     {
-                        let mut cb = panel.spawn(checkbox_bundle(
-                            (),
-                            Spawn((Text::new("Remember password"), ThemedText)),
-                        ));
+                        let mut cb = panel.spawn_empty();
+                        cb.apply_scene(bsn! {
+                            @FeathersCheckbox {
+                                @caption: bsn! {
+                                    Text::new("Remember password")
+                                    ThemedText
+                                },
+                            }
+                            InheritableFont { font: {Handle::<Font>::default()} }
+                        });
                         if remember {
                             cb.insert(Checked);
                         }
@@ -237,14 +243,17 @@ fn build_login_ui(
 
                     panel.spawn(row()).with_children(|r| {
                         if !blocked {
-                            r.spawn(button_bundle(
-                            ButtonBundleProps {
-                                variant: ButtonVariant::Primary,
-                                ..default()
-                            },
-                            (),
-                            Spawn((Text::new("Log in"), ThemedText)),
-                        ))
+                            r.spawn_empty().apply_scene(bsn! {
+                                @FeathersButton {
+                                    @variant: ButtonVariant::Primary,
+                                    @caption: bsn! {
+                                        Text::new("Log in")
+                                        ThemedText
+                                    },
+                                }
+                                Node { flex_grow: 1.0 }
+                                InheritableFont { font: {Handle::<Font>::default()} }
+                            })
                         .insert(DefaultFocusTarget)
                         .observe(
                             move |_ev: On<Activate>,
@@ -260,28 +269,40 @@ fn build_login_ui(
                             return;
                         }
 
-                        r.spawn(button_bundle(
-                            ButtonBundleProps::default(),
-                            (),
-                            Spawn((Text::new("Create account"), ThemedText)),
-                        ))
-                        .insert_if(DefaultFocusTarget, || blocked)
-                        .observe(
-                            |_ev: On<Activate>, mut next: ResMut<NextState<LauncherState>>| {
-                                next.set(LauncherState::CreateAccount);
-                            },
-                        );
+                        r.spawn_empty()
+                            .apply_scene(bsn! {
+                                @FeathersButton {
+                                    @caption: bsn! {
+                                        Text::new("Create account")
+                                        ThemedText
+                                    },
+                                }
+                                Node { flex_grow: 1.0 }
+                                InheritableFont { font: {Handle::<Font>::default()} }
+                            })
+                            .insert_if(DefaultFocusTarget, || blocked)
+                            .observe(
+                                |_ev: On<Activate>, mut next: ResMut<NextState<LauncherState>>| {
+                                    next.set(LauncherState::CreateAccount);
+                                },
+                            );
 
-                        r.spawn(button_bundle(
-                            ButtonBundleProps::default(),
-                            (),
-                            Spawn((Text::new("Change password"), ThemedText)),
-                        ))
-                        .observe(
-                            |_ev: On<Activate>, mut next: ResMut<NextState<LauncherState>>| {
-                                next.set(LauncherState::ChangePassword);
-                            },
-                        );
+                        r.spawn_empty()
+                            .apply_scene(bsn! {
+                                @FeathersButton {
+                                    @caption: bsn! {
+                                        Text::new("Change password")
+                                        ThemedText
+                                    },
+                                }
+                                Node { flex_grow: 1.0 }
+                                InheritableFont { font: {Handle::<Font>::default()} }
+                            })
+                            .observe(
+                                |_ev: On<Activate>, mut next: ResMut<NextState<LauncherState>>| {
+                                    next.set(LauncherState::ChangePassword);
+                                },
+                            );
                     });
                 }
             });
@@ -337,19 +358,23 @@ fn spawn_terms_gate(panel: &mut ChildSpawnerCommands, profile_name: Option<&str>
     }
     let name = profile_name.map(str::to_string);
     panel.spawn(row()).with_children(|r| {
-        r.spawn(button_bundle(
-            ButtonBundleProps {
-                variant: ButtonVariant::Primary,
-                ..default()
-            },
-            (),
-            Spawn((Text::new("I understand"), ThemedText)),
-        ))
-        .insert(DefaultFocusTarget)
-        .observe(move |_ev: On<Activate>, mut dirty: ResMut<LoginUiDirty>| {
-            acknowledge_terms(name.as_deref());
-            dirty.0 = true;
-        });
+        r.spawn_empty()
+            .apply_scene(bsn! {
+                @FeathersButton {
+                    @variant: ButtonVariant::Primary,
+                    @caption: bsn! {
+                        Text::new("I understand")
+                        ThemedText
+                    },
+                }
+                Node { flex_grow: 1.0 }
+                InheritableFont { font: {Handle::<Font>::default()} }
+            })
+            .insert(DefaultFocusTarget)
+            .observe(move |_ev: On<Activate>, mut dirty: ResMut<LoginUiDirty>| {
+                acknowledge_terms(name.as_deref());
+                dirty.0 = true;
+            });
     });
 }
 
@@ -410,119 +435,135 @@ fn spawn_saved_accounts_row(
                 let forget_playonline = playonline;
 
                 r.spawn(chip_group()).with_children(|chip| {
-                    chip.spawn(button_bundle(
-                        ButtonBundleProps {
-                            variant,
-                            ..default()
-                        },
-                        (),
-                        Spawn((Text::new(label), ThemedText)),
-                    ))
-                    .observe(
-                        move |_ev: On<Activate>,
-                              mut login: ResMut<LoginForm>,
-                              mut dirty: ResMut<LoginUiDirty>| {
-                            // The saved account is keyed on whichever identity
-                            // the flavor always has, so a PlayOnline chip names
-                            // the PlayOnline id and carries the other beside it.
-                            if pick_playonline {
-                                login.pol_id = pick_user.clone();
-                                login.user = pick_square_enix_id.clone();
-                            } else {
-                                login.user = pick_user.clone();
+                    chip.spawn_empty()
+                        .apply_scene(bsn! {
+                            @FeathersButton {
+                                @variant: variant,
+                                @caption: bsn! {
+                                    Text::new(label)
+                                    ThemedText
+                                },
                             }
-                            login.pass.clear();
-                            login.pol_pass.clear();
-                            login.remember_password = pick_remember;
-                            if pick_remember {
-                                let primary = SecretStore::get(
-                                    KEYRING_SERVICE,
-                                    &keyring_account_key(&pick_server, &pick_user),
-                                );
-                                let secondary = SecretStore::get(
-                                    KEYRING_SERVICE,
-                                    &keyring_square_enix_key(&pick_server, &pick_user),
-                                );
+                            Node { flex_grow: 1.0 }
+                            InheritableFont { font: {Handle::<Font>::default()} }
+                        })
+                        .observe(
+                            move |_ev: On<Activate>,
+                                  mut login: ResMut<LoginForm>,
+                                  mut dirty: ResMut<LoginUiDirty>| {
+                                // The saved account is keyed on whichever identity
+                                // the flavor always has, so a PlayOnline chip names
+                                // the PlayOnline id and carries the other beside it.
                                 if pick_playonline {
-                                    login.pol_pass = primary.unwrap_or_default();
-                                    login.pass = secondary.unwrap_or_default();
+                                    login.pol_id = pick_user.clone();
+                                    login.user = pick_square_enix_id.clone();
                                 } else {
-                                    login.pass = primary.unwrap_or_default();
+                                    login.user = pick_user.clone();
                                 }
-                            }
-                            login.focus = if login.pass.is_empty() {
-                                LoginField::Password
-                            } else {
-                                LoginField::User
-                            };
-
-                            dirty.0 = true;
-                        },
-                    );
-
-                    chip.spawn(button_bundle(
-                        ButtonBundleProps::default(),
-                        (),
-                        Spawn((Text::new("X"), ThemedText)),
-                    ))
-                    .observe(
-                        move |_ev: On<Activate>,
-                              mut login: ResMut<LoginForm>,
-                              mut dirty: ResMut<LoginUiDirty>| {
-                            let mut store = launcher_store::load();
-                            store.accounts.retain(|a| {
-                                !(a.server_name == forget_server && a.username == forget_user)
-                            });
-                            if let Some((s, u)) = &store.last_used {
-                                if *s == forget_server && *u == forget_user {
-                                    store.last_used = None;
-                                }
-                            }
-                            if let Err(e) = launcher_store::save(&store) {
-                                tracing::warn!(error = %e, "launcher_store: save failed");
-                            }
-                            SecretStore::delete(
-                                KEYRING_SERVICE,
-                                &keyring_account_key(&forget_server, &forget_user),
-                            );
-                            SecretStore::delete(
-                                KEYRING_SERVICE,
-                                &keyring_square_enix_key(&forget_server, &forget_user),
-                            );
-
-                            if login.account_key(forget_playonline) == forget_user {
-                                login.user.clear();
                                 login.pass.clear();
-                                login.pol_id.clear();
                                 login.pol_pass.clear();
-                                login.remember_password = false;
-                                login.focus = LoginField::User;
+                                login.remember_password = pick_remember;
+                                if pick_remember {
+                                    let primary = SecretStore::get(
+                                        KEYRING_SERVICE,
+                                        &keyring_account_key(&pick_server, &pick_user),
+                                    );
+                                    let secondary = SecretStore::get(
+                                        KEYRING_SERVICE,
+                                        &keyring_square_enix_key(&pick_server, &pick_user),
+                                    );
+                                    if pick_playonline {
+                                        login.pol_pass = primary.unwrap_or_default();
+                                        login.pass = secondary.unwrap_or_default();
+                                    } else {
+                                        login.pass = primary.unwrap_or_default();
+                                    }
+                                }
+                                login.focus = if login.pass.is_empty() {
+                                    LoginField::Password
+                                } else {
+                                    LoginField::User
+                                };
+
+                                dirty.0 = true;
+                            },
+                        );
+
+                    chip.spawn_empty()
+                        .apply_scene(bsn! {
+                            @FeathersButton {
+                                @caption: bsn! {
+                                    Text::new("X")
+                                    ThemedText
+                                },
                             }
-                            dirty.0 = true;
-                        },
-                    );
+                            Node { flex_grow: 1.0 }
+                            InheritableFont { font: {Handle::<Font>::default()} }
+                        })
+                        .observe(
+                            move |_ev: On<Activate>,
+                                  mut login: ResMut<LoginForm>,
+                                  mut dirty: ResMut<LoginUiDirty>| {
+                                let mut store = launcher_store::load();
+                                store.accounts.retain(|a| {
+                                    !(a.server_name == forget_server && a.username == forget_user)
+                                });
+                                if let Some((s, u)) = &store.last_used {
+                                    if *s == forget_server && *u == forget_user {
+                                        store.last_used = None;
+                                    }
+                                }
+                                if let Err(e) = launcher_store::save(&store) {
+                                    tracing::warn!(error = %e, "launcher_store: save failed");
+                                }
+                                SecretStore::delete(
+                                    KEYRING_SERVICE,
+                                    &keyring_account_key(&forget_server, &forget_user),
+                                );
+                                SecretStore::delete(
+                                    KEYRING_SERVICE,
+                                    &keyring_square_enix_key(&forget_server, &forget_user),
+                                );
+
+                                if login.account_key(forget_playonline) == forget_user {
+                                    login.user.clear();
+                                    login.pass.clear();
+                                    login.pol_id.clear();
+                                    login.pol_pass.clear();
+                                    login.remember_password = false;
+                                    login.focus = LoginField::User;
+                                }
+                                dirty.0 = true;
+                            },
+                        );
                 });
             }
 
             r.spawn(chip_group()).with_children(|chip| {
-                chip.spawn(button_bundle(
-                    ButtonBundleProps::default(),
-                    (),
-                    Spawn((Text::new("+"), ThemedText)),
-                ))
-                .observe(
-                    |_ev: On<Activate>,
-                     mut login: ResMut<LoginForm>,
-                     mut dirty: ResMut<LoginUiDirty>| {
-                        login.user.clear();
-                        login.pass.clear();
-                        login.pol_id.clear();
-                        login.pol_pass.clear();
-                        login.remember_password = false;
-                        login.focus = LoginField::User;
-                        dirty.0 = true;
-                    },
-                );
+                chip.spawn_empty()
+                    .apply_scene(bsn! {
+                        @FeathersButton {
+                            @caption: bsn! {
+                                Text::new("+")
+                                ThemedText
+                            },
+                        }
+                        Node { flex_grow: 1.0 }
+                        InheritableFont { font: {Handle::<Font>::default()} }
+                    })
+                    .observe(
+                        |_ev: On<Activate>,
+                         mut login: ResMut<LoginForm>,
+                         mut dirty: ResMut<LoginUiDirty>| {
+                            login.user.clear();
+                            login.pass.clear();
+                            login.pol_id.clear();
+                            login.pol_pass.clear();
+                            login.remember_password = false;
+                            login.focus = LoginField::User;
+                            dirty.0 = true;
+                        },
+                    );
             });
         });
 }
@@ -669,25 +710,36 @@ fn spawn_client_era_banner(panel: &mut ChildSpawnerCommands, era: &ClientEraStat
                 ThemedText,
             ));
             bar.spawn(row()).with_children(|r| {
-                r.spawn(button_bundle(
-                    ButtonBundleProps::default(),
-                    (),
-                    Spawn((Text::new("Choose install..."), ThemedText)),
-                ))
-                .observe(
-                    |_ev: On<Activate>,
-                     mut ret: ResMut<DatSetupReturn>,
-                     mut next: ResMut<NextState<LauncherState>>| {
-                        ret.0 = Some(LauncherState::Login);
-                        next.set(LauncherState::DatSetup);
-                    },
-                );
+                r.spawn_empty()
+                    .apply_scene(bsn! {
+                        @FeathersButton {
+                            @caption: bsn! {
+                                Text::new("Choose install...")
+                                ThemedText
+                            },
+                        }
+                        Node { flex_grow: 1.0 }
+                        InheritableFont { font: {Handle::<Font>::default()} }
+                    })
+                    .observe(
+                        |_ev: On<Activate>,
+                         mut ret: ResMut<DatSetupReturn>,
+                         mut next: ResMut<NextState<LauncherState>>| {
+                            ret.0 = Some(LauncherState::Login);
+                            next.set(LauncherState::DatSetup);
+                        },
+                    );
                 if let Some(name) = server_name {
-                    r.spawn(button_bundle(
-                        ButtonBundleProps::default(),
-                        (),
-                        Spawn((Text::new("Edit server..."), ThemedText)),
-                    ))
+                    r.spawn_empty().apply_scene(bsn! {
+                        @FeathersButton {
+                            @caption: bsn! {
+                                Text::new("Edit server...")
+                                ThemedText
+                            },
+                        }
+                        Node { flex_grow: 1.0 }
+                        InheritableFont { font: {Handle::<Font>::default()} }
+                    })
                     .observe(
                         move |_ev: On<Activate>,
                               mut form: ResMut<ServerEditForm>,
@@ -914,14 +966,19 @@ pub(super) fn spawn_error_ui(
                     ThemedText,
                 ));
                 panel
-                    .spawn(button_bundle(
-                        ButtonBundleProps {
-                            variant: ButtonVariant::Primary,
-                            ..default()
-                        },
-                        DefaultFocusTarget,
-                        Spawn((Text::new(back_label), ThemedText)),
-                    ))
+                    .spawn_empty()
+                    .apply_scene(bsn! {
+                        @FeathersButton {
+                            @variant: ButtonVariant::Primary,
+                            @caption: bsn! {
+                                Text::new(back_label)
+                                ThemedText
+                            },
+                        }
+                        Node { flex_grow: 1.0 }
+                        InheritableFont { font: {Handle::<Font>::default()} }
+                    })
+                    .insert(DefaultFocusTarget)
                     .observe(
                         |_ev: On<Activate>,
                          ret: Res<LoginErrorReturn>,

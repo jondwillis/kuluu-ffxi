@@ -302,7 +302,7 @@ fn setup(
             Mesh3d(meshes.add(skinned_cuboid(size))),
             MeshMaterial3d(material.clone()),
             Transform::from_translation(position),
-            MeshTag(slot),
+            MeshTag::new(slot),
             FfxiInstanceSlot(slot),
         ));
     }

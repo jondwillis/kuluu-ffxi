@@ -22,7 +22,7 @@ repository.workspace = true
 #   NR unavailable; the SR path is unaffected.
 
 [target.'cfg(target_os = "windows")'.dependencies]
-# Same major as bevy's wgpu so cargo unifies on one copy (29.x in the lockfile).
+# Share Bevy's wgpu version.
 # Only the Vulkan HAL surface is needed: `as_hal::<Vulkan>()` raw-handle
 # extraction. Feature set is a subset of what bevy_render already enables, so
 # no extra backend code gets compiled into the final binary.

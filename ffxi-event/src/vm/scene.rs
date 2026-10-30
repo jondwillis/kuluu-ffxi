@@ -17,6 +17,10 @@ pub const EVENT_SPEED_SCALE: f32 = 0.1;
 const REQUEST_STACK_LIMIT: usize = 16;
 const OP_SPEED: u8 = 0x32;
 const OP_GET_POSITION: u8 = 0x3B;
+/// Actor operand @1, destination work operand @5 (`f_100b2c80`).
+const OP_GET_HEADING: u8 = 0x3A;
+const GET_HEADING_ACTOR_OFS: usize = 1;
+const GET_HEADING_WORK_OFS: usize = 5;
 const OP_REQSET: u8 = 0x27;
 const OP_REQSET_CHECKED: u8 = 0x28;
 const OP_REQUEST_WAIT: u8 = 0x29;
@@ -60,6 +64,12 @@ const LOOKAT_ACTOR_OFS: usize = 2;
 const LOOKAT_TARGET_OFS: usize = 6;
 /// Target operand (research/XiEvents/OpCodes/0x001E.md).
 const LOOK_AND_TALK_TARGET_OFS: usize = 1;
+
+/// Positive-remainder wrap of a heading into one turn — the integer image of
+/// retail's radians wrap `f_100dd9d0` scaled by 4096·(1/2π).
+fn wrap_heading_units(heading: i32) -> i32 {
+    heading.rem_euclid(EVENT_HEADING_UNITS as i32)
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct EventPosition {
@@ -346,14 +356,26 @@ impl EventVm {
                         surfaced = Some(result);
                     }
                 }
-                StepResult::AwaitMessageAck | StepResult::AwaitServerAck(_) => {
+                StepResult::AwaitMessageAck => {
                     tracing::debug!(
                         target: "ffxi_event::vm",
                         actor,
                         ?result,
-                        "a child request parked on a server round-trip this \
+                        "a child request parked on a position round-trip this \
                          scene does not author"
                     );
+                }
+                StepResult::AwaitServerAck(tag) => {
+                    // The pending tag is one global per event, so an owner
+                    // child holding it is the holder the host must release
+                    // (research/XiEvents/OpCodes/0x0043.md): surface the round
+                    // trip and leave the request parked on its poll. Swallowing
+                    // it instead froze zone 235's event 22 - its owner block
+                    // arms the tag at 0x43 case 0 and parks on the case-1 poll,
+                    // and the session never learns to send the c2s half.
+                    if surfaced.is_none() {
+                        surfaced = Some(StepResult::AwaitServerAck(tag));
+                    }
                 }
                 StepResult::Unimplemented(op) | StepResult::Spun(op) => {
                     tracing::debug!(
@@ -381,6 +403,62 @@ impl EventVm {
         }
     }
 
+    /// The position a look-at-style actor operand names, resolved the way the host's cue
+    /// resolver does (`kuluu-session/src/event_dialog.rs` resolve_actor): local-player selectors
+    /// read the shared cell, literal server ids read the host-fed entity map, and the
+    /// event-entity/default selector stands for this block's owner - which is exactly what
+    /// [`Self::entity_positions`] is keyed by for scene actors.
+    pub(super) fn named_actor_position(&self, lookup: ActorLookup) -> Option<EventPosition> {
+        let scene = self.scene.as_ref()?;
+        if lookup.is_local_player() {
+            return Some(self.shared_player_position().unwrap_or(scene.player));
+        }
+        if let Some(id) = lookup.server_id() {
+            return self.entity_positions.get(&id).copied();
+        }
+        // The event-entity selector and the default handler's fallback (cue.rs ActorLookup).
+        self.entity_positions.get(&scene.actor).copied()
+    }
+
+    /// A look-at form whose first actor names this scene's own local player pins retail's
+    /// facing on the tracked position: the shared cell takes a heading toward the target and
+    /// publishes it as a `PlayerPosition` action, exactly like `OP_SET_FACING`. The steering
+    /// formula is [`Self::tick_scene`]'s - the same one every walk-leg bearing uses. Without
+    /// this half the authored "look at X" reaches kuluu only as an actor cue, and every path
+    /// that consumes player-directed cues deliberately skips the local player (the renderer's
+    /// `moved` filter, kuluu-session/src/scheduler_runtime.rs), so the facing was never applied.
+    pub(super) fn turn_scene_player_toward(&mut self, actor: ActorLookup, target: ActorLookup) {
+        let owns_player = self.scene.as_ref().is_some_and(|scene| {
+            actor.is_local_player()
+                || (scene.actor == ffxi_dat::event_dat::ZONE_PLAYER_ACTOR
+                    && actor.is_event_entity())
+        });
+        if !owns_player {
+            return;
+        }
+        let Some(target_position) = self.named_actor_position(target) else {
+            return;
+        };
+        let current = self
+            .shared_player_position()
+            .or_else(|| self.scene.as_ref().map(|s| s.player));
+        let Some(current) = current else { return };
+        let dx = (target_position.x - current.x) as f32;
+        let dz = (target_position.z - current.z) as f32;
+        if dx == 0.0 && dz == 0.0 {
+            return;
+        }
+        let heading = ((-dz).atan2(dx) / std::f32::consts::TAU * EVENT_HEADING_UNITS) as i32;
+        let scene = self.scene.as_mut().unwrap();
+        scene.player = current;
+        scene.player.heading = heading;
+        scene.controls_position = true;
+        let updated = scene.player;
+        self.set_shared_player_position(updated);
+        self.scene_actions
+            .push(SceneAction::PlayerPosition(updated));
+    }
+
     /// Run the host clock into the player's MOVE lerp while a scene hold is
     /// parked on it; each step publishes the new position as a scene action.
     pub(super) fn tick_scene(&mut self, dt: f32) {
@@ -404,6 +482,14 @@ impl EventVm {
             scene.player.z += (dz / distance * travel) as i32;
         }
         scene.player.y = goal.y;
+        tracing::debug!(
+            target: "ffxi_event::vm",
+            at = ?(scene.player.x, scene.player.z),
+            goal = ?(goal.x, goal.z),
+            travel,
+            landed = distance <= travel,
+            "scene player lerp step"
+        );
         self.scene_actions
             .push(SceneAction::PlayerPosition(scene.player));
         let position = scene.player;
@@ -443,6 +529,21 @@ impl EventVm {
         vm.action_holds = self.action_holds.clone();
         vm.move_holds = self.move_holds.clone();
         let result = vm.step();
+        tracing::trace!(
+            target: "event_trace",
+            actor,
+            request_index = index,
+            ?result,
+            park = ?vm.park(),
+            exec_pointer = vm.exec_pointer,
+            pending_tag = ?vm.pending_tag(),
+            progress = vm.progress_stamp(),
+            action_holds = ?vm.action_holds.iter().map(|hold| (hold.actor, hold.key, hold.remaining_units)).collect::<Vec<_>>(),
+            pending_action_holds = ?vm.pending_action_holds,
+            pending_action_starts = ?vm.pending_action_starts,
+            cue_count = vm.cues.len(),
+            "child event step"
+        );
         for cue in vm.take_cues() {
             self.cues.push(cue.resolve_event_actor(ActorLookup(actor)));
         }
@@ -816,9 +917,41 @@ impl EventVm {
                 }
                 self.advance(op);
             }
+            // `OP_GET_HEADING` (`f_100b2c80`): the named actor's facing stored as a
+            // non-negative count of the VM's own heading units — retail wraps its
+            // radians float into [0, 2π) (`f_100dd9d0`, subtracting 6.283185 while
+            // above and adding it back below zero) and scales by 4096 × the
+            // captured 1/2π dword `[0x1032d6b4]` before rounding, which on kuluu's
+            // integer unit heading is exactly a positive modulo. An empty entity
+            // table slot stores zero; retail skips its write entirely when its
+            // eligibility check refuses the lookup, but that refusal is not
+            // separately observable from here, so unresolvable actors share the
+            // zero law (recorded delta).
+            OP_GET_HEADING => {
+                let target = ActorLookup(self.eventgetcode2(GET_HEADING_ACTOR_OFS));
+                let heading = self
+                    .named_actor_position(target)
+                    .map_or(0, |position| wrap_heading_units(position.heading));
+                self.setworkofs(GET_HEADING_WORK_OFS, heading, 0);
+                self.advance(op);
+            }
             OP_MOVE | OP_CODE_MOVE2 if self.scene.as_ref().unwrap().actor == ZONE_PLAYER_ACTOR => {
                 if self.byte_at(1) == 0 {
                     let goal = self.position_operands(MOVE_GOAL_OFS, false);
+                    // Which beat arms the player walk matters more than the lerp: every
+                    // "player moves at the wrong time" report resolves from this line's
+                    // stamp against the camera-route starts.
+                    tracing::info!(
+                        target: "ffxi_event::vm",
+                        op = if op == OP_SMOVE { "31" } else { "1f/5a" },
+                        goal = ?(goal.x, goal.y, goal.z),
+                        from = ?(
+                            self.scene.as_ref().unwrap().player.x,
+                            self.scene.as_ref().unwrap().player.z,
+                        ),
+                        speed = self.scene.as_ref().unwrap().speed,
+                        "scene player move armed"
+                    );
                     self.scene.as_mut().unwrap().motion = Some(goal);
                     self.scene.as_mut().unwrap().controls_position = true;
                     self.advance(op);
@@ -872,6 +1005,17 @@ impl EventVm {
             OP_SMOVE if self.scene.as_ref().unwrap().actor == ZONE_PLAYER_ACTOR => {
                 if self.byte_at(1) == 0 {
                     let goal = self.position_operands(2, false);
+                    tracing::info!(
+                        target: "ffxi_event::vm",
+                        op = "31",
+                        goal = ?(goal.x, goal.y, goal.z),
+                        from = ?(
+                            self.scene.as_ref().unwrap().player.x,
+                            self.scene.as_ref().unwrap().player.z,
+                        ),
+                        speed = self.scene.as_ref().unwrap().speed,
+                        "scene player move armed"
+                    );
                     self.scene.as_mut().unwrap().motion = Some(goal);
                     self.scene.as_mut().unwrap().controls_position = true;
                     self.exec_pointer += 10;
@@ -905,6 +1049,12 @@ impl EventVm {
             // their orbit around this position and facing.
             OP_SET_EVENT_POS => {
                 let position = self.position_operands(SET_EVENT_POS_X_OFS, true);
+                tracing::info!(
+                    target: "ffxi_event::vm",
+                    pos = ?(position.x, position.y, position.z),
+                    heading = position.heading,
+                    "scene player snap (0x37)"
+                );
                 // The snap moves the shared local-player cell so every sibling
                 // VM that walks or reads the local player sees it.
                 self.set_shared_player_position(position);
@@ -974,18 +1124,22 @@ impl EventVm {
                 self.advance(op);
             }
             // `OP_LOOKAT` case 0: turn the first named actor toward the second
-            // (research/XiEvents/OpCodes/0x0079.md).
+            // (research/XiEvents/OpCodes/0x0079.md). When that actor is the scene's own local
+            // player, [`turn_scene_player_toward`] puts the facing on the tracked position too.
             OP_LOOKAT if self.byte_at(LOOKAT_CASE_OFS) == 0 => {
                 let actor = ActorLookup(self.eventgetcode2(LOOKAT_ACTOR_OFS));
                 let target = ActorLookup(self.eventgetcode2(LOOKAT_TARGET_OFS));
+                self.turn_scene_player_toward(actor, target);
                 self.cues.push(EventCue::ActorLookAt { actor, target });
                 self.advance(op);
             }
             // `OP_LOOK_AND_TALK`: the motion half turns the event entity
             // toward the named actor (research/XiEvents/OpCodes/0x001E.md); the
-            // talk half is a separate message path.
+            // talk half is a separate message path. In a zone-player block the event entity
+            // resolves to the local player, whose facing this pins as well.
             OP_LOOK_AND_TALK => {
                 let target = ActorLookup(self.eventgetcode2(LOOK_AND_TALK_TARGET_OFS));
+                self.turn_scene_player_toward(ActorLookup::EVENT_ENTITY, target);
                 self.cues.push(EventCue::ActorLookAt {
                     actor: ActorLookup::EVENT_ENTITY,
                     target,
@@ -1040,7 +1194,8 @@ impl EventVm {
         self.scene.is_some()
             && matches!(
                 op,
-                OP_REQSET
+                OP_GET_HEADING
+                    | OP_REQSET
                     | OP_REQSET_CHECKED
                     | OP_REQUEST_WAIT
                     | OP_REQWAIT

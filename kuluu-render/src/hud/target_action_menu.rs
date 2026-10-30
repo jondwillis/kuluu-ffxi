@@ -1,4 +1,7 @@
+use bevy::picking::events::PointerPress;
+use bevy::picking::hover::Hovered;
 use bevy::prelude::*;
+use bevy::ui_widgets::Button;
 
 use crate::hud::action_model::{ActionEntry, ActionEntryKind, TargetActionId};
 use crate::hud::overlay::ActiveOverlay;
@@ -115,6 +118,7 @@ fn spawn_target_action_rows(p: &mut ChildSpawnerCommands) {
         p.spawn((
             TargetActionRow { slot },
             Button,
+            Hovered::default(),
             Node::default(),
             Text::new(""),
             style::text_font(13.0),
@@ -142,11 +146,11 @@ pub fn update_target_action_menu(
         return;
     };
 
+    // The staleness guard is exactly "the server-side mount disappeared" - a menu opened
+    // while riding must survive every mount the snapshot still reports, chocobos included
+    // (the record's evidence row: `.agents/skills/retail-observe/references/2026-10-02-mounted-command-menu.md`).
     if matches!(&*mode, InputMode::TargetAction(state) if state.ctx.modern_mount)
-        && !matches!(
-            scene.snapshot.self_mount,
-            Some(kuluu_snapshot::Mount::Other { .. })
-        )
+        && scene.snapshot.self_mount.is_none()
     {
         *mode = InputMode::World;
     }
@@ -353,7 +357,7 @@ pub fn update_target_action_menu(
 pub fn target_action_mouse_hover_system(
     mut mode: ResMut<InputMode>,
     overlay: Res<ActiveOverlay>,
-    rows: Query<(&Interaction, &TargetActionRow), Changed<Interaction>>,
+    rows: Query<(&Hovered, &TargetActionRow), Changed<Hovered>>,
 ) {
     let limit = entry_count(&mode, &overlay);
     let InputMode::TargetAction(state) = &mut *mode else {
@@ -366,10 +370,7 @@ pub fn target_action_mouse_hover_system(
     let start = viewport_start(limit, state.cursor);
     for (interaction, row) in &rows {
         let idx = start + row.slot;
-        if matches!(interaction, Interaction::Hovered | Interaction::Pressed)
-            && idx < limit
-            && state.cursor != idx
-        {
+        if interaction.0 && idx < limit && state.cursor != idx {
             state.cursor = idx;
         }
     }
@@ -378,9 +379,12 @@ pub fn target_action_mouse_hover_system(
 pub fn target_action_mouse_click_system(
     mode: Res<InputMode>,
     overlay: Res<ActiveOverlay>,
-    rows: Query<(&Interaction, &TargetActionRow), Changed<Interaction>>,
+    rows: Query<&TargetActionRow>,
     mut out: MessageWriter<TargetActionActivated>,
+    mut presses: MessageReader<PointerPress>,
+    parents: Query<&ChildOf>,
 ) {
+    let pressed_rows = super::primary_pressed_rows(&mut presses, &rows, &parents);
     let limit = entry_count(&mode, &overlay);
     let InputMode::TargetAction(state) = &*mode else {
         return;
@@ -389,9 +393,9 @@ pub fn target_action_mouse_click_system(
         return;
     }
     let start = viewport_start(limit, state.cursor);
-    for (interaction, row) in &rows {
+    for row in pressed_rows {
         let idx = start + row.slot;
-        if *interaction == Interaction::Pressed && idx < limit {
+        if idx < limit {
             out.write(TargetActionActivated { slot: idx });
         }
     }
@@ -454,6 +458,40 @@ mod tests {
             .world_mut()
             .query_filtered::<&Node, With<TargetActionMenu>>();
         assert_eq!(panel.single(app.world()).unwrap().display, Display::None);
+    }
+
+    /// The record's evidence row is a rented CHOCOBO screenshot
+    /// (.agents/skills/retail-observe/references/2026-10-02-mounted-command-menu.md): riding one keeps the
+    /// mounted self menu up - the staleness guard answers only to the mount disappearing.
+    #[test]
+    fn a_riding_chocobo_keeps_its_self_menu_open() {
+        let mut app = App::new();
+        app.init_resource::<crate::snapshot::SceneState>()
+            .init_resource::<ActiveOverlay>()
+            .insert_resource(InputMode::TargetAction(TargetActionState::open(
+                TargetActionContext {
+                    modern_mount: true,
+                    ..default()
+                },
+            )))
+            .add_systems(Update, update_target_action_menu);
+        app.world_mut().spawn((TargetActionMenu, Node::default()));
+        app.world_mut()
+            .resource_mut::<crate::snapshot::SceneState>()
+            .snapshot
+            .self_mount = Some(kuluu_snapshot::Mount::Chocobo {
+            colour: kuluu_snapshot::ChocoboColour::Yellow,
+        });
+        for _ in 0..3 {
+            app.update();
+        }
+        assert!(
+            matches!(
+                app.world().resource::<InputMode>(),
+                InputMode::TargetAction(_)
+            ),
+            "a menu opened on a chocobo must not be closed by its own kind"
+        );
     }
 
     #[test]

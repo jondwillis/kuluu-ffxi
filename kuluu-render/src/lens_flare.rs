@@ -102,7 +102,7 @@ struct FlareElement {
 
 impl Material for LensFlareMaterial {
     fn fragment_shader() -> ShaderRef {
-        "embedded://kuluu_render/lens_flare.wgsl".into()
+        "embedded://kuluu_render/lens_flare.wesl".into()
     }
 
     fn alpha_mode(&self) -> AlphaMode {
@@ -320,7 +320,7 @@ pub struct LensFlarePlugin;
 
 impl Plugin for LensFlarePlugin {
     fn build(&self, app: &mut App) {
-        embedded_asset!(app, "lens_flare.wgsl");
+        embedded_asset!(app, "lens_flare.wesl");
         app.init_resource::<LensFlareSheet>()
             .init_resource::<SunOcclusion>()
             .add_plugins(MaterialPlugin::<LensFlareMaterial>::default())
@@ -337,14 +337,14 @@ impl Plugin for LensFlarePlugin {
 mod tests {
     #[test]
     fn wgsl_sun_sky_radius_matches_sun_moon() {
-        let wgsl = include_str!("lens_flare.wgsl");
+        let wgsl = include_str!("lens_flare.wesl");
         let expected = format!(
             "const SUN_SKY_RADIUS: f32 = {:?};",
             crate::sun_moon::SKY_RADIUS
         );
         assert!(
             wgsl.contains(&expected),
-            "lens_flare.wgsl SUN_SKY_RADIUS drifted from sun_moon::SKY_RADIUS ({expected})"
+            "lens_flare.wesl SUN_SKY_RADIUS drifted from sun_moon::SKY_RADIUS ({expected})"
         );
     }
 }

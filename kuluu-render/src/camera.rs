@@ -235,6 +235,65 @@ impl Default for ChaseCamera {
     }
 }
 
+/// Retail's body-facing reference channel (`.agents/skills/retail-observe/references/
+/// 2026-10-07-camera-orbit-channels.md`, spec section "Body-facing reference channel"): a body-turning
+/// event stores its heading-change term and marks it active, steer-zero and reset events clear both, and
+/// the reference lasts until replaced or cleared. Kuluu's producer is each committed heading of
+/// `dispatch_movement_system`; every consumer sees it only through [`Self::post_orbit_angle`].
+#[derive(Resource, Debug, Clone, Copy, Default, PartialEq)]
+pub struct BodyFacingReference {
+    active: bool,
+    /// The stored term in chase-yaw radians, as the producer wrote it (un-negated).
+    heading_change_rad: f32,
+}
+
+impl BodyFacingReference {
+    pub fn is_active(&self) -> bool {
+        self.active
+    }
+
+    pub fn heading_change_rad(&self) -> f32 {
+        self.heading_change_rad
+    }
+
+    /// The producer half of the record: a turning event replaces the reference and its term with its
+    /// own, and steering that no longer turns the body calls this at zero, which retires both.
+    pub fn apply_heading_change(&mut self, heading_change_rad: f32) {
+        if heading_change_rad == 0.0 {
+            *self = Self::default();
+        } else {
+            self.active = true;
+            self.heading_change_rad = heading_change_rad;
+        }
+    }
+
+    /// The consumer half of the record, run only after the direct manual orbit within a frame: it
+    /// requires a control configuration active, the actor follow-mode flag set, an active reference,
+    /// and a nonzero horizontal camera action; it contributes the negative of the stored term through
+    /// the same applier as the direct angle (the stable-path consumer scales neither), and any positive
+    /// remaining transition time forces that angle to zero.
+    pub fn post_orbit_angle(
+        &self,
+        control_config_active: bool,
+        follow_mode: bool,
+        manual_axis: f32,
+        transition_secs_remaining: f32,
+    ) -> f32 {
+        let gated = control_config_active && follow_mode && self.active && manual_axis != 0.0;
+        if !gated || transition_secs_remaining > 0.0 {
+            return 0.0;
+        }
+        -self.heading_change_rad
+    }
+}
+
+/// The heading-change term of a body turn, in chase-yaw radians: the signed shortest sweep between two
+/// wire heading bytes as [`yaw_for_heading`] reads them.
+pub fn heading_change_term_rad(prev_byte: u8, new_byte: u8) -> f32 {
+    let swept = yaw_for_heading(new_byte) - yaw_for_heading(prev_byte);
+    (swept + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI
+}
+
 /// The operator camera's projection focal length — the live value the view zoom
 /// (mouse wheel, PgUp/PgDn, `.`, `,`) integrates and [`apply_view_fov_system`] turns into the
 /// vertical FOV it pushes each frame. Runtime-only: `GraphicsSettings::fov_deg` is the base it
@@ -499,11 +558,12 @@ impl CameraTransition {
 
 pub fn camera_transition_system(
     time: Res<Time>,
+    cutscene: Res<crate::cutscene::CutsceneMode>,
     mut transition: ResMut<CameraTransition>,
     mut mode: ResMut<CameraMode>,
     mut chase: ResMut<ChaseCamera>,
 ) {
-    if !transition.active {
+    if cutscene.camera_locked || !transition.active {
         return;
     }
 
@@ -680,12 +740,17 @@ pub use snapshot_chase_camera_system as chase_camera_system;
 
 pub fn firstperson_camera_system(
     mode: Res<CameraMode>,
+    cutscene: Res<crate::cutscene::CutsceneMode>,
     chase: Res<ChaseCamera>,
     step: Res<CameraStepSmoothing>,
+    arrange: Option<Res<crate::myroom_arrange::ArrangeCameraHold>>,
     q_self: Query<(&Transform, Option<&BakedActor>), (With<IsSelf>, Without<OperatorCamera>)>,
     mut q_cam: Query<&mut Transform, (With<OperatorCamera>, Without<IsSelf>)>,
 ) {
-    if !matches!(*mode, CameraMode::FirstPerson) {
+    if cutscene.camera_locked
+        || !matches!(*mode, CameraMode::FirstPerson)
+        || arrange.is_some_and(|hold| hold.0)
+    {
         return;
     }
     let Ok((self_t, baked)) = q_self.single() else {
@@ -752,6 +817,131 @@ pub fn heading_for_yaw(yaw: f32) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The producer half of the body-facing reference channel (camera record, "Body-facing reference
+    /// channel"): a turn replaces both halves; steering that no longer turns retires them, and until
+    /// then nothing else clears the reference.
+    #[test]
+    fn a_body_reference_is_replaced_or_retired_only_by_its_producer() {
+        let mut r = BodyFacingReference::default();
+        assert!(!r.is_active());
+
+        r.apply_heading_change(0.25);
+        assert!(r.is_active() && r.heading_change_rad() == 0.25);
+
+        r.apply_heading_change(-0.75);
+        assert!(r.is_active(), "the turning path replaces, not accumulates");
+        assert!((r.heading_change_rad() + 0.75).abs() < 1e-6);
+
+        r.apply_heading_change(0.0);
+        assert!(!r.is_active());
+    }
+
+    /// The consumer gate set of the same record section: all four predicates or nothing, the term
+    /// negated for a remaining transition gate.
+    #[test]
+    fn post_orbit_angle_needs_every_gate_and_negates_the_term() {
+        let mut r = BodyFacingReference::default();
+        r.apply_heading_change(0.3);
+
+        assert!((r.post_orbit_angle(true, true, 1.0, 0.0) + 0.3).abs() < 1e-6);
+        assert_eq!(r.post_orbit_angle(false, true, 1.0, 0.0), 0.0);
+        assert_eq!(r.post_orbit_angle(true, false, 1.0, 0.0), 0.0);
+        assert_eq!(r.post_orbit_angle(true, true, 0.0, 0.0), 0.0);
+        assert_eq!(r.post_orbit_angle(true, true, 1.0, 0.25), 0.0);
+
+        let mut idle = BodyFacingReference::default();
+        idle.apply_heading_change(0.3);
+        idle.apply_heading_change(0.0);
+        assert_eq!(idle.post_orbit_angle(true, true, 1.0, 0.0), 0.0);
+    }
+
+    /// The heading-change term takes the short sweep between wire bytes and answers in the frame
+    /// [`yaw_for_heading`] reports: byte-constant is zero, sweeps are antisymmetric and chain,
+    /// wrapping pairs agree.
+    #[test]
+    fn heading_change_terms_take_the_short_sweep_round() {
+        assert_eq!(heading_change_term_rad(73, 73), 0.0);
+
+        let quarter = std::f32::consts::FRAC_PI_4;
+        let t = heading_change_term_rad(0, 32);
+        assert!((t.abs() - quarter).abs() < 1e-5, "{t}");
+
+        let back = heading_change_term_rad(32, 0);
+        assert!((back + t).abs() < 1e-5);
+
+        let wrapped = heading_change_term_rad(248, 8);
+        let short = heading_change_term_rad(0, 16);
+        assert!(
+            (wrapped - short).abs() < 1e-4,
+            "the wrap reads the same 16-byte sweep"
+        );
+
+        let chain = heading_change_term_rad(10, 42)
+            - (heading_change_term_rad(10, 26) + heading_change_term_rad(26, 42));
+        assert!(chain.abs() < 1e-5);
+    }
+
+    #[test]
+    fn locked_cutscene_preserves_pose_in_first_person() {
+        let mut app = App::new();
+        app.insert_resource(CameraMode::FirstPerson)
+            .init_resource::<ChaseCamera>()
+            .init_resource::<CameraStepSmoothing>()
+            .insert_resource(crate::cutscene::CutsceneMode::active_locked())
+            .add_systems(Update, firstperson_camera_system);
+        app.world_mut().spawn((IsSelf, Transform::default()));
+        let authored_pose = Transform::from_translation(Vec3::X).looking_at(Vec3::ZERO, Vec3::Y);
+        let camera = app.world_mut().spawn((OperatorCamera, authored_pose)).id();
+
+        app.update();
+        assert_eq!(
+            *app.world().get::<Transform>(camera).unwrap(),
+            authored_pose
+        );
+
+        app.world_mut()
+            .resource_mut::<crate::cutscene::CutsceneMode>()
+            .camera_locked = false;
+        app.update();
+        assert_ne!(
+            *app.world().get::<Transform>(camera).unwrap(),
+            authored_pose
+        );
+    }
+
+    #[test]
+    fn locked_cutscene_pauses_active_camera_transition() {
+        let mut app = App::new();
+        let chase = ChaseCamera::default();
+        let distance = chase.distance;
+        let mut transition = CameraTransition::default();
+        transition.begin(CameraMode::Chase, distance);
+        let mut time = Time::<()>::default();
+        time.advance_by(std::time::Duration::from_secs_f32(transition.duration));
+        app.insert_resource(time)
+            .insert_resource(CameraMode::Chase)
+            .insert_resource(chase)
+            .insert_resource(transition)
+            .insert_resource(crate::cutscene::CutsceneMode::active_locked())
+            .add_systems(Update, camera_transition_system);
+
+        app.update();
+        assert_eq!(*app.world().resource::<CameraMode>(), CameraMode::Chase);
+        assert_eq!(app.world().resource::<ChaseCamera>().distance, distance);
+        assert_eq!(app.world().resource::<CameraTransition>().t, 0.0);
+        assert!(app.world().resource::<CameraTransition>().active);
+
+        app.world_mut()
+            .resource_mut::<crate::cutscene::CutsceneMode>()
+            .camera_locked = false;
+        app.update();
+        assert_eq!(
+            *app.world().resource::<CameraMode>(),
+            CameraMode::FirstPerson
+        );
+        assert!(!app.world().resource::<CameraTransition>().active);
+    }
 
     fn locator_skeleton(bone: usize) -> ffxi_dat::skel::Skeleton {
         use ffxi_dat::{

@@ -12,9 +12,26 @@ impl Default for NetStatusVisible {
     }
 }
 
-/// Fixed panel width so the menu help bar can reserve space for it exactly
-/// (retail pins the S/R readout at top-right, overlapping the bar's frame).
+/// Fixed slot width so the menu help bar can reserve space for it exactly.
+/// The readout itself draws no box - just the arrows and text (USER
+/// 2026-10-28: "it should not be drawing its own box.. it should be just the
+/// text/arrws"; any frame belongs to the top controls, which own their fade).
 pub const NET_PANEL_W: f32 = 122.0;
+
+/// Text sizes for the readout. Sized so the tallest stacks (the two baud rows, the arrow pair)
+/// fit inside one framed menu row - `menu_help_bar::BAR_HEIGHT` minus its borders, twenty-four
+/// px (USER 2026-10-28: "height should match the other bar and the inside to match fitting
+/// inside"; the box is now owned by the top controls at exactly that height).
+const NET_ARROW_FONT_PX: f32 = 8.0;
+const NET_PERCENT_FONT_PX: f32 = 11.0;
+const NET_BAUD_FONT_PX: f32 = 9.0;
+
+/// Rhythm between the three groups (arrows | percent | S-R stack) and within a baud row. Set by
+/// side-by-side with retail's readout (USER screenshot 2026-10-28: "spacing on kuluu crap.. its
+/// much tigher/neater on retail"): even gaps between the groups, and the value sits close to its
+/// S/R letter - wide right-aligned wells were what made kuluu's rows read loose.
+const NET_COLUMN_GAP_PX: f32 = 8.0;
+const NET_VALUE_GAP_PX: f32 = 3.0;
 
 #[derive(Component)]
 pub struct NetworkStatusPanel;
@@ -39,22 +56,25 @@ pub fn spawn_network_status(mut commands: Commands) {
         .spawn((
             crate::components::InGameEntity,
             NetworkStatusPanel,
+            // Text and arrows only: no fill, no border. The old own-frame made an
+            // empty box float at the viewport corner while the top controls' framed
+            // segments fade below it (USER 2026-10-28: "separate teh box from the
+            // send/recieve system and align it"). Anchored off the same inset the old
+            // 1px border + 6px padding produced, starting at the bar's row so it sits
+            // aligned with the top controls instead of the screen edge.
             Node {
                 position_type: PositionType::Absolute,
-                top: Val::Px(0.0),
-                right: Val::Px(0.0),
-                width: Val::Px(NET_PANEL_W),
-                padding: UiRect::axes(Val::Px(6.0), Val::Px(2.0)),
-                border: UiRect::all(Val::Px(1.0)),
+                top: Val::Px(crate::hud::menu_help_bar::BAR_TOP),
+                right: Val::Px(7.0),
+                width: Val::Px(NET_PANEL_W - 7.0),
+                height: Val::Px(crate::hud::menu_help_bar::BAR_HEIGHT),
                 flex_direction: FlexDirection::Row,
                 align_items: AlignItems::Center,
                 justify_content: JustifyContent::Center,
-                column_gap: Val::Px(6.0),
+                column_gap: Val::Px(NET_COLUMN_GAP_PX),
                 ..default()
             },
-            BackgroundColor(theme::FRAME_BG),
-            BorderColor::all(theme::FRAME_EDGE),
-            // Above the menu help bar so the panel frames over it, as retail does.
+            // Text stays above the fading bar band either way.
             GlobalZIndex(style::WINDOW_Z + 1),
         ))
         .with_children(|p| {
@@ -67,13 +87,13 @@ pub fn spawn_network_status(mut commands: Commands) {
                 col.spawn((
                     NetSendArrow,
                     Text::new("\u{25B2}"),
-                    style::text_font(9.0),
+                    style::text_font(NET_ARROW_FONT_PX),
                     TextColor(health_color(100)),
                 ));
                 col.spawn((
                     NetRecvArrow,
                     Text::new("\u{25BC}"),
-                    style::text_font(9.0),
+                    style::text_font(NET_ARROW_FONT_PX),
                     TextColor(health_color(100)),
                 ));
             });
@@ -87,7 +107,7 @@ pub fn spawn_network_status(mut commands: Commands) {
                 b.spawn((
                     NetPercentLabel,
                     Text::new("100%"),
-                    style::text_font(13.0),
+                    style::text_font(NET_PERCENT_FONT_PX),
                     TextColor(health_color(100)),
                 ));
             });
@@ -104,20 +124,22 @@ pub fn spawn_network_status(mut commands: Commands) {
         });
 }
 
-const PERCENT_BOX_W: f32 = 36.0;
-const BAUD_BOX_W: f32 = 38.0;
+// Well widths for the right-aligned fields, sized to their longest shown value plus a hair:
+// "100%" in the percent box (eleven px glyphs), four digits in the baud box.
+const PERCENT_BOX_W: f32 = 28.0;
+const BAUD_BOX_W: f32 = 26.0;
 
 fn spawn_baud_row<M: Component>(col: &mut ChildSpawnerCommands, prefix: &str, value_marker: M) {
     col.spawn(Node {
         flex_direction: FlexDirection::Row,
         align_items: AlignItems::Center,
-        column_gap: Val::Px(3.0),
+        column_gap: Val::Px(NET_VALUE_GAP_PX),
         ..default()
     })
     .with_children(|row| {
         row.spawn((
             Text::new(prefix.to_string()),
-            style::text_font(11.0),
+            style::text_font(NET_BAUD_FONT_PX),
             TextColor(theme::MUTED),
         ));
         row.spawn(Node {
@@ -129,7 +151,7 @@ fn spawn_baud_row<M: Component>(col: &mut ChildSpawnerCommands, prefix: &str, va
             b.spawn((
                 value_marker,
                 Text::new("0"),
-                style::text_font(11.0),
+                style::text_font(NET_BAUD_FONT_PX),
                 TextColor(theme::TEXT),
             ));
         });

@@ -167,6 +167,7 @@ fn quantity_overlay_production_capture() {
                     next_use_vana_ts: None,
                     use_delay_end_vana_ts: None,
                     ready: None,
+                    extdata: None,
                 })
             })
             .collect(),
@@ -185,6 +186,10 @@ fn item_id(name: &str) -> u16 {
         .expect("fixture item in scraped vocabulary")
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "The capture driver waits between manually advanced frames."
+)]
 fn capture(app: &mut App, target: &Handle<Image>, path: &str) {
     if std::path::Path::new(path).exists() {
         std::fs::remove_file(path).unwrap();

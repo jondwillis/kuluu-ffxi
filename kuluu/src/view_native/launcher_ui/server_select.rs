@@ -1,5 +1,5 @@
-use bevy::ecs::spawn::Spawn;
-use bevy::feathers::controls::{button_bundle, ButtonBundleProps, ButtonVariant};
+use bevy::feathers::controls::{ButtonVariant, FeathersButton};
+use bevy::feathers::font_styles::InheritableFont;
 use bevy::feathers::theme::ThemedText;
 use bevy::input::keyboard::{Key, KeyboardInput};
 use bevy::input::ButtonState;
@@ -78,14 +78,17 @@ pub(super) fn spawn_ui(
                         r.spawn(chip_group()).with_children(|chip| {
                             let pick_name = server_name.clone();
 
-                            chip.spawn(button_bundle(
-                                ButtonBundleProps {
-                                    variant,
-                                    ..default()
-                                },
-                                (),
-                                Spawn((Text::new(label), ThemedText)),
-                            ))
+                            chip.spawn_empty().apply_scene(bsn! {
+                                @FeathersButton {
+                                    @variant: variant,
+                                    @caption: bsn! {
+                                        Text::new(label)
+                                        ThemedText
+                                    },
+                                }
+                                Node { flex_grow: 1.0 }
+                                InheritableFont { font: {Handle::<Font>::default()} }
+                            })
                             .insert_if(DefaultFocusTarget, || idx == cursor_idx)
                             .observe(
                                 move |_ev: On<Activate>,
@@ -136,11 +139,16 @@ pub(super) fn spawn_ui(
                             );
 
                             let edit_name = server_name.clone();
-                            chip.spawn(button_bundle(
-                            ButtonBundleProps::default(),
-                            (),
-                            Spawn((Text::new("Edit"), ThemedText)),
-                        ))
+                            chip.spawn_empty().apply_scene(bsn! {
+                                @FeathersButton {
+                                    @caption: bsn! {
+                                        Text::new("Edit")
+                                        ThemedText
+                                    },
+                                }
+                                Node { flex_grow: 1.0 }
+                                InheritableFont { font: {Handle::<Font>::default()} }
+                            })
                         .observe(
                             move |_ev: On<Activate>,
                                   mut edit: ResMut<super::ServerEditForm>,
@@ -165,14 +173,17 @@ pub(super) fn spawn_ui(
                             } else {
                                 ("Delete", ButtonVariant::Normal)
                             };
-                            chip.spawn(button_bundle(
-                            ButtonBundleProps {
-                                variant: del_variant,
-                                ..default()
-                            },
-                            (),
-                            Spawn((Text::new(del_label), ThemedText)),
-                        ))
+                            chip.spawn_empty().apply_scene(bsn! {
+                                @FeathersButton {
+                                    @variant: del_variant,
+                                    @caption: bsn! {
+                                        Text::new(del_label)
+                                        ThemedText
+                                    },
+                                }
+                                Node { flex_grow: 1.0 }
+                                InheritableFont { font: {Handle::<Font>::default()} }
+                            })
                         .observe(
                             move |_ev: On<Activate>,
                                   mut commands: Commands,
@@ -219,14 +230,17 @@ pub(super) fn spawn_ui(
                 }
 
                 panel.spawn(row()).with_children(|r| {
-                    r.spawn(button_bundle(
-                        ButtonBundleProps {
-                            variant: ButtonVariant::Primary,
-                            ..default()
-                        },
-                        (),
-                        Spawn((Text::new("+ Add server"), ThemedText)),
-                    ))
+                    r.spawn_empty().apply_scene(bsn! {
+                        @FeathersButton {
+                            @variant: ButtonVariant::Primary,
+                            @caption: bsn! {
+                                Text::new("+ Add server")
+                                ThemedText
+                            },
+                        }
+                        Node { flex_grow: 1.0 }
+                        InheritableFont { font: {Handle::<Font>::default()} }
+                    })
                     .insert_if(DefaultFocusTarget, || n == 0)
                     .observe(
                         |_ev: On<Activate>,
@@ -239,16 +253,22 @@ pub(super) fn spawn_ui(
                     );
 
                     if has_last_used {
-                        r.spawn(button_bundle(
-                            ButtonBundleProps::default(),
-                            (),
-                            Spawn((Text::new("Cancel"), ThemedText)),
-                        ))
-                        .observe(
-                            |_ev: On<Activate>, mut next: ResMut<NextState<LauncherState>>| {
-                                next.set(LauncherState::Login);
-                            },
-                        );
+                        r.spawn_empty()
+                            .apply_scene(bsn! {
+                                @FeathersButton {
+                                    @caption: bsn! {
+                                        Text::new("Cancel")
+                                        ThemedText
+                                    },
+                                }
+                                Node { flex_grow: 1.0 }
+                                InheritableFont { font: {Handle::<Font>::default()} }
+                            })
+                            .observe(
+                                |_ev: On<Activate>, mut next: ResMut<NextState<LauncherState>>| {
+                                    next.set(LauncherState::Login);
+                                },
+                            );
                     }
                 });
             });

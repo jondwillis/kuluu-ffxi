@@ -1,5 +1,17 @@
 use super::*;
 
+/// The ceiling a seller may ask for one unit of merchandise: LSB validates the
+/// price of c2s 0x10A against exactly this range, and retail's own `Set Prices`
+/// spinner prints its cap as `/99,999,999 G`
+/// (vendor/server/src/map/packets/c2s/0x10a_bazaar_itemset.cpp validate).
+pub const BAZAAR_PRICE_MAX: u32 = 99_999_999;
+
+/// What survives of a bazaar comment: c2s 0x0DE carries a fixed `uint8_t[123]` and LSB's
+/// handler stores `sizeof(sInspectMessage) - 3` bytes of it verbatim to `char_stats`
+/// (vendor/server/src/map/packets/c2s/0x0de_inspect_message.cpp
+/// GP_CLI_COMMAND_INSPECT_MESSAGE::process).
+pub const BAZAAR_COMMENT_MAX_BYTES: usize = 120;
+
 /// One priced row of a browsed bazaar (s2c 0x105 GP_SERV_COMMAND_BAZAAR_LIST).
 /// The server pushes one packet per priced LOC_INVENTORY slot when we open the
 /// bazaar, then re-pushes the single affected row after every purchase — so

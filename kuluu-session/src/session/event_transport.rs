@@ -107,6 +107,7 @@ pub(super) fn prepare(
 ) -> Option<PreparedStep> {
     let (actor, index, event) = dialog.active_end()?;
     let advance = dialog.step(drive, &DrivePermit(()));
+    dialog.trace_step(&advance);
     let cues = dialog.take_cues();
     let mut actions = dialog.drain_scene_actions(&DrivePermit(()));
     if let Advance::Ended {

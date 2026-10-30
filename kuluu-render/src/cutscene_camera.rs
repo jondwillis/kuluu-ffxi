@@ -514,6 +514,11 @@ pub fn attach_matrix(actor: &Transform, model_point: Vec3) -> Mat4 {
     Mat4::from_translation(eid) * Mat4::from_quat(actor.rotation)
 }
 
+// The shipped skeletons settle the sign: race 1's reference table puts EID_NAME at
+// y=-2.0, EID_HEIGHT at -1.81 and EID_BODY_CENTER at -1.24 with the feet at ~-0.06 (dump:
+// `cargo run -p ffxi-dat --example zz-eid-refs`), i.e. negative model-frame y is up, exactly
+// what [`attach_matrix`]'s mzb_to_bevy flips to +y for Bevy. The height-fraction fallback
+// stands in with the same sign.
 /// research/XIClient include/World/Actor/EID_INDEX.h - the locator's point in the actor's
 /// model frame: the skeleton's EID reference table when the actor has a loaded model, else a
 /// fraction of the actor's height on the model's up axis. The special locators (EID_GROUND
@@ -526,6 +531,9 @@ pub fn eid_model_point(
     if locator >= ffxi_dat::camera::EID_NORMAL_MAX {
         return None;
     }
+    // `FfxiRenderActor::world_pose` is the actor-local pose chain (the instance's world matrix
+    // rides on top in the skinning shader), so its EID reference point names a model-frame
+    // location: [`attach_matrix`] carries it out exactly like an authored point.
     if let Some(render) = render {
         let point = ffxi_actor::skeleton_instance::standard_joint_world_position(
             render.world_pose(),
@@ -537,7 +545,10 @@ pub fn eid_model_point(
         }
     }
     let height = baked.map_or(crate::camera::FALLBACK_ACTOR_HEIGHT, |b| b.actor_height);
-    locator_height_fraction(locator).map(|frac| Vec3::new(0.0, height * frac, 0.0))
+    // Negative model-frame y is up (see above), so the stand-in carries the negative fraction
+    // like every shipped reference entry does; a positive one lands below the feet once
+    // [`attach_matrix`] flips the frame.
+    locator_height_fraction(locator).map(|frac| Vec3::new(0.0, -(height * frac), 0.0))
 }
 
 // research/XIClient include/World/Actor/EID_INDEX.h - the named body point indices; the
@@ -588,6 +599,12 @@ fn locator_height_fraction(locator: u32) -> Option<f32> {
 #[derive(Resource, Default)]
 pub struct CutsceneCameraTasks {
     current: Option<CutsceneCameraTask>,
+
+    /// Counts installed routes so the first-frame log prints once per route, not once per
+    /// camera lock: the chocobo rental scene runs c05i/c01i/c00i back to back under one lock,
+    /// and an unlogged middle route is a blind spot for framing reports.
+    start_seq: u64,
+
     /// The last frame applied while the scene held the camera. While locked with no active
     /// task, retail's user-control-disabled operator camera stays where the finished route
     /// left it (research/XiEvents/OpCodes/0x0046.md: case 1 disables control; only case 0
@@ -599,6 +616,12 @@ pub struct CutsceneCameraTasks {
 impl CutsceneCameraTasks {
     pub fn start(&mut self, task: CutsceneCameraTask) {
         self.current = Some(task);
+        self.start_seq += 1;
+    }
+
+    /// Identifies the route currently installed (0 before the first).
+    pub fn start_seq(&self) -> u64 {
+        self.start_seq
     }
 
     pub fn is_active(&self) -> bool {
@@ -714,7 +737,7 @@ pub fn advance_cutscene_camera_task(
     events: Res<EventLog>,
     mut tasks: ResMut<CutsceneCameraTasks>,
     mut cursor: Local<u64>,
-    mut logged_start: Local<bool>,
+    mut logged_route: Local<u64>,
     mut q_cam: Query<(&mut Transform, &mut Projection), With<crate::camera::OperatorCamera>>,
     q_attach: Query<
         (&Transform, Option<&BakedActor>),
@@ -734,7 +757,6 @@ pub fn advance_cutscene_camera_task(
             | kuluu_snapshot::ViewerEvent::ZoneChanged { .. }
             | kuluu_snapshot::ViewerEvent::Disconnected { .. } => {
                 tasks.clear();
-                *logged_start = false;
                 restore_projection(&settings, &mut q_cam);
             }
             _ => {}
@@ -766,25 +788,20 @@ pub fn advance_cutscene_camera_task(
         if let Some(held) = held {
             tasks.set_held(held);
             apply_frame(&held, &mut q_cam);
-        } else if *logged_start {
-            tracing::debug!(
-                target: "kuluu_render::cutscene_camera",
-                "cutscene camera route finished"
-            );
-            *logged_start = false;
         }
         return;
     };
-    if !*logged_start {
+    if *logged_route != tasks.start_seq() {
         tracing::debug!(
             target: "kuluu_render::cutscene_camera",
+            route = tasks.start_seq(),
             eye = ?frame.eye,
             target = ?frame.target,
             focal_length = frame.focal_length,
             roll = frame.roll,
             "cutscene camera route first frame"
         );
-        *logged_start = true;
+        *logged_route = tasks.start_seq();
     }
     tasks.set_held(frame);
     apply_frame(&frame, &mut q_cam);
@@ -1144,7 +1161,8 @@ mod tests {
 
     /// EID_NAME stands above the head, EID_BODY_CENTER at half height, EID_CURRENT on the
     /// ground; the special locators and untabled empties stay unresolvable, and without a
-    /// baked actor the fallback height stands in.
+    /// baked actor the fallback height stands in - negative model-frame y is up, matching the
+    /// shipped reference tables (`zz-eid-refs`: race 1 carries EID_NAME at y=-2.0).
     #[test]
     fn the_eid_fallback_reads_the_named_points_off_the_actor_height() {
         let baked = BakedActor {
@@ -1153,11 +1171,11 @@ mod tests {
             skeleton_span: None,
         };
         assert!(
-            (eid_model_point(2, Some(&baked), None).unwrap() - Vec3::new(0.0, 2.1, 0.0)).length()
+            (eid_model_point(2, Some(&baked), None).unwrap() - Vec3::new(0.0, -2.1, 0.0)).length()
                 < 1e-5
         );
         assert!(
-            (eid_model_point(21, Some(&baked), None).unwrap() - Vec3::new(0.0, 1.0, 0.0)).length()
+            (eid_model_point(21, Some(&baked), None).unwrap() - Vec3::new(0.0, -1.0, 0.0)).length()
                 < 1e-5
         );
         assert_eq!(eid_model_point(0, Some(&baked), None), Some(Vec3::ZERO));
@@ -1165,15 +1183,15 @@ mod tests {
         assert!(eid_model_point(44, Some(&baked), None).is_none());
         assert!(
             (eid_model_point(2, None, None).unwrap()
-                - Vec3::new(0.0, 1.05 * crate::camera::FALLBACK_ACTOR_HEIGHT, 0.0))
+                - Vec3::new(0.0, -1.05 * crate::camera::FALLBACK_ACTOR_HEIGHT, 0.0))
             .length()
                 < 1e-5
         );
     }
 
-    #[test]
-    fn the_eid_point_reads_the_skeleton_reference_table() {
-        let skeleton = ffxi_dat::skel::Skeleton {
+    /// The fixture every skeleton-branch test shares: joint 0 with references ringing it.
+    fn ring_skeleton() -> ffxi_dat::skel::Skeleton {
+        ffxi_dat::skel::Skeleton {
             id: ffxi_dat::datid::DatId::from_str("0000"),
             joints: vec![ffxi_dat::skel::Joint {
                 rotation: [0.0, 0.0, 0.0, 1.0],
@@ -1189,7 +1207,12 @@ mod tests {
                 .collect(),
             bounding_boxes: Vec::new(),
             look_at_limits: Vec::new(),
-        };
+        }
+    }
+
+    #[test]
+    fn the_eid_point_reads_the_skeleton_reference_table() {
+        let skeleton = ring_skeleton();
         let pose = ffxi_actor::skeleton_instance::pose_world(
             &skeleton,
             |_| None,
@@ -1201,6 +1224,54 @@ mod tests {
             (eid_model_point(7, None, Some(&render)).unwrap() - Vec3::new(0.0, 7.0, 0.0)).length()
                 < 1e-4
         );
+    }
+
+    /// The skinning shader composes the instance's world matrix on top of `world_pose`'s joint
+    /// blend, so the pose chain - and every locator point read from it - names a model-frame
+    /// location. Whatever branch resolves (loaded skeleton or height fraction), the attach
+    /// matrix must land on the actor wherever it stands, carrying the locator above the feet
+    /// as authored; an origin left near world zero (or built by placing the posed point twice,
+    /// or standing under the feet where a sign-inverted stand-in would put it) frames every
+    /// attached route from elsewhere.
+    #[test]
+    fn every_attach_branch_lands_the_matrix_on_the_actor() {
+        // A torso-height body center in the model's DAT frame, joint 0 at the pose origin as
+        // `pose_world` leaves it - placement rides on the entity transform, not the chain.
+        let mut skeleton = ring_skeleton();
+        skeleton.references[21].position_offset = [0.0, -1.0, 0.0];
+        let pose = ffxi_actor::skeleton_instance::pose_world(
+            &skeleton,
+            |_| None,
+            ffxi_actor::skeleton_instance::RootTransform::identity(),
+            &[],
+        );
+        let render = crate::ffxi_actor_render::render_actor_for_test(skeleton.clone(), pose);
+        // An actor at Bastok-rental scale, turned a quarter way: ~43.9 east, ~108.9 south.
+        let rotation = Quat::from_rotation_y(-std::f32::consts::FRAC_PI_2);
+        let actor = Transform {
+            translation: Vec3::new(43.9, -1.0, 108.9),
+            rotation,
+            ..Default::default()
+        };
+
+        let baked = BakedActor {
+            min_mesh_y: 0.0,
+            actor_height: 2.0,
+            skeleton_span: None,
+        };
+        for point in [
+            eid_model_point(21, None, Some(&render)),
+            eid_model_point(21, Some(&baked), None),
+        ] {
+            let m = attach_matrix(&actor, point.unwrap());
+            // Within a torso of the entity's own placement - not near world zero and not at a
+            // double-placed mirror ~150 yalms out.
+            assert!(
+                (m.transform_point3(Vec3::ZERO) - actor.translation).length() < 2.0,
+                "attach origin must ride on the actor: {:?}",
+                m.transform_point3(Vec3::ZERO)
+            );
+        }
     }
 
     #[test]
@@ -1467,8 +1538,9 @@ mod tests {
 
     /// An attached route re-resolves the attach matrix from the actor's wire transform each
     /// frame; a full interp follows every move. EID_BODY_CENTER is half the actor's height in
-    /// the model frame; mzb_to_bevy maps the model's up to Bevy -Y, so the eye parks one unit
-    /// below the actor's origin.
+    /// the model frame, where negative y is up (the shipped reference tables: race 1 carries
+    /// body center at -1.24, `zz-eid-refs`); mzb_to_bevy flips it out, so the eye parks one
+    /// unit above the actor's feet.
     #[test]
     fn an_attached_route_tracks_the_actor_as_it_moves() {
         let mut app = hold_app();
@@ -1506,7 +1578,7 @@ mod tests {
                 1.0,
                 attach_matrix(
                     &Transform::from_xyz(10.0, 0.0, 0.0),
-                    Vec3::new(0.0, 1.0, 0.0),
+                    Vec3::new(0.0, -1.0, 0.0),
                 ),
             )),
         );
@@ -1517,7 +1589,7 @@ mod tests {
         hold_step(&mut app, 2);
         let (eye, _) = hold_cam(&mut app);
         assert!(
-            (eye - Vec3::new(10.0, -1.0, 0.0)).length() < 1e-3,
+            (eye - Vec3::new(10.0, 1.0, 0.0)).length() < 1e-3,
             "parked: {eye:?}"
         );
 
@@ -1529,7 +1601,7 @@ mod tests {
         hold_step(&mut app, 2);
         let (eye, _) = hold_cam(&mut app);
         assert!(
-            (eye - Vec3::new(30.0, -1.0, 0.0)).length() < 1e-3,
+            (eye - Vec3::new(30.0, 1.0, 0.0)).length() < 1e-3,
             "tracked: {eye:?}"
         );
     }

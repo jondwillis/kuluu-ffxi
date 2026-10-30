@@ -15,6 +15,7 @@ use kuluu_render::mouse::{
 };
 
 use super::collision_bvh::{CollisionBvh, ZoneCollisionBvh};
+use super::input::RETAIL_MOVE_TICKS_PER_SEC;
 use super::locked_camera::{
     follow_share, lock_focal, short_of_wall, LockedCamera, LockedWorld, PLAYER_POINT_SLOT,
     TARGET_POINT_SLOT, WALL_RAY_RISE,
@@ -108,6 +109,62 @@ pub struct LeashState {
     target_rise: Option<(u32, f32)>,
     /// How far the rendered view still sits from the chase rig's after a lock released.
     handoff: Option<Handoff>,
+    /// The retail chase cascade while the spring drives the rig; every reset path clears it and the
+    /// next frame re-seeds exact.
+    chase: Option<ChaseCascade>,
+}
+
+/// Retail's chase-camera cascade (record `.agents/skills/retail-observe/references/2026-10-07-camera-orbit-channels.md`
+/// "Chase-camera leash and spring"): the eased triple blends toward this frame's candidate at weight
+/// one-half once per update, then the sprung triple closes nought-point-two-five of what remains every
+/// movement tick (retail runs an integerized tick-proportional count - substeps in proportion to
+/// elapsed ticks, so wall-clock response is framerate-independent). Kuluu takes that share
+/// fractionally (`1 - (1 - alpha)^ticks`) instead of carrying whole substeps, which is identical at
+/// retail's and a 60 Hz client's tick counts and removes the refresh-rate aliasing above it.
+#[derive(Clone, Copy)]
+struct ChaseCascade {
+    eased: Vec3,
+    /// The triple the rig consumes - retail's persisted chase state.
+    sprung: Vec3,
+}
+
+impl ChaseCascade {
+    fn seeded_at(point: Vec3) -> Self {
+        Self {
+            eased: point,
+            sprung: point,
+        }
+    }
+
+    fn advance(&mut self, candidate: Vec3, dt: f32) {
+        if dt > FRAME_STALL_SECS {
+            // A stalled frame (a window resize, a menu opening for the first time, a zone stream
+            // hitch): retail runs its cascade once per vsynced frame and can never owe more than one
+            // tick of spring, so what it shows across a stall is simply the new rig position. Kuluu's
+            // carry would instead spend the stall as a burst of substeps through
+            // [`CHASE_SPRING_MAX_STEPS`] - visible as the view lurching when the frame finally comes,
+            // which USER saw twice ("the FIRST time you open the menu, the screen jitters", 2026-10-28
+            // on top of the earlier stair jackhammer). Re-seed exact: the hitch stays a hitch, it
+            // stops becoming camera motion.
+            self.eased = candidate;
+            self.sprung = candidate;
+            return;
+        }
+        self.eased += (candidate - self.eased) * CHASE_EASE_ALPHA;
+        let elapsed_ticks =
+            (dt * RETAIL_MOVE_TICKS_PER_SEC).clamp(0.0, CHASE_SPRING_MAX_STEPS as f32);
+        // The spring share in fractional form: closing `elapsed_ticks` iterations of the recorded
+        // nought-point-two-five is exactly `1 - (1 - 0.25)^elapsed_ticks`, and for whole tick counts
+        // (retail's own integer count, and kuluu at a vsynced 60 Hz) the two are bit-for-bit the same
+        // law. The fraction matters above 60 Hz: with an integer substep count a 144 Hz client closes
+        // zero spring on most frames and a full one on every third, so the rig moves in bursts - the
+        // refresh-rate aliasing USER keeps reporting as jitter while running ("W+D causing a jitter..
+        // like an update pause", "nameplates jitter on a flat surface while running", 2026-10-28) -
+        // where retail, vsynced at its own rate, never aliases. `chase_cascade_springs_identically_at
+        // _any_framerate` pins the equivalence and the smoothness.
+        let share = 1.0 - (1.0 - CHASE_SPRING_ALPHA).powf(elapsed_ticks);
+        self.sprung += (self.eased - self.sprung) * share;
+    }
 }
 
 /// A lock in play: the target, the locked camera, and whether the lock's opening
@@ -179,6 +236,33 @@ const CAMERA_MIN_DISTANCE: f32 = 0.5;
 /// boom under the anchor; the zone BVH raycast cannot see unauthored floor gaps, so without this
 /// a fully lowered eye slips under the floor and views through it from below.
 const EYE_FLOOR_BELOW_PIVOT: f32 = 0.5;
+
+/// The chase cascade's ease weight - the immediate float one-half at FFXiMain.dll retail-2026-10 VA
+/// 0x1001F50F, blended toward this frame's candidate once per update.
+const CHASE_EASE_ALPHA: f32 = 0.5;
+
+/// The chase cascade's spring weight per substep as retail carries it - the immediate float
+/// nought-point-two-five at FFXiMain.dll retail-2026-10 VA 0x1001F5D3.
+const CHASE_SPRING_ALPHA_RETAIL: f32 = 0.25;
+
+/// The spring weight kuluu runs today: HALF the recorded retail share, on USER's feel request of
+/// 2026-10-28. Doubling it read as making the spring LESS ("wtf.. you made the spring LESS.. I told
+/// you i WANTED MORE") because a bigger share makes the eye catch up FASTER - stiffer, less trail.
+/// Halving it doubles how long the eye trails its leash goal after a cut or stair rise, which is the
+/// spring feel being asked for. Retail's own number is kept above so this deviation stays auditable
+/// against the record (`chase_cascade_run_spring_is_retail_halved_for_trail` pins both values).
+const CHASE_SPRING_ALPHA: f32 = CHASE_SPRING_ALPHA_RETAIL / 2.0;
+
+/// How many spring substeps one frame simulates at most, bounding the simulation after a pause or
+/// hitch; retail's own count is bounded by its vsynced framerate instead.
+const CHASE_SPRING_MAX_STEPS: u32 = 8;
+
+/// A rendered frame longer than the catch-up cap plus one tick is a stall, not a slow frame:
+/// [`ChaseCascade::advance`] re-seeds exact rather than carrying it into spring substeps. Derived from
+/// the cap so the two can never drift apart: frames the cascade can still simulate it simulates, and
+/// anything longer - the pauses felt as the view lurching when a menu opened or a zone streamed in,
+/// USER 2026-10-28 - simply lands.
+const FRAME_STALL_SECS: f32 = (CHASE_SPRING_MAX_STEPS as f32 + 1.0) / RETAIL_MOVE_TICKS_PER_SEC;
 
 const OUTWARD_LERP: f32 = 0.18;
 
@@ -259,7 +343,10 @@ pub fn resolve_camera(
     step: Res<kuluu_render::camera::CameraStepSmoothing>,
     time: Res<Time>,
     scene_state: Res<SceneState>,
-    cutscene: Res<kuluu_render::cutscene::CutsceneMode>,
+    (cutscene, arrange): (
+        Res<kuluu_render::cutscene::CutsceneMode>,
+        Option<Res<kuluu_render::myroom_arrange::ArrangeCameraHold>>,
+    ),
     zone_bvh: Res<ZoneCollisionBvh>,
     self_q: Query<
         (&Transform, Option<&BakedActor>, Option<&Children>),
@@ -278,11 +365,15 @@ pub fn resolve_camera(
     >,
     view_fov: Res<kuluu_render::ViewFov>,
     render_q: Query<(&FfxiRenderActor, &GlobalTransform)>,
-    mut smoothed_effective: Local<Option<f32>>,
+    // `smoothed_effective`: eased boom length. The second slot is the self pivot's chest offset,
+    // measured once and held while a re-bake (gear swap, mount pose) leaves the actor
+    // momentarily unmeasured - the focus height moves only with the actor.
+    (mut smoothed_effective, mut self_anchor_y): (Local<Option<f32>>, Local<Option<f32>>),
     mut leash_state: Local<LeashState>,
 ) {
     if !matches!(*mode, CameraMode::Chase) {
         *smoothed_effective = None;
+        *self_anchor_y = None;
         *leash_state = LeashState::default();
         chase.turn_owed = 0.0;
         return;
@@ -290,14 +381,17 @@ pub fn resolve_camera(
     // A running event holding the camera owns the operator camera (the
     // cutscene camera route advances or freezes it after this system): the
     // chase must not attach to the player while the script owns the view.
-    if cutscene.camera_locked {
+    // Mog House layout mode holds it the same way while arranging.
+    if cutscene.camera_locked || arrange.is_some_and(|hold| hold.0) {
         *smoothed_effective = None;
+        *self_anchor_y = None;
         *leash_state = LeashState::default();
         chase.turn_owed = 0.0;
         return;
     }
     let Ok((self_t, baked, self_children)) = self_q.single() else {
         *smoothed_effective = None;
+        *self_anchor_y = None;
         *leash_state = LeashState::default();
         chase.turn_owed = 0.0;
         return;
@@ -316,7 +410,18 @@ pub fn resolve_camera(
     }
 
     let player_pos = self_t.translation;
-    let anchor_y = Vec3::Y * (third_person_anchor_y(baked) - step.offset);
+    // Feet + the retail span×0.6 chest offset (`kuluu_render::camera`, record cited there). A
+    // model re-bake drops the measurement for a frame or two; the held value keeps the aim point
+    // from moving when only the pose changed.
+    let anchor_y = Vec3::Y
+        * (match baked {
+            Some(b) => {
+                let measured = third_person_anchor_y(Some(b));
+                *self_anchor_y = Some(measured);
+                measured
+            }
+            None => *self_anchor_y.get_or_insert_with(|| third_person_anchor_y(None)),
+        } - step.offset);
     let pivot_y = player_pos.y + anchor_y.y;
     let pivot_xz = Vec2::new(player_pos.x, player_pos.z);
     let dt = time.delta_secs().max(1e-4);
@@ -333,7 +438,38 @@ pub fn resolve_camera(
     let min_h = LEASH_INNER_EDGE;
     let yaw_dir = |yaw: f32| Vec2::new(yaw.sin(), yaw.cos());
 
-    // Focus: held inside the dead zone, dragged to its edge outside it.
+    // Retail's chase cascade sits between the anchor and everything the rig consumes: position, aim
+    // height and the pull-in origin all come from the sprung triple, so a discrete jump of the
+    // player pose arrives attenuated. `camera_spring` off or a snap leaves exact pose - retail runs no
+    // cascade on its reset paths (record cited on [`ChaseCascade`]).
+    let raw_pivot = Vec3::new(pivot_xz.x, pivot_y, pivot_xz.y);
+    let chase_cascade = if settings.camera_spring {
+        let mut c = leash_state
+            .chase
+            .unwrap_or_else(|| ChaseCascade::seeded_at(raw_pivot));
+        // A snap writes exact values into the persisted state without cascading, like retail's
+        // reset paths - so a jump on the very next frame still arrives attenuated.
+        if chase.snap_to_anchor {
+            c = ChaseCascade::seeded_at(raw_pivot);
+        } else {
+            c.advance(raw_pivot, dt);
+        }
+        Some(c)
+    } else {
+        None
+    };
+    // The lateral law (USER 2026-10-29): the view's centre is always exactly the player on XZ.
+    // Consuming the cascade laterally made a steady strafe trail it by its follow-lag (~half a
+    // yalm at run speed), seen as the player pushed off-centre left/right ("the player has leash
+    // l/r when it should be set at 0 default") and arrow turns holding that offset in front of
+    // the face ("camera focus for arrows is way off"). The cascade keeps its two jobs it cannot
+    // lose: the stepped height arrives sloped (stairs, jackhammer class) and the boom's distance
+    // easing trails; both are vertical/radial, never lateral.
+    let sprung_pivot = chase_cascade.map_or(raw_pivot, |c| c.sprung);
+    let pivot_y = sprung_pivot.y;
+
+    // Focus: at the player exactly (Camera_leash = 0, the shipped default), or held inside the
+    // debug row's dead zone against pivot wobble when that row is raised.
     let focus = match leash_state.focus {
         Some(f) if !chase.snap_to_anchor && leash_on => {
             leash(f, pivot_xz, 0.0, settings.camera_leash_yalms, Vec2::ZERO)
@@ -408,13 +544,15 @@ pub fn resolve_camera(
             };
             // Retail's wall test runs from just above the player's feet to the eye and keeps the eye
             // short of a hit (`FFXiMain.dll retail-2026-09` RVA 0x20651..0x20765).
-            if let Some(bvh) = zone_bvh.0.as_ref() {
-                let origin = player_pos + Vec3::Y * WALL_RAY_RISE;
-                let to_eye = view.eye - origin;
-                let reach = to_eye.length();
-                if reach > f32::EPSILON {
-                    if let Some(hit) = bvh.ray_cast(origin, to_eye / reach, reach) {
-                        view.eye = short_of_wall(origin, view.eye, hit);
+            if zone_bvh.query_ready() {
+                if let Some(bvh) = zone_bvh.tree() {
+                    let origin = player_pos + Vec3::Y * WALL_RAY_RISE;
+                    let to_eye = view.eye - origin;
+                    let reach = to_eye.length();
+                    if reach > f32::EPSILON {
+                        if let Some(hit) = bvh.ray_cast(origin, to_eye / reach, reach) {
+                            view.eye = short_of_wall(origin, view.eye, hit);
+                        }
                     }
                 }
             }
@@ -507,14 +645,26 @@ pub fn resolve_camera(
     let dir = Vec3::new(chase.yaw.sin() * cos_p, sin_p, chase.yaw.cos() * cos_p);
     let wanted = to_eye.length().max(min_h) / cos_p;
 
+    // Readiness gate: while zone geometry is streaming or its tree is being rebuilt there is no answer
+    // for this boom, so hold last frame's standoff instead of extending the eye through geometry that has
+    // not arrived. Retail refuses an unready candidate rather than answering from it
+    // (.agents/skills/retail-observe/references/2026-10-25-collision-query.md).
+    let ready = zone_bvh.query_ready();
     let mut hit_t = wanted;
-    if let Some(bvh) = zone_bvh.0.as_ref() {
-        if let Some(t) = bvh.ray_cast(pivot, dir, wanted) {
-            hit_t = t.min(hit_t);
+    if ready {
+        if let Some(bvh) = zone_bvh.tree() {
+            if let Some(t) = bvh.ray_cast(pivot, dir, wanted) {
+                hit_t = t.min(hit_t);
+            }
         }
     }
 
     let target = clamped_camera_distance(hit_t, wanted);
+    let target = if ready || chase.snap_to_anchor {
+        target
+    } else {
+        smoothed_effective.unwrap_or(target)
+    };
 
     let mut effective = if !settings.camera_spring || chase.snap_to_anchor {
         target
@@ -565,6 +715,7 @@ pub fn resolve_camera(
         locked: locked_view.map(|(lock, _)| lock),
         target_rise: locked_view.and_then(|(lock, rise)| rise.map(|rise| (lock.target, rise))),
         handoff,
+        chase: chase_cascade,
     };
     chase.snap_to_anchor = false;
 }
@@ -626,7 +777,7 @@ pub fn draw_camera_collision_debug(
     };
 
     if source.uses_mzb() {
-        if let Some((mn, mx)) = zone_bvh.0.as_ref().and_then(|b| b.root_aabb()) {
+        if let Some((mn, mx)) = zone_bvh.tree().and_then(|b| b.root_aabb()) {
             draw_aabb(mn, mx, Color::srgba(0.20, 0.80, 1.0, 0.55));
         }
     }
@@ -1754,5 +1905,394 @@ mod tests {
             (continuous_yaw(home, yaw) - home).abs() < 2e-3,
             "the camera came to rest at {yaw} rad, want {home} rad"
         );
+    }
+
+    /// The deviation itself, pinned: kuluu runs exactly half the recorded retail spring share
+    /// (USER's 2026-10-28 feel request - doubling it felt like LESS spring), with the ease weight
+    /// untouched at the record's one-half.
+    #[test]
+    fn chase_cascade_run_spring_is_retail_halved_for_trail() {
+        assert!(
+            (CHASE_SPRING_ALPHA - CHASE_SPRING_ALPHA_RETAIL / 2.0).abs() < 1e-7
+                && (CHASE_SPRING_ALPHA_RETAIL - 0.25).abs() < 1e-7,
+            "spring share drifted from recorded retail {CHASE_SPRING_ALPHA_RETAIL} halved: {}",
+            CHASE_SPRING_ALPHA
+        );
+    }
+
+    /// The cascade's constants, pinned against the record and kuluu's doubled spring: from a seeded
+    /// rest, one movement tick after a jump of `R` toward the new pose the eased triple sits at R/2
+    /// and the sprung triple at R times the ease share times the spring share.
+    #[test]
+    fn chase_cascade_pins_the_recorded_weights_after_a_jump() {
+        const RISER: f32 = 0.5;
+        let mut c = ChaseCascade::seeded_at(Vec3::ZERO);
+        c.advance(Vec3::Y * RISER, 1.0 / 60.0);
+        assert!(
+            (c.eased.y - RISER * CHASE_EASE_ALPHA).abs() < 1e-7,
+            "ease weight applied once per update: {:?}",
+            c.eased
+        );
+        assert!(
+            (c.sprung.y - RISER * CHASE_EASE_ALPHA * CHASE_SPRING_ALPHA).abs() < 1e-7,
+            "one movement tick springs the spring share of what the ease stage moved: {:?}",
+            c.sprung
+        );
+    }
+
+    /// A cascade run to rest never overshoots the jump and no single frame closes more than one
+    /// tick's worth (ease share times spring share) of the raw jump; with substeps at the movement
+    /// rate it settles on the new pose.
+    #[test]
+    fn chase_cascade_attenuates_and_settles_without_overshoot() {
+        const RISER: f32 = 0.5;
+        let target = Vec3::Y * RISER;
+        let mut c = ChaseCascade::seeded_at(Vec3::ZERO);
+        let mut prev_y = 0.0f32;
+        let mut max_step = 0.0f32;
+        for _ in 0..60 {
+            c.advance(target, 1.0 / 60.0);
+            assert!(
+                c.sprung.y <= RISER + 1e-7,
+                "overshot the jump: {:?}",
+                c.sprung
+            );
+            let dy = c.sprung.y - prev_y;
+            max_step = max_step.max(dy);
+            prev_y = c.sprung.y;
+        }
+        assert!(
+            (c.sprung.y - RISER).abs() < 1e-3,
+            "did not settle on the new pose: {:?}",
+            c.sprung
+        );
+        // Attenuation law vs the raw step: one movement tick closes only the spring share of what
+        // still separates the eye from its eased goal, and that gap is itself bounded by the riser -
+        // so no single frame may carry more than the spring share of a full riser. (Measured on this
+        // build rather than assumed: the biggest step falls mid-curve at 0.0454 yalm, not on the first
+        // tick's 0.0313, because the ease stage is still moving while the spring chases it.)
+        assert!(
+            max_step <= RISER * CHASE_SPRING_ALPHA + 1e-6,
+            "a frame moved {max_step} of a {RISER} jump"
+        );
+    }
+
+    /// The spring closes in proportion to elapsed ticks at *any* framerate, and the trajectory is
+    /// the same one a vsynced client traces. Replaces the former integer-substep pin (half-tick frames
+    /// springing on alternate frames): that burst-at-refresh-rate behaviour was itself felt as jitter
+    /// on kuluu's uncapped frames (USER 2026-10-28, "W+D causing a jitter ... like an update pause",
+    /// "nameplates jitter on a flat surface while running"). Three refresh rates over one second of
+    /// wall clock - 30 Hz, 60 Hz and 144 Hz - must arrive at the same sprung triple within float noise,
+    /// and no frame may reverse direction by more than float noise (no burst-then-stall).
+    #[test]
+    fn chase_cascade_springs_identically_at_any_framerate() {
+        let target = Vec3::new(2.0, 0.0, 0.0);
+        let mut end_by_fps: Vec<f32> = Vec::new();
+        for fps in [30.0f32, 60.0, 144.0] {
+            let dt = 1.0 / fps;
+            let mut c = ChaseCascade::seeded_at(Vec3::X);
+            let mut prev_x = 1.0f32;
+            let initial_gap = target.x - 1.0;
+            // Aliasing measure: a frame in which the rig does not move at all while most of its gap
+            // is still open is the burst-then-stall pattern USER feels as jitter along a run. The
+            // fractional share never stalls; an integer substep count stalled every other frame at
+            // half-tick rates and two frames in three at 144 Hz.
+            let mut stalled_frames = 0usize;
+            let mut moving_frames = 0usize;
+            for _ in 0..(fps as usize) {
+                c.advance(target, dt);
+                if c.sprung.x > target.x + 1e-6 {
+                    panic!("overshot at {fps} fps: {:?}", c.sprung);
+                }
+                let step = c.sprung.x - prev_x;
+                // "Still meaningfully short of the rig": a quarter or more of the original gap left.
+                if target.x - prev_x > 0.25 * initial_gap {
+                    moving_frames += 1;
+                    if step <= 0.0 {
+                        stalled_frames += 1;
+                    }
+                }
+                prev_x = c.sprung.x;
+            }
+            println!(
+                "DIAG cascade {fps:>5.0} fps: end x={:.9}, stalled frames while moving {stalled_frames}/{moving_frames}",
+                c.sprung.x
+            );
+            assert_eq!(
+                stalled_frames, 0,
+                "{fps} fps rig stood still on {stalled_frames} of {moving_frames} frames with a quarter or more of its gap open"
+            );
+            end_by_fps.push(c.sprung.x);
+        }
+        let spread = end_by_fps
+            .iter()
+            .fold(0.0f32, |acc, v| acc.max(v - end_by_fps[0]));
+        println!("DIAG cascade endpoint spread across 30/60/144 fps: {spread:.3e}");
+        assert!(
+            spread < 1e-3,
+            "framerates disagree about where the rig ended up: {end_by_fps:?}"
+        );
+    }
+
+    /// A stalled frame re-seeds the cascade exact instead of spending it as catch-up: the view shows
+    /// the new rig position when the frame finally arrives, never a lurch through it (USER's first
+    /// menu-open jitter, 2026-10-28). Frames up to `CHASE_SPRING_MAX_STEPS` ticks are not stalls and are
+    /// simulated - one fractional share equals the same number of whole iterations of the recorded
+    /// spring weight.
+    #[test]
+    fn chase_cascade_reseeds_on_a_stall_and_simulates_a_long_frame() {
+        // Stall: one huge frame lands the rig on the candidate exactly, with no carry left over.
+        let mut c = ChaseCascade::seeded_at(Vec3::ZERO);
+        c.advance(Vec3::Y * 0.5, FRAME_STALL_SECS * 2.0);
+        assert!(
+            (c.sprung - Vec3::Y * 0.5).length() < 1e-6,
+            "a stall left the cascade owing spring: {:?}",
+            c.sprung
+        );
+        // Long-but-not-stalled frame (exactly the cap in ticks): the fractional share equals the
+        // whole iterations of the recorded weight.
+        let mut long = ChaseCascade::seeded_at(Vec3::ZERO);
+        let mut stepped = ChaseCascade::seeded_at(Vec3::ZERO);
+        stepped.eased += (Vec3::Y - stepped.eased) * CHASE_EASE_ALPHA;
+        for _ in 0..CHASE_SPRING_MAX_STEPS {
+            stepped.sprung += (stepped.eased - stepped.sprung) * CHASE_SPRING_ALPHA;
+        }
+        long.advance(
+            Vec3::Y,
+            CHASE_SPRING_MAX_STEPS as f32 / RETAIL_MOVE_TICKS_PER_SEC,
+        );
+        println!(
+            "DIAG cascade cap frame ({} ticks): fractional {} vs whole iterations {}",
+            CHASE_SPRING_MAX_STEPS, long.sprung.y, stepped.sprung.y
+        );
+        assert!(
+            (long.sprung.y - stepped.sprung.y).abs() < 1e-5,
+            "cap-tick frame did not close like whole iterations: {} vs {}",
+            long.sprung.y,
+            stepped.sprung.y
+        );
+    }
+
+    /// The full rig on the retail spring (default setting): a one-riser jump of the player pose must
+    /// move the camera by strictly less than the riser in every frame and settles it on the new
+    /// anchor - no vertical kick for a stair mount. `camera_spring` off keeps the exact-follow
+    /// behavior pinned by the other rig tests.
+    #[test]
+    fn a_stair_jump_reaches_the_camera_attenuated_and_settles() {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .insert_resource(bevy::time::TimeUpdateStrategy::ManualDuration(
+                std::time::Duration::from_secs_f32(1.0 / 60.0),
+            ))
+            .insert_resource(CameraMode::Chase)
+            .insert_resource(kuluu_render::GraphicsSettings::default())
+            .insert_resource(SceneState::default())
+            .init_resource::<ZoneCollisionBvh>()
+            .insert_resource(kuluu_render::camera::CameraStepSmoothing::default())
+            .init_resource::<kuluu_render::cutscene::CutsceneMode>()
+            .init_resource::<kuluu_render::lock_on::LockOn>()
+            .init_resource::<kuluu_render::ViewFov>()
+            .insert_resource(ChaseCamera {
+                snap_to_anchor: true,
+                ..Default::default()
+            })
+            .add_systems(Update, resolve_camera);
+        assert!(
+            app.world()
+                .resource::<kuluu_render::GraphicsSettings>()
+                .camera_spring,
+            "retail spring is the default chase behavior"
+        );
+
+        let player = Vec3::new(10.0, 1.0, -4.0);
+        let me = app
+            .world_mut()
+            .spawn((IsSelf, Transform::from_translation(player)))
+            .id();
+        let cam = app
+            .world_mut()
+            .spawn((OperatorCamera, Transform::from_xyz(999.0, 500.0, -999.0)))
+            .id();
+
+        app.update(); // snap frame: the rig seats exactly behind the player.
+        let y0 = app.world().get::<Transform>(cam).unwrap().translation.y;
+        app.world_mut()
+            .get_mut::<Transform>(me)
+            .unwrap()
+            .translation = player + Vec3::Y * 0.5; // one shipped riser
+
+        let mut prev = y0;
+        for frame in 0..240 {
+            app.update();
+            let y = app.world().get::<Transform>(cam).unwrap().translation.y;
+            assert!(
+                (y - prev).abs() < 0.5,
+                "frame {frame} moved the camera a full riser: {prev} -> {y}"
+            );
+            prev = y;
+        }
+        let settled = app.world().get::<Transform>(cam).unwrap().translation.y;
+        assert!(
+            (settled - (y0 + 0.5)).abs() < 1e-3,
+            "camera did not settle on the new anchor: {settled} vs {}",
+            y0 + 0.5
+        );
+    }
+
+    /// The signed horizontal angle, from the camera's own facing to a bearing at the player:
+    /// zero exactly when the view centre sits on them. A laterally lagged focus shows this as
+    /// degrees of off-centre while strafing.
+    fn horizontal_off_centre_rad(cam_t: &Transform, player_xz: Vec2) -> f32 {
+        let eye = cam_t.translation;
+        // `look_at` aims the local -Z, i.e. forward(), at the pivot: on-centre means
+        // forward() itself points from the eye toward the player.
+        let look = *cam_t.forward();
+        let to_player = player_xz - Vec2::new(eye.x, eye.z);
+        let fl = (look.x * look.x + look.z * look.z).sqrt().max(1e-6);
+        let tl = to_player.length().max(1e-6);
+        let (fx, fz) = (look.x / fl, look.z / fl);
+        let (tx, tz) = (to_player.x / tl, to_player.y / tl);
+        (fz * tx - fx * tz).atan2(fx * tx + fz * tz)
+    }
+
+    /// A chase app on a manual 60 Hz clock: the player at `player`, no lock target.
+    fn strafe_app(spring: bool) -> (App, Entity, Entity) {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .insert_resource(bevy::time::TimeUpdateStrategy::ManualDuration(
+                std::time::Duration::from_secs_f32(1.0 / 60.0),
+            ))
+            .insert_resource(CameraMode::Chase)
+            .insert_resource(kuluu_render::GraphicsSettings {
+                camera_spring: spring,
+                volumetric_fog: false,
+                ..Default::default()
+            })
+            .insert_resource(SceneState::default())
+            .init_resource::<ZoneCollisionBvh>()
+            .insert_resource(kuluu_render::camera::CameraStepSmoothing::default())
+            .init_resource::<kuluu_render::cutscene::CutsceneMode>()
+            .init_resource::<kuluu_render::lock_on::LockOn>()
+            .init_resource::<kuluu_render::ViewFov>()
+            .insert_resource(ChaseCamera {
+                snap_to_anchor: true,
+                ..Default::default()
+            })
+            .add_systems(Update, resolve_camera);
+        let me = app
+            .world_mut()
+            .spawn((
+                IsSelf,
+                Transform::from_translation(Vec3::new(10.0, 1.0, -4.0)),
+            ))
+            .id();
+        let cam = app
+            .world_mut()
+            .spawn((OperatorCamera, Transform::from_xyz(0.0, 0.0, 0.0)))
+            .id();
+        (app, me, cam)
+    }
+
+    /// USER 2026-10-29: "the player has leash l/r when it should be set at 0 default" - a
+    /// sustained strafe must not slide the view centre off the player. At run speed on retail's
+    /// (halved) lateral spring the old lag reached ~half a yalm, degrees of off-centre; the view
+    /// centre is now exactly the player every frame.
+    #[test]
+    fn strafe_never_slides_the_view_centre_off_the_player() {
+        for spring in [false, true] {
+            let (mut app, me, cam) = strafe_app(spring);
+            app.update(); // snap frame seats the rig
+            let run_step = 4.5 / 60.0;
+            for frame in 0..180 {
+                {
+                    let mut t = app.world_mut().get_mut::<Transform>(me).unwrap();
+                    t.translation.x += run_step;
+                }
+                app.update();
+                let cam_t = *app.world().get::<Transform>(cam).unwrap();
+                let player_xz = {
+                    let p = app.world().get::<Transform>(me).unwrap().translation;
+                    Vec2::new(p.x, p.z)
+                };
+                assert!(
+                    horizontal_off_centre_rad(&cam_t, player_xz).abs() < 1e-3,
+                    "spring {spring} frame {frame}: view centre off the player by {} rad",
+                    horizontal_off_centre_rad(&cam_t, player_xz)
+                );
+            }
+        }
+    }
+
+    /// USER 2026-10-29: "the camera focus for arrows is way off" - arrow turns (each frame a new
+    /// chase yaw written by the input system) while moving keep orbiting exactly round the
+    /// player, and never around some point the rig trailed behind them at.
+    #[test]
+    fn arrow_turns_orbit_the_player_and_never_a_trailing_point() {
+        let (mut app, me, cam) = strafe_app(true);
+        app.update();
+        let run_step = 4.5 / 60.0;
+        let mut radius0 = None;
+        for frame in 0..180 {
+            {
+                let mut t = app.world_mut().get_mut::<Transform>(me).unwrap();
+                t.translation.x += run_step * (frame % 3) as f32 * 0.5 + run_step;
+            }
+            app.world_mut().resource_mut::<ChaseCamera>().yaw += 0.02;
+            app.update();
+            let cam_t = *app.world().get::<Transform>(cam).unwrap();
+            let p = app.world().get::<Transform>(me).unwrap().translation;
+            let player_xz = Vec2::new(p.x, p.z);
+            let off = horizontal_off_centre_rad(&cam_t, player_xz);
+            assert!(
+                off.abs() < 1e-3,
+                "frame {frame}: arrow turn put the centre {} rad off the player",
+                off
+            );
+            let eye_xz = Vec2::new(cam_t.translation.x, cam_t.translation.z);
+            let radius = (eye_xz - player_xz).length();
+            match radius0 {
+                None => radius0 = Some(radius),
+                Some(r0) => assert!(
+                    (radius - r0).abs() < 1e-2,
+                    "frame {frame}: boom breathing during the turn: {r0} -> {radius}"
+                ),
+            }
+        }
+    }
+
+    /// The pivot's chest offset is measured from the model and held while a re-bake drops the
+    /// measurement for a frame - only an actual change of the actor may move the focus height,
+    /// never a pose/model swap that comes back identical.
+    #[test]
+    fn self_pivot_height_survives_a_model_swap() {
+        let (mut app, me, cam) = strafe_app(false);
+        app.update();
+        let y_unmeasured = app.world().get::<Transform>(cam).unwrap().translation.y;
+
+        app.world_mut()
+            .entity_mut(me)
+            .insert((kuluu_render::scene::BakedActor {
+                min_mesh_y: -0.1,
+                actor_height: 1.5,
+                skeleton_span: Some(1.0),
+            },));
+        app.update();
+        let y_measured = app.world().get::<Transform>(cam).unwrap().translation.y;
+        assert!(
+            (y_measured - y_unmeasured).abs() > 1e-3,
+            "the first model measurement must set the pivot height ({y_unmeasured} -> {y_measured})"
+        );
+
+        app.world_mut()
+            .entity_mut(me)
+            .remove::<kuluu_render::scene::BakedActor>();
+        for frame in 0..5 {
+            app.update();
+            let y = app.world().get::<Transform>(cam).unwrap().translation.y;
+            assert!(
+                (y - y_measured).abs() < 1e-6,
+                "frame {frame}: focus height moved while the model re-baked: {y_measured} -> {y}"
+            );
+        }
     }
 }

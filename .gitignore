@@ -56,6 +56,9 @@ vendor/xi-tinkerer/
 # RZN MapViewer — STRICT cite-only, all-rights-reserved. Never copy/derive/link.
 vendor/RZN-mapviewer/
 
+# REA, the Ghidra reader for agents: local install from scripts/install-rea.ps1, pins in vendor/README.md.
+vendor/rea/
+
 # XIM browser FFXI client (GPL-3) — read-only reference, NEVER commit.
 research/xim/
 # Phoenix server (GPL-3) — private upstream, clone locally.
@@ -98,3 +101,8 @@ archive/scratch/
 
 # Legacy local SDK/runtime downloads; the optional pinned SDK is vendor/DLSS.
 /Dlss_Nvidia_dll/
+
+# Generated C recompile of FFXiMain (research/xi-on-anything): regenerated from this machine's
+# install, never committed. Procedure: vendor/rea/INSTALL.md.
+research/xi-on-anything/generated/
+research/xi-on-anything/build/

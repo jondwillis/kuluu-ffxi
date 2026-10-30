@@ -232,7 +232,7 @@ ledger_add() {
     [ -n "$file" ] || continue
     printf '%s\n' "$(_rel "$cwd" "$file")" >> "$out"
     case "$file" in
-      *.rs|*.wgsl)
+      *.rs|*.wgsl|*.wesl)
         python3 "$(dirname "${BASH_SOURCE[0]}")/runtime-verification.py" track \
           --session "$sid" --cwd "$cwd" "$file" >/dev/null || return 1
         ;;

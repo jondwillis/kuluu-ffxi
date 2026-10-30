@@ -1,10 +1,10 @@
+use bevy::feathers::font_styles::InheritableFont;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
-use bevy::ecs::spawn::Spawn;
-use bevy::feathers::controls::{button_bundle, ButtonBundleProps, ButtonVariant};
+use bevy::feathers::controls::{ButtonVariant, FeathersButton};
 use bevy::feathers::theme::ThemedText;
 use bevy::prelude::*;
 use bevy::ui_widgets::Activate;
@@ -119,20 +119,22 @@ pub(crate) fn fetch_and_verify_sha256(tag: &str, artifact_path: &Path) -> Result
         .timeout_connect(Duration::from_secs(5))
         .timeout_read(Duration::from_secs(8))
         .build();
-    let body = agent
-        .get(&url)
-        .set(
-            "User-Agent",
-            concat!("kuluu-ffxi/", env!("CARGO_PKG_VERSION")),
-        )
-        .call()
-        .with_context(|| format!("fetching {url}"))?
-        .into_string()
-        .context("reading SHA256SUMS body")?;
+    let response = Context::with_context(
+        agent
+            .get(&url)
+            .set(
+                "User-Agent",
+                concat!("kuluu-ffxi/", env!("CARGO_PKG_VERSION")),
+            )
+            .call(),
+        || format!("fetching {url}"),
+    )?;
+    let body = Context::context(response.into_string(), "reading SHA256SUMS body")?;
     let expected = parse_sha256sums(&body, filename)
         .ok_or_else(|| anyhow!("no SHA256SUMS entry for {filename}"))?;
-    let bytes = std::fs::read(artifact_path)
-        .with_context(|| format!("reading artifact {}", artifact_path.display()))?;
+    let bytes = Context::with_context(std::fs::read(artifact_path), || {
+        format!("reading artifact {}", artifact_path.display())
+    })?;
     let actual = sha256_hex(&bytes);
     if actual != expected {
         bail!("sha256 mismatch for {filename}: expected {expected}, got {actual}");
@@ -234,23 +236,33 @@ fn build_banner(commands: &mut Commands, latest: &str) {
                     TextColor(Color::srgb(0.0, 1.0, 1.0)),
                     ThemedText,
                 ));
-                bar.spawn(button_bundle(
-                    ButtonBundleProps {
-                        variant: ButtonVariant::Primary,
-                        ..default()
-                    },
-                    (),
-                    Spawn((Text::new("Open release page"), ThemedText)),
-                ))
-                .observe(|_ev: On<Activate>| open_url(RELEASE_URL));
-                bar.spawn(button_bundle(
-                    ButtonBundleProps::default(),
-                    (),
-                    Spawn((Text::new("Dismiss"), ThemedText)),
-                ))
-                .observe(|_ev: On<Activate>, mut status: ResMut<UpdateStatus>| {
-                    status.dismissed = true;
-                });
+                bar.spawn_empty()
+                    .apply_scene(bsn! {
+                        @FeathersButton {
+                            @variant: ButtonVariant::Primary,
+                            @caption: bsn! {
+                                Text::new("Open release page")
+                                ThemedText
+                            },
+                        }
+                        Node { flex_grow: 1.0 }
+                        InheritableFont { font: {Handle::<Font>::default()} }
+                    })
+                    .observe(|_ev: On<Activate>| open_url(RELEASE_URL));
+                bar.spawn_empty()
+                    .apply_scene(bsn! {
+                        @FeathersButton {
+                            @caption: bsn! {
+                                Text::new("Dismiss")
+                                ThemedText
+                            },
+                        }
+                        Node { flex_grow: 1.0 }
+                        InheritableFont { font: {Handle::<Font>::default()} }
+                    })
+                    .observe(|_ev: On<Activate>, mut status: ResMut<UpdateStatus>| {
+                        status.dismissed = true;
+                    });
             });
         });
 }

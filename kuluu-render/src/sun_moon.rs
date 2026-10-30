@@ -42,7 +42,7 @@ const MOON_DISC_EDGE: f32 = 350.0;
 // headroom; uncapped its ~22x peak blows the disc out to a solid white blob.
 const SUN_DISC_MAX_INTENSITY: f32 = 8.0;
 
-// moon.wgsl's `params` is a vec4 for uniform alignment; only xyz carry meaning.
+// moon.wesl's `params` is a vec4 for uniform alignment; only xyz carry meaning.
 const MOON_PARAMS_PAD: f32 = 0.0;
 
 const MOON_CYCLE_VANA_DAYS: u64 = 84;

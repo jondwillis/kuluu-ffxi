@@ -666,8 +666,7 @@ fn rebuild_zone_stars(
 
     // Unlit additive: stars are self-luminous points on a black field, so scene
     // lighting must not dim them and the black background must add nothing.
-    // Bevy applies DistanceFog to unlit StandardMaterials too (vendor/bevy_pbr
-    // pbr.wgsl:89 main_pass_post_lighting_processing), and the star generators
+    // Bevy applies DistanceFog to unlit StandardMaterials too, and the star generators
     // clear fog in the DAT (measured star/sta1 = 0x02440204).
     let material = materials.add(StandardMaterial {
         base_color_texture: texture,

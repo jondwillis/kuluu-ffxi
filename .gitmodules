@@ -30,3 +30,6 @@
 [submodule "research/cow_ffxi_disassembly"]
 	path = research/cow_ffxi_disassembly
 	url = https://github.com/cowrevenge/cow_ffxi_disassembly.git
+[submodule "research/xi-on-anything"]
+	path = research/xi-on-anything
+	url = https://github.com/rubymatrix/xi-on-anything

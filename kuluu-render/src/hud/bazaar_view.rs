@@ -31,11 +31,36 @@ pub const MAX_BUY_QUANTITY: u32 = 99;
 pub struct BazaarScreenState {
     pub cursor: usize,
     pub viewport: ListViewport,
-    /// Active quantity picker for the focused row, once confirmed into.
+    /// Active quantity picker for the focused row, once confirmed into. In our own
+    /// price menu the same slot holds the price spinner being typed.
     pub quantity: Option<DigitSpinner>,
     /// Sized purchase awaiting the retail "Purchase N x for Y gil?" answer.
     pub pending: Option<PendingBuy>,
+    /// Our own stall's `Set Prices` menu, open instead of a browsed bazaar (the
+    /// same surface wears both, like retail's).
+    pub prices: Option<BazaarPriceMode>,
 }
+
+/// One offered slot of our own price menu. `slot` is the LOC_INVENTORY index c2s
+/// 0x10A reprices by; `price` is what we have asked for it this session (LSB's
+/// ITEM_ATTR answer folds back onto the item as its lock flag, not as a number).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BazaarPriceRow {
+    pub slot: u8,
+    pub item_no: u16,
+    pub price: u32,
+}
+
+/// The state of the `Set Prices` menu: the offered inventory slots and which row's
+/// price is being typed (its spinner lives in [`BazaarScreenState::quantity`).
+#[derive(Debug, Clone, Default)]
+pub struct BazaarPriceMode {
+    pub rows: Vec<BazaarPriceRow>,
+    pub edit_row: Option<usize>,
+}
+
+/// The ceiling of one price cell, shared with the wire validator's range.
+pub const PRICE_CAP: u32 = ffxi_proto::decode::BAZAAR_PRICE_MAX;
 
 /// A purchase the player has sized but not yet confirmed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,6 +74,47 @@ pub struct PendingBuy {
 impl BazaarScreenState {
     pub fn reset(&mut self) {
         *self = Self::default();
+    }
+
+    /// Raise our own price menu over the inventory. Retail lists the sellable
+    /// LOC_INVENTORY slots: not gil, and not locked, because LSB's 0x10A handler
+    /// refuses currency and busy/reserved items outright
+    /// (vendor/server/src/map/packets/c2s/0x10a_bazaar_itemset.cpp). Prices typed
+    /// earlier in this session survive a rebuild of the list.
+    pub fn open_prices(&mut self, snap: &SceneSnapshot) {
+        let previous = self
+            .prices
+            .as_ref()
+            .map(|mode| {
+                mode.rows
+                    .iter()
+                    .map(|row| (row.slot, row.price))
+                    .collect::<std::collections::HashMap<_, _>>()
+            })
+            .unwrap_or_default();
+        let rows = snap
+            .inventory_main()
+            .iter()
+            .filter(|it| {
+                it.index != 0
+                    && it.item_no != 0
+                    && it.item_no != ffxi_proto::map::GIL_ITEM_NO
+                    && !it.locked
+            })
+            .map(|it| BazaarPriceRow {
+                slot: it.index,
+                item_no: it.item_no,
+                price: previous.get(&it.index).copied().unwrap_or(0),
+            })
+            .collect::<Vec<_>>();
+        self.cursor = 0;
+        self.viewport = ListViewport::default();
+        self.quantity = None;
+        self.pending = None;
+        self.prices = Some(BazaarPriceMode {
+            rows,
+            edit_row: None,
+        });
     }
 
     /// Keep the cursor inside a list the server may have shrunk under us.
@@ -110,7 +176,12 @@ enum BazaarRole {
     RowPrice(usize),
     GilLabel,
     GilValue,
+    /// The quantity picker that takes the Current Gil box's place while a purchase
+    /// is being sized.
     Spinner(SpinnerSlot),
+    /// Our own price entry, which instead takes the description panel's place
+    /// (owner 2026-10-24: "the price replaces the item description while its open").
+    PriceSpinner(SpinnerSlot),
     DetailName,
     DetailBody,
 }
@@ -130,10 +201,19 @@ pub(crate) struct BazaarScrollTrack;
 #[derive(Component)]
 pub(crate) struct BazaarScrollThumb;
 
-const PANEL_WIDTH_PX: f32 = 340.0;
+const PANEL_WIDTH_PX: f32 = 372.0;
 const PRICE_COL_PX: f32 = 110.0;
-const GIL_BOX_PX: f32 = 116.0;
+/// Wide enough that the widest gil readout keeps to one line.
+const GIL_BOX_PX: f32 = 150.0;
 const LIST_GAP_PX: f32 = 4.0;
+/// The bazaar law window draws a step under the standard menu scale (owner
+/// 2026-10-24: "text a little big").
+const ROW_TEXT_PX: f32 = 12.0;
+const GIL_LABEL_PX: f32 = 11.0;
+const GIL_VALUE_PX: f32 = 12.0;
+const DETAIL_NAME_PX: f32 = 12.0;
+const DETAIL_BODY_PX: f32 = 11.0;
+const SPINNER_PX: f32 = 13.0;
 
 pub(crate) fn spawn_bazaar_view(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
     let placeholder = transparent_placeholder(&mut images);
@@ -142,10 +222,13 @@ pub(crate) fn spawn_bazaar_view(mut commands: Commands, mut images: ResMut<Asset
         .spawn((
             crate::components::InGameEntity,
             BazaarPanel,
+            // Retail runs both bazaar screens as a left-side law window, so the panel
+            // stands where kuluu's Items (law) window does rather than mid-screen
+            // (owner 2026-10-24).
             Node {
                 position_type: PositionType::Absolute,
-                top: Val::Percent(20.0),
-                left: Val::Percent(30.0),
+                top: Val::Px(48.0),
+                left: Val::Px(8.0),
                 row_gap: Val::Px(6.0),
                 flex_direction: FlexDirection::Column,
                 align_items: AlignItems::FlexStart,
@@ -183,7 +266,7 @@ pub(crate) fn spawn_bazaar_view(mut commands: Commands, mut images: ResMut<Asset
                                 col.spawn((
                                     BazaarText(BazaarRole::RowName(i)),
                                     Text::new(""),
-                                    text_font(13.0),
+                                    text_font(ROW_TEXT_PX),
                                     TextColor(theme::TEXT),
                                     list_view::row_label_layout(),
                                 ));
@@ -191,7 +274,7 @@ pub(crate) fn spawn_bazaar_view(mut commands: Commands, mut images: ResMut<Asset
                             row.spawn((
                                 BazaarText(BazaarRole::RowPrice(i)),
                                 Text::new(""),
-                                text_font(13.0),
+                                text_font(ROW_TEXT_PX),
                                 TextColor(theme::TEXT),
                                 TextLayout {
                                     justify: Justify::Right,
@@ -222,16 +305,16 @@ pub(crate) fn spawn_bazaar_view(mut commands: Commands, mut images: ResMut<Asset
                     g.spawn((
                         BazaarText(BazaarRole::GilLabel),
                         Text::new(""),
-                        text_font(12.0),
+                        text_font(GIL_LABEL_PX),
                         TextColor(theme::MUTED),
                     ));
                     g.spawn((
                         BazaarText(BazaarRole::GilValue),
                         Text::new(""),
-                        text_font(13.0),
+                        text_font(GIL_VALUE_PX),
                         TextColor(theme::TEXT),
                     ));
-                    digit_spinner::spawn_row(g, digit_spinner::slots(), |s| {
+                    digit_spinner::spawn_row_px(g, digit_spinner::slots(), SPINNER_PX, |s| {
                         BazaarText(BazaarRole::Spinner(s))
                     });
                 });
@@ -258,16 +341,25 @@ pub(crate) fn spawn_bazaar_view(mut commands: Commands, mut images: ResMut<Asset
                         t.spawn((
                             BazaarText(BazaarRole::DetailName),
                             Text::new(""),
-                            text_font(13.0),
+                            text_font(DETAIL_NAME_PX),
                             TextColor(theme::TITLE),
                         ));
                         t.spawn((
                             BazaarText(BazaarRole::DetailBody),
                             Text::new(""),
-                            text_font(12.0),
+                            text_font(DETAIL_BODY_PX),
                             TextColor(theme::TEXT),
                         ));
                     });
+                    // The price entry rides in this box, over the description it
+                    // replaces while a price is being typed. It wears no `/cap` readout (owner
+                    // 2026-10-24); stepping and typing still stop at that ceiling.
+                    digit_spinner::spawn_row_px(
+                        d,
+                        digit_spinner::slots_without_cap(),
+                        SPINNER_PX,
+                        |s| BazaarText(BazaarRole::PriceSpinner(s)),
+                    );
                 });
             });
         });
@@ -298,13 +390,14 @@ pub(crate) fn update_bazaar_view(
         Without<BazaarRowIcon>,
     >,
     mut icon_q: Query<(&BazaarRowIcon, &mut ImageNode), Without<BazaarDetailIcon>>,
-    mut detail_icon_q: Query<&mut ImageNode, With<BazaarDetailIcon>>,
+    mut detail_icon_q: Query<(&mut Node, &mut ImageNode), With<BazaarDetailIcon>>,
 ) {
     let Ok(mut panel) = panel_q.single_mut() else {
         return;
     };
     let snap: &SceneSnapshot = &state.snapshot;
-    let Some(view) = snap.bazaar.as_ref() else {
+    let browsing = snap.bazaar.as_ref();
+    if browsing.is_none() && screen.prices.is_none() {
         if panel.display != Display::None {
             panel.display = Display::None;
         }
@@ -315,11 +408,37 @@ pub(crate) fn update_bazaar_view(
     }
 
     let gil = current_gil(snap);
+    // One surface wears both lists: a stall being browsed, or our own sellable
+    // inventory while we price it. Both speak in (item, price cell, selectable).
+    let row_at = |i: usize| -> Option<(u16, String, bool)> {
+        match (&screen.prices, browsing) {
+            (Some(mode), _) => mode.rows.get(i).map(|row| {
+                (
+                    row.item_no,
+                    if row.price == 0 {
+                        String::new()
+                    } else {
+                        format!("{} G", group_digits(row.price))
+                    },
+                    true,
+                )
+            }),
+            (None, Some(view)) => view.items.get(i).map(|entry| {
+                (
+                    entry.item_no,
+                    format!("{} G", group_digits(entry.price)),
+                    entry.total_price(1) <= gil,
+                )
+            }),
+            (None, None) => None,
+        }
+    };
+    let row_count = shown_rows(&screen, snap);
     let start = screen
         .viewport
         .start
-        .min(ListViewport::max_start(view.items.len()));
-    let focused = view.items.get(screen.cursor);
+        .min(ListViewport::max_start(row_count));
+    let focus_item = row_at(screen.cursor).map(|(item_no, _, _)| item_no);
     let table = icon_cache.table(&dat_root);
     let static_of = |item_no: u16| {
         table
@@ -328,9 +447,14 @@ pub(crate) fn update_bazaar_view(
     };
 
     for (tag, mut text, mut color, background) in text_q.iter_mut() {
-        if let (Some(mut background), BazaarRole::Spinner(slot)) = (background, tag.0) {
+        let spinner_slot = match tag.0 {
+            BazaarRole::Spinner(slot) | BazaarRole::PriceSpinner(slot) => Some(slot),
+            _ => None,
+        };
+        if let (Some(mut background), Some(slot)) = (background, spinner_slot) {
+            let unit = spinner_unit(&screen);
             let bg = match screen.quantity.as_ref() {
-                Some(spin) => digit_spinner::slot_style(spin, slot, SpinnerUnit::Count).2,
+                Some(spin) => digit_spinner::slot_style(spin, slot, unit).2,
                 None => Color::NONE,
             };
             if background.0 != bg {
@@ -338,35 +462,49 @@ pub(crate) fn update_bazaar_view(
             }
         }
         let (want, want_color) = match tag.0 {
-            BazaarRole::RowName(i) => match view.items.get(start + i) {
-                Some(entry) => (
-                    item_name(entry.item_no, static_of(entry.item_no).map(|s| s.name)),
-                    row_color(start + i == screen.cursor, entry.total_price(1) <= gil),
+            BazaarRole::RowName(i) => match row_at(start + i) {
+                Some((item_no, _, enabled)) => (
+                    item_name(item_no, static_of(item_no).map(|s| s.name)),
+                    row_color(start + i == screen.cursor, enabled),
                 ),
                 None => (String::new(), theme::TEXT),
             },
-            BazaarRole::RowPrice(i) => match view.items.get(start + i) {
-                Some(entry) => (
-                    format!("{} G", group_digits(entry.price)),
-                    row_color(start + i == screen.cursor, entry.total_price(1) <= gil),
-                ),
-                None => (String::new(), theme::TEXT),
-            },
-            // Retail swaps the Current Gil box for the quantity picker while a
-            // purchase is being sized.
-            BazaarRole::GilLabel => match screen.quantity.is_some() {
-                true => (String::new(), theme::MUTED),
-                false => ("Current Gil".to_string(), theme::MUTED),
-            },
-            BazaarRole::Spinner(slot) => match screen.quantity.as_ref() {
-                Some(spin) => {
-                    let (s, c, _) = digit_spinner::slot_style(spin, slot, SpinnerUnit::Count);
-                    (s, c)
+            BazaarRole::RowPrice(i) => match row_at(start + i) {
+                Some((_, price, enabled)) => {
+                    (price, row_color(start + i == screen.cursor, enabled))
                 }
                 None => (String::new(), theme::TEXT),
             },
-            BazaarRole::GilValue => match screen.pending.as_ref() {
-                Some(buy) => (
+            // Retail swaps the Current Gil box for the quantity picker while a
+            // purchase is being sized. Our own price menu keeps the gil readout
+            // beside its spinner (owner's retail capture 2026-10-24).
+            BazaarRole::GilLabel => match screen.prices.is_none() && screen.quantity.is_some() {
+                true => (String::new(), theme::MUTED),
+                false => ("Current Gil".to_string(), theme::MUTED),
+            },
+            // The gil-box picker belongs to browsing; the price picker lives in the
+            // description box. Never both at once.
+            BazaarRole::Spinner(slot) => {
+                match (screen.prices.is_none(), screen.quantity.as_ref()) {
+                    (true, Some(spin)) => {
+                        let (s, c, _) = digit_spinner::slot_style(spin, slot, SpinnerUnit::Count);
+                        (s, c)
+                    }
+                    _ => (String::new(), theme::TEXT),
+                }
+            }
+            BazaarRole::PriceSpinner(slot) => {
+                match (price_entry_open(&screen), screen.quantity.as_ref()) {
+                    (true, Some(spin)) => {
+                        let (s, c, _) = digit_spinner::slot_style(spin, slot, SpinnerUnit::Gil);
+                        (s, c)
+                    }
+                    _ => (String::new(), theme::TEXT),
+                }
+            }
+            BazaarRole::GilValue => match (screen.prices.as_ref(), screen.pending.as_ref()) {
+                (Some(_), _) | (None, None) => (format!("{} G", group_digits(gil)), theme::TEXT),
+                (None, Some(buy)) => (
                     format!("{} G?", group_digits(buy.total_gil)),
                     if buy.total_gil <= gil {
                         theme::CURSOR
@@ -374,16 +512,20 @@ pub(crate) fn update_bazaar_view(
                         theme::DANGER
                     },
                 ),
-                None => (format!("{} G", group_digits(gil)), theme::TEXT),
             },
-            BazaarRole::DetailName => match focused {
-                Some(entry) => (
-                    item_name(entry.item_no, static_of(entry.item_no).map(|s| s.name)),
+            // A price entry replaces the description while it is open; browsing rows
+            // still read theirs.
+            BazaarRole::DetailName if price_entry_open(&screen) => (String::new(), theme::MUTED),
+            BazaarRole::DetailBody if price_entry_open(&screen) => (String::new(), theme::TEXT),
+            BazaarRole::DetailName => match focus_item {
+                Some(item_no) => (
+                    item_name(item_no, static_of(item_no).map(|s| s.name)),
                     theme::TITLE,
                 ),
+                None if screen.prices.is_some() => (String::new(), theme::MUTED),
                 None => ("Nothing for sale.".to_string(), theme::MUTED),
             },
-            BazaarRole::DetailBody => match focused.and_then(|e| static_of(e.item_no)) {
+            BazaarRole::DetailBody => match focus_item.and_then(static_of) {
                 Some(s) => (s.description.clone(), theme::TEXT),
                 None => (String::new(), theme::TEXT),
             },
@@ -397,15 +539,54 @@ pub(crate) fn update_bazaar_view(
     }
 
     for (icon, mut image) in icon_q.iter_mut() {
-        let handle = view
-            .items
-            .get(start + icon.0)
-            .and_then(|e| icon_cache.ensure(e.item_no, &dat_root, &mut images));
+        let handle = row_at(start + icon.0)
+            .and_then(|(item_no, _, _)| icon_cache.ensure(item_no, &dat_root, &mut images));
         set_icon(&mut image, handle);
     }
-    if let Ok(mut image) = detail_icon_q.single_mut() {
-        let handle = focused.and_then(|e| icon_cache.ensure(e.item_no, &dat_root, &mut images));
+    // The price entry owns the whole description box (owner 2026-10-24), so its plate goes too -
+    // and with it the space the plate held.
+    let pricing = price_entry_open(&screen);
+    if let Ok((mut node, mut image)) = detail_icon_q.single_mut() {
+        let want = if pricing {
+            Display::None
+        } else {
+            Display::Flex
+        };
+        if node.display != want {
+            node.display = want;
+        }
+        let handle = focus_item
+            .filter(|_| !pricing)
+            .and_then(|item_no| icon_cache.ensure(item_no, &dat_root, &mut images));
         set_icon(&mut image, handle);
+    }
+}
+
+/// Whether a price entry currently owns the description box.
+fn price_entry_open(screen: &BazaarScreenState) -> bool {
+    screen
+        .prices
+        .as_ref()
+        .and_then(|mode| mode.edit_row)
+        .is_some()
+}
+
+/// Whether the shared surface is pricing our own stall (gil spinner) or browsing a
+/// customer-side purchase (count spinner).
+fn spinner_unit(screen: &BazaarScreenState) -> SpinnerUnit {
+    if screen.prices.is_some() {
+        SpinnerUnit::Gil
+    } else {
+        SpinnerUnit::Count
+    }
+}
+
+/// How many rows the shared surface shows right now.
+pub fn shown_rows(screen: &BazaarScreenState, snap: &SceneSnapshot) -> usize {
+    match (&screen.prices, snap.bazaar.as_ref()) {
+        (Some(mode), _) => mode.rows.len(),
+        (None, Some(view)) => view.items.len(),
+        (None, None) => 0,
     }
 }
 
@@ -417,15 +598,13 @@ pub(crate) fn update_bazaar_scrollbar(
     mut track_q: Query<&mut Node, (With<BazaarScrollTrack>, Without<BazaarScrollThumb>)>,
     mut thumb_q: Query<&mut Node, (With<BazaarScrollThumb>, Without<BazaarScrollTrack>)>,
 ) {
-    let Some(view) = state.snapshot.bazaar.as_ref() else {
-        return;
-    };
     if let (Ok(mut track), Ok(mut thumb)) = (track_q.single_mut(), thumb_q.single_mut()) {
         list_view::apply_scrollbar(
             &mut track,
             &mut thumb,
             screen.viewport.start,
-            view.items.len(),
+            shown_rows(&screen, &state.snapshot),
+            list_view::LIST_ROWS,
         );
     }
 }
@@ -493,6 +672,7 @@ mod tests {
                 quantity: 2,
                 total_gil: 10,
             }),
+            prices: None,
         };
         s.move_cursor(1, 0);
         assert_eq!(s.cursor, 0);

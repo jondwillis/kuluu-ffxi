@@ -1,5 +1,5 @@
+use bevy::platform::time::Instant;
 use std::sync::OnceLock;
-use std::time::Instant;
 
 use bevy::asset::RenderAssetUsages;
 use bevy::mesh::{Indices, PrimitiveTopology};
@@ -25,7 +25,7 @@ use ffxi_dat::scheduler::{StageKind, NO_LOCAL_DIR};
 // exposes standard attributes at fixed shader locations (bevy_pbr render/mesh.rs
 // MeshPipeline::specialize — position 0, normal 1, uv 2, uv_b 3, tangent 4, color 5), and a
 // custom attribute id never reaches the vertex buffer layout. TANGENT is the one standard
-// vec4 slot these meshes do not otherwise use; ffxi_particle.wgsl reads it at location 4.
+// vec4 slot these meshes do not otherwise use; ffxi_particle.wesl reads it at location 4.
 
 // CPU particle simulation. research/xim ParticleGenerator + Particle: a Particle stage (0x02)
 // spawns a `LiveGenerator` that streams billboard particles over its window, each integrating
@@ -48,15 +48,8 @@ pub struct CelestialClock {
     pub day_fraction: f32,
     pub day_of_week: usize,
     pub moon_phase: usize,
-    // The animation-test slider values: lamp_halos_lift is the lamp halos' (PATH_LAMP_ALPHAMAP)
-    // peak wall-brighten; wash_alpha_lift multiplies the authored alpha of the ghu*/li* wall-wash
-    // volumes (1.0 = exactly as authored). Both live on the clock so every draw site reads them
-    // without new plumbing.
     pub lamp_halos_lift: f32,
     pub wash_alpha_lift: f32,
-    // Seconds accumulator for the halo flicker wave (the DAT ships no flicker keyframes; retail
-    // wavers at runtime, so both modes ride the hand-tuned `lamp_flicker` model on this clock).
-    pub lamp_flicker_phase: f32,
 }
 
 impl Default for CelestialClock {
@@ -65,9 +58,8 @@ impl Default for CelestialClock {
             day_fraction: 0.0,
             day_of_week: 0,
             moon_phase: 0,
-            lamp_halos_lift: LAMP_ALPHAMAP_LIFT_DEFAULT,
+            lamp_halos_lift: LAMP_ALPHA_LIFT_DEFAULT,
             wash_alpha_lift: WASH_ALPHA_LIFT_DEFAULT,
-            lamp_flicker_phase: 0.0,
         }
     }
 }
@@ -80,7 +72,6 @@ impl ParticleSimulator {
     pub fn set_celestial_clock(&mut self, mut clock: CelestialClock) {
         clock.lamp_halos_lift = self.clock.lamp_halos_lift;
         clock.wash_alpha_lift = self.clock.wash_alpha_lift;
-        clock.lamp_flicker_phase = self.clock.lamp_flicker_phase;
         self.clock = clock;
     }
 
@@ -98,7 +89,7 @@ impl ParticleSimulator {
     // room's teardown restores the shipped defaults so a tester visit cannot leak a
     // lighting change into a session.
     pub fn reset_test_lighting(&mut self) {
-        self.clock.lamp_halos_lift = LAMP_ALPHAMAP_LIFT_DEFAULT;
+        self.clock.lamp_halos_lift = LAMP_ALPHA_LIFT_DEFAULT;
         self.clock.wash_alpha_lift = WASH_ALPHA_LIFT_DEFAULT;
     }
 
@@ -210,13 +201,12 @@ struct SpriteTemplate {
     colors: Vec<Vec4>,
 }
 
-// The fixed-function colour tables live in ffxi_particle.wgsl (per stage, with D3D8 saturation
+// The fixed-function colour tables live in ffxi_particle.wesl (per stage, with D3D8 saturation
 // after every op): CMoD3m.cpp's TSS blocks for the D3m path (NonZeroTwoTSS textured default,
 // NonZeroOneTSS when renderStateFlags 0x1000 drops the texture alpha, ZeroOneTSS untextured) and
-// ZoneRenderer.cpp DoD3mDraw's tables for MMB meshes. The path selects which table; nothing is
-// pre-scaled on the CPU — D3m/sheet template colours carry stage 0's MODULATE2X via the /128
-// normalise (ffxi_dat::d3m::VERTEX_COLOR_DIVISOR), MMB colours are raw byte/255, and the factor
-// attribute carries the particle's TEXTUREFACTOR.
+// ZoneRenderer.cpp DoD3mDraw supplies the MMB tables.
+// D3m templates use byte/128; SpriteSheet and MMB templates use byte/255.
+// The factor attribute carries the particle's TEXTUREFACTOR.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum D3mDrawPath {
     // CMoD3m.cpp NonZeroTwoTSS / NonZeroOneTSS (the ignore flag picks between them).
@@ -247,22 +237,25 @@ const D3M_TFACTOR_PROMOTE_BLEND_BYTE: u8 = 0x44;
 const D3M_TFACTOR_PROMOTE_MIN: f32 = 0x7F as f32 / u8::MAX as f32;
 const D3M_TFACTOR_PROMOTED: f32 = 1.0;
 
-// Lamp halo billboards — the soft glow sheets retail authors under ligh/ (SG's lig* quad,
-// Bastok's lt__/gl*/lp* families, the lglt wall wash): additive sprite sheets whose whole
-// brightness is their ToD gate. The class is content-based so every zone's lanterns ride one
-// code path: lift/flicker/range knobs and Enhanced-mode replacement all apply identically.
 const LAMP_HALO_INIT_ALPHA_MAX: f32 = 0.2;
 
 pub(crate) fn is_lamp_halo_def(def: &ParticleGeneratorDef) -> bool {
     def.mesh_kind == ParticleMeshKind::SpriteSheet
         && def.blend == ffxi_dat::particle_gen::ParticleBlend::Additive
         && def.tod_color_driven[TOD_ALPHA_CHANNEL]
-        // Halos author a near-zero alpha (SG lig2 0.071, Bastok lt__ 0.0) and let the ToD gate
-        // do all the work; flame sheets carry their own authored alpha (fi* 0.5) and stay out.
         && def.init_color[TOD_ALPHA_CHANNEL] <= LAMP_HALO_INIT_ALPHA_MAX
 }
 
 const WALL_WASH_MESH_ID: [u8; 4] = *b"ligh";
+const PORT_LAMP_GLOW_MESH_ID: [u8; 4] = *b"lt  ";
+
+pub(crate) fn is_lamp_glow_def(def: &ParticleGeneratorDef) -> bool {
+    is_lamp_halo_def(def)
+        || (matches!(def.mesh_id, WALL_WASH_MESH_ID | PORT_LAMP_GLOW_MESH_ID)
+            && def.auto_run
+            && def.mesh_kind == ParticleMeshKind::SpriteSheet
+            && def.blend == ffxi_dat::particle_gen::ParticleBlend::Additive)
+}
 
 pub(crate) fn is_wall_wash_def(def: &ParticleGeneratorDef) -> bool {
     def.mesh_id == WALL_WASH_MESH_ID
@@ -292,25 +285,12 @@ pub struct WallWashOff(pub bool);
 #[derive(Component)]
 pub struct HaloSuppressed;
 
-// A hand tuning, not a measured retail value: at 0.12 the halo reads as lantern light on stone
-// without washing out the wall texture; past roughly 0.6 it covers the stone instead of
-// lighting it.
-// pub: the AnimationTest box seeds its lantern-alpha slider from this default.
-pub const LAMP_ALPHAMAP_LIFT_DEFAULT: f32 = 0.12;
+pub const LAMP_ALPHA_LIFT_DEFAULT: f32 = 1.0;
 // Wall-wash slider seed (1.0 = authored alpha) and ceiling. The seed has to be
 // the identity multiplier: it scales authored wash alpha, so any other default
 // dims every wall wash in a normal session rather than only inside the tester.
 pub const WASH_ALPHA_LIFT_DEFAULT: f32 = 1.0;
 pub const WASH_ALPHA_LIFT_MAX: f32 = 2.0;
-// The DAT ships no flicker keyframes, so each halo's phase in the shared `lamp_flicker` wave is
-// derived from its mesh id: halos of different families waver out of step. The stride is a hand
-// tuning.
-const LAMP_FLICKER_SEED_STRIDE: f32 = 0.37;
-
-fn lamp_flicker_seed(def: &ParticleGeneratorDef) -> f32 {
-    def.mesh_id.iter().map(|b| f32::from(*b)).sum::<f32>() * LAMP_FLICKER_SEED_STRIDE
-}
-
 pub(crate) fn ignores_texture_alpha(def: &ParticleGeneratorDef, path: D3mDrawPath) -> bool {
     def.ignore_texture_alpha
         || (path == D3mDrawPath::Mmb
@@ -1965,8 +1945,6 @@ pub fn tick_particle_simulator(
             &mut commands,
         );
     }
-    // Advance the shared flicker wave before any draw factor samples it this frame.
-    sim.clock.lamp_flicker_phase += time.delta_secs();
     let frames = time.delta_secs() * ROUTINE_FPS;
     // research/xim Particle.kt update — children read the parent's state before anything ages.
     let orphans = anchor_children(&mut sim);
@@ -3020,7 +2998,7 @@ fn emit(g: &mut LiveGenerator, life_frames: f32) {
     // of the 0x16 base (research/xim ParticleInitializers.kt ColorVarianceSetup — the shipped
     // alpha byte is always 0 and the engine's alpha comes from the 0x16 base / alpha track).
     // Both are raw D3DCOLOR bytes/255: sum in that space. The PS2 half-scale doubling happens
-    // in the fixed-function stages (ffxi_particle.wgsl), so nothing rescales here.
+    // in the fixed-function stages (ffxi_particle.wesl), so nothing rescales here.
     let mut rgb = Vec3::from_slice(&g.def.init_color[..3]);
     if let Some(var) = g.def.color_variance {
         rgb += Vec3::new(
@@ -3405,7 +3383,6 @@ fn particle_draw(g: &LiveGenerator, p: &Particle, clock: &CelestialClock) -> Par
     // This is the sun's authored dawn/noon/dusk ramp: the disc is not tinted by a formula.
     let mut rgb = p.rgb;
     let mut alpha = alpha;
-    let mut tod_alpha_gate = 1.0f32;
     for (channel, track) in g.tracks.tod_color.iter().enumerate() {
         let Some(track) = track.as_ref().filter(|_| g.def.tod_color_driven[channel]) else {
             continue;
@@ -3414,7 +3391,6 @@ fn particle_draw(g: &LiveGenerator, p: &Particle, clock: &CelestialClock) -> Par
         match channel {
             TOD_ALPHA_CHANNEL => {
                 alpha *= v;
-                tod_alpha_gate *= v;
             }
             _ => rgb[channel] = v,
         }
@@ -3451,32 +3427,19 @@ fn particle_draw(g: &LiveGenerator, p: &Particle, clock: &CelestialClock) -> Par
     // vel_basis like every other position source.
     let world = track_position(g, p, progress);
 
-    let lamp_halo = is_lamp_halo_def(&g.def);
-    let factor_alpha = if lamp_halo {
-        // PATH_LAMP_ALPHAMAP multiplies this against the texel's own alpha in the shader; the
-        // day gate (tkaa) is what turns lamps on at night and off by day. Retail's visible
-        // wavering is runtime behavior (no flicker keyframes ship), so retail mode rides the
-        // same hand-tuned lamp_flicker model as the Enhanced lights — a timer going up/down.
-        (clock.lamp_halos_lift
-            * tod_alpha_gate
-            * crate::zone_point_lights::lamp_flicker(
-                clock.lamp_flicker_phase,
-                lamp_flicker_seed(&g.def),
-            ))
-        .clamp(0.0, 1.0)
+    let alpha_lift = if is_lamp_halo_def(&g.def) {
+        clock.lamp_halos_lift
     } else if is_wall_wash_def(&g.def) {
-        // Wash volumes keep the authored D3m alpha path; the slider multiplies it (1.0 = as
-        // authored) so the test box can dial the wash down without touching retail defaults.
-        tfactor_alpha(&g.def, g.draw_path, alpha) * clock.wash_alpha_lift
+        clock.wash_alpha_lift
     } else {
-        tfactor_alpha(&g.def, g.draw_path, alpha)
+        1.0
     };
+    let factor_alpha = tfactor_alpha(&g.def, g.draw_path, alpha) * alpha_lift;
 
     ParticleDraw {
         flipbook_frame,
         scale: Vec2::new(sx, sy),
-        // The shader's lamp branch adds neutral light, so a halo's factor colour is white.
-        factor_rgb: if lamp_halo { Vec3::ONE } else { rgb },
+        factor_rgb: rgb,
         factor_alpha,
         world,
     }
@@ -3842,9 +3805,6 @@ fn rebuild_mesh(g: &LiveGenerator, cam: CameraView, clock: &CelestialClock, mesh
             };
             positions.push((draw.world + oriented).to_array());
             uvs.push([uv[0] + g.tex_translate.x, uv[1] + g.tex_translate.y]);
-            // The template colour is stage 0's D argument verbatim (D3m/sheet: /128-normalised,
-            // MMB: raw byte/255); the per-particle F rides its own attribute. ffxi_particle.wgsl
-            // runs the selected table against both, so nothing is folded in here.
             colors.push(vertex.to_array());
             factors.push(draw.factor_rgb.extend(draw.factor_alpha).to_array());
         }
@@ -4088,14 +4048,12 @@ fn sprite_sheet_templates(ss: &ParticleSpriteSheet) -> Vec<SpriteTemplate> {
                 positions: f.positions.iter().map(|p| Vec3::from_array(*p)).collect(),
                 uvs: f.uvs.clone(),
                 indices: (0..f.positions.len() as u32).collect(),
-                // FFXI vertex colors are 2x-overbright (see d3m.rs color parse); the venom-cloud
-                // tint is then modulated by the generator's init_color in rebuild_mesh.
                 colors: f
                     .colors
                     .iter()
                     .map(|c| {
                         Vec4::new(c[0] as f32, c[1] as f32, c[2] as f32, c[3] as f32)
-                            / ffxi_dat::d3m::VERTEX_COLOR_DIVISOR
+                            / f32::from(u8::MAX)
                     })
                     .collect(),
             })
@@ -4821,51 +4779,54 @@ mod tests {
         }
     }
 
-    // Lamp halos (`lig*` sprite sheets) are LIGHTS: their drawn alpha is the lift knob times the
-    // ToD gate and must not carry the `enhanced-particle-alpha-20` boost — that enhancement is
-    // for hit-flash and other effect particles. Pins both sides so either half drifting fails a
-    // test whichever feature set hits it.
     #[test]
-    fn lamp_halo_alpha_bypasses_enhanced_particle_gain() {
-        let mut g = live(def(60.0, 1.0, 1), 60.0);
+    fn real_woods_sprite_sheets_select_normal_alpha_stages() {
+        const WOODS_PINNED_DAT_ID: u32 = 341;
+        let Some(assets) = retail_assets(WOODS_PINNED_DAT_ID) else {
+            return;
+        };
+        for id in [*b"gl01", *b"gl04"] {
+            let generator = assets.particle_def(*b"myro", &id).unwrap();
+            assert_eq!(generator.mesh_kind, ParticleMeshKind::SpriteSheet);
+            assert_eq!(generator.blend_byte, 0);
+            assert!(!generator.ignore_texture_alpha);
+            assert!(!ignores_texture_alpha(generator, D3mDrawPath::D3m));
+            let sheet = assets.sprite_sheet(*b"myro", &generator.mesh_id).unwrap();
+            let templates = sprite_sheet_templates(sheet);
+            for (frame, template) in sheet.frames.iter().zip(&templates) {
+                for (bytes, diffuse) in frame.colors.iter().zip(&template.colors) {
+                    assert_eq!(
+                        *diffuse,
+                        Vec4::from_array(bytes.map(f32::from)) / f32::from(u8::MAX)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lamp_sprite_keeps_authored_color_and_alpha() {
+        const AUTHORED_COLOR: [f32; 4] = [0.25, 0.5, 0.75, 0.071];
+        let mut d = def(ROUTINE_FPS, 1.0, 1);
+        d.mesh_id = *b"ligh";
+        d.mesh_kind = ParticleMeshKind::SpriteSheet;
+        d.tod_color_driven[TOD_ALPHA_CHANNEL] = true;
+        d.init_color = AUTHORED_COLOR;
+        assert!(is_lamp_halo_def(&d));
+        let mut g = live(d, ROUTINE_FPS);
         advance(&mut g, 2.0);
-        assert!(!g.particles.is_empty(), "two frames emit");
-
+        assert!(!g.particles.is_empty());
         let clock = CelestialClock::default();
-        let raw_alpha = g.def.init_color[3];
-        let plain = drawn_factor(&g, &clock);
+        let factor = drawn_factor(&g, &clock);
+        assert_eq!(factor.xyz(), Vec3::from_slice(&AUTHORED_COLOR[..3]));
+        assert_eq!(factor.w, expected_factor_alpha(AUTHORED_COLOR[3]));
+        let dimmed = CelestialClock {
+            lamp_halos_lift: 0.5,
+            ..clock
+        };
         assert_eq!(
-            plain.w,
-            expected_factor_alpha(raw_alpha),
-            "non-halo particles carry the build's alpha gain"
-        );
-
-        g.def.mesh_id = *b"lig0";
-        g.def.mesh_kind = ffxi_dat::particle_gen::ParticleMeshKind::SpriteSheet;
-        // The content rule: ToD-gated alpha over a near-zero authored alpha.
-        g.def.tod_color_driven[TOD_ALPHA_CHANNEL] = true;
-        g.def.init_color[TOD_ALPHA_CHANNEL] = 0.071;
-        let halo = drawn_factor(&g, &clock);
-        assert!(
-            is_lamp_halo_def(&g.def),
-            "ToD-gated low-alpha sheet must hit the halo branch"
-        );
-        // No ToD track here: gate holds at 1.0, so alpha is the lift knob times the flicker wave
-        // at this phase — still independent of the build's alpha gain.
-        let seed = lamp_flicker_seed(&g.def);
-        assert_eq!(
-            halo.w,
-            (clock.lamp_halos_lift
-                * crate::zone_point_lights::lamp_flicker(clock.lamp_flicker_phase, seed))
-            .clamp(0.0, 1.0)
-        );
-        assert_eq!(halo.xyz(), Vec3::ONE);
-        let mut other_family = g.def;
-        other_family.mesh_id = *b"lt__";
-        assert_ne!(
-            lamp_flicker_seed(&other_family),
-            seed,
-            "halo families waver out of step"
+            drawn_factor(&g, &dimmed).w,
+            factor.w * dimmed.lamp_halos_lift
         );
     }
 
@@ -5229,7 +5190,7 @@ mod tests {
         }
     }
 
-    // ffxi_particle.wgsl runs retail's fixed-function tables per stage with D3D8 saturation
+    // ffxi_particle.wesl runs retail's fixed-function tables per stage with D3D8 saturation
     // after every op; this mirror reproduces that math in Rust so the canonical values are
     // pinned without a GPU. The WGSL is the source of truth — keep the two in lockstep.
     mod stage_chain {
@@ -5238,11 +5199,6 @@ mod tests {
         const STAGE_MODULATE_2X: f32 = 2.0;
         const STAGE_MODULATE_4X: f32 = 4.0;
 
-        // Mirror of ffxi_particle.wgsl fragment(): d is the template colour (D3m/sheet stored
-        // /128, MMB raw byte/255), texel the sampled T (white on untextured paths), f the
-        // per-particle factor in raw byte/255. DoD3mDraw's textured table modulates TEXTURE
-        // against CURRENT with a4 set and against TFACTOR with it clear, stage 1 taking the
-        // other argument — both channels.
         fn retail_stages(
             path: D3mDrawPath,
             ignore_texture_alpha: bool,
@@ -5330,6 +5286,32 @@ mod tests {
             );
             assert_eq!(one[..3], two[..3]);
             assert!((one[3] - two[3] / 2.0).abs() < 1e-6);
+        }
+
+        #[test]
+        fn sprite_sheet_vertex_bytes_enter_stages_once() {
+            const SPRITE_COLOR_PINNED_BYTE: u8 = 128;
+            let sheet = ParticleSpriteSheet {
+                category: String::new(),
+                id: String::new(),
+                frames: vec![ffxi_dat::sprite_sheet::SpriteFrame {
+                    positions: vec![[0.0; 3]],
+                    uvs: vec![[0.0; 2]],
+                    colors: vec![[SPRITE_COLOR_PINNED_BYTE; 4]],
+                }],
+            };
+            let diffuse = sprite_sheet_templates(&sheet)[0].colors[0];
+            let normalized = f32::from(SPRITE_COLOR_PINNED_BYTE) / f32::from(u8::MAX);
+            assert_eq!(diffuse, Vec4::splat(normalized));
+            let output = retail_stages(
+                D3mDrawPath::D3m,
+                false,
+                diffuse,
+                Vec4::splat(0.25),
+                Vec4::splat(0.25),
+            );
+            assert_eq!(output[..3], [normalized / STAGE_MODULATE_4X; 3]);
+            assert_eq!(output[3], normalized / STAGE_MODULATE_2X);
         }
 
         // D3D saturates each stage on its own: a byte-255 vertex (stored 2.0 at /128) clips to
@@ -7533,7 +7515,7 @@ mod tests {
     // The sun/moon domes are untextured meshes whose whole shape is a vertex-alpha ramp (128 at
     // the centre to 0 at the rim). Folding the per-particle factor into that colour on the CPU
     // flattens the ramp; the mesh carries D (template, verbatim) and F (factor) as separate
-    // attributes and ffxi_particle.wgsl runs the table against both. Nothing is rescaled here:
+    // attributes and ffxi_particle.wesl runs the table against both. Nothing is rescaled here:
     // F.a is def()'s raw init alpha byte (0.5), held for the whole life — independent of
     // progress, on every draw path.
     #[test]

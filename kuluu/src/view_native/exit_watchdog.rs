@@ -34,6 +34,10 @@ pub fn note_complete() {
     COMPLETE.store(true, Ordering::SeqCst);
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "The exit watchdog uses its own blocking thread."
+)]
 pub fn arm() {
     if ARMED.swap(true, Ordering::SeqCst) {
         return;

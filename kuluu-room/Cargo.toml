@@ -1,0 +1,21 @@
+[package]
+name = "kuluu-room"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[package.metadata.dist]
+dist = false
+
+[dependencies]
+anyhow = { workspace = true }
+bevy = { workspace = true }
+clap = { workspace = true }
+ffxi-dat = { path = "../ffxi-dat" }
+ffxi-proto = { path = "../ffxi-proto" }
+kuluu-render = { path = "../kuluu-render" }
+kuluu-snapshot = { path = "../kuluu-snapshot" }
+serde_json = { workspace = true }
+tracing-subscriber = { workspace = true }

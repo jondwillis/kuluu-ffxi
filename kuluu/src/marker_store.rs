@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
-use bevy::prelude::*;
+use bevy::prelude::{DetectChanges, ResMut, Resource};
 use kuluu_render::hud::map_screen::{MapMarker, MapMarkers};
 use kuluu_render::snapshot::{system_chat_line, SceneState};
 use serde::{Deserialize, Serialize};
@@ -243,6 +243,7 @@ pub fn sync_markers(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bevy::prelude::*;
     use kuluu_snapshot::{SceneSnapshot, Vec3};
     use std::time::{SystemTime, UNIX_EPOCH};
 

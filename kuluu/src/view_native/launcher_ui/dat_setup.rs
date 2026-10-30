@@ -1,5 +1,5 @@
-use bevy::ecs::spawn::Spawn;
-use bevy::feathers::controls::{button_bundle, ButtonBundleProps, ButtonVariant};
+use bevy::feathers::controls::{ButtonVariant, FeathersButton};
+use bevy::feathers::font_styles::InheritableFont;
 use bevy::feathers::theme::ThemedText;
 use bevy::input::keyboard::{Key, KeyboardInput};
 use bevy::input::ButtonState;
@@ -363,21 +363,25 @@ fn build_job_panel(panel: &mut ChildSpawnerCommands, job: &ClientJob) {
     )));
     panel.spawn(actions_row()).with_children(|r| {
         r.spawn(button_slot(BUTTON_WIDTH)).with_children(|s| {
-            s.spawn(button_bundle(
-                ButtonBundleProps::default(),
-                (),
-                Spawn((
-                    Text::new(client_job::CANCEL_LABEL),
-                    ThemedText,
-                    JobText::CancelButton,
-                )),
-            ))
-            .observe(|_ev: On<Activate>, job: Option<ResMut<ClientJob>>| {
-                if let Some(mut job) = job {
-                    job.cancel.cancel();
-                    job.cancelling = true;
-                }
-            });
+            let cancel_marker = JobText::CancelButton;
+            s.spawn_empty()
+                .apply_scene(bsn! {
+                    @FeathersButton {
+                        @caption: bsn! {
+                            Text::new(client_job::CANCEL_LABEL)
+                            ThemedText
+                            cancel_marker
+                        },
+                    }
+                    Node { flex_grow: 1.0 }
+                    InheritableFont { font: {Handle::<Font>::default()} }
+                })
+                .observe(|_ev: On<Activate>, job: Option<ResMut<ClientJob>>| {
+                    if let Some(mut job) = job {
+                        job.cancel.cancel();
+                        job.cancelling = true;
+                    }
+                });
         });
     });
 }
@@ -485,11 +489,16 @@ fn build_setup_panel(panel: &mut ChildSpawnerCommands, form: &DatSetupForm, can_
             .with_children(|left| {
                 left.spawn(button_slot(OFFICIAL_BUTTON_WIDTH))
                     .with_children(|s| {
-                        s.spawn(button_bundle(
-                            ButtonBundleProps::default(),
-                            (),
-                            Spawn((Text::new("Get the official client..."), ThemedText)),
-                        ))
+                        s.spawn_empty().apply_scene(bsn! {
+                            @FeathersButton {
+                                @caption: bsn! {
+                                    Text::new("Get the official client...")
+                                    ThemedText
+                                },
+                            }
+                            Node { flex_grow: 1.0 }
+                            InheritableFont { font: {Handle::<Font>::default()} }
+                        })
                         .observe(
                             |_ev: On<Activate>,
                              mut form: ResMut<DatSetupForm>,
@@ -503,30 +512,41 @@ fn build_setup_panel(panel: &mut ChildSpawnerCommands, form: &DatSetupForm, can_
         }
         if can_go_back {
             r.spawn(button_slot(BUTTON_WIDTH)).with_children(|s| {
-                s.spawn(button_bundle(
-                    ButtonBundleProps::default(),
-                    (),
-                    Spawn((Text::new("Back"), ThemedText)),
-                ))
-                .observe(
-                    |_ev: On<Activate>,
-                     mut ret: ResMut<DatSetupReturn>,
-                     mut next: ResMut<NextState<LauncherState>>| {
-                        go_back(&mut ret, &mut next);
-                    },
-                );
+                s.spawn_empty()
+                    .apply_scene(bsn! {
+                        @FeathersButton {
+                            @caption: bsn! {
+                                Text::new("Back")
+                                ThemedText
+                            },
+                        }
+                        Node { flex_grow: 1.0 }
+                        InheritableFont { font: {Handle::<Font>::default()} }
+                    })
+                    .observe(
+                        |_ev: On<Activate>,
+                         mut ret: ResMut<DatSetupReturn>,
+                         mut next: ResMut<NextState<LauncherState>>| {
+                            go_back(&mut ret, &mut next);
+                        },
+                    );
             });
         }
         r.spawn(button_slot(BUTTON_WIDTH)).with_children(|s| {
-            s.spawn(button_bundle(
-                ButtonBundleProps {
-                    variant: ButtonVariant::Primary,
-                    ..default()
-                },
-                DefaultFocusTarget,
-                Spawn((Text::new("Continue"), ThemedText)),
-            ))
-            .observe(continue_observer);
+            s.spawn_empty()
+                .apply_scene(bsn! {
+                    @FeathersButton {
+                        @variant: ButtonVariant::Primary,
+                        @caption: bsn! {
+                            Text::new("Continue")
+                            ThemedText
+                        },
+                    }
+                    Node { flex_grow: 1.0 }
+                    InheritableFont { font: {Handle::<Font>::default()} }
+                })
+                .insert(DefaultFocusTarget)
+                .observe(continue_observer);
         });
     });
 }
@@ -558,52 +578,55 @@ fn spawn_install_row(panel: &mut ChildSpawnerCommands, install: &Install, curren
         });
         let select_root = root.clone();
         r.spawn(button_slot(BUTTON_WIDTH)).with_children(|s| {
-            s.spawn(button_bundle(
-                ButtonBundleProps {
-                    variant: if selected {
-                        ButtonVariant::Primary
-                    } else {
-                        ButtonVariant::Normal
-                    },
-                    ..default()
-                },
-                (),
-                Spawn((
-                    Text::new(if selected { "Selected" } else { "Select" }),
-                    ThemedText,
-                )),
-            ))
-            .observe(
-                move |_ev: On<Activate>,
-                      mut form: ResMut<DatSetupForm>,
-                      mut dirty: ResMut<DatSetupUiDirty>| {
-                    form.path = select_root.display().to_string();
-                    form.feedback = None;
-                    dirty.0 = true;
-                },
-            );
-        });
-        r.spawn(button_slot(BUTTON_WIDTH)).with_children(|s| {
-            if updatable {
-                s.spawn(button_bundle(
-                    ButtonBundleProps::default(),
-                    (),
-                    Spawn((Text::new("Update"), ThemedText)),
-                ))
+            s.spawn_empty()
+                .apply_scene(bsn! {
+                    @FeathersButton {
+                        @variant: {if selected { ButtonVariant::Primary } else { ButtonVariant::Normal }},
+                        @caption: bsn! {
+                            Text::new(if selected { "Selected" } else { "Select" })
+                            ThemedText
+                        },
+                    }
+                    Node { flex_grow: 1.0 }
+                    InheritableFont { font: {Handle::<Font>::default()} }
+                })
                 .observe(
                     move |_ev: On<Activate>,
-                          mut commands: Commands,
+                          mut form: ResMut<DatSetupForm>,
                           mut dirty: ResMut<DatSetupUiDirty>| {
-                        client_job::start(
-                            &mut commands,
-                            JobKind::Update {
-                                root: root.clone(),
-                                verify: false,
-                            },
-                        );
+                        form.path = select_root.display().to_string();
+                        form.feedback = None;
                         dirty.0 = true;
                     },
                 );
+        });
+        r.spawn(button_slot(BUTTON_WIDTH)).with_children(|s| {
+            if updatable {
+                s.spawn_empty()
+                    .apply_scene(bsn! {
+                        @FeathersButton {
+                            @caption: bsn! {
+                                Text::new("Update")
+                                ThemedText
+                            },
+                        }
+                        Node { flex_grow: 1.0 }
+                        InheritableFont { font: {Handle::<Font>::default()} }
+                    })
+                    .observe(
+                        move |_ev: On<Activate>,
+                              mut commands: Commands,
+                              mut dirty: ResMut<DatSetupUiDirty>| {
+                            client_job::start(
+                                &mut commands,
+                                JobKind::Update {
+                                    root: root.clone(),
+                                    verify: false,
+                                },
+                            );
+                            dirty.0 = true;
+                        },
+                    );
             }
         });
     });
@@ -637,19 +660,25 @@ fn spawn_path_row(panel: &mut ChildSpawnerCommands, path: &str) {
             );
         });
         rowc.spawn(button_slot(BUTTON_WIDTH)).with_children(|s| {
-            s.spawn(button_bundle(
-                ButtonBundleProps::default(),
-                (),
-                Spawn((Text::new("Browse..."), ThemedText)),
-            ))
-            .observe(
-                |_ev: On<Activate>,
-                 mut form: ResMut<DatSetupForm>,
-                 mut dirty: ResMut<DatSetupUiDirty>| {
-                    pick_folder(&mut form);
-                    dirty.0 = true;
-                },
-            );
+            s.spawn_empty()
+                .apply_scene(bsn! {
+                    @FeathersButton {
+                        @caption: bsn! {
+                            Text::new("Browse...")
+                            ThemedText
+                        },
+                    }
+                    Node { flex_grow: 1.0 }
+                    InheritableFont { font: {Handle::<Font>::default()} }
+                })
+                .observe(
+                    |_ev: On<Activate>,
+                     mut form: ResMut<DatSetupForm>,
+                     mut dirty: ResMut<DatSetupUiDirty>| {
+                        pick_folder(&mut form);
+                        dirty.0 = true;
+                    },
+                );
         });
     });
 }
@@ -693,26 +722,26 @@ fn spawn_download_block(panel: &mut ChildSpawnerCommands, form: &DatSetupForm) {
         for region in REGIONS {
             let active = form.download_region == region;
             r.spawn(button_slot(SMALL_BUTTON_WIDTH)).with_children(|s| {
-                s.spawn(button_bundle(
-                    ButtonBundleProps {
-                        variant: if active {
-                            ButtonVariant::Primary
-                        } else {
-                            ButtonVariant::Normal
+                s.spawn_empty()
+                    .apply_scene(bsn! {
+                        @FeathersButton {
+                            @variant: {if active { ButtonVariant::Primary } else { ButtonVariant::Normal }},
+                            @caption: bsn! {
+                                Text::new(region.to_uppercase())
+                                ThemedText
+                            },
+                        }
+                        Node { flex_grow: 1.0 }
+                        InheritableFont { font: {Handle::<Font>::default()} }
+                    })
+                    .observe(
+                        move |_ev: On<Activate>,
+                              mut form: ResMut<DatSetupForm>,
+                              mut dirty: ResMut<DatSetupUiDirty>| {
+                            form.download_region = region.to_string();
+                            dirty.0 = true;
                         },
-                        ..default()
-                    },
-                    (),
-                    Spawn((Text::new(region.to_uppercase()), ThemedText)),
-                ))
-                .observe(
-                    move |_ev: On<Activate>,
-                          mut form: ResMut<DatSetupForm>,
-                          mut dirty: ResMut<DatSetupUiDirty>| {
-                        form.download_region = region.to_string();
-                        dirty.0 = true;
-                    },
-                );
+                    );
             });
         }
     });
@@ -725,30 +754,40 @@ fn spawn_download_block(panel: &mut ChildSpawnerCommands, form: &DatSetupForm) {
     }
     panel.spawn(actions_row()).with_children(|r| {
         r.spawn(button_slot(BUTTON_WIDTH)).with_children(|s| {
-            s.spawn(button_bundle(
-                ButtonBundleProps::default(),
-                (),
-                Spawn((Text::new("Cancel"), ThemedText)),
-            ))
-            .observe(
-                |_ev: On<Activate>,
-                 mut form: ResMut<DatSetupForm>,
-                 mut dirty: ResMut<DatSetupUiDirty>| {
-                    form.download_open = false;
-                    dirty.0 = true;
-                },
-            );
+            s.spawn_empty()
+                .apply_scene(bsn! {
+                    @FeathersButton {
+                        @caption: bsn! {
+                            Text::new("Cancel")
+                            ThemedText
+                        },
+                    }
+                    Node { flex_grow: 1.0 }
+                    InheritableFont { font: {Handle::<Font>::default()} }
+                })
+                .observe(
+                    |_ev: On<Activate>,
+                     mut form: ResMut<DatSetupForm>,
+                     mut dirty: ResMut<DatSetupUiDirty>| {
+                        form.download_open = false;
+                        dirty.0 = true;
+                    },
+                );
         });
         r.spawn(button_slot(WIDE_BUTTON_WIDTH)).with_children(|s| {
-            s.spawn(button_bundle(
-                ButtonBundleProps {
-                    variant: ButtonVariant::Primary,
-                    ..default()
-                },
-                (),
-                Spawn((Text::new("Download and patch"), ThemedText)),
-            ))
-            .observe(start_download_observer);
+            s.spawn_empty()
+                .apply_scene(bsn! {
+                    @FeathersButton {
+                        @variant: ButtonVariant::Primary,
+                        @caption: bsn! {
+                            Text::new("Download and patch")
+                            ThemedText
+                        },
+                    }
+                    Node { flex_grow: 1.0 }
+                    InheritableFont { font: {Handle::<Font>::default()} }
+                })
+                .observe(start_download_observer);
         });
     });
 }

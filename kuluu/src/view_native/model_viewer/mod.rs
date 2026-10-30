@@ -561,7 +561,7 @@ fn turntable(time: Res<Time>, mut q: Query<&mut Transform, With<PreviewTurntable
 }
 
 fn tag_preview_meshes(
-    trigger: On<Add, Mesh3d>,
+    trigger: On<Add<Mesh3d>>,
     parents: Query<&ChildOf>,
     preview_parents: Query<(), With<PreviewParent>>,
     skinned: Query<(), With<SkinnedActor>>,

@@ -1,7 +1,7 @@
 use bevy::app::AppExit;
 use bevy::camera::ScalingMode;
 use bevy::prelude::*;
-use bevy::render::view::screenshot::{save_to_disk, Capturing, Screenshot};
+use bevy::render::view::screenshot::Capturing;
 use ffxi_dat::weather::collect_zone_weather_sets;
 use kuluu_render::camera::OperatorCamera;
 use kuluu_render::dat_mmb::{
@@ -21,6 +21,9 @@ use kuluu_render::vana_time::VanaClock;
 use kuluu_render::weather::{apply_zone_weather, sample_zone_weather, ZoneWeather};
 use kuluu_render::SceneState;
 use std::env;
+
+#[path = "support/capture_preview.rs"]
+mod capture_preview;
 
 // --sky reuses the REAL client sky pipeline (no reimplementation): the skybox
 // gradient dome, the sun/moon discs + directional lights, and the lens flare,
@@ -44,6 +47,7 @@ struct P {
     amb: f32,
     sun: f32,
     cam: Option<Vec3>,
+    stream_origin: Option<Vec3>,
     tgt: Vec3,
     fog: bool,
     sky: bool,
@@ -61,6 +65,7 @@ struct P {
     /// The zone's own timed auto-run emitters (lantern flames/glows, chimney
     /// smoke); --no-zone-particles leaves them out for an A/B frame-time read.
     zone_particles: bool,
+    lamp_halos: bool,
     /// Some(n): Enhanced Dynamic Lights with n shadowed lamps, zone geometry casting.
     enhanced_lights: Option<u32>,
     /// Skinned NPC actors placed in the zone (needs --sky), for reading how the
@@ -102,6 +107,7 @@ fn main() {
         amb: 600.0,
         sun: 8000.0,
         cam: None,
+        stream_origin: None,
         tgt: Vec3::ZERO,
         fog: false,
         sky: false,
@@ -110,6 +116,7 @@ fn main() {
         client_sun: false,
         weather: None,
         zone_particles: true,
+        lamp_halos: true,
         enhanced_lights: None,
         npcs: Vec::new(),
         no_receive: false,
@@ -146,6 +153,10 @@ fn main() {
             }
             "--cam" => {
                 p.cam = Some(f3(&a, i));
+                i += 4;
+            }
+            "--stream-origin" => {
+                p.stream_origin = Some(f3(&a, i));
                 i += 4;
             }
             "--tgt" => {
@@ -188,6 +199,10 @@ fn main() {
                 p.zone_particles = false;
                 i += 1;
             }
+            "--no-lamp-halos" => {
+                p.lamp_halos = false;
+                i += 1;
+            }
             "--npc" | "--pc" => {
                 let subject = if a[i] == "--npc" {
                     ActorSubject::Npc(a[i + 1].parse().unwrap())
@@ -221,16 +236,17 @@ fn main() {
             .expect("an FFXI install (kuluu install use NAME, or FFXI_DAT_PATH)"),
     );
     let mut app = App::new();
+    if !p.lamp_halos {
+        app.insert_resource(kuluu_render::particle_sim::LampHalosOff(true));
+    }
     app.insert_resource(VanaClock::anchored_at_hour(p.hour))
+        .insert_resource(bevy::winit::WinitSettings::continuous())
         .insert_resource(p)
         .init_resource::<FC>()
         .init_resource::<CS>()
         .insert_resource(ClearColor(Color::BLACK))
         .add_plugins(DefaultPlugins.set(WindowPlugin {
-            primary_window: Some(Window {
-                resolution: (1280u32, 1280u32).into(),
-                ..default()
-            }),
+            primary_window: Some(capture_preview::window((1280, 1280))),
             ..default()
         }))
         .add_plugins(FfxiZoneMaterialPlugin)
@@ -311,6 +327,9 @@ fn main() {
             // they do in the client. Only the simulator's two systems are pulled in — the
             // rest of SchedulerRuntimePlugin wants a live session's resources.
             .init_resource::<kuluu_render::particle_sim::ParticleSimulator>()
+            .init_resource::<kuluu_render::distortion_pass::ActiveDistortion>()
+            .add_message::<kuluu_render::scheduler_runtime::ParticleSpawnTrace>()
+            .add_message::<kuluu_render::audio::SfxEvent>()
             .add_systems(
                 Update,
                 (
@@ -475,6 +494,13 @@ fn setup(
     mut images: ResMut<Assets<Image>>,
     settings: Res<GraphicsSettings>,
 ) {
+    if let Some(origin) = p.stream_origin {
+        c.spawn((
+            kuluu_render::components::IsSelf,
+            Transform::from_translation(origin),
+            GlobalTransform::from_translation(origin),
+        ));
+    }
     d.zone_geom_mode = p.mode;
     if p.draw_scale.is_none() {
         d.world = 1e5;
@@ -498,6 +524,7 @@ fn setup(
         | bevy::render::render_resource::TextureUsages::RENDER_ATTACHMENT;
     let target = images.add(target);
     c.insert_resource(CapTarget(target.clone()));
+    capture_preview::spawn(&mut c, target.clone(), UVec2::new(size.width, size.height));
     let cam_target = bevy::camera::RenderTarget::Image(target.into());
     let cam = match p.cam {
         Some(pos) => c
@@ -521,6 +548,7 @@ fn setup(
             .id()
         }
     };
+    c.entity(cam).insert(bevy::camera::ShadowLodOrigin);
     if p.fog {
         c.entity(cam).insert((
             OperatorCamera,
@@ -743,8 +771,7 @@ fn cap(
         *frame_secs = 0.0;
     }
     if !s.0 && f.0 >= p.cap {
-        c.spawn(Screenshot::image(target.0.clone()))
-            .observe(save_to_disk(p.out.clone()));
+        capture_preview::capture(&mut c, target.0.clone(), &p.out);
         s.0 = true;
         eprintln!("captured -> {}", p.out);
     }

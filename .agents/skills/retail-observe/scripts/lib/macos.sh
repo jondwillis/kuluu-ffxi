@@ -36,7 +36,8 @@ host_windows_json() {
     function run(argv) {
     ObjC.import("CoreGraphics");
     ObjC.bindFunction("CFMakeCollectable", ["id", ["void *"]]);
-    const opts = $.kCGWindowListOptionOnScreenOnly | $.kCGWindowListExcludeDesktopElements;
+    const opts = argv[1] === "1" ? $.kCGWindowListExcludeDesktopElements :
+      $.kCGWindowListOptionOnScreenOnly | $.kCGWindowListExcludeDesktopElements;
     const wins = ObjC.deepUnwrap($.CFMakeCollectable(
       $.CGWindowListCopyWindowInfo(opts, $.kCGNullWindowID))) || [];
     const re = new RegExp(argv[0]);
@@ -44,11 +45,12 @@ host_windows_json() {
       .filter(w => re.test(w.kCGWindowOwnerName || "") && (w.kCGWindowLayer|0) === 0)
       .map(w => ({ id: w.kCGWindowNumber, name: w.kCGWindowName || "",
                    owner: w.kCGWindowOwnerName, pid: w.kCGWindowOwnerPID,
+                   on_screen: !!w.kCGWindowIsOnscreen,
                    x: w.kCGWindowBounds.X, y: w.kCGWindowBounds.Y,
                    w: w.kCGWindowBounds.Width, h: w.kCGWindowBounds.Height }))
       .filter(w => w.w > 200 && w.h > 200)
       .filter(w => !/Control Center/i.test(w.name)));
-    }' "$WINDOW_OWNER" 2>/dev/null
+    }' "$WINDOW_OWNER" "${WINDOW_INCLUDE_OFFSCREEN:-0}" 2>/dev/null
 }
 
 host_image_width() { sips -g pixelWidth "$1" 2>/dev/null | awk '/pixelWidth/{print $2}'; }

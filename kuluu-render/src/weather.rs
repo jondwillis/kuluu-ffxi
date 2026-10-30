@@ -537,7 +537,7 @@ pub struct ZoneViewCamera;
 /// altitude. The volume is a low-density lit ground haze, not the DAT distance
 /// fog (DistanceFog owns that): bevy's raymarch attenuates directional
 /// in-scatter by exp(-density * bounding_radius * (absorption + scattering))
-/// (volumetric_fog.wgsl), the same density*sigma product extinction needs, so
+/// (volumetric_fog.wesl), the same density*sigma product extinction needs, so
 /// a volume dense enough to reproduce DAT fog distances would crush its own
 /// lighting and render black instead of fog-colored; the density is capped so
 /// the light term survives and the haze scales gently with the zone's DAT fog
@@ -662,7 +662,7 @@ pub fn apply_zone_weather(
     let fog_color = Color::srgb(fr, fg, fb);
 
     // DistanceFog is the authoritative DAT distance fog in BOTH modes. The
-    // geometry materials sample it (zone_ffxi.wgsl / skinned_ffxi.wgsl call
+    // geometry materials sample it (zone_ffxi.wesl / skinned_ffxi.wesl call
     // apply_distance_fog under DISTANCE_FOG); the sky-dome material does not, so
     // like the client, fog swallows terrain but not the sky. The volumetric
     // layer can't take this role (the density cap in weather.rs) — it only

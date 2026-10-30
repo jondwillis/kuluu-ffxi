@@ -1,8 +1,10 @@
 #![cfg(not(target_arch = "wasm32"))]
 
 use bevy::asset::RenderAssetUsages;
+use bevy::picking::hover::Hovered;
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
+use bevy::ui_widgets::Button;
 
 use crate::graphics_settings::{GraphicsSettings, MinimapRadar};
 use crate::hud::style::theme;
@@ -367,6 +369,7 @@ pub fn spawn_minimap_as_child(p: &mut ChildSpawnerCommands, images: &mut Assets<
 
         p.spawn((
             Button,
+            Hovered::default(),
             MinimapResetButton,
             Node {
                 position_type: PositionType::Absolute,
@@ -412,16 +415,16 @@ pub fn update_reset_button_visibility(
 }
 
 pub fn handle_reset_button_click(
-    interactions: Query<&Interaction, (With<MinimapResetButton>, Changed<Interaction>)>,
+    rows: Query<&MinimapResetButton>,
+    mut presses: MessageReader<bevy::picking::events::PointerPress>,
+    parents: Query<&ChildOf>,
     mut zoom: ResMut<MinimapZoom>,
     mut view: ResMut<MinimapView>,
 ) {
-    for interaction in &interactions {
-        if *interaction == Interaction::Pressed {
-            *zoom = MinimapZoom::default();
-            view.pan_offset_xz = Vec2::ZERO;
-            view.idle_frames = 0;
-        }
+    if !crate::hud::primary_pressed_rows(&mut presses, &rows, &parents).is_empty() {
+        *zoom = MinimapZoom::default();
+        view.pan_offset_xz = Vec2::ZERO;
+        view.idle_frames = 0;
     }
 }
 

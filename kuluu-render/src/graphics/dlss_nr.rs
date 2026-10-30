@@ -65,11 +65,11 @@ pub struct NrEnabled {
     pub structure_strength: f32,
 }
 
-impl SyncComponent for NrEnabled {
+impl SyncComponent<RenderApp> for NrEnabled {
     type Target = Self;
 }
 
-impl ExtractComponent for NrEnabled {
+impl ExtractComponent<RenderApp> for NrEnabled {
     type QueryData = &'static Self;
     type QueryFilter = ();
     type Out = Self;

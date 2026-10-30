@@ -8,7 +8,6 @@ description = "Recast/Detour-backed NavMesh for FFXI zones, sourced from LandSan
 [dependencies]
 kuluu-nav = { path = "../kuluu-nav" }
 recastnavigation-rs = "0.1"
-glam = "0.32"
 thiserror = { workspace = true }
 tracing = { workspace = true }
 ureq = { version = "2", default-features = false, features = ["tls"] }

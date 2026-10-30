@@ -8,17 +8,47 @@ use bevy::text::{Font, FontSource, TextFont};
 // built-in default is a FiraMono *subset* with no geometric shapes / arrows /
 // symbols, so glyphs like ▶ render as tofu. This font covers them across the HUD.
 pub const DEJAVU_SANS_MONO: &[u8] = include_bytes!("../assets/fonts/DejaVuSansMono.ttf");
+/// The same family's oblique cut — real slanted outlines, not a rotated text box (owner
+/// ruling 2026-10-19 on the first attempt at an italic caption: "that is NOT italics.. you
+/// just slanted the whole word"). Byte-identical family to `DEJAVU_SANS_MONO` (both are
+/// upstream dejavu-fonts 2.37 releases; see `oblique_face_keeps_the_regular_advances`), so
+/// every width the HUD measures from the regular face still fits its glyphs.
+pub const DEJAVU_SANS_MONO_OBLIQUE: &[u8] =
+    include_bytes!("../assets/fonts/DejaVuSansMono-Oblique.ttf");
 
 #[derive(Resource, Default)]
 pub struct UiFont(pub Handle<Font>);
 
-pub fn load_ui_font(mut fonts: ResMut<Assets<Font>>, mut ui_font: ResMut<UiFont>) {
+/// The italic handle for the one HUD caption that asks for it. Deliberately separate from
+/// `UiFont`: `apply_ui_font` rewrites every `TextFont` it sees to the regular face, so an
+/// italic has to be requested explicitly and defended from that system.
+#[derive(Resource, Default)]
+pub struct UiFontItalic(pub Handle<Font>);
+
+// Fonts load in Startup, before any HUD spawns: a `TextFont` naming a handle is taken at
+// spawn time, so the handles must exist by then (the `Added<TextFont>` rewrites only ever
+// patch the face, never the choice to use an explicit one).
+pub fn load_ui_fonts(
+    mut fonts: ResMut<Assets<Font>>,
+    mut ui_font: ResMut<UiFont>,
+    mut italic: ResMut<UiFontItalic>,
+) {
     // Parse errors surface later in the text pipeline under Parley; the
     // unit tests below gate the bundled bytes at build time instead.
     ui_font.0 = fonts.add(Font::from_bytes(DEJAVU_SANS_MONO.to_vec()));
+    italic.0 = fonts.add(Font::from_bytes(DEJAVU_SANS_MONO_OBLIQUE.to_vec()));
 }
 
-pub fn apply_ui_font(ui_font: Res<UiFont>, mut q: Query<&mut TextFont, Added<TextFont>>) {
+/// Marks text that chose its own face: `apply_ui_font` skips it. Needed because that system
+/// rewrites every new `TextFont` to the regular HUD face, which would otherwise undo a
+/// caption asking for a different cut of the family (the Status panel's oblique).
+#[derive(Component)]
+pub struct KeepOwnFont;
+
+pub fn apply_ui_font(
+    ui_font: Res<UiFont>,
+    mut q: Query<&mut TextFont, (Added<TextFont>, Without<KeepOwnFont>)>,
+) {
     if ui_font.0 == Handle::default() {
         return;
     }
@@ -99,12 +129,46 @@ mod tests {
         assert!(line_height_px(10.0) > 10.0, "line box exceeds the em size");
     }
 
+    // The HUD measures every string from the regular face (`text_width_px`), including the
+    // caption drawn in the oblique. That is only sound while the two cuts share advance and
+    // line height — which they do upstream, and this catches it if a font refresh breaks it.
+    #[test]
+    fn oblique_face_keeps_the_regular_advances() {
+        let regular = FontArc::try_from_slice(DEJAVU_SANS_MONO).expect("regular ttf parses");
+        let oblique =
+            FontArc::try_from_slice(DEJAVU_SANS_MONO_OBLIQUE).expect("oblique ttf parses");
+        for (label, font) in [("regular", &regular), ("oblique", &oblique)] {
+            assert!(
+                font.units_per_em().is_some(),
+                "{label} declares units_per_em"
+            );
+        }
+        let upem = regular.units_per_em().expect("units_per_em");
+        assert_eq!(
+            oblique.units_per_em().expect("units_per_em"),
+            upem,
+            "same em square"
+        );
+        for ch in ['S', 't', 'a', 'u', 's', '0', ':', 'W', ' '] {
+            assert_eq!(
+                oblique.h_advance_unscaled(oblique.glyph_id(ch)),
+                regular.h_advance_unscaled(regular.glyph_id(ch)),
+                "'{ch}' advances differently in the oblique cut"
+            );
+        }
+        assert_eq!(
+            oblique.height_unscaled(),
+            regular.height_unscaled(),
+            "same line height, so the caption's mask row and pitch stay valid"
+        );
+    }
+
     #[test]
     fn bundled_font_covers_hud_glyphs_that_tofu_in_firamono() {
         let font = FontArc::try_from_slice(DEJAVU_SANS_MONO).expect("valid ttf");
         // glyph_id 0 is .notdef (tofu). These render as [] in Bevy's default
         // FiraMono subset; the whole point of vendoring DejaVu is to cover them.
-        for ch in ['▶', '▸', '»', '→', '↑', '↓'] {
+        for ch in ['▶', '▸', '»', '→', '↑', '↓', '◄', '►'] {
             assert_ne!(
                 font.glyph_id(ch).0,
                 0,

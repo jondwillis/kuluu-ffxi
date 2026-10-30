@@ -17,6 +17,11 @@ pub fn state_to_snapshot(s: &SessionState) -> wire::SceneSnapshot {
         self_pos,
         entities: s.entities.iter().map(entity_to_wire).collect(),
         party: s.party.iter().map(party_to_wire).collect(),
+        party_invite: s.party_invite.as_ref().map(|i| wire::PartyInvite {
+            char_id: i.char_id,
+            name: i.name.clone(),
+            alliance: i.alliance,
+        }),
         zone_generation: s.zone_generation,
         chat: s.chat.iter().map(chat_to_wire).collect(),
         chat_base_seq: s.chat_dropped,
@@ -71,7 +76,10 @@ pub fn state_to_snapshot(s: &SessionState) -> wire::SceneSnapshot {
         stats: s.char_stats.map(char_stats_to_wire),
         bazaar: s.bazaar.as_ref().map(bazaar_to_wire),
         auction: auction_to_wire(&s.auction),
-        play_time_s: 0,
+        // Retail's `/playtime` sum: the base the server sent at zone-in plus its
+        // own elapsed clock since that packet landed (FFXiMain.dll retail-2026-09
+        // RVA 0x7CAB0). A hard zero here is what made the panel read `0m`.
+        play_time_s: s.play_time_seconds(),
 
         self_fishing: s.self_fishing.map(|f| wire::SelfFishing {
             phase: f.phase,
@@ -101,7 +109,10 @@ pub fn state_to_snapshot(s: &SessionState) -> wire::SceneSnapshot {
         myroom: s.myroom.map(|m| wire::MyRoom {
             model: m.model,
             sub_map: m.sub_map,
+            door_open: m.door_open,
         }),
+
+        myroom_mode: s.myroom_mode,
 
         mh_2f_unlocked: s.mh_2f_unlocked,
 
@@ -120,6 +131,61 @@ pub fn state_to_snapshot(s: &SessionState) -> wire::SceneSnapshot {
         death_menu_offer: s.death_menu_offer.map(|offer| match offer {
             ffxi_proto::decode::DeathMenuOffer::Raise => wire::DeathMenuOffer::Raise,
             ffxi_proto::decode::DeathMenuOffer::Tractor => wire::DeathMenuOffer::Tractor,
+        }),
+        // The trade state lives on the shared snapshot type already (no mirror
+        // struct in `state`), so it forwards by clone — search results likewise
+        // (the scresult model, vault main_menu.md §26).
+        trade: s.trade.clone(),
+        search: s.search.clone(),
+        linkshells: s.linkshells,
+        synth_result: s.synth_result.clone(),
+        missions: s.missions.clone(),
+        // The extended-job records (vault main_menu.md §39) ride the shared
+        // snapshot type — clone straight through.
+        automaton: s.automaton.clone(),
+        monstrosity: s.monstrosity,
+        // The client-local macro store (vault main_menu.md §41) has no wire of
+        // its own; it rides the shared snapshot like the extended-job records.
+        macros: s.macros.clone(),
+        config_confdata: s.config_confdata,
+        // The job roster (s2c 0x01B) rides the shared snapshot so myroom's
+        // Change Jobs row can offer every unlocked job — LSB validates its
+        // commit against this very bitmask (vault main_menu.md §53).
+        jobs: s.job_info.map(|info| kuluu_snapshot::JobList {
+            unlocked: info.unlocked,
+            sub_job_unlocked: info.sub_job_unlocked,
+            job_levels: info.job_levels.to_vec(),
+        }),
+        // The raw 0x062 words ride through unchanged: each Status window applies its
+        // own family's encoding (FFXiMain.dll retail-2026-09 RVA 0x148564 for
+        // combat/magic, RVA 0x1488A0 for craft).
+        char_skills: s.char_skills,
+        merits: s.merits,
+        // The emote display order is client-local like the macro store — retail reads
+        // its own user blob at fill time (FFXiMain.dll retail-2026-09 `.text 0x2259C6`),
+        // and LSB ships no emote-order packet [V-negative], so it rides the snapshot.
+        emote_order: s.emote_order.clone(),
+        // The currency reports ride through RAW (bead kuluu-o9qt7.35): each Currencies window
+        // applies its own getter table at draw time, mirroring the client's fill helper
+        // FFXiMain.dll retail-2026-09 `.text 0x2297C0` (vault §59 addendum 27).
+        currencies_1: s.currencies_1.clone(),
+        currencies_2: s.currencies_2.clone(),
+        unity: s.unity,
+        alter_ego_points: s.alter_ego_points,
+        status_data_ready: s.status_data_ready,
+        login_state: s.login_state,
+        login_is_monstrosity: s.login_is_monstrosity,
+        merit_entries: s.merit_entries.clone(),
+        job_point_types: s.job_point_types.clone(),
+        job_points_received: s.job_points_received,
+        job_points: s.job_points,
+        homepoints: s.homepoints,
+        // The two rank rows of the Status Profile window ride in 0x01B JOB_INFO, which the session
+        // kept only for the Mog menus until now.
+        job_ranks: s.job_info.map(|j| wire::JobRanks {
+            mastery_rank: j.mastery_rank,
+            mentor_rank: j.mentor_rank,
+            can_thumbs_up_mentor: j.can_thumbs_up_mentor,
         }),
     }
 }
@@ -256,6 +322,7 @@ fn project_containers(s: &SessionState) -> Vec<wire::ContainerView> {
                     next_use_vana_ts: slot.next_use_vana_ts,
                     use_delay_end_vana_ts: slot.use_delay_end_vana_ts,
                     ready: slot.ready,
+                    extdata: slot.extdata,
                 })
                 .collect(),
         })
@@ -296,12 +363,28 @@ fn char_stats_to_wire(c: crate::state::CharStatsRaw) -> wire::CharStats {
         int_: c.bp_base[4],
         mnd: c.bp_base[5],
         chr: c.bp_base[6],
+        exp_now: c.exp_now,
+        exp_next: c.exp_next,
         hp_max: c.hp_max,
         mp_max: c.mp_max,
         attack: c.attack,
         defense: c.defense,
         bonus: c.bonus,
         resist: c.resist,
+        su_lv: c.su_lv,
+        equip_slot_block: c.equip_slot_block,
+        master_level_unlocked: c.master_level_unlocked,
+        mjob_no: c.mjob_no,
+        unity_faction: c.unity_faction,
+        unity_points: c.unity_points,
+        unity_points1: c.unity_points1,
+        unity_points2: c.unity_points2,
+        mjob_lv: c.mjob_lv,
+        title_id: c.title_id,
+        conquest_rank: c.conquest_rank,
+        conquest_rank_bar: c.conquest_rank_bar,
+        home_point_zone: c.home_point_zone,
+        nation: c.nation,
     }
 }
 
@@ -523,6 +606,29 @@ pub fn event_to_viewer_event(ev: AgentEvent) -> Option<wire::ViewerEvent> {
             label,
         }),
         AgentEvent::MapClosed => Some(wire::ViewerEvent::MapClosed),
+        AgentEvent::EventSoundChannelsSet { mask, enabled } => {
+            Some(wire::ViewerEvent::EventSoundChannelsSet { mask, enabled })
+        }
+        AgentEvent::EventSoundChannelsChange {
+            mask,
+            volume_thousandths,
+        } => Some(wire::ViewerEvent::EventSoundChannelsChange {
+            mask,
+            volume_thousandths,
+        }),
+        AgentEvent::EventMapPropsState { select, value } => {
+            Some(wire::ViewerEvent::EventMapPropsState { select, value })
+        }
+        AgentEvent::MapReloadRequested { map_id } => {
+            Some(wire::ViewerEvent::MapReloadRequested { map_id })
+        }
+        AgentEvent::ActorRenderFlagChanged { actor, bit, value } => {
+            Some(wire::ViewerEvent::ActorRenderFlagChanged {
+                actor: cutscene_actor_to_wire(actor),
+                bit,
+                value,
+            })
+        }
 
         _ => None,
     }
@@ -1160,6 +1266,8 @@ mod tests {
                     next_use_vana_ts: None,
                     use_delay_end_vana_ts: (id == 0 && i == 0).then_some(12_345),
                     ready: (id == 0 && i == 0).then_some(false),
+
+                    extdata: None,
                 })
                 .collect();
             s.inventory
@@ -1564,15 +1672,75 @@ mod tests {
             model: 615,
             sub_map: 2,
             exit_bit: 1,
+            door_open: true,
         });
         let snap = state_to_snapshot(&s);
-        // exit_bit stays session-side: the exit menu is DialogState-driven.
+        // exit_bit stays session-side: the exit menu is DialogState-driven. The open-door byte does
+        // cross, since that byte alone greys myroom's Layout/Remodel rows and flips its caption.
         assert_eq!(
             snap.myroom,
             Some(wire::MyRoom {
                 model: 615,
-                sub_map: 2
+                sub_map: 2,
+                door_open: true
             })
+        );
+    }
+
+    #[test]
+    fn macro_store_crosses_the_wire_boundary() {
+        use kuluu_snapshot::MacroSlot;
+        let mut s = SessionState::default();
+        assert!(state_to_snapshot(&s).macros.is_empty());
+        s.macros.push(MacroSlot {
+            block: 0,
+            index: 3,
+            text: "/ra".to_string(),
+        });
+        let snap = state_to_snapshot(&s);
+        assert_eq!(snap.macros.len(), 1);
+        assert_eq!((snap.macros[0].block, snap.macros[0].index), (0, 3));
+    }
+
+    #[test]
+    fn job_roster_crosses_the_wire_boundary() {
+        // The home-view Change Jobs row offers its pick list from this roster,
+        // and LSB's MYROOM_JOB validator re-tests every non-zero index against
+        // the same unlocked bits (vendor/server/src/map/packets/c2s/
+        // 0x100_myroom_job.cpp; vault main_menu.md §53) — so the fold must be
+        // lossless, not a summary.
+        let mut s = SessionState::default();
+        assert!(state_to_snapshot(&s).jobs.is_none());
+        s.job_info = Some(crate::state::JobInfoState {
+            mjob_no: 1,
+            sjob_no: 4,
+            unlocked: 0b1_0010,
+            sub_job_unlocked: true,
+            job_levels: {
+                let mut l = [0u8; ffxi_proto::decode::JobInfo::MAX_JOBTYPE];
+                l[1] = 99;
+                l[4] = 24;
+                l
+            },
+            can_thumbs_up_mentor: false,
+            mentor_rank: 0,
+            mastery_rank: 3,
+        });
+        let snap = state_to_snapshot(&s);
+        let jobs = snap.jobs.expect("roster folds through");
+        assert_eq!((jobs.unlocked, jobs.sub_job_unlocked), (0b1_0010, true));
+        assert_eq!(jobs.job_levels[1], 99);
+        assert_eq!(jobs.job_levels[4], 24);
+    }
+
+    #[test]
+    fn config_confdata_crosses_the_wire_boundary() {
+        let mut s = SessionState::default();
+        assert!(state_to_snapshot(&s).config_confdata.is_none());
+        s.config_confdata = Some([0x02, 0x80, 0x00, 0x01]);
+        assert_eq!(
+            state_to_snapshot(&s).config_confdata,
+            Some([0x02, 0x80, 0x00, 0x01])
         );
     }
 
@@ -1593,6 +1761,8 @@ mod tests {
             next_use_vana_ts: None,
             use_delay_end_vana_ts: None,
             ready: None,
+
+            extdata: None,
         });
         s.inventory.containers.insert(0, inv0);
 

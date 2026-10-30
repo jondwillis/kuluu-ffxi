@@ -781,7 +781,7 @@ mod tests {
         );
     }
 
-    /// point_shadow.wgsl resolves a per-actor slot to its shadow map by matching the
+    /// point_shadow.wesl resolves a per-actor slot to its shadow map by matching the
     /// slot's position against the clustered light's, so the uniform pack and the
     /// PointLight entity carry the same f32s for the same light.
     #[test]

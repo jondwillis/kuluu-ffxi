@@ -6,7 +6,9 @@
 //! `envelope(progress) × falloff(camera distance)` sent through bevy's rumble pipeline —
 //! bevy_gilrs' PostUpdate handler turns the requests into gilrs force feedback.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use bevy::platform::time::Instant;
 
 use bevy::ecs::message::MessageWriter;
 use bevy::input::gamepad::{Gamepad, GamepadRumbleIntensity, GamepadRumbleRequest};

@@ -36,19 +36,35 @@ const MODEL_SCREEN_SHIFT: f32 = 1.05;
 const PREVIEW_CAMERA_OFFSET: Vec3 = Vec3::new(-MODEL_SCREEN_SHIFT, 1.3, 3.0);
 const PREVIEW_LOOK_AT_OFFSET: Vec3 = Vec3::new(-MODEL_SCREEN_SHIFT, 1.0, 0.0);
 
-pub(super) fn register(app: &mut App) {
+/// The dressed model is a system of its own (`spawn_models_on_enter`,
+/// `rebake_model_if_debounced`) so `-cpu-mode` can leave the create screen to
+/// its menus without touching any actor DAT.
+pub(super) fn register(app: &mut App, models: bool) {
     app.add_observer(tag_create_preview_meshes)
         .add_systems(OnEnter(LauncherState::CharCreate), spawn_preview)
+        .add_systems(
+            OnEnter(LauncherState::CharCreate),
+            // Runs after `spawn_preview` has flushed, so the parent is there.
+            spawn_models_on_enter.run_if(move || models),
+        )
         .add_systems(OnExit(LauncherState::CharCreate), despawn_preview)
         .add_systems(
             Update,
-            (mark_dirty_on_form_change, rebake_if_debounced, turntable)
-                .run_if(in_state(LauncherState::CharCreate)),
+            (mark_dirty_on_form_change, turntable).run_if(in_state(LauncherState::CharCreate)),
+        )
+        .add_systems(
+            Update,
+            rebake_model_if_debounced
+                // `launcher_ui::char_preview` owns the screen while a character
+                // is being made: stand down rather than fight it.
+                .run_if(in_state(LauncherState::CharCreate))
+                .run_if(move || models)
+                .run_if(|q: Query<(), With<super::char_preview::CharPreviewParent>>| q.is_empty()),
         );
 }
 
 fn tag_create_preview_meshes(
-    trigger: On<Add, Mesh3d>,
+    trigger: On<Add<Mesh3d>>,
     parents: Query<&ChildOf>,
     preview_parents: Query<(), With<CharCreatePreviewParent>>,
     mut commands: Commands,
@@ -70,14 +86,7 @@ fn tag_create_preview_meshes(
     }
 }
 
-fn spawn_preview(
-    mut commands: Commands,
-    form: Res<CharCreateForm>,
-    dat_root: Res<crate::view_native::DatRootRes>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-    mut images: ResMut<Assets<Image>>,
-) {
+fn spawn_preview(mut commands: Commands, form: Res<CharCreateForm>) {
     let root = commands
         .spawn((
             CharCreatePreviewRoot,
@@ -114,6 +123,7 @@ fn spawn_preview(
             .looking_at(PREVIEW_PARENT_POS + Vec3::new(0.0, 1.0, 0.0), Vec3::Y),
         ChildOf(root),
     ));
+
     commands.spawn((
         DirectionalLight {
             illuminance: 7_000.0,
@@ -125,6 +135,7 @@ fn spawn_preview(
             .looking_at(PREVIEW_PARENT_POS + Vec3::new(0.0, 1.0, 0.0), Vec3::Y),
         ChildOf(root),
     ));
+
     commands.spawn((
         DirectionalLight {
             illuminance: 4_000.0,
@@ -133,36 +144,21 @@ fn spawn_preview(
         },
         RenderLayers::layer(PREVIEW_RENDER_LAYER),
         Transform::from_translation(PREVIEW_PARENT_POS + Vec3::new(0.0, 2.5, -3.0))
-            .looking_at(PREVIEW_PARENT_POS + Vec3::new(0.0, 1.0, 0.0), Vec3::Y),
+            .looking_at(PREVIEW_PARENT_POS + Vec3::ZERO, Vec3::Y),
         ChildOf(root),
     ));
 
-    let parent = commands
-        .spawn((
-            CharCreatePreviewParent,
-            CharCreatePreviewTurntable,
-            Transform {
-                translation: PREVIEW_PARENT_POS,
-                rotation: Quat::from_rotation_y(-std::f32::consts::FRAC_PI_2),
-                scale: Vec3::ONE,
-            },
-            Visibility::default(),
-            ChildOf(root),
-        ))
-        .id();
-
-    if let Some(dat) = dat_root.0.as_deref() {
-        spawn_preview_pc(
-            dat,
-            &mut commands,
-            parent,
-            form.race,
-            form.face,
-            &mut meshes,
-            &mut materials,
-            &mut images,
-        );
-    }
+    commands.spawn((
+        CharCreatePreviewParent,
+        CharCreatePreviewTurntable,
+        Transform {
+            translation: PREVIEW_PARENT_POS,
+            rotation: Quat::from_rotation_y(-std::f32::consts::FRAC_PI_2),
+            scale: Vec3::ONE,
+        },
+        Visibility::default(),
+        ChildOf(root),
+    ));
 
     commands.insert_resource(PreviewRebakeState {
         last_change: Instant::now(),
@@ -170,6 +166,30 @@ fn spawn_preview(
         last_race: form.race,
         last_face: form.face,
     });
+}
+
+fn spawn_models_on_enter(
+    mut commands: Commands,
+    dat_root: Res<crate::view_native::DatRootRes>,
+    parent: Single<Entity, With<CharCreatePreviewParent>>,
+    form: Res<CharCreateForm>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut images: ResMut<Assets<Image>>,
+) {
+    let Some(dat) = dat_root.0.as_deref() else {
+        return;
+    };
+    spawn_preview_pc(
+        dat,
+        &mut commands,
+        *parent,
+        form.race,
+        form.face,
+        &mut meshes,
+        &mut materials,
+        &mut images,
+    );
 }
 
 fn despawn_preview(mut commands: Commands, q_root: Query<Entity, With<CharCreatePreviewRoot>>) {
@@ -191,11 +211,11 @@ fn mark_dirty_on_form_change(form: Res<CharCreateForm>, mut state: ResMut<Previe
     state.dirty = true;
 }
 
-fn rebake_if_debounced(
+fn rebake_model_if_debounced(
     mut commands: Commands,
     form: Res<CharCreateForm>,
     mut state: ResMut<PreviewRebakeState>,
-    q_parent: Query<(Entity, Option<&Children>), With<CharCreatePreviewParent>>,
+    q_parent: Query<(Entity, &Children), With<CharCreatePreviewParent>>,
     dat_root: Res<crate::view_native::DatRootRes>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
@@ -210,10 +230,8 @@ fn rebake_if_debounced(
     let Ok((parent, kids)) = q_parent.single() else {
         return;
     };
-    if let Some(kids) = kids {
-        for child in kids.iter() {
-            commands.entity(child).despawn();
-        }
+    for child in kids.iter() {
+        commands.entity(child).despawn();
     }
     if let Some(dat) = dat_root.0.as_deref() {
         spawn_preview_pc(

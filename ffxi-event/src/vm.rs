@@ -9,12 +9,14 @@ use crate::cue::{
     EventCue, ExtSchedulerMotion, FourCc, LOCAL_PLAYER_SCHEDULER_DAT_ID_BASE, MAGIC_DAT_ID_BASE,
     MAGIC_ROUTINE_TAG, MUSIC_VOLUME_MAX, NO_ACTION_KEY, SCHEDULER_DAT_ID_BASE,
     SCHEDULER_DURATION_FROM_DAT, STATUS_EVENT_CHOCOBO, STATUS_EVENT_DOOR_CLOSE,
-    STATUS_EVENT_DOOR_OPEN, STATUS_EVENT_IDLE, STATUS_EVENT_MOTION_BASE, STATUS_EVENT_MOUNT,
+    STATUS_EVENT_DOOR_CLOSE2, STATUS_EVENT_DOOR_OPEN, STATUS_EVENT_DOOR_OPEN2, STATUS_EVENT_IDLE,
+    STATUS_EVENT_MOTION_BASE, STATUS_EVENT_MOUNT,
 };
 use crate::opcode_meta::{
-    OPCODE_META, OP_ENTITYSPEED, OP_EVENTPOSSET, OP_ITEMINFO, OP_LOADROOM, OP_LOOKSET, OP_MENU,
-    OP_MOVE, OP_NAMESET, OP_RENDERFLAG, OP_REQRESET, OP_STATUSSET, OP_STRINGOPS, OP_SUBSCHED,
-    OP_WINDOW,
+    OPCODE_META, OP_CODE_MOVE2, OP_ENTITYSPEED, OP_EVENTPOSSET, OP_EVENT_DIR_WRITER_D8,
+    OP_FLAGWORD_SELECTOR, OP_ITEMINFO, OP_LOADROOM, OP_LOOKSET, OP_MENU, OP_MOVE,
+    OP_MOVER_BRIDGE_B7, OP_NAMESET, OP_RENDERFLAG, OP_REQRESET, OP_STAGED_SLOT_LOADER_C3,
+    OP_STATUSSET, OP_STRINGOPS, OP_SUBSCHED, OP_WINDOW, OP_WORK_SLOT_TRIPLE_READ_AF,
 };
 
 /// A message the VM asked to display: dialog string `message_id` from the zone
@@ -152,6 +154,12 @@ pub enum Park {
 }
 
 pub(crate) const OP_END: u8 = 0x00;
+// 0xCA/0xCB dispatch to the very handler END runs (`f_100afc80`, one function
+// for all three slots): reset this thread slot's fields and yield. kuluu runs
+// each event block as its own VM, so ending the current one is the identical
+// response (opcode parity ledger pass 2026-10-29).
+const OP_END_TWIN_CA: u8 = 0xCA;
+const OP_END_TWIN_CB: u8 = 0xCB;
 const OP_GOTO: u8 = 0x01;
 const OP_IF: u8 = 0x02;
 const OP_GET_STORE: u8 = 0x03;
@@ -170,8 +178,26 @@ const OP_SHL: u8 = 0x10;
 const OP_SHR: u8 = 0x11;
 const OP_MUL: u8 = 0x14;
 const OP_DIV: u8 = 0x15;
+// Store-family opcodes armed from the opcode parity ledger pass (record
+// `.agents/skills/retail-observe/references/2026-10-28-event-opcode-no-skip-pass.md`):
+// each follows its handler's exact operand offsets, advance and rounding.
+const OP_RANDOM: u8 = 0x12;
+const OP_RANDOM_MODULO: u8 = 0x13;
+const OP_SINE: u8 = 0x16;
+const OP_COSINE: u8 = 0x17;
+const OP_VECTOR_TO_HEADING: u8 = 0x18;
+const OP_MODULO: u8 = 0x3F;
 const OP_SWAP: u8 = 0x19;
 const OP_BITARRAY_SET: u8 = 0x3C;
+// The clear half of the bit-array pair (`f_100b02f0`): same operand layout as
+// OP_BITARRAY_SET, and like it a guarded word write — retail skips whenever the
+// word number is at or past the bound.
+const OP_BITARRAY_CLEAR: u8 = 0x3D;
+// The flag-family siblings writing bits of the *first* entity flags word: one
+// takes its actor from operands like 0x92 (`f_100b35e0`), the other always acts
+// on the event's own entry (`f_100b5a40`).
+const OP_ENTITY_FLAGS_SET_BIT19: u8 = 0x2F;
+const OP_ENTITY_FLAGS_SET_BIT21: u8 = 0x33;
 pub(crate) const OP_WAIT: u8 = 0x1C;
 const OP_JUMP: u8 = 0x1A;
 const OP_RETURN: u8 = 0x1B;
@@ -237,8 +263,17 @@ const OP_LOCAL_PLAYER_SCHEDULER: u8 = 0x7D;
 // Non-scene NPC choreography: the same cues the scene path (vm/scene.rs) emits
 // when the event carries scene data. 0x1F itself is the sub-byte `OP_MOVE`.
 const OP_MAIN_SPEED: u8 = 0x32;
-// research/XiEvents/OpCodes/0x0031.md CodeSMOVE requires player movement and MoveTime support.
+// research/XiEvents/OpCodes/0x0031.md CodeSMOVE: OP_MOVE with a staged
+// MoveTime budget; the armed law and its twin 0x5A sit in the mover section of
+// `.agents/skills/retail-observe/references/2026-10-28-event-opcode-no-skip-pass.md`.
 const OP_SMOVE: u8 = 0x31;
+/// The staged MoveTime word sits at this operand offset in the case-0 record
+/// of both mover opcodes (handler `f_100b5630`, same record).
+const SMOVE_MOVE_TIME_OFS: usize = 8;
+/// Second-flags-word (`[entry+0x124]`) bit 17 — set before every poll pass by
+/// both handlers, the movers' in-flight mark (`f_100b5630`/`f_100b31f0`, same
+/// record; retail's `or dword ptr [eax+0x124], 0x20000`).
+const MOVER_IN_FLIGHT_BIT_124: u32 = 17;
 // 0xDA: a batch motion loader beyond the 0x00..=0xD9 meta range. A 6-byte
 // header followed by 28-byte records, each naming (actor1, actor2, key);
 // the VM emits one ActorMotion cue per record and advances past them all.
@@ -263,6 +298,13 @@ const OP_RANGE_RECT: u8 = 0x82;
 const OP_FRIENDPASS_87: u8 = 0x87;
 const OP_FRIENDPASS_88: u8 = 0x88;
 const OP_RECIPE: u8 = 0x8C;
+// Three opcodes whose whole behaviour is a store into a fixed client global; their names are the
+// cell they write plus the value rule, since no upstream name exists for them (the ledger calls them
+// by handler symbol). Each was previously scored as "nothing to model", which was wrong: retail
+// writes these cells and so does kuluu now.
+const OP_CLIENT_BYTE_10488100_ZERO: u8 = 0x30;
+const OP_CLIENT_DWORD_104898FC_OPERAND_IS_ZERO: u8 = 0x9E;
+const OP_CLIENT_BYTE_10463924_OPERAND_IS_ZERO: u8 = 0xD9;
 // 0xD4 MAP_QUERY: case 0 runs the 0x24 query helper and opens the current
 // zone's map (type 6), parking on the answer; case 2 runs the helper without
 // the map; cases 1/3/4/5 copy into the client's query window, which has no
@@ -284,6 +326,96 @@ const OP_A6_SUBMAP: u8 = 0xA6;
 const OP_B2_DELIVERY: u8 = 0xB2;
 const OP_RANKING: u8 = 0xB3;
 const OP_SET_FACING: u8 = 0x39;
+// Operand offsets of the entity-speed switch (`OP_ENTITYSPEED`, `f_100b6a60`),
+// now that its cases are handled individually rather than by the shared
+// sub-byte family path.
+const ENTITY_SPEED_SELF_VALUE_OFS: usize = 2;
+const ENTITY_SPEED_LOOKUP_ACTOR_OFS: usize = 2;
+const ENTITY_SPEED_LOOKUP_VALUE_OFS: usize = 6;
+// The third-flags-word writer (`f_100b74e0`) and the selector op
+// (`f_100b73f0`, whose width table lives with the other variable widths);
+// retail names neither, so the constants say what each demonstrably does
+// (opcode parity ledger pass 2026-10-29).
+const OP_ENTITY_WORD128_SET: u8 = 0x61;
+// The third latch of the same word-124 family (`f_100b7490`), two bytes wide,
+// and the [entry+0x128] bit-17 writer (`f_100b8a80`) whose meta width already
+// matches its handler step (opcode parity ledger pass 2026-10-29).
+const OP_ENTITY_WORD124_BIT31_LATCH: u8 = 0x74;
+const OP_ENTITY_WORD128_SET_BIT17: u8 = 0x7C;
+// The three fourth-flags-word force-setters (`f_100ba8d0`, `f_100ba920`,
+// `f_100ba970`): each pins one bit of `[entry+0x12c]` — 26, 11 and 12 — to the
+// low bit of its inline operand (a plain bit store, not the xor-latch family).
+// The subject is always the current event entity, read as a word at `[exec+2]`
+// rather than fetched from an operand; the null-slot write skip folds into
+// kuluu's publish-anyway posture. Widths two/two/three (opcode parity ledger
+// pass 2026-10-29, `.agents/skills/retail-observe/references/
+// 2026-10-28-event-opcode-no-skip-pass.md`).
+const OP_ENTITY_WORD12C_SET_BIT26: u8 = 0xA4;
+// The pair-dispatcher family (`f_100bb620`): weather, name-colour and actor-link
+// cases whose widths the sub byte decides (six/eight/ten in `opcode_meta.rs`);
+// effects sit below kuluu's cue boundary (record Not established #12), and an
+// unknown sub halts here as retail spins without advancing.
+const OP_PAIRDISPATCH_AE: u8 = 0xAE;
+// The staged-record loader (`f_100b7140`): only a zero sub byte runs — the
+// others leave exec untouched (retail spins there, kuluu halts); the running
+// case resolves one actor and answers two predicate calls on its handle before
+// taking width six. Zero authored uses in the corpus; armed so the spin law is
+// right even where no script yet leans on it.
+const OP_STAGED_RECORD_PROBE_D3: u8 = 0xD3;
+// The registry-lookup op (`f_100bbd80`): selector picks which global registry
+// field feeds a work-slot store; widths eight (most selectors, the two live
+// registries) or ten (selector sixty-four's wider-strided one), and selectors
+// past its own sixty-four-entry ceiling never advance — retail spins,
+// kuluu halts. Values below the cue boundary (`opcode_meta.rs` width row).
+const OP_REGISTRY_LOOKUP_BF: u8 = 0xBF;
+// The mode-bits work-slot writer (`f_100bba70`, width four on its three live
+// selectors): selector zero stores bits one-two of the shared mode dword,
+// one bit zero, two a constant; any other selector exits without advancing —
+// retail spins, kuluu halts. The values come from a client mode global with no
+// named producer (record census tail two), so nothing is published.
+const OP_MODE_BITS_WORK_WRITER_B1: u8 = 0xB1;
+const OP_ENTITY_WORD12C_SET_BIT11: u8 = 0xA5;
+const OP_ENTITY_WORD12C_SET_BIT12: u8 = 0xC0;
+// The unconditional bit-setter on the same fourth word (`f_100b9100`): ors bit
+// zero into `[entry+0x12c]` of the current event entity, one byte wide (the
+// ledger's earlier "none" form again being `inc`-blindness).
+const OP_ENTITY_WORD12C_SET_BIT0: u8 = 0x84;
+// The resolved-actor member of the fourth-word family (`f_100b8f30`, width
+// six): the actor operand resolves from a token at +2 (eligibility gate and
+// staleness folded into kuluu's lookup posture), the bit source is the byte at
+// +1, and bit three of `[entry+0x12c]` takes its low bit.
+const OP_ENTITY_WORD12C_SET_BIT3_RESOLVED: u8 = 0x86;
+// Operand offsets shared by the selector op and its word-128 sibling.
+const FLAGWORD_VALUE_OFS: usize = 1;
+// The resolved-actor fourth-word setter's actor token sits at +2 (`f_100b8f30`).
+const WORD12C_RESOLVED_ACTOR_OFS: usize = 2;
+// The staged-slot loader reads its table index through the stream getter
+// immediately after the opcode byte (`push 1; call f_100af4b0` @100bc001..@100bc005,
+// i.e. `getworkofs(+1)` with the reference-window routing that getter carries),
+// and the handler's own bound `cmp eax, 8` @100bc011 says that staging table
+// holds eight entries — a signed index outside it takes the no-advance exit.
+const STAGED_SLOT_INDEX_OFS: usize = 1;
+// The bound is applied to the resolved operand as a signed thirty-two-bit value,
+// which is what the handler's `test eax, eax` / `cmp eax, 8` pair compares.
+const STAGED_SLOT_TABLE_ENTRY_COUNT: i32 = 8;
+// The busy-predicate case 7 (`f_100b4e10`) inline actor dwords, read at the
+// helper's two fetch offsets (the dispatcher pre-increments exec by one):
+// absolute +2 and +6 — 2026-10-29 revised scheduler-helper section of this
+// record.
+const SUBSCHED_ACTOR_OFS_C7_FIRST: usize = 2;
+const SUBSCHED_ACTOR_OFS_C7_SECOND: usize = 6;
+// The two distance stores (`f_100b75c0`, `f_100b7860`); both are eleven bytes
+// wide and store through a work operand at +1.
+const OP_WORK_DISTANCE: u8 = 0x64;
+const OP_ACTOR_DISTANCE: u8 = 0x65;
+const DISTANCE_DEST_OFS: usize = 1;
+const WORK_DISTANCE_X_MINUS_OFS: usize = 3;
+const WORK_DISTANCE_X_PLUS_OFS: usize = 7;
+const WORK_DISTANCE_Z_MINUS_OFS: usize = 5;
+const WORK_DISTANCE_Z_PLUS_OFS: usize = 9;
+// The actor distance's lookups (`f_100afac0` pushes 3 and 7).
+const ACTOR_DISTANCE_FIRST_LOOKUP_OFS: usize = 3;
+const ACTOR_DISTANCE_SECOND_LOOKUP_OFS: usize = 7;
 const OP_YAW: u8 = 0x4B;
 const OP_SET_EVENT_POS: u8 = 0x36;
 const OP_SET_ACTOR_POS: u8 = 0xBA;
@@ -306,6 +438,12 @@ const OP_MUSIC: u8 = 0x5C;
 const OP_MUSICVOLUME: u8 = 0x5D;
 const OP_SET_SOUND_VOLUME: u8 = 0x69;
 const OP_CHANGE_SOUND_VOLUME: u8 = 0x6A;
+// The per-actor render-flag writes. Retail names none of the bits, so each
+// carries its image bit index and no invented tier name
+// (`.agents/skills/retail-observe/references/2026-10-28-event-opcode-no-skip-pass.md`).
+const OP_VISUAL_RENDER_BYTE: u8 = 0x81;
+const OP_ACTOR_FLAGS_WORD_BIT16_TOGGLE: u8 = 0x92;
+const OP_ACTOR_FLAGS_WORD_BIT17_TOGGLE: u8 = 0x94;
 const OP_SET_CLOCK_DATE: u8 = 0xA9;
 const OP_ENABLE_TIMER: u8 = 0xC9;
 const OP_WAITSCHEDULOR: u8 = 0x53;
@@ -365,6 +503,22 @@ const OP_PLAYANIM: u8 = 0x63;
 const OP_BITTEST: u8 = 0x3E;
 const OP_QUERYWAIT2: u8 = 0x7F;
 
+// The event emote trio's operands (`.agents/skills/retail-observe/references/
+// 2026-10-02-event-emote-busy.md`): 0x6E names its actor at +1 and carries the
+// packed emote-id/argument word at +5; 0x99 names its actor at +1. 0x63 reads
+// no operand — retail takes the owner from `[event+2]`, which is this block's
+// own event entity (the same actor `OP_PLAYANIM`'s busy gate and mark key on).
+const EMOT_ACTOR_OFS: usize = 1;
+const EMOT_VALUE_OFS: usize = 5;
+const ANIMWAIT_ACTOR_OFS: usize = 1;
+/// The zero key a numeric event animation or emote occupies its actor's action
+/// slot under. Retail's mark is the per-actor byte at `[actor+0x1BC]`, not a
+/// routine fourcc (the census record proves `OP_ANIMWAIT`'s predicate is that
+/// byte, "not a routine-name-specific or emote-only timer"), and kuluu has no
+/// numeric-id motion content to key differently — see the 2026-10-28 cutscene
+/// scheduler record for what the id spaces do and do not reach.
+const NUMERIC_ACTION_KEY: FourCc = [0, 0, 0, 0];
+
 // Advances the load/turn/transpar opcodes take when their entity does not
 // resolve — retail's own `!GetActorIndex` / `!entity` early exit, which is the
 // only path this actor-less VM can be on (research/XiEvents/OpCodes/0x0080.md,
@@ -372,12 +526,17 @@ const OP_QUERYWAIT2: u8 = 0x7F;
 const LOADWAIT_SIZE: usize = 5;
 const TRANSPAR_SIZE: usize = 9;
 /// 0x0034.md (and 0x0035.md, the same handler without the zone close) spreads
-/// its zone load over three `EventIdle` ticks driven by two file-scope counters,
-/// advancing only on the last; the net effect of the sequence is +3, and this VM
-/// has no frame clock to spend the first two on.
+/// its map/zone-window reload over three scheduler deliveries driven by two
+/// file-scope counters, holding twice and advancing only on the last
+/// (`OP_MAPLOAD`'s `mapload_three_pass_hold` now spends all three).
 const MAPLOAD_SIZE: usize = 3;
-/// 0x0058.md is `ExecPointer++; RetFlag = 1`; 0x009A.md yields only while the
-/// music server is mid-read, which nothing here triggers.
+/// The held passes retail takes before it reloads and advances — entity-touch,
+/// then arm-the-countdown, per the 2026-10-28 event opcode no-skip-pass record.
+const MAPLOAD_PASSES_BEFORE_RELOAD: u8 = 2;
+/// 0x0058.md is `ExecPointer++; RetFlag = 1`. 0x9A MUSICREADWAIT occupies one
+/// byte too; it holds in-tick only while the music server's read is running,
+/// a state that lives behind kuluu's cue boundary, so its arm yields exactly
+/// one pass (2026-10-28 event opcode no-skip-pass record).
 const YIELD_SIZE: usize = 1;
 /// 0x0025.md / 0x007F.md: one byte, `ExecPointer += 1` on every exit that
 /// advances (selection taken, or no talk window open).
@@ -391,6 +550,27 @@ const BIT_TEST_WORD_OFS: usize = 1;
 const BIT_TEST_TARGET_OFS: usize = 5;
 const BIT_TEST_WORD_SHIFT: i32 = 5;
 const BIT_TEST_BIT_MASK: i32 = 0x1F;
+
+// The CRT LCG behind the random store opcodes' helper `f_103149e0`: in place,
+// state = state * 0x343FD + 0x269EC3 (mod 2^32), and the draw is
+// (state >> 16) & 0x7FFF — MSVC's `rand()` sequence. Retail keeps one global
+// copy; no event opcode re-seeds it, so kuluu starts each VM at MSVC's default
+// seed of 1 (sequence parity with retail processes is not observable through
+// opcodes and needs none).
+const EVENT_RNG_MULTIPLIER: u32 = 0x3_43FD;
+const EVENT_RNG_INCREMENT: u32 = 0x0026_9EC3;
+const EVENT_RNG_OUTPUT_SHIFT: u32 = 16;
+const EVENT_RNG_OUTPUT_MASK: u32 = 0x7FFF;
+const EVENT_RNG_SEED: u32 = 1;
+
+// Float constants the trig handlers load from `.rdata`, captured bit-exact:
+// `ANGLE_TO_RADIANS` ([0x1032d694]) scales the angle operand, which is in FFXI
+// heading units (a full turn is 4096), for SIN/COS; `ATAN_TURN_SCALE_A/B`
+// ([0x1032d3d8], [0x1032b170]) convert FPATAN's radian output back to heading
+// units, multiplied in that order.
+const ANGLE_TO_RADIANS: f32 = f32::from_bits(0x3AC9_0E56);
+const ATAN_TURN_SCALE_A: f32 = f32::from_bits(0x4580_0000); // 4096.0
+const ATAN_TURN_SCALE_B: f32 = f32::from_bits(0x3EA2_FABE); // ~1/pi
 
 const IF_KIND_MASK: u8 = 0x0F;
 
@@ -531,6 +711,31 @@ const MAP_MARKER_X_OFS: usize = 5; // 0x008B
 const MAP_MARKER_Y_OFS: usize = 7; // 0x008B
 const MAP_MARKER_NAME_OFS: usize = 9; // 0x008B, 16 bytes
 const OPEN_MAP_ID_OFS: usize = 1; // 0x0089, 0x008D
+                                  // The map-window ops' operand slots (2026-10-28 event opcode no-skip-pass
+                                  // record): 0x8D passes (select, value) to retail's shared window helper; the
+                                  // marked variant inserts one helper-only word at +3 between the id and the
+                                  // coordinates, which shifts x/y/name by two bytes over the plain marker above.
+const OPEN_MAP_PROPS_SELECT_OFS: usize = 1;
+const OPEN_MAP_PROPS_VALUE_OFS: usize = 3;
+const MAP_ADD_MARK_ID_OFS: usize = 1;
+const MAP_ADD_MARK_X_OFS: usize = 7; // shifted from the plain marker's +5
+const MAP_ADD_MARK_Y_OFS: usize = 9; // shifted from the plain marker's +7
+const MAP_ADD_MARK_NAME_OFS: usize = 11; // 16 bytes, shifted from the plain +9
+                                         // The volume ops' operands (`SOUND_TYPE_*` bits select retail's mixer arms):
+                                         // 0x69 is an inline full-or-silence flag and a work-mask; 0x6A carries its
+                                         // per-mille target first and its work-mask last.
+const SOUND_SET_FLAG_OFS: usize = 1;
+const SOUND_SET_MASK_OFS: usize = 2;
+const SOUND_CHANGE_TARGET_OFS: usize = 1;
+const SOUND_CHANGE_MASK_OFS: usize = 5;
+// The flag-write ops resolve their actor at +2 (the shared big-endian lookup)
+// and carry the written bit/byte inline at +1.
+const RENDER_FLAG_ACTOR_OFS: usize = 2;
+const RENDER_FLAG_VALUE_OFS: usize = 1;
+// Image bit positions of the two flags-word toggles, kept as numbers because
+// no source names what either bit does on screen (record's Not established 2).
+const ACTOR_FLAGS_WORD_BIT_16: u32 = 16;
+const ACTOR_FLAGS_WORD_BIT_17: u32 = 17;
 const CHOCOBO_CASE_OFS: usize = 1; // 0x007E
 const CHOCOBO_TARGET_OFS: usize = 2;
 const CHOCOBO_MOUNT_ID_OFS: usize = 6;
@@ -583,6 +788,29 @@ pub const OPCODE_BUDGET_PER_STEP: u32 = 100_000;
 /// await in a spawned task, so the VM must stay Send.
 type SharedWorkZone = Arc<Mutex<[u32; WORK_ZONE_LEN]>>;
 
+/// Fixed client globals that retail's event interpreter writes *directly*, with no entity or
+/// work-slot indirection. They are ordinary `.bss` cells in the image (so they read zero before any
+/// write), and three opcodes store into them; the engine writes the same cells too, which is what
+/// names each one here. Recorded site-by-site in
+/// `.agents/skills/retail-observe/references/2026-10-28-event-opcode-no-skip-pass.md` (section "The
+/// 'effectless' rows were not effectless"): an opcode that stores has to perform the store, whether or not
+/// kuluu yet consumes the value.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct EventClientGlobals {
+    /// Image byte at 0x10488100. Zeroed by opcode 0x30 (`f_100b5620`: `mov byte ptr [0x10488100], 0`
+    /// then `inc word ptr [ecx+0x256]`). The engine sets it to one at `f_100aed00` (@100aed4f) and
+    /// reads it in the per-actor update `f_100ae3f0` (@100ae84c).
+    pub byte_10488100: bool,
+    /// Image byte at 0x10463924. Opcode 0xD9 (`f_100b7be0`) stores its operand-byte-is-zero predicate
+    /// here (`cmp/sete` on the inline byte, `mov byte ptr [0x10463924], al`). Also written by
+    /// `f_100355f0` (@100356d8) and compared at `f_10038330` (@10038364).
+    pub byte_10463924: bool,
+    /// Image dword at 0x104898fc. Opcode 0x9E (`f_100ba8a0`) stores the same operand-is-zero
+    /// predicate as a full dword (`sete bl` into a zeroed ebx, `mov dword ptr [0x104898fc], ebx`).
+    /// Other writers: `f_10094190` (@10094205), `f_100ae3f0` (@100ae817), `f_100aed00` (@100aedab).
+    pub dword_104898fc: u32,
+}
+
 /// `XiEvent` runtime for a single event, simplified to the linear+jump+message
 /// flow plus the per-actor request stacks a scene fans out onto (research/
 /// XiEvents/Event VM Structures.md xievent_t::ReqStack). Mirrors the fields the
@@ -603,6 +831,9 @@ pub struct EventVm {
     /// (research/XiPackets/world/server/0x005D, research/XiEvents/OpCodes/
     /// 0x00B4.md).
     pending_strings: [[u8; 16]; 4],
+    /// The LCG state the random store opcodes (0x12/0x13) advance, as the
+    /// handler-side `rand()` helper keeps it; see [`EVENT_RNG_SEED`].
+    event_rng_state: u32,
     work_zone: SharedWorkZone,
     /// The local player's position, one shared cell across every VM in the
     /// event: retail keeps a single position for the zone block's entity, and
@@ -611,6 +842,13 @@ pub struct EventVm {
     /// scene and shared to owner and request children, so a walk child starts
     /// from the snapped position rather than a sibling's zeroed scene.
     shared_player: Option<std::sync::Arc<std::sync::Mutex<scene::EventPosition>>>,
+    /// Movement budget, in hold units, staged by 0x31 CodeSMOVE. Retail counts
+    /// it down once per interpreter pass alongside its move clocks, and the
+    /// poll advances past arrival once it runs out — a walk longer than the
+    /// budget lets later script beats race ahead of the body. The twin 0x5A
+    /// stages no budget (`.agents/skills/retail-observe/references/
+    /// 2026-10-28-event-opcode-no-skip-pass.md` mover section).
+    smove_budget_left: Option<f32>,
     exec_pointer: usize,
     jump_table: [u16; JUMP_STACK_LEN],
     jump_index: usize,
@@ -647,6 +885,9 @@ pub struct EventVm {
     /// (fully or partly) past the end of the bytecode; each read yields 0.
     /// `Cell` because reads happen through `&self` accessors.
     oob_reads: std::cell::Cell<u32>,
+    /// Retail's directly-addressed client globals, written by opcodes 0x30 / 0x9E / 0xD9 and readable
+    /// by the host through [`Self::client_globals`]. See [`EventClientGlobals`].
+    client_globals: EventClientGlobals,
     /// Retail's `ReqStack[RunPos].WaitTime`: what is left of a timed wait, and
     /// how far to step once it runs out. Armed by the opcode, drained by
     /// [`Self::tick`].
@@ -669,6 +910,13 @@ pub struct EventVm {
     /// target's stack so the re-run of the parked opcode advances instead of
     /// queueing a second child.
     req_wait: Option<(u32, u8)>,
+    /// The pass counter of 0x34/0x35 (`mapload_three_pass_hold`); retail keeps
+    /// the equivalent countdown in a global shared across event threads, this VM
+    /// per running instance (record's Not established 5).
+    mapload_passes_taken: u8,
+    /// Set while 0x9A MUSICREADWAIT has yielded its one pass and not yet
+    /// advanced; cleared by the advance.
+    music_read_yield_taken: bool,
     /// Host-armed action holds the WAIT* family parks on; see [`ActionHold`].
     action_holds: Vec<ActionHold>,
     /// Host-armed move holds a non-player MOVE case 1 parks on; see
@@ -886,6 +1134,7 @@ impl EventVm {
             work_local: [0; WORK_LOCAL_LEN],
             work_local_str: [[0u8; 16]; WORK_LOCAL_LEN],
             pending_strings: [[0u8; 16]; 4],
+            event_rng_state: EVENT_RNG_SEED,
             work_zone,
             shared_player: None,
             exec_pointer,
@@ -908,9 +1157,12 @@ impl EventVm {
             a7_result: 0,
             a6_submap_num: 0,
             req_wait: None,
+            mapload_passes_taken: 0,
+            music_read_yield_taken: false,
             action_holds: Vec::new(),
             move_holds: Vec::new(),
             move_speed: 0,
+            smove_budget_left: None,
             actor_types: std::collections::HashMap::new(),
             entity_positions: std::collections::HashMap::new(),
             pending_action_starts: Vec::new(),
@@ -923,6 +1175,7 @@ impl EventVm {
             dat_root: None,
             routine_lengths: std::collections::HashMap::new(),
             oob_reads: std::cell::Cell::new(0),
+            client_globals: EventClientGlobals::default(),
         }
     }
 
@@ -990,6 +1243,13 @@ impl EventVm {
         self.exec_pointer
     }
 
+    /// Retail's directly-addressed client globals after the opcodes seen so far. Opcodes 0x30, 0x9E
+    /// and 0xD9 write them with no entity involved (see [`EventClientGlobals`] for every site), so a
+    /// host that wants retail's own state has to read it here rather than infer it.
+    pub fn client_globals(&self) -> EventClientGlobals {
+        self.client_globals
+    }
+
     /// The opcode byte the VM is parked on, for the host's stall diagnostics;
     /// 0 when the pointer ran past the end of the bytecode.
     pub fn current_opcode(&self) -> u8 {
@@ -1031,11 +1291,16 @@ impl EventVm {
         if self.wait.is_some() {
             return Park::TimedWait;
         }
-        if self.parked_on_action_hold || self.parked_on_move_hold || self.scene_waiting() {
-            return Park::Hold;
-        }
+        // The pending tag outranks the holds: it is one global per event and
+        // its holder may be an owner child buried in the request stacks that
+        // make `scene_waiting` true - classifying that as a Hold would time it
+        // out on the motion-hold clocks instead of the ack clock (the zone 235
+        // event 22 stall).
         if self.pending_tag().is_some() {
             return Park::ServerAck;
+        }
+        if self.parked_on_action_hold || self.parked_on_move_hold || self.scene_waiting() {
+            return Park::Hold;
         }
         if self.last_waiting {
             return Park::Dead;
@@ -1402,6 +1667,19 @@ impl EventVm {
             .any(|h| h.actor == actor && h.remaining_units > 0.0)
     }
 
+    /// Retail's `OP_ANIMWAIT` predicate: the per-actor action byte
+    /// `[actor+0x1BC]`, set by every running action (a scheduler routine, an
+    /// emote, a numeric event animation) and read with no key at all (the
+    /// 2026-10-02 emote-busy census: "not a routine-name-specific or emote-only
+    /// timer"). True while any hold, pending hold or same-pass start names the
+    /// actor.
+    fn action_running_any(&self, actor: ActorLookup) -> bool {
+        let actor = self.resolve_hold_actor(actor);
+        self.action_holds.iter().any(|h| h.actor == actor)
+            || self.pending_action_holds.iter().any(|(a, _)| *a == actor)
+            || self.pending_action_starts.iter().any(|(a, _)| *a == actor)
+    }
+
     /// True while a host-armed hold for `(actor, key)` still has frames left,
     /// a motion hold is still pending its renderer finish report, or the
     /// action was started by this VM's own loader in the current batch, before
@@ -1490,6 +1768,9 @@ impl EventVm {
             hold.remaining_units -= hold_dt;
         }
         self.move_holds.retain(|h| h.remaining_units > 0.0);
+        if let Some(budget) = &mut self.smove_budget_left {
+            *budget -= hold_dt;
+        }
         let Some(wait) = self.wait.as_mut() else {
             return;
         };
@@ -1621,7 +1902,11 @@ impl EventVm {
         // A new EventIdle tick: retail re-queries IsMovingAction from live
         // render state, so the same-pass bridge (this VM's own loader cues not
         // yet armed by the host) spans only the pass that emitted them
-        // (research/XiEvents/OpCodes/0x0053.md).
+        // (research/XiEvents/OpCodes/0x0053.md). The numeric action marks the
+        // emote trio leaves work the same way: retail's `[actor+0x1BC]` clears
+        // when the handed-over routine ends, which kuluu can only observe for
+        // motions it actually plays — so an unmapped id's mark spans the pass,
+        // never a hang.
         self.pending_action_starts.clear();
         // The actor request stacks run on this frame before the master's own
         // opcodes, the way retail's RunPos ticks every actor each EventIdle. A
@@ -1688,7 +1973,7 @@ impl EventVm {
                 continue;
             }
             match op {
-                OP_END => {
+                OP_END | OP_END_TWIN_CA | OP_END_TWIN_CB => {
                     self.finished = true;
                     return self.finish_result();
                 }
@@ -1759,6 +2044,64 @@ impl EventVm {
                         0
                     }
                 }),
+                // The random store: one draw from the CRT LCG into the slot operand +1
+                // selects; nothing else in the handler (f_100b04c0), advance 3.
+                OP_RANDOM => {
+                    let value = self.event_rand();
+                    self.store_unary(value, 3);
+                }
+                // rand() modulo (operand +3's slot) + 1: when that divisor wraps to zero
+                // the handler skips the division *without drawing* and stores 0 — so the
+                // skip must not consume from kuluu's LCG either (f_100b04e0), advance 5.
+                OP_RANDOM_MODULO => {
+                    let divisor = self.getworkofs(3, 0).wrapping_add(1);
+                    let value = if divisor == 0 {
+                        0
+                    } else {
+                        self.event_rand().wrapping_rem(divisor)
+                    };
+                    self.store_unary(value, 5);
+                }
+                // The trig pair in heading units (4096 to a full turn): operand +3 is the
+                // angle slot, +5 an amplitude multiplier read *after* the angle, and the
+                // sine handler negates the product before rounding (`f_100b0600` carries
+                // the sign flip; `f_100b0660` does not). Round-to-nearest through the
+                // x87 helper, store into operand +1's slot, advance 7.
+                OP_SINE | OP_COSINE => {
+                    let radians = (self.getworkofs(3, 0) as f64) * f64::from(ANGLE_TO_RADIANS);
+                    let amplitude = self.getworkofs(5, 0) as f64;
+                    let product = if op == OP_SINE {
+                        -(amplitude * radians.sin())
+                    } else {
+                        amplitude * radians.cos()
+                    };
+                    self.store_unary(Self::x87_round_to_int(product), 7);
+                }
+                // Vector to heading: FPATAN over (-operand[+3], operand[+5]) — the +3
+                // value is integer-negated before conversion (`neg eax` at f_100b06e2) —
+                // scaled by 4096 then ~1/pi in that order, rounded to nearest. Heading
+                // comes back on the same ±2048-per-half-turn scale the inputs use
+                // (f_100b06c0), advance 7.
+                OP_VECTOR_TO_HEADING => {
+                    let y = f64::from(self.getworkofs(3, 0).wrapping_neg());
+                    let x = self.getworkofs(5, 0) as f64;
+                    let heading =
+                        (y.atan2(x) * f64::from(ATAN_TURN_SCALE_A)) * f64::from(ATAN_TURN_SCALE_B);
+                    self.store_unary(Self::x87_round_to_int(heading), 7);
+                }
+                // Remainder with the same both-operands guard as OP_DIV: either operand
+                // zero stores 0 (f_100b61a0 pushes EDX, which its zero-guarded path has
+                // cleared), advance 7.
+                OP_MODULO => {
+                    let dividend = self.getworkofs(3, 0);
+                    let divisor = self.getworkofs(5, 0);
+                    let value = if dividend == 0 || divisor == 0 {
+                        0
+                    } else {
+                        dividend.wrapping_rem(divisor)
+                    };
+                    self.store_unary(value, 7);
+                }
                 OP_AND => self.store_binary(|a, b| a & b),
                 OP_OR => self.store_binary(|a, b| a | b),
                 OP_XOR => self.store_binary(|a, b| a ^ b),
@@ -1792,6 +2135,41 @@ impl EventVm {
                     }
                     self.exec_pointer += 7;
                 }
+                // The clear half reads-modifies-writes the same addressed word
+                // with an inverted bit mask (`f_100b02f0`), guarded the same way.
+                OP_BITARRAY_CLEAR => {
+                    let bit = self.getworkofs(3, 0);
+                    let slot = bit >> BIT_TEST_WORD_SHIFT;
+                    if slot < self.getworkofs(5, 0) {
+                        let prev = self.getworkofs(1, slot);
+                        self.setworkofs(
+                            1,
+                            !(1i32.wrapping_shl((bit & BIT_TEST_BIT_MASK) as u32)) & prev,
+                            slot,
+                        );
+                    }
+                    self.exec_pointer += 7;
+                }
+                // Entity flags word siblings of the render-flag pair: bit :=
+                // low bit of the inline byte (the handlers' xor-mask arithmetic
+                // isolates exactly that), one from operands like 0x92, one always
+                // on the event's own entry (`f_100b35e0`, `f_100b5a40`).
+                OP_ENTITY_FLAGS_SET_BIT19 => {
+                    self.cues.push(EventCue::ActorRenderFlag {
+                        actor: ActorLookup(self.eventgetcode2(RENDER_FLAG_ACTOR_OFS)),
+                        bit: EventCue::ENTITY_FLAG_BASE + 19,
+                        value: self.byte_at(RENDER_FLAG_VALUE_OFS) & 1 != 0,
+                    });
+                    self.advance(op);
+                }
+                OP_ENTITY_FLAGS_SET_BIT21 => {
+                    self.cues.push(EventCue::ActorRenderFlag {
+                        actor: ActorLookup::EVENT_ENTITY,
+                        bit: EventCue::ENTITY_FLAG_BASE + 21,
+                        value: self.byte_at(RENDER_FLAG_VALUE_OFS) & 1 != 0,
+                    });
+                    self.advance(op);
+                }
                 OP_SETBITWORK => {
                     self.op_bitwork(true);
                     self.exec_pointer += 9;
@@ -1800,10 +2178,23 @@ impl EventVm {
                     self.op_bitwork(false);
                     self.exec_pointer += 9;
                 }
-                // Retail yields here only while the event entity is mid-turn,
-                // which is render state we do not model, so only its other path
-                // is reachable (research/XiEvents/OpCodes/0x0070.md).
-                OP_TURNWAIT => self.exec_pointer += 1,
+                // Retail parks on itself while the block entity's turning/
+                // animating bit stands — set both by turn flights and by mover
+                // steering under way — and advances one otherwise. The VM sees
+                // that state through its two entity holds: a running animation
+                // (the 0x9B machinery) and an in-flight authored walk. Host
+                // facing cues are applied instantly, so no turn-only flight
+                // exists to gate here (`2026-10-28-event-opcode-no-skip-pass.md`
+                // turn-wait section; corpus: 180 TURNWAITs sit directly after
+                // walk/move opcodes across the zone DATs).
+                OP_TURNWAIT => {
+                    if self.entity_animation_running()
+                        || self.move_running(ActorLookup::EVENT_ENTITY)
+                    {
+                        return StepResult::Waiting;
+                    }
+                    self.exec_pointer += 1;
+                }
                 OP_SLEEP => return self.arm_wait(SLEEP_WAIT_UNITS, 1),
                 OP_WAIT => {
                     let units = self.getworkofs(1, 0) as f32;
@@ -2039,6 +2430,41 @@ impl EventVm {
                 OP_REQSET | OP_REQSET_CHECKED | OP_REQSET_PRIORITY | OP_REQWAIT => {
                     self.exec_pointer += OPCODE_META[op as usize].size as usize;
                 }
+                // Sub-sched helper cases: selector ≥2 dispatches to one of the
+                // three scheduler helpers (`f_100b5510` case 2, `f_100b5210`
+                // cases 3-6, `f_100b4e10` case 7). Every failed operand fetch,
+                // null entity-table slot and id-pair/flags-word refusal lands
+                // on the helper's *advance* tail — full case width consumed,
+                // the caller's operand byte stored into the scheduler yield
+                // byte — so kuluu advances cases 2-6 by their width whether or
+                // not the inline actor dwords resolve. The dispatcher rewinds
+                // exec (kuluu `Waiting`) on exactly one condition: case 7,
+                // whose predicate queries both actors' motion objects and parks
+                // while either runs — kuluu's busy space, mirroring how the
+                // waitschedulor family parks. Retail issues that query only
+                // when both entity slots are present; a null slot takes the
+                // same advance tail cases 2-6 always take. The cases 2-6 motion
+                // loads themselves parse to nothing applied: their bucketed
+                // file ids reach the load virtuals through a range-table
+                // indirection whose inputs no kuluu consumer names (record Not
+                // established). Widths match the helpers' own adds over the
+                // dispatcher's pre-incremented exec (+5, +0xF with a +2 bump on
+                // two operand-carrying cases, +0xD) — 2026-10-29 revised
+                // scheduler-helper section of this record, which retracts an
+                // earlier reading that failed resolutions rewound exec.
+                OP_SUBSCHED if self.byte_at(1) >= 2 => {
+                    if self.byte_at(1) == 7 {
+                        let actor1 = ActorLookup(self.eventgetcode2(SUBSCHED_ACTOR_OFS_C7_FIRST));
+                        let actor2 = ActorLookup(self.eventgetcode2(SUBSCHED_ACTOR_OFS_C7_SECOND));
+                        if self.named_actor_position(actor1).is_some()
+                            && self.named_actor_position(actor2).is_some()
+                            && (self.action_running_any(actor1) || self.action_running_any(actor2))
+                        {
+                            return StepResult::Waiting;
+                        }
+                    }
+                    self.advance(op);
+                }
                 // XiEvent LOADEXTSCHEDULER (research/XiEvents/OpCodes/0x005B.md,
                 // 0x0066.md): load an event motion resource into actor1, then
                 // SetAction(actor1, key, actor2) unless the key is empty. Retail
@@ -2147,7 +2573,97 @@ impl EventVm {
                     self.exec_pointer += OPCODE_META[op as usize].size as usize;
                     return StepResult::Waiting;
                 }
-                OP_EMOT | OP_PLAYANIM | OP_ANIMWAIT => self.advance(op),
+                // 0x6E EMOT (retail thunk `f_100b7c40`; record
+                // `.agents/skills/retail-observe/references/2026-10-02-event-emote-busy.md`):
+                // an unresolvable actor is passed over silently; a busy one
+                // parks the thread without replacing the running action; a free
+                // one receives its emote id plus one-byte argument. The cue
+                // rides kuluu's live motion pipeline (kuluu-session routes it
+                // to `dispatch_entity_emoted`, ffxi-vocab's empirical table
+                // plays ids below 96); the numeric action mark keeps later
+                // 0x6E/0x99 in this pass gated the way retail's `[actor+0x1BC]`
+                // gate holds them.
+                OP_EMOT => {
+                    let actor = ActorLookup(self.eventgetcode2(EMOT_ACTOR_OFS));
+                    if !self.actor_resolved(actor) {
+                        // Retail's failed-lookup path: passed over, the loop
+                        // runs on (kuluu's own LOADWAIT-style pass-over).
+                        self.advance(op);
+                        continue;
+                    }
+                    if self.action_running_any(actor) {
+                        self.parked_on_action_hold = true;
+                        return StepResult::Waiting;
+                    }
+                    let operand = self.eventgetcode2(EMOT_VALUE_OFS);
+                    // Low byte emote id, high byte argument (the split kuluu's
+                    // cue shape already documents; retail passes the pair to its
+                    // one emote routine `f_100a0b90`).
+                    self.cues.push(EventCue::Emote {
+                        actor,
+                        emote_id: (operand & 0xff) as u16,
+                        param: ((operand >> 8) & 0xff) as u16,
+                    });
+                    let marked = self.resolve_hold_actor(actor);
+                    if !self
+                        .pending_action_starts
+                        .iter()
+                        .any(|(a, k)| *a == marked && *k == NUMERIC_ACTION_KEY)
+                    {
+                        self.pending_action_starts
+                            .push((marked, NUMERIC_ACTION_KEY));
+                    }
+                    self.exec_pointer += OPCODE_META[op as usize].size as usize;
+                }
+                // 0x63 PLAYANIM (retail thunk `f_100b7550`): the cutscene
+                // owner's numeric animation request. Retail stores the id on the
+                // owner (`[owner+0x1C0]`) and marks `[owner+0x1BC]=9`; kuluu has
+                // no decoded content for those ids (the retail tables behind
+                // `f_100a0d00` et al. name them only as indexes — see the
+                // 2026-10-28 scheduler record), so this implements retail's
+                // staging exactly and its content not at all: absent owner (no
+                // scene) advances, a busy owner parks without replacing,
+                // otherwise the id occupies the owner's action slot for the
+                // pass. No cue: with no decoded motion there is nothing to play.
+                OP_PLAYANIM => {
+                    let Some(scene_actor) = self.scene.as_ref().map(|scene| scene.actor) else {
+                        // No running scene: retail's null-owner path — passed
+                        // over, the loop runs on.
+                        self.advance(op);
+                        continue;
+                    };
+                    let owner = ActorLookup(scene_actor);
+                    if self.action_running_any(owner) {
+                        self.parked_on_action_hold = true;
+                        return StepResult::Waiting;
+                    }
+                    if !self
+                        .pending_action_starts
+                        .iter()
+                        .any(|(a, k)| *a == owner && *k == NUMERIC_ACTION_KEY)
+                    {
+                        self.pending_action_starts.push((owner, NUMERIC_ACTION_KEY));
+                    }
+                    self.exec_pointer += OPCODE_META[op as usize].size as usize;
+                }
+                // 0x99 ANIMWAIT (retail thunk `f_100b7ce0`): same lookup and
+                // eligibility gate — unresolvable advances five silently. An
+                // eligible actor parks the thread while its action byte is set:
+                // every motion hold, same-pass start or numeric mark on that
+                // actor (retail's predicate is the per-actor byte, not a key).
+                OP_ANIMWAIT => {
+                    let actor = ActorLookup(self.eventgetcode2(ANIMWAIT_ACTOR_OFS));
+                    if !self.actor_resolved(actor) {
+                        self.advance(op);
+                        continue;
+                    }
+                    if self.action_running_any(actor) {
+                        self.parked_on_action_hold = true;
+                        return StepResult::Waiting;
+                    }
+                    self.parked_on_action_hold = false;
+                    self.exec_pointer += OPCODE_META[op as usize].size as usize;
+                }
 
                 // XiEvent MAPSCHEDULOR (research/XiEvents/OpCodes/0x002D.md): start the
                 // zone-level routine `key`, waited on by 0x54. Kuluu resolves `key` out
@@ -2340,7 +2856,90 @@ impl EventVm {
                     self.move_speed = self.getworkofs(MAIN_SPEED_OFS, 0);
                     self.advance(op);
                 }
-                OP_SMOVE => return StepResult::Unimplemented(op),
+                // 0x31 CodeSMOVE and its budget-free twin 0x5A CodeMOVE2.
+                // Case 0 stages the scaled goal triple into the entity's mover
+                // slot (retail also releases the two visual animation channels
+                // there — kuluu's movers interrupt them on their own, that
+                // half parsed-not-applied) and SMOVE stages one raw further
+                // word as its MoveTime budget. Case 1 polls: retail integrates
+                // toward the goal every pass (heading through atan2 into
+                // [entity+340], step = frame time × entity speed × constant)
+                // and advances only when one such step still covers the rest —
+                // then it snaps to exactly the staged triple — or, for SMOVE,
+                // once its budget has run out: a staged budget of zero or less
+                // skips all integration, so no walk is issued either. Every
+                // poll pass sets word +300 bit 17 before yielding; that tail's
+                // ground probe runs through the scene singleton kuluu's own
+                // renderer movers do not need. Record:
+                // `.agents/skills/retail-observe/references/2026-10-28-event-opcode-no-skip-pass.md`
+                OP_SMOVE | OP_CODE_MOVE2 => {
+                    let Some(&sub) = self.event_data.get(self.exec_pointer + 1) else {
+                        return StepResult::Unimplemented(op);
+                    };
+                    // Widths and the unknown-sub halt come from the table read
+                    // off the handlers' own advance sites.
+                    let Some(width) = crate::opcode_meta::sub_size(op, sub) else {
+                        return StepResult::Unimplemented(op);
+                    };
+                    match sub {
+                        0x00 => {
+                            let goal = self.position_operands(MOVE_GOAL_X_OFS, false);
+                            if op == OP_SMOVE {
+                                // The budget word resolves through the same
+                                // operand redirect as the goal triple (retail's
+                                // fetch(+8)), and its countdown reads signed.
+                                let budget = self.getworkofs(SMOVE_MOVE_TIME_OFS, 0) as i16 as f32;
+                                if budget > 0.0 {
+                                    self.smove_budget_left = Some(budget);
+                                    // A budget hold of its own keeps the poll
+                                    // honest where no host arms one (the sweep
+                                    // harness has no session layer); the clamp
+                                    // in case 1 folds any host hold onto this.
+                                    self.hold_move(ActorLookup::EVENT_ENTITY, budget.max(1.0));
+                                    self.cues.push(EventCue::ActorMove {
+                                        actor: ActorLookup::EVENT_ENTITY,
+                                        goal,
+                                        speed: self.move_speed,
+                                    });
+                                }
+                                // A non-positive staged budget means retail's
+                                // poll never integrates: issue no walk at all.
+                            } else {
+                                self.cues.push(EventCue::ActorMove {
+                                    actor: ActorLookup::EVENT_ENTITY,
+                                    goal,
+                                    speed: self.move_speed,
+                                });
+                            }
+                            self.exec_pointer += width as usize;
+                        }
+                        0x01 => {
+                            if let Some(left) = self.smove_budget_left {
+                                // Clamp the walk's hold so expiry lands on the
+                                // budget no matter how the host sized it.
+                                let actor = self.resolve_hold_actor(ActorLookup::EVENT_ENTITY);
+                                for hold in &mut self.move_holds {
+                                    if hold.actor == actor && hold.remaining_units > left {
+                                        hold.remaining_units = left.max(0.0);
+                                    }
+                                }
+                            }
+                            self.cues.push(EventCue::ActorRenderFlag {
+                                actor: ActorLookup::EVENT_ENTITY,
+                                bit: EventCue::ENTITY_WORD_124_BASE + MOVER_IN_FLIGHT_BIT_124,
+                                value: true,
+                            });
+                            if self.move_running(ActorLookup::EVENT_ENTITY) {
+                                self.parked_on_move_hold = true;
+                                return StepResult::Waiting;
+                            }
+                            self.parked_on_move_hold = false;
+                            self.smove_budget_left = None;
+                            self.exec_pointer += width as usize;
+                        }
+                        _ => return StepResult::Unimplemented(op),
+                    }
+                }
                 // 0x72 GETWEATHER: mode 0 kicks off the forecast read and mode 1
                 // copies three values into Work_Zone[2..5)
                 // (research/XiEvents/OpCodes/0x0072.md). The table is resident
@@ -2369,6 +2968,349 @@ impl EventVm {
                     }
                     _ => return StepResult::Unimplemented(op),
                 },
+                // 0x59 entity turn/move speed (`OP_ENTITYSPEED`, `f_100b6a60`):
+                // a nine-case staging write family keyed on the inline byte at +1,
+                // each case with its own width (sub_size). The four slot cases
+                // store a work value into the entity's custom dword slots +0xDC /
+                // +0xE0 — self-entry form (4 bytes, operand @+2) and actor-lookup
+                // form (8, operand @+6); no opcode reads those slots back and the
+                // client-side readers sit in the mover-mirror family, so kuluu
+                // parses each store faithfully and applies nothing yet (record:
+                // Not established). Case 4 converts the work value to float scaled
+                // by 0.1f toward field +0x168 of the actor's interpolated render
+                // object — the `[[entry+0xd4]+0x260]` chain 0x3A reads heading from;
+                // likewise parsed, not applied. Case 5 is a third entity-flags-word
+                // twin (bit 21 like 0x33) with its value byte at +6, and publishes
+                // the flag cue. Cases 7/8 hand the value to the actor object's
+                // vtable slot +0x22c (`f_1008a790`), case 6 parks while that
+                // object's slot +0x2a0 answers busy for the handle at
+                // `[entry+0x1c4]`; those internals are unobservable to kuluu, so it
+                // advances with the case width — retail's own absent-actor path
+                // (same posture as 0x9A). A selector past eight makes retail
+                // re-dispatch without advancing; like 0x72's unknown mode, refused
+                // rather than guessed at.
+                OP_ENTITYSPEED => {
+                    let sub = self.byte_at(1);
+                    match sub {
+                        0 | 2 | 7 => {
+                            // Self-entry stores into +0xDC (0), +0xE0 (2), and the
+                            // vtable-slot-+0x22c handoff (7) all fetch their value
+                            // from the work operand at +2.
+                            let _store_value = self.getworkofs(ENTITY_SPEED_SELF_VALUE_OFS, 0);
+                        }
+                        1 | 3 | 4 | 8 => {
+                            let _actor =
+                                ActorLookup(self.eventgetcode2(ENTITY_SPEED_LOOKUP_ACTOR_OFS));
+                            let _store_value = self.getworkofs(ENTITY_SPEED_LOOKUP_VALUE_OFS, 0);
+                        }
+                        5 => {
+                            self.cues.push(EventCue::ActorRenderFlag {
+                                actor: ActorLookup(
+                                    self.eventgetcode2(ENTITY_SPEED_LOOKUP_ACTOR_OFS),
+                                ),
+                                bit: EventCue::ENTITY_FLAG_BASE + 21,
+                                value: self.byte_at(ENTITY_SPEED_LOOKUP_VALUE_OFS) & 1 != 0,
+                            });
+                        }
+                        // The visual-ready park; kuluu has no visual object, so the
+                        // advance-only path is taken unconditionally.
+                        6 => {}
+                        _ => return StepResult::Unimplemented(op),
+                    }
+                    self.advance(op);
+                }
+                // 0x64 work distance (`f_100b75c0`): the hypotenuse of
+                // (G(7)−G(3), G(9)−G(5)) — fetched in that order, squared exactly,
+                // square-rooted and rounded nearest-even through the image's
+                // integer store conversion — stored at the work operand @+1.
+                OP_WORK_DISTANCE => {
+                    let dx = self
+                        .getworkofs(WORK_DISTANCE_X_PLUS_OFS, 0)
+                        .wrapping_sub(self.getworkofs(WORK_DISTANCE_X_MINUS_OFS, 0));
+                    let dz = self
+                        .getworkofs(WORK_DISTANCE_Z_PLUS_OFS, 0)
+                        .wrapping_sub(self.getworkofs(WORK_DISTANCE_Z_MINUS_OFS, 0));
+                    let distance =
+                        Self::x87_round_to_int(((dx as f64).powi(2) + (dz as f64).powi(2)).sqrt());
+                    self.setworkofs(DISTANCE_DEST_OFS, distance, 0);
+                    self.advance(op);
+                }
+                // 0x65 actor distance (`f_100b7860`): the three-axis distance
+                // between two looked-up actors — first at +3, second at +7 —
+                // scaled by exactly 1000 and rounded nearest-even into the work
+                // operand @+1. kuluu's tracked positions are already thousandths,
+                // so the scale lands on their integer space unchanged. Unlike most
+                // actor ops this one **always stores**: any unresolvable actor (or
+                // absent table slot — retail's two outcomes, which kuluu cannot
+                // separate) stores zero. Retail reads each actor's raw triple
+                // unless that first flags word's bit 7 promotes to the interpolated
+                // render chain; kuluu has one tracked position per actor, and when
+                // no scene is attached at all it resolves nothing and stores zero.
+                OP_ACTOR_DISTANCE => {
+                    let first = ActorLookup(self.eventgetcode2(ACTOR_DISTANCE_FIRST_LOOKUP_OFS));
+                    let second = ActorLookup(self.eventgetcode2(ACTOR_DISTANCE_SECOND_LOOKUP_OFS));
+                    let distance = self.named_actor_position(first).and_then(|a| {
+                        self.named_actor_position(second).map(|b| {
+                            let dx = (a.x - b.x) as f64;
+                            let dy = (a.y - b.y) as f64;
+                            let dz = (a.z - b.z) as f64;
+                            Self::x87_round_to_int((dx * dx + dy * dy + dz * dz).sqrt())
+                        })
+                    });
+                    self.setworkofs(DISTANCE_DEST_OFS, distance.unwrap_or(0), 0);
+                    self.advance(op);
+                }
+                // The selector op (`f_100b73f0`): the byte at +1 picks both the
+                // width and the law. Cases 0/1 latch bit 30 of the entity's
+                // second flags word ([entry+0x124]) to the selector itself —
+                // retail's xor-latch arithmetic (`shl 0x1e`, mask `0x40000000`)
+                // isolates exactly that bit, the sibling one below 0x5F's
+                // case-0/1 latch at bit 29; an empty entity-table slot skips
+                // the write and still advances 4. Case 2 hands the looked-up
+                // actor to a singleton interface (`[[0x1065cb04]]` vtable +0x18,
+                // internals unread); kuluu resolves nothing there, so it is
+                // parsed-not-applied with the case width 6. Any other selector
+                // advances 2 — retail's own default arm adds two, it does not
+                // spin or park (unlike e.g. the entity-speed switch).
+                OP_FLAGWORD_SELECTOR => {
+                    let sel = self.byte_at(FLAGWORD_VALUE_OFS);
+                    if sel <= 1 {
+                        self.cues.push(EventCue::ActorRenderFlag {
+                            actor: ActorLookup::EVENT_ENTITY,
+                            bit: EventCue::ENTITY_WORD_124_BASE + 30,
+                            value: sel & 1 != 0,
+                        });
+                    }
+                    // Case 2's lookup token is the selector itself, not an
+                    // operand offset — kuluu reads no bytes past +1 for it.
+                    self.advance(op);
+                }
+                // Third-flags-word writer (`f_100b74e0`): bit 0 of
+                // [entry+0x128] := low bit of the byte at +1, written with a
+                // mask-OR read-modify-write — a plain store of the bit, not
+                // 0x60's xor-latch. Empty table slot skips the write and both
+                // paths advance 2.
+                OP_ENTITY_WORD128_SET => {
+                    self.cues.push(EventCue::ActorRenderFlag {
+                        actor: ActorLookup::EVENT_ENTITY,
+                        bit: EventCue::ENTITY_WORD_128_BASE,
+                        value: self.byte_at(FLAGWORD_VALUE_OFS) & 1 != 0,
+                    });
+                    self.advance(op);
+                }
+                // The third latch of the word-124 family (`f_100b7490`), after
+                // 0x5F's bit 29 and 0x60's bit 30: xor-latch bit 31 to the low
+                // bit of the byte at +1 (retail's `shl 0x1f`, mask `0x7fffffff`
+                // arithmetic), two bytes wide, empty slot skips the write.
+                OP_ENTITY_WORD124_BIT31_LATCH => {
+                    self.cues.push(EventCue::ActorRenderFlag {
+                        actor: ActorLookup::EVENT_ENTITY,
+                        bit: EventCue::ENTITY_WORD_124_BASE + 31,
+                        value: self.byte_at(FLAGWORD_VALUE_OFS) & 1 != 0,
+                    });
+                    self.advance(op);
+                }
+                // Bit-17 writer of the third flags word (`f_100b8a80`): set
+                // when the byte at +1 is non-zero, cleared when it is zero —
+                // retail's `or 0x20000`/`and ~0x20000` pair, gating on nothing
+                // else observable here (the eligibility gate and null-slot skip
+                // fold into kuluu's publish-anyway posture, as for the twins).
+                OP_ENTITY_WORD128_SET_BIT17 => {
+                    self.cues.push(EventCue::ActorRenderFlag {
+                        actor: ActorLookup::EVENT_ENTITY,
+                        bit: EventCue::ENTITY_WORD_128_BASE + 17,
+                        value: self.byte_at(FLAGWORD_VALUE_OFS) != 0,
+                    });
+                    self.advance(op);
+                }
+                // Fourth-flags-word force-setters (`f_100ba8d0`): pin bit 26
+                // to the low bit of the byte at +1; widths and subject law in
+                // their constants block.
+                OP_ENTITY_WORD12C_SET_BIT26 => {
+                    self.cues.push(EventCue::ActorRenderFlag {
+                        actor: ActorLookup::EVENT_ENTITY,
+                        bit: EventCue::ENTITY_WORD_12C_BASE + 26,
+                        value: self.byte_at(FLAGWORD_VALUE_OFS) & 1 != 0,
+                    });
+                    self.advance(op);
+                }
+                // The bit-11 twin (`f_100ba920`), identical law and width.
+                OP_ENTITY_WORD12C_SET_BIT11 => {
+                    self.cues.push(EventCue::ActorRenderFlag {
+                        actor: ActorLookup::EVENT_ENTITY,
+                        bit: EventCue::ENTITY_WORD_12C_BASE + 11,
+                        value: self.byte_at(FLAGWORD_VALUE_OFS) & 1 != 0,
+                    });
+                    self.advance(op);
+                }
+                // Unconditional set (no clear branch exists in retail's
+                // handler): bit zero of the fourth flags word, current event
+                // entity (`f_100b9100`); null-slot skip folds as usual.
+                OP_ENTITY_WORD12C_SET_BIT0 => {
+                    self.cues.push(EventCue::ActorRenderFlag {
+                        actor: ActorLookup::EVENT_ENTITY,
+                        bit: EventCue::ENTITY_WORD_12C_BASE,
+                        value: true,
+                    });
+                    self.advance(op);
+                }
+                // The fourth word's resolved-actor setter (`f_100b8f30`):
+                // bit three := low bit of byte +1 on the actor named at +2.
+                OP_ENTITY_WORD12C_SET_BIT3_RESOLVED => {
+                    self.cues.push(EventCue::ActorRenderFlag {
+                        actor: ActorLookup(self.eventgetcode2(WORD12C_RESOLVED_ACTOR_OFS)),
+                        bit: EventCue::ENTITY_WORD_12C_BASE + 3,
+                        value: self.byte_at(FLAGWORD_VALUE_OFS) & 1 != 0,
+                    });
+                    self.advance(op);
+                }
+                // Three selectors advance four (`f_100bba70`); the rest of
+                // the byte range exits without touching exec.
+                OP_MODE_BITS_WORK_WRITER_B1 => {
+                    if self.byte_at(FLAGWORD_VALUE_OFS) <= 2 {
+                        self.advance(op);
+                    } else {
+                        return StepResult::Unimplemented(op);
+                    }
+                }
+                // Width-only arm of the mover-bridge writer: five selector
+                // bodies advance uniformly (ten / eight × four) on every path,
+                // selectors above four reach the handler's pops-only epilogue
+                // where retail spins and kuluu halts (`f_100afee0`; before this
+                // arm the fixed-ten fallback over-skipped those spin cases).
+                OP_MOVER_BRIDGE_B7 => {
+                    let Some(width) = self
+                        .event_data
+                        .get(self.exec_pointer + 1)
+                        .copied()
+                        .and_then(|sub| crate::opcode_meta::sub_size(op, sub))
+                    else {
+                        return StepResult::Unimplemented(op);
+                    };
+                    self.exec_pointer += width as usize;
+                }
+                // Width-only arm of the staged-block writer: selector decides
+                // six/eight/twelve from its own advance-register loads,
+                // selectors above four fall through on the same tail at six
+                // (`f_100bc060`), matching this op's `sub_size` default row.
+                OP_EVENT_DIR_WRITER_D8 => {
+                    let Some(width) = self
+                        .event_data
+                        .get(self.exec_pointer + 1)
+                        .copied()
+                        .and_then(|sub| crate::opcode_meta::sub_size(op, sub))
+                    else {
+                        return StepResult::Unimplemented(op);
+                    };
+                    self.exec_pointer += width as usize;
+                }
+                // The three fixed-client-global stores, armed this pass from their handlers. Each
+                // handler is nothing but the store and its advance, so kuluu performs exactly that:
+                //   0x30 `f_100b5620` — `mov byte ptr [0x10488100], 0`; `inc word ptr [ecx+0x256]`.
+                //   0xD9 `f_100b7be0` — reads the inline operand byte at +1, `sete` on equality with
+                //     zero, stores it as a byte; `add word ptr [ecx+0x256], 2`.
+                //   0x9E `f_100ba8a0` — same predicate stored as a dword (ebx is pre-zeroed, so the
+                //     value is exactly 1 or 0); `add word ptr [ecx+0x256], 2`.
+                // Pinned by `fixed_client_global_stores_write_their_cells_and_nothing_else`.
+                OP_CLIENT_BYTE_10488100_ZERO => {
+                    self.client_globals.byte_10488100 = false;
+                    self.advance(op);
+                }
+                OP_CLIENT_BYTE_10463924_OPERAND_IS_ZERO => {
+                    self.client_globals.byte_10463924 = self.byte_at(1) == 0;
+                    self.advance(op);
+                }
+                OP_CLIENT_DWORD_104898FC_OPERAND_IS_ZERO => {
+                    self.client_globals.dword_104898fc = u32::from(self.byte_at(1) == 0);
+                    self.advance(op);
+                }
+                // The staged-slot loader's own gate on its index word
+                // (`f_100bc000`): signed and below the entry count it copies the
+                // fetched block into that table slot (advance seven, @100bc04b);
+                // out of range it returns with NO advance (@100bc00c/@100bc011),
+                // which is retail spinning — kuluu halts there. Before this arm
+                // the generic size skip walked seven past those spin cases. The
+                // staged table itself and the fetched blocks stay below kuluu's
+                // cue boundary, so only the control-flow law is applied.
+                OP_STAGED_SLOT_LOADER_C3 => {
+                    // The operand resolves through the reference window like every
+                    // other `f_100af4b0` read (the record decodes it as wrapping
+                    // `getworkofs`): in this corpus each authored site carries a
+                    // flagged word (`C3 00 80 …`, raw +1 word `0x8000`), so reading
+                    // the bytes directly hands back a negative and refuses scenes
+                    // retail runs — measured 17 such sites when first armed.
+                    let index = self.getworkofs(STAGED_SLOT_INDEX_OFS, 0);
+                    if !(0..STAGED_SLOT_TABLE_ENTRY_COUNT).contains(&index) {
+                        return StepResult::Unimplemented(op);
+                    }
+                    self.advance(op);
+                }
+                // Width-only arm of the work-slot float triple (`f_100bb9c0`):
+                // selectors zero and one advance exactly eight, every other
+                // selector reaches retail's pops-only exit where it spins. The
+                // triple values themselves come from a singleton whose role is
+                // unnamed in this record (parsed-not-applied).
+                OP_WORK_SLOT_TRIPLE_READ_AF => {
+                    let Some(width) = self
+                        .event_data
+                        .get(self.exec_pointer + 1)
+                        .copied()
+                        .and_then(|sub| crate::opcode_meta::sub_size(op, sub))
+                    else {
+                        return StepResult::Unimplemented(op);
+                    };
+                    self.exec_pointer += width as usize;
+                }
+                // Width-only arm of the registry lookup: sub-size table
+                // decides, ceiling breaches halt as retail spins (`f_100bbd80`).
+                OP_REGISTRY_LOOKUP_BF => {
+                    let Some(width) = self
+                        .event_data
+                        .get(self.exec_pointer + 1)
+                        .copied()
+                        .and_then(|sub| crate::opcode_meta::sub_size(op, sub))
+                    else {
+                        return StepResult::Unimplemented(op);
+                    };
+                    self.exec_pointer += width as usize;
+                }
+                // Only sub zero advances; every other selector lands on
+                // retail's no-advance exit (`f_100b7140` spins there, kuluu
+                // halts). The predicate-and-handle half has no cue counterpart.
+                OP_STAGED_RECORD_PROBE_D3 => {
+                    if self.event_data.get(self.exec_pointer + 1) == Some(&0) {
+                        self.advance(op);
+                    } else {
+                        return StepResult::Unimplemented(op);
+                    }
+                }
+                // Width-only arm of the pair-dispatcher family (constants
+                // block): every case takes its sub-byte width on both retail's
+                // success and failure paths; unknown subs return Unimplemented
+                // where retail spins, kuluu's standing halt posture for that.
+                OP_PAIRDISPATCH_AE => {
+                    let Some(width) = self
+                        .event_data
+                        .get(self.exec_pointer + 1)
+                        .copied()
+                        .and_then(|sub| crate::opcode_meta::sub_size(op, sub))
+                    else {
+                        return StepResult::Unimplemented(op);
+                    };
+                    self.exec_pointer += width as usize;
+                }
+                // The bit-12 setter (`f_100ba970`), three bytes wide: its
+                // operand is a fetched word at +1, but retail masks the value
+                // to bit zero before shifting, so the low-bit law reads the
+                // same byte as the two-byte twins.
+                OP_ENTITY_WORD12C_SET_BIT12 => {
+                    self.cues.push(EventCue::ActorRenderFlag {
+                        actor: ActorLookup::EVENT_ENTITY,
+                        bit: EventCue::ENTITY_WORD_12C_BASE + 12,
+                        value: self.byte_at(FLAGWORD_VALUE_OFS) & 1 != 0,
+                    });
+                    self.advance(op);
+                }
                 // 0x82 RANGE_RECT: find the zone range rect named by the u32 at
                 // +1 and hit-test the event entity's tracked position against it;
                 // a hit advances 7, a miss (no rect, no position, or outside) jumps
@@ -2458,23 +3400,12 @@ impl EventVm {
                 // 0x8B places a named marker on the player's map —
                 // research/XiEvents/OpCodes/0x008B.md.
                 OP_MAP_MARKER => {
-                    let mut name = [0u8; 16];
-                    for (slot, byte) in name.iter_mut().enumerate() {
-                        *byte = self.byte_at(MAP_MARKER_NAME_OFS + slot);
-                    }
-                    // Retail rewrites underscores to spaces before the rename
-                    // (research/XiEvents/OpCodes/0x008B.md).
-                    for b in &mut name {
-                        if *b == b'_' {
-                            *b = b' ';
-                        }
-                    }
-                    self.cues.push(EventCue::MapMarker {
-                        map_id: self.getworkofs(MAP_MARKER_ID_OFS, 0),
-                        x_milli: self.getworkofs(MAP_MARKER_X_OFS, 0),
-                        y_milli: self.getworkofs(MAP_MARKER_Y_OFS, 0),
-                        name,
-                    });
+                    self.push_map_marker_cue(
+                        MAP_MARKER_ID_OFS,
+                        MAP_MARKER_X_OFS,
+                        MAP_MARKER_Y_OFS,
+                        MAP_MARKER_NAME_OFS,
+                    );
                     self.advance(op);
                 }
                 // 0x89 opens the map on the work-slot zone id, sub-menus
@@ -2486,8 +3417,30 @@ impl EventVm {
                     });
                     self.advance(op);
                 }
-                OP_OPEN_MAP_PROPS => self.advance(op),
-                OP_MAP_ADD_MARK => self.advance(op),
+                // 0x8D shows or hides the map window's prop-label layer
+                // (research/XiEvents/OpCodes/0x008D.md; operand reading in the
+                // 2026-10-28 event opcode no-skip-pass record). kuluu has no
+                // prop-label layer to show yet, but the state crosses the wire.
+                OP_OPEN_MAP_PROPS => {
+                    self.cues.push(EventCue::MapPropsState {
+                        select: self.getworkofs(OPEN_MAP_PROPS_SELECT_OFS, 0),
+                        value: self.getworkofs(OPEN_MAP_PROPS_VALUE_OFS, 0),
+                    });
+                    self.advance(op);
+                }
+                // 0xB8 is the marker opcode with one helper-only word inserted
+                // between the id and the coordinates; every field kuluu's host
+                // acts on arrives in the same cue as for the plain opcode
+                // (2026-10-28 event opcode no-skip-pass record).
+                OP_MAP_ADD_MARK => {
+                    self.push_map_marker_cue(
+                        MAP_ADD_MARK_ID_OFS,
+                        MAP_ADD_MARK_X_OFS,
+                        MAP_ADD_MARK_Y_OFS,
+                        MAP_ADD_MARK_NAME_OFS,
+                    );
+                    self.advance(op);
+                }
                 OP_CLOSE_MAP => {
                     self.cues.push(EventCue::MapClose);
                     self.advance(op);
@@ -2643,7 +3596,28 @@ impl EventVm {
                     });
                     self.advance(op);
                 }
-                OP_SET_SOUND_VOLUME | OP_CHANGE_SOUND_VOLUME => self.advance(op),
+                // 0x69 drives the masked retail mixer channels to exactly full
+                // or exactly silence at once; the inline flag reads zero for
+                // full (`SoundVolumeSet::enabled`). kuluu folds retail's four
+                // arms plus global multiplier into its two buses at session
+                // level (2026-10-28 event opcode no-skip-pass record).
+                OP_SET_SOUND_VOLUME => {
+                    self.cues.push(EventCue::SoundVolumeSet {
+                        mask: (self.getworkofs(SOUND_SET_MASK_OFS, 0) & 0xff) as u8,
+                        enabled: self.byte_at(SOUND_SET_FLAG_OFS) == 0,
+                    });
+                    self.advance(op);
+                }
+                // 0x6A eases the masked channels to a per-mille target; retail's
+                // mixer-side second operand is unread, so only the thousandths
+                // value crosses (record's Not established 1).
+                OP_CHANGE_SOUND_VOLUME => {
+                    self.cues.push(EventCue::SoundVolumeChange {
+                        mask: (self.getworkofs(SOUND_CHANGE_MASK_OFS, 0) & 0xff) as u8,
+                        volume_thousandths: self.getworkofs(SOUND_CHANGE_TARGET_OFS, 0),
+                    });
+                    self.advance(op);
+                }
                 // Status writes: retail-2026-09 RVAs 0xB6950, 0xB6A00, 0xB69B0;
                 // .agents/skills/retail-observe/references/2026-10-02-event-control-clock-doors.md.
                 // Native actor render-bit gating is not represented by VM state.
@@ -2663,7 +3637,50 @@ impl EventVm {
                     self.emit_status_event_cue(status);
                     self.advance(op);
                 }
-                OP_DOOR_OPEN2 | OP_DOOR_CLOSE2 => self.advance(op),
+                // The second door pair writes the second door status slot on
+                // the block's own event entity, with the same gate as the first
+                // pair (`.agents/skills/retail-observe/references/
+                // 2026-10-28-event-opcode-no-skip-pass.md`).
+                OP_DOOR_OPEN2 => {
+                    self.emit_status_event_cue(STATUS_EVENT_DOOR_OPEN2);
+                    self.advance(op);
+                }
+                OP_DOOR_CLOSE2 => {
+                    self.emit_status_event_cue(STATUS_EVENT_DOOR_CLOSE2);
+                    self.advance(op);
+                }
+                // The three per-actor flag writes. Retail's shared actor lookup
+                // sits at +2 with the written bit inline at +1; the toggles are
+                // conditional writes of one flags-word bit and 0x81 a byte in
+                // the visual half gated on display bits this VM does not carry.
+                // The cue carries the target state, which is where retail's
+                // xor-latch always lands. No host applies it yet — no source
+                // names what these bits do. Record:
+                // `.agents/skills/retail-observe/references/2026-10-28-event-opcode-no-skip-pass.md`
+                OP_VISUAL_RENDER_BYTE => {
+                    self.cues.push(EventCue::ActorRenderFlag {
+                        actor: ActorLookup(self.eventgetcode2(RENDER_FLAG_ACTOR_OFS)),
+                        bit: EventCue::RENDER_FLAG_VISUAL_BYTE,
+                        value: self.byte_at(RENDER_FLAG_VALUE_OFS) != 0,
+                    });
+                    self.advance(op);
+                }
+                OP_ACTOR_FLAGS_WORD_BIT16_TOGGLE => {
+                    self.cues.push(EventCue::ActorRenderFlag {
+                        actor: ActorLookup(self.eventgetcode2(RENDER_FLAG_ACTOR_OFS)),
+                        bit: ACTOR_FLAGS_WORD_BIT_16,
+                        value: self.byte_at(RENDER_FLAG_VALUE_OFS) & 1 != 0,
+                    });
+                    self.advance(op);
+                }
+                OP_ACTOR_FLAGS_WORD_BIT17_TOGGLE => {
+                    self.cues.push(EventCue::ActorRenderFlag {
+                        actor: ActorLookup(self.eventgetcode2(RENDER_FLAG_ACTOR_OFS)),
+                        bit: ACTOR_FLAGS_WORD_BIT_17,
+                        value: self.byte_at(RENDER_FLAG_VALUE_OFS) & 1 != 0,
+                    });
+                    self.advance(op);
+                }
                 // The Flags1 half of 0x90 has no tier-named meaning, so the cue
                 // carries only the hide write (research/XiEvents/OpCodes/0x0090.md).
                 OP_EVENT_HIDE_ALWAYS => {
@@ -2694,8 +3711,33 @@ impl EventVm {
                 // (research/XiEvents/OpCodes/0x0080.md, 0x0076.md).
                 OP_LOADWAIT | OP_TURNCHECK => self.exec_pointer += LOADWAIT_SIZE,
                 OP_TRANSPAR => self.exec_pointer += TRANSPAR_SIZE,
-                OP_MAPLOAD | OP_MAPLOAD_KEEP => self.exec_pointer += MAPLOAD_SIZE,
-                OP_MUSICREADWAIT | OP_YIELD => self.exec_pointer += YIELD_SIZE,
+                // The reload pair spends three passes exactly like retail's
+                // counter machine: touch-refresh, arm-the-countdown, then the
+                // teardown-and-reopen published as `MapReload` (the only branch
+                // kuluu can observe — nothing here ever sets retail's streaming-
+                // pending flag; record above).
+                OP_MAPLOAD | OP_MAPLOAD_KEEP => {
+                    self.mapload_passes_taken = self.mapload_passes_taken.saturating_add(1);
+                    if self.mapload_passes_taken <= MAPLOAD_PASSES_BEFORE_RELOAD {
+                        return StepResult::Waiting;
+                    }
+                    self.mapload_passes_taken = 0;
+                    self.cues.push(EventCue::MapReload {
+                        map_id: self.getworkofs(1, 0),
+                    });
+                    self.exec_pointer += MAPLOAD_SIZE;
+                }
+                // 0x9A holds in-tick while the music server's read is running —
+                // a state behind kuluu's cue boundary — so it yields exactly one
+                // pass (authored choice, record above).
+                OP_MUSICREADWAIT => {
+                    if !std::mem::replace(&mut self.music_read_yield_taken, true) {
+                        return StepResult::Waiting;
+                    }
+                    self.music_read_yield_taken = false;
+                    self.exec_pointer += YIELD_SIZE;
+                }
+                OP_YIELD => self.exec_pointer += YIELD_SIZE,
                 // 0x98 yields while the zone is reading ext data; an event
                 // never starts before the zone is resident, so only the
                 // advance path is reachable (research/XiEvents/OpCodes/0x0098.md).
@@ -2754,9 +3796,9 @@ impl EventVm {
                 // The sub-byte-dispatched families. Their width is the case's,
                 // not the table's widest, so an undocumented sub stops the VM
                 // rather than falling back and landing mid-instruction.
-                OP_LOOKSET | OP_LOADROOM | OP_ITEMINFO | OP_ENTITYSPEED | OP_MOVE | OP_WINDOW
-                | OP_MENU | OP_RENDERFLAG | OP_REQRESET | OP_STRINGOPS | OP_NAMESET
-                | OP_SUBSCHED | OP_STATUSSET => {
+                OP_LOOKSET | OP_LOADROOM | OP_ITEMINFO | OP_MOVE | OP_WINDOW | OP_MENU
+                | OP_RENDERFLAG | OP_REQRESET | OP_STRINGOPS | OP_NAMESET | OP_SUBSCHED
+                | OP_STATUSSET => {
                     let Some(&sub) = self.event_data.get(self.exec_pointer + 1) else {
                         return StepResult::Unimplemented(op);
                     };
@@ -2819,6 +3861,21 @@ impl EventVm {
                             }
                             self.parked_on_move_hold = false;
                         }
+                        // Sub-sched cases 0/1 (`f_100b72c0`): xor-latch bit 29
+                        // of the entity's word [entry+0x124] to the selector —
+                        // first member of the latch family that also covers
+                        // 0x60's bit 30 and opcode 0x74's bit 31; sel==0 stores
+                        // zero there (`shl 0x1d` of 0). Cases ≥2 run the
+                        // scheduler-load helpers (record: Not established —
+                        // motion-package buckets unread) and keep advancing by
+                        // their recorded widths here.
+                        (OP_SUBSCHED, 0x00 | 0x01) => {
+                            self.cues.push(EventCue::ActorRenderFlag {
+                                actor: ActorLookup::EVENT_ENTITY,
+                                bit: EventCue::ENTITY_WORD_124_BASE + 29,
+                                value: sub & 1 != 0,
+                            });
+                        }
                         _ => {}
                     }
                     self.exec_pointer += width as usize;
@@ -2861,6 +3918,24 @@ impl EventVm {
     fn advance(&mut self, op: u8) {
         let fixed = OPCODE_META[op as usize].size;
         self.exec_pointer += self.op_width(op, fixed) as usize;
+    }
+
+    /// The four-band bucket arithmetic (`f_100af4b0`-fed chain inside
+    /// `f_100b5210`) the sub-sched load path applies: each band adds its own
+    /// anchor to the bucketed value, and the second operand joins at the load.
+    /// Reading that chain off the image back-to-back with the event-motion
+    /// resource selection in `cue::event_motion_dat_id` shows they are ONE
+    /// table — same four band edges (0xC00/0x800/0x400/0x200) and same five
+    /// anchors — so this carries no constants of its own: it is that law with
+    /// the load-side second operand folded in. Pinned per boundary by
+    /// `scheduler_file_id_follows_the_four_bucket_anchors`. What feeds it is
+    /// still open: retail's chain re-reads one case-operand word through a
+    /// range-table indirection (`f_100af4b0`, itself a stream-word getter over
+    /// the scheduler state block) rather than two raw words, so the pair's
+    /// stream identity is record Not established; parsed-not-applied until a
+    /// consumer of this id space is named.
+    pub fn scheduler_file_id(id1: i32, id2: i32) -> u32 {
+        crate::cue::event_motion_dat_id(id1).wrapping_add(id2 as u32)
     }
 
     /// Yield on the frame [`Self::open_message`] just opened. Retail prints the
@@ -2911,6 +3986,30 @@ impl EventVm {
             target: ActorLookup::EVENT_ENTITY,
             status_event,
             mount_id: None,
+        });
+    }
+
+    /// Both marker opcodes' cue: sixteen inline name bytes with retail's
+    /// underscore-to-space rewrite applied in the VM, from the opcode's own
+    /// operand slots (research/XiEvents/OpCodes/0x008B.md and the 2026-10-28
+    /// event opcode no-skip-pass record for the marked variant's shifted ones).
+    fn push_map_marker_cue(&mut self, id_ofs: usize, x_ofs: usize, y_ofs: usize, name_ofs: usize) {
+        let mut name = [0u8; 16];
+        for (slot, byte) in name.iter_mut().enumerate() {
+            *byte = self.byte_at(name_ofs + slot);
+        }
+        // Retail rewrites underscores to spaces before the rename
+        // (research/XiEvents/OpCodes/0x008B.md).
+        for b in &mut name {
+            if *b == b'_' {
+                *b = b' ';
+            }
+        }
+        self.cues.push(EventCue::MapMarker {
+            map_id: self.getworkofs(id_ofs, 0),
+            x_milli: self.getworkofs(x_ofs, 0),
+            y_milli: self.getworkofs(y_ofs, 0),
+            name,
         });
     }
 
@@ -3082,6 +4181,28 @@ impl EventVm {
         let v1 = self.getworkofs(1, 0);
         let v2 = self.getworkofs(3, 0);
         self.store_unary(f(v1, v2), 5);
+    }
+
+    /// One draw from the CRT LCG state, exactly as the random opcodes' handler-side
+    /// helper `f_103149e0` steps and reads it back.
+    fn event_rand(&mut self) -> i32 {
+        self.event_rng_state = self
+            .event_rng_state
+            .wrapping_mul(EVENT_RNG_MULTIPLIER)
+            .wrapping_add(EVENT_RNG_INCREMENT);
+        ((self.event_rng_state >> EVENT_RNG_OUTPUT_SHIFT) & EVENT_RNG_OUTPUT_MASK) as i32
+    }
+
+    /// The float-to-int conversion the trig handlers funnel through (`f_10311c6c`):
+    /// it forces the x87 control word to round-to-nearest and stores through a
+    /// qword, so ties go even and the value is re-read as the *low dword* — a
+    /// magnitude beyond 2^63 leaves the store invalid (zero-ish on the real CPU),
+    /// which no in-range event operand reaches.
+    fn x87_round_to_int(value: f64) -> i32 {
+        if !value.is_finite() || value.abs() >= (1i64 << 62) as f64 {
+            return 0;
+        }
+        value.round_ties_even() as i64 as i32
     }
 
     /// `XiEvent::CodeSETBITWORK` (0x40) / `CodeGETBITWORK` (0x41): build a
@@ -3308,8 +4429,8 @@ mod tests {
 
         assert_eq!(
             e.step(),
-            StepResult::Waiting,
-            "the owner parks on its 0x43 poll"
+            StepResult::AwaitServerAck(PendingTag::SendTag { end_para: 0 }),
+            "an owner parked on its 0x43 poll surfaces the event-global tag through \n             the master - zone 235's event 22 froze when this was swallowed"
         );
         assert!(
             e.pending_tag().is_some(),
@@ -3370,8 +4491,8 @@ mod tests {
 
         assert_eq!(
             e.step(),
-            StepResult::Waiting,
-            "the owner parks on its 0x43 poll"
+            StepResult::AwaitServerAck(PendingTag::SendTag { end_para: 0 }),
+            "the owner surfaces its 0x43 poll through the master"
         );
         e.apply_pending_num(&[11, 22, 33, 44, 55, 66, 77, 88]);
         e.ack_server();
@@ -3569,7 +4690,128 @@ mod tests {
         }
     }
 
-    /// `OP_SWAP` swaps the two slots rather than storing a computed value.
+    /// CA and CB run END's own handler (one dispatch slot each, same function), so
+    /// mid-program they must end the VM exactly like 0x00 — including never reading
+    /// past the opcode pair at all.
+    #[test]
+    fn end_twins_ca_cb_finish_like_end() {
+        for op in [OP_END_TWIN_CA, OP_END_TWIN_CB] {
+            let data = vec![op, 0xFF, 0xFF]; // bytes a non-terminating parse would consume
+            let mut e = vm(data, vec![]);
+            assert_eq!(e.step(), StepResult::Done, "opcode 0x{op:02X}");
+        }
+    }
+
+    /// The random stores run the CRT LCG exactly as its handler-side helper steps
+    /// it (`f_103149e0`: `imul 0x343FD`, `add 0x269EC3`): from seed 1 the first
+    /// draw is 41 and the second 18467 — both pinned here, across two opcodes so
+    /// state progression between instructions is covered too.
+    #[test]
+    fn random_stores_follow_the_crt_sequence() {
+        let data = vec![OP_RANDOM, DST[0], DST[1], OP_END];
+        let mut e = vm(data, vec![]);
+        assert_eq!(e.step(), StepResult::Done);
+        assert_eq!(e.work_zone(0), 41);
+
+        // Draw #1 into work_zone[1] via RANDOM, then draw #2 (mod a divisor of
+        // references[0]+1 = 1000) into work_zone[0]: 18467 % 1000 = 467.
+        let data = vec![
+            OP_RANDOM,
+            0x01,
+            0x10,
+            OP_RANDOM_MODULO,
+            DST[0],
+            DST[1],
+            0x00,
+            0x80,
+            OP_END,
+        ];
+        let mut e = vm(data, vec![999]);
+        assert_eq!(e.step(), StepResult::Done);
+        assert_eq!((e.work_zone(1), e.work_zone(0)), (41, 467));
+    }
+
+    /// When the modulo divisor (`operand[+3] + 1`) wraps to zero the retail handler
+    /// branches around `rand()` entirely — stores 0 and leaves the draw counter
+    /// untouched, which this pins by demanding the *next* store still get draw #1.
+    #[test]
+    fn random_modulo_zero_divisor_stores_zero_without_a_draw() {
+        let data = vec![
+            OP_RANDOM_MODULO,
+            DST[0],
+            DST[1],
+            0x00,
+            0x80, // references[0] = -1 -> divisor wraps to 0
+            OP_RANDOM,
+            0x01,
+            0x10,
+            OP_END,
+        ];
+        let mut e = vm(data, vec![u32::MAX]);
+        assert_eq!(e.step(), StepResult::Done);
+        assert_eq!((e.work_zone(0), e.work_zone(1)), (0, 41));
+    }
+
+    /// SIN/COS in heading units: `angle[+3] * ANGLE_TO_RADIANS`, times amplitude
+    /// `[+5]` — negated on the sine side, as the handlers do it — rounded to
+    /// nearest-even through the x87 helper. Values pinned against those constants.
+    #[test]
+    fn trig_stores_round_to_nearest_at_pinned_headings() {
+        for (op, angle, amplitude, want) in [
+            (OP_SINE, 512i32, 100i32, -71i32),
+            (OP_SINE, 0, 7, 0),
+            (OP_COSINE, 0, -50, -50),
+            (OP_COSINE, 1024, 100, 0),
+        ] {
+            let data = vec![
+                op, DST[0], DST[1], 0x00, 0x80, // angle   = references[0]
+                0x01, 0x80, // amp     = references[1]
+                OP_END,
+            ];
+            let mut e = vm(data, vec![angle as u32, amplitude as u32]);
+            assert_eq!(e.step(), StepResult::Done);
+            assert_eq!(e.work_zone(0), want, "op 0x{op:02X}({angle}, {amplitude})");
+        }
+    }
+
+    /// VECTOR_TO_HEADING: `atan2(-operand[+3], operand[+5])` scaled back to the
+    /// ±2048-per-half-turn heading scale — the cardinals and one off-axis case.
+    #[test]
+    fn vector_to_heading_pins_the_four_cardinal_sides() {
+        for (x, y, want) in [
+            (0i32, 1i32, 0i32),
+            (-1, 0, 2048),
+            (1, 0, -2048),
+            (1, -1, -3072),
+            (-3, 7, 528),
+        ] {
+            let data = vec![
+                OP_VECTOR_TO_HEADING,
+                DST[0],
+                DST[1],
+                0x00,
+                0x80, // operand[+3] = x
+                0x01,
+                0x80, // operand[+5] = y
+                OP_END,
+            ];
+            let mut e = vm(data, vec![x as u32, y as u32]);
+            assert_eq!(e.step(), StepResult::Done);
+            assert_eq!(e.work_zone(0), want, "atan({x}, {y})");
+        }
+    }
+
+    /// MODULO takes operands +3/+5 and guards both against zero like OP_DIV does,
+    /// with the truncated remainder x86 `idiv` yields (sign follows the dividend).
+    #[test]
+    fn modulo_guards_both_operands_like_div() {
+        for (a, b, want) in [(7i32, -2i32, 1i32), (-7, 2, -1), (0, 5, 0), (30, 0, 0)] {
+            let data = vec![OP_MODULO, DST[0], DST[1], 0x00, 0x80, 0x01, 0x80, OP_END];
+            let mut e = vm(data, vec![a as u32, b as u32]);
+            assert_eq!(e.step(), StepResult::Done);
+            assert_eq!(e.work_zone(0), want, "{a} % {b}");
+        }
+    }
     #[test]
     fn endian_swap_exchanges_both_slots() {
         let data = vec![OP_SWAP, DST[0], DST[1], 0x01, 0x10, OP_END];
@@ -3604,6 +4846,691 @@ mod tests {
             assert_eq!(e.step(), StepResult::Done);
             assert_eq!(e.work_zone(1), want_slot1, "bound {bound}");
             assert_eq!(e.work_zone(0), 0, "bound {bound} must not touch slot 0");
+        }
+    }
+
+    /// The clear half shares SET's addressing and bound guard exactly (retail
+    /// skips when the word number reaches or passes the bound): set bit 33,
+    /// attempt an out-of-bound clear (bound too small — must not touch), then
+    /// clear it for real.
+    #[test]
+    fn bitarray_clear_mirrors_set_addressing_and_guard() {
+        let data = vec![
+            OP_BITARRAY_SET,
+            DST[0],
+            DST[1],
+            0x00,
+            0x80, // references[0] = flat bit index 33 (word 1, bit 1)
+            0x01,
+            0x80, // references[1] = bound 2 -> admitted
+            OP_BITARRAY_CLEAR,
+            DST[0],
+            DST[1],
+            0x00,
+            0x80,
+            0x02,
+            0x80, // references[2] = bound 1 -> word 1 >= bound: skip
+            OP_BITARRAY_CLEAR,
+            DST[0],
+            DST[1],
+            0x00,
+            0x80,
+            0x01,
+            0x80,
+            OP_END,
+        ];
+        let mut e = vm(data, vec![33, 2, 1]);
+
+        // Without stepping we cannot see the middle state; instead run one step
+        // and assert only the final word: SET then refused CLEAR then admitted
+        // CLEAR leaves zero.
+        assert_eq!(e.step(), StepResult::Done);
+        assert_eq!(e.work_zone(1), 0);
+        // And the guard itself, proven by the pair SET+refused-clear leaving the bit set.
+        let guarded = vec![
+            OP_BITARRAY_SET,
+            DST[0],
+            DST[1],
+            0x00,
+            0x80,
+            0x01,
+            0x80,
+            OP_BITARRAY_CLEAR,
+            DST[0],
+            DST[1],
+            0x00,
+            0x80,
+            0x02,
+            0x80,
+            OP_END,
+        ];
+        let mut e = vm(guarded, vec![33, 2, 1]);
+        assert_eq!(e.step(), StepResult::Done);
+        assert_eq!(
+            e.work_zone(1),
+            0b10,
+            "bound-refused clear must leave the bit set"
+        );
+    }
+
+    /// `OP_WORK_DISTANCE` (`f_100b75c0`) stores sqrt((G7−G3)² + (G9−G5)²),
+    /// nearest-even rounded: the operand pair order fixes the sign of each
+    /// difference, and the fetch order 7/3 then 9/5 is retail's.
+    #[test]
+    fn work_distance_stores_the_rounded_integer_hypotenuse() {
+        for ((x_plus, x_minus, z_plus, z_minus), want) in [
+            ((5u32, 2, 10, 6), 5), // (3, 4) → 5
+            ((2, 5, 6, 10), 5),    // negated pair, same length
+            ((1, 0, 2, 0), 2),     // sqrt(5) truncates down
+            ((0, 0, 0, 0), 0),     // both zero
+        ] {
+            let mut e = vm(
+                vec![
+                    OP_WORK_DISTANCE,
+                    DST[0],
+                    DST[1], // destination @+1: Work_Zone[0]
+                    0x00,
+                    0x80, // G@3 → references[0]
+                    0x01,
+                    0x80, // G@5 → references[1]
+                    0x02,
+                    0x80, // G@7 → references[2]
+                    0x03,
+                    0x80, // G@9 → references[3]
+                    OP_END,
+                ],
+                vec![x_minus, z_minus, x_plus, z_plus],
+            );
+            assert_eq!(e.step(), StepResult::Done);
+            assert_eq!(e.exec_pointer(), 11, "op 0x64 advanced wrong width");
+            assert_eq!(
+                e.work_zone(0),
+                want,
+                "({x_plus}-{x_minus}, {z_plus}-{z_minus})"
+            );
+        }
+    }
+
+    /// `OP_ACTOR_DISTANCE` (`f_100b7860`) always stores — the three-axis distance
+    /// between the two named actors in thousandths (kuluu's tracked space needs
+    /// no further scale), and zero whenever either actor resolves to nothing.
+    #[test]
+    fn actor_distance_stores_the_scaled_separation_or_zero() {
+        let mut positions = std::collections::HashMap::new();
+        positions.insert(NPC_SERVER_ID, crate::vm::scene::EventPosition::default());
+        positions.insert(
+            NPC_SERVER_ID + 1,
+            crate::vm::scene::EventPosition {
+                x: 3000,
+                y: 4000,
+                z: 0,
+                heading: 0,
+            },
+        );
+        let dat = std::sync::Arc::new(ffxi_dat::event_dat::EventDat {
+            blocks: vec![block(vec![OP_END], vec![])],
+        });
+
+        for (second_id, want) in [
+            (NPC_SERVER_ID + 1, 5000),
+            (NPC_SERVER_ID + 2, 0), // untracked actor stores zero, still advances
+        ] {
+            let mut data = vec![OP_ACTOR_DISTANCE];
+            data.extend_from_slice(&DST); // destination word @+1
+            data.extend_from_slice(&NPC_SERVER_ID.to_le_bytes()); // first lookup @+3
+            data.extend_from_slice(&second_id.to_le_bytes()); // second lookup @+7
+            data.push(OP_END);
+            let mut e = vm(data, vec![]);
+            e.attach_scene(
+                dat.clone(),
+                ffxi_dat::event_dat::ZONE_PLAYER_ACTOR,
+                crate::vm::scene::EventPosition::default(),
+            );
+            e.set_entity_positions(&positions);
+
+            assert_eq!(
+                e.step(),
+                StepResult::Done,
+                "actor {second_id:#x} must run to END"
+            );
+            assert_eq!(e.exec_pointer(), 11, "op 0x65 advanced wrong width");
+            assert_eq!(e.work_zone(0), want, "distance to actor {second_id:#x}");
+        }
+    }
+
+    /// The entity-speed switch's nine cases each carry their own width, lifted
+    /// case-by-case from `f_100b6a60`; anything past case eight must be refused,
+    /// never walked over. Padded operand bytes keep OP_END at the expected slot so
+    /// a wrong per-case advance shows up as stepping into operands.
+    #[test]
+    fn entity_speed_advances_by_the_case_width_per_the_retail_dispatch() {
+        const CASE_WIDTHS: [(u8, usize); 9] = [
+            (0, 4),
+            (1, 8),
+            (2, 4),
+            (3, 8),
+            (4, 8),
+            (5, 7),
+            (6, 6),
+            (7, 4),
+            (8, 8),
+        ];
+        for (sub, width) in CASE_WIDTHS {
+            let mut data = vec![OP_ENTITYSPEED, sub];
+            data.resize(1 + width, 0x00);
+            data.push(OP_END);
+            let mut e = vm(data, vec![]);
+            assert_eq!(e.step(), StepResult::Done, "case {sub} must run to END");
+            assert_eq!(
+                e.exec_pointer(),
+                width,
+                "case {sub} advanced by the wrong width"
+            );
+        }
+        for sub in [9u8, 0xA, 0xFF] {
+            let mut data = vec![OP_ENTITYSPEED, sub];
+            data.resize(1 + 8, 0x00);
+            data.push(OP_END);
+            let mut e = vm(data, vec![]);
+            assert_eq!(
+                e.step(),
+                StepResult::Unimplemented(OP_ENTITYSPEED),
+                "selector {sub:#X} must be refused, not walked"
+            );
+        }
+    }
+
+    /// Case 5 of the entity-speed switch is a flags-word twin with an unusual
+    /// operand layout: actor lookup @+2 but the value byte at +6 — bit 21 := low
+    /// bit of that byte, same first-flags-word bit space as 0x33.
+    #[test]
+    fn entity_speed_bit21_case_publishes_the_entity_flag_at_plus_six() {
+        for (value_byte, want) in [(3u8, true), (2, false)] {
+            let mut data = vec![OP_ENTITYSPEED, 5];
+            data.extend_from_slice(&NPC_SERVER_ID.to_le_bytes()); // lookup @+2
+            data.push(value_byte); // value byte at +6
+            data.push(OP_END);
+            let mut e = vm(data, vec![]);
+            assert_eq!(e.step(), StepResult::Done);
+            assert_eq!(
+                e.take_cues(),
+                [EventCue::ActorRenderFlag {
+                    actor: ActorLookup(NPC_SERVER_ID),
+                    bit: EventCue::ENTITY_FLAG_BASE + 21,
+                    value: want,
+                }],
+                "value byte {value_byte}"
+            );
+        }
+    }
+
+    /// The selector op (`f_100b73f0`) takes its width from the selector byte:
+    /// cases 0/1 latch and advance 4, case 2 carries the lookup and advances 6,
+    /// and every other selector walks retail's default arm — exactly two bytes,
+    /// not a refusal. Padding keeps `OP_END` at each expected landing slot so a
+    /// wrong width shows up as stepping into operands.
+    #[test]
+    fn flagword_selector_advances_by_the_selector_width() {
+        for (sel, width) in [(0u8, 4), (1, 4), (2, 6), (3, 2), (9, 2), (0xFE, 2)] {
+            let mut data = vec![OP_FLAGWORD_SELECTOR, sel];
+            data.resize(1 + width, 0x00);
+            data.push(OP_END);
+            let mut e = vm(data, vec![]);
+            assert_eq!(
+                e.step(),
+                StepResult::Done,
+                "selector {sel:#X} must run to END"
+            );
+            assert_eq!(
+                e.exec_pointer(),
+                width,
+                "selector {sel:#X} advanced by the wrong width"
+            );
+        }
+    }
+
+    /// Cases 0/1 of the selector op latch bit 30 of the entity's second flags
+    /// word to the selector itself — value = low bit, carried in the sibling
+    /// `ENTITY_WORD_124_BASE` bit space; case 2 hands off with no cue kuluu can
+    /// act on (the singleton's internals are unread).
+    #[test]
+    fn flagword_selector_latches_the_word_124_bit_from_the_selector() {
+        for (sel, want) in [(0u8, false), (1, true)] {
+            let mut operands = vec![sel];
+            operands.resize(3, 0x00); // pad to the case width, op + 3 = 4
+            let cues = cues_of(OP_FLAGWORD_SELECTOR, &operands, vec![]);
+            assert_eq!(
+                cues,
+                [EventCue::ActorRenderFlag {
+                    actor: ActorLookup::EVENT_ENTITY,
+                    bit: EventCue::ENTITY_WORD_124_BASE + 30,
+                    value: want,
+                }],
+                "selector {sel:#X}"
+            );
+        }
+        let mut operands = vec![2];
+        operands.resize(5, 0x00); // case 2's width: op + lookup + pad = 6
+        let cues = cues_of(OP_FLAGWORD_SELECTOR, &operands, vec![]);
+        assert!(cues.is_empty(), "case 2 publishes nothing kuluu can act on");
+    }
+
+    /// The third-flags-word writer (`f_100b74e0`) is a mask-OR store of the
+    /// byte's low bit into bit 0 of `[entry+0x128]` — value follows `byte & 1`
+    /// exactly (3 sets, 2 clears), in its own sibling bit space.
+    #[test]
+    fn entity_word128_set_stores_the_low_bit_of_its_byte() {
+        for (value_byte, want) in [(3u8, true), (2, false)] {
+            let cues = cues_of(OP_ENTITY_WORD128_SET, &[value_byte], vec![]);
+            assert_eq!(
+                cues,
+                [EventCue::ActorRenderFlag {
+                    actor: ActorLookup::EVENT_ENTITY,
+                    bit: EventCue::ENTITY_WORD_128_BASE,
+                    value: want,
+                }],
+                "value byte {value_byte}"
+            );
+        }
+    }
+
+    /// The word-124 latch at bit 31 (`f_100b7490`) takes the low bit of its
+    /// byte like its siblings (2 sets, 3 clears), and is two bytes wide.
+    #[test]
+    fn entity_word124_bit31_latch_follows_the_low_bit_of_its_byte() {
+        for (value_byte, want) in [(2u8, false), (3, true)] {
+            let cues = cues_of(OP_ENTITY_WORD124_BIT31_LATCH, &[value_byte], vec![]);
+            assert_eq!(
+                cues,
+                [EventCue::ActorRenderFlag {
+                    actor: ActorLookup::EVENT_ENTITY,
+                    bit: EventCue::ENTITY_WORD_124_BASE + 31,
+                    value: want,
+                }],
+                "value byte {value_byte}"
+            );
+        }
+    }
+
+    /// The three fourth-flags-word force-setters (`f_100ba8d0`/`f_100ba920`/
+    /// `f_100ba970`) pin bits 26, 11 and 12 of `[entry+0x12c]`: each stores
+    /// its operand's low bit into exactly one bit, never touching neighbours.
+    #[test]
+    fn word12c_force_setters_pin_one_bit_each_to_the_low_bit() {
+        for (op, bit, width) in [
+            (
+                OP_ENTITY_WORD12C_SET_BIT26,
+                EventCue::ENTITY_WORD_12C_BASE + 26,
+                2,
+            ),
+            (
+                OP_ENTITY_WORD12C_SET_BIT11,
+                EventCue::ENTITY_WORD_12C_BASE + 11,
+                2,
+            ),
+            (
+                OP_ENTITY_WORD12C_SET_BIT12,
+                EventCue::ENTITY_WORD_12C_BASE + 12,
+                3,
+            ),
+        ] {
+            for (value_byte, want) in [(3u8, true), (2, false)] {
+                let mut operands = vec![value_byte];
+                operands.resize(width - 1, 0);
+                let cues = cues_of(op, &operands, vec![]);
+                assert_eq!(
+                    cues,
+                    [EventCue::ActorRenderFlag {
+                        actor: ActorLookup::EVENT_ENTITY,
+                        bit,
+                        value: want,
+                    }],
+                    "op {op:#04x} value byte {value_byte}"
+                );
+            }
+        }
+    }
+
+    /// 0x84 (`f_100b9100`) ors bit zero of the fourth flags word with no
+    /// condition on any operand value and no clear branch — always true.
+    #[test]
+    fn entity_word12c_bit0_op_is_an_unconditional_set() {
+        let cues = cues_of(OP_ENTITY_WORD12C_SET_BIT0, &[], vec![]);
+        assert_eq!(
+            cues,
+            [EventCue::ActorRenderFlag {
+                actor: ActorLookup::EVENT_ENTITY,
+                bit: EventCue::ENTITY_WORD_12C_BASE,
+                value: true,
+            }]
+        );
+    }
+
+    /// 0x86 (`f_100b8f30`) forces bit three of the fourth flags word on the
+    /// actor named at +2 from the low bit at +1 — width six, resolved form.
+    #[test]
+    fn entity_word12c_bit3_resolved_form_names_its_actor_and_low_bit() {
+        for (value_byte, want) in [(5u8, true), (6, false)] {
+            let cues = cues_of(
+                OP_ENTITY_WORD12C_SET_BIT3_RESOLVED,
+                &[value_byte, 0x2a, 0, 0, 0],
+                vec![],
+            );
+            assert_eq!(
+                cues,
+                [EventCue::ActorRenderFlag {
+                    actor: ActorLookup(0x2a),
+                    bit: EventCue::ENTITY_WORD_12C_BASE + 3,
+                    value: want,
+                }],
+                "value byte {value_byte}"
+            );
+        }
+    }
+
+    /// The helper bucket law (`f_100b5210`): each band's file id is its anchor
+    /// plus the distance under the boundary, plus the second operand word —
+    /// pinned at every edge of all four boundaries and for the below-all band.
+    /// The anchors are restated here (PINNED) rather than imported from
+    /// `cue::event_motion_dat_id`: this witness reads them out of
+    /// `f_100b5210`, so it must not borrow its expected values from the other
+    /// reader of that table.
+    #[test]
+    fn scheduler_file_id_follows_the_four_bucket_anchors() {
+        const ANCHOR_A_PINNED: u32 = 0x1_0323;
+        const ANCHOR_B_PINNED: u32 = 0xE95B;
+        const ANCHOR_C_PINNED: u32 = 0xDC19;
+        const ANCHOR_D_PINNED: u32 = 0xBF_EF;
+        const ANCHOR_E_PINNED: u32 = 0x7D68;
+        const BAND_A_EDGE_PINNED: i32 = 0xC00;
+        for (id1, id2, want) in [
+            (
+                BAND_A_EDGE_PINNED,
+                0i32,
+                ANCHOR_A_PINNED + BAND_A_EDGE_PINNED as u32,
+            ),
+            (0xFFF, 5, ANCHOR_A_PINNED + 0xFFF + 5),
+            (0xBFF, 0, ANCHOR_B_PINNED + 0xBFF),
+            (0x800, 7, ANCHOR_B_PINNED + 0x800 + 7),
+            (0x7FF, 1, ANCHOR_C_PINNED + 0x7FF + 1),
+            (0x400, 2, ANCHOR_C_PINNED + 0x400 + 2),
+            (0x3FF, 3, ANCHOR_D_PINNED + 0x3FF + 3),
+            (0x200, 4, ANCHOR_D_PINNED + 0x200 + 4),
+            (0x1FF, 6, ANCHOR_E_PINNED + 0x1FF + 6),
+            (0, 0, ANCHOR_E_PINNED),
+        ] {
+            assert_eq!(EventVm::scheduler_file_id(id1, id2), want, "id1 {id1:#X}");
+        }
+    }
+
+    /// Sub-sched helper cases 2-6 advance by their recorded width whether or
+    /// not their inline actor dwords resolve: every fetch failure, null entity
+    /// slot and id-pair/flags refusal lands on retail's helpers' advance tail
+    /// (only the motion-load handoff rewinds exec — unmodelled here, record Not
+    /// established). Actor dwords sit at `f_100b5510`'s single fetch (+2) and
+    /// `f_100b5210`'s pair (+4/+8); the widths are 6/16/16/18/18.
+    #[test]
+    fn subsched_helper_cases_advance_whether_their_actors_resolve_or_not() {
+        const C2_ACTOR_OFS: usize = 2;
+        const C36_ACTOR1_OFS: usize = 4;
+        const C36_ACTOR2_OFS: usize = 8;
+        const CASE_WIDTHS: [(u8, usize); 5] = [(2, 6), (3, 16), (4, 16), (5, 18), (6, 18)];
+        let dat = std::sync::Arc::new(ffxi_dat::event_dat::EventDat {
+            blocks: vec![block(vec![OP_END], vec![])],
+        });
+        for (sel, width) in CASE_WIDTHS {
+            // Actor dwords land inside the case body at each helper's own
+            // fetch offsets; every other byte of the body is operand.
+            let mut data = vec![OP_SUBSCHED, sel];
+            data.resize(width, 0x00);
+            let actor1 = if sel == 2 {
+                C2_ACTOR_OFS
+            } else {
+                C36_ACTOR1_OFS
+            };
+            data[actor1..actor1 + 4].copy_from_slice(&NPC_SERVER_ID.to_le_bytes());
+            if sel != 2 {
+                data[C36_ACTOR2_OFS..C36_ACTOR2_OFS + 4]
+                    .copy_from_slice(&(NPC_SERVER_ID + 1).to_le_bytes());
+            }
+            let end = data.len();
+            assert_eq!(
+                end, width,
+                "case {sel} body must fit its recorded width exactly"
+            );
+            data.push(OP_END);
+
+            // Unresolved actors (empty entity map): retail's null-slot advance
+            // tail — the case still consumes its width.
+            let mut unresolved = vm(data.clone(), vec![]);
+            unresolved.attach_scene(
+                dat.clone(),
+                ffxi_dat::event_dat::ZONE_PLAYER_ACTOR,
+                crate::vm::scene::EventPosition::default(),
+            );
+            assert_eq!(
+                unresolved.step(),
+                StepResult::Done,
+                "case {sel} must not park on unresolved actors"
+            );
+            assert_eq!(
+                unresolved.exec_pointer(),
+                end,
+                "unresolved case {sel} advanced by the wrong width (want {width})"
+            );
+
+            // Resolved and free (`NPC_SERVER_ID` has its high byte set, so it
+            // is a literal server id — cue.rs ActorLookup): same width.
+            let mut positions = std::collections::HashMap::new();
+            for id in [NPC_SERVER_ID, NPC_SERVER_ID + 1] {
+                positions.insert(id, crate::vm::scene::EventPosition::default());
+            }
+            let mut resolved = vm(data.clone(), vec![]);
+            resolved.attach_scene(
+                dat.clone(),
+                ffxi_dat::event_dat::ZONE_PLAYER_ACTOR,
+                crate::vm::scene::EventPosition::default(),
+            );
+            resolved.set_entity_positions(&positions);
+            assert_eq!(
+                resolved.step(),
+                StepResult::Done,
+                "case {sel} must run when free"
+            );
+            assert_eq!(
+                resolved.exec_pointer(),
+                end,
+                "case {sel} advanced by the wrong width (want {width})"
+            );
+        }
+    }
+
+    /// Sub-sched case 7 is the family's parking predicate (`f_100b4e10`): with
+    /// both inline actors resolved it holds while either reports a running
+    /// action (retail rewinds exec to retry each pass) and runs through by its
+    /// width once free; an unresolved actor takes retail's null-slot advance
+    /// tail, so the predicate never parks on one.
+    #[test]
+    fn subsched_case_seven_parks_while_an_actor_is_busy() {
+        const KEY: [u8; 4] = *b"abcd";
+        let dat = std::sync::Arc::new(ffxi_dat::event_dat::EventDat {
+            blocks: vec![block(vec![OP_END], vec![])],
+        });
+        let mut data = vec![OP_SUBSCHED, 7];
+        data.resize(14, 0x00); // the case width; both actor dwords sit inside it
+        data[SUBSCHED_ACTOR_OFS_C7_FIRST..SUBSCHED_ACTOR_OFS_C7_FIRST + 4]
+            .copy_from_slice(&NPC_SERVER_ID.to_le_bytes());
+        data[SUBSCHED_ACTOR_OFS_C7_SECOND..SUBSCHED_ACTOR_OFS_C7_SECOND + 4]
+            .copy_from_slice(&(NPC_SERVER_ID + 1).to_le_bytes());
+        data.push(OP_END);
+
+        // Null entity slots skip the predicate (advance tail).
+        let mut unresolved = vm(data.clone(), vec![]);
+        unresolved.attach_scene(
+            dat.clone(),
+            ffxi_dat::event_dat::ZONE_PLAYER_ACTOR,
+            crate::vm::scene::EventPosition::default(),
+        );
+        assert_eq!(
+            unresolved.step(),
+            StepResult::Done,
+            "null actor-1 takes the advance tail"
+        );
+
+        // Resolved and busy: park without advancing.
+        let mut positions = std::collections::HashMap::new();
+        for id in [NPC_SERVER_ID, NPC_SERVER_ID + 1] {
+            positions.insert(id, crate::vm::scene::EventPosition::default());
+        }
+        let mut e = vm(data.clone(), vec![]);
+        e.attach_scene(
+            dat,
+            ffxi_dat::event_dat::ZONE_PLAYER_ACTOR,
+            crate::vm::scene::EventPosition::default(),
+        );
+        e.set_entity_positions(&positions);
+        e.hold_action(ActorLookup(NPC_SERVER_ID), KEY, WAIT_UNITS_PER_SEC);
+        assert_eq!(
+            e.step(),
+            StepResult::Waiting,
+            "busy actor-1 parks the predicate"
+        );
+        assert_eq!(e.exec_pointer(), 0, "a parked case 7 must not advance");
+
+        // Free again — the hold expires by report or clock like any
+        // waitschedulor hold — run through by the case width.
+        e.tick(1.1);
+        assert_eq!(
+            e.step(),
+            StepResult::Done,
+            "free actors run the predicate through"
+        );
+        assert_eq!(e.exec_pointer(), 14, "case 7 advanced by the wrong width");
+    }
+
+    /// Sub-sched cases 0/1 latch word-[0x124] bit 29 to the selector: sel=0
+    /// stores zero (`shl 0x1d` of 0), sel=1 sets; width 2 both ways.
+    #[test]
+    fn subsched_latch_cases_store_the_word_124_bit_29() {
+        for (sel, want) in [(0u8, false), (1, true)] {
+            let cues = cues_of(OP_SUBSCHED, &[sel], vec![]);
+            assert_eq!(
+                cues,
+                [EventCue::ActorRenderFlag {
+                    actor: ActorLookup::EVENT_ENTITY,
+                    bit: EventCue::ENTITY_WORD_124_BASE + 29,
+                    value: want,
+                }],
+                "selector {sel}"
+            );
+        }
+    }
+
+    /// The third-word bit-17 writer (`f_100b8a80`) is set-or-clear on whether
+    /// the whole byte is non-zero — unlike the low-bit twins, any non-zero
+    /// value (not just odd ones) sets it.
+    #[test]
+    fn entity_word128_bit17_set_is_non_zero_not_low_bit() {
+        for (value_byte, want) in [(0u8, false), (1, true), (2, true), (0xFE, true)] {
+            let mut operands = vec![value_byte];
+            operands.resize(5, 0x00); // the op's recorded width: op + 5 = 6
+            let cues = cues_of(OP_ENTITY_WORD128_SET_BIT17, &operands, vec![]);
+            assert_eq!(
+                cues,
+                [EventCue::ActorRenderFlag {
+                    actor: ActorLookup::EVENT_ENTITY,
+                    bit: EventCue::ENTITY_WORD_128_BASE + 17,
+                    value: want,
+                }],
+                "value byte {value_byte:#X}"
+            );
+        }
+    }
+
+    /// `OP_GET_HEADING` (`f_100b2c80`) stores the named actor's facing as a
+    /// non-negative count of heading units: kuluu's integer unit heading wraps by
+    /// positive modulo (retail's radians wrap `f_100dd9d0` scaled by 4096·(1/2π)),
+    /// and an actor the scene does not track stores zero, like retail's null
+    /// entity-table branch. The actor lookup dword is at +1 — one byte earlier
+    /// than the flag-family twins — and the destination work operand sits at +5.
+    #[test]
+    fn get_heading_wraps_the_named_actor_and_zeroes_unknowns() {
+        const OP_GET_HEADING: u8 = 0x3A;
+        let mut positions = std::collections::HashMap::new();
+        for (id, heading) in [(NPC_SERVER_ID, -10), (NPC_SERVER_ID + 1, 5000)] {
+            positions.insert(
+                id,
+                crate::vm::scene::EventPosition {
+                    heading,
+                    ..Default::default()
+                },
+            );
+        }
+        let dat = std::sync::Arc::new(ffxi_dat::event_dat::EventDat {
+            blocks: vec![block(vec![OP_END], vec![])],
+        });
+
+        for (id, want) in [
+            (NPC_SERVER_ID, 4086),
+            (NPC_SERVER_ID + 1, 904),
+            (NPC_SERVER_ID + 2, 0),
+        ] {
+            let mut data = vec![OP_GET_HEADING];
+            data.extend_from_slice(&id.to_le_bytes());
+            data.extend_from_slice(&DST);
+            let mut e = vm(data, vec![]);
+            e.attach_scene(
+                dat.clone(),
+                ffxi_dat::event_dat::ZONE_PLAYER_ACTOR,
+                crate::vm::scene::EventPosition::default(),
+            );
+            e.set_entity_positions(&positions);
+
+            assert_eq!(e.step(), StepResult::Done, "id {id:#x} must run to END");
+            assert_eq!(
+                e.exec_pointer(),
+                7,
+                "op 0x{OP_GET_HEADING:02X} advanced wrong size"
+            );
+            assert_eq!(e.work_zone(0), want, "heading for id {id:#x}");
+        }
+    }
+
+    /// The entity flags word twins carry their cue in the `ENTITY_FLAG_BASE` bit
+    /// space, value = low bit of the inline byte (byte 3 sets the bit, byte 2
+    /// clears it — the handlers isolate exactly that bit), and the operand
+    /// layout matches the recorded widths: 0x2F carries a 0x92-style actor
+    /// lookup after its value byte, 0x33 is the value byte alone on the
+    /// block's own entry.
+    #[test]
+    fn entity_flag_twins_carry_first_word_bits_and_low_bit_values() {
+        for (op, bit) in [
+            (OP_ENTITY_FLAGS_SET_BIT19, EventCue::ENTITY_FLAG_BASE + 19),
+            (OP_ENTITY_FLAGS_SET_BIT21, EventCue::ENTITY_FLAG_BASE + 21),
+        ] {
+            let mut operands = vec![0x03];
+            if op == OP_ENTITY_FLAGS_SET_BIT19 {
+                operands.extend_from_slice(&LOOKUP_EVENT_ENTITY.to_le_bytes());
+            }
+            let cues = cues_of(op, &operands, vec![]);
+            assert!(
+                matches!(
+                    &cues[..],
+                    [EventCue::ActorRenderFlag { bit: got, value: true, .. }]
+                      if *got == bit
+                ),
+                "op 0x{op:02X} byte=3 must cue bit {bit}=true"
+            );
+            operands[0] = 0x02;
+            let cues = cues_of(op, &operands, vec![]);
+            assert!(
+                matches!(
+                    &cues[..],
+                    [EventCue::ActorRenderFlag { bit: got, value: false, .. }]
+                      if *got == bit
+                ),
+                "op 0x{op:02X} byte=2 must cue bit {bit}=false"
+            );
         }
     }
 
@@ -4044,16 +5971,61 @@ mod tests {
         assert_eq!(e.step(), StepResult::Done, "an expired hold falls through");
     }
 
+    /// TURNWAIT parks while a walk of the event entity is in flight — the
+    /// mover-steering half of retail's turning bit, the shape 180 authored
+    /// post-motion TURNWAITs take (`.agents/skills/retail-observe/references/
+    /// 2026-10-28-event-opcode-no-skip-pass.md` turn-wait section).
     #[test]
-    fn skipped_emote_does_not_arm_animation_yield() {
+    fn turnwait_parks_while_a_walk_is_in_flight() {
+        let mut e = vm(vec![OP_TURNWAIT, OP_END], vec![]);
+        assert_eq!(e.step(), StepResult::Done, "nothing running: advance one");
+        assert_eq!(e.exec_pointer(), 1);
+        let mut e = vm(vec![OP_TURNWAIT, OP_END], vec![]);
+        e.hold_move(ActorLookup::EVENT_ENTITY, WAIT_UNITS_PER_SEC);
+        assert_eq!(
+            e.step(),
+            StepResult::Waiting,
+            "a running walk parks the turn-wait"
+        );
+        assert_eq!(e.exec_pointer(), 0);
+    }
+
+    /// TURNWAIT also parks while the event entity's animation byte is busy —
+    /// retail's bit covers animating too, read through the 0x9B machinery.
+    #[test]
+    fn turnwait_parks_while_the_event_entity_animates() {
+        let key: [u8; 4] = *b"efgh";
+        let mut e = vm(vec![OP_TURNWAIT, OP_END], vec![]);
+        e.hold_action(ActorLookup::EVENT_ENTITY, key, WAIT_UNITS_PER_SEC);
+        assert_eq!(e.step(), StepResult::Waiting);
+        e.tick(1.1);
+        assert_eq!(e.step(), StepResult::Done, "an expired hold falls through");
+        assert_eq!(e.exec_pointer(), 1);
+    }
+
+    /// An accepted 0x6E marks its actor's action slot for the pass, exactly
+    /// like retail's `[actor+0x1BC]=0xc`: the per-entity yield of 0x9B (and the
+    /// trio's own busy gates) see it in the same pass. Once the host drains the
+    /// cues — the point kuluu arms real holds for motions it can time — the
+    /// mark is spent, so an id kuluu cannot time never parks a scene deeper
+    /// than one pass.
+    #[test]
+    fn emoted_arms_the_animation_yield_for_the_pass() {
         let mut data = vec![OP_EMOT];
         data.extend_from_slice(&ActorLookup::EVENT_ENTITY.0.to_le_bytes());
-        data.extend_from_slice(&REF0);
+        data.extend_from_slice(&REF0); // id/argument at +5/+6
         data.push(OP_ANIM_YIELD);
         data.push(OP_END);
         let mut e = vm(data, vec![7]);
+        // The EMOT and the yield run in one pass: the yield sees the mark.
+        assert_eq!(e.step(), StepResult::Waiting);
+        let cues = e.take_cues();
+        assert!(matches!(
+            cues.as_slice(),
+            [EventCue::Emote { actor, .. }] if *actor == ActorLookup::EVENT_ENTITY
+        ));
+        // Drained like every same-pass start: the next pass runs through.
         assert_eq!(e.step(), StepResult::Done);
-        assert!(e.take_cues().is_empty());
     }
 
     #[test]
@@ -4820,16 +6792,16 @@ mod tests {
 
     /// The actor-driven waits all reduce to retail's own "no such entity"
     /// advance here, and the width is load-bearing: each carries an actor
-    /// lookup the VM steps over blind.
+    /// lookup the VM steps over blind. 0x34/0x35 and 0x9A are not in this list
+    /// any more: they gained real multi-pass holds (the reload triple and the
+    /// music-read yield), pinned by `mapload_holds_two_passes_then_reloads_once_
+    /// and_rearms` and `musicreadwait_yields_exactly_one_pass`.
     #[test]
     fn actor_early_exit_opcodes_skip_by_size_and_continue() {
         for (op, size) in [
             (OP_LOADWAIT, LOADWAIT_SIZE),
             (OP_TURNCHECK, LOADWAIT_SIZE),
             (OP_TRANSPAR, TRANSPAR_SIZE),
-            (OP_MAPLOAD, MAPLOAD_SIZE),
-            (OP_MAPLOAD_KEEP, MAPLOAD_SIZE),
-            (OP_MUSICREADWAIT, YIELD_SIZE),
             (OP_YIELD, YIELD_SIZE),
         ] {
             assert_eq!(
@@ -5020,7 +6992,40 @@ mod tests {
     /// instruction and start executing operands as opcodes.
     #[test]
     fn sub_width_opcodes_stop_rather_than_falling_back_to_the_fixed_size() {
-        for (op, sub) in [(OP_LOOKSET, 0x16u8), (OP_STRINGOPS, 0x07)] {
+        for (op, sub) in [
+            (OP_LOOKSET, 0x16u8),
+            (OP_STRINGOPS, 0x07),
+            // The pair dispatcher's declared ten must not swallow a six-byte
+            // case nor run operands as code: retail spins here (`f_100bb620`).
+            (OP_PAIRDISPATCH_AE, 0x09),
+            // The staged-record probe runs on sub zero only; anything else is
+            // retail's no-advance spin (`f_100b7140`).
+            (OP_STAGED_RECORD_PROBE_D3, 0x01u8),
+            // Registry lookup: selectors with no body under its own ceiling and
+            // selectors above it both reach exits that never touch exec — retail
+            // spins on both (`f_100bbd80` byte map + pops-only default).
+            (OP_REGISTRY_LOOKUP_BF, 0x10u8),
+            (OP_REGISTRY_LOOKUP_BF, 0x60u8),
+            // Mode-bits writer above its three live selectors: no advance
+            // (`f_100bba70`).
+            (OP_MODE_BITS_WORK_WRITER_B1, 0x03u8),
+            // Mover-bridge writer above its five selector bodies: the jump
+            // lands on the epilogue that pops without touching exec — retail
+            // spins there (`f_100afee0` default arm @100b0100).
+            (OP_MOVER_BRIDGE_B7, 0x05u8),
+            // The exec-context op's ceiling sits at selector five; above it
+            // the jump-table exit pops with no exec write (@100b3aac path,
+            // `f_100b3a50`).
+            (OP_REQRESET, 0x06u8),
+            // The name-patch op runs sub zero only; any other selector sets
+            // the pending flag with no advance (`f_100b10f0` @100b113c) and
+            // retail re-dispatches.
+            (OP_NAMESET, 0x01u8),
+            // The work-slot float triple has two selector bodies; above them the
+            // handler returns through its pops-only exit @100bba68 — retail spins
+            // there where the generic size skip used to walk eight (`f_100bb9c0`).
+            (OP_WORK_SLOT_TRIPLE_READ_AF, 0x02u8),
+        ] {
             let mut data = vec![op, sub];
             data.extend(std::iter::repeat_n(
                 0u8,
@@ -5043,6 +7048,10 @@ mod tests {
             (OP_LOOKSET, 0x0Bu8, 20usize),
             (OP_EVENTPOSSET, 0x01, 2),
             (OP_LOADROOM, 0x00, 4),
+            // The handler's two bare `add eax, 2` tails @100b86df/@100b86c4
+            // minus the re-base — op+sub only for cases 1 and 2.
+            (OP_LOADROOM, 0x01, 2),
+            (OP_LOADROOM, 0x02, 2),
             (OP_ITEMINFO, 0x02, 14),
             (OP_ENTITYSPEED, 0x05, 7),
             (OP_MOVE, 0x00, 8),
@@ -5051,9 +7060,45 @@ mod tests {
             (OP_RENDERFLAG, 0x1B, 6),
             (OP_REQRESET, 0x01, 7),
             (OP_NAMESET, 0x00, 4),
+            // The exec-context op's remaining case widths, each from one of
+            // the handler's own advance sites (`f_100b3a50`: six @100b3aa4 /
+            // @100b3b83 / via shared tail, two @100b3bd7 for the return case,
+            // eight @100b3c54 — section in this record).
+            (OP_REQRESET, 0x02, 6),
+            (OP_REQRESET, 0x03, 2),
+            (OP_REQRESET, 0x04, 8),
             (OP_SUBSCHED, 0x05, 18),
             (OP_STRINGOPS, 0x08, 23),
             (OP_STATUSSET, 0x04, 8),
+            // Pair-dispatcher widths (`f_100bb620`'s own advance tails at
+            // 100bb669/100bb6ea/100bb846, six/eight/ten).
+            (OP_PAIRDISPATCH_AE, 0x00, 6),
+            (OP_PAIRDISPATCH_AE, 0x02, 8),
+            (OP_PAIRDISPATCH_AE, 0x05, 10),
+            // Staged-record probe's running case (`f_100b7140`), width six.
+            (OP_STAGED_RECORD_PROBE_D3, 0x00, 6),
+            // Registry lookup advances on exactly three selectors: eight for
+            // zero's registry, ten for the two three-dword-entry ones.
+            (OP_REGISTRY_LOOKUP_BF, 0x00, 8),
+            (OP_REGISTRY_LOOKUP_BF, 0x20, 10),
+            (OP_REGISTRY_LOOKUP_BF, 0x40, 10),
+            // Mode-bits writer: width four on its live selectors.
+            (OP_MODE_BITS_WORK_WRITER_B1, 0x02, 4),
+            // Mover-bridge writer (`f_100afee0`): ten for selector zero's
+            // mover-slot case (@100aff5c) and eight for each of the four
+            // fetch-body cases (@100affbb…@100b00f8).
+            (OP_MOVER_BRIDGE_B7, 0x00, 10),
+            (OP_MOVER_BRIDGE_B7, 0x01, 8),
+            (OP_MOVER_BRIDGE_B7, 0x04, 8),
+            // Staged-block writer (`f_100bc060`): the advance register each
+            // case loads itself — six @100bc076, eight @100bc144/@100bc180,
+            // twelve @100bc21c; an above-ceiling selector reaches the shared
+            // tail (@100bc23d) with that register still six.
+            (OP_EVENT_DIR_WRITER_D8, 0x00, 6),
+            (OP_EVENT_DIR_WRITER_D8, 0x01, 8),
+            (OP_EVENT_DIR_WRITER_D8, 0x03, 8),
+            (OP_EVENT_DIR_WRITER_D8, 0x04, 12),
+            (OP_EVENT_DIR_WRITER_D8, 0x05, 6),
         ] {
             let mut data = vec![op, sub];
             data.extend(std::iter::repeat_n(0u8, width - 2));
@@ -5069,6 +7114,28 @@ mod tests {
                 width,
                 "op 0x{op:02X} sub 0x{sub:02X} advanced wrong size"
             );
+        }
+    }
+
+    /// The status-set family's case widths, each from one of the handler's own
+    /// advance-register sites (the `add word [exec+0x256], cx` tails at VA
+    /// 100bb1e1/100bb221 carry four, 100bb2b3 six, 100bb314 eight —
+    /// `.agents/skills/retail-observe/references/
+    /// 2026-10-28-event-opcode-no-skip-pass.md`); out-of-range subs reach the
+    /// same tail with its register zeroed, so they spin and kuluu's halt stands in.
+    #[test]
+    fn statusset_widths_answer_from_the_handlers_own_advance_sites() {
+        for (sub, width) in [(0x00u8, 4usize), (0x01, 4), (0x02, 6), (0x03, 6), (0x04, 8)] {
+            let mut data = vec![OP_STATUSSET, sub];
+            data.extend(std::iter::repeat_n(0u8, width - 2));
+            data.push(OP_END);
+            let mut e = vm(data, vec![]);
+            assert_eq!(
+                e.step(),
+                StepResult::Done,
+                "status-set sub {sub} should run to END"
+            );
+            assert_eq!(e.exec_pointer(), width, "status-set sub {sub} width");
         }
     }
 
@@ -5115,6 +7182,112 @@ mod tests {
     fn unknown_nonjump_opcode_skipped_by_size() {
         let mut e = vm(vec![0x30, 0x30, OP_END], vec![]);
         assert_eq!(e.step(), StepResult::Done);
+    }
+
+    /// Both work-slot triple selectors advance their single recorded width,
+    /// eight — the handler's two `add word [exec+0x256], 8` tails are the same
+    /// instruction path (@100bba60) for both bodies (`f_100bb9c0`).
+    #[test]
+    fn work_slot_triple_advances_eight_on_both_selectors() {
+        for sub in [0x00u8, 0x01] {
+            let mut data = vec![OP_WORK_SLOT_TRIPLE_READ_AF, sub];
+            data.extend(std::iter::repeat_n(0u8, 6));
+            data.push(OP_END);
+            let mut e = vm(data, vec![]);
+            assert_eq!(e.step(), StepResult::Done, "sub {sub} should run to END");
+            assert_eq!(e.exec_pointer(), 8, "sub {sub} width");
+        }
+    }
+
+    /// The staged-slot loader runs only when its resolved operand sits inside
+    /// that table: in range it takes seven (@100bc04b); negative or at-or-above
+    /// the entry count reaches the handler's no-advance exits (@100bc00c /
+    /// @100bc011) where retail spins — kuluu halts instead of walking past
+    /// (`f_100bc000`). The operand is authored as a reference-window word, the way
+    /// every sample in this corpus carries it (`C3 00 80 …`), so each case drives
+    /// the value through the block's References table rather than a literal.
+    #[test]
+    fn staged_slot_loader_halts_outside_its_index_table() {
+        let ref16 = |i: u32| ((i | crate::vm::REFERENCE_FLAG) as u16).to_le_bytes();
+        for resolved in [0i32, 7] {
+            let mut data = vec![OP_STAGED_SLOT_LOADER_C3];
+            data.extend(ref16(0));
+            data.extend(std::iter::repeat_n(0u8, 4));
+            data.push(OP_END);
+            let mut e = vm(data, vec![resolved as u32]);
+            assert_eq!(
+                e.step(),
+                StepResult::Done,
+                "resolved {resolved} sits inside the table and must run"
+            );
+            assert_eq!(e.exec_pointer(), 7, "in-range resolved width");
+        }
+        for resolved in [8i32, 90, -1] {
+            let mut data = vec![OP_STAGED_SLOT_LOADER_C3];
+            data.extend(ref16(0));
+            data.extend(std::iter::repeat_n(0u8, 4));
+            data.push(OP_END);
+            let mut e = vm(data, vec![resolved as u32]);
+            assert_eq!(
+                e.step(),
+                StepResult::Unimplemented(OP_STAGED_SLOT_LOADER_C3),
+                "resolved {resolved} sits outside the table and must halt"
+            );
+            assert_eq!(
+                e.exec_pointer(),
+                0,
+                "out-of-range resolved operand must not advance"
+            );
+        }
+    }
+
+    /// Opcodes 0x30 / 0xD9 / 0x9E are nothing but a store into a fixed client global plus their own
+    /// advance, so the pins are the cell's value and where the pointer lands. Retail widths: one for
+    /// 0x30 (`inc word ptr [ecx+0x256]`), two each for 0xD9/0x9E (`add word ptr [ecx+0x256], 2`).
+    /// Both predicates read the inline operand byte at +1 and store equality with zero, so a non-zero
+    /// operand has to clear the cell. For 0x30 only the width is pinnable from bytecode: its value is
+    /// a constant zero, and the engine-side writer that sets that byte to one (`f_100aed00`)
+    /// is not an opcode kuluu can reach.
+    #[test]
+    fn fixed_client_global_stores_write_their_cells_and_nothing_else() {
+        // Each program is the op plus its operands and OP_END; `step` runs to END, so the pointer
+        // lands on the END byte exactly when the width is right (index data.len()-1).
+        let mut e = vm(vec![OP_CLIENT_BYTE_10488100_ZERO, OP_END], vec![]);
+        assert_eq!(e.step(), StepResult::Done);
+        assert_eq!(
+            e.exec_pointer(),
+            1,
+            "0x30 advances one — the handler's own `inc word ptr [ecx+0x256]`"
+        );
+        assert!(!e.client_globals().byte_10488100);
+        assert!(e.take_cues().is_empty(), "no cue: this op only stores");
+
+        for operand in [0u8, 1, 255] {
+            let want = operand == 0;
+            let mut e = vm(
+                vec![OP_CLIENT_BYTE_10463924_OPERAND_IS_ZERO, operand, OP_END],
+                vec![],
+            );
+            assert_eq!(e.step(), StepResult::Done);
+            assert_eq!(
+                e.client_globals().byte_10463924,
+                want,
+                "0xD9 byte cell for operand {operand:#04x}"
+            );
+            assert_eq!(e.exec_pointer(), 2, "0xD9 advances two");
+
+            let mut e = vm(
+                vec![OP_CLIENT_DWORD_104898FC_OPERAND_IS_ZERO, operand, OP_END],
+                vec![],
+            );
+            assert_eq!(e.step(), StepResult::Done);
+            assert_eq!(
+                e.client_globals().dword_104898fc,
+                u32::from(want),
+                "0x9E dword cell for operand {operand:#04x} (ebx is pre-zeroed, so exactly 1 or 0)"
+            );
+            assert_eq!(e.exec_pointer(), 2, "0x9E advances two");
+        }
     }
 
     /// Armed at event start; `OP_CANCEL_DISARM` (event 503's second opcode)
@@ -5729,13 +7902,110 @@ mod tests {
         assert_eq!(e.step(), StepResult::Done, "the move is over");
     }
 
+    /// A CodeSMOVE stage issues the walk and its MoveTime budget: the poll
+    /// parks while a walk runs but advances when the budget expires even if
+    /// that walk never landed (retail counts the staged word down per pass, so
+    /// a capped hold lets later script beats race ahead of the body). A budget
+    /// staged at zero issues no move at all — retail's poll skips integration.
+    /// `.agents/skills/retail-observe/references/
+    /// 2026-10-28-event-opcode-no-skip-pass.md` mover section.
     #[test]
-    fn smove_stops_without_emitting_incomplete_motion() {
-        for mode in [0, 1, 2] {
-            let mut e = vm(vec![OP_SMOVE, mode], vec![]);
-            assert_eq!(e.step(), StepResult::Unimplemented(OP_SMOVE));
-            assert!(e.take_cues().is_empty());
+    fn smove_stage_arms_the_walk_and_its_move_time_budget() {
+        let mut data = vec![OP_SMOVE, 0x00];
+        for index in 0..4u8 {
+            data.extend_from_slice(&[index, 0x80]); // refs[0..4] goal x/y/z + budget
         }
+        let mut e = vm(data, vec![2000, 0, 1500, 45]);
+        assert_eq!(e.step(), StepResult::Done, "the stage lands on END");
+        assert_eq!(e.exec_pointer(), 10, "case 0 takes ten stream bytes");
+        assert_eq!(e.smove_budget_left, Some(45.0));
+        assert!(e
+            .take_cues()
+            .iter()
+            .any(|cue| matches!(cue, EventCue::ActorMove { .. })));
+    }
+
+    /// The poll parks on the running walk and takes its width when the budget
+    /// runs out mid-walk — expiry, not arrival, is what lets it pass.
+    #[test]
+    fn smove_poll_expires_mid_walk_at_the_move_time_budget() {
+        let mut data = vec![OP_SMOVE, 0x00];
+        for index in 0..4u8 {
+            data.extend_from_slice(&[index, 0x80]);
+        }
+        data.push(OP_SMOVE);
+        data.push(0x01);
+        data.push(OP_END);
+        let mut e = vm(data, vec![2000, 0, 1500, 45]);
+        assert_eq!(
+            e.step(),
+            StepResult::Waiting,
+            "stage then poll: the walk's budget hold parks the poll"
+        );
+        assert_eq!(e.exec_pointer(), 10);
+        let cues = e.take_cues();
+        assert!(cues
+            .iter()
+            .any(|cue| matches!(cue, EventCue::ActorRenderFlag { bit, .. } if
+                *bit == EventCue::ENTITY_WORD_124_BASE + MOVER_IN_FLIGHT_BIT_124)));
+        e.tick(46.0 / WAIT_UNITS_PER_SEC);
+        assert_eq!(
+            e.step(),
+            StepResult::Done,
+            "the budget expired mid-walk; the poll takes its two bytes anyway"
+        );
+        assert_eq!(e.exec_pointer(), 12);
+    }
+
+    /// A staged MoveTime of zero means retail's poll never integrates: kuluu
+    /// issues no walk and the poll steps straight through.
+    #[test]
+    fn smove_with_a_zero_move_time_stages_no_walk() {
+        let mut data = vec![OP_SMOVE, 0x00];
+        for index in 0..4u8 {
+            data.extend_from_slice(&[index, 0x80]);
+        }
+        data.push(OP_END);
+        let mut e = vm(data, vec![2000, 0, 1500, 0]);
+        assert_eq!(e.step(), StepResult::Done);
+        assert_eq!(e.exec_pointer(), 10, "END sits right after the stage");
+        assert!(e.smove_budget_left.is_none());
+        assert!(!e
+            .take_cues()
+            .iter()
+            .any(|cue| matches!(cue, EventCue::ActorMove { .. })));
+    }
+
+    /// The twin 0x5A CodeMOVE2: case 0 stages with no budget (width eight),
+    /// the poll holds on a host-armed walk hold and advances its two bytes
+    /// once released, and an unknown sub halts like retail's no-advance tail.
+    #[test]
+    fn codemove2_pair_parks_on_the_walk_and_halts_on_unknown_subs() {
+        let mut data = vec![OP_CODE_MOVE2, 0x00];
+        for index in 0..3u8 {
+            data.extend_from_slice(&[index, 0x80]); // goal x/y/z only
+        }
+        data.push(OP_END);
+        let mut e = vm(data.clone(), vec![2000, 500, 1500]);
+        assert_eq!(e.step(), StepResult::Done);
+        assert_eq!(e.exec_pointer(), 8, "case 0 takes eight stream bytes");
+        assert!(e.smove_budget_left.is_none(), "the twin stages no budget");
+
+        let mut e = vm(vec![OP_CODE_MOVE2, 0x01, OP_END], vec![]);
+        e.hold_move(ActorLookup::EVENT_ENTITY, 5.0);
+        assert_eq!(e.step(), StepResult::Waiting, "the move is running");
+        assert_eq!(e.exec_pointer(), 0);
+        e.tick(6.0 / WAIT_UNITS_PER_SEC);
+        assert_eq!(e.step(), StepResult::Done, "the walk landed; advance two");
+        assert_eq!(e.exec_pointer(), 2);
+
+        let mut e = vm(vec![OP_CODE_MOVE2, 0x09, OP_END], vec![]);
+        assert_eq!(e.step(), StepResult::Unimplemented(OP_CODE_MOVE2));
+        assert_eq!(
+            e.exec_pointer(),
+            0,
+            "retail advances nothing on unknown subs"
+        );
     }
 
     /// 0x72 mode 0 kicks off the forecast read: it advances past itself and
@@ -5908,17 +8178,146 @@ mod tests {
         assert!(e.take_cues().is_empty());
     }
 
+    /// The trio's shared eligibility gate (all three retail thunks): an actor
+    /// the VM cannot resolve is passed over silently — no cue, no park, the
+    /// opcode's own size spent.
     #[test]
-    fn unsupported_event_emotes_preserve_baseline_skip() {
-        for op in [OP_EMOT, OP_PLAYANIM, OP_ANIMWAIT] {
+    fn emote_trio_passes_over_unresolvable_actors() {
+        let unresolved = 0x7FFF_FFFFu32; // never in the type table, never self
+        for op in [OP_EMOT, OP_ANIMWAIT] {
             let size = OPCODE_META[op as usize].size as usize;
             let mut data = vec![op];
+            data.extend_from_slice(&unresolved.to_le_bytes());
             data.resize(size, 0);
             data.push(OP_END);
             let mut event = vm(data, vec![]);
-            assert_eq!(event.step(), StepResult::Done);
+            assert_eq!(event.step(), StepResult::Done, "op 0x{op:02X}");
             assert!(event.take_cues().is_empty());
         }
+        // 0x63's owner is the running scene; with no scene there is no owner,
+        // retail's null-`[event+2]` path.
+        let mut data = vec![OP_PLAYANIM, 0, 0, OP_END];
+        let mut event = vm(data.clone(), vec![]);
+        assert_eq!(event.step(), StepResult::Done);
+        assert!(event.take_cues().is_empty());
+        // With a scene it still consumes exactly its three bytes.
+        let dat = std::sync::Arc::new(ffxi_dat::event_dat::EventDat { blocks: vec![] });
+        data.remove(3); // drop the END so exec can be read back at 3
+        let mut event = vm(data, vec![]);
+        event.attach_scene(
+            dat,
+            ffxi_dat::event_dat::ZONE_PLAYER_ACTOR,
+            crate::vm::scene::EventPosition::default(),
+        );
+        assert_eq!(event.step(), StepResult::Done);
+        assert_eq!(event.exec_pointer(), 3);
+    }
+
+    /// A free actor's 0x6E becomes the emote cue kuluu already routes to its
+    /// live motion pipeline (kuluu-session/src/event_dialog.rs), with retail's
+    /// id/argument split: low byte the emote id, high byte the argument. The
+    /// Bastok rental thread's `0x80F6`/`0x80FD` operands ride this path; ids
+    /// ffxi-vocab does not name play nothing there, exactly as retail's own
+    /// table-lookup refusal paths pass those ids over.
+    #[test]
+    fn emote_on_free_actor_emits_the_cue_and_occupies_the_action_slot() {
+        let mut operands = ActorLookup::EVENT_ENTITY.0.to_le_bytes().to_vec();
+        // The id/argument word sits at +5/+6, right past the 4-byte selector.
+        operands.extend_from_slice(&[0xF6, 0x80]); // rental-style operand 0x80F6
+        let cues = cues_of(OP_EMOT, &operands, vec![]);
+        assert_eq!(
+            cues.as_slice(),
+            &[EventCue::Emote {
+                actor: ActorLookup::EVENT_ENTITY,
+                emote_id: 246,
+                param: 128,
+            }][..]
+        );
+    }
+
+    /// Retail's busy gate on 0x6E (`[actor+0x1BC] != 0` parks without replacing
+    /// the running action — the exact regression `unsupported_event_emotes_
+    /// preserve_baseline_skip` used to protect by skipping the opcode): here a
+    /// pending renderer-report hold on the actor, armed the way kuluu-session
+    /// arms every SCHEDULOR motion.
+    #[test]
+    fn emote_parks_while_its_actor_carries_an_action() {
+        let mut data = vec![OP_EMOT];
+        data.extend_from_slice(&ActorLookup::LOCAL_PLAYER.0.to_le_bytes());
+        data.extend_from_slice(&[0x2C, 0]); // id 44 (wave), param 0, at +5/+6
+        data.push(OP_END);
+        let mut e = vm(data, vec![]);
+        e.hold_action_pending(ActorLookup::LOCAL_PLAYER, *b"sit0");
+        assert_eq!(e.step(), StepResult::Waiting);
+        assert_eq!(
+            e.exec_pointer(),
+            0,
+            "the running action is not replaced and the opcode does not advance"
+        );
+        assert!(e.take_cues().is_empty());
+        // The renderer's finish report releases the gate.
+        e.release_action_hold(ActorLookup::LOCAL_PLAYER, *b"sit0");
+        assert_eq!(e.step(), StepResult::Done);
+    }
+
+    /// 0x99 is retail's per-actor action-byte wait (the 2026-10-02 census: not
+    /// a routine-specific timer): it parks while any hold on that actor runs,
+    /// advances the moment the renderer's report releases it, and never waits
+    /// on another actor's business.
+    #[test]
+    fn animwait_parks_on_the_actor_and_only_the_actor() {
+        let mut data = vec![OP_ANIMWAIT];
+        data.extend_from_slice(&ActorLookup::LOCAL_PLAYER.0.to_le_bytes());
+        data.push(OP_END);
+        let mut e = vm(data, vec![]);
+        assert_eq!(e.step(), StepResult::Done, "nothing armed falls through");
+
+        let mut data = vec![OP_ANIMWAIT];
+        data.extend_from_slice(&ActorLookup::LOCAL_PLAYER.0.to_le_bytes());
+        data.push(OP_END);
+        let mut e = vm(data, vec![]);
+        e.hold_action_pending(ActorLookup(NPC_SERVER_ID), *b"sit0");
+        assert_eq!(
+            e.step(),
+            StepResult::Done,
+            "another actor's action is not this one's gate"
+        );
+
+        let mut data = vec![OP_ANIMWAIT];
+        data.extend_from_slice(&ActorLookup::LOCAL_PLAYER.0.to_le_bytes());
+        data.push(OP_END);
+        let mut e = vm(data, vec![]);
+        e.hold_action_pending(ActorLookup::LOCAL_PLAYER, *b"s007");
+        assert_eq!(e.step(), StepResult::Waiting);
+        assert_eq!(e.exec_pointer(), 0);
+        assert!(e.is_waiting(), "the host keeps ticking the pending hold");
+        e.release_action_hold(ActorLookup::LOCAL_PLAYER, *b"s007");
+        assert_eq!(e.step(), StepResult::Done);
+    }
+
+    /// The Bastok rental thread's shape — `6E id; 99` back to back on one NPC:
+    /// the emote's own mark holds the following wait inside the pass, and once
+    /// the host has drained cues (and kuluu has no motion length to arm) the
+    /// next pass runs through. Retail's wait there is one NPC animation long;
+    /// for ids with no decoded content that is the deepest faithful kuluu can
+    /// be without inventing a duration — and bounded, never a hang.
+    #[test]
+    fn rental_emote_then_animwait_spans_one_pass() {
+        let mut data = vec![OP_EMOT];
+        data.extend_from_slice(&ActorLookup::LOCAL_PLAYER.0.to_le_bytes());
+        data.extend_from_slice(&[0xF6, 0x80]); // the rental operand at +5/+6
+        data.push(OP_ANIMWAIT);
+        data.extend_from_slice(&ActorLookup::LOCAL_PLAYER.0.to_le_bytes());
+        data.push(OP_END);
+        let mut e = vm(data, vec![]);
+        assert_eq!(e.step(), StepResult::Waiting, "the wait sees the mark");
+        assert_eq!(
+            e.exec_pointer(),
+            7,
+            "parked at the ANIMWAIT itself (right past the 7-byte EMOT)"
+        );
+        assert_eq!(e.take_cues().len(), 1, "the emote cue reached the host");
+        assert_eq!(e.step(), StepResult::Done);
     }
 
     /// 0x2C's third operand is an ASCII action key, not a numeric id
@@ -6316,26 +8715,180 @@ mod tests {
         );
     }
 
+    /// 0x69's inline flag reads zero for exactly full volume and non-zero for
+    /// exactly silence; the mask is the low byte of its work operand
+    /// (`.agents/skills/retail-observe/references/
+    /// 2026-10-28-event-opcode-no-skip-pass.md`).
     #[test]
-    fn partial_presentation_opcodes_keep_baseline_skip_without_effects() {
-        for op in [
-            OP_SET_SOUND_VOLUME,
-            OP_CHANGE_SOUND_VOLUME,
-            OP_OPEN_MAP_PROPS,
-            OP_MAP_ADD_MARK,
-        ] {
-            let size = OPCODE_META[op as usize].size as usize;
-            let mut program = vec![op];
-            program.resize(size, 0);
-            program.push(OP_END);
-            let mut event = vm(program, vec![]);
-            assert_eq!(event.step(), StepResult::Done);
-            assert_eq!(event.exec_pointer(), size);
-            assert!(
-                event.take_cues().is_empty(),
-                "partial opcode {op:#x} emitted an effect"
-            );
+    fn set_sound_volume_publishes_mask_and_full_or_silence() {
+        // Authored records look like `69 01 | 4F 80`: the flag byte, then one
+        // reference-selector word (`--sample 0x69`).
+        assert_eq!(
+            cues_of(OP_SET_SOUND_VOLUME, &[0x00, 0x01, 0x80], vec![0, 34]),
+            [EventCue::SoundVolumeSet {
+                mask: 34,
+                enabled: true
+            }]
+        );
+        assert_eq!(
+            cues_of(OP_SET_SOUND_VOLUME, &[0x02, 0x01, 0x80], vec![0, 1]),
+            [EventCue::SoundVolumeSet {
+                mask: 1,
+                enabled: false
+            }]
+        );
+    }
+
+    /// 0x6A carries its per-mille target first and the channel mask last; the
+    /// mixer-side second operand stays unread and uncued (record Not established).
+    /// Its seven bytes are the opcode plus three consecutive words: retail reads
+    /// `+1`, `+3` and `+5` through its operand helper, and the corpus's authored
+    /// records carry selector triples at exactly those slots (`--sample 0x6A`).
+    #[test]
+    fn change_sound_volume_carries_the_permille_target_and_mask() {
+        assert_eq!(
+            cues_of(
+                OP_CHANGE_SOUND_VOLUME,
+                &[0x00, 0x80, 0x01, 0x80, 0x02, 0x80],
+                vec![750, 44, 2]
+            ),
+            [EventCue::SoundVolumeChange {
+                mask: 2,
+                volume_thousandths: 750
+            }]
+        );
+    }
+
+    /// 0x8D passes both window-helper words through untouched.
+    #[test]
+    fn open_map_props_carries_select_and_value() {
+        assert_eq!(
+            cues_of(OP_OPEN_MAP_PROPS, &[0x00, 0x80, 0x01, 0x80], vec![7, 1]),
+            [EventCue::MapPropsState {
+                select: 7,
+                value: 1
+            }]
+        );
+    }
+
+    /// The marked variant (0xB8) rides the plain marker cue through the shared
+    /// builder, reading its shifted slots: one helper-only word between id and
+    /// coordinates pushes x/y/name two bytes over the plain opcode's — authored
+    /// records carry exactly five words before the inline name (`--sample 0x8B,
+    /// 0xB8`: four consecutive selectors there, six for the marked form).
+    #[test]
+    fn marked_map_opcode_rides_the_marker_cue_with_shifted_operands() {
+        let mut ops = vec![OP_MAP_ADD_MARK];
+        for sel in [0x8001u16, 0x8003, 0x0007, 0x8005, 0x8007] {
+            ops.extend_from_slice(&sel.to_le_bytes());
         }
+        let mut name = [0u8; 16];
+        name[..10].copy_from_slice(b"sandy_warp");
+        ops.extend_from_slice(&name);
+        assert_eq!(
+            cues_of(
+                OP_MAP_ADD_MARK,
+                &ops[1..],
+                // Words sit at +1 (id), +3 and +5 (helper-only), +7 (x), +9 (y).
+                vec![0, 4, 0, 0, 0, (-5000i32) as u32, 0, (-363i32) as u32]
+            ),
+            [EventCue::MapMarker {
+                map_id: 4,
+                x_milli: -5000,
+                y_milli: -363,
+                name: *b"sandy warp\0\0\0\0\0\0",
+            }]
+        );
+    }
+
+    /// The three per-actor flag writes publish the image bit index and the
+    /// target state; no invented semantics rides along (record delta).
+    #[test]
+    fn actor_flag_write_opcodes_publish_image_bit_indices() {
+        let mut program = vec![OP_ACTOR_FLAGS_WORD_BIT16_TOGGLE, 0x01];
+        program.extend_from_slice(&NPC_SERVER_ID.to_le_bytes());
+        assert_eq!(
+            cues_of(OP_ACTOR_FLAGS_WORD_BIT16_TOGGLE, &program[1..], vec![]),
+            [EventCue::ActorRenderFlag {
+                actor: ActorLookup(NPC_SERVER_ID),
+                bit: 16,
+                value: true
+            }]
+        );
+        let mut program = vec![OP_ACTOR_FLAGS_WORD_BIT17_TOGGLE, 0x02];
+        program.extend_from_slice(&NPC_SERVER_ID.to_le_bytes());
+        assert_eq!(
+            cues_of(OP_ACTOR_FLAGS_WORD_BIT17_TOGGLE, &program[1..], vec![]),
+            [EventCue::ActorRenderFlag {
+                actor: ActorLookup(NPC_SERVER_ID),
+                bit: 17,
+                value: false // only the operand's low bit is read (record)
+            }]
+        );
+        let mut program = vec![OP_VISUAL_RENDER_BYTE, 0x01];
+        program.extend_from_slice(&NPC_SERVER_ID.to_le_bytes());
+        assert_eq!(
+            cues_of(OP_VISUAL_RENDER_BYTE, &program[1..], vec![]),
+            [EventCue::ActorRenderFlag {
+                actor: ActorLookup(NPC_SERVER_ID),
+                bit: EventCue::RENDER_FLAG_VISUAL_BYTE,
+                value: true
+            }]
+        );
+    }
+
+    /// 0x34 holds two passes exactly like retail's counter machine, then reloads
+    /// (work-named id) and advances; the counter re-arms for a second run —
+    /// retail zeroes its global on the terminal pass too
+    /// (`.agents/skills/retail-observe/references/
+    /// 2026-10-28-event-opcode-no-skip-pass.md`).
+    #[test]
+    fn mapload_holds_two_passes_then_reloads_once_and_rearms() {
+        let mut e = vm(
+            vec![
+                OP_MAPLOAD, REF0[0], REF0[1], OP_MAPLOAD, REF0[0], REF0[1], OP_END,
+            ],
+            vec![5],
+        );
+        assert_eq!(e.step(), StepResult::Waiting);
+        assert!(e.take_cues().is_empty());
+        assert_eq!(e.step(), StepResult::Waiting);
+        assert!(e.take_cues().is_empty());
+        // Third pass reloads and runs on into the second occurrence's first hold.
+        assert_eq!(e.step(), StepResult::Waiting);
+        assert_eq!(
+            e.take_cues(),
+            [EventCue::MapReload { map_id: 5 }],
+            "the reload cue lands on the pass that advances"
+        );
+        // The second run holds twice again before it reloads.
+        assert_eq!(e.step(), StepResult::Waiting);
+        assert!(e.take_cues().is_empty());
+        let final_step = e.step();
+        assert!(
+            matches!(final_step, StepResult::Done),
+            "the second run finishes: {final_step:?}"
+        );
+        assert_eq!(
+            e.take_cues(),
+            [EventCue::MapReload { map_id: 5 }],
+            "re-armed counter reloads again"
+        );
+    }
+
+    /// 0x9A yields exactly one pass — never zero (retail holds at least once
+    /// while its read runs, the usual case after MUSIC) and never a hang.
+    #[test]
+    fn musicreadwait_yields_exactly_one_pass() {
+        let mut e = vm(vec![OP_MUSICREADWAIT, OP_END], vec![]);
+        assert_eq!(e.step(), StepResult::Waiting);
+        assert_eq!(e.exec_pointer(), 0, "a held pass must not advance");
+        assert_eq!(e.step(), StepResult::Done);
+        // A second occurrence yields on its own too.
+        let mut e = vm(vec![OP_MUSICREADWAIT, OP_MUSICREADWAIT, OP_END], vec![]);
+        assert_eq!(e.step(), StepResult::Waiting);
+        assert_eq!(e.step(), StepResult::Waiting);
+        assert_eq!(e.step(), StepResult::Done);
     }
 
     /// `OP_DEFCAMERA` case 1 takes the camera, case 0 gives it back; case 2
@@ -6507,11 +9060,16 @@ mod tests {
             cues_of(OP_DOOR_CLOSE, &[], vec![]),
             door(STATUS_EVENT_DOOR_CLOSE)
         );
-        for op in [OP_DOOR_OPEN2, OP_DOOR_CLOSE2] {
-            let mut e = vm(vec![op, OP_END], vec![]);
-            assert_eq!(e.step(), StepResult::Done);
-            assert!(e.take_cues().is_empty());
-        }
+        // The second pair writes the second door statuses (the 2026-10-28
+        // event opcode no-skip-pass record; these were baseline skips before).
+        assert_eq!(
+            cues_of(OP_DOOR_OPEN2, &[], vec![]),
+            door(STATUS_EVENT_DOOR_OPEN2)
+        );
+        assert_eq!(
+            cues_of(OP_DOOR_CLOSE2, &[], vec![]),
+            door(STATUS_EVENT_DOOR_CLOSE2)
+        );
         assert_eq!(
             cues_of(OP_STATUS_EVENT, &REF1, vec![0, 3]),
             door(STATUS_EVENT_MOTION_BASE as u8 + 3)
@@ -7691,6 +10249,133 @@ mod tests {
             [crate::vm::scene::SceneAction::PlayerPosition(authored)]
         );
         assert_eq!(e.controlled_position(), Some(authored));
+    }
+
+    /// The zone-player block's closing `1E` of thread 17 in the Bastok Mines
+    /// chocobo rental: after the walk legs end, LOOK_AND_TALK pins the player facing
+    /// the chocobo NPC. The facing lands on the tracked position as one PlayerPosition
+    /// action (same publish half `OP_SET_FACING` does), so the visible body turns there and
+    /// the c2s POS carries it; before this the authored facing went nowhere for the player.
+    #[test]
+    fn look_and_talk_in_a_zone_player_block_faces_the_player_at_the_target() {
+        let mut data = vec![0x1E];
+        data.extend_from_slice(&NPC_SERVER_ID.to_le_bytes());
+        data.push(OP_END);
+        // The steer is the walk-leg bearing (-dz).atan2(dx) in 4096ths of a turn: due event
+        // south (dz = +1000) reads as exactly -1024, so a clean quadrant pins the formula.
+        let mut e = scene_player_vm(
+            data,
+            vec![],
+            crate::vm::scene::EventPosition {
+                x: 43_855,
+                y: 750,
+                z: -108_883,
+                heading: 0,
+            },
+        );
+        e.set_entity_positions(&std::collections::HashMap::from([(
+            NPC_SERVER_ID,
+            crate::vm::scene::EventPosition {
+                x: 43_855,
+                y: 750,
+                z: -107_883,
+                heading: 0,
+            },
+        )]));
+        assert_eq!(e.step(), StepResult::Done);
+        let actions = e.take_scene_actions();
+        assert_eq!(
+            actions.len(),
+            1,
+            "the authored facing publishes exactly one position"
+        );
+        let crate::vm::scene::SceneAction::PlayerPosition(faced) = actions[0] else {
+            panic!("expected a PlayerPosition scene action: {actions:?}");
+        };
+        assert_eq!(
+            faced.heading, -1024,
+            "due event south on the walk-leg formula"
+        );
+        assert_eq!((faced.x, faced.y, faced.z), (43_855, 750, -108_883));
+        // The cue still rides out; `take_cues` resolves the event-entity selector to the
+        // scene owner (vm.rs take_cues), which is the local player here - tonight's live
+        // Bastok artifact shows this same cue as actor=LocalPlayer.
+        let cues = e.take_cues();
+        assert!(matches!(
+            cues.as_slice(),
+            [EventCue::ActorLookAt { actor, target, .. }]
+                if actor.is_local_player() && target.server_id() == Some(NPC_SERVER_ID)
+        ));
+    }
+
+    /// 0x79 case 0 with the local-player selector turns the player too: due event north
+    /// (dz = -1000) reads as +1024 on the same formula, and the turn composes on top of a
+    /// sibling's earlier snap because it is read from the shared cell.
+    #[test]
+    fn lookat_on_the_local_player_selector_faces_the_tracked_position() {
+        let mut data = vec![0x79, 0x00];
+        data.extend_from_slice(&ffxi_dat::event_dat::ZONE_PLAYER_ACTOR.to_le_bytes());
+        data.extend_from_slice(&NPC_SERVER_ID.to_le_bytes());
+        data.push(OP_END);
+        let mut e = scene_player_vm(
+            data,
+            vec![],
+            crate::vm::scene::EventPosition {
+                x: 10_000,
+                y: 0,
+                z: -20_000,
+                heading: 40,
+            },
+        );
+        e.set_entity_positions(&std::collections::HashMap::from([(
+            NPC_SERVER_ID,
+            crate::vm::scene::EventPosition {
+                x: 10_000,
+                y: 0,
+                z: -21_000,
+                heading: 0,
+            },
+        )]));
+        assert_eq!(e.step(), StepResult::Done);
+        let actions = e.take_scene_actions();
+        let [crate::vm::scene::SceneAction::PlayerPosition(faced)] = &actions[..] else {
+            panic!("expected exactly one PlayerPosition scene action: {actions:?}");
+        };
+        assert_eq!(
+            faced.heading, 1024,
+            "due event north on the walk-leg formula"
+        );
+    }
+
+    /// An NPC block's `1E` keeps its old shape: a cue only. The local-player facing half is
+    /// scoped to scenes that own the player, so an NPC turning toward someone cannot leak a
+    /// position write for the player.
+    #[test]
+    fn look_and_talk_in_an_npc_block_stays_a_cue() {
+        let mut data = vec![0x1E];
+        data.extend_from_slice(&ffxi_dat::event_dat::ZONE_PLAYER_ACTOR.to_le_bytes());
+        data.push(OP_END);
+        let block = block(data.clone(), vec![]);
+        let mut e = EventVm::start(&block, 7, 5, vec![]).unwrap();
+        e.attach_scene(
+            std::sync::Arc::new(ffxi_dat::event_dat::EventDat {
+                blocks: vec![block],
+            }),
+            NPC_SERVER_ID,
+            crate::vm::scene::EventPosition::default(),
+        );
+        assert_eq!(e.step(), StepResult::Done);
+        assert!(
+            e.take_scene_actions().is_empty(),
+            "an NPC-owned scene must not publish player positions"
+        );
+        // The cue resolves its event-entity actor to this block's NPC owner, exactly as the
+        // live streams show for the rental Chocobo NPC.
+        assert!(matches!(
+            e.take_cues().as_slice(),
+            [EventCue::ActorLookAt { actor, target, .. }]
+                if actor.server_id() == Some(NPC_SERVER_ID) && target.is_local_player()
+        ));
     }
 
     /// 0x37 on the player moves the shared local-player cell every sibling VM

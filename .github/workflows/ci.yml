@@ -50,6 +50,9 @@ jobs:
       - run: scripts/checks.sh comments
       - run: scripts/checks.sh literals
       - run: scripts/checks.sh records
+      # The opcode effect table is derived from the decompiled handlers; this fails if a row written off
+      # as having no retail effect turns out to store or call, or if the committed artifact drifted.
+      - run: scripts/checks.sh opcode-table
       # No toolchain step on purpose: the workspace manifest needs the pinned nightly
       # (unstable codegen-backend), so stable cargo cannot parse Cargo.toml. Like every other
       # job here, rustup installs the channel from rust-toolchain.toml.

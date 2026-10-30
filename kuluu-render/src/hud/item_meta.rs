@@ -1,4 +1,4 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+use web_time::{SystemTime, UNIX_EPOCH};
 
 use kuluu_snapshot::{InventoryItem, SceneSnapshot};
 
@@ -153,6 +153,7 @@ mod tests {
             next_use_vana_ts: next_use,
             use_delay_end_vana_ts: use_delay_end,
             ready,
+            extdata: None,
         }
     }
 
@@ -225,6 +226,8 @@ mod tests {
             next_use_vana_ts: Some(0),
             use_delay_end_vana_ts: Some(0),
             ready: Some(true),
+
+            extdata: None,
         };
         let cooling = InventoryItem {
             container: 0,

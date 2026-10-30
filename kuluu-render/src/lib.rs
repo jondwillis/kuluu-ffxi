@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 #![allow(clippy::type_complexity, clippy::too_many_arguments)]
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -56,6 +57,9 @@ pub mod look_resolver;
 pub mod minimap;
 pub mod moon_material;
 pub mod mouse;
+pub mod myroom_arrange;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod myroom_furniture;
 pub mod nameplate;
 pub mod nameplate_billboard;
 pub mod nameplate_color;
@@ -111,10 +115,10 @@ pub mod zone_texture;
 
 pub use camera::{
     camera_transition_system, chase_camera_system, configure_gizmo_render_layer,
-    first_person_eye_y, firstperson_camera_system, heading_for_yaw, nameplate_anchor,
-    self_visibility_for_camera_mode_system, spawn_camera, third_person_anchor_y,
-    toggle_camera_mode, yaw_for_heading, CameraMode, CameraTransition, ChaseCamera, OperatorCamera,
-    ViewFov, WheelZoom, ZoomArm, WORLD_GIZMO_LAYER,
+    first_person_eye_y, firstperson_camera_system, heading_change_term_rad, heading_for_yaw,
+    nameplate_anchor, self_visibility_for_camera_mode_system, spawn_camera, third_person_anchor_y,
+    toggle_camera_mode, yaw_for_heading, BodyFacingReference, CameraMode, CameraTransition,
+    ChaseCamera, OperatorCamera, ViewFov, WheelZoom, ZoomArm, WORLD_GIZMO_LAYER,
 };
 pub use components::{
     CurrRenderPos, EntityModel, HpIndicator, InGameEntity, IsSelf, LookComp, Nameplate,
@@ -205,6 +209,12 @@ impl<S: SceneSource + Resource + Component<Mutability = bevy::ecs::component::Mu
         app.add_plugins((dat_mmb::DatOverlayPlugin, transport::TransportPlugin));
 
         #[cfg(not(target_arch = "wasm32"))]
+        app.add_plugins((
+            myroom_furniture::MyroomFurniturePlugin,
+            myroom_arrange::systems::MyroomArrangePlugin,
+        ));
+
+        #[cfg(not(target_arch = "wasm32"))]
         app.add_plugins(audio::AudioPlugin);
 
         app.add_plugins(weather::WeatherPlugin);
@@ -212,7 +222,6 @@ impl<S: SceneSource + Resource + Component<Mutability = bevy::ecs::component::Mu
         #[cfg(not(target_arch = "wasm32"))]
         app.add_plugins(minimap::MinimapPlugin);
 
-        #[cfg(not(target_arch = "wasm32"))]
         app.add_plugins(ui_element_atlas::UiElementAtlasPlugin);
 
         #[cfg(not(target_arch = "wasm32"))]
@@ -306,12 +315,15 @@ impl<S: SceneSource + Resource + Component<Mutability = bevy::ecs::component::Mu
             .init_resource::<nameplate_billboard::BillboardFont>()
             .init_resource::<nameplate_billboard::NameplateBillboardDebug>()
             .init_resource::<ui_font::UiFont>()
+            .init_resource::<ui_font::UiFontItalic>()
             .add_plugins(nameplate_color::NameColorPlugin)
             .add_plugins(nameplate_icons::NameplateIconsPlugin)
             .add_plugins(PickingPlugin)
             .add_plugins(CursorPlugin)
             .add_message::<ToastEvent>()
-            .add_systems(Startup, ui_font::load_ui_font)
+            // In Startup: a `TextFont` that names a handle (the Status caption's oblique)
+            // needs the asset registered before the HUD spawns.
+            .add_systems(Startup, ui_font::load_ui_fonts)
             .add_systems(Update, ui_font::apply_ui_font)
             .add_systems(PreUpdate, ingest_system::<S>.run_if(resource_exists::<S>))
             .add_systems(PostUpdate, drain_toast_events)
@@ -467,6 +479,14 @@ impl<S: SceneSource + Resource + Component<Mutability = bevy::ecs::component::Mu
             scene::pin_mount_actors_system
                 .after(combat_stance::predict_entities_system)
                 .after(scene::self_visual_yaw_system),
+        );
+        // The departing mount stands free of the pin (its own last spot) and plays its
+        // authored get-off gallop; it only needs to run after the pose pass that advances
+        // the one-shot chain so `done` lands the frame the windows end.
+        #[cfg(not(target_arch = "wasm32"))]
+        app.add_systems(
+            Update,
+            scene::drive_mount_departure_system.after(scene::pin_mount_actors_system),
         );
         #[cfg(not(target_arch = "wasm32"))]
         app.add_systems(

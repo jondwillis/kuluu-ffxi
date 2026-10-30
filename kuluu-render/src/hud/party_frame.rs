@@ -18,6 +18,8 @@
 //! vendor/server/src/map/packets/s2c/0x0dd_group_list.cpp), Res<Target>,
 //! NameColorTable, ZoneNameResolver.
 
+use bevy::picking::events::PointerPress;
+use bevy::picking::hover::Hovered;
 use bevy::prelude::*;
 
 use crate::hud::panel_column::ColumnPanel;
@@ -522,7 +524,7 @@ fn spawn_ui_settings_panel(mut commands: Commands) {
             for key in rows {
                 p.spawn((
                     UiSettingsRow { key },
-                    Interaction::None,
+                    Hovered::default(),
                     Text::new(setting_label(key, &PartyFrameSettings::default())),
                     style::text_font(12.0),
                     TextColor(theme::TEXT),
@@ -967,7 +969,7 @@ fn spawn_row_l1(
             ..default()
         },
         PartyRowTarget(m.id),
-        Interaction::None,
+        Hovered::default(),
     ));
     if s.selection_box && is_target {
         row.insert((BackgroundColor(TARGET_BG), BorderColor::all(TARGET_BORDER)));
@@ -1128,7 +1130,7 @@ fn spawn_row_l2(
             ..default()
         },
         PartyRowTarget(m.id),
-        Interaction::None,
+        Hovered::default(),
     ));
     if s.selection_box && is_target {
         row.insert((BackgroundColor(TARGET_BG), BorderColor::all(TARGET_BORDER)));
@@ -1369,12 +1371,14 @@ fn short_zone(zone_no: u16, resolver: Option<&crate::hud::zone_flash::ZoneNameRe
 /// Clicking a member row targets that entity — same path as world picking.
 /// Settings rows carry no PartyRowTarget, so no filter is needed here.
 pub fn party_row_click_system(
-    mut q: Query<(&mut Interaction, &PartyRowTarget)>,
+    q: Query<&PartyRowTarget>,
     mut target: ResMut<Target>,
+    mut presses: MessageReader<PointerPress>,
+    parents: Query<&ChildOf>,
 ) {
-    for (mut interaction, row_target) in q.iter_mut() {
-        if *interaction == Interaction::Pressed {
-            *interaction = Interaction::None;
+    let pressed_rows = super::primary_pressed_rows(&mut presses, &q, &parents);
+    for row_target in pressed_rows {
+        {
             target.id = Some(row_target.0);
         }
     }
@@ -1411,12 +1415,14 @@ pub fn update_ui_settings_system(
 
 /// Click a settings row: cycle/toggle the value.
 pub fn ui_settings_click_system(
-    mut q: Query<(&mut Interaction, &UiSettingsRow)>,
+    q: Query<&UiSettingsRow>,
     mut settings: ResMut<PartyFrameSettings>,
+    mut presses: MessageReader<PointerPress>,
+    parents: Query<&ChildOf>,
 ) {
-    for (mut interaction, row) in q.iter_mut() {
-        if *interaction == Interaction::Pressed {
-            *interaction = Interaction::None;
+    let pressed_rows = super::primary_pressed_rows(&mut presses, &q, &parents);
+    for row in pressed_rows {
+        {
             cycle_setting(row.key, &mut settings);
         }
     }

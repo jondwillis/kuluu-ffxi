@@ -162,6 +162,7 @@ mod tests {
             .init_resource::<SceneState>()
             .init_resource::<CameraMode>()
             .init_resource::<ChaseCamera>()
+            .init_resource::<crate::BodyFacingReference>()
             .init_resource::<ViewFov>()
             .insert_resource(MinimapHoverGate { hovered })
             .insert_resource(MousePointer {

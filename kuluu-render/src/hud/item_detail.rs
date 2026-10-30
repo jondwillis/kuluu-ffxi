@@ -150,15 +150,31 @@ fn format_races(races_mask: u16) -> String {
     }
 }
 
-#[derive(Resource, Debug, Clone, Copy)]
+/// Which order the item list uses while auto-sort is on. The Gameplay Config page offers exactly
+/// this pair (`conf2win` rows id 10/11): "Sort items by category when organizing them." (store
+/// `CONFIG_STORE_SORT_KEY` := 0) and "Sort items by name when organizing them and stacking them
+/// when possible." (= 1).
+#[derive(Resource, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SortKey {
+    #[default]
+    Category,
+    Name,
+}
+
+#[derive(Resource, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SortOptions {
     pub auto: bool,
+    /// The order the sorted list uses; retail's own choice lives in the sort-key store.
+    pub key: SortKey,
 }
 
 impl Default for SortOptions {
     fn default() -> Self {
         // Retail defaults the Items window to auto-sort on.
-        Self { auto: true }
+        Self {
+            auto: true,
+            key: SortKey::default(),
+        }
     }
 }
 
@@ -227,6 +243,32 @@ impl SortOptions {
         } else {
             SortOptionId::Manual
         }
+    }
+}
+
+/// `CONFIG_STORE_SORT_KEY` value meaning "by name"; the other arm of the pair writes 0.
+pub const CONFIG_VALUE_SORT_BY_NAME: i32 = 1;
+
+/// The auto-sort pair's meaning: the row whose DAT help reads "Automatically sort items as they
+/// enter your inventory." is the arm writing **1** (`CONF2WIN_ROW_ARMS` rows id 8/9).
+pub fn auto_sort_on_for_store(value: i32) -> bool {
+    value != 0
+}
+
+/// The order a `CONFIG_STORE_SORT_KEY` value selects.
+pub fn sort_key_for_store(value: i32) -> SortKey {
+    if value == CONFIG_VALUE_SORT_BY_NAME {
+        SortKey::Name
+    } else {
+        SortKey::Category
+    }
+}
+
+/// The store value kuluu writes back for an order choice.
+pub fn store_value_for_sort_key(key: SortKey) -> i32 {
+    match key {
+        SortKey::Category => 0,
+        SortKey::Name => CONFIG_VALUE_SORT_BY_NAME,
     }
 }
 
@@ -383,6 +425,65 @@ pub fn auto_consolidate_inventory_system(
     });
 }
 
+/// Read the Gameplay page's two inventory-sort stores into [`SortOptions`]. A store neither menu
+/// has written yet is left at kuluu's default rather than guessed.
+pub fn sync_inventory_sort_options_system(
+    menu: Option<Res<crate::hud::menu::DynamicMenu>>,
+    mut sort: ResMut<SortOptions>,
+) {
+    let Some(menu) = menu else { return };
+    if !menu.is_changed() && !sort.is_added() {
+        return;
+    }
+    let mut next = *sort;
+    if let Some(value) = menu
+        .config_option_values
+        .get(&crate::hud::menu::CONFIG_STORE_AUTO_SORT)
+    {
+        next.auto = auto_sort_on_for_store(*value);
+    }
+    if let Some(value) = menu
+        .config_option_values
+        .get(&crate::hud::menu::CONFIG_STORE_SORT_KEY)
+    {
+        next.key = sort_key_for_store(*value);
+    }
+    if next != *sort {
+        *sort = next;
+    }
+}
+
+/// Write the Items window's own Auto/Manual pick back into the same stores, so whichever menu the
+/// player used is where the other one reads from. Both directions compare before writing, so the
+/// pair settles instead of marking each other changed every frame.
+pub fn mirror_inventory_sort_options_system(
+    menu: Option<ResMut<crate::hud::menu::DynamicMenu>>,
+    sort: Res<SortOptions>,
+) {
+    let Some(mut menu) = menu else { return };
+    // A freshly initialised SortOptions is not a player choice: seeding the stores from it would
+    // invent an option value neither menu has written.
+    if !sort.is_changed() || sort.is_added() {
+        return;
+    }
+    set_config_store(
+        &mut menu,
+        crate::hud::menu::CONFIG_STORE_AUTO_SORT,
+        i32::from(sort.auto),
+    );
+    set_config_store(
+        &mut menu,
+        crate::hud::menu::CONFIG_STORE_SORT_KEY,
+        store_value_for_sort_key(sort.key),
+    );
+}
+
+fn set_config_store(menu: &mut crate::hud::menu::DynamicMenu, store_id: u32, value: i32) {
+    if menu.config_option_values.get(&store_id).copied() != Some(value) {
+        menu.config_option_values.insert(store_id, value);
+    }
+}
+
 pub fn item_detail_open(mode: &InputMode) -> bool {
     match mode {
         InputMode::Menu(stack) => stack
@@ -424,6 +525,7 @@ mod tests {
             next_use_vana_ts: None,
             use_delay_end_vana_ts: None,
             ready: None,
+            extdata: None,
         }
     }
 
@@ -605,7 +707,10 @@ mod tests {
 
     #[test]
     fn apply_sort_option_selects_mode() {
-        let mut s = SortOptions { auto: true };
+        let mut s = SortOptions {
+            auto: true,
+            ..SortOptions::default()
+        };
         assert!(apply_sort_option(&mut s, SortOptionId::Manual));
         assert!(!s.auto);
         assert!(apply_sort_option(&mut s, SortOptionId::Auto));
@@ -709,7 +814,120 @@ mod tests {
 
     #[test]
     fn sort_options_active_mirrors_auto_flag() {
-        assert_eq!(SortOptions { auto: true }.active(), SortOptionId::Auto);
-        assert_eq!(SortOptions { auto: false }.active(), SortOptionId::Manual);
+        assert_eq!(
+            SortOptions {
+                auto: true,
+                ..SortOptions::default()
+            }
+            .active(),
+            SortOptionId::Auto
+        );
+        assert_eq!(
+            SortOptions {
+                auto: false,
+                ..SortOptions::default()
+            }
+            .active(),
+            SortOptionId::Manual
+        );
+    }
+
+    #[test]
+    fn store_laws_name_the_pair_each_way() {
+        assert!(auto_sort_on_for_store(1));
+        assert!(!auto_sort_on_for_store(0));
+        assert_eq!(sort_key_for_store(CONFIG_VALUE_SORT_BY_NAME), SortKey::Name);
+        assert_eq!(sort_key_for_store(0), SortKey::Category);
+        assert_eq!(
+            store_value_for_sort_key(SortKey::Name),
+            CONFIG_VALUE_SORT_BY_NAME
+        );
+        assert_eq!(store_value_for_sort_key(SortKey::Category), 0);
+    }
+
+    /// The Gameplay page's stores are retail's source: a Config-side change flips the live option,
+    /// and stores nobody wrote leave kuluu's defaults alone.
+    #[test]
+    fn config_stores_drive_the_live_sort_options() {
+        let mut menu = crate::hud::menu::DynamicMenu::default();
+        menu.config_option_values
+            .insert(crate::hud::menu::CONFIG_STORE_AUTO_SORT, 0);
+        menu.config_option_values.insert(
+            crate::hud::menu::CONFIG_STORE_SORT_KEY,
+            CONFIG_VALUE_SORT_BY_NAME,
+        );
+
+        let mut app = App::new();
+        app.add_plugins(bevy::MinimalPlugins)
+            .insert_resource(menu)
+            .init_resource::<SortOptions>()
+            .add_systems(Update, sync_inventory_sort_options_system);
+
+        let untouched = SortOptions::default();
+        assert!(untouched.auto, "the Items window starts auto-sorted");
+        app.update();
+
+        let sort = *app.world().resource::<SortOptions>();
+        assert!(!sort.auto);
+        assert_eq!(sort.key, SortKey::Name);
+    }
+
+    /// The Items window's own pick writes back into the same stores, and because both directions
+    /// compare before writing the pair settles instead of marking each other changed every frame.
+    #[test]
+    fn sort_options_write_back_to_their_stores_and_settle() {
+        let mut app = App::new();
+        app.add_plugins(bevy::MinimalPlugins)
+            .init_resource::<crate::hud::menu::DynamicMenu>()
+            .init_resource::<SortOptions>()
+            .add_systems(
+                Update,
+                (
+                    sync_inventory_sort_options_system,
+                    mirror_inventory_sort_options_system,
+                )
+                    .chain(),
+            );
+
+        app.update();
+        let stores_of = |app: &App| -> Option<(Option<i32>, Option<i32>)> {
+            let menu = app.world().resource::<crate::hud::menu::DynamicMenu>();
+            Some((
+                menu.config_option_values
+                    .get(&crate::hud::menu::CONFIG_STORE_AUTO_SORT)
+                    .copied(),
+                menu.config_option_values
+                    .get(&crate::hud::menu::CONFIG_STORE_SORT_KEY)
+                    .copied(),
+            ))
+        };
+        assert_eq!(stores_of(&app), Some((None, None)), "nothing written yet");
+
+        *app.world_mut().resource_mut::<SortOptions>() = SortOptions {
+            auto: false,
+            key: SortKey::Name,
+        };
+        app.update();
+        assert_eq!(
+            stores_of(&app),
+            Some((Some(0), Some(CONFIG_VALUE_SORT_BY_NAME))),
+            "the Items window's choice reaches the Config stores"
+        );
+
+        for _ in 0..3 {
+            app.update();
+        }
+        assert_eq!(
+            *app.world().resource::<SortOptions>(),
+            SortOptions {
+                auto: false,
+                key: SortKey::Name,
+            },
+            "the mirror and the sync agree, so neither keeps rewriting"
+        );
+        assert_eq!(
+            stores_of(&app),
+            Some((Some(0), Some(CONFIG_VALUE_SORT_BY_NAME)))
+        );
     }
 }

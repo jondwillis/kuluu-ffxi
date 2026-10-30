@@ -95,6 +95,8 @@ pub enum SearchError {
     UnexpectedType { got: u8, want: u8 },
     #[error("body size field {field} is inconsistent with a {actual}-byte frame")]
     BadBodySize { field: u16, actual: usize },
+    #[error("search list entry type {0:#04x} unknown (stream desync?)")]
+    UnknownSearchEntry(u8),
 }
 
 fn rd_u16(buf: &[u8], off: usize) -> u16 {
@@ -410,6 +412,482 @@ pub fn parse_ah_history(body: &[u8]) -> Result<AhHistory, SearchError> {
         category: rd_u16(body, AH_HISTORY_CATEGORY_OFFSET),
         sales,
     })
+}
+
+// ---- Player search (`searchma` row): request TLV + CSearchListPacket reply ----
+
+// vendor/server/src/search/search_handler.h TCP_SEARCH / TCP_SEARCH_ALL dispatch
+pub const SEARCH_LIST_RESPONSE_TYPE: u8 = 0x80;
+// vendor/server/src/search/packets/search_list.cpp CSearchListPacket ctor — m_offset(192)
+pub const SEARCH_LIST_ENTRIES_BIT_OFFSET: usize = 192;
+// vendor/server/src/search/packets/search_list.cpp AddPlayer — "A maximum of 20 characters can be added to a single packet."
+pub const SEARCH_LIST_PLAYERS_PER_PACKET_MAX: usize = 20;
+/// Byte count of the TLV entry blob starting at `SEARCH_REQUEST_ENTRIES_OFFSET`;
+/// vendor/server/src/search/search_handler.cpp _HandleSearchRequest reads it as
+/// `size * 8` workload bits.
+pub const SEARCH_REQUEST_ENTRY_BYTES_OFFSET: usize = 0x10;
+pub const SEARCH_REQUEST_ENTRIES_OFFSET: usize = 0x11;
+// vendor/server/src/search/packets/search_list.cpp ctor — total found across all frames
+pub const SEARCH_LIST_TOTAL_COUNT_OFFSET: usize = 0x0E;
+
+// vendor/server/src/search/enums/search_type.h SearchType
+pub mod search_type {
+    pub const NAME: u8 = 0x00;
+    pub const AREA: u8 = 0x01;
+    pub const NATION: u8 = 0x02;
+    pub const JOB: u8 = 0x03;
+    pub const LEVEL: u8 = 0x04;
+    pub const RACE: u8 = 0x05;
+    pub const FLAGS1: u8 = 0x06;
+    pub const ID: u8 = 0x08;
+    pub const PARTY: u8 = 0x0A;
+    pub const LINKSHELL: u8 = 0x0B;
+    pub const FRIEND: u8 = 0x0C;
+    pub const LINKSHELL_RANK: u8 = 0x0D;
+    pub const UNKNOWN_0E: u8 = 0x0E;
+    pub const RANK: u8 = 0x10;
+    pub const COMMENT: u8 = 0x11;
+    pub const LINKSHELL2: u8 = 0x13;
+    pub const FLAGS2: u8 = 0x16;
+    pub const LANGUAGE: u8 = 0x17;
+}
+
+use crate::bitstream::{pack_bits_le, unpack_bits_le};
+
+// The bit codecs live in crate::bitstream (shared with the linkshell-name codec);
+// they are ports of packBitsLE/unpackBitsLE from vendor/server/src/common/utils.cpp.
+
+/// Sequential writer over the request TLV blob: one [`pack`](Self::pack) call per
+/// bit field, mirroring how search_handler.cpp walks its `unpackBitsLE` cursor.
+pub struct SearchBitWriter {
+    pub buf: Vec<u8>,
+    pub bits: usize,
+}
+
+impl Default for SearchBitWriter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SearchBitWriter {
+    pub fn new() -> Self {
+        Self {
+            buf: Vec::new(),
+            bits: 0,
+        }
+    }
+    pub fn pack(&mut self, value: u64, len: u32) {
+        let need_bytes = (self.bits + len as usize + 15) / 8;
+        if self.buf.len() < need_bytes {
+            self.buf.resize(need_bytes, 0);
+        }
+        self.bits = pack_bits_le(&mut self.buf, value, self.bits, len);
+    }
+}
+
+/// One `searchma` filter as the retail form exposes them (vault main_menu.md
+/// section 26). Each becomes one TLV entry; areas append the list-end marker
+/// (_HandleSearchRequest: `isPresent == 0` ends the Area run).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SearchFilter {
+    Name(String),
+    Level { from: u8, to: u8 },
+    Job(u8),
+    Race(u8),
+    Nation(u8),
+    Rank { min: u8, max: u8 },
+    Areas(Vec<u16>),
+}
+
+impl SearchCrypto {
+    /// Builds the TCP_SEARCH (or TCP_SEARCH_ALL when `all_pages`) request whose
+    /// TLV blob LSB's `_HandleSearchRequest` consumes. Entry order follows the
+    /// retail form's reading order as encoded by our caller.
+    pub fn encode_player_search_request(
+        &mut self,
+        filters: &[SearchFilter],
+        all_pages: bool,
+        client_key: u32,
+    ) -> Vec<u8> {
+        let mut w = SearchBitWriter::new();
+        for filter in filters {
+            match filter {
+                // Name entry: {type:5}{sort:1}{present:1}{len:5}{chars ×7}
+                SearchFilter::Name(name) => {
+                    let chars: Vec<u8> = name.bytes().take(31).collect();
+                    w.pack(u64::from(search_type::NAME), 5);
+                    w.pack(0, 1);
+                    w.pack(1, 1);
+                    // LSB clamps rawNameLen to 15 but consumes every char the length says.
+                    w.pack(chars.len() as u64, 5);
+                    for c in chars {
+                        w.pack(c as u64, 7);
+                    }
+                }
+                SearchFilter::Level { from, to } => {
+                    w.pack(u64::from(search_type::LEVEL), 5);
+                    w.pack(0, 1);
+                    w.pack(1, 1);
+                    w.pack(*from as u64, 8);
+                    w.pack(*to as u64, 8);
+                }
+                SearchFilter::Job(job) => {
+                    w.pack(u64::from(search_type::JOB), 5);
+                    w.pack(0, 1);
+                    w.pack(1, 1);
+                    w.pack(*job as u64, 5);
+                }
+                SearchFilter::Race(race) => {
+                    w.pack(u64::from(search_type::RACE), 5);
+                    w.pack(0, 1);
+                    w.pack(1, 1);
+                    w.pack(*race as u64, 4);
+                }
+                SearchFilter::Nation(nation) => {
+                    w.pack(u64::from(search_type::NATION), 5);
+                    w.pack(0, 1);
+                    w.pack(1, 1);
+                    w.pack(*nation as u64 & 0x3, 2);
+                }
+                SearchFilter::Rank { min, max } => {
+                    w.pack(u64::from(search_type::RANK), 5);
+                    w.pack(0, 1);
+                    w.pack(1, 1);
+                    w.pack(*min as u64, 8);
+                    w.pack(*max as u64, 8);
+                }
+                SearchFilter::Areas(zones) => {
+                    for zone in zones {
+                        w.pack(u64::from(search_type::AREA), 5);
+                        w.pack(0, 1);
+                        w.pack(1, 1);
+                        w.pack(*zone as u64 & 0x3FF, 10);
+                    }
+                    // list end: isPresent = 0 (search_handler.cpp "Area List End found.")
+                    w.pack(u64::from(search_type::AREA), 5);
+                    w.pack(0, 1);
+                    w.pack(0, 1);
+                }
+            }
+        }
+        let entry_bytes = w.bits.div_ceil(8);
+        let len = SEARCH_REQUEST_ENTRIES_OFFSET + entry_bytes + SERVER_KEY_FROM_END;
+        self.encode_request(
+            len,
+            if all_pages {
+                TCP_SEARCH_ALL
+            } else {
+                TCP_SEARCH
+            },
+            client_key,
+            |frame| {
+                frame[SEARCH_REQUEST_ENTRY_BYTES_OFFSET] = entry_bytes as u8;
+                frame[SEARCH_REQUEST_ENTRIES_OFFSET..][..entry_bytes]
+                    .copy_from_slice(&w.buf[..entry_bytes]);
+            },
+        )
+    }
+}
+
+/// One player row of a `CSearchListPacket` (vendor/server/src/search/packets/search_list.cpp AddPlayer).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SearchHit {
+    pub name: String,
+    pub zone: u16,
+    /// Absent while flags1 & 0x4000 — the hidden/GM-shape entry skip (AddPlayer).
+    pub nation: Option<u8>,
+    pub main_job: Option<u8>,
+    pub sub_job: Option<u8>,
+    pub main_level: Option<u8>,
+    pub sub_level: Option<u8>,
+    pub race: Option<u8>,
+    pub rank: Option<u8>,
+    pub flags1: u16,
+    /// Packed 20 bits wide.
+    pub id: u32,
+    /// seacom_type, present only when non-zero (AddPlayer).
+    pub comment_type: Option<u32>,
+    pub flags2: u32,
+    pub languages: u16,
+}
+
+/// One decrypted results frame of a player search.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchListFrame {
+    pub is_final: bool,
+    /// Total characters found across all frames (may exceed what this frame carries).
+    pub total_count: u16,
+    pub players: Vec<SearchHit>,
+}
+
+struct BitCursor<'a> {
+    buf: &'a [u8],
+    bits: usize,
+}
+
+impl<'a> BitCursor<'a> {
+    fn new(buf: &'a [u8], bits: usize) -> Self {
+        Self { buf, bits }
+    }
+    fn take(&mut self, len: u32) -> u64 {
+        let v = unpack_bits_le(self.buf, self.bits, len);
+        self.bits += len as usize;
+        v
+    }
+}
+
+/// Parses one decrypted `CSearchListPacket` body (response type 0x80).
+/// Entries live in bytes [24, body_size) with a per-entity size byte preceding each
+/// bit-packed blob; frames chain until the final flag (search_handler.cpp
+/// HandleSearchRequest emits up to 20 players per frame and flags only the last).
+pub fn parse_search_list(body: &[u8]) -> Result<SearchListFrame, SearchError> {
+    if body.len() < SEARCH_LIST_ENTRIES_BIT_OFFSET / 8 {
+        return Err(SearchError::TooShort(body.len()));
+    }
+    let got = body[RESPONSE_TYPE_OFFSET];
+    if got != SEARCH_LIST_RESPONSE_TYPE {
+        return Err(SearchError::UnexpectedType {
+            got,
+            want: SEARCH_LIST_RESPONSE_TYPE,
+        });
+    }
+    // search_list.cpp ctor memsets m_data, so a zero-player frame leaves the size field 0.
+    let data_size = (rd_u16(body, RESPONSE_BODY_SIZE_OFFSET) as usize).min(body.len());
+    let mut players = Vec::new();
+    let mut pos = SEARCH_LIST_ENTRIES_BIT_OFFSET / 8;
+    while pos < data_size {
+        // One entity's entries occupy exactly `size_bytes` bytes after the size
+        // byte (search_list.cpp: `ref<uint8>(data, size_offset) = m_offset / 8 - size_offset - 1`).
+        let size_bytes = body[pos] as usize;
+        let end_bit = (pos + 1 + size_bytes) * 8;
+        let mut cur = BitCursor::new(body, (pos + 1) * 8);
+        let mut hit = SearchHit::default();
+        // The smallest response entry — Name with a zero-length field — is 9 bits,
+        // so anything shorter than that past the cursor is AddPlayer's byte-alignment pad.
+        while end_bit.saturating_sub(cur.bits) >= 9 {
+            match cur.take(5) as u8 {
+                search_type::NAME => {
+                    let len = (cur.take(4) as usize).min(15);
+                    let mut s = String::new();
+                    for _ in 0..len {
+                        s.push(((cur.take(7) & 0x7F) as u8).into());
+                    }
+                    hit.name = s;
+                }
+                search_type::AREA => hit.zone = cur.take(10) as u16,
+                search_type::NATION => hit.nation = Some(cur.take(2) as u8),
+                search_type::JOB => {
+                    hit.main_job = Some(cur.take(5) as u8);
+                    hit.sub_job = Some(cur.take(5) as u8);
+                }
+                search_type::LEVEL => {
+                    hit.main_level = Some(cur.take(8) as u8);
+                    hit.sub_level = Some(cur.take(8) as u8);
+                }
+                search_type::RACE => hit.race = Some(cur.take(4) as u8),
+                search_type::RANK => hit.rank = Some(cur.take(8) as u8),
+                search_type::FLAGS1 => hit.flags1 = cur.take(16) as u16,
+                search_type::ID => hit.id = cur.take(20) as u32,
+                // The packer always emits this zero entry; its meaning is unknown upstream.
+                search_type::UNKNOWN_0E => {
+                    cur.take(32);
+                }
+                search_type::COMMENT => hit.comment_type = Some(cur.take(32) as u32),
+                search_type::FLAGS2 => hit.flags2 = cur.take(32) as u32,
+                search_type::LANGUAGE => hit.languages = cur.take(16) as u16,
+                other => return Err(SearchError::UnknownSearchEntry(other)),
+            }
+        }
+        players.push(hit);
+        pos += size_bytes + 1;
+    }
+    Ok(SearchListFrame {
+        is_final: body[RESPONSE_FLAGS_OFFSET] & RESPONSE_FINAL_FLAG != 0,
+        total_count: rd_u16(body, SEARCH_LIST_TOTAL_COUNT_OFFSET),
+        players,
+    })
+}
+
+#[cfg(test)]
+mod player_search_tests {
+    use super::*;
+
+    fn hex_bytes(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn bit_codec_matches_lsb_packvectors_at_nasty_offsets() {
+        // Generated from a line-by-line port of utils.cpp packBitsLE, kept here so the
+        // Rust mirror is pinned to the upstream algorithm rather than a guess.
+        let cases = [
+            (4usize, 12u32, 0xAB1u64, "0ab10000"),
+            (7, 3, 0x5, "01400000"),
+            (5, 16, 0xF00D, "07806800"),
+            (0, 32, 0xDEAD_BEEF, "deadbeef"),
+            (6, 10, 0x2AB, "02ab0000"),
+            (1, 7, 0x4E, "4e000000"),
+            (3, 20, 0xABCDE, "1579bc00"),
+            (2, 8, 0xFF, "3fc00000"),
+        ];
+        for (bo, len, value, want) in cases {
+            let mut buf = vec![0u8; 4];
+            let next = pack_bits_le(&mut buf, value, bo, len);
+            assert_eq!(bytes_to_hex(&buf), want, "pack {value:#x} @{bo}/{len}");
+            assert_eq!(next, bo + len as usize);
+            assert_eq!(unpack_bits_le(&buf, bo, len), value, "unpack mirror");
+        }
+    }
+
+    #[test]
+    fn sequential_streams_round_trip_through_the_lsb_pair() {
+        // FIXTURE A: widths the search TLV actually uses, packed back to back.
+        let stream: [(u64, u32); 9] = [
+            (0x04, 5),
+            (0, 1),
+            (1, 1),
+            (255, 8),
+            (99, 8),
+            (0x17, 5),
+            (1, 1),
+            (0, 1),
+            (0xBEEF, 16),
+        ];
+        let mut w = SearchBitWriter::new();
+        for (v, l) in stream {
+            w.pack(v, l);
+        }
+        assert_eq!(w.bits, 46);
+        // The reference buffer was an 8-byte zero pad; the writer stops at the last
+        // touched byte — the trailing padding nibble agrees either way.
+        assert_eq!(bytes_to_hex(&w.buf), "23fec77afbbc00");
+        let mut pos = 0;
+        for (v, l) in stream {
+            assert_eq!(unpack_bits_le(&w.buf, pos, l), v);
+            pos += l as usize;
+        }
+    }
+
+    fn bytes_to_hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    const CLIENT_KEY: u32 = 0xA1B2_C3D4;
+
+    /// SearchHandler::decrypt (vendor/server/src/search/search_handler.cpp) — splice the trailer
+    /// key, decipher with MD5(key[..20]), then splice the plaintext `len-0x18` word.
+    fn lsb_decrypt_request(frame: &mut [u8]) {
+        let len = frame.len();
+        let mut key = SEARCH_BASE_KEY;
+        key[16..20].copy_from_slice(&frame[len - 4..]);
+        let state = blowfish::State::new(&md5::md5(&key[..20]));
+        let mut words = (len - 12) / 4;
+        words -= words % 2;
+        for i in (0..words).step_by(2) {
+            let a = 4 * (i + 2);
+            let b = 4 * (i + 3);
+            let mut xl = u32::from_le_bytes(frame[a..a + 4].try_into().unwrap());
+            let mut xr = u32::from_le_bytes(frame[b..b + 4].try_into().unwrap());
+            blowfish::decipher(&mut xl, &mut xr, &state.p, &state.s);
+            frame[a..a + 4].copy_from_slice(&xl.to_le_bytes());
+            frame[b..b + 4].copy_from_slice(&xr.to_le_bytes());
+        }
+        key[20..24].copy_from_slice(&frame[len - 0x18..len - 0x18 + 4]);
+        assert_eq!(
+            md5::md5(&frame[8..len - 0x14]),
+            frame[len - 0x14..len - 0x14 + 16],
+            "server-side request hash"
+        );
+    }
+
+    #[test]
+    fn request_entries_land_exactly_where_lsb_parses_them() {
+        // FIXTURE D: Name("bob"), Level 10-99, Job 5, Area[103]+list end — the exact
+        // byte blob _HandleSearchRequest consumes after frame[0x10] says 12 bytes.
+        let mut crypto = SearchCrypto::new();
+        let mut frame = crypto.encode_player_search_request(
+            &[
+                SearchFilter::Name("bob".into()),
+                SearchFilter::Level { from: 10, to: 99 },
+                SearchFilter::Job(5),
+                SearchFilter::Areas(vec![103]),
+            ],
+            false,
+            CLIENT_KEY,
+        );
+        lsb_decrypt_request(&mut frame);
+        let entries = frame[SEARCH_REQUEST_ENTRIES_OFFSET..][..12].to_vec();
+        assert_eq!(frame[REQUEST_TYPE_OFFSET], TCP_SEARCH);
+        assert_eq!(frame[SEARCH_REQUEST_ENTRY_BYTES_OFFSET], 12);
+        assert_eq!(bytes_to_hex(&entries), "023c5bf1110a631a50a33840");
+    }
+
+    #[test]
+    fn search_list_frames_parse_the_addplayer_law() {
+        // FIXTURE E: a single-frame body for two players (second hidden via
+        // flags1 & 0x4000, carrying a seacom comment), packed by the utils.cpp port.
+        let mut body = hex_bytes("00000000000000005c0080800000000000000000000000002001e2df8823389194c44b2529400cc00848123457000000005800000002e0006022054199bf7679d876e5b01000c8000800063700000000440000001ec0001bd5b70001");
+        assert_eq!(body.len(), 0x5C);
+        body[SEARCH_LIST_TOTAL_COUNT_OFFSET..][..2].copy_from_slice(&2u16.to_le_bytes());
+        let frame = parse_search_list(&body).unwrap();
+        assert!(frame.is_final);
+        assert_eq!(frame.total_count, 2);
+        assert_eq!(frame.players.len(), 2);
+        let first = &frame.players[0];
+        assert_eq!(first.name, "bob");
+        assert_eq!(first.zone, 103);
+        assert_eq!(first.nation, Some(1));
+        assert_eq!((first.main_job, first.sub_job), (Some(5), Some(6)));
+        assert_eq!((first.main_level, first.sub_level), (Some(75), Some(37)));
+        assert_eq!((first.race, first.rank), (Some(2), Some(3)));
+        assert_eq!(first.flags1, 0x42);
+        assert_eq!(first.id, 0x1_2345);
+        assert_eq!(first.comment_type, None);
+        assert_eq!((first.flags2, first.languages), (0, 3));
+        let second = &frame.players[1];
+        assert_eq!(second.name, "ALongNameX");
+        // The hidden shape drops nation/job/level/race/rank entries entirely.
+        assert_eq!(second.nation, None);
+        assert_eq!((second.main_job, second.main_level), (None, None));
+        assert_eq!((second.race, second.rank), (None, None));
+        assert_eq!(second.flags1, 0x4000);
+        assert_eq!(second.id, 99);
+        assert_eq!(second.comment_type, Some(7));
+        assert_eq!((second.flags2, second.languages), (0xDEAD, 1));
+
+        body[RESPONSE_FLAGS_OFFSET] = 0;
+        let more = parse_search_list(&body).unwrap();
+        assert!(!more.is_final, "final bit read through from [0x0A]");
+    }
+
+    #[test]
+    fn zero_result_frame_parses_empty() {
+        let mut body = vec![0u8; SEARCH_LIST_ENTRIES_BIT_OFFSET / 8];
+        body[RESPONSE_TYPE_OFFSET] = SEARCH_LIST_RESPONSE_TYPE;
+        body[RESPONSE_FLAGS_OFFSET] = RESPONSE_FINAL_FLAG;
+        let frame = parse_search_list(&body).unwrap();
+        assert!(frame.is_final);
+        assert_eq!(frame.total_count, 0);
+        assert!(frame.players.is_empty());
+    }
+
+    #[test]
+    fn unknown_entry_type_is_a_hard_error_not_a_desync() {
+        let mut body = vec![0u8; 40];
+        body[RESPONSE_TYPE_OFFSET] = SEARCH_LIST_RESPONSE_TYPE;
+        body[RESPONSE_BODY_SIZE_OFFSET..][..2].copy_from_slice(&30u16.to_le_bytes());
+        // Two-byte entity region so the entry loop actually starts (min entry 9 bits).
+        body[SEARCH_LIST_ENTRIES_BIT_OFFSET / 8] = 2;
+        pack_bits_le(&mut body, 0x1F, SEARCH_LIST_ENTRIES_BIT_OFFSET + 8, 5);
+        assert_eq!(
+            parse_search_list(&body),
+            Err(SearchError::UnknownSearchEntry(0x1F))
+        );
+    }
 }
 
 #[cfg(test)]

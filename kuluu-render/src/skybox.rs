@@ -77,7 +77,7 @@ impl Default for SkyboxGradientMaterial {
             data: SkyboxUniform {
                 colors: [horizon, horizon, mid, mid, mid, zenith, zenith, zenith],
 
-                // Coupled to skybox.wgsl's lookup parameter: the shader brackets
+                // Coupled to skybox.wesl's lookup parameter: the shader brackets
                 // against a polar-angle fraction in [0, 1] (horizon -> zenith),
                 // which is the domain every shipped 0x2F record uses. This
                 // placeholder ramp only shows before a record loads, but it has to
@@ -100,7 +100,7 @@ impl Default for SkyboxGradientMaterial {
 
 impl Material for SkyboxGradientMaterial {
     fn fragment_shader() -> ShaderRef {
-        "embedded://kuluu_render/skybox.wgsl".into()
+        "embedded://kuluu_render/skybox.wesl".into()
     }
 
     fn alpha_mode(&self) -> AlphaMode {
@@ -238,7 +238,7 @@ pub struct SkyboxPlugin;
 
 impl Plugin for SkyboxPlugin {
     fn build(&self, app: &mut App) {
-        embedded_asset!(app, "skybox.wgsl");
+        embedded_asset!(app, "skybox.wesl");
         app.add_plugins(MaterialPlugin::<SkyboxGradientMaterial>::default())
             .add_systems(Startup, spawn_skybox_sphere)
             .add_systems(

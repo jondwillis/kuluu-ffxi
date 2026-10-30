@@ -1420,7 +1420,7 @@ fn spawn_ffxi_actor(
             Vos2Overlay,
             Mesh3d(meshes.add(mesh)),
             MeshMaterial3d(mat),
-            MeshTag(instance_slot),
+            MeshTag::new(instance_slot),
             FfxiInstanceSlot(instance_slot),
             Transform::default(),
             ChildOf(pivot),

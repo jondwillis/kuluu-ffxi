@@ -106,6 +106,55 @@ impl GroupTbl {
     }
 }
 
+/// Decoded GROUP_SOLICIT_REQ (s2c 0x0DC): an incoming party/alliance invite.
+/// vendor/server/src/map/packets/s2c/0x0dc_group_solicit_req.h
+/// PacketData { UniqueNo, ActIndex, AnonFlag, Kind, sName[16], RaceNo, padding[2] }.
+#[derive(Debug, Clone)]
+pub struct GroupSolicitReq {
+    pub unique_no: u32,
+    pub act_index: u16,
+    pub anon_flag: u8,
+    pub kind: GroupKind,
+    /// Inviter's display name, NUL-terminated in the frame.
+    pub name: String,
+}
+
+impl GroupSolicitReq {
+    /// Body length per LSB's PacketData (28 bytes).
+    const BODY_LEN: usize = 28;
+
+    pub fn decode(body: &[u8]) -> Result<Self, DecodeError> {
+        if body.len() < Self::BODY_LEN {
+            return Err(DecodeError::Truncated(Self::BODY_LEN, body.len()));
+        }
+        let unique_no = u32::from_le_bytes(body[0..4].try_into().unwrap());
+        let act_index = u16::from_le_bytes(body[4..6].try_into().unwrap());
+        let anon_flag = body[6];
+        let kind = match body[7] {
+            // PartyKind (vendor/server/src/map/enums/party_kind.h): Party = 0,
+            // Alliance = 5. A solicit is always for an existing group, so —
+            // unlike GROUP_TBL — byte 0 is unambiguously Party.
+            0 => GroupKind::Party,
+            5 => GroupKind::Alliance,
+            v => GroupKind::Unknown(v),
+        };
+        let name = nul_terminated(&body[8..24]);
+        Ok(Self {
+            unique_no,
+            act_index,
+            anon_flag,
+            kind,
+            name,
+        })
+    }
+}
+
+/// NUL-terminated slice → owned name (same reading as the inspect_message decoder).
+fn nul_terminated(bytes: &[u8]) -> String {
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    String::from_utf8_lossy(&bytes[..end]).into_owned()
+}
+
 #[derive(Debug, Clone)]
 pub struct PartyAttrs {
     pub unique_no: u32,
@@ -401,6 +450,38 @@ mod party_attrs_tests {
         assert!(extra.is_party_leader);
         assert!(!extra.is_alliance_leader);
         assert_eq!(extra.name.as_deref(), Some("Vanari"));
+    }
+
+    #[test]
+    fn group_solicit_req_decodes_lsb_layout() {
+        // Body per vendor/server/src/map/packets/s2c/0x0dc_group_solicit_req.h
+        // PacketData: UniqueNo, ActIndex, AnonFlag, Kind, sName[16], RaceNo, pad.
+        let mut body = vec![0u8; 28];
+        body[0..4].copy_from_slice(&0x00A1_0002u32.to_le_bytes());
+        body[4..6].copy_from_slice(&0x001Au16.to_le_bytes());
+        body[6] = 1; // AnonFlag
+        body[7] = 0; // PartyKind::Party
+        body[8..14].copy_from_slice(b"Pruneo");
+
+        let sol = GroupSolicitReq::decode(&body).unwrap();
+        assert_eq!(sol.unique_no, 0x00A1_0002);
+        assert_eq!(sol.act_index, 0x1A);
+        assert_eq!(sol.anon_flag, 1);
+        assert_eq!(sol.kind, GroupKind::Party);
+        assert_eq!(sol.name, "Pruneo");
+
+        // PartyKind::Alliance == 5 (vendor/server/src/map/enums/party_kind.h).
+        body[7] = 5;
+        assert_eq!(
+            GroupSolicitReq::decode(&body).unwrap().kind,
+            GroupKind::Alliance
+        );
+
+        // One byte short of LSB's 28-byte body is a hard truncation.
+        assert!(matches!(
+            GroupSolicitReq::decode(&body[..27]),
+            Err(DecodeError::Truncated(28, 27))
+        ));
     }
 
     #[test]

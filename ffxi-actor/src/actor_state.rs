@@ -91,7 +91,21 @@ pub struct SpecialPose {
     /// resurface, where retail's fresh actor has no slot: the pose is held only for the load
     /// routine's lock length, then falls to idle even if the server keeps the sub set.
     pub slot_held: bool,
+
+    /// Whether `server_status` said this entity was mounted (`ffxi_proto::decode::animation::is_mounted`)
+    /// last frame. The dismount edge (true -> false) triggers [`DISMOUNT_ROUTINE`] - retail's
+    /// only visual for getting off, since the server changes nothing else
+    /// (vendor/server/scripts/effects/mounted.lua onEffectLose: setAnimation(NONE), silent).
+    pub mounted: bool,
 }
+
+/// The rider-side get-off routine every PC action-animation block ships at its base offset
+/// (census 2026-10-29, `ffxi-dat/examples/zz-mount-clips.rs` + `dat-routine-stages` on the
+/// install's ROM/351 files): Motion stages `ch1?`(hop down, window 104) then `ch2?`(land,
+/// window 72), under MovementLock+AnimationLock+HoldRotation for its whole length. The name
+/// reads "Chocobo OFF"; LandSandBoat sends no packet of its own for a dismount, so this edge
+/// is the trigger (vendor/server/scripts/effects/mounted.lua onEffectLose).
+pub const DISMOUNT_ROUTINE: [u8; 4] = *b"coff";
 
 /// LSB `STATUS_TYPE::INVISIBLE` (vendor/server/data/enums/status.yaml): the server hides
 /// the model entirely while a burrowing mob is underground.
@@ -131,7 +145,12 @@ pub struct SpecialPoseStep {
 /// Our port keeps one hidden actor instead of destroying/rebuilding it (retail destroys on
 /// INVISIBLE and constructs a fresh model on resurface), so `hidden` stands in for "actor
 /// destroyed" and the resurface's 'init' runs on our kept-hidden actor.
-pub fn next_special_pose(prev: &SpecialPose, status: u8, animationsub: u8) -> SpecialPoseStep {
+pub fn next_special_pose(
+    prev: &SpecialPose,
+    status: u8,
+    animationsub: u8,
+    mounted: bool,
+) -> SpecialPoseStep {
     let hidden = status == INVISIBLE_STATUS;
     let (active_routine, slot_held, triggered) = if hidden {
         (prev.active_routine, prev.slot_held, None)
@@ -142,6 +161,14 @@ pub fn next_special_pose(prev: &SpecialPose, status: u8, animationsub: u8) -> Sp
             Some(routine) => (Some(routine), true, Some(routine)),
             None => (prev.active_routine, false, None),
         }
+    } else if prev.mounted && !mounted {
+        // The server's silent animation-byte flip mounted -> none is all a dismount ever
+        // is on the wire; retail answers it with the rider-side get-off routine. It becomes
+        // the pose's ACTIVE routine too, not just a one-shot trigger: dismount also re-keys
+        // the model (the mounted flag rides the load key), and the fresh render actor must
+        // re-derive the pose from this state instead of inheriting a dead per-model action -
+        // the same spine the dig's buried pose and the resurface use.
+        (Some(DISMOUNT_ROUTINE), false, Some(DISMOUNT_ROUTINE))
     } else if special_routine(animationsub).is_none() {
         (prev.active_routine, false, None)
     } else {
@@ -153,6 +180,7 @@ pub fn next_special_pose(prev: &SpecialPose, status: u8, animationsub: u8) -> Sp
             hidden,
             active_routine,
             slot_held,
+            mounted,
         },
         triggered,
     }
@@ -1125,7 +1153,34 @@ mod tests {
     }
 
     fn step(prev: &SpecialPose, status: u8, animationsub: u8) -> SpecialPoseStep {
-        next_special_pose(prev, status, animationsub)
+        next_special_pose(prev, status, animationsub, false)
+    }
+
+    #[test]
+    fn dismount_edge_triggers_the_get_off_routine() {
+        // A rider observed mounted, then not, fires `coff` once (the census in the constant's
+        // docs); riding on, or never mounted, fires nothing - and the first sighting of an
+        // already-mounted actor is a create, not a dismount.
+        let riding = SpecialPose {
+            sub: 0,
+            hidden: false,
+            active_routine: None,
+            slot_held: false,
+            mounted: true,
+        };
+        let on = next_special_pose(&SpecialPose::default(), 0, 0, true);
+        assert_eq!(
+            on.triggered, None,
+            "first observation of a mounted actor is not a dismount"
+        );
+        assert!(on.pose.mounted);
+
+        let off = next_special_pose(&riding, 0, 0, false);
+        assert_eq!(off.triggered, Some(DISMOUNT_ROUTINE));
+        assert!(!off.pose.mounted);
+
+        let after = next_special_pose(&off.pose, 0, 0, false);
+        assert_eq!(after.triggered, None, "one edge, one routine");
     }
 
     #[test]
@@ -1193,6 +1248,7 @@ mod tests {
             hidden: true,
             active_routine: Some(*b"ini1"),
             slot_held: true,
+            mounted: false,
         };
         let s = step(&buried, INVISIBLE_STATUS, 2);
         assert_eq!(s.triggered, None);
@@ -1206,6 +1262,7 @@ mod tests {
             hidden: true,
             active_routine: Some(*b"ini1"),
             slot_held: true,
+            mounted: false,
         };
         let s = step(&buried, 0, 1);
         assert!(!s.pose.hidden);
@@ -1229,6 +1286,7 @@ mod tests {
             hidden: false,
             active_routine: Some(*b"ini1"),
             slot_held: true,
+            mounted: false,
         };
         let s = step(&digging, 0, 0);
         assert_eq!(s.pose.active_routine, Some(*b"ini1"));
@@ -1240,6 +1298,7 @@ mod tests {
             hidden: false,
             active_routine: Some(*b"init"),
             slot_held: false,
+            mounted: false,
         };
         let held = step(&settled, 0, 1);
         assert_eq!(held.pose.active_routine, Some(*b"init"));

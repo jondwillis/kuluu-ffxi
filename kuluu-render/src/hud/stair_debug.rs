@@ -1,3 +1,10 @@
+//! Stair-debug HUD: the top-left panel that shows what the walker sees at the
+//! player's feet - per probe column along the heading, the standable ground
+//! answer, every surface height in the column, and the identity of the wall
+//! faces the body chain touches. The producer lives in the kuluu crate
+//! (`kuluu/src/view_native/walker/debug.rs`) and fills [`StairDebugSnapshot`]
+//! each frame; this panel only renders it behind the `stair_debug` toggle.
+
 use bevy::prelude::*;
 
 use crate::hud::style::{self, theme};
@@ -17,7 +24,7 @@ pub fn spawn_stair_debug_hud(mut commands: Commands) {
                 position_type: PositionType::Absolute,
                 top: Val::Px(10.0),
                 left: Val::Px(10.0),
-                width: Val::Px(520.0),
+                width: Val::Px(620.0),
                 max_height: Val::Percent(90.0),
                 padding: UiRect::axes(Val::Px(8.0), Val::Px(6.0)),
                 border: UiRect::all(Val::Px(1.0)),
@@ -39,8 +46,6 @@ pub fn spawn_stair_debug_hud(mut commands: Commands) {
         });
 }
 
-/// A separate system in the kuluu crate populates StairDebugSnapshot each
-/// frame (kuluu-render can't depend on kuluu, so it pulls only this summary).
 pub fn update_stair_debug_hud(
     snap: Res<StairDebugSnapshot>,
     panels: Res<crate::hud::HudPanels>,
@@ -70,10 +75,8 @@ pub fn update_stair_debug_hud(
     }
 }
 
-/// Build the multi-line status string. ASCII only:
-/// this text renders with Bevy's bundled default font, which covers U+0020-7E.
-/// The 120-tick strip chart shows h0 / target / y: a staircase should show h0 as
-/// steps and target + y as one straight line; any zig in y is the bug.
+/// Build the multi-line status string. ASCII only: this text renders with
+/// Bevy's bundled default font, which covers U+0020-7E.
 fn build_status_text(snap: &StairDebugSnapshot) -> String {
     let mut out = String::with_capacity(1024);
     out.push_str("=== STAIR DEBUG ===\n");
@@ -113,12 +116,7 @@ fn build_status_text(snap: &StairDebugSnapshot) -> String {
         if f.grounded { "yes" } else { "no (airborne)" },
         f.speed_yps
     ));
-    let vy_txt = if f.vy.abs() > 1e-6 {
-        format!("vy={:+.2}", f.vy)
-    } else {
-        String::new()
-    };
-    out.push_str(&format!("mode    : {}{}\n", f.mode, vy_txt));
+    out.push_str(&format!("mode    : {}\n", f.mode));
     let d0 = f.decisions[0].as_deref().unwrap_or("-");
     let d1 = f.decisions[1].as_deref().unwrap_or("-");
     out.push_str(&format!("decision: {} -> {}\n", d0, d1));
@@ -126,31 +124,26 @@ fn build_status_text(snap: &StairDebugSnapshot) -> String {
     let o1 = f.outcomes[1].as_deref().unwrap_or("-");
     out.push_str(&format!("move    : {} -> {}\n", o0, o1));
     out.push_str(&format!(
-        "y/h0/tgt: {:+.3} / {} / {}\n",
+        "y/h0    : {:+.3} / {}\n",
         snap.player_y,
-        fmt_opt_h(f.h0),
-        fmt_opt_h(f.target)
+        fmt_opt_h(f.h0)
     ));
     out.push_str(&format!(
-        "g       : along={:+.3} lat={:+.3}\n",
-        f.g_along, f.g_lateral
-    ));
-    out.push_str(&format!(
-        "window  : risers={} range={:.3} poof={}\n",
-        f.riser_count,
-        f.range,
-        if f.poof { "yes" } else { "no" }
+        "meas/ass: {:+.3} / {:.3}\n",
+        f.measurement_y, f.assist
     ));
 
-    out.push_str("along   lat     raw      filt   status\n");
-    for s in &f.samples {
+    out.push_str("columns along heading (ground = standable answer at these feet;\n");
+    out.push_str("hits = every surface height in the column with its normal.y,\n");
+    out.push_str("walls = body-chain wall contacts: d dist n(nx,ny) slot tri sub prop y-range)\n");
+    for c in &f.columns {
+        let ground_txt = match c.ground {
+            Some(h) => format!("{h:+.3}"),
+            None => " none ".to_string(),
+        };
         out.push_str(&format!(
-            "{:>6.2} {:>5.2} {} {}  {}\n",
-            s.along,
-            s.lateral,
-            fmt_opt_h(s.raw),
-            fmt_opt_h(s.filtered),
-            s.status
+            "{:>6.2} {:>7}\n    hits : {}\n    walls: {}\n",
+            c.along, ground_txt, c.hits, c.walls
         ));
     }
 
@@ -159,12 +152,10 @@ fn build_status_text(snap: &StairDebugSnapshot) -> String {
         f.history.len(),
         STRIP_COLS
     ));
-    let ys: Vec<Option<f32>> = f.history.iter().map(|(_, _, y)| Some(*y)).collect();
-    let h0s: Vec<Option<f32>> = f.history.iter().map(|(h, _, _)| *h).collect();
-    let ts: Vec<Option<f32>> = f.history.iter().map(|(_, t, _)| *t).collect();
+    let ys: Vec<Option<f32>> = f.history.iter().map(|(_, y)| Some(*y)).collect();
+    let h0s: Vec<Option<f32>> = f.history.iter().map(|(h, _)| *h).collect();
     out.push_str(&format!("y      : {}\n", strip_line(&ys)));
     out.push_str(&format!("h0     : {}\n", strip_line(&h0s)));
-    out.push_str(&format!("target : {}\n", strip_line(&ts)));
 
     out.push_str(&format!(
         "reversals(120)={}  max|d2y|(120)={:.4}\n",
@@ -173,7 +164,7 @@ fn build_status_text(snap: &StairDebugSnapshot) -> String {
     out
 }
 
-/// Height cell for the panel: fixed width so the sample table stays aligned.
+/// Height cell for the panel: fixed width so the rows stay aligned.
 fn fmt_opt_h(v: Option<f32>) -> String {
     match v {
         Some(h) => format!("{h:>7.3}"),
@@ -181,14 +172,14 @@ fn fmt_opt_h(v: Option<f32>) -> String {
     }
 }
 
-/// Strip-chart columns (panel width ~75 chars at the 11 px default font).
+/// Strip-chart columns (panel width ~90 chars at the 11 px default font).
 const STRIP_COLS: usize = 64;
 
 /// Sparkline levels, low to high; index 0 is a space.
 const STRIP_LEVELS: &[u8] = b" .:-=+*#%";
 
-/// One ASCII sparkline row over `values` (None renders as 'o'). The whole ring
-/// shares one scale so the three series can be compared vertically.
+/// One ASCII sparkline row over `values` (None renders as 'o'). Both series
+/// build their own scale here, so compare shapes across rows by eye.
 fn strip_line(values: &[Option<f32>]) -> String {
     if values.is_empty() {
         return "(empty)".to_string();
@@ -216,68 +207,57 @@ fn strip_line(values: &[Option<f32>]) -> String {
     out
 }
 
-/// One ramp-field sample row for the panel's table.
+/// One probe column along the heading for the panel's table. All heights are
+/// y-up (bevy); wire z grows down. The strings cross the crate boundary pre-
+/// formatted because the render crate must not depend on the walker module.
 #[derive(Debug, Clone)]
-pub struct SampleRow {
-    /// Signed distance along the move direction; 0 is under the feet.
+pub struct ColumnRow {
+    /// Signed distance along the heading; 0 is under the feet.
     pub along: f32,
-    /// Signed lateral offset from the move line (+ left of m).
-    pub lateral: f32,
-    /// Height as sampled (None for Miss).
-    pub raw: Option<f32>,
-    /// Height after the lip filter (None when truncated / missed).
-    pub filtered: Option<f32>,
-    /// `SampleStatus` as a string; the render crate must not depend on the
-    /// walker module, so the status crosses the crate boundary as text.
-    pub status: String,
+    /// Standable ground answer at these feet (`ground_walkable`), None when
+    /// nothing standable answers there.
+    pub ground: Option<f32>,
+    /// Every surface in the column: `height@normal.y`, nearest-first.
+    pub hits: String,
+    /// Body-chain wall contacts as compact face identities.
+    pub walls: String,
 }
 
-/// The last tick's ramp field for the panel. All heights are
-/// y-up (bevy); wire z grows down.
+/// The last tick's probe picture for the panel.
 #[derive(Debug, Clone)]
 pub struct FieldSnapshot {
-    /// Walk mode after the last tick's vertical pass (`WalkMode` as a string;
-    /// the render crate must not depend on the walker module).
+    /// Walk mode after the last tick's vertical pass (`WalkMode` as a string).
     pub mode: String,
-    /// Fall velocity (yalms/s, negative = down); 0 when grounded.
-    pub vy: f32,
-    /// Last two ticks' vertical decisions, oldest first (`VerticalDecision`
-    /// as strings; None before the second tick).
+    /// Last two ticks' vertical decisions, oldest first (None before the
+    /// second tick).
     pub decisions: [Option<String>; 2],
-    /// Last two ticks' horizontal outcomes, oldest first (`HorizontalOutcome`
-    /// as strings; None before the second tick).
+    /// Last two ticks' horizontal outcomes, oldest first.
     pub outcomes: [Option<String>; 2],
-    /// Floor under the footprint per the support-probe rule; None airborne.
+    /// Measured standable floor under the feet per this tick's contact test;
+    /// None when nothing answered inside the follow window.
     pub h0: Option<f32>,
-    /// Walking target: envelope when a staircase is in view, else h0 direct.
-    pub target: Option<f32>,
-    /// Envelope gradient along m (ZERO unless the window is a staircase).
-    pub g_along: f32,
-    /// Envelope gradient lateral to m.
-    pub g_lateral: f32,
-    /// 0 = flat/slope, 1 = single step, >= 2 = staircase.
-    pub riser_count: u32,
-    /// max(h) - min(h) over the window's surviving samples.
-    pub range: f32,
-    /// Dead band: no ramp, target is h0 direct.
-    pub poof: bool,
-    /// Support probe grounded flag for this tick.
+    /// The walker's step-up assist reach for this frame (yalms).
+    pub assist: f32,
+    /// What `step` published as its measurement feed this tick (yalms,
+    /// up-positive): exactly the height change applied to Y.
+    pub measurement_y: f32,
+    /// This tick's contact-probe grounded flag.
     pub grounded: bool,
-    /// The speed variable (yalms/s) that paced this tick's vertical move.
+    /// The speed variable (yalms/s) that paced this tick.
     pub speed_yps: f32,
-    /// Every sample of the last tick (on-line arm + lateral pairs).
-    pub samples: Vec<SampleRow>,
-    /// Ring oldest-first as (h0, target, y), all y-up; up to 120 ticks.
-    pub history: Vec<(Option<f32>, Option<f32>, f32)>,
-    /// dy sign reversals over the ring (the walker's `live_tests` assert on this).
+    /// Probe columns along the heading, nearest first.
+    pub columns: Vec<ColumnRow>,
+    /// Ring oldest-first as (h0, y), both y-up; up to 120 ticks.
+    pub history: Vec<(Option<f32>, f32)>,
+    /// dy sign reversals over the ring.
     pub reversals_120: u32,
     /// Max |second difference| of y over the ring.
     pub max_d2y_120: f32,
 }
 
-/// Snapshot of stair-debug state, populated by the input crate each frame
-/// and consumed by the render crate's status panel. Kept as a plain data
-/// resource so the render crate has no dependency on the input crate.
+/// Snapshot of stair-debug state, populated by the kuluu crate each frame and
+/// consumed by this panel. Plain data resource: the render crate has no
+/// dependency on the input crate.
 #[derive(Resource, Debug, Clone)]
 pub struct StairDebugSnapshot {
     pub drawing_enabled: bool,
@@ -289,10 +269,8 @@ pub struct StairDebugSnapshot {
     /// Live server zone id (SceneState.snapshot.zone_id), 0 if none yet.
     pub zone_id: u16,
     /// Effective MZB DAT path ("ROMx/y/z.DAT"), or empty if unresolved.
-    /// Effective = mog-house model wins over zone id (matches
-    /// ffxi_dat::zone_dat::effective_zone_dat_file_id).
     pub dat_path: String,
-    /// Last tick's ramp field; None until dispatch has recorded a tick.
+    /// Last tick's probe picture; None until dispatch has recorded a tick.
     pub field: Option<FieldSnapshot>,
 }
 
@@ -310,7 +288,6 @@ impl Default for StairDebugSnapshot {
     }
 }
 
-/// Marks the stair debug panel's root node so the metrics system can measure
-/// its own laid-out rect.
+/// Marks the stair debug panel's root node so layout metrics can find it.
 #[derive(bevy::ecs::component::Component)]
 pub struct StairDebugPanelRoot;

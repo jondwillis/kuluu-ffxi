@@ -11,7 +11,7 @@ use bevy::prelude::*;
 use bevy::tasks::futures_lite::future;
 use bevy::tasks::{AsyncComputeTaskPool, Task};
 use ffxi_dat::mmb::{parse_models, MmbHeader};
-use ffxi_dat::texture::{decode_texture, DecodedTexture};
+use ffxi_dat::texture::{decode_texture, DecodedTexture, QualifiedTextureName};
 use ffxi_dat::{mmb, walk, ChunkKind, DatRoot};
 
 use crate::ffxi_zone_material::{FfxiZoneMaterial, ZoneMaterialTouched};
@@ -37,6 +37,41 @@ pub struct MmbHandleCache {
         ),
         bevy::asset::Handle<FfxiZoneMaterial>,
     >,
+}
+
+impl MmbLoadQueue {
+    /// Whether a queued zone placement still sits inside `radius_sq` of `from`.
+    /// Placements beyond the load radius stay queued until the view approaches
+    /// them, so this false means everything the current view would show has been
+    /// spawned.
+    pub fn pending_within(&self, from: Vec3, radius_sq: f32) -> bool {
+        self.pending
+            .iter()
+            .any(|req| is_zone_placement(req) && mmb_dist_sq_xz(req, from) <= radius_sq)
+    }
+}
+
+/// Loads every queued zone placement whatever its distance from the view. The
+/// launcher screens run their stream with this on so "loaded" means the whole
+/// block: the veil lifts once, onto a complete background, and never mid-stream.
+#[derive(Resource, Default)]
+pub struct StreamEverything(pub bool);
+
+/// How far and how wide the stream reaches. Grouped because the streaming system
+/// already carries a full complement of parameters, and callers name this one in
+/// schedule ordering.
+#[derive(bevy::ecs::system::SystemParam)]
+pub struct MmbStreamGate<'w> {
+    pub draw: Res<'w, crate::dat_mzb::DrawDistance>,
+    pub everything: Res<'w, StreamEverything>,
+}
+
+impl MmbLoadQueue {
+    /// Whether any zone placement is still waiting to spawn. The launcher's
+    /// loading states watch this rather than a distance-bounded subset.
+    pub fn has_pending_zone_placements(&self) -> bool {
+        self.pending.iter().any(is_zone_placement)
+    }
 }
 
 #[derive(Resource, Default)]
@@ -78,11 +113,47 @@ pub struct MmbParseCache {
     pub by_asset: std::collections::HashMap<(u32, usize), Option<LoadedMmb>>,
 }
 
+/// Upload one file's decoded textures and return the pool entry its placements
+/// resolve through. Split out so a zone can be warmed before it is ever drawn.
+pub fn pool_loaded_textures(
+    loaded: &LoadedMmb,
+    texture_count: usize,
+    quality: TextureQuality,
+    images: &mut Assets<Image>,
+) -> (
+    std::collections::HashMap<String, Handle<Image>>,
+    Option<Handle<Image>>,
+    std::collections::HashMap<QualifiedTextureName, Handle<Image>>,
+) {
+    let mut by_name: std::collections::HashMap<String, Handle<Image>> =
+        std::collections::HashMap::with_capacity(texture_count);
+    let mut first: Option<Handle<Image>> = None;
+    let mut by_raw_name: std::collections::HashMap<QualifiedTextureName, Handle<Image>> =
+        std::collections::HashMap::with_capacity(texture_count);
+    for nt in &loaded.textures {
+        let mut image = decoded_texture_to_image(&nt.texture, quality);
+        image.asset_usage = RenderAssetUsages::RENDER_WORLD;
+        let handle = images.add(image);
+        if first.is_none() {
+            first = Some(handle.clone());
+        }
+        if let Some(raw_name) = nt.raw_name {
+            by_raw_name
+                .entry(raw_name)
+                .or_insert_with(|| handle.clone());
+        }
+        if !nt.name.is_empty() {
+            by_name.insert(nt.name.clone(), handle);
+        }
+    }
+    (by_name, first, by_raw_name)
+}
+
 /// Release the decoded texels every cached chunk of `file_id` holds, once that
 /// file's `MmbTexPools` entry owns the uploaded handles. A file's Img chunks are
 /// collected into *every* chunk's `LoadedMmb`, so the cache otherwise keeps one
 /// full copy of the file's texture set per cached chunk index.
-fn drop_pooled_textures(cache: &mut MmbParseCache, file_id: u32) {
+pub fn drop_pooled_textures(cache: &mut MmbParseCache, file_id: u32) {
     for ((fid, _), entry) in cache.by_asset.iter_mut() {
         if *fid != file_id {
             continue;
@@ -98,6 +169,8 @@ pub struct MmbLoadInFlight {
     pub tasks: std::collections::HashMap<(u32, usize), Task<Option<LoadedMmb>>>,
 }
 
+/// Per file: textures by local name, the file's first texture, and textures by their 16 name bytes
+/// (the key a static model resolves its parts by).
 #[derive(Resource, Default)]
 pub struct MmbTexPools {
     pub by_file: std::collections::HashMap<
@@ -105,8 +178,27 @@ pub struct MmbTexPools {
         (
             std::collections::HashMap<String, Handle<Image>>,
             Option<Handle<Image>>,
+            std::collections::HashMap<QualifiedTextureName, Handle<Image>>,
         ),
     >,
+}
+
+/// A static model (one MMB per placed piece of furniture) hangs its submeshes off `frame` and draws them by
+/// the static-model rules instead of the zone placement ones
+/// (.agents/skills/retail-observe/references/2026-10-15-mog-house-arrange.md A2).
+#[derive(Debug, Clone, Copy)]
+pub struct StaticModelTarget {
+    pub frame: Entity,
+    pub alpha_test: bool,
+}
+
+/// One submesh of a static model, with its own material so the piece can be tinted alone.
+#[derive(Component, Debug, Clone)]
+pub struct StaticModelPart {
+    pub file_id: u32,
+    pub texture_name: QualifiedTextureName,
+    pub material: Handle<FfxiZoneMaterial>,
+    pub textured: bool,
 }
 
 /// Last texture-filtering anisotropy applied to the pooled images, so the
@@ -163,6 +255,8 @@ pub struct LoadMmbRequest {
     /// `MmbPlacement::sub_area_link`; 0 for everything that is not the exterior
     /// shell of an interior.
     pub sub_area_link: u32,
+
+    pub static_model: Option<StaticModelTarget>,
 }
 
 // Animates one generator water sheet's UV scroll. Each sheet owns its material
@@ -206,7 +300,13 @@ pub fn apply_zone_shadow_cast(
     mut commands: Commands,
     q: Query<
         (Entity, Has<bevy::light::NotShadowCaster>),
-        (With<MmbOverlay>, With<crate::components::CameraOccluder>),
+        (
+            With<MmbOverlay>,
+            Or<(
+                With<crate::components::CameraOccluder>,
+                With<StaticModelPart>,
+            )>,
+        ),
     >,
 ) {
     if !settings.is_changed() {
@@ -255,6 +355,7 @@ impl Plugin for DatOverlayPlugin {
             .init_resource::<crate::sub_area_activation::SubAreaActivation>()
             .init_resource::<MmbHandleCache>()
             .init_resource::<MmbLoadQueue>()
+            .init_resource::<StreamEverything>()
             .init_resource::<MmbParseCache>()
             .init_resource::<MmbLoadInFlight>()
             .init_resource::<MmbTexPools>()
@@ -299,12 +400,19 @@ impl Plugin for DatOverlayPlugin {
             .add_systems(
                 Update,
                 apply_texture_filtering_system.run_if(resource_changed::<GraphicsSettings>),
+            )
+            .add_systems(
+                Update,
+                resolve_static_model_textures
+                    .after(process_load_mmb_requests)
+                    .run_if(resource_changed::<MmbTexPools>),
             );
     }
 }
 
 pub struct MmbSubMesh {
     pub variant_name: String,
+    pub texture_name_raw: QualifiedTextureName,
     pub positions: Vec<[f32; 3]>,
     pub normals: Vec<[f32; 3]>,
     pub uvs: Vec<[f32; 2]>,
@@ -317,6 +425,7 @@ pub struct MmbSubMesh {
 #[derive(Debug, Clone)]
 pub struct NamedTexture {
     pub name: String,
+    pub raw_name: Option<QualifiedTextureName>,
     pub texture: DecodedTexture,
 }
 
@@ -364,7 +473,12 @@ pub fn load_mmb(root: &DatRoot, file_id: u32, chunk_idx: usize) -> Result<Loaded
         .filter_map(|c| {
             let texture = decode_texture(c.data).ok()?;
             let name = ffxi_dat::texture::extract_texture_name(c.data).unwrap_or_default();
-            Some(NamedTexture { name, texture })
+            let raw_name = ffxi_dat::texture::texture_name_raw(c.data);
+            Some(NamedTexture {
+                name,
+                raw_name,
+                texture,
+            })
         })
         .collect();
 
@@ -404,6 +518,7 @@ pub fn load_mmb(root: &DatRoot, file_id: u32, chunk_idx: usize) -> Result<Loaded
         }
         out.push(MmbSubMesh {
             variant_name: m.texture_name.clone(),
+            texture_name_raw: m.texture_name_raw,
             positions,
             normals,
             uvs,
@@ -467,8 +582,8 @@ pub fn process_load_mmb_requests(
     mut parse_cache: ResMut<MmbParseCache>,
     mut tex_pools_res: ResMut<MmbTexPools>,
     settings: Res<GraphicsSettings>,
-    draw: Res<crate::dat_mzb::DrawDistance>,
-    self_q: Query<&GlobalTransform, With<crate::components::IsSelf>>,
+    gate: MmbStreamGate<'_>,
+    anchor: crate::dat_mzb::ZoneViewAnchor<'_, '_>,
     mut in_flight: ResMut<MmbLoadInFlight>,
     actor_root: Res<crate::ffxi_actor_render::ActorDatRoot>,
 ) {
@@ -499,12 +614,18 @@ pub fn process_load_mmb_requests(
         return;
     }
 
-    let self_pos = self_q.single().ok().map(|t| t.translation());
+    let (self_pos, follows_character) = match anchor.stream() {
+        Some((pos, character)) => (Some(pos), character),
+        None => (None, false),
+    };
+    // An attract-mode view has nothing waiting behind it: its stream is a
+    // background job, and the screens in front of it keep their frame rate.
+    let background_stream = self_pos.is_some() && !follows_character;
     if !mmb_repass_needed(
         new_events,
         parse_completed,
         queue.budget_deferred,
-        draw.is_changed(),
+        gate.draw.is_changed(),
         queue.last_eval_pos,
         self_pos,
     ) {
@@ -518,8 +639,11 @@ pub fn process_load_mmb_requests(
             mmb_load_order_key(a, self_pos).total_cmp(&mmb_load_order_key(b, self_pos))
         });
     }
-    let load_radius = draw.world * crate::dat_mzb::MMB_LOAD_DISTANCE_MARGIN;
+    let load_radius = gate.draw.world * crate::dat_mzb::MMB_LOAD_DISTANCE_MARGIN;
     let load_radius_sq = load_radius * load_radius;
+    // Full-load mode keeps every placement in play instead of holding the far
+    // ones back until the view approaches.
+    let gate_placements_by_distance = !gate.everything.0;
 
     let mut mmb_logged: std::collections::HashSet<(u32, usize)> = std::collections::HashSet::new();
 
@@ -542,19 +666,41 @@ pub fn process_load_mmb_requests(
     };
 
     const MMB_SPAWN_BUDGET: usize = 96;
+    /// A background stream takes a fraction of the frame's model files.
+    const BACKGROUND_SPAWN_BUDGET: usize = 24;
+    /// The count budget cannot bound a file carrying dozens of textures, so the
+    /// background stream also stops at a wall-clock slice.
+    const BACKGROUND_STREAM_SLICE_MS: u128 = 3;
     const HEAVY: usize = 8;
     const MMB_MAX_INFLIGHT: usize = 64;
+    let spawn_budget = if background_stream {
+        BACKGROUND_SPAWN_BUDGET
+    } else {
+        MMB_SPAWN_BUDGET
+    };
+    let frame_started = std::time::Instant::now();
     let mut spawned = 0usize;
     let mut newly_pooled: Vec<u32> = Vec::new();
     let mut retained: std::collections::VecDeque<LoadMmbRequest> =
         std::collections::VecDeque::with_capacity(queue.pending.len());
 
     while let Some(req) = queue.pending.pop_front() {
-        if let Some(self_pos) = self_pos {
-            if is_zone_placement(&req) && mmb_dist_sq_xz(&req, self_pos) > load_radius_sq {
-                retained.push_back(req);
-                retained.append(&mut queue.pending);
-                break;
+        if background_stream
+            && spawned > 0
+            && frame_started.elapsed().as_millis() >= BACKGROUND_STREAM_SLICE_MS
+        {
+            queue.budget_deferred = true;
+            retained.push_back(req);
+            retained.append(&mut queue.pending);
+            break;
+        }
+        if gate_placements_by_distance {
+            if let Some(self_pos) = self_pos {
+                if is_zone_placement(&req) && mmb_dist_sq_xz(&req, self_pos) > load_radius_sq {
+                    retained.push_back(req);
+                    retained.append(&mut queue.pending);
+                    break;
+                }
             }
         }
 
@@ -573,7 +719,7 @@ pub fn process_load_mmb_requests(
                             .push((req.chunk_idx, loaded.asset_name.clone()));
                     }
 
-                    if req.world_transform.is_none() {
+                    if req.world_transform.is_none() && req.static_model.is_none() {
                         push_system_msg(
                             &mut toasts,
                             format!(
@@ -587,7 +733,7 @@ pub fn process_load_mmb_requests(
 
                 let pool_exists = tex_pools_res.by_file.contains_key(&req.file_id);
                 let cost = if pool_exists { 1 } else { HEAVY };
-                if spawned > 0 && spawned + cost > MMB_SPAWN_BUDGET {
+                if spawned > 0 && spawned + cost > spawn_budget {
                     queue.budget_deferred = true;
                     retained.push_back(req);
                     continue;
@@ -600,21 +746,7 @@ pub fn process_load_mmb_requests(
                     anisotropy: settings.texture_filtering.anisotropy(),
                 };
                 let pool = tex_pools_res.by_file.entry(req.file_id).or_insert_with(|| {
-                    let mut by_name: std::collections::HashMap<String, Handle<Image>> =
-                        std::collections::HashMap::with_capacity(texture_count);
-                    let mut first: Option<Handle<Image>> = None;
-                    for nt in &loaded.textures {
-                        let mut image = decoded_texture_to_image(&nt.texture, quality);
-                        image.asset_usage = RenderAssetUsages::RENDER_WORLD;
-                        let handle = images.add(image);
-                        if first.is_none() {
-                            first = Some(handle.clone());
-                        }
-                        if !nt.name.is_empty() {
-                            by_name.insert(nt.name.clone(), handle);
-                        }
-                    }
-                    (by_name, first)
+                    pool_loaded_textures(loaded, texture_count, quality, &mut images)
                 });
                 let tex_by_name = &pool.0;
                 let first_texture = pool.1.clone();
@@ -683,6 +815,22 @@ pub fn process_load_mmb_requests(
                     );
                 }
 
+                if let Some(target) = req.static_model {
+                    if commands.get_entity(target.frame).is_ok() {
+                        spawn_static_model_parts(
+                            &mut commands,
+                            &req,
+                            target,
+                            loaded,
+                            &tex_pools_res,
+                            &mut handle_cache,
+                            &mut meshes,
+                            &mut materials,
+                            &settings,
+                        );
+                    }
+                    continue;
+                }
                 if req
                     .entity_id
                     .is_some_and(|id| !tracked.by_id.contains_key(&id))
@@ -743,18 +891,7 @@ pub fn process_load_mmb_requests(
                     let mesh_handle = handle_cache
                         .mesh
                         .entry(cache_key)
-                        .or_insert_with(|| {
-                            let mut mesh = Mesh::new(
-                                PrimitiveTopology::TriangleList,
-                                RenderAssetUsages::default(),
-                            );
-                            mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, sub.positions.clone());
-                            mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, sub.normals.clone());
-                            mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, sub.uvs.clone());
-                            mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, sub.colors.clone());
-                            mesh.insert_indices(Indices::U32(sub.indices.clone()));
-                            meshes.add(mesh)
-                        })
+                        .or_insert_with(|| meshes.add(submesh_mesh(sub)))
                         .clone();
 
                     let variant_trimmed = sub.variant_name.trim();
@@ -941,6 +1078,13 @@ pub fn process_load_mmb_requests(
                 }
             }
             None => {
+                let at_parse_cap = !in_flight.tasks.contains_key(&asset)
+                    && in_flight.tasks.len() >= MMB_MAX_INFLIGHT;
+                if at_parse_cap {
+                    // The cap defers the parse, not just this frame's pass; without
+                    // a repass signal the tail of the queue would never drain.
+                    queue.budget_deferred = true;
+                }
                 if !in_flight.tasks.contains_key(&asset) && in_flight.tasks.len() < MMB_MAX_INFLIGHT
                 {
                     let pool = AsyncComputeTaskPool::get();
@@ -1003,12 +1147,198 @@ pub fn process_load_mmb_requests(
     }
 }
 
+fn submesh_mesh(sub: &MmbSubMesh) -> Mesh {
+    let mut mesh = Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::default(),
+    );
+    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, sub.positions.clone());
+    mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, sub.normals.clone());
+    mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, sub.uvs.clone());
+    mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, sub.colors.clone());
+    mesh.insert_indices(Indices::U32(sub.indices.clone()));
+    mesh
+}
+
+/// What a static model's parts can bind from what is pooled now: its own file's textures, then every pooled
+/// file's in file-id order (ffxi_dat::furniture::match_part_texture).
+struct StaticTextureSources {
+    own: Vec<(QualifiedTextureName, Handle<Image>)>,
+    loaded: Vec<(QualifiedTextureName, Handle<Image>)>,
+}
+
+impl StaticTextureSources {
+    fn new(pools: &MmbTexPools, file_id: u32) -> Self {
+        let sorted = |names: &std::collections::HashMap<QualifiedTextureName, Handle<Image>>| {
+            let mut entries: Vec<(QualifiedTextureName, Handle<Image>)> = names
+                .iter()
+                .map(|(name, handle)| (*name, handle.clone()))
+                .collect();
+            entries.sort_by_key(|(name, _)| *name);
+            entries
+        };
+        let own = pools
+            .by_file
+            .get(&file_id)
+            .map(|pool| sorted(&pool.2))
+            .unwrap_or_default();
+        let mut files: Vec<_> = pools.by_file.iter().collect();
+        files.sort_by_key(|(id, _)| **id);
+        let loaded = files.iter().flat_map(|(_, pool)| sorted(&pool.2)).collect();
+        Self { own, loaded }
+    }
+
+    fn texture(&self, part: &QualifiedTextureName) -> Option<Handle<Image>> {
+        ffxi_dat::furniture::match_part_texture(part, &self.own, &self.loaded)
+    }
+}
+
+pub fn static_part_texture(
+    pools: &MmbTexPools,
+    file_id: u32,
+    part: &QualifiedTextureName,
+) -> Option<Handle<Image>> {
+    StaticTextureSources::new(pools, file_id).texture(part)
+}
+
+/// The static-model draw state for one part
+/// (.agents/skills/retail-observe/references/2026-10-15-mog-house-arrange.md A2): the zone pass's
+/// lighting and fog, 0x8000 blends the part, 0x2000 draws both faces, and an alpha-tested piece keeps
+/// pixels above [`ffxi_dat::furniture::ALPHA_TEST_REF`].
+pub fn static_part_material(
+    texture: Option<Handle<Image>>,
+    blending: u16,
+    alpha_test: bool,
+    light_bindings: crate::ffxi_zone_material::ZoneLightBindings,
+    area_id: u32,
+) -> FfxiZoneMaterial {
+    let rs = mmb::MmbRenderState::from_blending(blending);
+    let threshold = if alpha_test {
+        f32::from(ffxi_dat::furniture::ALPHA_TEST_REF) / f32::from(u8::MAX)
+    } else {
+        0.0
+    };
+    let alpha_mode = if rs.blend_enabled {
+        AlphaMode::Blend
+    } else if alpha_test {
+        AlphaMode::Mask(threshold)
+    } else {
+        AlphaMode::Opaque
+    };
+    let has_texture = if texture.is_some() { 1.0 } else { 0.0 };
+    let blend_flag = if rs.blend_enabled { 1.0 } else { 0.0 };
+    FfxiZoneMaterial::new(
+        texture,
+        crate::skinned_ffxi_material::FfxiMaterialFlags {
+            flags: Vec4::new(
+                has_texture,
+                blend_flag,
+                crate::ffxi_zone_material::ZONE_FLAG_FOGGED,
+                threshold,
+            ),
+        },
+        Vec4::ONE,
+        Vec4::ZERO,
+        alpha_mode,
+        crate::ffxi_zone_material::FfxiZoneMaterialKey {
+            back_face_culling: rs.back_face_culling,
+            mirrored: false,
+            z_bias_level: rs.z_bias_level(),
+            depth_write: rs.depth_write(),
+            generator_stage_chain: false,
+        },
+    )
+    .with_light_bindings(light_bindings)
+    .with_area(area_id)
+}
+
+fn spawn_static_model_parts(
+    commands: &mut Commands,
+    req: &LoadMmbRequest,
+    target: StaticModelTarget,
+    loaded: &LoadedMmb,
+    pools: &MmbTexPools,
+    handle_cache: &mut MmbHandleCache,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<FfxiZoneMaterial>,
+    settings: &GraphicsSettings,
+) {
+    let sources = StaticTextureSources::new(pools, req.file_id);
+    for (sub_index, sub) in loaded.submeshes.iter().enumerate() {
+        let mesh = handle_cache
+            .mesh
+            .entry((req.file_id, req.chunk_idx, sub_index))
+            .or_insert_with(|| meshes.add(submesh_mesh(sub)))
+            .clone();
+        let texture = sources.texture(&sub.texture_name_raw);
+        let textured = texture.is_some();
+        let material = materials.add(static_part_material(
+            texture,
+            sub.blending,
+            target.alpha_test,
+            req.light_bindings,
+            req.area_id,
+        ));
+        let mut part = commands.spawn((
+            MmbOverlay,
+            Mesh3d(mesh),
+            MeshMaterial3d(material.clone()),
+            Transform::default(),
+            ChildOf(target.frame),
+            StaticModelPart {
+                file_id: req.file_id,
+                texture_name: sub.texture_name_raw,
+                material,
+                textured,
+            },
+        ));
+        if !settings.zone_shadow_cast {
+            part.insert(bevy::light::NotShadowCaster);
+        }
+        part.insert(mesh_debug_bundle(crate::components::MmbDebugInfo {
+            file_id: req.file_id,
+            chunk_idx: req.chunk_idx,
+            sub_index,
+            asset_name: loaded.asset_name.clone(),
+            variant_name: sub.variant_name.trim().to_string(),
+        }));
+    }
+}
+
+/// Retail binds a static-model part to whatever texture is loaded when the piece is built, which in
+/// retail is after its room. Here the room's own textures can pool after a piece, so a part that found
+/// nothing tries again whenever the pools grow.
+pub fn resolve_static_model_textures(
+    pools: Res<MmbTexPools>,
+    mut parts: Query<&mut StaticModelPart>,
+    mut materials: ResMut<Assets<FfxiZoneMaterial>>,
+) {
+    let mut sources: std::collections::HashMap<u32, StaticTextureSources> = Default::default();
+    for mut part in &mut parts {
+        if part.textured {
+            continue;
+        }
+        let Some(texture) = sources
+            .entry(part.file_id)
+            .or_insert_with(|| StaticTextureSources::new(&pools, part.file_id))
+            .texture(&part.texture_name)
+        else {
+            continue;
+        };
+        if let Some(mut material) = materials.get_mut(&part.material) {
+            material.base_color_texture = Some(texture);
+            material.material_flags.flags.x = 1.0;
+        }
+        part.textured = true;
+    }
+}
+
 /// Choose an MMB submesh's render mode, per XIM (`research/xim` ·
 /// `ZoneMeshSection.kt`). The model name (header bytes 16..32, our
 /// `zone_mesh_name`) starting with '_' selects an alpha-tested cutout at
 /// XIM's `discardThreshold` of 0.375; the `0x8000` flag bit marks translucency
 /// (water/glass), rendered as `AlphaMode::Blend` — the zone shader emits real
-/// alpha for these (see `flags.y` in `zone_ffxi.wgsl`). Everything else is
+/// alpha for these (see `flags.y` in `zone_ffxi.wesl`). Everything else is
 /// opaque. The render mode is NEVER derived from texture alpha content — doing
 /// so punches holes in ordinary opaque ground/wall textures that carry
 /// incidental transparency.
@@ -1055,8 +1385,8 @@ pub fn apply_texture_filtering_system(
             );
         }
     };
-    for (by_name, first) in pools.by_file.values() {
-        for handle in by_name.values() {
+    for (by_name, first, by_raw_name) in pools.by_file.values() {
+        for handle in by_name.values().chain(by_raw_name.values()) {
             patch(handle);
         }
         if let Some(handle) = first {
@@ -1132,6 +1462,7 @@ mod tests {
             slot: crate::dat_mzb::ZONE_SLOT_MAIN,
             sub_area_link: NO_SUB_AREA_LINK,
             voyage_backdrop: false,
+            static_model: None,
         }
     }
 
@@ -1150,6 +1481,7 @@ mod tests {
             slot: crate::dat_mzb::ZONE_SLOT_MAIN,
             sub_area_link: NO_SUB_AREA_LINK,
             voyage_backdrop: false,
+            static_model: None,
         }
     }
 
@@ -1247,6 +1579,7 @@ mod tests {
                 submeshes: Vec::new(),
                 textures: vec![NamedTexture {
                     name: "tex".to_string(),
+                    raw_name: None,
                     texture: DecodedTexture {
                         width: 1,
                         height: 1,
@@ -1330,5 +1663,130 @@ mod zone_shadow_cast_tests {
             .zone_shadow_cast = false;
         app.update();
         assert!(app.world().get::<NotShadowCaster>(placement).is_some());
+    }
+}
+
+#[cfg(test)]
+mod static_model_tests {
+    use super::*;
+    use crate::ffxi_zone_material::ZoneLightBindings;
+    use ffxi_dat::texture::NAMESPACE_LEN;
+
+    const BLEND: u16 = 0x8000;
+    const BOTH_FACES: u16 = 0x2000;
+    const OWN_FILE: u32 = 7;
+    const OTHER_FILE: u32 = 3;
+    const LATER_FILE: u32 = 9;
+
+    fn name(namespace: &[u8; 8], local: &[u8; 8]) -> QualifiedTextureName {
+        let mut n = [0u8; 16];
+        n[..NAMESPACE_LEN].copy_from_slice(namespace);
+        n[NAMESPACE_LEN..].copy_from_slice(local);
+        n
+    }
+
+    fn pool(
+        names: &[(QualifiedTextureName, Handle<Image>)],
+    ) -> (
+        std::collections::HashMap<String, Handle<Image>>,
+        Option<Handle<Image>>,
+        std::collections::HashMap<QualifiedTextureName, Handle<Image>>,
+    ) {
+        (
+            Default::default(),
+            names.first().map(|(_, h)| h.clone()),
+            names.iter().cloned().collect(),
+        )
+    }
+
+    #[test]
+    fn a_static_part_blends_on_0x8000_and_alpha_tests_only_when_the_piece_does() {
+        let bindings = ZoneLightBindings::default();
+        let blended = static_part_material(None, BLEND, false, bindings, 0);
+        assert_eq!(blended.alpha_mode, AlphaMode::Blend);
+        assert_eq!(blended.material_flags.flags.y, 1.0);
+        assert_eq!(blended.material_flags.flags.w, 0.0);
+        assert!(!blended.render_key.depth_write);
+
+        let cutout = static_part_material(None, 0, true, bindings, 0);
+        let threshold = f32::from(ffxi_dat::furniture::ALPHA_TEST_REF) / f32::from(u8::MAX);
+        assert_eq!(cutout.alpha_mode, AlphaMode::Mask(threshold));
+        assert_eq!(cutout.material_flags.flags.w, threshold);
+        assert!(cutout.render_key.back_face_culling);
+        assert!(!cutout.render_key.mirrored && !cutout.render_key.generator_stage_chain);
+
+        let blended_cutout = static_part_material(None, BLEND, true, bindings, 0);
+        assert_eq!(blended_cutout.alpha_mode, AlphaMode::Blend);
+        assert_eq!(blended_cutout.material_flags.flags.w, threshold);
+
+        let two_sided = static_part_material(None, BOTH_FACES, false, bindings, 0);
+        assert_eq!(two_sided.alpha_mode, AlphaMode::Opaque);
+        assert!(!two_sided.render_key.back_face_culling);
+        assert_eq!(two_sided.material_flags.flags.x, 0.0, "no texture bound");
+    }
+
+    #[test]
+    fn a_static_part_takes_its_own_file_then_the_full_name_then_the_local_name() {
+        let mut images = Assets::<Image>::default();
+        let own = images.add(Image::default());
+        let full = images.add(Image::default());
+        let local = images.add(Image::default());
+        let part = name(b"furnitur", b"desk_top");
+        let mut pools = MmbTexPools::default();
+        pools.by_file.insert(
+            OTHER_FILE,
+            pool(&[(name(b"zone____", b"desk_top"), local.clone())]),
+        );
+        pools
+            .by_file
+            .insert(LATER_FILE, pool(&[(part, full.clone())]));
+        pools.by_file.insert(OWN_FILE, pool(&[(part, own.clone())]));
+        assert_eq!(static_part_texture(&pools, OWN_FILE, &part), Some(own));
+        pools.by_file.remove(&OWN_FILE);
+        assert_eq!(static_part_texture(&pools, OWN_FILE, &part), Some(full));
+        pools.by_file.remove(&LATER_FILE);
+        assert_eq!(static_part_texture(&pools, OWN_FILE, &part), Some(local));
+        pools.by_file.clear();
+        assert_eq!(static_part_texture(&pools, OWN_FILE, &part), None);
+    }
+
+    #[test]
+    fn an_untextured_part_binds_a_texture_that_pools_later() {
+        let mut app = App::new();
+        app.init_resource::<Assets<Image>>()
+            .init_resource::<Assets<FfxiZoneMaterial>>()
+            .init_resource::<MmbTexPools>()
+            .add_systems(Update, resolve_static_model_textures);
+        let part_name = name(b"furnitur", b"desk_top");
+        let material = app
+            .world_mut()
+            .resource_mut::<Assets<FfxiZoneMaterial>>()
+            .add(static_part_material(None, 0, false, Default::default(), 0));
+        let part = app
+            .world_mut()
+            .spawn(StaticModelPart {
+                file_id: OWN_FILE,
+                texture_name: part_name,
+                material: material.clone(),
+                textured: false,
+            })
+            .id();
+        app.update();
+        assert!(!app.world().get::<StaticModelPart>(part).unwrap().textured);
+
+        let image = app
+            .world_mut()
+            .resource_mut::<Assets<Image>>()
+            .add(Image::default());
+        app.world_mut()
+            .resource_mut::<MmbTexPools>()
+            .by_file
+            .insert(OTHER_FILE, pool(&[(part_name, image.clone())]));
+        app.update();
+        assert!(app.world().get::<StaticModelPart>(part).unwrap().textured);
+        let materials = app.world().resource::<Assets<FfxiZoneMaterial>>();
+        let bound = materials.get(&material).unwrap();
+        assert_eq!(bound.base_color_texture, Some(image));
+        assert_eq!(bound.material_flags.flags.x, 1.0);
     }
 }

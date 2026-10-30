@@ -1,6 +1,7 @@
+use bevy::feathers::font_styles::InheritableFont;
 pub mod text_field;
 
-use bevy::feathers::controls::{button_bundle, ButtonBundleProps, ButtonVariant};
+use bevy::feathers::controls::{ButtonVariant, FeathersButton};
 use bevy::feathers::theme::ThemedText;
 use bevy::input_focus::tab_navigation::TabGroup;
 use bevy::prelude::*;
@@ -112,15 +113,16 @@ pub fn spawn_widget_demo(mut commands: Commands) {
                     ..default()
                 },
             ));
-            root.spawn(button_bundle(
-                ButtonBundleProps {
-                    variant: ButtonVariant::Primary,
-                    ..default()
-                },
-                (),
-                Spawn((Text::new("Sign in"), ThemedText)),
-            ));
+            root.spawn_empty().apply_scene(bsn! {
+                @FeathersButton {
+                    @variant: ButtonVariant::Primary,
+                    @caption: bsn! {
+                        Text::new("Sign in")
+                        ThemedText
+                    },
+                }
+                Node { flex_grow: 1.0 }
+                InheritableFont { font: {Handle::<Font>::default()} }
+            });
         });
 }
-
-use bevy::ecs::spawn::Spawn;

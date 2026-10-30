@@ -20,10 +20,19 @@ impl AuthFlavorKind {
         !matches!(self, AuthFlavorKind::PlayOnline)
     }
 
+    pub fn auth_flavor(self) -> kuluu_session::auth_client::AuthFlavor {
+        use kuluu_session::auth_client::AuthFlavor;
+        match self {
+            Self::Json => AuthFlavor::Json,
+            Self::Binary => AuthFlavor::Binary,
+            Self::PlayOnline => AuthFlavor::PlayOnline,
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
-            AuthFlavorKind::Json => "JSON",
-            AuthFlavorKind::Binary => "Binary",
+            AuthFlavorKind::Json => "Current LSB",
+            AuthFlavorKind::Binary => "Legacy LSB",
             AuthFlavorKind::PlayOnline => "PlayOnline",
         }
     }
@@ -67,6 +76,7 @@ pub const HORIZONXI_HOST: &str = "play.horizonxi.com";
 /// HorizonXI's launcher ships a 2.0.0 xiloader; the JSON auth flavor is what
 /// its server answers.
 pub const HORIZONXI_XILOADER_VERSION: &str = "2.0.0";
+pub const LEGACY_LSB_XILOADER_VERSION: &str = "1.1.5";
 const HORIZONXI_KNOWN_CLIENT: &str = "horizonxi-2023";
 pub const LOCALHOST: &str = "127.0.0.1";
 
@@ -93,6 +103,14 @@ pub fn server_templates() -> Vec<ServerTemplate> {
         ServerTemplate {
             label: "Local LandSandBoat",
             profile: ServerProfile::lsb_defaults("local", LOCALHOST),
+        },
+        ServerTemplate {
+            label: "Legacy LSB",
+            profile: ServerProfile {
+                flavor: AuthFlavorKind::Binary,
+                xiloader_version: Some(LEGACY_LSB_XILOADER_VERSION.into()),
+                ..ServerProfile::lsb_defaults("", "")
+            },
         },
         ServerTemplate {
             label: "PlayOnline",
@@ -466,6 +484,29 @@ mod tests {
 
     fn profile(name: &str, host: &str) -> ServerProfile {
         ServerProfile::lsb_defaults(name, host)
+    }
+
+    #[test]
+    fn legacy_template_sets_protocol_and_version_without_changing_existing_defaults() {
+        let legacy = server_templates()
+            .into_iter()
+            .find(|template| template.label == "Legacy LSB")
+            .unwrap()
+            .profile;
+        assert_eq!(legacy.flavor, AuthFlavorKind::Binary);
+        assert_eq!(
+            legacy.xiloader_version.as_deref(),
+            Some(LEGACY_LSB_XILOADER_VERSION)
+        );
+        let current = ServerProfile::lsb_defaults("", "");
+        assert_eq!(current.flavor, AuthFlavorKind::Json);
+        assert!(current.xiloader_version.is_none());
+        let mut saved_binary = current;
+        saved_binary.flavor = AuthFlavorKind::Binary;
+        let restored: ServerProfile =
+            serde_json::from_str(&serde_json::to_string(&saved_binary).unwrap()).unwrap();
+        assert_eq!(restored.flavor, AuthFlavorKind::Binary);
+        assert!(restored.xiloader_version.is_none());
     }
 
     #[test]

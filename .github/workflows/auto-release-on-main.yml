@@ -52,5 +52,6 @@ jobs:
     uses: ./.github/workflows/release.yml
     with:
       tag: ${{ needs.detect.outputs.tag }}
+      publish: true
     permissions:
       contents: write

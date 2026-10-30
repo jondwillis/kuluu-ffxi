@@ -402,6 +402,31 @@ impl DatRoot {
         self.apps.first().map_or(0, |base| base.vtable.len())
     }
 
+    /// The `file_id` whose (dir, file) sub-path matches, under the same
+    /// highest-ROM-wins ownership walk [`Self::resolve`] uses. Lets a caller pin
+    /// only a `<dir>/<no>` pair — measured names like the mission-family catalogs
+    /// ROM/176/67-73.DAT — and still resolve through each install's own tables.
+    pub fn locate(&self, dir: u16, file: u8) -> Option<DatLocation> {
+        for app in self.apps.iter().rev() {
+            for file_id in 0..app.vtable.len() {
+                if !app.vtable.contains(file_id, app.rom_index) {
+                    continue;
+                }
+                if app
+                    .ftable
+                    .sub_path(file_id)
+                    .is_ok_and(|sp| sp.dir == dir && sp.file == file)
+                {
+                    return Some(DatLocation {
+                        rom_dir: app.rom_dir.clone(),
+                        sub_path: SubPath { dir, file },
+                    });
+                }
+            }
+        }
+        None
+    }
+
     /// The highest ROM claiming `file_id` owns it. LoadFileTables
     /// (research/XIClient/src/XIClient/source/System/FileIO/FileIOVirtualFileSystem.cpp)
     /// merges ROM2..INDEX_ROM_MAX ascending into the base tables and overwrites

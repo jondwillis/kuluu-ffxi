@@ -15,15 +15,20 @@ pub fn event_map_sync_system(
     mut mode: ResMut<InputMode>,
     mut map_state: ResMut<kuluu_render::hud::map_screen::MapScreenState>,
     mut markers: ResMut<kuluu_render::hud::map_screen::MapMarkers>,
+    dynamic_menu: Res<kuluu_render::hud::menu::DynamicMenu>,
 ) {
     let total = events.pushed_total;
     let len = events.recent.len() as u64;
     let first_global = total - len;
     for i in (*cursor).max(first_global)..total {
         match &events.recent[(i - first_global) as usize] {
-            kuluu_snapshot::ViewerEvent::MapOpen { map_id, .. } => {
-                open_event_map(*map_id, state.snapshot.zone_id, &mut mode, &mut map_state)
-            }
+            kuluu_snapshot::ViewerEvent::MapOpen { map_id, .. } => open_event_map(
+                *map_id,
+                state.snapshot.zone_id,
+                &mut mode,
+                &mut map_state,
+                &dynamic_menu.window_cursors,
+            ),
             kuluu_snapshot::ViewerEvent::MapMarkerPlaced {
                 map_id,
                 x_milli,
@@ -31,6 +36,21 @@ pub fn event_map_sync_system(
                 label,
             } => upsert_event_marker(*map_id, *x_milli, *y_milli, label.clone(), &mut markers),
             kuluu_snapshot::ViewerEvent::MapClosed => close_event_map(&mut mode, &mut map_state),
+            // 0x8D OPEN_MAP_PROPS hands the window its prop-label layer state;
+            // stored on the surface until a label layer exists to read it.
+            kuluu_snapshot::ViewerEvent::EventMapPropsState { select, value } => {
+                map_state.event_props_layer = Some((*select, *value));
+            }
+            // 0x34/0x35 MAPLOAD's final pass tears the window data down and
+            // re-opens it for the named id; kuluu's observable equivalent is
+            // opening the surface on that id.
+            kuluu_snapshot::ViewerEvent::MapReloadRequested { map_id } => open_event_map(
+                *map_id,
+                state.snapshot.zone_id,
+                &mut mode,
+                &mut map_state,
+                &dynamic_menu.window_cursors,
+            ),
             _ => {}
         }
     }
@@ -45,13 +65,14 @@ fn open_event_map(
     live_zone: Option<u16>,
     mode: &mut InputMode,
     map_state: &mut kuluu_render::hud::map_screen::MapScreenState,
+    window_cursors: &CursorMemory,
 ) {
     let already_open = matches!(
         mode,
         InputMode::Menu(stack) if stack.current().is_some_and(|l| l.kind == MenuKind::Map)
     );
     if !already_open {
-        let mut stack = MenuStack::root();
+        let mut stack = MenuStack::open_main_menu(window_cursors);
         stack.push(MenuKind::Map);
         *mode = InputMode::Menu(stack);
     }
@@ -113,6 +134,7 @@ mod tests {
         world.insert_resource(InputMode::World);
         world.insert_resource(MapScreenState::default());
         world.insert_resource(MapMarkers::default());
+        world.insert_resource(kuluu_render::hud::menu::DynamicMenu::default());
         world.clear_trackers();
         world
     }
@@ -125,10 +147,19 @@ mod tests {
             ResMut<InputMode>,
             ResMut<MapScreenState>,
             ResMut<MapMarkers>,
+            Res<kuluu_render::hud::menu::DynamicMenu>,
         )>::new(world);
-        let (scene, events, cursor, mode, map_state, markers) =
+        let (scene, events, cursor, mode, map_state, markers, dynamic_menu) =
             state.get_mut(world).expect("event-map params");
-        event_map_sync_system(scene, events, cursor, mode, map_state, markers);
+        event_map_sync_system(
+            scene,
+            events,
+            cursor,
+            mode,
+            map_state,
+            markers,
+            dynamic_menu,
+        );
     }
 
     fn mode_is_map_open(world: &World) -> bool {
@@ -284,5 +315,37 @@ mod tests {
         assert_eq!(markers.for_zone(230)[0].label, "Ailevia");
         assert_eq!(markers.for_zone(230)[0].world.x, -10.264);
         assert_eq!(markers.for_zone(230)[0].world.z, -0.363);
+    }
+
+    /// 0x8D's two raw work operands reach the window and stay there (nothing
+    /// draws them yet).
+    #[test]
+    fn prop_label_state_is_stored_on_the_window() {
+        let mut world = world_with_zone(Some(230));
+        push(
+            &mut world,
+            ViewerEvent::EventMapPropsState {
+                select: 2,
+                value: 1,
+            },
+        );
+        run(&mut world);
+
+        assert_eq!(
+            world.resource::<MapScreenState>().event_props_layer,
+            Some((2, 1))
+        );
+    }
+
+    /// MAPLOAD's final pass re-opens the window on the named id: a foreign zone
+    /// lands as the Change-Map override, exactly like a fresh open.
+    #[test]
+    fn reload_reopens_the_surface_on_the_named_zone() {
+        let mut world = world_with_zone(Some(230));
+        push(&mut world, ViewerEvent::MapReloadRequested { map_id: 150 });
+        run(&mut world);
+
+        assert!(mode_is_map_open(&world));
+        assert_eq!(world.resource::<MapScreenState>().viewed, Some((150, 0)));
     }
 }

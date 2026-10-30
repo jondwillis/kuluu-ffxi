@@ -22,7 +22,7 @@
 //! unsampled view holds the fully processed image in every AA mode. Both passes here touch only
 //! that single-sample surface; nothing samples a multi-sample buffer.
 
-use std::time::Instant;
+use bevy::platform::time::Instant;
 
 use bevy::asset::{embedded_asset, AssetServer};
 use bevy::core_pipeline::{upscaling::upscaling, Core3d, Core3dSystems};
@@ -245,7 +245,7 @@ pub struct FanVertex {
     pub vertex_rgb: f32,
 }
 
-/// Floats written per [`FanVertex`], and the attribute order `distortion.wgsl` expects.
+/// Floats written per [`FanVertex`], and the attribute order `distortion.wesl` expects.
 pub const FAN_VERTEX_FLOATS: usize = 10;
 const FAN_VERTEX_BYTES: usize = FAN_VERTEX_FLOATS * std::mem::size_of::<f32>();
 
@@ -451,8 +451,8 @@ impl DistortionPassGpu {
             mapped_at_creation: false,
         });
         Self {
-            field_shader: asset_server.load("embedded://kuluu_render/distortion.wgsl"),
-            copy_shader: asset_server.load("embedded://kuluu_render/distortion_copy.wgsl"),
+            field_shader: asset_server.load("embedded://kuluu_render/distortion.wesl"),
+            copy_shader: asset_server.load("embedded://kuluu_render/distortion_copy.wesl"),
             field_bgl0: field_bgl_descriptors(),
             copy_bgl: copy_bgl_descriptor(),
             sampler,
@@ -551,6 +551,7 @@ fn field_pipeline_descriptor(
             ..Default::default()
         },
         fragment: Some(FragmentState {
+            constants: Default::default(),
             shader: shader.clone(),
             entry_point: Some("fs".into()),
             shader_defs: Vec::new(),
@@ -602,6 +603,7 @@ fn copy_pipeline_descriptor(
             ..Default::default()
         },
         fragment: Some(FragmentState {
+            constants: Default::default(),
             shader: shader.clone(),
             entry_point: Some("fs".into()),
             shader_defs: Vec::new(),
@@ -773,8 +775,8 @@ pub struct DistortionPassPlugin;
 
 impl Plugin for DistortionPassPlugin {
     fn build(&self, app: &mut App) {
-        embedded_asset!(app, "distortion.wgsl");
-        embedded_asset!(app, "distortion_copy.wgsl");
+        embedded_asset!(app, "distortion.wesl");
+        embedded_asset!(app, "distortion_copy.wesl");
         app.init_resource::<ActiveDistortion>().add_systems(
             Update,
             (carry_attached_distortion_fields, prune_distortion_fields).chain(),
@@ -825,7 +827,7 @@ mod tests {
     #[test]
     fn fan_covers_the_built_in_footprint_with_four_triangles() {
         let world_from_view = eye_ahead_of_origin();
-        let clip = Mat4::perspective_rh(std::f32::consts::FRAC_PI_3, 1.0, 0.1, 500.0);
+        let clip = bevy::math::proj::perspective(std::f32::consts::FRAC_PI_3, 1.0, 0.1, 500.0);
         let f = field(Vec2::ONE, 0.0);
         let fan =
             build_fan(world_from_view, clip, &f, f.started_at, Vec2::splat(1280.0)).expect("fan");
@@ -849,7 +851,7 @@ mod tests {
     /// sampling coordinate of that corner untouched — displacement without a second sample.
     #[test]
     fn haze_shifts_the_draw_on_both_axes_but_never_the_sample() {
-        let clip = Mat4::perspective_rh(std::f32::consts::FRAC_PI_3, 1.0, 0.1, 500.0);
+        let clip = bevy::math::proj::perspective(std::f32::consts::FRAC_PI_3, 1.0, 0.1, 500.0);
         let world = eye_ahead_of_origin();
         let no_haze = field(Vec2::ONE, 0.0);
         let with = field(Vec2::ONE, 0.02);
@@ -887,7 +889,7 @@ mod tests {
     /// exactly the same amount regardless of where their alpha track has got to.
     #[test]
     fn haze_translation_does_not_scale_with_the_alpha_track() {
-        let clip = Mat4::perspective_rh(std::f32::consts::FRAC_PI_3, 1.0, 0.1, 500.0);
+        let clip = bevy::math::proj::perspective(std::f32::consts::FRAC_PI_3, 1.0, 0.1, 500.0);
         let world = eye_ahead_of_origin();
         // g142's k143 knots at the precision the record carries them: the DAT stores these as 32-bit
         // floats, so rounding a knot here would move the plateau the test is measuring.
@@ -952,7 +954,7 @@ mod tests {
     /// A field whose alpha track has reached zero contributes no geometry at all.
     #[test]
     fn a_field_at_zero_alpha_draws_nothing() {
-        let clip = Mat4::perspective_rh(std::f32::consts::FRAC_PI_3, 1.0, 0.1, 500.0);
+        let clip = bevy::math::proj::perspective(std::f32::consts::FRAC_PI_3, 1.0, 0.1, 500.0);
         let world = eye_ahead_of_origin();
         let mut f = field(Vec2::ONE, 0.02);
         f.envelope = Some(ffxi_dat::particle_gen::KeyFrameTrack {
@@ -973,7 +975,7 @@ mod tests {
     /// copy the scene out of.
     #[test]
     fn a_field_behind_the_eye_draws_nothing() {
-        let clip = Mat4::perspective_rh(std::f32::consts::FRAC_PI_3, 1.0, 0.1, 500.0);
+        let clip = bevy::math::proj::perspective(std::f32::consts::FRAC_PI_3, 1.0, 0.1, 500.0);
         let behind = Mat4::from_translation(Vec3::new(0.0, 0.0, -3.0));
         let f = field(Vec2::ONE, 0.02);
         assert!(build_fan(behind, clip, &f, f.started_at, Vec2::splat(1280.0)).is_none());
@@ -1110,7 +1112,7 @@ mod tests {
     fn partially_offscreen_field_keeps_its_projected_footprint() {
         // Close enough that the footprint is wider than the frustum: some corners land outside NDC.
         let world_from_view = Mat4::from_translation(Vec3::new(0.0, 0.0, 1.2));
-        let clip = Mat4::perspective_rh(std::f32::consts::FRAC_PI_3, 1.0, 0.1, 500.0);
+        let clip = bevy::math::proj::perspective(std::f32::consts::FRAC_PI_3, 1.0, 0.1, 500.0);
         let f = field(Vec2::ONE, 0.0);
         let fan =
             build_fan(world_from_view, clip, &f, f.started_at, Vec2::splat(1280.0)).expect("fan");
@@ -1142,7 +1144,7 @@ mod tests {
         }
     }
 
-    /// The vertex stream is a wire contract with distortion.wgsl: four vec2s then two scalars, little
+    /// The vertex stream is a wire contract with distortion.wesl: four vec2s then two scalars, little
     /// endian, so a reorder cannot silently desync the two.
     #[test]
     fn fan_vertex_bytes_match_the_wgsl_layout() {

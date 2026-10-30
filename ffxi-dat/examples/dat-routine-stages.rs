@@ -33,6 +33,18 @@ fn main() -> ExitCode {
         }
         println!("routine {}", String::from_utf8_lossy(&sched.name));
         for t in &sched.stages {
+            if t.stage.kind == ffxi_dat::scheduler::StageKind::Unknown {
+                println!(
+                    "   frame {:>4} kind={:?} op=0x{:02X} words={} id_hex={:02X?} dur={}",
+                    t.frame,
+                    t.stage.kind,
+                    t.stage.raw_type,
+                    t.stage.stage_words,
+                    t.stage.id,
+                    t.stage.duration_frames,
+                );
+                continue;
+            }
             println!(
                 "   frame {:>4} kind={:?} op=0x{:02X} id={} dur={} loops={:?}",
                 t.frame,

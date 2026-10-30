@@ -1,5 +1,5 @@
-use bevy::ecs::spawn::Spawn;
-use bevy::feathers::controls::{button_bundle, ButtonBundleProps, ButtonVariant};
+use bevy::feathers::controls::{ButtonVariant, FeathersButton};
+use bevy::feathers::font_styles::InheritableFont;
 use bevy::feathers::theme::ThemedText;
 use bevy::input::keyboard::{Key, KeyboardInput};
 use bevy::input::ButtonState;
@@ -66,7 +66,7 @@ pub(super) struct GraphicsValueText(GraphicsField);
 pub(super) struct AdvancedRow;
 
 /// The disclosure row's label text, swapped between `>` and `v`.
-#[derive(Component)]
+#[derive(Component, Default, Clone)]
 pub(super) struct AdvancedToggleLabel;
 
 /// Whether the Advanced sub-knobs are expanded. Persists across visits to the
@@ -96,7 +96,7 @@ pub(super) struct DlssRow;
 pub(super) struct DlssGated;
 
 /// The DLSS disclosure row's label text, swapped between `>` and `v`.
-#[derive(Component)]
+#[derive(Component, Default, Clone)]
 pub(super) struct DlssToggleLabel;
 
 /// Whether the DLSS config rows are expanded. Persists across visits like
@@ -179,22 +179,22 @@ pub(super) fn spawn_ui(
                                     }
 
                                     list.spawn(row()).with_children(|r| {
-                                        r.spawn(button_bundle(
-                                            ButtonBundleProps {
-                                                variant: ButtonVariant::Normal,
-                                                ..default()
-                                            },
-                                            (),
-                                            Spawn((
-                                                Text::new(if open {
+                                        r.spawn_empty().apply_scene(bsn! {
+                                            @FeathersButton {
+                                                @variant: ButtonVariant::Normal,
+                                                @caption: bsn! {
+                                                    Text::new(if open {
                                                     ADVANCED_EXPANDED
-                                                } else {
+                                                    } else {
                                                     ADVANCED_COLLAPSED
-                                                }),
-                                                ThemedText,
-                                                AdvancedToggleLabel,
-                                            )),
-                                        ))
+                                                    })
+                                                    ThemedText
+                                                    AdvancedToggleLabel
+                                                },
+                                            }
+                                            Node { flex_grow: 1.0 }
+                                            InheritableFont { font: {Handle::<Font>::default()} }
+                                        })
                                         .observe(
                                             |_ev: On<Activate>,
                                              mut open: ResMut<GraphicsAdvancedOpen>| {
@@ -220,22 +220,22 @@ pub(super) fn spawn_ui(
                                     }
 
                                     list.spawn((row(), DlssGated)).with_children(|r| {
-                                        r.spawn(button_bundle(
-                                            ButtonBundleProps {
-                                                variant: ButtonVariant::Normal,
-                                                ..default()
-                                            },
-                                            (),
-                                            Spawn((
-                                                Text::new(if dlss_open {
+                                        r.spawn_empty().apply_scene(bsn! {
+                                            @FeathersButton {
+                                                @variant: ButtonVariant::Normal,
+                                                @caption: bsn! {
+                                                    Text::new(if dlss_open {
                                                     DLSS_EXPANDED
-                                                } else {
+                                                    } else {
                                                     DLSS_COLLAPSED
-                                                }),
-                                                ThemedText,
-                                                DlssToggleLabel,
-                                            )),
-                                        ))
+                                                    })
+                                                    ThemedText
+                                                    DlssToggleLabel
+                                                },
+                                            }
+                                            Node { flex_grow: 1.0 }
+                                            InheritableFont { font: {Handle::<Font>::default()} }
+                                        })
                                         .observe(
                                             |_ev: On<Activate>,
                                              mut open: ResMut<GraphicsDlssOpen>| {
@@ -276,17 +276,17 @@ pub(super) fn spawn_ui(
                                         DlssRow,
                                     ))
                                     .with_children(|r| {
-                                        r.spawn(button_bundle(
-                                            ButtonBundleProps {
-                                                variant: ButtonVariant::Normal,
-                                                ..default()
-                                            },
-                                            (),
-                                            Spawn((
-                                                Text::new("Reset DLSS to defaults"),
-                                                ThemedText,
-                                            )),
-                                        ))
+                                        r.spawn_empty().apply_scene(bsn! {
+                                            @FeathersButton {
+                                                @variant: ButtonVariant::Normal,
+                                                @caption: bsn! {
+                                                    Text::new("Reset DLSS to defaults")
+                                                    ThemedText
+                                                },
+                                            }
+                                            Node { flex_grow: 1.0 }
+                                            InheritableFont { font: {Handle::<Font>::default()} }
+                                        })
                                         .observe(
                                             |_ev: On<Activate>,
                                              mut settings: ResMut<GraphicsSettings>| {
@@ -334,33 +334,41 @@ pub(super) fn spawn_ui(
                         });
 
                     panel.spawn(row()).with_children(|r| {
-                        r.spawn(button_bundle(
-                            ButtonBundleProps {
-                                variant: ButtonVariant::Normal,
-                                ..default()
-                            },
-                            (),
-                            Spawn((Text::new("Reset to Minimum"), ThemedText)),
-                        ))
-                        .observe(
-                            |_ev: On<Activate>, mut settings: ResMut<GraphicsSettings>| {
-                                settings.reset_to_minimum();
-                            },
-                        );
+                        r.spawn_empty()
+                            .apply_scene(bsn! {
+                                @FeathersButton {
+                                    @variant: ButtonVariant::Normal,
+                                    @caption: bsn! {
+                                        Text::new("Reset to Minimum")
+                                        ThemedText
+                                    },
+                                }
+                                Node { flex_grow: 1.0 }
+                                InheritableFont { font: {Handle::<Font>::default()} }
+                            })
+                            .observe(
+                                |_ev: On<Activate>, mut settings: ResMut<GraphicsSettings>| {
+                                    settings.reset_to_minimum();
+                                },
+                            );
 
-                        r.spawn(button_bundle(
-                            ButtonBundleProps {
-                                variant: ButtonVariant::Primary,
-                                ..default()
-                            },
-                            (),
-                            Spawn((Text::new("Back"), ThemedText)),
-                        ))
-                        .observe(
-                            |_ev: On<Activate>, mut next: ResMut<NextState<LauncherState>>| {
-                                next.set(LauncherState::ServerSelect);
-                            },
-                        );
+                        r.spawn_empty()
+                            .apply_scene(bsn! {
+                                @FeathersButton {
+                                    @variant: ButtonVariant::Primary,
+                                    @caption: bsn! {
+                                        Text::new("Back")
+                                        ThemedText
+                                    },
+                                }
+                                Node { flex_grow: 1.0 }
+                                InheritableFont { font: {Handle::<Font>::default()} }
+                            })
+                            .observe(
+                                |_ev: On<Activate>, mut next: ResMut<NextState<LauncherState>>| {
+                                    next.set(LauncherState::ServerSelect);
+                                },
+                            );
                     });
                 });
         });
@@ -475,11 +483,18 @@ fn spawn_field_row(
             ThemedText,
         ));
 
-        let mut dec = rowc.spawn(button_bundle(
-            ButtonBundleProps::default(),
-            (),
-            Spawn((Text::new("<"), ThemedText)),
-        ));
+        let mut dec = rowc.spawn_empty();
+
+        dec.apply_scene(bsn! {
+            @FeathersButton {
+                @caption: bsn! {
+                    Text::new("<")
+                    ThemedText
+                },
+            }
+            Node { flex_grow: 1.0 }
+            InheritableFont { font: {Handle::<Font>::default()} }
+        });
         if default_focus {
             dec.insert(DefaultFocusTarget);
         }
@@ -505,16 +520,22 @@ fn spawn_field_row(
             ThemedText,
         ));
 
-        rowc.spawn(button_bundle(
-            ButtonBundleProps::default(),
-            (),
-            Spawn((Text::new(">"), ThemedText)),
-        ))
-        .observe(
-            move |_ev: On<Activate>, mut settings: ResMut<GraphicsSettings>| {
-                settings.cycle(field, 1);
-            },
-        );
+        rowc.spawn_empty()
+            .apply_scene(bsn! {
+                @FeathersButton {
+                    @caption: bsn! {
+                        Text::new(">")
+                        ThemedText
+                    },
+                }
+                Node { flex_grow: 1.0 }
+                InheritableFont { font: {Handle::<Font>::default()} }
+            })
+            .observe(
+                move |_ev: On<Activate>, mut settings: ResMut<GraphicsSettings>| {
+                    settings.cycle(field, 1);
+                },
+            );
     });
 }
 
@@ -664,14 +685,18 @@ pub(super) fn spawn_config_ui(
                         }
                     }
                     panel
-                        .spawn(button_bundle(
-                            ButtonBundleProps {
-                                variant: ButtonVariant::Primary,
-                                ..default()
-                            },
-                            (),
-                            Spawn((Text::new("Back"), ThemedText)),
-                        ))
+                        .spawn_empty()
+                        .apply_scene(bsn! {
+                            @FeathersButton {
+                                @variant: ButtonVariant::Primary,
+                                @caption: bsn! {
+                                    Text::new("Back")
+                                    ThemedText
+                                },
+                            }
+                            Node { flex_grow: 1.0 }
+                            InheritableFont { font: {Handle::<Font>::default()} }
+                        })
                         .observe(
                             |_ev: On<Activate>, mut next: ResMut<NextState<LauncherState>>| {
                                 next.set(LauncherState::ServerSelect);

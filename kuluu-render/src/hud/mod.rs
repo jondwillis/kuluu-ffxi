@@ -1,12 +1,18 @@
 pub mod action_model;
 pub mod auction;
+pub mod bazaar_comment;
 pub mod bazaar_view;
 #[cfg(feature = "enhanced-cast-bar")]
 pub mod cast_bar;
 pub mod chat_input;
 pub mod chat_panel;
 pub mod check_view;
+/// The player's own macro and equipment-set files in the install; see this module's header for what
+/// law they establish.
+pub mod client_user_files;
 pub mod compass;
+pub mod controls_law;
+pub mod currency_law;
 #[cfg(feature = "enhanced-death-countdown")]
 pub mod death_countdown;
 pub mod death_prompt;
@@ -14,8 +20,10 @@ pub mod delivery;
 pub mod diagnostics;
 pub mod dialog;
 pub mod digit_spinner;
+pub mod dock;
 pub mod entity_hover_card;
 pub mod equipment_screen;
+pub mod gettext;
 pub mod item_dat_root;
 pub mod item_detail;
 pub mod item_grid;
@@ -27,21 +35,30 @@ pub mod list_view;
 pub mod logout_countdown;
 // Depends on `crate::minimap`, which is itself gated off wasm (lib.rs).
 pub mod graphics_debug;
+/// One macro keytop editor: Prev/Next, its hotkey word and name, six command line slots.
+pub mod macro_edit_view;
+/// The macro palette's two-rows-of-ten keytop band (`mcr1pall`/`mcr2pall`).
+pub mod macro_pallet_view;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod map_screen;
 pub mod menu;
+pub mod menu_anim;
 pub mod menu_help_bar;
+pub mod merit_windows;
 pub mod mesh_debug;
 pub mod network_status;
 pub mod overlay;
 pub mod panel_column;
 pub mod quick_action;
-pub mod stair_debug;
+// Reads the region map DATs through `crate::minimap` (wasm-gated), like `map_screen`.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod region_map;
 // (roster mockup deleted — real party/self HUD is party_frame.rs)
 pub mod party_frame;
 pub mod self_fishing;
 pub mod shop;
 pub mod stage_bar;
+pub mod stair_debug;
 pub mod status_panel;
 pub mod status_ribbon;
 pub mod style;
@@ -49,11 +66,32 @@ pub mod target_action_menu;
 pub mod target_panel;
 pub mod trade;
 pub mod treasure_pool;
+pub mod unity_fp;
+pub mod unity_fp_view;
 pub mod vana_clock;
 pub mod weather_icon;
 pub mod zone_flash;
 
+use bevy::picking::{events::PointerPress, pointer::PointerButton};
 use bevy::prelude::*;
+
+pub(crate) fn primary_pressed_rows<'a, T: Component>(
+    presses: &mut MessageReader<PointerPress>,
+    rows: &'a Query<&T>,
+    parents: &Query<&ChildOf>,
+) -> Vec<&'a T> {
+    let mut seen = bevy::platform::collections::HashSet::<Entity>::default();
+    presses
+        .read()
+        .filter(|press| press.button == PointerButton::Primary)
+        .filter_map(|press| {
+            std::iter::once(press.entity)
+                .chain(parents.iter_ancestors(press.entity))
+                .find_map(|entity| rows.get(entity).ok().map(|row| (entity, row)))
+        })
+        .filter_map(|(entity, row)| seen.insert(entity).then_some(row))
+        .collect()
+}
 
 #[derive(Resource, Debug, Clone, Copy, Default)]
 pub struct HudVerbosity {
@@ -79,17 +117,15 @@ pub struct HudPanels {
     /// the enternity blacklist (Paintbrush of Souls, Geomantic Reservoir) are
     /// not advanced. Toggled from the Debug menu "Auto-Enter CS" row.
     pub auto_enter_cs: bool,
-    /// Stair-climber debug: when true, shows the status panel populated by
-    /// the input crate's stair detection state (orbs, slopes, classification
-    /// counts). Independent from `stair_draw` (whether the in-world gizmos
-    /// render); either can be on without the other.
-    pub stair_debug: bool,
-    /// Draws the in-world stair-climber gizmos (ring orbs, purple march,
-    /// head sphere, ramp line). Off = detection still runs (the character
-    /// still climbs), just no visuals.
-    pub stair_draw: bool,
     /// Graphics-debug panel (win/img/panel metrics). Runtime-only, no persist.
     pub graphics_debug: bool,
+    /// Stair-debug status panel: last two ticks' walker decisions, the probe
+    /// columns along the heading and the wall faces blocking them.
+    /// Runtime-only, no persist.
+    pub stair_debug: bool,
+    /// Draws the in-world stair gizmos (probe-column markers, feet/h0 bars,
+    /// move arrow, blocking-contact mark). Runtime-only, no persist.
+    pub stair_draw: bool,
     /// Nameplate Debug panel: last-two-tick pass state from the final in-view
     /// nameplate pass (extract/bind/draw counters + far-plate clip position).
     /// Runtime-only, no persist.
@@ -153,6 +189,7 @@ pub fn spawn_bottom_left_stack(
                 row_gap: Val::Px(4.0),
                 ..default()
             },
+            ZIndex(style::CHAT_STACK_Z),
         ))
         .with_children(|p| {
             chat_panel::spawn_chat_panels_as_children(p);
@@ -204,6 +241,10 @@ pub fn spawn_bottom_left_stack(
                                 weather_icon::spawn_weather_icon_as_child(under);
                             });
                     });
+
+                    // Last in the column, so the field stands directly above the chat log it
+                    // belongs to (owner 2026-10-24).
+                    bazaar_comment::spawn_bazaar_comment_editor(col);
                 });
 
                 target_action_menu::spawn_target_action_menu_as_child(row);
@@ -249,6 +290,16 @@ impl Plugin for HudPlugin {
         app.init_resource::<vana_clock::VanaClockVisible>();
 
         app.init_resource::<menu::DynamicMenu>();
+        app.init_resource::<menu::MagicSchoolTable>();
+        app.init_resource::<menu::ConfigDatRows>();
+        // ur/139: which level stands on which pooled surface, shared between the draw pass and
+        // row hit routing (a shared seat relabels in place instead of opening a second box).
+        app.init_resource::<menu::PooledSeats>();
+        app.init_resource::<dock::DockBoard>();
+        app.init_resource::<menu::CommandSelectorCaptions>();
+        app.init_resource::<menu::EquipRecords>();
+        app.init_resource::<unity_fp::UnityFpDat>();
+        app.init_resource::<merit_windows::MeritDat>();
 
         app.init_resource::<overlay::ActiveOverlay>();
         app.init_resource::<chat_panel::ActiveChatTab>();
@@ -256,8 +307,8 @@ impl Plugin for HudPlugin {
         app.init_resource::<chat_panel::ChatUnread>();
         app.init_resource::<chat_panel::ChatActivityTracker>();
         app.init_resource::<mesh_debug::MeshHoverDebug>();
-        app.init_resource::<stair_debug::StairDebugSnapshot>();
         app.init_resource::<graphics_debug::GraphicsDebugState>();
+        app.init_resource::<stair_debug::StairDebugSnapshot>();
         if let Some(render_app) = app.get_sub_app_mut(bevy::render::RenderApp) {
             render_app.add_systems(
                 bevy::render::Render,
@@ -269,6 +320,8 @@ impl Plugin for HudPlugin {
 
         app.init_resource::<status_ribbon::StatusIconCache>();
         app.init_resource::<status_ribbon::StatusIconDatRoot>();
+        #[cfg(not(target_arch = "wasm32"))]
+        app.init_resource::<region_map::ViewedRegionMap>();
 
         app.init_resource::<item_dat_root::ItemDatRoot>();
         app.init_resource::<item_dat_root::ItemIconCache>();
@@ -290,7 +343,6 @@ impl Plugin for HudPlugin {
 
         app.init_resource::<check_view::CheckTarget>();
         app.init_resource::<bazaar_view::BazaarScreenState>();
-        app.init_resource::<status_panel::StatusProfileOpen>();
         app.init_resource::<party_frame::PartyFrameSettings>();
 
         app.init_resource::<trade::TradeState>();
@@ -387,9 +439,62 @@ impl Plugin for HudPlugin {
                 .after(party_frame::update_party_frame_system),
         );
 
+        // A window input opened owns its rows in the same frame: every stack mutator (keyboard,
+        // mouse nav, arrows, cancel) runs inside the chain that ends at `dock_windows_system`, and
+        // the row rebuild sits between that boundary and every draw pass. No drawn frame can then
+        // see a new kind with unbuilt rows - holding the previous occupant's words onto a fresh
+        // box for one frame was the right-side flash on any menu kind change.
         app.add_systems(
             Update,
-            menu::refresh_dynamic_menu_rows.before(menu::update_main_menu),
+            menu::refresh_dynamic_menu_rows
+                .after(crate::hud::dock::dock_windows_system)
+                .before(menu::update_main_menu),
+        );
+        // The window title bands: they need the word and the pixel width `update_main_menu` picks
+        // for this frame, so they place immediately after it. They also write text faces, so they go
+        // behind the face-stamping system to keep one writer per node in a frame.
+        app.add_systems(
+            Update,
+            menu::place_menu_title_bands
+                .after(menu::update_main_menu)
+                .after(crate::ui_font::apply_ui_font),
+        );
+        app.add_systems(
+            Update,
+            (
+                menu::settle_opened_windows
+                    .after(menu::refresh_dynamic_menu_rows)
+                    .before(menu::update_main_menu)
+                    .before(menu::update_menu_stack_windows)
+                    .before(unity_fp_view::update_unity_fp_windows),
+                menu::persist_window_cursors,
+            ),
+        );
+        app.add_systems(
+            Update,
+            (
+                menu::update_menu_stack_windows,
+                status_panel::update_status_level_box,
+                status_panel::update_persona_frame,
+                unity_fp_view::update_unity_fp_windows,
+                merit_windows::merit_window_upkeep,
+            )
+                .after(menu::refresh_dynamic_menu_rows),
+        );
+        // The selector-column relabel squeeze: last writer of the pane's box, standing after
+        // `update_main_menu` places it natural with words filled underneath.
+        app.add_systems(
+            Update,
+            menu::squeeze_menu_column.after(menu::update_main_menu),
+        );
+
+        // The end-of-frame forensic sample (owner debug 2026-10-19): runs last among the
+        // menu systems and names every visible UI text node while a Status flow is open,
+        // so any stray drawer identifies itself in the log. The dedicated statcom2 copy
+        // it once shadowed was removed same day (owner: "that menu should not exist here").
+        app.add_systems(
+            Update,
+            (menu::ui_window_forensics.after(menu::update_menu_stack_windows),),
         );
 
         app.add_systems(
@@ -397,10 +502,31 @@ impl Plugin for HudPlugin {
             panel_column::layout_panel_column_system
                 .after(target_panel::update_target_panel_system),
         );
-
         app.add_systems(
             Update,
-            menu_help_bar::update_menu_help_bar.after(menu::refresh_dynamic_menu_rows),
+            (
+                dock::dock_windows_system
+                    .after(target_panel::update_target_panel_system)
+                    .after(party_frame::update_party_frame_system)
+                    .before(menu::update_main_menu)
+                    .before(menu::update_menu_stack_windows)
+                    .before(unity_fp_view::update_unity_fp_windows),
+                dock::place_target_window
+                    .after(dock::dock_windows_system)
+                    .before(panel_column::layout_panel_column_system),
+            ),
+        );
+
+        // The bar's fade-in rider (owner law 2026-10-22): runs on the same frame as its fills so
+        // the appearing frame already renders chrome-only at the first alpha step.
+        app.add_systems(
+            Update,
+            (
+                menu_help_bar::update_menu_help_bar,
+                menu_help_bar::fade_menu_help_bar_in,
+            )
+                .chain()
+                .after(menu::refresh_dynamic_menu_rows),
         );
 
         #[cfg(feature = "enhanced-shutdown-counter")]
@@ -414,6 +540,9 @@ impl Plugin for HudPlugin {
                 target_action_menu::target_action_mouse_hover_system,
                 target_action_menu::target_action_mouse_click_system,
                 item_screen::update_item_screen_layout,
+                menu::update_status_detail_window
+                    .after(menu::refresh_dynamic_menu_rows)
+                    .before(menu::update_main_menu),
                 item_screen::update_item_screen.after(menu::refresh_dynamic_menu_rows),
                 item_screen::update_item_scrollbar.after(item_screen::update_item_screen),
                 item_screen::update_bag_tabs.after(item_screen::update_item_screen),
@@ -421,7 +550,11 @@ impl Plugin for HudPlugin {
                 check_view::update_check_view,
                 bazaar_view::update_bazaar_view,
                 bazaar_view::update_bazaar_scrollbar.after(bazaar_view::update_bazaar_view),
-                status_panel::update_status_panel,
+                // The Status column's squeeze legs (menu_anim law): this system writes persona
+                // and `level` box geometry last, after the passes that place them.
+                status_panel::update_status_panel
+                    .after(status_panel::update_status_level_box)
+                    .after(status_panel::update_persona_frame),
                 equipment_screen::update_equipment_screen.after(menu::refresh_dynamic_menu_rows),
                 delivery::rebuild_delivery_inventory,
                 delivery::update_delivery_screen.after(delivery::rebuild_delivery_inventory),
@@ -429,6 +562,25 @@ impl Plugin for HudPlugin {
                 auction::update_auction_screen.after(auction::rebuild_sell_inventory),
                 auction::auction_chat_echo_system,
             ),
+        );
+        // Its own registration: the pass reads only `InputMode` and `DynamicMenu`, so it owes
+        // nothing to the group above and that group has no room left in it.
+        app.add_systems(Update, bazaar_comment::update_bazaar_comment_editor);
+        // The palette band fills from the rows `refresh_dynamic_menu_rows` just built (their labels are
+        // the display names of the book's keytops), so it runs behind that pass and never earlier.
+        app.add_systems(
+            Update,
+            macro_pallet_view::update_macro_pallet_view
+                .after(menu::refresh_dynamic_menu_rows)
+                .after(bazaar_comment::update_bazaar_comment_editor),
+        );
+        // Same law for the keytop editor: its fields fill from the stack, and it draws over the band's
+        // corner, which that band has just hidden.
+        app.add_systems(
+            Update,
+            macro_edit_view::update_macro_edit_view
+                .after(menu::refresh_dynamic_menu_rows)
+                .after(macro_pallet_view::update_macro_pallet_view),
         );
         // Map screen + minimap markers depend on `crate::minimap` (wasm-gated).
         #[cfg(not(target_arch = "wasm32"))]
@@ -443,7 +595,8 @@ impl Plugin for HudPlugin {
                 map_screen::update_map_screen_markers,
                 map_screen::update_map_widescan_dots.after(map_screen::update_map_view),
                 map_screen::update_map_placed_markers,
-                map_screen::update_map_panel,
+                map_screen::update_map_panel.after(dock::dock_windows_system),
+                region_map::update_region_map,
             ),
         );
         app.add_systems(Update, apply_dev_hud_visibility);
@@ -487,11 +640,17 @@ impl Plugin for HudPlugin {
             (
                 party_frame::party_row_click_system,
                 party_frame::ui_settings_click_system,
-                menu::menu_mouse_hover_system,
-                menu::menu_mouse_click_system,
+                // ur/139: routes clicks through the seat table, so it reads it current.
+                menu::menu_mouse_hover_system.after(menu::update_menu_stack_windows),
+                menu::menu_mouse_click_system.after(menu::update_menu_stack_windows),
                 item_screen::item_row_mouse_hover_system,
                 item_screen::item_row_mouse_click_system,
                 item_screen::sort_option_mouse_system,
+                (
+                    item_detail::sync_inventory_sort_options_system,
+                    item_detail::mirror_inventory_sort_options_system,
+                )
+                    .chain(),
                 item_detail::auto_consolidate_inventory_system,
                 item_screen::bag_tab_mouse_system,
                 dialog::dialog_mouse_hover_system,
@@ -516,10 +675,10 @@ impl Plugin for HudPlugin {
             (
                 mesh_debug::update_hover_state,
                 mesh_debug::update_mesh_debug_hud,
-                stair_debug::update_stair_debug_hud,
                 graphics_debug::graphics_debug_metrics_system,
                 graphics_debug::update_graphics_debug_hud,
                 graphics_debug::update_nameplate_debug_hud,
+                stair_debug::update_stair_debug_hud,
             )
                 .chain(),
         );
@@ -561,9 +720,9 @@ pub fn add_hud_spawners<L: bevy::ecs::schedule::ScheduleLabel + Clone>(app: &mut
             network_status::spawn_network_status,
         ),
     );
-    app.add_systems(schedule.clone(), stair_debug::spawn_stair_debug_hud);
     app.add_systems(schedule.clone(), graphics_debug::spawn_graphics_debug_hud);
     app.add_systems(schedule.clone(), graphics_debug::spawn_nameplate_debug_hud);
+    app.add_systems(schedule.clone(), stair_debug::spawn_stair_debug_hud);
 
     #[cfg(feature = "enhanced-buff-tooltips")]
     app.add_systems(schedule.clone(), status_ribbon::tooltip::spawn_buff_tooltip);
@@ -578,16 +737,23 @@ pub fn add_hud_spawners<L: bevy::ecs::schedule::ScheduleLabel + Clone>(app: &mut
             trade::spawn_trade_window,
             check_view::spawn_check_view,
             bazaar_view::spawn_bazaar_view,
+            macro_pallet_view::spawn_macro_pallet_view,
+            macro_edit_view::spawn_macro_edit_view,
             status_panel::spawn_status_panel,
+            menu::spawn_status_detail_window,
             equipment_screen::spawn_equipment_screen,
             delivery::spawn_delivery_screen,
             auction::spawn_auction_screen,
             shop::spawn_shop_panel,
+            unity_fp_view::spawn_unity_fp_windows,
         ),
     );
     // Depends on `crate::minimap` (wasm-gated).
     #[cfg(not(target_arch = "wasm32"))]
-    app.add_systems(schedule, map_screen::spawn_map_screen);
+    app.add_systems(
+        schedule,
+        (map_screen::spawn_map_screen, region_map::spawn_region_map),
+    );
 }
 
 #[cfg(test)]
@@ -609,6 +775,30 @@ mod tests {
         assert_eq!(
             world.query::<&compass::CompassLabel>().iter(&world).count(),
             4
+        );
+    }
+
+    /// Bevy stacks UI roots by (GlobalZIndex, ZIndex) and leaves ties to archetype order, so only
+    /// the chat stack's own lower layer keeps a menu that reaches the log drawn over it.
+    #[test]
+    fn menus_draw_over_the_chat_stack() {
+        fn layer<F: bevy::ecs::query::QueryFilter>(world: &mut World) -> (i32, i32) {
+            let (global, local) = world
+                .query_filtered::<(Option<&GlobalZIndex>, Option<&ZIndex>), F>()
+                .single(world)
+                .expect("one root");
+            (
+                global.copied().unwrap_or_default().0,
+                local.copied().unwrap_or_default().0,
+            )
+        }
+        let mut world = World::new();
+        #[cfg(not(target_arch = "wasm32"))]
+        world.init_resource::<Assets<bevy::image::Image>>();
+        world.run_system_once(spawn_bottom_left_stack).unwrap();
+        world.run_system_once(menu::spawn_main_menu).unwrap();
+        assert!(
+            layer::<With<BottomLeftStack>>(&mut world) < layer::<With<menu::MainMenu>>(&mut world)
         );
     }
 }

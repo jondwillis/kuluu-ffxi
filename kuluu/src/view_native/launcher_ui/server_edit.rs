@@ -1,5 +1,5 @@
-use bevy::ecs::spawn::Spawn;
-use bevy::feathers::controls::{button_bundle, ButtonBundleProps, ButtonVariant};
+use bevy::feathers::controls::{ButtonVariant, FeathersButton};
+use bevy::feathers::font_styles::InheritableFont;
 use bevy::feathers::theme::ThemedText;
 use bevy::input::keyboard::{Key, KeyboardInput};
 use bevy::input::ButtonState;
@@ -12,7 +12,7 @@ use ffxi_proto::login::{VerLock, LSB_CLIENT_VER, LSB_DEFAULT_VER_LOCK};
 use kuluu_session::auth_client;
 
 use super::common::{
-    hint, panel_node, row, screen_root, spawn_breadcrumb, title, Crumb, DefaultFocusTarget,
+    hint, panel_node_capped, row, screen_root, spawn_breadcrumb, title, Crumb, DefaultFocusTarget,
 };
 use crate::view_native::widgets::text_field::text_field;
 use crate::view_native::widgets::{TextFieldDisplay, TextFieldProps};
@@ -21,6 +21,12 @@ use super::{LauncherState, ServerEditField, ServerEditForm, ServerInfo};
 
 #[derive(Component)]
 pub(super) struct ServerEditRoot;
+
+#[derive(Component)]
+pub(super) struct ConnectionSummary;
+
+#[derive(Component)]
+pub(super) struct ServerEditError;
 
 #[derive(Component, Clone, Copy)]
 pub(super) struct FlavorButton(AuthFlavorKind);
@@ -51,6 +57,7 @@ pub(super) struct ServerEditUiDirty(pub bool);
 
 const PANEL_WIDTH_PX: f32 = 560.0;
 const FIELD_LABEL_PX: f32 = 150.0;
+const FORM_ROW_GAP_PX: f32 = 12.0;
 
 pub(super) fn spawn_ui(mut commands: Commands, form: Res<ServerEditForm>, server: Res<ServerInfo>) {
     build_ui(&mut commands, &form, &server);
@@ -73,66 +80,101 @@ pub(super) fn rebuild_ui_system(
     build_ui(&mut commands, &form, &server);
 }
 
+fn connection_summary(form: &ServerEditForm) -> String {
+    if auth_client::validate_loader_version(form.flavor.auth_flavor(), &form.xiloader_version)
+        .is_err()
+    {
+        return "Connection: invalid loader version".into();
+    }
+    let version =
+        (!form.xiloader_version.trim().is_empty()).then_some(form.xiloader_version.as_str());
+    match form.flavor {
+        AuthFlavorKind::Json => {
+            let [major, minor, patch] = auth_client::resolve_client_version(version);
+            format!("Connection: JSON | loader {major}.{minor}.{patch}")
+        }
+        AuthFlavorKind::Binary => {
+            let version = auth_client::resolve_binary_version(version);
+            format!(
+                "Connection: Binary | loader {}",
+                String::from_utf8_lossy(&version)
+            )
+        }
+        AuthFlavorKind::PlayOnline => "Connection: PlayOnline | no loader version".into(),
+    }
+}
+
 fn build_ui(commands: &mut Commands, form: &ServerEditForm, server: &ServerInfo) {
     let editing = form.editing_index.is_some();
-    let name = form.name.clone();
-    let host = form.host.clone();
-    let show_advanced = form.show_advanced;
     let leaf = if editing {
-        Crumb::Other(format!("Edit: {name}"))
+        Crumb::Other(format!("Edit: {}", form.name))
     } else {
         Crumb::Other("New server".to_string())
     };
-
-    commands
-        .spawn((ServerEditRoot, screen_root()))
-        .with_children(|root| {
-            spawn_breadcrumb(root, server, &[Crumb::Server, leaf]);
-            root.spawn(panel_node(PANEL_WIDTH_PX))
-                .with_children(|panel| {
-                    panel.spawn(title(if editing { "Edit server" } else { "New server" }));
-
-                    if !editing {
-                        spawn_template_row(panel);
+    commands.spawn((ServerEditRoot, screen_root())).with_children(|root| {
+        spawn_breadcrumb(root, server, &[Crumb::Server, leaf]);
+        root.spawn(panel_node_capped(PANEL_WIDTH_PX, Val::Percent(100.0))).with_children(|panel| {
+            panel.spawn(title(if editing { "Edit server" } else { "New server" }));
+            panel.spawn(Node {
+                flex_direction: FlexDirection::Column,
+                flex_shrink: 1.0,
+                min_height: Val::Px(0.0),
+                overflow: Overflow::scroll_y(),
+                row_gap: Val::Px(FORM_ROW_GAP_PX),
+                ..default()
+            }).with_children(|body| {
+                if !editing {
+                    spawn_template_row(body);
+                }
+                spawn_field(body, "Name", &form.name, "", ServerEditField::Name);
+                spawn_field(body, "Host", &form.host, "", ServerEditField::Host);
+                body.spawn(hint("Server type:"));
+                body.spawn(row()).with_children(|r| {
+                    for kind in [AuthFlavorKind::Json, AuthFlavorKind::Binary, AuthFlavorKind::PlayOnline] {
+                        spawn_flavor_button(r, kind.label(), kind, form.flavor);
                     }
-
-                    spawn_field(panel, "Name", &name, "", ServerEditField::Name);
-                    spawn_field(panel, "Host", &host, "", ServerEditField::Host);
-
-                    spawn_advanced_toggle(panel, show_advanced);
-                    if show_advanced {
-                        spawn_advanced_fields(panel, form);
-                    }
-
-                    panel.spawn(row()).with_children(|r| {
-                        r.spawn(button_bundle(
-                        ButtonBundleProps {
-                            variant: ButtonVariant::Primary,
-                            ..default()
-                        },
-                        DefaultFocusTarget,
-                        Spawn((Text::new("Save"), ThemedText)),
-                    ))
-                    .observe(
-                        |_ev: On<Activate>,
-                         form: Res<ServerEditForm>,
-                         mut next: ResMut<NextState<LauncherState>>| {
-                            save_form(&form, &mut next);
-                        },
-                    );
-                        r.spawn(button_bundle(
-                            ButtonBundleProps::default(),
-                            (),
-                            Spawn((Text::new("Cancel"), ThemedText)),
-                        ))
-                        .observe(
-                            |_ev: On<Activate>, mut next: ResMut<NextState<LauncherState>>| {
-                                next.set(LauncherState::ServerSelect);
-                            },
-                        );
-                    });
                 });
+                body.spawn((hint(connection_summary(form)), ConnectionSummary));
+                if form.flavor == AuthFlavorKind::PlayOnline {
+                    for line in POL_FLAVOR_HINTS {
+                        body.spawn(hint(line));
+                    }
+                }
+                spawn_advanced_toggle(body, form.show_advanced);
+                if form.show_advanced {
+                    spawn_advanced_fields(body, form);
+                }
+            });
+            panel.spawn((hint(&form.error), ServerEditError));
+            panel.spawn(row()).with_children(|r| {
+                r.spawn_empty().apply_scene(bsn! {
+                    @FeathersButton {
+                        @variant: ButtonVariant::Primary,
+                        @caption: bsn! {
+                            Text::new("Save")
+                            ThemedText
+                        },
+                    }
+                    Node { flex_grow: 1.0 }
+                    InheritableFont { font: {Handle::<Font>::default()} }
+                }).insert(DefaultFocusTarget).observe(|_ev: On<Activate>, mut form: ResMut<ServerEditForm>, mut next: ResMut<NextState<LauncherState>>| {
+                    save_form(&mut form, &mut next);
+                });
+                r.spawn_empty().apply_scene(bsn! {
+                    @FeathersButton {
+                        @caption: bsn! {
+                            Text::new("Cancel")
+                            ThemedText
+                        },
+                    }
+                    Node { flex_grow: 1.0 }
+                    InheritableFont { font: {Handle::<Font>::default()} }
+                }).observe(|_ev: On<Activate>, mut next: ResMut<NextState<LauncherState>>| {
+                    next.set(LauncherState::ServerSelect);
+                });
+            });
         });
+    });
 }
 
 fn spawn_template_row(panel: &mut ChildSpawnerCommands) {
@@ -140,19 +182,25 @@ fn spawn_template_row(panel: &mut ChildSpawnerCommands) {
     panel.spawn(row()).with_children(|r| {
         for template in launcher_store::server_templates() {
             let profile = template.profile;
-            r.spawn(button_bundle(
-                ButtonBundleProps::default(),
-                (),
-                Spawn((Text::new(template.label), ThemedText)),
-            ))
-            .observe(
-                move |_ev: On<Activate>,
-                      mut form: ResMut<ServerEditForm>,
-                      mut dirty: ResMut<ServerEditUiDirty>| {
-                    *form = ServerEditForm::from_profile(&profile);
-                    dirty.0 = true;
-                },
-            );
+            r.spawn_empty()
+                .apply_scene(bsn! {
+                    @FeathersButton {
+                        @caption: bsn! {
+                            Text::new(template.label)
+                            ThemedText
+                        },
+                    }
+                    Node { flex_grow: 1.0 }
+                    InheritableFont { font: {Handle::<Font>::default()} }
+                })
+                .observe(
+                    move |_ev: On<Activate>,
+                          mut form: ResMut<ServerEditForm>,
+                          mut dirty: ResMut<ServerEditUiDirty>| {
+                        *form = ServerEditForm::from_profile(&profile);
+                        dirty.0 = true;
+                    },
+                );
         }
     });
 }
@@ -164,11 +212,17 @@ fn spawn_advanced_toggle(panel: &mut ChildSpawnerCommands, show_advanced: bool) 
         "Advanced settings..."
     };
     panel
-        .spawn(button_bundle(
-            ButtonBundleProps::default(),
-            (),
-            Spawn((Text::new(label), ThemedText)),
-        ))
+        .spawn_empty()
+        .apply_scene(bsn! {
+            @FeathersButton {
+                @caption: bsn! {
+                    Text::new(label)
+                    ThemedText
+                },
+            }
+            Node { flex_grow: 1.0 }
+            InheritableFont { font: {Handle::<Font>::default()} }
+        })
         .observe(
             |_ev: On<Activate>,
              mut form: ResMut<ServerEditForm>,
@@ -184,15 +238,6 @@ fn spawn_advanced_fields(panel: &mut ChildSpawnerCommands, form: &ServerEditForm
         .into_iter()
         .map(|i| i.name)
         .collect();
-    let json_default = auth_client::resolve_client_version(None);
-    let binary_default = auth_client::resolve_binary_version(None);
-    let version_placeholder = format!(
-        "JSON {}.{}.{} / Binary {}",
-        json_default[0],
-        json_default[1],
-        json_default[2],
-        String::from_utf8_lossy(&binary_default)
-    );
     let default_lock = ver_lock_label(VerLock::from_setting(LSB_DEFAULT_VER_LOCK));
 
     spawn_field(
@@ -217,28 +262,22 @@ fn spawn_advanced_fields(panel: &mut ChildSpawnerCommands, form: &ServerEditForm
         ServerEditField::ViewPort,
     );
 
-    panel.spawn(hint("Auth flavor:"));
-    panel.spawn(row()).with_children(|r| {
-        for kind in [
-            AuthFlavorKind::Json,
-            AuthFlavorKind::Binary,
-            AuthFlavorKind::PlayOnline,
-        ] {
-            spawn_flavor_button(r, kind.label(), kind, form.flavor);
-        }
-    });
-    if form.flavor == AuthFlavorKind::PlayOnline {
-        for line in POL_FLAVOR_HINTS {
-            panel.spawn(hint(line));
-        }
+    if form.flavor.uses_auth_server() {
+        let placeholder = match form.flavor {
+            AuthFlavorKind::Json => {
+                let [major, minor, patch] = auth_client::resolve_client_version(None);
+                format!("{major}.{minor}.{patch}")
+            }
+            _ => String::from_utf8_lossy(&auth_client::resolve_binary_version(None)).into_owned(),
+        };
+        spawn_field(
+            panel,
+            "Loader",
+            &form.xiloader_version,
+            &placeholder,
+            ServerEditField::XiloaderVersion,
+        );
     }
-    spawn_field(
-        panel,
-        "Loader version",
-        &form.xiloader_version,
-        &version_placeholder,
-        ServerEditField::XiloaderVersion,
-    );
     spawn_field(
         panel,
         "Update URL",
@@ -288,8 +327,16 @@ const POL_FLAVOR_HINTS: [&str; 2] = [
     "auth port is unused. Host is the FFXI lobby server the account plays on.",
 ];
 
-fn save_form(form: &ServerEditForm, next: &mut NextState<LauncherState>) {
-    if form.name.is_empty() || form.host.is_empty() {
+fn save_form(form: &mut ServerEditForm, next: &mut NextState<LauncherState>) {
+    form.error.clear();
+    if let Err(error) =
+        auth_client::validate_loader_version(form.flavor.auth_flavor(), &form.xiloader_version)
+    {
+        form.error = error.to_string();
+        return;
+    }
+    if form.name.trim().is_empty() || form.host.trim().is_empty() {
+        form.error = "Enter a server name and host.".into();
         return;
     }
     let auth_port = form.auth_port.parse().unwrap_or(0);
@@ -297,6 +344,7 @@ fn save_form(form: &ServerEditForm, next: &mut NextState<LauncherState>) {
     let view_port = form.view_port.parse().unwrap_or(0);
     let auth_port_missing = auth_port == 0 && form.flavor.uses_auth_server();
     if auth_port_missing || data_port == 0 || view_port == 0 {
+        form.error = "Enter port numbers from 1 to 65535.".into();
         return;
     }
     let xiloader_version = {
@@ -439,26 +487,32 @@ fn spawn_flavor_button(
     kind: AuthFlavorKind,
     current: AuthFlavorKind,
 ) {
+    let label = label.to_string();
     let variant = if kind == current {
         ButtonVariant::Primary
     } else {
         ButtonVariant::Normal
     };
     parent
-        .spawn((button_bundle(
-            ButtonBundleProps {
-                variant,
-                ..default()
-            },
-            FlavorButton(kind),
-            Spawn((Text::new(label.to_string()), ThemedText)),
-        ),))
+        .spawn_empty()
+        .apply_scene(bsn! {
+            @FeathersButton {
+                @variant: variant,
+                @caption: bsn! {
+                    Text::new(label.clone())
+                    ThemedText
+                },
+            }
+            Node { flex_grow: 1.0 }
+            InheritableFont { font: {Handle::<Font>::default()} }
+        })
+        .insert(FlavorButton(kind))
         .observe(
             move |_ev: On<Activate>,
                   mut form: ResMut<ServerEditForm>,
                   mut dirty: ResMut<ServerEditUiDirty>| {
                 if form.flavor != kind {
-                    form.flavor = kind;
+                    form.select_flavor(kind);
                     dirty.0 = true;
                 }
             },
@@ -471,15 +525,21 @@ fn spawn_ver_lock_button(
     value: Option<u8>,
     current: Option<u8>,
 ) {
+    let label = label.to_string();
     parent
-        .spawn((button_bundle(
-            ButtonBundleProps {
-                variant: chip_variant(value == current),
-                ..default()
-            },
-            VerLockButton(value),
-            Spawn((Text::new(label.to_string()), ThemedText)),
-        ),))
+        .spawn_empty()
+        .apply_scene(bsn! {
+            @FeathersButton {
+                @variant: chip_variant(value == current),
+                @caption: bsn! {
+                    Text::new(label.clone())
+                    ThemedText
+                },
+            }
+            Node { flex_grow: 1.0 }
+            InheritableFont { font: {Handle::<Font>::default()} }
+        })
+        .insert(VerLockButton(value))
         .observe(move |_ev: On<Activate>, mut form: ResMut<ServerEditForm>| {
             form.ver_lock = value;
         });
@@ -491,16 +551,22 @@ fn spawn_preferred_client_button(
     value: Option<String>,
     current: Option<&str>,
 ) {
+    let label = label.to_string();
     let selected = value.as_deref() == current;
     parent
-        .spawn((button_bundle(
-            ButtonBundleProps {
-                variant: chip_variant(selected),
-                ..default()
-            },
-            PreferredClientButton(value.clone()),
-            Spawn((Text::new(label.to_string()), ThemedText)),
-        ),))
+        .spawn_empty()
+        .apply_scene(bsn! {
+            @FeathersButton {
+                @variant: chip_variant(selected),
+                @caption: bsn! {
+                    Text::new(label.clone())
+                    ThemedText
+                },
+            }
+            Node { flex_grow: 1.0 }
+            InheritableFont { font: {Handle::<Font>::default()} }
+        })
+        .insert(PreferredClientButton(value.clone()))
         .observe(move |_ev: On<Activate>, mut form: ResMut<ServerEditForm>| {
             form.preferred_client = value.clone();
         });
@@ -566,6 +632,60 @@ pub(super) fn redraw_system(
     locks: Query<(Entity, &VerLockButton)>,
     clients: Query<(Entity, &PreferredClientButton)>,
     commands: Commands,
+    mut summary: Query<&mut Text, (With<ConnectionSummary>, Without<ServerEditError>)>,
+    mut errors: Query<&mut Text, (With<ServerEditError>, Without<ConnectionSummary>)>,
 ) {
+    if form.is_changed() {
+        for mut text in &mut summary {
+            text.0 = connection_summary(&form);
+        }
+        for mut text in &mut errors {
+            text.0.clone_from(&form.error);
+        }
+    }
     redraw_flavor_buttons(form, flavors, locks, clients, commands);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn changing_server_type_updates_the_loader_without_changing_the_endpoint() {
+        let mut form =
+            ServerEditForm::from_profile(&ServerProfile::lsb_defaults("Test", "localhost"));
+        form.editing_index = Some(0);
+        form.select_flavor(AuthFlavorKind::Binary);
+        assert_eq!(
+            form.xiloader_version,
+            launcher_store::LEGACY_LSB_XILOADER_VERSION
+        );
+        assert_eq!(form.host, "localhost");
+        assert_eq!(form.editing_index, Some(0));
+        form.select_flavor(AuthFlavorKind::Json);
+        assert!(form.xiloader_version.is_empty());
+    }
+
+    #[test]
+    fn opening_an_existing_binary_profile_preserves_its_override() {
+        let profile = ServerProfile {
+            flavor: AuthFlavorKind::Binary,
+            xiloader_version: Some("1.0.9".into()),
+            ..ServerProfile::lsb_defaults("Test", "localhost")
+        };
+        let mut form = ServerEditForm::from_profile(&profile);
+        form.select_flavor(AuthFlavorKind::Binary);
+        assert_eq!(form.xiloader_version, profile.xiloader_version.unwrap());
+    }
+
+    #[test]
+    fn invalid_loader_does_not_save_or_leave_the_form() {
+        let mut form =
+            ServerEditForm::from_profile(&ServerProfile::lsb_defaults("Test", "localhost"));
+        form.xiloader_version = "1.1.5.9".into();
+        let mut next = NextState::Unchanged;
+        save_form(&mut form, &mut next);
+        assert!(!form.error.is_empty());
+        assert!(matches!(next, NextState::Unchanged));
+    }
 }

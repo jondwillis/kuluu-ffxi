@@ -43,6 +43,8 @@ mod movement;
 pub use movement::*;
 mod party;
 pub use party::*;
+mod trade;
+pub use trade::*;
 mod inventory;
 pub use inventory::*;
 mod delivery;
@@ -63,6 +65,12 @@ mod assist;
 pub use assist::*;
 mod pending;
 pub use pending::*;
+mod unity;
+pub use unity::*;
+mod merits;
+pub use merits::*;
+mod homepoints;
+pub use homepoints::*;
 
 #[derive(Debug, thiserror::Error)]
 pub enum DecodeError {

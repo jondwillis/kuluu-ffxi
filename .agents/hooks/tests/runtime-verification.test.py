@@ -96,6 +96,14 @@ class VerificationGateTests(unittest.TestCase):
     def marker(self):
         return self.root / ".verify/latest.json"
 
+    def test_wesl_shader_changes_require_visual_evidence(self):
+        shader = self.root / "kuluu-render/src/zone.wesl"
+        shader.write_text("@fragment fn fragment() {}\n")
+        verification.track(self.session, self.root, [str(shader)])
+        self.assertEqual(verification.surface(Path("kuluu-render/src/zone.wesl")), "visual")
+        self.assertIsNone(verification.surface(Path("vendor/bevy_pbr/src/zone.wesl")))
+        self.assertIn("no runtime evidence", verification.check(self.payload))
+
     def test_commit_does_not_clear_the_requirement(self):
         self.edit()
         self.git("commit", "-qam", "quantity fix")

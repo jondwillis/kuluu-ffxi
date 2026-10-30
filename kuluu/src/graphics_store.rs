@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use bevy::prelude::*;
+use bevy::prelude::{DetectChanges, Local, Res, Resource};
 use kuluu_render::GraphicsSettings;
 
 #[derive(Resource, Debug, Clone)]
@@ -237,22 +237,11 @@ pub fn load_or_default() -> (GraphicsSettings, GraphicsStore) {
     }
 }
 
-/// While set, `persist_graphics_on_change` stands down. The AnimationTest box's shadow
-/// suppression rewrites `GraphicsSettings` in memory (and hands them back afterwards); neither
-/// the override nor its restore belongs on disk — a run killed mid-box must not leave the user's
-/// own settings altered.
-#[derive(Resource, Default)]
-pub struct GraphicsPersistSuspended(pub bool);
-
 pub fn persist_graphics_on_change(
     settings: Res<GraphicsSettings>,
     state: Res<GraphicsStateRes>,
-    suspended: Option<Res<GraphicsPersistSuspended>>,
     mut last_saved: Local<Option<GraphicsSettings>>,
 ) {
-    if suspended.is_some_and(|s| s.0) {
-        return;
-    }
     if !settings.is_changed() {
         return;
     }
@@ -277,6 +266,7 @@ pub fn persist_graphics_on_change(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bevy::prelude::*;
     use kuluu_render::{GraphicsField, MinimapRadar, QualityPreset};
     use std::time::{SystemTime, UNIX_EPOCH};
 

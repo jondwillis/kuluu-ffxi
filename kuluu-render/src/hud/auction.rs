@@ -6,7 +6,10 @@
 //! native input layer (`view_native/text_input/auction.rs`) drives focus and
 //! emits the `Ah*` `AgentCommand`s.
 
+use bevy::picking::events::PointerPress;
+use bevy::picking::hover::Hovered;
 use bevy::prelude::*;
+use bevy::ui_widgets::Button;
 use kuluu_snapshot::{AhSaleView, SceneSnapshot};
 
 use crate::hud::bazaar_view::group_digits;
@@ -1115,7 +1118,7 @@ pub fn spawn_auction_screen(mut commands: Commands, mut images: ResMut<Assets<Im
             AuctionScreenRoot,
             Node {
                 position_type: PositionType::Absolute,
-                top: Val::Px(crate::hud::menu_help_bar::BAR_HEIGHT + 8.0),
+                top: Val::Px(crate::hud::menu_help_bar::help_line_bottom_left().y + 8.0),
                 left: Val::Px(8.0),
                 right: Val::Px(8.0),
                 bottom: Val::Px(54.0),
@@ -1257,6 +1260,7 @@ pub fn spawn_auction_screen(mut commands: Commands, mut images: ResMut<Assets<Im
                                 slot: i,
                             },
                             Button,
+                            Hovered::default(),
                             Text::new(""),
                             text_font(14.0),
                             TextColor(theme::TEXT),
@@ -1282,6 +1286,7 @@ pub fn spawn_auction_screen(mut commands: Commands, mut images: ResMut<Assets<Im
                                 slot,
                             },
                             Button,
+                            Hovered::default(),
                             Text::new(""),
                             text_font(14.0),
                             TextColor(theme::TEXT),
@@ -1309,6 +1314,7 @@ fn spawn_list_row(p: &mut ChildSpawnerCommands, i: usize, placeholder: Handle<Im
             slot: i,
         },
         Button,
+        Hovered::default(),
         Node {
             flex_direction: FlexDirection::Row,
             align_items: AlignItems::Center,
@@ -1893,13 +1899,13 @@ pub fn auction_mouse_hover_system(
     mut screen: ResMut<AuctionScreenState>,
     inv: Res<AuctionSellInventory>,
     state: Res<SceneState>,
-    rows: Query<(&Interaction, &AhHotRow), Changed<Interaction>>,
+    rows: Query<(&Hovered, &AhHotRow), Changed<Hovered>>,
 ) {
     if !screen.active {
         return;
     }
     for (interaction, row) in &rows {
-        if !matches!(interaction, Interaction::Hovered | Interaction::Pressed) {
+        if !interaction.0 {
             continue;
         }
         apply_hover(
@@ -1983,14 +1989,17 @@ pub fn apply_hover(
 /// Click activates a row (the client confirms it exactly like Enter).
 pub fn auction_mouse_click_system(
     screen: Res<AuctionScreenState>,
-    rows: Query<(&Interaction, &AhHotRow), Changed<Interaction>>,
+    rows: Query<&AhHotRow>,
     mut out: MessageWriter<AuctionRowActivated>,
+    mut presses: MessageReader<PointerPress>,
+    parents: Query<&ChildOf>,
 ) {
+    let pressed_rows = super::primary_pressed_rows(&mut presses, &rows, &parents);
     if !screen.active {
         return;
     }
-    for (interaction, row) in &rows {
-        if *interaction == Interaction::Pressed {
+    for row in pressed_rows {
+        {
             out.write(AuctionRowActivated {
                 region: row.region,
                 slot: row.slot,
@@ -2276,6 +2285,8 @@ mod tests {
             next_use_vana_ts: None,
             use_delay_end_vana_ts: None,
             ready: None,
+
+            extdata: None,
         };
         let snap = SceneSnapshot {
             containers: vec![ContainerView {

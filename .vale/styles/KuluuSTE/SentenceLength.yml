@@ -1,0 +1,7 @@
+extends: occurrence
+message: "Split this sentence. Use at most 25 words in a description."
+link: https://www.asd-ste100.org/assets/files/ASD-STE100_ISSUE9.pdf
+level: warning
+scope: sentence
+max: 25
+token: '\S+'

@@ -2,6 +2,7 @@
 //! self.
 
 use bevy::prelude::{Local, Res, Resource};
+use kuluu_render::hud::menu::{DynamicMenu, CONFIG_STORE_AUTO_LOCK};
 use kuluu_render::{InputMode, SceneState, Target};
 use kuluu_session::state::{ActionKind, AgentCommand};
 use kuluu_snapshot::{Entity, EntityKind, PartyMember, Vec3};
@@ -57,6 +58,23 @@ pub fn pick_auto_target<'a>(
     Some(pool[seed as usize % pool.len()])
 }
 
+/// Whether Config's "Do not automatically lock on to target." row suppresses this
+/// path. The store behind that pair (`conf2win` rows id 1/2) has exactly two
+/// references in FFXiMain.dll retail-2026-09 — the arms writing 0 (.text RVA
+/// 0x1974D2) and 1 (.text 0x1974E4), no reader anywhere through the store
+/// accessor family — so the DAT captions govern: absent or zero is retail's
+/// boot state ("Automatically lock on to target at the start of battle.") and
+/// any non-zero value means "Do not automatically lock on".
+fn engage_lock_disabled_by_config(menu: Option<&DynamicMenu>) -> bool {
+    menu.is_some_and(|menu| {
+        *menu
+            .config_option_values
+            .get(&CONFIG_STORE_AUTO_LOCK)
+            .unwrap_or(&0)
+            != 0
+    })
+}
+
 /// Re-engage on target death. Fires on the frame the main target leaves the
 /// slot with no server retarget filling it: a 0x058 assist that already
 /// committed a new main target
@@ -71,6 +89,7 @@ pub fn auto_attack_retarget_system(
     state: Res<SceneState>,
     mode: Res<InputMode>,
     cmd_tx: Res<CommandTx>,
+    config: Option<Res<DynamicMenu>>,
     mut prev_target: Local<Option<u32>>,
     mut frames: Local<u64>,
 ) {
@@ -80,6 +99,9 @@ pub fn auto_attack_retarget_system(
     *prev_target = current;
 
     if !auto.enabled {
+        return;
+    }
+    if engage_lock_disabled_by_config(config.as_deref()) {
         return;
     }
     if prev.is_none() || current.is_some() {
@@ -368,5 +390,60 @@ mod tests {
         app.world_mut().resource_mut::<Target>().id = None;
         app.update();
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn an_absent_or_zero_auto_lock_store_keeps_locking_on() {
+        assert!(!engage_lock_disabled_by_config(None));
+        let absent = DynamicMenu::default();
+        assert!(!engage_lock_disabled_by_config(Some(&absent)));
+        let mut on = DynamicMenu::default();
+        on.config_option_values.insert(CONFIG_STORE_AUTO_LOCK, 0);
+        assert!(!engage_lock_disabled_by_config(Some(&on)));
+    }
+
+    #[test]
+    fn any_written_off_value_disables_engage_lock() {
+        let mut menu = DynamicMenu::default();
+        for value in [1, -1, 7] {
+            menu.config_option_values
+                .insert(CONFIG_STORE_AUTO_LOCK, value);
+            assert!(engage_lock_disabled_by_config(Some(&menu)), "{value}");
+        }
+    }
+
+    #[test]
+    fn auto_lock_off_from_config_blocks_the_retarget() {
+        let (mut app, mut rx) = retarget_app();
+        let mut menu = DynamicMenu::default();
+        menu.config_option_values.insert(CONFIG_STORE_AUTO_LOCK, 1);
+        app.world_mut().insert_resource(menu);
+        death_frame_scene(&mut app, ffxi_proto::decode::animation::ATTACK);
+        app.world_mut().resource_mut::<Target>().id = Some(MOB_A);
+        app.update();
+        app.world_mut().resource_mut::<Target>().id = None;
+        app.update();
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn auto_lock_on_from_config_still_fires() {
+        let (mut app, mut rx) = retarget_app();
+        let mut menu = DynamicMenu::default();
+        menu.config_option_values.insert(CONFIG_STORE_AUTO_LOCK, 0);
+        app.world_mut().insert_resource(menu);
+        death_frame_scene(&mut app, ffxi_proto::decode::animation::ATTACK);
+        app.world_mut().resource_mut::<Target>().id = Some(MOB_A);
+        app.update();
+        app.world_mut().resource_mut::<Target>().id = None;
+        app.update();
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            AgentCommand::Action {
+                target_id: MOB_B,
+                target_index: 7,
+                kind: ActionKind::ChangeTarget,
+            }
+        );
     }
 }

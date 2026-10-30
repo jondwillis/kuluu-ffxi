@@ -262,7 +262,6 @@ pub(super) fn despawn_auth_ui(mut commands: Commands, q: Query<Entity, With<Auth
 
 struct ConnectOk {
     handoff: MapHandoff,
-    key3: [u8; 20],
     auth: kuluu_session::auth_client::AuthSession,
 }
 
@@ -345,7 +344,6 @@ async fn select_with_existing_handle(
         })?;
     Ok(ConnectOk {
         handoff,
-        key3,
         auth: auth_session,
     })
 }
@@ -403,7 +401,6 @@ async fn reopen_and_select(
         })?;
     Ok(ConnectOk {
         handoff,
-        key3,
         auth: session,
     })
 }
@@ -432,7 +429,6 @@ pub(super) fn poll_connect_system(
                 initial_state: InitialState {
                     auth: ok.auth,
                     handoff: ok.handoff,
-                    key3: ok.key3,
                 },
             });
             commands.remove_resource::<ConnectInFlightChan>();
@@ -556,10 +552,10 @@ async fn run_char_create(
 ) -> Result<CharCreateOk> {
     let name = spec.name.clone();
     tracing::info!(name = %name, race = spec.race, job = spec.job, "char-create: sending");
-    let refreshed = handle
-        .create_character(&auth, &spec)
-        .await
-        .context("character creation")?;
+    let refreshed = Context::context(
+        handle.create_character(&auth, &spec).await,
+        "character creation",
+    )?;
     tracing::info!(
         name = %name,
         char_count = refreshed.chars().len(),

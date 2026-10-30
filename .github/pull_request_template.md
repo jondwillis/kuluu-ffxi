@@ -14,6 +14,8 @@
 
 ## Validation
 
+<!-- Match runtime evidence to each material claim. Include the reported failure, intended success, and affected behavior that must continue to work. For compatibility claims, identify the server/device revision, client build, protocol, version, and effective settings. Test successful operation with the advertised configuration. Rejection by an incompatible server proves rejection handling only. Tests and local TLS fixtures cannot replace the required live check. Missing decisive evidence prevents a merge-ready recommendation. Use a table when several configurations are involved. -->
+
 <!-- Tested revision/stack, completed checks and actual results, and precise remaining gaps. Never write "waiting for CI", "CI is running" or another transient status. Wait before reporting that check; pending progress belongs in the task conversation. Newly opened PRs can state completed local checks without a CI placeholder. Omit refresh chronology. Use concise bullets when useful. -->
 
 ## Visual evidence

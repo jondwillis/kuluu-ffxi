@@ -20,6 +20,7 @@
 
 pub mod cue;
 pub mod opcode_meta;
+pub mod opcode_table;
 pub mod runner;
 pub mod vm;
 
@@ -33,5 +34,6 @@ pub use cue::{
 };
 pub use runner::{clean_display, DialogFrame, DialogRunner, DialogStep, EVENT_CANCELLED_END_PARA};
 pub use vm::{
-    EventChoice, EventMessage, EventVm, Park, PendingTag, StepResult, OPCODE_BUDGET_PER_STEP,
+    EventChoice, EventClientGlobals, EventMessage, EventVm, Park, PendingTag, StepResult,
+    OPCODE_BUDGET_PER_STEP,
 };

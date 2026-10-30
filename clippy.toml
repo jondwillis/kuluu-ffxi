@@ -1,0 +1,5 @@
+disallowed-methods = [
+    { path = "std::thread::sleep", reason = "Do not suspend a frame or task worker. Use a timer or a dedicated blocking worker." },
+    { path = "std::thread::park", reason = "Do not park a frame or task worker." },
+    { path = "std::thread::JoinHandle::join", reason = "Do not wait synchronously for a worker on a frame path. Poll for completion." },
+]

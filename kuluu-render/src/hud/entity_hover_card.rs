@@ -172,14 +172,16 @@ mod tests {
         use bevy::ecs::system::RunSystemOnce;
         use bevy::picking::{
             backend::{HitData, PointerHits},
-            hover::{generate_hovermap, HoverMap, PreviousHoverMap},
-            pointer::{PointerId, PointerInput},
+            hover::{generate_hovermap, HoverMap, PointerCaptureMap, PreviousHoverMap},
+            pointer::{PointerId, PointerInput, PointerMap},
         };
 
         let mut app = App::new();
         app.add_plugins(MinimalPlugins)
             .add_message::<PointerHits>()
             .add_message::<PointerInput>()
+            .init_resource::<PointerMap>()
+            .init_resource::<PointerCaptureMap>()
             .init_resource::<HoverMap>()
             .init_resource::<PreviousHoverMap>()
             .init_resource::<HoveredEntity>()

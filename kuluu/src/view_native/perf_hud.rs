@@ -1,4 +1,5 @@
 use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
+use bevy::input::mouse::{MouseScrollUnit, MouseWheel};
 use bevy::prelude::*;
 use bevy::time::Real;
 use kuluu_render::hud::{style::theme, HudPanels};
@@ -7,14 +8,21 @@ use kuluu_render::{perf_probe, InGameEntity};
 use super::bridge::NativeSource;
 
 const SAMPLES: usize = 120;
-const GRAPH_W: f32 = 240.0;
+const GRAPH_W: f32 = 720.0;
 const GRAPH_H: f32 = 64.0;
-const BAR_W: f32 = GRAPH_W / SAMPLES as f32;
+const BAR_PERCENT: f32 = 100.0 / SAMPLES as f32;
 const GRAPH_MAX_MS: f32 = 60.0;
-const TARGET_MS: f32 = 1000.0 / 60.0;
+const PERCENTILE_95: f32 = 0.95;
+const PERCENTILE_99: f32 = 0.99;
+const WARN_BUDGET_RATIO: f32 = 1.25;
+const SEVERE_BUDGET_RATIO: f32 = 2.0;
 const FONT: f32 = 12.0;
 const LOG_COOLDOWN_S: f32 = 1.0;
 const SUMMARY_PERIOD_S: f32 = 5.0;
+const PANEL_INSET: f32 = 16.0;
+const PANEL_MAX_WIDTH_PERCENT: f32 = 95.0;
+const PANEL_MAX_HEIGHT_PERCENT: f32 = 80.0;
+const SCROLL_LINE_PX: f32 = 24.0;
 
 const GRAPH_BG: Color = Color::srgb(0.08, 0.08, 0.10);
 
@@ -23,6 +31,9 @@ pub struct PerfPanel;
 
 #[derive(Component)]
 pub struct PerfGraphBar(usize);
+
+#[derive(Component)]
+pub struct PerfBudgetLine(f32);
 
 #[derive(Component)]
 pub struct PerfTextLine(usize);
@@ -35,6 +46,9 @@ pub struct PerfMonitor {
     frame_start: Option<std::time::Instant>,
     last_cpu_us: u64,
     last_main_us: u64,
+    thread_cpu_start: Option<std::time::Duration>,
+    last_thread_cpu_us: Option<u64>,
+    sample_count: usize,
     spike_cpu_us: u64,
     spike_main_us: u64,
 
@@ -101,6 +115,9 @@ impl Default for PerfMonitor {
             frame_start: None,
             last_cpu_us: 0,
             last_main_us: 0,
+            thread_cpu_start: None,
+            last_thread_cpu_us: None,
+            sample_count: 0,
             spike_cpu_us: 0,
             spike_main_us: 0,
             seen_first: false,
@@ -204,8 +221,17 @@ pub fn track_asset_churn(
         .count() as u64;
 }
 
-pub fn mark_frame_start(mut m: ResMut<PerfMonitor>) {
+pub fn mark_frame_start(
+    mut m: ResMut<PerfMonitor>,
+    panels: Res<HudPanels>,
+    _main_thread: bevy::ecs::system::NonSendMarker,
+) {
     m.frame_start = Some(std::time::Instant::now());
+    m.thread_cpu_start = panels
+        .perf
+        .then(|| cpu_time::ThreadTime::try_now().ok())
+        .flatten()
+        .map(|clock| clock.as_duration());
 }
 
 pub fn mark_frame_end(mut m: ResMut<PerfMonitor>) {
@@ -214,16 +240,27 @@ pub fn mark_frame_end(mut m: ResMut<PerfMonitor>) {
     }
 }
 
-pub fn mark_last_end(mut m: ResMut<PerfMonitor>) {
+pub fn mark_last_end(mut m: ResMut<PerfMonitor>, _main_thread: bevy::ecs::system::NonSendMarker) {
     if let Some(start) = m.frame_start {
         m.last_main_us = start.elapsed().as_micros() as u64;
     }
+    m.last_thread_cpu_us = m.thread_cpu_start.and_then(|start| {
+        cpu_time::ThreadTime::try_now()
+            .ok()?
+            .as_duration()
+            .checked_sub(start)
+            .map(|elapsed| elapsed.as_micros() as u64)
+    });
 }
 
 fn top_render_spans(diag: &DiagnosticsStore) -> String {
     let mut spans: Vec<(String, f64)> = diag
         .iter()
-        .filter(|d| d.path().as_str().starts_with("render/"))
+        .filter(|d| {
+            let path = d.path().as_str();
+            path.starts_with("render/")
+                && (path.ends_with("/elapsed_cpu") || path.ends_with("/elapsed_gpu"))
+        })
         .filter_map(|d| {
             let peak = d.values().copied().fold(0.0f64, f64::max);
             (peak > 0.0).then(|| {
@@ -298,6 +335,7 @@ pub fn update_perf_monitor(
     let cpu_us = m.last_cpu_us;
     let head = m.head;
     m.samples[head] = dt_ms;
+    m.sample_count = (m.sample_count + 1).min(SAMPLES);
     m.head = (head + 1) % SAMPLES;
     m.secs_since_spike += dt;
     if m.log_cooldown_s > 0.0 {
@@ -365,7 +403,7 @@ pub fn update_perf_monitor(
         let avg_fps = m.summary_frames as f32 / m.summary_s;
         info!(
             target: "perf",
-            "summary {avg_fps:.1}fps baseline {:.1}ms max {:.1}ms spikes {} | max rprep {}\u{00b5}s {} rgraph {}\u{00b5}s rtotal {}\u{00b5}s | churn img+{} ({}KB) mesh+{} std+{} zone+{} skin+{}",
+            "summary {avg_fps:.1}fps baseline {:.1}ms max {:.1}ms spikes {} | max rprep {}us {} rgraph {}us rtotal {}us | churn img+{} ({}KB) mesh+{} std+{} zone+{} skin+{}",
             m.baseline_ms,
             m.summary_max_ms,
             m.spikes_total,
@@ -453,7 +491,7 @@ pub fn update_perf_monitor(
     m.suppressed = 0;
     m.log_cooldown_s = LOG_COOLDOWN_S;
     let rebuild = if m.spike_rebuilt {
-        format!("rebuild {}\u{00b5}s", m.spike_rebuild_us)
+        format!("rebuild {}us", m.spike_rebuild_us)
     } else {
         "no rebuild".to_string()
     };
@@ -469,7 +507,7 @@ pub fn update_perf_monitor(
     let render_spans = top_render_spans(&diag);
     warn!(
         target: "perf",
-        "frame spike {dt_ms:.1}ms (baseline {:.1}ms, +{:.1}ms) after {interval:.2}s \u{2014} cpu {}\u{00b5}s late {late_us}\u{00b5}s render~{render_us}\u{00b5}s [rprep {w_rprep_us}\u{00b5}s {} rgraph {w_rgraph_us}\u{00b5}s rtotal {w_rtotal_us}\u{00b5}s] | {rebuild}, model+{w_model} plate+{w_rasters} probe {w_probe_us}\u{00b5}s | churn img+{} ({}KB) mesh+{} std+{} zone+{} skin+{}{extra}{render_spans}",
+        "frame spike {dt_ms:.1}ms (baseline {:.1}ms, +{:.1}ms) after {interval:.2}s \u{2014} cpu {}us late {late_us}us render~{render_us}us [rprep {w_rprep_us}us {} rgraph {w_rgraph_us}us rtotal {w_rtotal_us}us] | {rebuild}, model+{w_model} plate+{w_rasters} probe {w_probe_us}us | churn img+{} ({}KB) mesh+{} std+{} zone+{} skin+{}{extra}{render_spans}",
         m.baseline_ms,
         dt_ms - m.baseline_ms,
         cpu_us,
@@ -488,11 +526,15 @@ pub fn spawn_perf_hud(mut commands: Commands) {
         .spawn((
             InGameEntity,
             PerfPanel,
+            bevy::ui::RelativeCursorPosition::default(),
             Node {
                 position_type: PositionType::Absolute,
                 top: Val::Px(96.0),
                 left: Val::Px(8.0),
-                width: Val::Px(GRAPH_W + 16.0),
+                width: Val::Px(GRAPH_W + PANEL_INSET),
+                max_width: Val::Percent(PANEL_MAX_WIDTH_PERCENT),
+                max_height: Val::Percent(PANEL_MAX_HEIGHT_PERCENT),
+                overflow: Overflow::scroll_y(),
                 padding: UiRect::axes(Val::Px(8.0), Val::Px(6.0)),
                 border: UiRect::all(Val::Px(1.0)),
                 flex_direction: FlexDirection::Column,
@@ -509,8 +551,9 @@ pub fn spawn_perf_hud(mut commands: Commands) {
 
             p.spawn((
                 Node {
-                    width: Val::Px(GRAPH_W),
+                    width: Val::Percent(100.0),
                     height: Val::Px(GRAPH_H),
+                    min_height: Val::Px(GRAPH_H),
                     overflow: Overflow::clip(),
                     ..default()
                 },
@@ -522,22 +565,34 @@ pub fn spawn_perf_hud(mut commands: Commands) {
                         PerfGraphBar(i),
                         Node {
                             position_type: PositionType::Absolute,
-                            left: Val::Px(i as f32 * BAR_W),
+                            left: Val::Percent(i as f32 * BAR_PERCENT),
                             bottom: Val::Px(0.0),
-                            width: Val::Px(BAR_W),
+                            width: Val::Percent(BAR_PERCENT),
                             height: Val::Px(0.0),
                             ..default()
                         },
                         BackgroundColor(theme::GOOD),
                     ));
                 }
-                spawn_ref_line(g, TARGET_MS, theme::GOOD);
-                spawn_ref_line(g, TARGET_MS * 2.0, theme::WARN);
+                spawn_ref_line(g, 1.0, theme::GOOD);
+                spawn_ref_line(g, SEVERE_BUDGET_RATIO, theme::WARN);
             });
 
             spawn_text_line(p, 1, theme::TEXT);
             spawn_text_line(p, 2, theme::TEXT);
             spawn_text_line(p, 3, theme::MUTED);
+            spawn_text_line(p, 4, theme::MUTED);
+            spawn_text_line(p, 5, theme::TEXT);
+            spawn_text_line(p, 6, theme::TEXT);
+            p.spawn((
+                super::dev_diagnostics::DevelopmentSummaryText,
+                Text::new("Collecting diagnostics..."),
+                TextFont {
+                    font_size: FONT.into(),
+                    ..default()
+                },
+                TextColor(theme::TEXT),
+            ));
         });
 }
 
@@ -550,17 +605,17 @@ fn spawn_text_line(p: &mut ChildSpawnerCommands, index: usize, color: Color) {
             ..default()
         },
         TextColor(color),
-        TextLayout::no_wrap(),
     ));
 }
 
-fn spawn_ref_line(g: &mut ChildSpawnerCommands, ms: f32, color: Color) {
+fn spawn_ref_line(g: &mut ChildSpawnerCommands, ratio: f32, color: Color) {
     g.spawn((
+        PerfBudgetLine(ratio),
         Node {
             position_type: PositionType::Absolute,
             left: Val::Px(0.0),
-            width: Val::Px(GRAPH_W),
-            bottom: Val::Px((ms / GRAPH_MAX_MS).clamp(0.0, 1.0) * GRAPH_H),
+            width: Val::Percent(100.0),
+            bottom: Val::Px(0.0),
             height: Val::Px(1.0),
             ..default()
         },
@@ -572,9 +627,6 @@ pub fn apply_perf_visibility(
     panels: Res<HudPanels>,
     mut q: Query<&mut Visibility, With<PerfPanel>>,
 ) {
-    if !panels.is_changed() {
-        return;
-    }
     let want = if panels.perf {
         Visibility::Inherited
     } else {
@@ -587,26 +639,78 @@ pub fn apply_perf_visibility(
     }
 }
 
+pub fn scroll_perf_panel(
+    panels: Res<HudPanels>,
+    mut wheel: MessageReader<MouseWheel>,
+    pointer: Option<ResMut<kuluu_render::mouse::MousePointer>>,
+    mut query: Query<
+        (
+            &bevy::ui::RelativeCursorPosition,
+            &ComputedNode,
+            &mut ScrollPosition,
+        ),
+        With<PerfPanel>,
+    >,
+) {
+    let delta: f32 = wheel
+        .read()
+        .map(|event| match event.unit {
+            MouseScrollUnit::Line => event.y * SCROLL_LINE_PX,
+            MouseScrollUnit::Pixel => event.y,
+        })
+        .sum();
+    if !panels.perf {
+        return;
+    }
+    let mut pointer = pointer;
+    for (cursor, node, mut scroll) in &mut query {
+        if cursor.cursor_over() {
+            if let Some(pointer) = pointer.as_mut() {
+                pointer.wheel = 0.0;
+            }
+            let max =
+                (node.content_size().y - node.size().y).max(0.0) * node.inverse_scale_factor();
+            scroll.0.y = (scroll.0.y - delta).clamp(0.0, max);
+        }
+    }
+}
+
 pub fn update_perf_graph(
     panels: Res<HudPanels>,
     m: Res<PerfMonitor>,
     source: Res<NativeSource>,
     diag: Res<DiagnosticsStore>,
+    settings: Option<Res<bevy_framepace::FramepaceSettings>>,
+    limit: Option<Res<bevy_framepace::FrametimeLimit>>,
     mut bars: Query<(&PerfGraphBar, &mut Node, &mut BackgroundColor)>,
+    mut budget_lines: Query<(&PerfBudgetLine, &mut Node, &mut Visibility), Without<PerfGraphBar>>,
     mut lines: Query<(&PerfTextLine, &mut Text, &mut TextColor)>,
 ) {
     if !panels.perf {
         return;
     }
 
+    let budget_ms = settings
+        .as_deref()
+        .and_then(|settings| frame_budget_ms(&settings.limiter, limit.as_deref()));
+    for (line, mut node, mut visibility) in &mut budget_lines {
+        *visibility = if budget_ms.is_some() {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        };
+        if let Some(budget) = budget_ms {
+            node.bottom = Val::Px((budget * line.0 / GRAPH_MAX_MS).clamp(0.0, 1.0) * GRAPH_H);
+        }
+    }
     for (bar, mut node, mut bg) in bars.iter_mut() {
         let ms = m.samples[(m.head + bar.0) % SAMPLES];
         let frac = (ms / GRAPH_MAX_MS).clamp(0.0, 1.0);
         node.height = Val::Px(frac * GRAPH_H);
-        bg.0 = sample_color(ms);
+        bg.0 = sample_color(ms, budget_ms);
     }
 
-    let text = build_text_lines(&m, &source, &diag);
+    let text = build_text_lines(&m, &source, &diag, budget_ms);
     for (line, mut t, mut tc) in lines.iter_mut() {
         if let Some((s, c)) = text.get(line.0) {
             if **t != *s {
@@ -621,6 +725,7 @@ fn build_text_lines(
     m: &PerfMonitor,
     source: &NativeSource,
     diag: &DiagnosticsStore,
+    budget_ms: Option<f32>,
 ) -> Vec<(String, Color)> {
     let fps = diag
         .get(&FrameTimeDiagnosticsPlugin::FPS)
@@ -629,7 +734,7 @@ fn build_text_lines(
 
     let title = (
         format!(
-            "PERF  {fps:.0} fps  {:.1}ms  (scale {GRAPH_MAX_MS:.0}ms)",
+            "DEVELOPMENT DIAGNOSTICS  {fps:.0} fps  {:.1}ms  (scale {GRAPH_MAX_MS:.0}ms)",
             m.baseline_ms,
         ),
         theme::TITLE,
@@ -652,7 +757,7 @@ fn build_text_lines(
     let main_us = m.spike_main_us.min(frame_us);
     let split = (
         format!(
-            "spike split: cpu {}\u{00b5}s  late {}\u{00b5}s  render~{}\u{00b5}s  (rp {} rg {} rt {})",
+            "spike wall time: main {}us  late {}us  remainder~{}us  (rp {} rg {} rt {})",
             m.spike_cpu_us,
             main_us.saturating_sub(m.spike_cpu_us),
             frame_us.saturating_sub(main_us),
@@ -670,9 +775,9 @@ fn build_text_lines(
 
     let cause = (
         format!(
-            "on spike: {}  model+{} plate+{} probe {}\u{00b5}s   snap {}\u{00b5}s n:{}  {:.0} rebuild/s",
+            "on spike: {}  model+{} plate+{} probe {}us   snap {}us n:{}  {:.0} rebuild/s",
             if m.spike_rebuilt {
-                format!("rebuild {}\u{00b5}s", m.spike_rebuild_us)
+                format!("rebuild {}us", m.spike_rebuild_us)
             } else {
                 "no rebuild".to_string()
             },
@@ -686,7 +791,35 @@ fn build_text_lines(
         theme::MUTED,
     );
 
-    vec![title, spike, split, rp_split, cause]
+    let mut samples = m.samples[..m.sample_count].to_vec();
+    samples.sort_by(f32::total_cmp);
+    let intervals = if let Some(budget) = budget_ms {
+        let over = samples.iter().filter(|&&ms| ms > budget).count();
+        let severe = samples
+            .iter()
+            .filter(|&&ms| ms > budget * SEVERE_BUDGET_RATIO)
+            .count();
+        format!(
+            "Budget {budget:.2}ms | intervals over budget {over}/{} | over 2x {severe}",
+            samples.len()
+        )
+    } else {
+        "Budget unavailable (limiter off or monitor rate unknown)".into()
+    };
+    let budget = (
+        format!(
+            "{intervals} | p95 {:.2}ms p99 {:.2}ms",
+            percentile(&samples, PERCENTILE_95),
+            percentile(&samples, PERCENTILE_99)
+        ),
+        theme::TEXT,
+    );
+    let cpu = m
+        .last_thread_cpu_us
+        .map(|us| format!("{:.2}ms", us as f64 / 1000.0))
+        .unwrap_or_else(|| "unavailable".into());
+    let timing = (format!("App schedule wall {:.2}ms | main thread CPU {cpu}\nWall includes worker waits and OS scheduling. Use a profiler to identify the cause.", m.last_main_us as f64 / 1000.0), theme::TEXT);
+    vec![title, spike, split, rp_split, cause, budget, timing]
 }
 
 /// Formats the rprep sub-spans as "[xtr N ast N vws N que N prp N]" (µs).
@@ -704,12 +837,102 @@ fn fmt_rprep_spans(us: &[u64; 5]) -> String {
     out
 }
 
-fn sample_color(ms: f32) -> Color {
-    if ms <= TARGET_MS * 1.25 {
+fn frame_budget_ms(
+    limiter: &bevy_framepace::Limiter,
+    limit: Option<&bevy_framepace::FrametimeLimit>,
+) -> Option<f32> {
+    let duration = match limiter {
+        bevy_framepace::Limiter::Manual(duration) => *duration,
+        bevy_framepace::Limiter::Auto => *limit?.0.try_lock().ok()?,
+        bevy_framepace::Limiter::Off => return None,
+    };
+    (!duration.is_zero()).then_some(duration.as_secs_f32() * 1000.0)
+}
+
+fn percentile(sorted: &[f32], fraction: f32) -> f32 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    sorted[((sorted.len() as f32 * fraction).ceil() as usize)
+        .saturating_sub(1)
+        .min(sorted.len() - 1)]
+}
+
+fn sample_color(ms: f32, budget_ms: Option<f32>) -> Color {
+    let Some(budget) = budget_ms else {
+        return theme::MUTED;
+    };
+    if ms <= budget * WARN_BUDGET_RATIO {
         theme::GOOD
-    } else if ms <= TARGET_MS * 2.0 {
+    } else if ms <= budget * SEVERE_BUDGET_RATIO {
         theme::WARN
     } else {
         theme::DANGER
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kuluu_render::mouse::MousePointer;
+
+    #[test]
+    fn budget_uses_the_active_limiter_and_rejects_unknown_rates() {
+        use bevy_framepace::Limiter;
+        let budget = frame_budget_ms(&Limiter::from_framerate(120.0), None).unwrap();
+        assert!((budget - 1000.0 / 120.0).abs() < f32::EPSILON * 100.0);
+        assert!(frame_budget_ms(&Limiter::Off, None).is_none());
+        assert!(frame_budget_ms(&Limiter::Auto, None).is_none());
+        assert!(frame_budget_ms(&Limiter::Auto, Some(&default())).is_none());
+    }
+
+    #[test]
+    fn percentiles_keep_long_frames_and_ignore_unused_history() {
+        assert_eq!(percentile(&[], PERCENTILE_99), 0.0);
+        assert_eq!(percentile(&[8.0], PERCENTILE_95), 8.0);
+        let mut samples = vec![8.0; 99];
+        samples.push(40.0);
+        assert_eq!(percentile(&samples, PERCENTILE_95), 8.0);
+        assert_eq!(percentile(&samples, 1.0), 40.0);
+    }
+
+    #[test]
+    fn only_a_visible_hovered_panel_claims_camera_scroll() {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .add_message::<MouseWheel>()
+            .init_resource::<HudPanels>()
+            .init_resource::<MousePointer>()
+            .add_systems(Update, scroll_perf_panel);
+        let panel = app
+            .world_mut()
+            .spawn((
+                PerfPanel,
+                bevy::ui::RelativeCursorPosition::default(),
+                ComputedNode::default(),
+                ScrollPosition::default(),
+            ))
+            .id();
+        for (visible, hovered, claimed) in [
+            (false, true, false),
+            (true, false, false),
+            (true, true, true),
+        ] {
+            app.world_mut().resource_mut::<HudPanels>().perf = visible;
+            app.world_mut()
+                .get_mut::<bevy::ui::RelativeCursorPosition>(panel)
+                .unwrap()
+                .cursor_over = hovered;
+            app.world_mut().resource_mut::<MousePointer>().wheel = 1.0;
+            app.world_mut().write_message(MouseWheel {
+                unit: MouseScrollUnit::Line,
+                x: 0.0,
+                y: 1.0,
+                phase: bevy::input::touch::TouchPhase::Moved,
+                window: Entity::PLACEHOLDER,
+            });
+            app.update();
+            assert_eq!(app.world().resource::<MousePointer>().wheel == 0.0, claimed);
+        }
     }
 }

@@ -74,6 +74,11 @@ if ! scripts/checks.sh records; then
   exit 1
 fi
 
+if ! scripts/checks.sh opcode-table; then
+  echo "pre-push: ✗ opcode-table — the derived effect table drifted, or an opcode written off as having no retail effect does store/call after all; run 'python3 scripts/opcode-effect-table.py' (or 'git push --no-verify' to bypass)" >&2
+  exit 1
+fi
+
 if ! scripts/checks.sh fmt; then
   echo "pre-push: ✗ formatting — run 'cargo fmt --all' (or 'git push --no-verify' to bypass)" >&2
   exit 1

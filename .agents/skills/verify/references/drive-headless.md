@@ -21,10 +21,10 @@ Two rules that decide most mis-runs:
   `kuluu-render` or `view_native`; a render-side panic needs the pipeline actually up,
   which means an offscreen window (§Render-health runs). Session-only logs carry zero
   `kuluu_render` lines — that absence is expected, not a broken build.
-- **Knob names come from the build, never from this file.** `kuluu animtest --knobs` (and
-  `{"query":"knobs"}` over `FFXI_KEY_DRIVE`) print what cases/environment variables the running
-  binary actually accepts; a name copied from documentation is a guess, and a guessed `ANIMTEST_*`
-  silently does nothing. §Taking screenshots has both invocations.
+- **Read knob names from the build.** `cargo run -p kuluu-room -- --knobs` prints
+  the room's cases, environment variables, and automatic case timing. The room
+  has no key-drive socket. The main client's key-drive query does not control
+  the room. See §Taking screenshots for the standalone command.
 - **Window modes are three, and only two work.** *Offscreen* = created hidden, then
   parked past every monitor and **shown**, so the swapchain keeps producing frames;
   nothing reaches the desktop (see §Offscreen window vocabulary). *Buried* = never
@@ -229,43 +229,43 @@ Everything lands in a dated folder (`/c/tmp/<what-you-check>-<YYYYMMDD>/` on Win
 `$TMPDIR/<name>-<date>/` elsewhere), never loose in the repo root, and stays there until
 the report is written.
 
-### A. Animation test box (pre-server pixels, no session)
+### A. Standalone animation room (pixels without a server session)
 
-The production render app with the DATs loaded directly — particles, routines, zone
-geometry and weather by file id, with zero server state. **Requires a
-`debug-animation_room` build** (`--features debug-animation_room`; the plugin is `#[cfg]`-gated
-in `kuluu/src/view_native/mod.rs`). Launch with user + password only: passing a char name
-auto-starts a session and plays the intro cutscene instead of opening the box. A non-empty
-`ANIMTEST_AUTO` opens the box by itself, so the whole run is hands-free.
+The `kuluu-room` binary loads game files into the production renderer. It opens
+directly, without the launcher, an account, or server credentials. No launcher
+feature is required. Select an install through the registry, or set `FFXI_DAT_PATH`.
+
+Read the controls supported by this build before starting a capture:
 
 ```bash
-KULUU_WINDOW_HIDDEN=1 \
-ANIMTEST_AUTO="zone,g141,g144,shot" \
-ANIMTEST_ZONE_ID=<id> ANIMTEST_MZB_FILE_ID=<fid> ANIMTEST_WORLD_POS="0,0,0" \
-ANIMTEST_SHOT_PATH=/c/tmp/<dated>/zone.png \
-RUST_LOG=info ./target/release/kuluu.exe --server 127.0.0.1 play verilight 'TestPass!1234' \
-  --mute > /dev/null 2> /c/tmp/<dated>/client.log &      # Unix: same, minus the .exe
+cargo run -p kuluu-room -- --knobs
 ```
 
-- **Ask this build what it can drive.** Do not transcribe case names or environment variables from
-  this file, from memory, or from someone's older capture — ask, and use what comes back:
-  ```bash
-  ./target/release/kuluu animtest --knobs      # no server, no install, no window; exits at once
-  echo '{"query":"knobs"}' | nc 127.0.0.1 <FFXI_KEY_DRIVE-port>    # same answer from a running box
-  ```
-  The reply lists every fireable case name, every env knob with what it does and its value shape,
-  and the auto-fire spacing. If it answers `"compiled_in": false`, **this build has no room**: rebuild
-  with the features the answer names instead of guessing flags or concluding the box is broken.
-- **Fire, then read the log.** Unknown case names warn and are dropped, so a typo'd list silently
-  produces fewer captures than you asked for; `[animationtest]` lines show what actually ran.
-- **Order matters more than speed**: cases fire on the fixed clock the report describes, so a long
-  queue delays the case you care about, and a zone capture fired before MZB placement settles shows
-  the wrong terrain — confirm in the log that the target file id's placements spawned before judging
-  what you see.
-- **The readback case is the pixel path**: Bevy reads back its own render target, so it lands while
-  parked offscreen where no window capture can reach. The report names which knob sets the output
-  file (unset means numbered default output). Include that case in the queue; if nothing lands,
-  presentation is stalled → escalation ladder.
+This command needs no install, server, or window. The report lists case names,
+environment variables, value formats, and automatic case timing. The `ANIMTEST_*`
+names remain unchanged. Set `ANIMTEST_AUTO` to run the required cases.
+
+The room currently opens a visible window. It has no key-drive socket or Windows
+offscreen parking support. `KULUU_WINDOW_HIDDEN` does not provide offscreen
+presentation for this binary. Follow the visible-window escalation procedure
+before starting the room. Then run:
+
+```bash
+cargo run -p kuluu-room -- --unfocused --mute
+```
+
+The `--unfocused` option prevents a keyboard-focus request; it does not hide the
+window. Use `--no-install` only to test the missing-install diagnostic. That
+fixture cannot establish rendering correctness.
+
+- **Read the log after each case.** Unknown case names produce warnings and are
+  removed from the queue. The `[animationtest]` lines identify the cases that ran.
+- **Wait for the required scene.** Cases use the timing in the knob report.
+  Confirm that the requested zone geometry loaded before assessing a zone capture.
+- **Capture through the renderer.** Use the reported screenshot case and output
+  variable for Bevy GPU readback. Save captures in the dated evidence directory.
+  Open and inspect each capture. If capture fails, retain the diagnostic and
+  follow the escalation procedure.
 
 ### B. Live session with pixels (offscreen window + key drive)
 
@@ -276,7 +276,7 @@ line per TCP connection:
 
 | Line | Effect |
 |---|---|
-| `{"query":"knobs"}` | what this build can drive: cases, env knobs and clock spacing — on a live session, where the offline `animtest --knobs` answer cannot see runtime state |
+| `{"query":"knobs"}` | Reports that the animation room is absent from the main client. Use the standalone command for room controls. |
 | `{"key":"printscreen"}` | in-app GPU readback → numbered `screenshot-<n>.png` **in the working directory**; move each into your dated folder immediately. Names accepted by `KeyMsg::resolve`: `printscreen`, `prtsc`, `prtscn` |
 | `{"text":"//warp 123.4 -56.7"}` then `{"key":"enter"}` | dev commands take a **double** slash (`//warp`, `//whereami`, `//zones`, `//pathto`, `//endevent`); single `/cmd` is rejected with a suggestion |
 | `{"text":"/shutdown"}` then `{"key":"enter"}` | normal player logout — LeaveGame wait (~30 s; skipped at GM rank), then the client closes itself. This is how every run ends; see §Cleanup |
@@ -366,9 +366,9 @@ confirm the log tail ends with exit-watchdog checkpoints; the map side records t
 - Raw stdio credentials are positional; env vars feed only the interactive launcher, which blocks
   on `Username:`.
 - Coordinate swap bites twice — in commands *and* events, `y` is ground and `z` is vertical.
-- colima dead / one-way UDP / login stuck at "Authenticating": the VM slept and virtiofs went
-  stale → `colima restart`, then `docker start` the server containers. If login succeeds and map
-  traffic goes silent, check the stack's DNAT sidecar before theorising about the client.
+- If Colima or Docker is unavailable, follow [stack recovery](stack.md#recover-the-installed-runtime).
+  Diagnose the endpoint and workload ownership before restarting a shared runtime.
+  If login succeeds but map traffic stops, inspect UDP publication and forwarding before attributing the failure to the client.
 
 **Offscreen/pixel surfaces (§A–§C)**
 

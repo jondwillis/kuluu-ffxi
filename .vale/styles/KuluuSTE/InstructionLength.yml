@@ -1,0 +1,7 @@
+extends: occurrence
+message: "Split this instruction. Use at most 20 words."
+link: https://www.asd-ste100.org/assets/files/ASD-STE100_ISSUE9.pdf
+level: warning
+scope: sentence
+max: 20
+token: '\S+'

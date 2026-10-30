@@ -1,6 +1,6 @@
 use bevy::ecs::hierarchy::ChildOf;
-use bevy::ecs::spawn::Spawn;
-use bevy::feathers::controls::{button_bundle, ButtonBundleProps, ButtonVariant};
+use bevy::feathers::controls::{ButtonVariant, FeathersButton};
+use bevy::feathers::font_styles::InheritableFont;
 use bevy::feathers::theme::ThemedText;
 use bevy::input::keyboard::KeyboardInput;
 use bevy::input::mouse::{MouseScrollUnit, MouseWheel};
@@ -145,7 +145,7 @@ pub(super) fn hint(text: impl Into<String>) -> impl Bundle {
     )
 }
 
-#[derive(Component)]
+#[derive(Component, Clone, Default)]
 pub(super) struct ServerChipLabel;
 
 pub(super) fn spawn_breadcrumb(
@@ -172,20 +172,24 @@ pub(super) fn spawn_breadcrumb(
             BorderColor::all(PANEL_BORDER_COLOR),
         ))
         .with_children(|chip| {
-            chip.spawn(button_bundle(
-                ButtonBundleProps::default(),
-                (),
-                Spawn((
-                    Text::new(format!("Server: {}", server.display_label())),
-                    ThemedText,
-                    ServerChipLabel,
-                )),
-            ))
-            .observe(
-                |_ev: On<Activate>, mut next: ResMut<NextState<LauncherState>>| {
-                    next.set(LauncherState::ServerSelect);
-                },
-            );
+            let server_label = format!("Server: {}", server.display_label());
+            chip.spawn_empty()
+                .apply_scene(bsn! {
+                    @FeathersButton {
+                        @caption: bsn! {
+                            Text::new(server_label)
+                            ThemedText
+                            ServerChipLabel
+                        },
+                    }
+                    Node { flex_grow: 1.0 }
+                    InheritableFont { font: {Handle::<Font>::default()} }
+                })
+                .observe(
+                    |_ev: On<Activate>, mut next: ResMut<NextState<LauncherState>>| {
+                        next.set(LauncherState::ServerSelect);
+                    },
+                );
 
             let Some((_current, trail)) = crumbs.split_last() else {
                 return;
@@ -202,19 +206,23 @@ pub(super) fn spawn_breadcrumb(
                 ));
                 let label = crumb.label();
                 if let Some(target) = crumb.target() {
-                    chip.spawn(button_bundle(
-                        ButtonBundleProps {
-                            variant: ButtonVariant::Normal,
-                            ..default()
-                        },
-                        (),
-                        Spawn((Text::new(label), ThemedText)),
-                    ))
-                    .observe(
-                        move |_ev: On<Activate>, mut next: ResMut<NextState<LauncherState>>| {
-                            next.set(target.clone());
-                        },
-                    );
+                    chip.spawn_empty()
+                        .apply_scene(bsn! {
+                            @FeathersButton {
+                                @variant: ButtonVariant::Normal,
+                                @caption: bsn! {
+                                    Text::new(label)
+                                    ThemedText
+                                },
+                            }
+                            Node { flex_grow: 1.0 }
+                            InheritableFont { font: {Handle::<Font>::default()} }
+                        })
+                        .observe(
+                            move |_ev: On<Activate>, mut next: ResMut<NextState<LauncherState>>| {
+                                next.set(target.clone());
+                            },
+                        );
                 } else {
                     chip.spawn((
                         Text::new(label),
@@ -343,7 +351,7 @@ const SPATIAL_FORWARD_EPSILON: f32 = 0.25;
 
 /// A node this small is either laid out to nothing or not laid out yet.
 /// `graphics` collapses whole sections with `Display::None` while their
-/// `button_bundle` children keep their `TabIndex`, so size is what separates a
+/// button children keep their `TabIndex`, so size is what separates a
 /// reachable widget from a hidden one.
 const MIN_FOCUSABLE_PX: f32 = 1.0;
 
@@ -780,39 +788,35 @@ fn spawn_titlebar(
                 ThemedText,
             ));
             if show_settings {
-                bar.spawn(button_bundle(
-                    ButtonBundleProps::default(),
-                    (),
-                    Spawn((Text::new("Settings"), ThemedText)),
-                ))
-                .observe(
-                    |_ev: On<Activate>, mut next: ResMut<NextState<LauncherState>>| {
-                        next.set(LauncherState::Settings);
-                    },
-                );
-                #[cfg(feature = "debug-animation_room")]
-                {
-                    bar.spawn(button_bundle(
-                        ButtonBundleProps::default(),
-                        (),
-                        Spawn((Text::new("AnimationTest"), ThemedText)),
-                    ))
+                bar.spawn_empty()
+                    .apply_scene(bsn! {
+                        @FeathersButton {
+                            @caption: bsn! {
+                                Text::new("Settings")
+                                ThemedText
+                            },
+                        }
+                        Node { flex_grow: 1.0 }
+                        InheritableFont { font: {Handle::<Font>::default()} }
+                    })
                     .observe(
-                        |_ev: On<Activate>,
-                         mut pending: ResMut<
-                            crate::view_native::animation_test_scene::PendingToggle,
-                        >| {
-                            pending.0 = true;
+                        |_ev: On<Activate>, mut next: ResMut<NextState<LauncherState>>| {
+                            next.set(LauncherState::Settings);
                         },
                     );
-                }
             }
             bar.spawn(Node::default()).with_children(|slot| {
-                let mut btn = slot.spawn(button_bundle(
-                    ButtonBundleProps::default(),
-                    (),
-                    Spawn((Text::new(label), ThemedText)),
-                ));
+                let mut btn = slot.spawn_empty();
+                btn.apply_scene(bsn! {
+                    @FeathersButton {
+                        @caption: bsn! {
+                            Text::new(label)
+                            ThemedText
+                        },
+                    }
+                    Node { flex_grow: 1.0 }
+                    InheritableFont { font: {Handle::<Font>::default()} }
+                });
                 match action {
                     NavAction::Close => {
                         btn.observe(|_ev: On<Activate>, mut exit: MessageWriter<AppExit>| {
@@ -877,6 +881,10 @@ pub(super) fn pick_folder_blocking(
     title: String,
     start_dir: Option<std::path::PathBuf>,
 ) -> Option<std::path::PathBuf> {
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "The picker waits on the dialog thread it owns; winit must not host a modal IFileDialog (kuluu-38bj)."
+    )]
     #[cfg(target_os = "windows")]
     {
         std::thread::spawn(move || run_folder_dialog(title, start_dir))

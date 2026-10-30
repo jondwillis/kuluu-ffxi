@@ -32,6 +32,14 @@ escaping `.agents/`, missing/non-executable project hook path, a reappeared
 that isn't tracked all fail the stage. It runs first in `.githooks/pre-push`
 and as its own CI step.
 
+## Output guidance
+
+`ste100-reminder.py` reads the ASD-STE100 section from the root `AGENTS.md`.
+Codex and Claude load it on `SessionStart` and `UserPromptSubmit`.
+This includes session restart after context compaction.
+The hook supplies writing guidance; it does not inspect or block output.
+Review prose before sending it. Keep the root section as the single source of rules.
+
 ## Layout
 
 - `.agents/skills/` — [agentskills.io](https://agentskills.io/specification)

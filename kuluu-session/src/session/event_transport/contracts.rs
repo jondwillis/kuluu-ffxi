@@ -780,6 +780,144 @@ async fn progressing_child_wait_does_not_timeout_contract() {
     host.waiting();
 }
 
+async fn owner_child_server_acknowledgement_contract() {
+    const OP_WAIT: u8 = 0x1C;
+    const OP_SEND_TAG: u8 = 0x43;
+    const WAIT_FRAMES: u32 = 1;
+    let mut program = vec![OP_WAIT];
+    operand(&mut program, REFERENCE);
+    program.extend([OP_SEND_TAG, 0, OP_SEND_TAG, 1]);
+    message(&mut program, 1);
+    program.push(OP_END);
+    let mut child = block(program, vec![WAIT_FRAMES, 0]);
+    child.actor = ZONE_PLAYER_ACTOR;
+    let mut master = vec![OP_SET];
+    operand(&mut master, WORK_FARE);
+    operand(&mut master, REFERENCE);
+    master.push(OP_END);
+    let mut host = Host::new(
+        EventDat {
+            blocks: vec![block(master, vec![0]), child],
+        },
+        FARE,
+    )
+    .await;
+    let step = host.step(Drive::Tick(TICK));
+    assert!(matches!(
+        step.advance,
+        Advance::AwaitServerAck(ffxi_event::PendingTag::SendTag { end_para: 0 })
+    ));
+    pending_tag_wire_contract(&mut host).await;
+    let generic_ack = map::event_position_wire::EVENT_RECV_PENDING.to_le_bytes();
+    assert!(server_ack_matches(
+        &mut host.dialog,
+        &framing::SubPacket {
+            opcode: map::s2c::EVENTUCOFF,
+            sequence: 0,
+            data: &generic_ack,
+        }
+    ));
+    let step = host.step(Drive::ServerAck);
+    assert!(matches!(step.advance, Advance::Frame(_)));
+    let step = host.step(Drive::Choice(0));
+    assert!(matches!(step.advance, Advance::Ended { .. }));
+    assert!(host.dialog.active_end().is_none());
+}
+
+// vendor/server/src/map/packets/s2c/0x00a_login.h GP_SERV_COMMAND_LOGIN and GP_SERV_POS_HEAD.
+async fn pending_tag_wire_contract(host: &mut Host) {
+    use ffxi_proto::decode::ServerLogin;
+    const LOGIN_BODY_LEN: usize = ServerLogin::WEATHER_NUMBER_OFFSET;
+    const STATUS_EVENT_PINNED_VALUE: u8 = 4;
+    const STATUS_PINNED_OFFSET: usize = 27;
+    const ZONE_PINNED_OFFSET: usize = 44;
+    const EVENT_ZONE_PINNED_OFFSET: usize = 0x5E;
+    const EVENT_ID_PINNED_OFFSET: usize = 0x60;
+    const PLAYER_INDEX_PINNED_VALUE: u16 = 1024;
+    const EVENT_ZONE_PINNED_VALUE: u16 = 231;
+    const EVENT_ID_PINNED_VALUE: u16 = 878;
+    const SEED: [u8; 20] = [0; 20];
+    let mut login_body = vec![0; LOGIN_BODY_LEN];
+    login_body[..4].copy_from_slice(&PLAYER.to_le_bytes());
+    login_body[4..6].copy_from_slice(&PLAYER_INDEX_PINNED_VALUE.to_le_bytes());
+    login_body[STATUS_PINNED_OFFSET] = STATUS_EVENT_PINNED_VALUE;
+    login_body[ZONE_PINNED_OFFSET..ZONE_PINNED_OFFSET + 4]
+        .copy_from_slice(&u32::from(EVENT_ZONE_PINNED_VALUE).to_le_bytes());
+    login_body[EVENT_ZONE_PINNED_OFFSET..EVENT_ZONE_PINNED_OFFSET + 2]
+        .copy_from_slice(&EVENT_ZONE_PINNED_VALUE.to_le_bytes());
+    login_body[EVENT_ID_PINNED_OFFSET..EVENT_ID_PINNED_OFFSET + 2]
+        .copy_from_slice(&EVENT_ID_PINNED_VALUE.to_le_bytes());
+    let login = ServerLogin::decode(&login_body).unwrap();
+    let event = login.zone_in_event.unwrap();
+    let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let address = server.local_addr().unwrap();
+    host.map = MapClient::connect_with_local(address, SEED, "127.0.0.1:0")
+        .await
+        .unwrap();
+    let previous = crate::map_client::BOOTSTRAP_SUB_SYNC;
+    let mut sequence = previous.wrapping_add(1);
+    super::super::send_pending_tag(
+        &mut host.map,
+        &mut sequence,
+        previous,
+        login.zone_no,
+        login.unique_no,
+        login.act_index,
+        event.event_para,
+        &ffxi_event::PendingTag::SendTag { end_para: 0 },
+    )
+    .await;
+    let mut bytes = vec![0; map::MAX_DATAGRAM];
+    let (size, peer) = server.recv_from(&mut bytes).await.unwrap();
+    bytes.truncate(size);
+    let decoded = host.map.decode_datagram(bytes, address).unwrap();
+    let header = u16::from_le_bytes(decoded[..2].try_into().unwrap());
+    let packet = framing::walk_sub_packets(&decoded[framing::FFXI_HEADER_SIZE..])
+        .next()
+        .unwrap()
+        .unwrap();
+    // vendor/server/src/map/map_networking.cpp MapNetworking::parse.
+    assert!(previous < packet.sequence && packet.sequence <= header);
+    assert_eq!(packet.opcode, map::c2s::EVENT_END);
+    assert_eq!(
+        u32::from_le_bytes(packet.data[..4].try_into().unwrap()),
+        login.unique_no
+    );
+    assert_eq!(
+        u16::from_le_bytes(packet.data[8..10].try_into().unwrap()),
+        login.act_index
+    );
+    assert_eq!(
+        u16::from_le_bytes(packet.data[10..12].try_into().unwrap()),
+        map::c2s::event_end_mode::UPDATE_PENDING
+    );
+    assert_eq!(
+        u16::from_le_bytes(packet.data[12..14].try_into().unwrap()),
+        event.event_num
+    );
+    assert_eq!(
+        u16::from_le_bytes(packet.data[14..16].try_into().unwrap()),
+        event.event_para
+    );
+    let ack_body = map::event_position_wire::EVENT_RECV_PENDING.to_le_bytes();
+    let ack_size = framing::subpacket_size_words(framing::SUBPACKET_HEADER_SIZE + ack_body.len());
+    let mut ack = framing::subpacket_header_word(map::s2c::EVENTUCOFF, ack_size)
+        .to_le_bytes()
+        .to_vec();
+    ack.extend(previous.to_le_bytes());
+    ack.extend(ack_body);
+    let sender = MapClient::connect_with_local(peer, SEED, "127.0.0.1:0")
+        .await
+        .unwrap();
+    sender.send_encrypted(&ack, previous, header).await.unwrap();
+    let received = host.map.recv_decrypted().await.unwrap();
+    let ack = framing::walk_sub_packets(&received[framing::FFXI_HEADER_SIZE..])
+        .next()
+        .unwrap()
+        .unwrap();
+    assert!(server_ack_matches(&mut host.dialog, &ack));
+}
+
 async fn abort_contract() {
     let mut replaced = Host::new(position_dat(false), FARE).await;
     replaced.begin(FARE).await;
@@ -1047,6 +1185,7 @@ async fn event_state_contract() {
     submap_reply_cancellation_diagnostic_contract().await;
     registration_reply_contract().await;
     progressing_child_wait_does_not_timeout_contract().await;
+    owner_child_server_acknowledgement_contract().await;
     abort_contract().await;
     action_event_gate_contract().await;
     item_stack_gate_contract().await;

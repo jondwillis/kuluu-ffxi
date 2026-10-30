@@ -60,7 +60,7 @@ pub struct CelestialColorTables {
 
 impl Material for MoonMaterial {
     fn fragment_shader() -> ShaderRef {
-        "embedded://kuluu_render/moon.wgsl".into()
+        "embedded://kuluu_render/moon.wesl".into()
     }
 
     fn alpha_mode(&self) -> AlphaMode {
@@ -169,7 +169,7 @@ pub struct MoonMaterialPlugin;
 
 impl Plugin for MoonMaterialPlugin {
     fn build(&self, app: &mut App) {
-        embedded_asset!(app, "moon.wgsl");
+        embedded_asset!(app, "moon.wesl");
         app.init_resource::<MoonDatRoot>()
             .init_resource::<MoonSpriteFrames>()
             .init_resource::<CelestialColorTables>()

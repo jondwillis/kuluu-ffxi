@@ -1,4 +1,7 @@
+use bevy::picking::events::PointerPress;
+use bevy::picking::hover::Hovered;
 use bevy::prelude::*;
+use bevy::ui_widgets::Button;
 
 use crate::hud::style::{self, theme};
 use crate::input_mode::InputMode;
@@ -72,6 +75,7 @@ pub fn spawn_quick_action(mut commands: Commands) {
                 p.spawn((
                     QuickActionRow { slot },
                     Button,
+                    Hovered::default(),
                     Node::default(),
                     Text::new(""),
                     style::text_font(13.0),
@@ -141,17 +145,14 @@ pub fn update_quick_action(
 
 pub fn quick_action_mouse_hover_system(
     mut mode: ResMut<InputMode>,
-    rows: Query<(&Interaction, &QuickActionRow), Changed<Interaction>>,
+    rows: Query<(&Hovered, &QuickActionRow), Changed<Hovered>>,
 ) {
     let InputMode::QuickAction(state) = &mut *mode else {
         return;
     };
     let limit = entry_count(state.has_target);
     for (interaction, row) in &rows {
-        if matches!(interaction, Interaction::Hovered | Interaction::Pressed)
-            && row.slot < limit
-            && state.cursor != row.slot
-        {
+        if interaction.0 && row.slot < limit && state.cursor != row.slot {
             state.cursor = row.slot;
         }
     }
@@ -159,15 +160,18 @@ pub fn quick_action_mouse_hover_system(
 
 pub fn quick_action_mouse_click_system(
     mode: Res<InputMode>,
-    rows: Query<(&Interaction, &QuickActionRow), Changed<Interaction>>,
+    rows: Query<&QuickActionRow>,
     mut out: MessageWriter<QuickActionActivated>,
+    mut presses: MessageReader<PointerPress>,
+    parents: Query<&ChildOf>,
 ) {
+    let pressed_rows = super::primary_pressed_rows(&mut presses, &rows, &parents);
     let InputMode::QuickAction(state) = &*mode else {
         return;
     };
     let limit = entry_count(state.has_target);
-    for (interaction, row) in &rows {
-        if *interaction == Interaction::Pressed && row.slot < limit {
+    for row in pressed_rows {
+        if row.slot < limit {
             out.write(QuickActionActivated { slot: row.slot });
         }
     }
@@ -176,6 +180,80 @@ pub fn quick_action_mouse_click_system(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn primary_press_activates_child_hit_once_and_secondary_press_does_not() {
+        use crate::input_mode::QuickActionState;
+        use bevy::camera::NormalizedRenderTarget;
+        use bevy::picking::{
+            backend::HitData,
+            events::Pointer,
+            pointer::{Location, PointerButton, PointerId},
+        };
+
+        let mut app = App::new();
+        app.add_message::<PointerPress>()
+            .add_message::<QuickActionActivated>()
+            .insert_resource(InputMode::QuickAction(QuickActionState::default()))
+            .add_systems(Update, quick_action_mouse_click_system);
+        let row = app.world_mut().spawn(QuickActionRow { slot: 0 }).id();
+        let label = app.world_mut().spawn(ChildOf(row)).id();
+        let press = |button| PointerPress {
+            entity: label,
+            pointer: Pointer::new(
+                PointerId::Mouse,
+                Location {
+                    target: NormalizedRenderTarget::None {
+                        width: 1,
+                        height: 1,
+                    },
+                    position: Vec2::ZERO,
+                },
+            ),
+            button,
+            hit: HitData::new(Entity::PLACEHOLDER, 0.0, None, None),
+            count: 1,
+        };
+        app.world_mut()
+            .write_message(press(PointerButton::Secondary));
+        app.update();
+        assert!(app
+            .world_mut()
+            .resource_mut::<Messages<QuickActionActivated>>()
+            .drain()
+            .next()
+            .is_none());
+        app.world_mut().write_message(press(PointerButton::Primary));
+        app.world_mut().write_message(press(PointerButton::Primary));
+        app.update();
+        let activated: Vec<_> = app
+            .world_mut()
+            .resource_mut::<Messages<QuickActionActivated>>()
+            .drain()
+            .collect();
+        assert_eq!(activated.len(), 1);
+        assert_eq!(activated[0].slot, 0);
+        app.update();
+        assert!(app
+            .world_mut()
+            .resource_mut::<Messages<QuickActionActivated>>()
+            .drain()
+            .next()
+            .is_none());
+
+        *app.world_mut().resource_mut::<InputMode>() = InputMode::default();
+        app.world_mut().write_message(press(PointerButton::Primary));
+        app.update();
+        *app.world_mut().resource_mut::<InputMode>() =
+            InputMode::QuickAction(QuickActionState::default());
+        app.update();
+        assert!(app
+            .world_mut()
+            .resource_mut::<Messages<QuickActionActivated>>()
+            .drain()
+            .next()
+            .is_none());
+    }
 
     #[test]
     fn targeted_list_starts_with_attack() {

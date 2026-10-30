@@ -199,9 +199,9 @@ fn handle_event(tally: &mut Tally, ev: &AgentEvent, now: Instant, t0: Instant) {
             }
         }
         AgentEvent::CutsceneCue { cue } => {
-            let desc = describe_cue(cue);
+            let desc = format!("{cue:?}");
             eprintln!("[live] t+{t:.2}s cue {desc}");
-            tally.cues.push((t, desc));
+            tally.cues.push((t, describe_cue(cue)));
         }
         AgentEvent::SelfServerStatus { status, mount_id } => {
             eprintln!("[live] t+{t:.2}s SelfServerStatus status={status} mount_id={mount_id}");

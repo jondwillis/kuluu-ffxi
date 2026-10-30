@@ -91,6 +91,7 @@ debug-menu = []
 # the workspace bevy (full default features) for the native build.
 
 [dependencies]
+web-time = "1"
 # `serialize` enables serde derives on `KeyCode`, `Modifiers` modifiers, and
 # the rest of `bevy_input` — needed by `keybinds::KeyBind` so the on-disk
 # `keybinds.json` can name keys (`"KeyW"`, `"Numpad8"`, etc.) without a
@@ -116,6 +117,9 @@ ffxi-actor = { path = "../ffxi-actor" }
 ffxi-proto = { path = "../ffxi-proto" }
 ffxi-vocab = { path = "../ffxi-vocab" }
 serde = { workspace = true }
+# The MD5 that every client user file (`mcr*.dat`, `mcr*.ttl`, `es*.dat`) carries over its own records:
+# a writer has to recompute it or the client stops trusting the file (see `hud::client_user_files`).
+md-5 = { workspace = true }
 # Diagnostic lines (target "mob_hp") in the nameplate billboard system.
 tracing = { workspace = true }
 # Local-timezone civil date for the Current Time menu's Earth-time chat line
@@ -137,7 +141,7 @@ ab_glyph = "0.2"
 # over the websocket if/when that's wanted.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 ffxi-audio = { path = "../ffxi-audio" }
-# Same pinned copy as bevy's wgpu (29.x in the lockfile — zero new compile):
+# Share Bevy's wgpu version.
 # graphics/dlss_nr.rs names a few raw wgpu types that bevy does not re-export
 # (TextureTransition/TextureUses). Native-only; wasm never sees it.
 wgpu = { version = "30", default-features = false, features = ["std"] }
@@ -149,12 +153,6 @@ uuid = { version = "1", default-features = false }
 # `RawPcmSource`) because Bevy 0.17 builds rodio without any
 # decoder features. So no hound dep needed — we feed rodio
 # pre-decoded f32 samples directly.
-
-# wasm32 has no syscall for wall-clock time; std::time::SystemTime::now()
-# panics there. The HUD's reconnect-age line needs millis-since-epoch, so
-# we delegate to JS's `Date.now()` on wasm targets only.
-[target.'cfg(target_arch = "wasm32")'.dependencies]
-js-sys = "0.3"
 
 [dev-dependencies]
 # JSON round-trip test for `GraphicsSettings`. Not in the runtime deps:

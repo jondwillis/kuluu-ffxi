@@ -1,5 +1,5 @@
-use bevy::ecs::spawn::Spawn;
-use bevy::feathers::controls::{button_bundle, checkbox_bundle, ButtonBundleProps, ButtonVariant};
+use bevy::feathers::controls::{ButtonVariant, FeathersButton, FeathersCheckbox};
+use bevy::feathers::font_styles::InheritableFont;
 use bevy::feathers::theme::ThemedText;
 use bevy::input::keyboard::{Key, KeyboardInput};
 use bevy::input::ButtonState;
@@ -142,11 +142,16 @@ fn build_ui(commands: &mut Commands, form: &SettingsForm, server: &ServerInfo) {
                 );
                 panel.spawn(hint(in_effect_line()));
                 panel.spawn(row()).with_children(|r| {
-                    r.spawn(button_bundle(
-                        ButtonBundleProps::default(),
-                        (),
-                        Spawn((Text::new("Installs..."), ThemedText)),
-                    ))
+                    r.spawn_empty().apply_scene(bsn! {
+                        @FeathersButton {
+                            @caption: bsn! {
+                                Text::new("Installs...")
+                                ThemedText
+                            },
+                        }
+                        Node { flex_grow: 1.0 }
+                        InheritableFont { font: {Handle::<Font>::default()} }
+                    })
                     .observe(
                         |_ev: On<Activate>,
                          mut ret: ResMut<DatSetupReturn>,
@@ -192,25 +197,35 @@ fn build_ui(commands: &mut Commands, form: &SettingsForm, server: &ServerInfo) {
                 }
 
                 panel.spawn(row()).with_children(|r| {
-                    r.spawn(button_bundle(
-                        ButtonBundleProps {
-                            variant: ButtonVariant::Primary,
-                            ..default()
-                        },
-                        DefaultFocusTarget,
-                        Spawn((Text::new("Save & reload"), ThemedText)),
-                    ))
-                    .observe(save_observer);
+                    r.spawn_empty()
+                        .apply_scene(bsn! {
+                            @FeathersButton {
+                                @variant: ButtonVariant::Primary,
+                                @caption: bsn! {
+                                    Text::new("Save & reload")
+                                    ThemedText
+                                },
+                            }
+                            Node { flex_grow: 1.0 }
+                            InheritableFont { font: {Handle::<Font>::default()} }
+                        })
+                        .insert(DefaultFocusTarget)
+                        .observe(save_observer);
 
                     for (label, destination) in [
                         ("Config", LauncherState::Config),
                         ("Graphics", LauncherState::Graphics),
                     ] {
-                        r.spawn(button_bundle(
-                            ButtonBundleProps::default(),
-                            (),
-                            Spawn((Text::new(label), ThemedText)),
-                        ))
+                        r.spawn_empty().apply_scene(bsn! {
+                            @FeathersButton {
+                                @caption: bsn! {
+                                    Text::new(label)
+                                    ThemedText
+                                },
+                            }
+                            Node { flex_grow: 1.0 }
+                            InheritableFont { font: {Handle::<Font>::default()} }
+                        })
                         .observe(
                             move |_ev: On<Activate>, mut next: ResMut<NextState<LauncherState>>| {
                                 next.set(destination.clone());
@@ -218,16 +233,22 @@ fn build_ui(commands: &mut Commands, form: &SettingsForm, server: &ServerInfo) {
                         );
                     }
 
-                    r.spawn(button_bundle(
-                        ButtonBundleProps::default(),
-                        (),
-                        Spawn((Text::new("Back"), ThemedText)),
-                    ))
-                    .observe(
-                        |_ev: On<Activate>, mut next: ResMut<NextState<LauncherState>>| {
-                            next.set(LauncherState::ServerSelect);
-                        },
-                    );
+                    r.spawn_empty()
+                        .apply_scene(bsn! {
+                            @FeathersButton {
+                                @caption: bsn! {
+                                    Text::new("Back")
+                                    ThemedText
+                                },
+                            }
+                            Node { flex_grow: 1.0 }
+                            InheritableFont { font: {Handle::<Font>::default()} }
+                        })
+                        .observe(
+                            |_ev: On<Activate>, mut next: ResMut<NextState<LauncherState>>| {
+                                next.set(LauncherState::ServerSelect);
+                            },
+                        );
                 });
             });
         });
@@ -293,25 +314,38 @@ fn spawn_path_field(
 
             if browsable {
                 let browse_label = label.to_string();
-                rowc.spawn(button_bundle(
-                    ButtonBundleProps::default(),
-                    (),
-                    Spawn((Text::new("Browse..."), ThemedText)),
-                ))
-                .observe(
-                    move |_ev: On<Activate>,
-                          mut form: ResMut<SettingsForm>,
-                          mut dirty: ResMut<SettingsUiDirty>| {
-                        pick_folder_into(field, &browse_label, &mut form);
-                        dirty.0 = true;
-                    },
-                );
+                rowc.spawn_empty()
+                    .apply_scene(bsn! {
+                        @FeathersButton {
+                            @caption: bsn! {
+                                Text::new("Browse...")
+                                ThemedText
+                            },
+                        }
+                        Node { flex_grow: 1.0 }
+                        InheritableFont { font: {Handle::<Font>::default()} }
+                    })
+                    .observe(
+                        move |_ev: On<Activate>,
+                              mut form: ResMut<SettingsForm>,
+                              mut dirty: ResMut<SettingsUiDirty>| {
+                            pick_folder_into(field, &browse_label, &mut form);
+                            dirty.0 = true;
+                        },
+                    );
             }
 
-            let mut cb = rowc.spawn(checkbox_bundle(
-                (),
-                Spawn((Text::new("Override"), ThemedText)),
-            ));
+            let mut cb = rowc.spawn_empty();
+
+            cb.apply_scene(bsn! {
+                @FeathersCheckbox {
+                    @caption: bsn! {
+                        Text::new("Override")
+                        ThemedText
+                    },
+                }
+                InheritableFont { font: {Handle::<Font>::default()} }
+            });
             if override_env {
                 cb.insert(Checked);
             }

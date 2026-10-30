@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use bevy::prelude::*;
+use bevy::prelude::{DetectChanges, Res, Resource};
 use kuluu_render::audio::AudioMuteState;
 
 /// Resource holding the on-disk audio settings store, so the persist system

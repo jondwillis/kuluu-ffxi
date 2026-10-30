@@ -1,6 +1,7 @@
 # GUI drive: native window + agent socket
 
 ## Contents
+- Image-target capture examples
 - Hold the display awake FIRST
 - Launch with the agent socket
 - What is focus-free (almost everything) — driving NPC events without
@@ -16,9 +17,43 @@ materials, input-driven movement.
 while they are using it. Everything except menu navigation can be driven and
 captured without the window being frontmost, so stealing focus is a choice you
 make deliberately for the few things that need it — not the default posture.
-The one condition you cannot escape: macOS stops rendering a **fully occluded**
-window, so *some* part of the client must stay on screen. Any sliver is enough;
+For window-backed client rendering, macOS stops drawing a **fully occluded**
+window. Keep some part of the client on screen. Any sliver is enough;
 focus is not.
+
+## Image-target capture examples
+
+The zone and actor capture examples render into an image target.
+They keep their unused desktop window hidden by default.
+This mode does not require a visible window or keyboard focus.
+
+Add `--preview` when the user wants to see the scene on the desktop.
+The preview displays the same image target that the capture saves.
+It preserves the image proportions when the window resizes.
+The process also saves the preview window as `<output-stem>-preview.png`.
+Inspect that companion image to verify the desktop composition.
+The process still exits after the capture.
+Omit `--preview` for automatic capture sequences.
+Do not use an empty desktop window as evidence of the rendered result.
+
+Build the required examples with the worktree's target directory:
+
+```bash
+cargo build -p kuluu-render --release --example zone-render-headless --example actor-render-headless
+```
+
+For example, show Lower Jeuno while the tool captures its lighting:
+
+```bash
+"${CARGO_TARGET_DIR:-target}/release/examples/zone-render-headless" \
+  --file 345 --sky --hour 5 --cap 1500 \
+  --cam 15 3 -37 --tgt 20 7 -47 --out /tmp/jeuno.png --preview
+```
+
+The actor example accepts the same `--preview` option.
+The `mzb-render-headless` example captures its window directly and requires a visible window.
+Inspect each saved image before recording a visual pass.
+When useful, open the inspected image in the app so the user can see the result.
 
 ## Hold the display awake FIRST
 
@@ -89,12 +124,12 @@ SKILL.md "Character strategy"):
 
 ```bash
 target/release/kuluu --agent-listen auto play --unfocused --mute \
-  verilight 'TestPass!1234' Verilamp
+  gui_cs1 'TestPass!1234' Csrent
 ```
 
-`verilight`/`TestPass!1234`/`Verilamp` (gmlevel 5) is this machine's throwaway
-dev account — a documented local example credential, not a secret; type it
-into launch commands freely. Use the user's real env-var account only when the
+`gui_cs1`/`TestPass!1234`/`Csrent` (`accounts.priv=5`) is this machine's single
+shared drive fixture — a documented local example credential, not a secret;
+type it into launch commands freely. Never invent another login. Use the user's real env-var account only when the
 check needs their own character.
 
 Credentials are **positional args to `play`** — the GUI path reads no
@@ -434,7 +469,7 @@ input-driven bugs; use `debug_drive` for those.
   Check this first when captures are blank; only a human unlock fixes it.
 - Ghost sessions: prefer a clean socket `disconnect` over `kill`. The map server
   holds a killed char for 2–5 min and the next login times out. To clear one:
-  `DELETE FROM accounts_sessions WHERE charid=<id>` (Verilamp is 17455719).
+  `DELETE FROM accounts_sessions WHERE charid=<id>` (Csrent is charid 5).
   That table's `targid` column is also the authoritative live targid —
   `charid & 0x7FF` is **not** it, and the server rejects actions built on it.
 - Agent-socket `chat` bypasses the client's local `/`-command parser and sends a

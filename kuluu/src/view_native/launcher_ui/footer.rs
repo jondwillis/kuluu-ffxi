@@ -1,7 +1,7 @@
 use bevy::asset::RenderAssetUsages;
-use bevy::feathers::cursor::EntityCursor;
 use bevy::feathers::theme::ThemedText;
 use bevy::image::{CompressedImageFormats, ImageFormat, ImageSampler, ImageType, TextureError};
+use bevy::picking::cursor::EntityCursor;
 use bevy::picking::hover::Hovered;
 use bevy::prelude::*;
 use bevy::window::SystemCursorIcon;
@@ -237,7 +237,7 @@ fn spawn_footer(
                                 ..default()
                             },
                         ))
-                        .observe(move |_ev: On<Pointer<Click>>| open_url(link.url))
+                        .observe(move |_ev: On<PointerClick>| open_url(link.url))
                         .with_children(|row| {
                             row.spawn((
                                 ImageNode {

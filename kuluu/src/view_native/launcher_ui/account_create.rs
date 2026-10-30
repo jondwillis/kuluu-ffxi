@@ -1,5 +1,5 @@
-use bevy::ecs::spawn::Spawn;
-use bevy::feathers::controls::{button_bundle, ButtonBundleProps, ButtonVariant};
+use bevy::feathers::controls::{ButtonVariant, FeathersButton};
+use bevy::feathers::font_styles::InheritableFont;
 use bevy::feathers::theme::ThemedText;
 use bevy::input::keyboard::{Key, KeyboardInput};
 use bevy::input::ButtonState;
@@ -66,14 +66,17 @@ pub(super) fn spawn_ui(
                 ));
 
                 panel.spawn(row()).with_children(|r| {
-                    r.spawn(button_bundle(
-                        ButtonBundleProps {
-                            variant: ButtonVariant::Primary,
-                            ..default()
-                        },
-                        DefaultFocusTarget,
-                        Spawn((Text::new("Create"), ThemedText)),
-                    ))
+                    r.spawn_empty().apply_scene(bsn! {
+                        @FeathersButton {
+                            @variant: ButtonVariant::Primary,
+                            @caption: bsn! {
+                                Text::new("Create")
+                                ThemedText
+                            },
+                        }
+                        Node { flex_grow: 1.0 }
+                        InheritableFont { font: {Handle::<Font>::default()} }
+                    }).insert(DefaultFocusTarget)
                     .observe(
                         |_ev: On<Activate>,
                          form: Res<CreateAccountForm>,
@@ -86,11 +89,16 @@ pub(super) fn spawn_ui(
                         },
                     );
 
-                    r.spawn(button_bundle(
-                        ButtonBundleProps::default(),
-                        (),
-                        Spawn((Text::new("Cancel"), ThemedText)),
-                    ))
+                    r.spawn_empty().apply_scene(bsn! {
+                        @FeathersButton {
+                            @caption: bsn! {
+                                Text::new("Cancel")
+                                ThemedText
+                            },
+                        }
+                        Node { flex_grow: 1.0 }
+                        InheritableFont { font: {Handle::<Font>::default()} }
+                    })
                     .observe(
                         |_ev: On<Activate>,
                          mut err: ResMut<CreateAccountErrorMsg>,
@@ -240,29 +248,40 @@ pub(super) fn spawn_error_ui(mut commands: Commands, msg: Res<CreateAccountError
                     ThemedText,
                 ));
                 panel.spawn(row()).with_children(|r| {
-                    r.spawn(button_bundle(
-                        ButtonBundleProps {
-                            variant: ButtonVariant::Primary,
-                            ..default()
-                        },
-                        DefaultFocusTarget,
-                        Spawn((Text::new("Try again"), ThemedText)),
-                    ))
-                    .observe(
-                        |_ev: On<Activate>, mut next: ResMut<NextState<LauncherState>>| {
-                            next.set(LauncherState::CreateAccountInFlight);
-                        },
-                    );
-                    r.spawn(button_bundle(
-                        ButtonBundleProps::default(),
-                        (),
-                        Spawn((Text::new("Back to form"), ThemedText)),
-                    ))
-                    .observe(
-                        |_ev: On<Activate>, mut next: ResMut<NextState<LauncherState>>| {
-                            next.set(LauncherState::CreateAccount);
-                        },
-                    );
+                    r.spawn_empty()
+                        .apply_scene(bsn! {
+                            @FeathersButton {
+                                @variant: ButtonVariant::Primary,
+                                @caption: bsn! {
+                                    Text::new("Try again")
+                                    ThemedText
+                                },
+                            }
+                            Node { flex_grow: 1.0 }
+                            InheritableFont { font: {Handle::<Font>::default()} }
+                        })
+                        .insert(DefaultFocusTarget)
+                        .observe(
+                            |_ev: On<Activate>, mut next: ResMut<NextState<LauncherState>>| {
+                                next.set(LauncherState::CreateAccountInFlight);
+                            },
+                        );
+                    r.spawn_empty()
+                        .apply_scene(bsn! {
+                            @FeathersButton {
+                                @caption: bsn! {
+                                    Text::new("Back to form")
+                                    ThemedText
+                                },
+                            }
+                            Node { flex_grow: 1.0 }
+                            InheritableFont { font: {Handle::<Font>::default()} }
+                        })
+                        .observe(
+                            |_ev: On<Activate>, mut next: ResMut<NextState<LauncherState>>| {
+                                next.set(LauncherState::CreateAccount);
+                            },
+                        );
                 });
             });
         });

@@ -8,11 +8,11 @@ use bevy::pbr::{Material, MaterialPipeline, MaterialPipelineKey, MaterialPlugin,
 use bevy::prelude::*;
 use bevy::render::render_asset::RenderAssets;
 use bevy::render::render_resource::{
-    AsBindGroup, AsBindGroupError, BindGroupLayout, BindGroupLayoutEntry, BindingResources,
+    AsBindGroup, AsBindGroupError, BindGroupBuilder, BindGroupLayout, BindGroupLayoutEntry,
     BindingType, Buffer, BufferBindingType, BufferDescriptor, BufferUsages, DepthBiasState, Face,
-    FrontFace, OwnedBindingResource, RenderPipelineDescriptor, SamplerBindingType, ShaderStages,
-    ShaderType, SpecializedMeshPipelineError, TextureSampleType, TextureViewDimension,
-    UnpreparedBindGroup,
+    FrontFace, RenderPipelineDescriptor, SamplerBindingType, ShaderStages, ShaderType,
+    SpecializedMeshPipelineError, TextureSampleType, TextureViewDimension,
+    UnpreparedBindingResource,
 };
 use bevy::render::renderer::{RenderDevice, RenderQueue};
 use bevy::render::texture::{FallbackImage, GpuImage};
@@ -25,7 +25,7 @@ use crate::skinned_ffxi_material::{write_uniform, FfxiLightingUniform, FfxiMater
 
 static NEXT_ZONE_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
-/// `FfxiMaterialFlags::flags.z` as `zone_ffxi.wgsl` reads it: whether this mesh takes the
+/// `FfxiMaterialFlags::flags.z` as `zone_ffxi.wesl` reads it: whether this mesh takes the
 /// camera's `DistanceFog`. Retail gates fog per generator on the CMoElem render-state word
 /// (research/XIClient CMoElem.cpp CMoElem::PrepDX, bit 0x2000000 -> `D3DRS_FOGENABLE` false), which
 /// the weat/ sky canopies mostly set — and must, since they sit thousands of units past every
@@ -99,7 +99,7 @@ impl FfxiZoneMaterialKey {
 }
 
 /// Shader def `specialize` pushes for [`FfxiZoneMaterialKey::generator_stage_chain`];
-/// `zone_ffxi.wgsl` matches on it.
+/// `zone_ffxi.wesl` matches on it.
 pub const GENERATOR_STAGE_CHAIN_DEF: &str = "FFXI_GENERATOR_STAGE_CHAIN";
 
 const WGPU_FORWARD_DECAL_BIAS: i32 = 1;
@@ -426,13 +426,14 @@ impl AsBindGroup for FfxiZoneMaterial {
         self.render_key
     }
 
-    fn unprepared_bind_group(
+    fn build_bind_group(
         &self,
         _layout: &BindGroupLayout,
         _render_device: &RenderDevice,
         param: &mut SystemParamItem<'_, '_, Self::Param>,
         _force_no_bindless: bool,
-    ) -> Result<UnpreparedBindGroup, AsBindGroupError> {
+        output: &mut BindGroupBuilder,
+    ) -> Result<(), AsBindGroupError> {
         let (buffers, images, fallback) = param;
         let inst = buffers
             .instances
@@ -444,40 +445,39 @@ impl AsBindGroup for FfxiZoneMaterial {
                 .ok_or(AsBindGroupError::RetryNextUpdate)?,
             None => &fallback.d2,
         };
-        Ok(UnpreparedBindGroup {
-            bindings: BindingResources(vec![
-                (
-                    0,
-                    OwnedBindingResource::Buffer(if self.area_id == 0 {
-                        buffers.lighting.clone()
-                    } else {
-                        buffers
-                            .areas
-                            .get(&self.area_id)
-                            .ok_or(AsBindGroupError::RetryNextUpdate)?
-                            .clone()
-                    }),
+        output.extend([
+            (
+                0,
+                UnpreparedBindingResource::Buffer(if self.area_id == 0 {
+                    buffers.lighting.clone()
+                } else {
+                    buffers
+                        .areas
+                        .get(&self.area_id)
+                        .ok_or(AsBindGroupError::RetryNextUpdate)?
+                        .clone()
+                }),
+            ),
+            (
+                1,
+                UnpreparedBindingResource::TextureView(
+                    TextureViewDimension::D2,
+                    image.texture_view.clone(),
                 ),
-                (
-                    1,
-                    OwnedBindingResource::TextureView(
-                        TextureViewDimension::D2,
-                        image.texture_view.clone(),
-                    ),
+            ),
+            (
+                2,
+                UnpreparedBindingResource::Sampler(
+                    SamplerBindingType::Filtering,
+                    image.sampler.clone(),
                 ),
-                (
-                    2,
-                    OwnedBindingResource::Sampler(
-                        SamplerBindingType::Filtering,
-                        image.sampler.clone(),
-                    ),
-                ),
-                (3, OwnedBindingResource::Buffer(inst.flags.clone())),
-                (4, OwnedBindingResource::Buffer(inst.tint.clone())),
-                (5, OwnedBindingResource::Buffer(inst.uv.clone())),
-                (6, OwnedBindingResource::Buffer(inst.points.clone())),
-            ]),
-        })
+            ),
+            (3, UnpreparedBindingResource::Buffer(inst.flags.clone())),
+            (4, UnpreparedBindingResource::Buffer(inst.tint.clone())),
+            (5, UnpreparedBindingResource::Buffer(inst.uv.clone())),
+            (6, UnpreparedBindingResource::Buffer(inst.points.clone())),
+        ]);
+        Ok(())
     }
 
     fn bind_group_layout_entries(
@@ -522,11 +522,11 @@ impl AsBindGroup for FfxiZoneMaterial {
 
 impl Material for FfxiZoneMaterial {
     fn vertex_shader() -> ShaderRef {
-        "embedded://kuluu_render/zone_ffxi.wgsl".into()
+        "embedded://kuluu_render/zone_ffxi.wesl".into()
     }
 
     fn fragment_shader() -> ShaderRef {
-        "embedded://kuluu_render/zone_ffxi.wgsl".into()
+        "embedded://kuluu_render/zone_ffxi.wesl".into()
     }
 
     fn alpha_mode(&self) -> AlphaMode {
@@ -546,11 +546,11 @@ impl Material for FfxiZoneMaterial {
     }
 
     fn prepass_vertex_shader() -> ShaderRef {
-        "embedded://kuluu_render/zone_ffxi_prepass.wgsl".into()
+        "embedded://kuluu_render/zone_ffxi_prepass.wesl".into()
     }
 
     fn prepass_fragment_shader() -> ShaderRef {
-        "embedded://kuluu_render/zone_ffxi_prepass.wgsl".into()
+        "embedded://kuluu_render/zone_ffxi_prepass.wesl".into()
     }
 
     fn specialize(
@@ -582,7 +582,7 @@ impl Material for FfxiZoneMaterial {
         // (scale.x * scale.y * scale.z < 0). Using Bevy's CCW default here
         // culled every non-mirrored tile: inverted-checkerboard zone geometry.
         // Directional shadow views (UNCLIPPED_DEPTH_ORTHO is set only there —
-        // vendor/bevy_pbr/src/render/light.rs check_views_lights_need_specialization) render single-sided walls
+        // bevy_pbr::render::light::check_views_lights_need_specialization) render single-sided walls
         // unculled: from the sun's viewpoint a wall's one sheet of triangles is
         // back-facing, so Face::Back culling writes no shadow-map depth — walls
         // cast nothing and sunlight leaks indoors (kuluu-lchx).
@@ -806,10 +806,10 @@ pub struct FfxiZoneMaterialPlugin;
 
 impl Plugin for FfxiZoneMaterialPlugin {
     fn build(&self, app: &mut App) {
-        bevy::shader::load_shader_library!(app, "directional_shadow.wgsl");
-        bevy::shader::load_shader_library!(app, "point_shadow.wgsl");
-        embedded_asset!(app, "zone_ffxi.wgsl");
-        embedded_asset!(app, "zone_ffxi_prepass.wgsl");
+        bevy::shader::load_shader_library!(app, "directional_shadow.wesl");
+        bevy::shader::load_shader_library!(app, "point_shadow.wesl");
+        embedded_asset!(app, "zone_ffxi.wesl");
+        embedded_asset!(app, "zone_ffxi_prepass.wesl");
         app.add_plugins(MaterialPlugin::<FfxiZoneMaterial>::default())
             .init_resource::<ZoneGlobalLighting>()
             // Idempotent: the full viewer also inits this (lib.rs). Minimal apps
@@ -1030,14 +1030,14 @@ mod tests {
     // every sky layer silently goes back to being fogged flat.
     #[test]
     fn shader_gates_distance_fog_on_the_lane() {
-        let lines: Vec<&str> = include_str!("zone_ffxi.wgsl")
+        let lines: Vec<&str> = include_str!("zone_ffxi.wesl")
             .lines()
             .map(str::trim)
             .collect();
         let call = lines
             .iter()
             .position(|l| l.starts_with("out_color = apply_distance_fog("))
-            .expect("zone_ffxi.wgsl no longer applies distance fog");
+            .expect("zone_ffxi.wesl no longer applies distance fog");
         let guard = lines[..call]
             .iter()
             .rev()
@@ -1066,8 +1066,8 @@ mod tests {
             .unwrap_or_else(|e| panic!("`{name}` is not a plain literal: {e}"))
     }
 
-    const ZONE_WGSL: &str = include_str!("zone_ffxi.wgsl");
-    const ACTOR_WGSL: &str = include_str!("skinned_ffxi.wgsl");
+    const ZONE_WGSL: &str = include_str!("zone_ffxi.wesl");
+    const ACTOR_WGSL: &str = include_str!("skinned_ffxi.wesl");
 
     // research/XIClient Rendering/ZoneRenderer.cpp ZoneRenderer::ApplyDefaultRenderState over the saturated
     // fixed-function T&L diffuse of Direct3D8Manager.cpp Direct3D8Manager::InitializeRenderStateBlocks,390,393,395.
@@ -1137,11 +1137,11 @@ mod tests {
                 .map(str::trim)
                 .filter(|l| l.starts_with("let ") && l.contains("D3D_MODULATE_2X *"))
                 .collect();
-            assert!(!composites.is_empty(), "{name}.wgsl composites nothing");
+            assert!(!composites.is_empty(), "{name}.wesl composites nothing");
             for l in composites {
                 assert!(
                     l.contains("saturate("),
-                    "{name}.wgsl has an unsaturated texture stage: `{l}`"
+                    "{name}.wesl has an unsaturated texture stage: `{l}`"
                 );
             }
         }
@@ -1177,7 +1177,7 @@ mod tests {
     // otherwise the two chains silently collapse into whichever one the shader hardcodes.
     #[test]
     fn the_shader_branches_on_the_stage_chain_def() {
-        assert!(ZONE_WGSL.contains(&format!("#ifdef {GENERATOR_STAGE_CHAIN_DEF}")));
+        assert!(ZONE_WGSL.contains(&format!("@if({GENERATOR_STAGE_CHAIN_DEF})")));
         assert_eq!(
             FfxiZoneMaterialKey::LEGACY.generator_stage_chain,
             FfxiZoneMaterialKey::default().generator_stage_chain,

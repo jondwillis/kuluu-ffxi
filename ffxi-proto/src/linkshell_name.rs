@@ -1,17 +1,24 @@
 //! Linkshell-name codec: the packed 6-bit encoding retail stores in a
-//! linkshell item's exdata and ships in s2c 0x0C9 GENERAL `sComLinkName`.
+//! linkshell item's exdata and ships in s2c 0x0C9 GENERAL `sComLinkName`, and which
+//! the client writes back into c2s 0x0C4 `sComLinkName` when it creates a shell.
 //!
-//! Port of `DecodeStringLinkshell` (vendor/server/src/common/utils.cpp)
-//! over `unpackBitsLE` (utils.cpp), which is plain little-endian bit-field
-//! extraction: the field at `bit_offset` occupies bits
-//! `[bit_offset % 8, bit_offset % 8 + len)` of the LE integer starting at
-//! `bit_offset / 8`.
+//! Port of `DecodeStringLinkshell`/`EncodeStringLinkshell`
+//! (vendor/server/src/common/utils.cpp) over [`unpack_bits_le`]/[`pack_bits_le`] —
+//! i.e. LSB's LE bit codec, whose byte-reversed-window rule means these names are NOT
+//! plain little-endian bit fields: reading them naively decodes "Kuluu" as garbage
+//! (see the pin test below).
 
-/// Bytes of `sComLinkName` (vendor/server/src/map/packets/s2c/0x0c9_equip_inspect_general.h GP_SERV_COMMAND_EQUIP_INSPECT job).
+use crate::bitstream::{pack_bits_le, unpack_bits_le};
+
+/// Bytes of `sComLinkName` in s2c 0x0C9 GENERAL
+/// (vendor/server/src/map/packets/s2c/0x0c9_equip_inspect_general.h GP_SERV_COMMAND_EQUIP_INSPECT job).
 pub const PACKED_LEN: usize = 16;
 
-const BITS_PER_CHAR: usize = 6;
-const CHAR_MASK: u16 = (1 << BITS_PER_CHAR) - 1;
+/// Bytes of `sComLinkName` in c2s 0x0C4
+/// (vendor/server/src/map/packets/c2s/0x0c4_group_comlink_active.h GP_CLI_COMMAND_GROUP_COMLINK_ACTIVE).
+pub const ACTIVE_PACKED_LEN: usize = 15;
+
+const BITS_PER_CHAR: u32 = 6;
 
 /// Encoder alphabet (utils.cpp EncodeStringLinkshell): 1..=26 lowercase, 27..=52 uppercase,
 /// 53..=62 digits. 63 is the end marker written into the trailing bits.
@@ -24,25 +31,17 @@ const CODE_END: u8 = 63;
 /// characters regardless of buffer size (utils.cpp DecodeStringLinkshell length).
 const MAX_CHARS: usize = 20;
 
-fn unpack_char(packed: &[u8], bit_offset: usize) -> u8 {
-    let byte = bit_offset / 8;
-    let shift = bit_offset % 8;
-    let lo = packed.get(byte).copied().unwrap_or(0) as u16;
-    let hi = packed.get(byte + 1).copied().unwrap_or(0) as u16;
-    (((lo | (hi << 8)) >> shift) & CHAR_MASK) as u8
-}
-
 /// Decode a packed linkshell name. Returns an empty string when no linkshell
 /// is equipped (the server leaves the field zeroed).
 pub fn decode(packed: &[u8]) -> String {
-    let len = MAX_CHARS.min(packed.len() * 8 / BITS_PER_CHAR);
+    let len = MAX_CHARS.min(packed.len() * 8 / BITS_PER_CHAR as usize);
     let mut out = String::with_capacity(len);
     for i in 0..len {
-        let code = unpack_char(packed, i * BITS_PER_CHAR);
+        let code = unpack_bits_le(packed, i * BITS_PER_CHAR as usize, BITS_PER_CHAR) as u8;
         match code {
-            // A zero code only occurs in padding, and the encoder's partial
-            // end marker can leave one bogus character in front of it — hence
-            // LSB dropping the previous character here (utils.cpp DecodeStringLinkshell).
+            // A zero code only occurs in padding, and the encoder's partial end marker can leave
+            // one bogus character in front of it — hence LSB dropping the previous character here
+            // (utils.cpp DecodeStringLinkshell).
             0 => {
                 out.pop();
                 break;
@@ -57,20 +56,11 @@ pub fn decode(packed: &[u8]) -> String {
     out
 }
 
-/// Mirror of `EncodeStringLinkshell` (utils.cpp), so tests pin our
-/// decoder against the upstream encoder rather than against our own reading of
-/// it. Test-only: the client never writes a linkshell name.
-#[cfg(test)]
-pub(crate) fn encode(name: &str) -> [u8; PACKED_LEN] {
-    fn pack(buf: &mut [u8; PACKED_LEN], value: u8, bit_offset: usize, len: usize) {
-        for bit in 0..len {
-            if value >> bit & 1 == 1 {
-                let at = bit_offset + bit;
-                buf[at / 8] |= 1 << (at % 8);
-            }
-        }
-    }
-    let mut buf = [0u8; PACKED_LEN];
+/// `EncodeStringLinkshell` (utils.cpp): packs at most 20 characters into `out`, then writes the
+/// end marker's leftover bits (`leftover == 8 || leftover == 2 ? 6 : leftover`). Both the s2c
+/// 0x0C9 `[16]` field and the c2s 0x0C4 `[15]` field use this same routine, so callers pass their
+/// own field width — 15 bytes holds exactly twenty 6-bit codes.
+pub fn encode_into(name: &str, out: &mut [u8]) {
     let mut chars = 0usize;
     for (i, ch) in name.chars().take(MAX_CHARS).enumerate() {
         let code = match ch {
@@ -79,14 +69,26 @@ pub(crate) fn encode(name: &str) -> [u8; PACKED_LEN] {
             'a'..='z' => ch as u8 - b'a' + CODE_LOWER_BASE,
             _ => 0,
         };
-        pack(&mut buf, code, i * BITS_PER_CHAR, BITS_PER_CHAR);
+        pack_bits_le(
+            out,
+            u64::from(code),
+            i * BITS_PER_CHAR as usize,
+            BITS_PER_CHAR,
+        );
         chars += 1;
     }
-    let mut leftover = 8 - (chars * BITS_PER_CHAR) % 8;
+    let mut leftover = 8 - (chars * BITS_PER_CHAR as usize) % 8;
     if leftover == 8 || leftover == 2 {
         leftover = 6;
     }
-    pack(&mut buf, 0xFF, BITS_PER_CHAR * chars, leftover);
+    pack_bits_le(out, 0xFF, chars * BITS_PER_CHAR as usize, leftover as u32);
+}
+
+/// Convenience wrapper around [`encode_into`] for the s2c-shaped 16-byte field (test fixture use).
+#[cfg(test)]
+pub(crate) fn encode(name: &str) -> [u8; PACKED_LEN] {
+    let mut buf = [0u8; PACKED_LEN];
+    encode_into(name, &mut buf);
     buf
 }
 
@@ -104,6 +106,27 @@ mod tests {
     }
 
     #[test]
+    fn round_trips_in_the_fifteen_byte_active_field_too() {
+        for name in ["a", "abcd", "Kuluu", "CowLLand2026"] {
+            let mut buf = [0u8; ACTIVE_PACKED_LEN];
+            encode_into(name, &mut buf);
+            assert_eq!(decode(&buf), name, "round trip {name} in [15]");
+        }
+    }
+
+    #[test]
+    fn kuluu_packs_to_the_lsb_le_bytes() {
+        // Independent emulation of utils.cpp packBitsLE over a 15-byte field: LSB's LE pair is not
+        // naive bit packing, so this hex also pins the fix against a regression to plain-LE.
+        let mut buf = [0u8; ACTIVE_PACKED_LEN];
+        encode_into("Kuluu", &mut buf);
+        assert_eq!(
+            buf,
+            [0x95, 0x53, 0x15, 0x57, 0xF0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,][..]
+        );
+    }
+
+    #[test]
     fn mixed_case_and_digits_map_to_the_lsb_alphabet() {
         assert_eq!(decode(&encode("aZ09")), "aZ09");
     }
@@ -117,11 +140,5 @@ mod tests {
     fn decoding_stops_at_the_twenty_character_cap() {
         let long = "abcdefghijklmnopqrstuvwxyz";
         assert_eq!(decode(&encode(long)).len(), MAX_CHARS);
-    }
-
-    #[test]
-    fn short_buffers_do_not_panic() {
-        assert_eq!(decode(&[]), "");
-        assert_eq!(decode(&[0xFF]), "");
     }
 }

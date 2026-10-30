@@ -9,10 +9,11 @@ use bevy::pbr::{Material, MaterialPipeline, MaterialPipelineKey, MaterialPlugin}
 use bevy::prelude::*;
 use bevy::render::render_asset::RenderAssets;
 use bevy::render::render_resource::{
-    encase, AsBindGroup, AsBindGroupError, BindGroupLayout, BindGroupLayoutEntry, BindingResources,
-    BindingType, Buffer, BufferBindingType, BufferDescriptor, BufferUsages, OwnedBindingResource,
+    encase, AsBindGroup, AsBindGroupError, BindGroupBuilder, BindGroupLayout, BindGroupLayoutEntry,
+    BindingType, Buffer, BufferBindingType, BufferDescriptor, BufferUsages,
     RenderPipelineDescriptor, SamplerBindingType, ShaderStages, ShaderType,
-    SpecializedMeshPipelineError, TextureSampleType, TextureViewDimension, UnpreparedBindGroup,
+    SpecializedMeshPipelineError, TextureSampleType, TextureViewDimension,
+    UnpreparedBindingResource,
 };
 use bevy::render::renderer::{RenderDevice, RenderQueue};
 use bevy::render::texture::{FallbackImage, GpuImage};
@@ -23,7 +24,7 @@ use std::collections::{BTreeSet, HashMap};
 pub const MAX_JOINTS: usize = 128;
 
 /// Point-light slots in `FfxiLightingUniform`, shared by the zone and skinned
-/// shaders. Both `zone_ffxi.wgsl` and `skinned_ffxi.wgsl` hard-code this as the
+/// shaders. Both `zone_ffxi.wesl` and `skinned_ffxi.wesl` hard-code this as the
 /// array length and loop bound; `point_light_slots_match_shader` guards the
 /// mirror. The active count (how many slots the nearest-N pickers fill) is the
 /// runtime `GraphicsSettings::model_light_count`, capped here; empty slots
@@ -489,7 +490,7 @@ impl FfxiSkinRegistry {
 }
 
 pub fn free_skin_slot_on_remove(
-    trigger: On<Remove, FfxiSkinSlot>,
+    trigger: On<Remove<FfxiSkinSlot>>,
     q: Query<&FfxiSkinSlot>,
     mut registry: ResMut<FfxiSkinRegistry>,
 ) {
@@ -499,7 +500,7 @@ pub fn free_skin_slot_on_remove(
 }
 
 pub fn free_instance_slot_on_remove(
-    trigger: On<Remove, FfxiInstanceSlot>,
+    trigger: On<Remove<FfxiInstanceSlot>>,
     q: Query<&FfxiInstanceSlot>,
     mut registry: ResMut<FfxiSkinRegistry>,
 ) {
@@ -733,13 +734,14 @@ impl AsBindGroup for FfxiSkinnedMaterial {
 
     fn bind_group_data(&self) -> Self::Data {}
 
-    fn unprepared_bind_group(
+    fn build_bind_group(
         &self,
         _layout: &BindGroupLayout,
         _render_device: &RenderDevice,
         param: &mut SystemParamItem<'_, '_, Self::Param>,
         _force_no_bindless: bool,
-    ) -> Result<UnpreparedBindGroup, AsBindGroupError> {
+        output: &mut BindGroupBuilder,
+    ) -> Result<(), AsBindGroupError> {
         let (buffers, images, fallback) = param;
         let (skins, instances) = buffers
             .bind_buffers()
@@ -750,26 +752,25 @@ impl AsBindGroup for FfxiSkinnedMaterial {
                 .ok_or(AsBindGroupError::RetryNextUpdate)?,
             None => &fallback.d2,
         };
-        Ok(UnpreparedBindGroup {
-            bindings: BindingResources(vec![
-                (0, OwnedBindingResource::Buffer(skins.clone())),
-                (
-                    1,
-                    OwnedBindingResource::TextureView(
-                        TextureViewDimension::D2,
-                        image.texture_view.clone(),
-                    ),
+        output.extend([
+            (0, UnpreparedBindingResource::Buffer(skins.clone())),
+            (
+                1,
+                UnpreparedBindingResource::TextureView(
+                    TextureViewDimension::D2,
+                    image.texture_view.clone(),
                 ),
-                (
-                    2,
-                    OwnedBindingResource::Sampler(
-                        SamplerBindingType::Filtering,
-                        image.sampler.clone(),
-                    ),
+            ),
+            (
+                2,
+                UnpreparedBindingResource::Sampler(
+                    SamplerBindingType::Filtering,
+                    image.sampler.clone(),
                 ),
-                (3, OwnedBindingResource::Buffer(instances.clone())),
-            ]),
-        })
+            ),
+            (3, UnpreparedBindingResource::Buffer(instances.clone())),
+        ]);
+        Ok(())
     }
 
     fn bind_group_layout_entries(
@@ -811,11 +812,11 @@ impl AsBindGroup for FfxiSkinnedMaterial {
 
 impl Material for FfxiSkinnedMaterial {
     fn vertex_shader() -> ShaderRef {
-        "embedded://kuluu_render/skinned_ffxi.wgsl".into()
+        "embedded://kuluu_render/skinned_ffxi.wesl".into()
     }
 
     fn fragment_shader() -> ShaderRef {
-        "embedded://kuluu_render/skinned_ffxi.wgsl".into()
+        "embedded://kuluu_render/skinned_ffxi.wesl".into()
     }
 
     fn alpha_mode(&self) -> AlphaMode {
@@ -835,11 +836,11 @@ impl Material for FfxiSkinnedMaterial {
     }
 
     fn prepass_vertex_shader() -> ShaderRef {
-        "embedded://kuluu_render/skinned_ffxi_prepass.wgsl".into()
+        "embedded://kuluu_render/skinned_ffxi_prepass.wesl".into()
     }
 
     fn prepass_fragment_shader() -> ShaderRef {
-        "embedded://kuluu_render/skinned_ffxi_prepass.wgsl".into()
+        "embedded://kuluu_render/skinned_ffxi_prepass.wesl".into()
     }
 
     fn specialize(
@@ -985,11 +986,11 @@ pub struct FfxiMaterialPlugin;
 
 impl Plugin for FfxiMaterialPlugin {
     fn build(&self, app: &mut App) {
-        bevy::shader::load_shader_library!(app, "directional_shadow.wgsl");
-        bevy::shader::load_shader_library!(app, "point_shadow.wgsl");
-        bevy::shader::load_shader_library!(app, "actor_reveal.wgsl");
-        embedded_asset!(app, "skinned_ffxi.wgsl");
-        embedded_asset!(app, "skinned_ffxi_prepass.wgsl");
+        bevy::shader::load_shader_library!(app, "directional_shadow.wesl");
+        bevy::shader::load_shader_library!(app, "point_shadow.wesl");
+        bevy::shader::load_shader_library!(app, "actor_reveal.wesl");
+        embedded_asset!(app, "skinned_ffxi.wesl");
+        embedded_asset!(app, "skinned_ffxi_prepass.wesl");
         app.add_plugins(MaterialPlugin::<FfxiSkinnedMaterial>::default());
         app.init_resource::<FfxiSkinRegistry>();
         app.init_resource::<FfxiSkinnedMaterialCache>();
@@ -1020,8 +1021,8 @@ mod tests {
     fn point_light_slots_match_shader() {
         let want_array = format!("array<vec4<f32>, {MAX_POINT_LIGHTS}>");
         for (name, src) in [
-            ("skinned_ffxi.wgsl", include_str!("skinned_ffxi.wgsl")),
-            ("zone_ffxi.wgsl", include_str!("zone_ffxi.wgsl")),
+            ("skinned_ffxi.wesl", include_str!("skinned_ffxi.wesl")),
+            ("zone_ffxi.wesl", include_str!("zone_ffxi.wesl")),
         ] {
             assert!(
                 src.contains(&want_array),
@@ -1029,8 +1030,8 @@ mod tests {
             );
         }
         assert!(
-            include_str!("skinned_ffxi.wgsl").contains(&format!("i < {MAX_POINT_LIGHTS}u")),
-            "skinned_ffxi.wgsl must loop `i < {MAX_POINT_LIGHTS}u` over the per-actor point slots"
+            include_str!("skinned_ffxi.wesl").contains(&format!("i < {MAX_POINT_LIGHTS}u")),
+            "skinned_ffxi.wesl must loop `i < {MAX_POINT_LIGHTS}u` over the per-actor point slots"
         );
     }
 
@@ -1040,16 +1041,15 @@ mod tests {
     /// it, gated by the same receive flag as the sun.
     #[test]
     fn point_slots_receive_shadows_through_the_shared_module() {
-        let skinned = include_str!("skinned_ffxi.wgsl");
-        assert!(skinned.contains("#import kuluu_render::point_shadow::point_shadow_factor"));
+        let skinned = include_str!("skinned_ffxi.wesl");
+        assert!(skinned.contains("import kuluu_render::point_shadow::point_shadow_factor;"));
         assert!(skinned.contains(
             "point_shadow_factor(p, n, skins[si].lighting.point_pos[i].xyz, frag_coord)"
         ));
         assert!(skinned.contains("if (point_shadows) {"));
         assert!(skinned.contains("shadow_scale, receive_shadows, in.clip_position.xy)"));
 
-        let module = include_str!("point_shadow.wgsl");
-        assert!(module.contains("#define_import_path kuluu_render::point_shadow"));
+        let module = include_str!("point_shadow.wesl");
         assert!(module.contains("POINT_LIGHT_FLAGS_SHADOWS_ENABLED_BIT) == 0u"));
         assert!(module.contains("distance((*light).position_radius.xyz, light_pos)"));
         assert!(module.contains("return fetch_point_shadow(light_id, vec4<f32>(world_pos, 1.0)"));
@@ -1061,10 +1061,10 @@ mod tests {
     fn storage_structs_match_shader() {
         let want_joints = format!("array<mat4x4<f32>, {MAX_JOINTS}>");
         for (name, src) in [
-            ("skinned_ffxi.wgsl", include_str!("skinned_ffxi.wgsl")),
+            ("skinned_ffxi.wesl", include_str!("skinned_ffxi.wesl")),
             (
-                "skinned_ffxi_prepass.wgsl",
-                include_str!("skinned_ffxi_prepass.wgsl"),
+                "skinned_ffxi_prepass.wesl",
+                include_str!("skinned_ffxi_prepass.wesl"),
             ),
         ] {
             assert!(

@@ -16,6 +16,11 @@ pub enum TargetActionId {
     Check,
     Open,
     Fish,
+
+    /// The mounted self-menu's Dig row - the 0x1A `ChocoboDig` self action, issued straight
+    /// with no confirm (`.agents/skills/retail-observe/references/2026-10-02-mounted-command-menu.md`,
+    /// dispatch literal at FFXiMain.dll retail-2026-09 VA 0x1012BACF).
+    Dig,
     Dismount,
 }
 
@@ -37,7 +42,9 @@ impl TargetActionId {
             | TargetActionId::Items
             | TargetActionId::Trade
             | TargetActionId::Disengage
-            | TargetActionId::Fish => false,
+            | TargetActionId::Fish
+            // The dig starts a routine and spends server-side state - never auto-confirmed.
+            | TargetActionId::Dig => false,
         }
     }
 }
@@ -171,7 +178,8 @@ fn applies_to(id: TargetActionId, kind: TargetKindLite, engaged: bool) -> bool {
         // appends it independently of the target).
         TargetActionId::Fish => true,
 
-        TargetActionId::Dismount => false,
+        // Only ever offered through the mounted self-menu early-return below.
+        TargetActionId::Dig | TargetActionId::Dismount => false,
     }
 }
 
@@ -194,12 +202,20 @@ pub fn build_target_action_entries(
         TargetActionId::Check,
     ];
 
-    // .agents/skills/retail-observe/references/2026-10-02-mounted-command-menu.md
+    // .agents/skills/retail-observe/references/2026-10-02-mounted-command-menu.md:
+    // the mounted self menu is Chat / Dig / Dismount - rows established on a rented chocobo
+    // (the owner's screenshot `2026-09-24-chocobo-mounted-menu.md`), so any mount qualifies,
+    // chocobos included; retail gates the dig itself server-side (LSB accepts ChocoboDig only
+    // for MOUNT_CHOCOBO).
     if ctx.modern_mount && (ctx.target_kind == TargetKindLite::SelfPc || !ctx.has_target) {
-        return [TargetActionId::Chat, TargetActionId::Dismount]
-            .iter()
-            .map(|&id| entry_for(id, ctx))
-            .collect();
+        return [
+            TargetActionId::Chat,
+            TargetActionId::Dig,
+            TargetActionId::Dismount,
+        ]
+        .iter()
+        .map(|&id| entry_for(id, ctx))
+        .collect();
     }
 
     let mut out = Vec::new();
@@ -259,6 +275,7 @@ fn entry_for(id: TargetActionId, ctx: &TargetActionContext) -> ActionEntry {
         TargetActionId::Check => (ActionEntryKind::Plain, "Check".to_string()),
         TargetActionId::Open => (ActionEntryKind::Plain, "Open".to_string()),
         TargetActionId::Fish => (ActionEntryKind::Plain, "Fish".to_string()),
+        TargetActionId::Dig => (ActionEntryKind::Plain, "Dig".to_string()),
         TargetActionId::Dismount => (ActionEntryKind::Plain, "Dismount".to_string()),
     };
 
@@ -527,18 +544,32 @@ mod tests {
     }
 
     #[test]
-    fn mounted_self_menu_is_chat_dismount() {
+    fn mounted_self_menu_is_chat_dig_dismount() {
         let entries = build_target_action_entries(&mounted_ctx(TargetKindLite::SelfPc), &RETAIL);
         let ids: Vec<_> = entries.iter().map(|e| e.id).collect();
-        assert_eq!(ids, vec![TargetActionId::Chat, TargetActionId::Dismount]);
+        assert_eq!(
+            ids,
+            vec![
+                TargetActionId::Chat,
+                TargetActionId::Dig,
+                TargetActionId::Dismount
+            ]
+        );
         assert!(entries.iter().all(|e| e.enabled));
     }
 
     #[test]
-    fn mounted_no_target_menu_is_chat_dismount() {
+    fn mounted_no_target_menu_is_chat_dig_dismount() {
         let entries = build_target_action_entries(&mounted_no_target(), &RETAIL);
         let ids: Vec<_> = entries.iter().map(|e| e.id).collect();
-        assert_eq!(ids, vec![TargetActionId::Chat, TargetActionId::Dismount]);
+        assert_eq!(
+            ids,
+            vec![
+                TargetActionId::Chat,
+                TargetActionId::Dig,
+                TargetActionId::Dismount
+            ]
+        );
         assert!(entries.iter().all(|e| e.enabled));
     }
 

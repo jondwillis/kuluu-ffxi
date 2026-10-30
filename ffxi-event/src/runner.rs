@@ -77,6 +77,12 @@ enum Pending {
 pub struct DialogRunner {
     vm: EventVm,
     pending: Pending,
+    /// The pending tag already announced to the host since it was armed. A
+    /// child parked on its case-1 poll yields [`StepResult::AwaitServerAck`]
+    /// every step; re-announcing would make a host that sends the c2s half on
+    /// this signal resend it each tick (the tag is one global per event -
+    /// research/XiEvents/OpCodes/0x0043.md).
+    reported_tag: Option<PendingTag>,
 }
 
 impl DialogRunner {
@@ -92,6 +98,7 @@ impl DialogRunner {
         Some(Self {
             vm: EventVm::start(block, event_id, speaker_index, params)?,
             pending: Pending::Start,
+            reported_tag: None,
         })
     }
 
@@ -263,6 +270,7 @@ impl DialogRunner {
     /// nothing is pending.
     pub fn ack_server(&mut self, strings: &StringDat) -> DialogStep {
         self.vm.ack_server();
+        self.reported_tag = None;
         self.run(strings)
     }
 
@@ -406,7 +414,13 @@ impl DialogRunner {
                 }
                 StepResult::Waiting => return DialogStep::Waiting,
                 StepResult::AwaitServerAck(tag) => {
-                    return DialogStep::AwaitServerAck(tag);
+                    if self.reported_tag.as_ref() == Some(&tag) {
+                        return DialogStep::Waiting;
+                    }
+                    self.reported_tag = Some(tag);
+                    return DialogStep::AwaitServerAck(
+                        self.reported_tag.clone().expect("set above"),
+                    );
                 }
             }
         }

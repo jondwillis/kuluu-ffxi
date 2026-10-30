@@ -28,7 +28,7 @@ crate-type = ["cdylib", "rlib"]
 # defaults — the workspace pin keeps full defaults for the native side.
 # 0.19 stopped cross-implying the ui/window/render features, so each is
 # listed explicitly; `bevy_ui_render` split out of `bevy_ui`.
-bevy = { version = "0.19", default-features = false, features = [
+bevy = { version = "0.20", default-features = false, features = [
     "bevy_winit",
     "bevy_window",
     "bevy_render",

@@ -410,14 +410,35 @@ pub enum EventCue {
     /// table, the same table the BGM slot layout reads
     /// (research/XiEvents/OpCodes/0x005C.md).
     MusicSong { slot: u8, track: u16, volume: u8 },
-    /// 0x69/0x6A SET/CHANGE sound volume: set the named retail sound types
-    /// (the `mask` bits) to `volume` over `fade_frames`
-    /// (research/XiEvents/OpCodes/0x0069.md, 0x006A.md).
-    SoundVolume {
-        mask: u8,
-        volume: u8,
-        fade_frames: u16,
+    /// 0x69 SETSOUNDVOLUME: drive the selected retail sound channels (`mask`
+    /// bits, bit-1: system/voice, BGM, effects, environment; bit-4: the
+    /// whole-effect multiplier) to full or to silence at once. Retail computes
+    /// `mute_flag == 0 ? 1.0 : 0.0` from the event's quiet byte (the sibling of
+    /// the hide-render flag this VM models as `event_hidden`) and applies it
+    /// per channel with no ramp (`enabled` carries that comparison).
+    SoundVolumeSet { mask: u8, enabled: bool },
+    /// 0x6A CHANGESOUNDVOLUME: ease the selected channels (`mask`, same bits as
+    /// [`Self::SoundVolumeSet`]) to `volume_thousandths`/1000 — retail's scale
+    /// constant is exactly 1/1000 — through the mixer's own change arms.
+    SoundVolumeChange { mask: u8, volume_thousandths: i32 },
+    /// 0x8D OPEN_MAP_PROPS: show (`value != 0`) or hide the prop-label layer of
+    /// the current zone's map window; retail passes both word operands to the
+    /// shared map-window helper as (select, value) with the mode bit fixed.
+    MapPropsState { select: i32, value: i32 },
+    /// The per-actor render-flag writes measured on this build (0x92/0x94 flip
+    /// bits 16/17 of the actor's second flags word when the inline operand bit
+    /// differs; 0x81 sets a visual-half byte, carried as bit index
+    /// [`Self::RENDER_FLAG_VISUAL_BYTE`]).
+    ActorRenderFlag {
+        actor: ActorLookup,
+        bit: u32,
+        value: bool,
     },
+    /// The final pass of 0x34 MAPLOAD / 0x35 MAPLOAD_KEEP: retail tears the map
+    /// window data down and re-opens it for the id named in the opcode's first
+    /// work operand, after two held passes (see the 2026-10-28 event opcode
+    /// no-skip-pass record).
+    MapReload { map_id: i32 },
     /// 0x7E CHOCOBO/MOUNT: put the target on or off a mount by writing its
     /// `StatusEvent` (research/XiEvents/OpCodes/0x007E.md). `mount_id` is
     /// carried only by the non-chocobo mount cases.
@@ -481,6 +502,38 @@ pub enum EventCue {
 }
 
 impl EventCue {
+    /// [`EventCue::ActorRenderFlag`] bit index carrying 0x81's visual-half byte
+    /// write, kept apart from the second-flags-word bits (the toggles' image
+    /// bit positions) so a host can route each to its own owner without address
+    /// arithmetic (2026-10-28 event opcode no-skip-pass record).
+    pub const RENDER_FLAG_VISUAL_BYTE: u32 = 0x81;
+
+    /// [`EventCue::ActorRenderFlag`] bit indices at this base carry writes to
+    /// the *first* entity flags word (the one door gates read a `&4` of), kept
+    /// apart from the second-flags-word bits 0..31 so hosts route each word to
+    /// its own owner without address arithmetic; opcode 0x2F uses base+19 and
+    /// 0x33 base+21 (opcode parity ledger pass 2026-10-29).
+    pub const ENTITY_FLAG_BASE: u32 = 0x20;
+
+    /// [`EventCue::ActorRenderFlag`] bit index carrying the latch at bit 30 of
+    /// the *second* entity flags word, written by the selector op 0x60 cases
+    /// 0/1 (`f_100b73f0`). Sibling base to [`Self::ENTITY_FLAG_BASE`], same
+    /// posture: hosts own the routing, no address arithmetic in the VM.
+    pub const ENTITY_WORD_124_BASE: u32 = 0x40;
+
+    /// [`EventCue::ActorRenderFlag`] bit indices at this base carry writes to
+    /// the *third* entity flags word (opcode 0x61 uses base+0 as a plain
+    /// mask-OR store — not an xor-latch like the first-word twins; 0x7C uses
+    /// base+17, set-or-clear from whether its byte is non-zero).
+    pub const ENTITY_WORD_128_BASE: u32 = 0x60;
+
+    /// [`EventCue::ActorRenderFlag`] bit indices at this base carry writes to
+    /// the *fourth* entity flags word (the one retail's turn-wait gate reads
+    /// bit 1 of, `f_100b7dd0`). Opcodes 0xA4/0xA5/0xC0 use base+26/+11/+12 as
+    /// plain force-stores of their operand's low bit (opcode parity ledger
+    /// pass 2026-10-29).
+    pub const ENTITY_WORD_12C_BASE: u32 = 0x80;
+
     pub(crate) fn resolve_event_actor(self, actor: ActorLookup) -> Self {
         let resolve = |target: ActorLookup| {
             if target.is_event_entity() {

@@ -413,7 +413,7 @@ pub enum ClickResolution {
 /// Self identity comes from the table's self slot, not a per-entity
 /// comparison against a snapshot field.
 pub fn click_to_target_system(
-    mut clicks: MessageReader<Pointer<Click>>,
+    mut clicks: MessageReader<PointerClick>,
     q_world: Query<&WorldEntity>,
     q_parent: Query<&ChildOf>,
     q_nameplate: Query<&Nameplate>,
@@ -589,7 +589,7 @@ mod tests {
     /// match the snapshot's self_char_id.
     fn click_world() -> World {
         let mut world = World::new();
-        world.insert_resource(Messages::<Pointer<Click>>::default());
+        world.insert_resource(Messages::<PointerClick>::default());
         world.insert_resource(crate::mouse::MousePointer::default());
         let mut scene = crate::snapshot::SceneState::default();
         scene.snapshot.self_char_id = Some(7);
@@ -635,24 +635,24 @@ mod tests {
     }
 
     fn send_click(world: &mut World, entity: Entity) {
-        let msg = Pointer::new(
-            PointerId::Mouse,
-            Location {
-                target: NormalizedRenderTarget::None {
-                    width: 1,
-                    height: 1,
-                },
-                position: Vec2::ZERO,
-            },
-            Click {
-                button: PointerButton::Primary,
-                hit: hover_hit(1.0),
-                duration: std::time::Duration::ZERO,
-                count: 1,
-            },
+        let msg = PointerClick {
             entity,
-        );
-        world.resource_mut::<Messages<Pointer<Click>>>().write(msg);
+            pointer: Pointer::new(
+                PointerId::Mouse,
+                Location {
+                    target: NormalizedRenderTarget::None {
+                        width: 1,
+                        height: 1,
+                    },
+                    position: Vec2::ZERO,
+                },
+            ),
+            button: PointerButton::Primary,
+            hit: hover_hit(1.0),
+            duration: std::time::Duration::ZERO,
+            count: 1,
+        };
+        world.resource_mut::<Messages<PointerClick>>().write(msg);
     }
 
     #[test]

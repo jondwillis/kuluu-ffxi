@@ -1,5 +1,5 @@
-use bevy::ecs::spawn::Spawn;
-use bevy::feathers::controls::{button_bundle, ButtonBundleProps, ButtonVariant};
+use bevy::feathers::controls::{ButtonVariant, FeathersButton};
+use bevy::feathers::font_styles::InheritableFont;
 use bevy::feathers::theme::ThemedText;
 use bevy::input_focus::tab_navigation::TabGroup;
 use bevy::prelude::*;
@@ -136,19 +136,23 @@ fn spawn_panel(mut commands: Commands, pc: Res<PcForm>, npc: Res<NpcForm>) {
                     ..default()
                 })
                 .with_children(|row| {
-                    row.spawn(button_bundle(
-                        ButtonBundleProps::default(),
-                        (),
-                        Spawn((Text::new("<"), ThemedText)),
-                    ))
-                    .observe(
-                        |_ev: On<Activate>, mut list: ResMut<ClipList>| {
+                    row.spawn_empty()
+                        .apply_scene(bsn! {
+                            @FeathersButton {
+                                @caption: bsn! {
+                                    Text::new("<")
+                                    ThemedText
+                                },
+                            }
+                            Node { flex_grow: 1.0 }
+                            InheritableFont { font: {Handle::<Font>::default()} }
+                        })
+                        .observe(|_ev: On<Activate>, mut list: ResMut<ClipList>| {
                             if list.names.is_empty() {
                                 return;
                             }
                             list.index = (list.index + list.names.len() - 1) % list.names.len();
-                        },
-                    );
+                        });
                     row.spawn((
                         ClipNameLabel,
                         Node {
@@ -159,19 +163,23 @@ fn spawn_panel(mut commands: Commands, pc: Res<PcForm>, npc: Res<NpcForm>) {
                         TextColor(Color::srgb(0.92, 0.92, 0.95)),
                         ThemedText,
                     ));
-                    row.spawn(button_bundle(
-                        ButtonBundleProps::default(),
-                        (),
-                        Spawn((Text::new(">"), ThemedText)),
-                    ))
-                    .observe(
-                        |_ev: On<Activate>, mut list: ResMut<ClipList>| {
+                    row.spawn_empty()
+                        .apply_scene(bsn! {
+                            @FeathersButton {
+                                @caption: bsn! {
+                                    Text::new(">")
+                                    ThemedText
+                                },
+                            }
+                            Node { flex_grow: 1.0 }
+                            InheritableFont { font: {Handle::<Font>::default()} }
+                        })
+                        .observe(|_ev: On<Activate>, mut list: ResMut<ClipList>| {
                             if list.names.is_empty() {
                                 return;
                             }
                             list.index = (list.index + 1) % list.names.len();
-                        },
-                    );
+                        });
                 });
 
             panel.spawn((
@@ -191,18 +199,21 @@ fn spawn_panel(mut commands: Commands, pc: Res<PcForm>, npc: Res<NpcForm>) {
 }
 
 fn spawn_mode_button(parent: &mut ChildSpawnerCommands, mode: ViewerMode, label: &str) {
+    let label = label.to_string();
     parent
-        .spawn((
-            ModeButton(mode),
-            button_bundle(
-                ButtonBundleProps {
-                    variant: ButtonVariant::Primary,
-                    ..default()
+        .spawn_empty()
+        .apply_scene(bsn! {
+            @FeathersButton {
+                @variant: ButtonVariant::Primary,
+                @caption: bsn! {
+                    Text::new(label.clone())
+                    ThemedText
                 },
-                (),
-                Spawn((Text::new(label.to_string()), ThemedText)),
-            ),
-        ))
+            }
+            Node { flex_grow: 1.0 }
+            InheritableFont { font: {Handle::<Font>::default()} }
+        })
+        .insert(ModeButton(mode))
         .observe(
             move |_ev: On<Activate>, mut viewer_mode: ResMut<ViewerMode>| {
                 *viewer_mode = mode;

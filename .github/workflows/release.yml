@@ -4,6 +4,7 @@ on:
   # Manual v-prefixed semver tag, e.g. `git push origin v0.2.0`. The trailing *
   # also admits prerelease/build suffixes like v0.2.0-rc1 or v0.0.0-wintest.
   push:
+    branches: ['release/v*']
     tags: ['v[0-9]+.[0-9]+.[0-9]+*']
   # Called by auto-release-on-main.yml after a version-bump-driven tag.
   workflow_call:
@@ -12,6 +13,10 @@ on:
         description: Tag/version being released (e.g. 0.2.0).
         required: true
         type: string
+      publish:
+        description: Publish after successful builds (false retains workflow artifacts only).
+        type: boolean
+        default: false
   # Re-run a release by hand.
   workflow_dispatch:
     inputs:
@@ -19,6 +24,10 @@ on:
         description: Tag/version to release (e.g. 0.2.0).
         required: true
         type: string
+      publish:
+        description: Publish after successful builds (false retains workflow artifacts only).
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -33,7 +42,12 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.resolve.outputs.tag }}
+      sha: ${{ steps.resolve.outputs.sha }}
+      publish: ${{ steps.resolve.outputs.publish }}
     steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
       - id: resolve
         shell: bash
         # `inputs.tag` must win over GITHUB_REF_NAME: on the workflow_call path a
@@ -42,14 +56,29 @@ jobs:
         # Branching on the event name there published a release tagged `main`.
         env:
           INPUT_TAG: ${{ inputs.tag }}
+          PUBLISH: ${{ inputs.publish == true || (github.event_name == 'push' && github.ref_type == 'tag') }}
         run: |
-          tag="${INPUT_TAG:-${GITHUB_REF_NAME}}"
-          echo "Releasing tag: ${tag}"
-          case "${tag}" in
-            v[0-9]*.[0-9]*.[0-9]*) ;;
-            *) echo "::error::refusing to release non-version tag '${tag}'"; exit 1 ;;
-          esac
-          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          if [[ "$GITHUB_EVENT_NAME" == push && "$GITHUB_REF_TYPE" == branch && "$GITHUB_REF_NAME" == release/v* ]]; then
+            INPUT_TAG="${GITHUB_REF_NAME#release/}"
+            PUBLISH=false
+          fi
+          # Interpreter probe, same rule as python_bin in scripts/checks.sh: PYTHON names an
+          # interpreter the caller knows starts (scripts/release-candidate.test.py passes its own),
+          # otherwise take the first of python3/python that actually runs. A Windows box can expose
+          # only python, or a python3 alias that fails to exec - and scripts/checks.sh harness runs
+          # this body verbatim in the developer shell.
+          PY="${PYTHON:-}"
+          if [ -n "$PY" ] && ! "$PY" --version >/dev/null 2>&1; then PY=""; fi
+          for c in python3 python; do
+            if [ -z "$PY" ] && command -v "$c" >/dev/null 2>&1 && "$c" --version >/dev/null 2>&1; then
+              PY="$c"
+              break
+            fi
+          done
+          if [ -z "$PY" ]; then echo '::error::no working python interpreter on PATH' >&2; exit 1; fi
+          "$PY" scripts/release-candidate.py \
+            --tag "${INPUT_TAG:-${GITHUB_REF_NAME}}" \
+            --sha "$GITHUB_SHA" --publish "$PUBLISH" >> "$GITHUB_OUTPUT"
 
   # Gate the release on the full CI suite (fmt, clippy, test) re-run against the
   # tagged commit. For the auto-release-on-main path CI already ran on the main
@@ -58,6 +87,7 @@ jobs:
   # between an unverified tree and published binaries.
   ci:
     name: CI gate
+    needs: setup
     uses: ./.github/workflows/ci.yml
     permissions:
       contents: read
@@ -205,6 +235,14 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Compress-Archive -Path target/release/kuluu.exe -DestinationPath "dist/kuluu-$env:TAG-x86_64-windows.zip"
 
+      - name: Check packaged Windows executable
+        env:
+          TAG: ${{ needs.setup.outputs.tag }}
+        run: |
+          Expand-Archive -Path "dist/kuluu-$env:TAG-x86_64-windows.zip" -DestinationPath launch-check
+          & .\launch-check\kuluu.exe --help | Out-File -FilePath launch-check/help.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - uses: actions/upload-artifact@v7
         with:
           name: windows
@@ -255,6 +293,14 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Compress-Archive -Path target/release/kuluu.exe -DestinationPath "dist/kuluu-$env:TAG-aarch64-windows.zip"
 
+      - name: Check packaged Windows executable
+        env:
+          TAG: ${{ needs.setup.outputs.tag }}
+        run: |
+          Expand-Archive -Path "dist/kuluu-$env:TAG-aarch64-windows.zip" -DestinationPath launch-check
+          & .\launch-check\kuluu.exe --help | Out-File -FilePath launch-check/help.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - uses: actions/upload-artifact@v7
         with:
           name: windows-arm
@@ -294,17 +340,37 @@ jobs:
           name: wasm
           path: dist/*
 
-  publish:
-    name: Publish GitHub Release
+  bundle:
+    name: Assemble verified release bundle
     needs: [setup, linux, linux-arm, macos, windows, windows-arm, wasm]
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
     steps:
       - uses: actions/download-artifact@v8
         with:
+          name: linux
           path: artifacts
-          merge-multiple: true
+      - uses: actions/download-artifact@v8
+        with:
+          name: linux-arm
+          path: artifacts
+      - uses: actions/download-artifact@v8
+        with:
+          name: macos
+          path: artifacts
+      - uses: actions/download-artifact@v8
+        with:
+          name: windows
+          path: artifacts
+      - uses: actions/download-artifact@v8
+        with:
+          name: windows-arm
+          path: artifacts
+      - uses: actions/download-artifact@v8
+        with:
+          name: wasm
+          path: artifacts
 
       # SHA256SUMS pins the integrity contract the in-app updater verifies
       # against (kuluu/src/view_native/launcher_ui/updater.rs). Hash the
@@ -314,6 +380,28 @@ jobs:
         working-directory: artifacts
         run: sha256sum * > SHA256SUMS
 
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-bundle
+          overwrite: true
+          path: artifacts/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    if: needs.setup.outputs.publish == 'true'
+    needs: [setup, bundle]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-bundle
+          path: artifacts
+      - name: Verify bundle
+        working-directory: artifacts
+        run: sha256sum -c SHA256SUMS
       - uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.setup.outputs.tag }}

@@ -6,15 +6,16 @@ use bevy::window::{PresentMode, PrimaryWindow};
 use kuluu_render::dat_mmb::LoadMmbRequest;
 use kuluu_render::dat_mzb::LoadMzbRequest;
 use kuluu_render::hud::chat_panel::{ActiveChatTab, ChatScroll};
+use kuluu_render::input_mode::CursorMemory;
 use kuluu_render::{
     Action, Bindings, ChatBuffer, ChatHistory, DialogCursor, InputMode, MenuKind, MenuStack,
-    Preset, QuickActionState, SceneState, Target,
+    QuickActionState, SceneState, Target,
 };
 
 use super::debug_heights::DebugHeightsRequest;
 
 mod check;
-pub use check::bazaar_mode_sync_system;
+pub use check::{bazaar_mode_sync_system, bazaar_price_mode_sync_system};
 use check::{handle_bazaar_key, handle_check_key};
 
 mod auction;
@@ -38,6 +39,9 @@ pub use shop::{shop_mode_sync_system, shop_mouse_activate_system};
 mod map_screen;
 
 mod menu;
+pub use menu::{
+    arrange_request_send_system, mission_log_arrow_press_system, unity_chat_send_system,
+};
 use menu::{confirm_menu_at_cursor, handle_menu_key};
 
 mod slash_apply;
@@ -137,8 +141,6 @@ pub struct SlashWriters<'w, 's> {
 
     pub auto_attack: ResMut<'w, crate::view_native::auto_target::AutoAttack>,
 
-    pub status_profile_open: ResMut<'w, kuluu_render::hud::status_panel::StatusProfileOpen>,
-
     pub sort_options: ResMut<'w, kuluu_render::hud::item_detail::SortOptions>,
 
     pub item_menu_focus: ResMut<'w, kuluu_render::hud::item_detail::ItemMenuFocus>,
@@ -198,6 +200,51 @@ pub struct KeyEventStreams<'w, 's> {
     pub pad: MessageReader<'w, 's, super::gamepad_input::PadKeyEvent>,
 }
 
+/// Owner ruling (no capture): "RMB is supposed to be ESC/Cancel", restated as holding it IS camera drag.
+/// A right button released without ever engaging a drag writes one tap of the bound `NavCancel` key onto
+/// the synthetic channel whenever [`kuluu_render::input_mode::right_button_is_cancel`] holds, so every surface's own Esc law fires and no window gains a mouse-specific close path.
+/// A press that engages `MousePointer.right_dragged` (the camera/rotation flag set by `collect_mouse_system`, which runs PreUpdate before
+/// this chain) never cancels, which is what keeps drag-aim alive. Engagement is sampled per frame while held because the release's own collect pass
+/// clears the flag; only press and release coalesced into one stalled frame can hide a drag.
+pub fn right_button_cancel_system(
+    mut buttons: MessageReader<bevy::input::mouse::MouseButtonInput>,
+    mut tap_armed: Local<bool>,
+    pointer: Res<kuluu_render::MousePointer>,
+    mode: Res<InputMode>,
+    trade_state: Res<kuluu_render::hud::trade::TradeState>,
+    bindings: Res<Bindings>,
+    mut synth: MessageWriter<super::gamepad_input::PadKeyEvent>,
+    windows: Query<Entity, With<PrimaryWindow>>,
+) {
+    // A hold that engaged is spent as a drag: disarm while the flag stands.
+    if *tap_armed && pointer.right_dragged {
+        *tap_armed = false;
+    }
+    for ev in buttons.read() {
+        match (ev.button, &ev.state) {
+            (MouseButton::Right, ButtonState::Pressed) => *tap_armed = true,
+            (MouseButton::Right, ButtonState::Released)
+                if std::mem::take(&mut *tap_armed)
+                    && kuluu_render::input_mode::right_button_is_cancel(
+                        &mode,
+                        trade_state.open,
+                    ) =>
+            {
+                let Ok(window) = windows.single() else {
+                    return;
+                };
+                super::gamepad_input::emit_pad_key(
+                    &mut synth,
+                    window,
+                    &bindings,
+                    Action::NavCancel,
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
 /// The navmesh overlay's visibility latch and cached mesh as one parameter:
 /// bevy_ecs's `impl_system_function` tops out at 16 parameters and
 /// `text_input_system` sits at that cap on unix (its `AgentPaused` parameter
@@ -221,7 +268,6 @@ pub(crate) struct SessionGates<'w> {
 #[derive(SystemParam)]
 pub struct MenuConfirmWriters<'w> {
     pub graphics: ResMut<'w, kuluu_render::GraphicsSettings>,
-    pub status_profile_open: ResMut<'w, kuluu_render::hud::status_panel::StatusProfileOpen>,
     pub hud_panels: ResMut<'w, kuluu_render::hud::HudPanels>,
     pub net_status: ResMut<'w, kuluu_render::hud::network_status::NetStatusVisible>,
     pub audio_mute: ResMut<'w, kuluu_render::audio::AudioMuteState>,
@@ -275,7 +321,7 @@ pub(crate) fn text_input_system(
 
     mut chat_scroll: ResMut<ChatScroll>,
 
-    dynamic_menu: Res<kuluu_render::hud::menu::DynamicMenu>,
+    mut dynamic_menu: ResMut<kuluu_render::hud::menu::DynamicMenu>,
 
     cutscene_mode: Res<kuluu_render::cutscene::CutsceneMode>,
 ) {
@@ -311,14 +357,32 @@ pub(crate) fn text_input_system(
 
     let pad_synth: Vec<KeyboardInput> = events.pad.read().map(|e| e.0.clone()).collect();
     for ev in events.keyboard.read().chain(pad_synth.iter()) {
-        if ev.state != ButtonState::Pressed {
+        let event_holds_keys = cutscene_mode.active && scene_state.snapshot.dialog.is_some();
+        if let Some(key) = kuluu_render::myroom_arrange::arrange_key_of(ev.key_code) {
+            let phase = kuluu_render::myroom_arrange::KeyPhase::of(
+                ev.state == ButtonState::Pressed,
+                ev.repeat,
+            );
+            let editor_takes = !event_holds_keys && matches!(*mode, InputMode::Arrange);
+            if let ArrangeKeyRoute::Taken(next) =
+                route_arrange_key(key, phase, editor_takes, &mut dynamic_menu)
+            {
+                if let Some(next) = next {
+                    *mode = next;
+                }
+                continue;
+            }
+        }
+        if ev.state != ButtonState::Pressed
+            || (!event_holds_keys && matches!(*mode, InputMode::Arrange))
+        {
             continue;
         }
         // CS input lock: while a VM-driven event frame is up, retail's DEFCAMERA has taken the
         // camera and disabled menu drawing (research/XiEvents/OpCodes/0x0046.md), so every key
         // routes through the dialog handler — Enter advances the event even with the map open in
         // Menu(Map) mode, and ESC respects cancel_armed instead of closing whatever window is up.
-        if cutscene_mode.active && scene_state.snapshot.dialog.is_some() {
+        if event_holds_keys {
             let next = match &mut *mode {
                 InputMode::Dialog(cursor) => handle_dialog_key(
                     &ev.logical_key,
@@ -327,6 +391,7 @@ pub(crate) fn text_input_system(
                     &mut scene_state,
                     &cmd_tx.0,
                     &mut slash_writers.item_screen_container,
+                    &dynamic_menu.window_cursors,
                 ),
                 _ => {
                     let mut cursor = DialogCursor::default();
@@ -337,6 +402,7 @@ pub(crate) fn text_input_system(
                         &mut scene_state,
                         &cmd_tx.0,
                         &mut slash_writers.item_screen_container,
+                        &dynamic_menu.window_cursors,
                     )
                 }
             };
@@ -402,10 +468,10 @@ pub(crate) fn text_input_system(
                 let self_char_id = scene_state.snapshot.self_char_id;
                 let usable_items = kuluu_render::hud::menu::any_usable_item(&scene_state.snapshot);
                 let can_fish = slash_writers.fishing_spot.0.is_ready();
-                let modern_mount = matches!(
-                    scene_state.snapshot.self_mount,
-                    Some(kuluu_snapshot::Mount::Other { .. })
-                );
+                // Any mount qualifies, chocobos included: the record's own evidence is a
+                // rented-chocobo screenshot showing the Chat / Dig / Dismount self menu
+                // (.agents/skills/retail-observe/references/2026-10-02-mounted-command-menu.md).
+                let modern_mount = scene_state.snapshot.self_mount.is_some();
                 if let Some(next) = handle_world_key(
                     &ev.logical_key,
                     &bindings,
@@ -423,6 +489,8 @@ pub(crate) fn text_input_system(
                     &mut slash_writers.check_target,
                     &mut slash_writers.trade_state,
                     &mut slash_writers.lock_on,
+                    slash_writers.graphics.magic_flat_list,
+                    &dynamic_menu.window_cursors,
                 ) {
                     *mode = next;
                 }
@@ -454,6 +522,7 @@ pub(crate) fn text_input_system(
                     session_gates.session_event_tx.as_deref(),
                     fishing_gate,
                     &mut slash_writers,
+                    &mut dynamic_menu,
                     &mut draw_distance,
                 );
             }
@@ -467,7 +536,6 @@ pub(crate) fn text_input_system(
                     &cmd_tx.0,
                     &mut keybinds_state,
                     &mut slash_writers.graphics,
-                    &mut slash_writers.status_profile_open,
                     &mut slash_writers.hud_panels,
                     &mut slash_writers.net_status_visible,
                     &mut slash_writers.audio_mute,
@@ -477,7 +545,7 @@ pub(crate) fn text_input_system(
                     &mut slash_writers.item_menu_focus,
                     &mut slash_writers.item_screen_container,
                     &mut slash_writers.item_viewport,
-                    &dynamic_menu,
+                    &mut dynamic_menu,
                     current_target,
                     self_pos,
                     &mut slash_writers.map_screen_state,
@@ -485,6 +553,7 @@ pub(crate) fn text_input_system(
                     &slash_writers.map_view,
                     &slash_writers.minimap_state,
                     &slash_writers.change_map_catalog,
+                    &slash_writers.command_surface,
                 ) {
                     *mode = next;
                 }
@@ -498,6 +567,9 @@ pub(crate) fn text_input_system(
                     current_target,
                     &entities,
                     &cmd_tx.0,
+                    slash_writers.graphics.magic_flat_list,
+                    slash_writers.graphics.abilities_flat_list,
+                    &dynamic_menu.window_cursors,
                 ) {
                     *mode = next;
                 }
@@ -510,6 +582,7 @@ pub(crate) fn text_input_system(
                     &mut scene_state,
                     &cmd_tx.0,
                     &mut slash_writers.item_screen_container,
+                    &dynamic_menu.window_cursors,
                 ) {
                     *mode = next;
                 }
@@ -548,6 +621,9 @@ pub(crate) fn text_input_system(
                     &mut slash_writers.trade_state,
                     &mut slash_writers.trade_intent,
                     &mut slash_writers.lock_on,
+                    slash_writers.graphics.reselect_unequip,
+                    slash_writers.graphics.magic_flat_list,
+                    &dynamic_menu.window_cursors,
                 ) {
                     *mode = next;
                 }
@@ -560,6 +636,7 @@ pub(crate) fn text_input_system(
                     &mut scene_state,
                     &entities,
                     &cmd_tx.0,
+                    slash_writers.graphics.reselect_unequip,
                 ) {
                     *mode = next;
                 }
@@ -620,8 +697,76 @@ pub(crate) fn text_input_system(
                     *mode = next;
                 }
             }
+            // Layout mode answers only its own keys (`route_arrange_key`).
+            InputMode::Arrange => {}
         }
     }
+
+    // The macro-run drain (bead kuluu-o9qt7.19.4): while the mcrmenu family has a run
+    // going, one queued step is submitted per frame — through apply_chat_action's
+    // own Submit arm on a synthetic buffer, so a run takes exactly the typed-line
+    // seam: same parse, same echoes, same channel to the session. Retail feeds a
+    // used keytop's lines into the chat pipeline one at a time (vault
+    // main_menu.md §41/§56); steps kuluu cannot do answer like typed ones do —
+    // visibly, never as silent no-ops.
+    if let Some(step) = scene_state.pop_next_macro_step() {
+        let mut synth_mode = InputMode::Chat(kuluu_render::input_mode::ChatBuffer {
+            text: step,
+            ..Default::default()
+        });
+        let fishing_gate = slash_writers.fishing_spot.0;
+        apply_chat_action(
+            ChatAction::Submit,
+            &mut synth_mode,
+            &entities,
+            self_pos,
+            current_target,
+            &mut target,
+            &cmd_tx.0,
+            &mut scene_state,
+            &mut exit,
+            &mut navmesh.visible,
+            &navmesh.state,
+            &mut bindings,
+            &mut keybinds_state,
+            #[cfg(unix)]
+            session_gates.agent_paused.as_deref(),
+            session_gates.session_event_tx.as_deref(),
+            fishing_gate,
+            &mut slash_writers,
+            &mut dynamic_menu,
+            &mut draw_distance,
+        );
+    }
+}
+
+/// Where an arrange key event went.
+#[derive(Debug)]
+enum ArrangeKeyRoute {
+    /// The editor took it; `Some` is the input mode it switches to.
+    Taken(Option<InputMode>),
+    /// The editor only noted what is held; the event goes on to the mode's own handler.
+    PassedOn,
+}
+
+/// In layout mode an arrange key goes to the editor and nowhere else; in any other mode the editor
+/// only follows what is held
+/// (.agents/skills/retail-observe/references/2026-10-15-mog-house-arrange.md B2).
+fn route_arrange_key(
+    key: kuluu_render::myroom_arrange::ArrangeKey,
+    phase: kuluu_render::myroom_arrange::KeyPhase,
+    editor_takes: bool,
+    dynamic_menu: &mut kuluu_render::hud::menu::DynamicMenu,
+) -> ArrangeKeyRoute {
+    if !editor_takes {
+        dynamic_menu.arrange.track(key, phase);
+        return ArrangeKeyRoute::PassedOn;
+    }
+    ArrangeKeyRoute::Taken(kuluu_render::myroom_arrange::arrange_key(
+        dynamic_menu,
+        key,
+        phase,
+    ))
 }
 
 fn death_menu_response_command(
@@ -667,6 +812,97 @@ mod death_menu_tests {
                 target_index: 0,
                 kind: ActionKind::TractorMenu { accept: false },
             }
+        ));
+    }
+}
+
+#[cfg(test)]
+mod arrange_route_tests {
+    use super::*;
+    use kuluu_render::hud::menu::DynamicMenu;
+    use kuluu_render::myroom_arrange::{
+        ArrangeFrame, ArrangeKey, ArrangeRequest, DrawnPiece, HouseKey, KeyPhase, PieceInfo,
+    };
+
+    fn layout_frame(drawn: Vec<DrawnPiece>) -> ArrangeFrame {
+        ArrangeFrame {
+            house: Some(HouseKey {
+                zone_generation: 1,
+                floor: ffxi_dat::furniture::FLOOR_2F,
+                map_number: 0,
+            }),
+            arrangeable: true,
+            myroom_mode: kuluu_snapshot::MYROOM_MODE_LAYOUT,
+            drawn,
+            ..ArrangeFrame::default()
+        }
+    }
+
+    fn chair() -> DrawnPiece {
+        let pose = ffxi_dat::furniture::FurniturePose::default();
+        DrawnPiece {
+            seat: ffxi_dat::furniture::seat_index(ffxi_proto::map::container::LOC_MOGSAFE, 1),
+            info: PieceInfo {
+                container: ffxi_proto::map::container::LOC_MOGSAFE,
+                slot: 1,
+                item_no: 1,
+                kind: ffxi_dat::furniture::KIND_FURNISHING,
+                planted: false,
+                storage: 0,
+                recorded: Some(pose),
+            },
+            property: ffxi_dat::furniture::FurnitureProperty {
+                flags: 0,
+                model: 0,
+                width: 1,
+                depth: 1,
+                height: 0,
+            },
+            pose,
+        }
+    }
+
+    fn route(dynamic: &mut DynamicMenu, key: ArrangeKey, editor_takes: bool) -> ArrangeKeyRoute {
+        route_arrange_key(key, KeyPhase::Press, editor_takes, dynamic)
+    }
+
+    /// Outside layout mode an arrange key goes on to the mode's own handler; in it the editor takes it
+    /// and nothing else sees it.
+    #[test]
+    fn arrange_keys_reach_the_editor_only_in_layout_mode() {
+        let mut dynamic = DynamicMenu::default();
+        let entered = dynamic.arrange.update(&layout_frame(vec![chair()]));
+        assert!(matches!(entered, Some(InputMode::Arrange)), "{entered:?}");
+
+        assert!(matches!(
+            route(&mut dynamic, ArrangeKey::Cancel, false),
+            ArrangeKeyRoute::PassedOn
+        ));
+        assert!(dynamic.arrange.requests.is_empty() && dynamic.ui_sounds.is_empty());
+
+        assert!(matches!(
+            route(&mut dynamic, ArrangeKey::Cancel, true),
+            ArrangeKeyRoute::Taken(Some(InputMode::Menu(_)))
+        ));
+        assert_eq!(dynamic.arrange.requests, vec![ArrangeRequest::Leave]);
+        assert!(!dynamic.arrange.active(), "keys go back to normal play");
+    }
+
+    /// A modifier pressed in layout mode and released while another mode held the keys does not
+    /// leave the editor muted.
+    #[test]
+    fn a_modifier_released_elsewhere_is_not_left_held() {
+        let mut dynamic = DynamicMenu::default();
+        dynamic.arrange.update(&layout_frame(vec![chair()]));
+        route(&mut dynamic, ArrangeKey::Ctrl, true);
+        assert!(matches!(
+            route(&mut dynamic, ArrangeKey::Confirm, true),
+            ArrangeKeyRoute::Taken(None)
+        ));
+        route_arrange_key(ArrangeKey::Ctrl, KeyPhase::Release, false, &mut dynamic);
+        assert!(matches!(
+            route(&mut dynamic, ArrangeKey::Confirm, true),
+            ArrangeKeyRoute::Taken(Some(InputMode::Menu(_)))
         ));
     }
 }
@@ -924,6 +1160,7 @@ fn apply_chat_action(
     session_event_tx: Option<&super::SessionEventTx>,
     fishing_gate: kuluu_render::fishing_spot::FishingGate,
     slash_writers: &mut SlashWriters,
+    dynamic_menu: &mut kuluu_render::hud::menu::DynamicMenu,
     draw_distance: &mut kuluu_render::dat_mzb::DrawDistance,
 ) {
     match action {
@@ -976,7 +1213,7 @@ fn apply_chat_action(
 
                 let mode_override = match &outcome {
                     SlashOutcome::OpenMenu(kind) => {
-                        let mut stack = MenuStack::root();
+                        let mut stack = MenuStack::open_main_menu(&dynamic_menu.window_cursors);
                         stack.push(*kind);
                         Some(InputMode::Menu(stack))
                     }
@@ -1023,6 +1260,7 @@ fn apply_chat_action(
                     agent_paused,
                     session_event_tx,
                     slash_writers,
+                    dynamic_menu,
                     draw_distance,
                 );
                 if let Some(next) = mode_override {
@@ -1119,11 +1357,114 @@ fn sub_target_action_for(
             item_no,
         }),
         A::MoveItem { .. } => None,
+        // Party window rows answer with a packet or are inert; no sub-target step.
+        A::AcceptPartyInvite | A::DeclinePartyInvite | A::PartyMemberRow { .. } => None,
+        // The `abisortw` chain row answers locally (swap state word only, FFXiMain.dll
+        // retail-2026-09 `.text 0x223CF0`; bead kuluu-o9qt7.34) — never targets.
+        A::AbisortwSelect { .. } => None,
+        // Automaton slot rows are inert display until §39's equip flow lands;
+        // no sub-target step (vault main_menu.md §39). Macro slot rows likewise
+        // — the macro-use seam is open-map on bead .19.1 (vault §41).
+        A::AutomatonSlotRow { .. }
+        | A::MacroSlotRow { .. }
+        // Macro edit rows are client-local and handled in confirm before
+        // dispatch (bead kuluu-o9qt7.19.3); they never target anything — nor
+        // does the run row, whose steps ride the chat pipeline instead
+        // (bead .19.4). A book/set row only raises its options box.
+        // A band keytop drills its editor window and a field row only moves that window's caret: both
+        // are client-local and answered in confirm, so neither has anything to target.
+        | A::MacroKeytopRow { .. }
+        | A::MacroKeytopStep { .. }
+        | A::MacroEditFieldFocus { .. }
+        | A::MacroBookRow { .. }
+        | A::MacroBookOptionRow { .. }
+        | A::EquipSetRow { .. }
+        | A::EquipSetOptionRow { .. }
+        | A::MacroEditLine { .. }
+        | A::MacroClearSlot
+        | A::MacroUse { .. } => None,
+        // Trade window rows likewise act on the wire directly, drill through
+        // confirm_menu_at_cursor, or stay display-only (vault main_menu.md §25).
+        A::TradeAcceptInvite
+        | A::TradeDeclineInvite
+        | A::TradeConfirmRow
+        | A::TradeCancelRow
+        | A::TradeOwnSlot { .. }
+        | A::TradeGilRow
+        | A::TradePartnerOfferRow { .. }
+        | A::TradeStageFromBag { .. } => None,
         A::OpenItemAction { .. } => None,
         A::DropItem { .. } => None,
         A::EquipItem { .. } => None,
         A::KeyItem { .. } => None,
         A::Emote { .. } => None,
+        // Search rows go straight to the search server (Run) or stay inert
+        // (hits); no sub-target cursor (vault main_menu.md section 26).
+        A::SearchRun | A::SearchHitRow { .. } | A::SynthesizeRecipe { .. } => None,
+        // Link Shell slot rows carry no target action (vault main_menu.md section 27.6 keeps their
+        // select semantics [I-pending]).
+        A::LinkShellSlot { .. } => None,
+        // Region Info rows change the window's installed mode, never a target.
+        A::RegionInfoMode { .. } => None,
+        // Mission list/detail rows drill or stay legible; no sub-target step. The
+        // `bazaar` setup panel's two rows answer on the plain confirm seam only,
+        // like the mission drills.
+        A::MissionOpenLog { .. }
+        | A::MissionLogRow { .. }
+        | A::MissionOpenText { .. }
+        | A::MissionTextRow { .. }
+        // ur/152: the key item description window's lines are inert readout.
+        | A::KeyItemTextRow { .. }
+        | A::BazaarSetupRow { .. } => None,
+        // Same law for the quest00/quest01 pair (vault main_menu.md §31), and
+        // for the home-view job picks — they commit one c2s 0x100 MYROOM_JOB on
+        // the wire, never to a target (handler FFXiMain.dll retail-2026-09
+        // RVA 0x145460 arm 0x145517; vault main_menu.md §53).
+        A::QuestOpenDetail { .. }
+        // …and the roomlist's remodel rows drill through their own confirm dialog
+        // inside confirm_menu_at_cursor, never through a sub-target cursor (bead
+        // kuluu-o9qt7.13.5; vault main_menu.md §59 addendum 20/21).
+        | A::MogHouseRemodelSelect { .. }
+        | A::QuestDetailRow { .. }
+        | A::OpenQuestList { .. }
+        // ur/150: Key Items bucket rows push their list in confirm_menu_at_cursor.
+        | A::OpenKeyItemCategory { .. }
+        | A::HomeJobRow { .. } => None,
+        // Config-family rows drill windows or answer locally (vault main_menu.md
+        // §42/§47/§48); they never take a sub-target step. Status detail lines
+        // are pure readouts with no command at all — the selector's dispatch is
+        // OPEN-only (FFXiMain.dll retail-2026-09 RVA 0x148D00; bead kuluu-0oy7b).
+        // Companion drills are window pushes too (vault main_menu.md §59 addendum 5).
+        A::OpenRetailConfigPage { .. }
+        | A::OpenRetailConfigSub { .. }
+        | A::OpenRetailConfigCompanion { .. }
+        | A::ConfigOptionRow { .. }
+        | A::ConfigOptionSet { .. }
+        | A::ConfigOptionBitSet { .. }
+        | A::ConfigOptionToggleBit { .. }
+        | A::ConfigCfilterSelect { .. }
+        | A::ConfigSliderEdit { .. }
+        | A::ConfigWindowChoiceSet { .. }
+        // The dialog row raises its prompt at the confirm seam; no target step.
+        | A::OpenKeyAssignResetPrompt
+        // …and neither does kuluu's Controls-page command rows — they write the
+        // key store on the spot (bead kuluu-o9qt7.26.1).
+        | A::ControlsPreset(_)
+        | A::ControlsReset
+        | A::DisplayInfo => None,
+        // The Unity, alter ego point, merit, job point and arrange windows answer at the confirm
+        // seam (`unity_fp::select_unity_fp_row`, `merit_windows::select_merit_row`,
+        // `myroom_arrange::select_arrange_row`); none targets anything.
+        A::UnityMenuItem { .. }
+        | A::UnityChatMode { .. }
+        | A::UnityRankingSet { .. }
+        | A::UnityRankingRow { .. }
+        | A::UnityLeaderRow { .. }
+        | A::AlterEgoCategory { .. }
+        | A::AlterEgoUpgrade { .. }
+        | A::AlterEgoConfirmAnswer { .. }
+        | A::Merit(_)
+        | A::Arrange(_) => None,
     }
 }
 
@@ -1330,6 +1671,7 @@ fn handle_sub_target_key(
     scene_state: &mut SceneState,
     entities: &[kuluu_snapshot::Entity],
     cmd_tx: &Sender<AgentCommand>,
+    reselect_unequip_enabled: bool,
 ) -> Option<InputMode> {
     use ffxi_vocab::valid_target::TargetFlags;
     use kuluu_render::input_mode::SubTargetAction;
@@ -1412,6 +1754,7 @@ fn handle_sub_target_key(
             entities,
             cmd_tx,
             scene_state,
+            reselect_unequip_enabled,
         );
         return Some(InputMode::World);
     }
@@ -1431,6 +1774,7 @@ fn dispatch_dynamic_menu_action(
     entities: &[kuluu_snapshot::Entity],
     cmd_tx: &Sender<AgentCommand>,
     scene_state: &mut SceneState,
+    reselect_unequip_enabled: bool,
 ) {
     use kuluu_render::hud::menu::DynamicMenuAction as A;
     // Refuse an ability still on recast client-side (retail blocks it locally rather
@@ -1472,6 +1816,25 @@ fn dispatch_dynamic_menu_action(
     };
 
     let (kind_name, cmd) = match action {
+        // The inert readout rows of the Status detail windows dispatch nothing
+        // whatsoever (bead kuluu-0oy7b; FFXiMain.dll retail-2026-09 RVA 0x148D00).
+        A::DisplayInfo => return,
+        // Consumed at the confirm seam by `unity_fp::select_unity_fp_row`,
+        // `merit_windows::select_merit_row` and `myroom_arrange::select_arrange_row`.
+        A::UnityMenuItem { .. }
+        | A::UnityChatMode { .. }
+        | A::UnityRankingSet { .. }
+        | A::UnityRankingRow { .. }
+        | A::UnityLeaderRow { .. }
+        | A::AlterEgoCategory { .. }
+        | A::AlterEgoUpgrade { .. }
+        | A::AlterEgoConfirmAnswer { .. }
+        | A::Merit(_)
+        | A::Arrange(_) => return,
+        // Roomlist remodel selects are consumed by their own confirm dialog in
+        // confirm_menu_at_cursor and never reach this target dispatch (bead
+        // kuluu-o9qt7.13.5; vault main_menu.md §59 addendum 20/21).
+        A::MogHouseRemodelSelect { .. } => return,
         A::CastSpell { spell_id } => {
             let self_only =
                 ffxi_vocab::valid_target::spell(spell_id).is_some_and(|f| f.is_self_only());
@@ -1644,6 +2007,158 @@ fn dispatch_dynamic_menu_action(
                 },
             )
         }
+        A::AcceptPartyInvite | A::DeclinePartyInvite => {
+            // c2s GROUP_SOLICIT_RES through the session; retail clears its
+            // pending-solicit static the moment prtyjoin answers, so drop the
+            // invite locally too (vault main_menu.md §24).
+            let accept = matches!(action, A::AcceptPartyInvite);
+            scene_state.snapshot.party_invite = None;
+            if let Err(e) = cmd_tx.try_send(AgentCommand::PartyInviteRespond { accept }) {
+                push_system_chat_line(scene_state, format!("[menu] party answer dropped: {e}"));
+            }
+            return;
+        }
+        // Roster slots stay inert until the prtyN member sub-action mapping is
+        // dug out (vault main_menu.md §24 [I]).
+        A::PartyMemberRow { .. } => return,
+        // Automaton slot rows are legible-only display: kuluu will not guess
+        // which c2s 0x102 pup_data_t equip request the pupequip select table
+        // sends until that family is lawed (vault main_menu.md §39 [I]). Macro
+        // slot rows stay inert for the same reason — no widget-press-to-use
+        // law yet (vault main_menu.md §41).
+        // Macro rows are client-local: the confirm seam drills the editor and
+        // commits through CommitMacros before this wire dispatcher runs (bead
+        // kuluu-o9qt7.19.3) — nothing to send here.
+        A::AutomatonSlotRow { .. }
+        | A::MacroSlotRow { .. }
+        // Book/set rows drill their option boxes (and a pallet) in confirm; nothing rides the wire.
+        // Both are answered in the confirm seam above (the editor writes his own macro files, never the
+        // wire), so nothing leaves here.
+        | A::MacroKeytopRow { .. }
+        | A::MacroKeytopStep { .. }
+        | A::MacroEditFieldFocus { .. }
+        | A::MacroBookRow { .. }
+        | A::MacroBookOptionRow { .. }
+        | A::EquipSetRow { .. }
+        | A::EquipSetOptionRow { .. }
+        | A::MacroEditLine { .. }
+        | A::MacroClearSlot
+        | A::MacroUse { .. } => return,
+        // Search hit rows stay inert until a search-to-target mapping exists;
+        // retail's own hit-row select semantics remain [I] (vault main_menu.md
+        // section 26).
+        A::SearchHitRow { .. } => return,
+        // Craft-list rows are answered at the confirm seam above (vault main_menu.md §28).
+        A::SynthesizeRecipe { .. } => return,
+
+        // Legible-only rows until the window's select table is lawed (vault main_menu.md section
+        // 27.6): kuluu will not guess what equip/unequip request retail sends from this window.
+        A::LinkShellSlot { .. } => return,
+        // Region Info installs are answered at the confirm seam above (vault
+        // main_menu.md §29).
+        A::RegionInfoMode { .. } => return,
+        // Mission drills and legible log rows are answered at the confirm seam
+        // above / stay inert per vault main_menu.md section 30; quest00's drill and
+        // quest01's legible rows follow the same law (vault section 31). The mission
+        // text drill (ur/80) is client-local like its log parent.
+        A::MissionOpenLog { .. }
+        | A::MissionLogRow { .. }
+        | A::MissionOpenText { .. }
+        | A::MissionTextRow { .. }
+        // ur/152: description lines never reach a sub-target cursor.
+        | A::KeyItemTextRow { .. } => return,
+        // The `bazaar` setup panel's rows answer on the plain confirm seam, never
+        // as a sub-target action.
+        A::BazaarSetupRow { .. } => return,
+        // The ur/87 hub's drill rows push their list in confirm_menu_at_cursor.
+        A::QuestOpenDetail { .. }
+        | A::QuestDetailRow { .. }
+        | A::OpenQuestList { .. }
+        // ur/150: the Key Items hub's drill rows push their bucket list in
+        // confirm_menu_at_cursor, never through a sub-target cursor.
+        | A::OpenKeyItemCategory { .. } => return,
+        // Config-family drills are pushed in confirm_menu_at_cursor (where the menu stack
+        // lives) and leaf option rows answer there until bead kuluu-o9qt7.20.1 wires the
+        // option store — no wire from here either way (vault main_menu.md §48: retail's
+        // value writes are c2s SAVE_CONF frames owned by that bead).
+        // Radio writes answer at the confirm seam (bead kuluu-o9qt7.20.1) —
+        // client-local, never a wire event.
+        A::OpenRetailConfigPage { .. }
+        | A::OpenRetailConfigSub { .. }
+        | A::OpenRetailConfigCompanion { .. }
+        | A::ConfigOptionRow { .. }
+        | A::ConfigOptionSet { .. }
+        | A::ConfigOptionBitSet { .. }
+        | A::ConfigOptionToggleBit { .. }
+        | A::ConfigCfilterSelect { .. }
+        | A::ConfigSliderEdit { .. }
+        | A::ConfigWindowChoiceSet { .. }
+        // The reset prompt writes its answer at the confirm seam — never a wire
+        // event, and neither do kuluu's Controls-page command rows (their whole
+        // effect is the local key store; bead kuluu-o9qt7.26.1).
+        | A::OpenKeyAssignResetPrompt
+        | A::ControlsPreset(_)
+        | A::ControlsReset
+        // The `abisortw` chain row answers at the confirm seam — it only flips the
+        // emote window's swap state word (FFXiMain.dll retail-2026-09 `.text 0x223CF0`
+        // id-5 arm; bead kuluu-o9qt7.34), never a wire event.
+        | A::AbisortwSelect { .. } => return,
+        // The `searchma` Run row (select id 1 — query-object method 0x20EE70 in
+        // FFXiMain.dll's handler law): fire a TCP_SEARCH with no filter entries,
+        // which LSB defaults to "everyone" (_HandleSearchRequest); the merged
+        // result frames land back on SceneSnapshot.search and refresh the rows
+        // (vault main_menu.md section 26). Filter sub-editors are the documented
+        // follow-up on this bead family.
+        A::SearchRun => {
+            if let Err(e) = cmd_tx.try_send(AgentCommand::PlayerSearch {
+                filters: Vec::new(),
+                all_pages: false,
+            }) {
+                push_system_chat_line(scene_state, format!("[menu] search dropped: {e}"));
+            }
+            return;
+        }
+        // Trade answer YES sends c2s TRADE_RES Kind Start; LSB then pushes
+        // RES{Start} to BOTH sides, which replaces our pending window with the
+        // live one (player_trade.cpp; vault main_menu.md §25) — nothing to clear
+        // locally yet. The slot/button/picker rows are fired by
+        // confirm_menu_at_cursor where the menu stack is in reach.
+        A::TradeAcceptInvite => {
+            if let Err(e) = cmd_tx.try_send(AgentCommand::TradeRespond { accept: true }) {
+                push_system_chat_line(scene_state, format!("[menu] trade answer dropped: {e}"));
+            }
+            return;
+        }
+        // Answer NO sends Cancell; the server confirms nothing back to the
+        // decliner (player_trade.cpp), so — like the party answer law of §24 —
+        // kuluu clears its own pending window right there.
+        A::TradeDeclineInvite => {
+            scene_state.snapshot.trade = None;
+            if let Err(e) = cmd_tx.try_send(AgentCommand::TradeRespond { accept: false }) {
+                push_system_chat_line(scene_state, format!("[menu] trade answer dropped: {e}"));
+            }
+            return;
+        }
+        // Button row id 9 = Confirm while unconfirmed → TRADE_RES Kind Make; the
+        // session marks us confirmed locally once it is on the wire (retail sets
+        // its state at send time, vault main_menu.md §25).
+        A::TradeConfirmRow => {
+            if let Err(e) = cmd_tx.try_send(AgentCommand::TradeConfirm) {
+                push_system_chat_line(scene_state, format!("[menu] trade confirm dropped: {e}"));
+            }
+            return;
+        }
+        // The gil cell mirrors retail's Add-Gil button (id 11), which posts an
+        // async keypad before staging slot 0 — the keypad dialog is [I-pending]
+        // (call 0x140D90 / callback 0x1515C0, vault main_menu.md §25), so this
+        // row stays display-only until it decodes.
+        A::TradeGilRow => return,
+        // Partner-side rows have no select arm at all in retail (`gift` is a
+        // pure view, vault main_menu.md §25).
+        A::TradePartnerOfferRow { .. } => return,
+        // Own-slot drill, the picker's stage and Exit (which pops its window
+        // with it) all live in confirm_menu_at_cursor.
+        A::TradeOwnSlot { .. } | A::TradeStageFromBag { .. } | A::TradeCancelRow => return,
         A::OpenItemAction { .. } | A::DropItem { .. } => return,
         // Handled in confirm_menu_at_cursor (chat echo, menu stays open).
         A::KeyItem { .. } => return,
@@ -1660,12 +2175,15 @@ fn dispatch_dynamic_menu_action(
                 .copied()
                 .flatten()
                 == Some(item_no);
-            if already_equipped {
-                // Re-selecting the item already in this slot toggles it off.
-                // LSB unequips when slotID (container_index) is 0, regardless of
-                // container: vendor/server/src/map/utils/charutils.cpp EquipItem
-                // ("slotID of zero = unequip"). LOC_INVENTORY (0) always passes
-                // the equip_set container validation.
+            // Retail's equipment handler equips on every select case - its command-event jump
+            // table has no toggle-off branch (FFXiMain.dll retail-2026-09 RVA 0x1322B0,
+            // table 0x132608; vault main_menu.md §20), so re-selecting the equipped item is an
+            // idempotent equip there. The unequip-on-reselect path below rides on LSB leniency
+            // (vendor/server/src/map/utils/charutils.cpp EquipItem: slotID of zero = unequip)
+            // and is the kuluu enhancement, off by default behind GraphicsSettings.reselect_unequip.
+            if reselect_unequip_enabled && already_equipped {
+                // LSB unequips when slotID (container_index) is 0, regardless of container;
+                // LOC_INVENTORY (0) always passes the equip_set container validation.
                 (
                     "unequip",
                     AgentCommand::Equip {
@@ -1685,6 +2203,26 @@ fn dispatch_dynamic_menu_action(
                 )
             }
         }
+        // A home-view job pick (c2s 0x100 MYROOM_JOB; vault main_menu.md §53):
+        // the picked id rides its own side, the untouched side rides `None`
+        // (= index 0, "no change" — LSB skips validating a zero index per
+        // vendor/server/src/map/packets/c2s/0x100_myroom_job.cpp). Like every
+        // other job-change path here the state is never updated optimistically;
+        // the server's follow-up burst confirms.
+        A::HomeJobRow { job_id, as_main } => (
+            "jobchange",
+            if as_main {
+                AgentCommand::ChangeJob {
+                    main_job: Some(job_id),
+                    sub_job: None,
+                }
+            } else {
+                AgentCommand::ChangeJob {
+                    main_job: None,
+                    sub_job: Some(job_id),
+                }
+            },
+        ),
     };
     if let Err(e) = cmd_tx.try_send(cmd) {
         push_system_chat_line(scene_state, format!("[menu] {kind_name} dropped: {e}"));
@@ -1744,9 +2282,10 @@ fn mog_menu_storage_choice(d: &kuluu_snapshot::DialogState, choice: u32) -> Opti
 fn open_items_on_bag(
     container: u8,
     item_bag: &mut kuluu_render::hud::item_screen::ItemScreenContainer,
+    window_cursors: &CursorMemory,
 ) -> InputMode {
     item_bag.0 = container;
-    let mut stack = MenuStack::root();
+    let mut stack = MenuStack::open_main_menu(window_cursors);
     stack.push(MenuKind::Items);
     InputMode::Menu(stack)
 }
@@ -1757,10 +2296,13 @@ fn confirm_quick_action_at_cursor(
     target_id: Option<u32>,
     entities: &[kuluu_snapshot::Entity],
     cmd_tx: &Sender<AgentCommand>,
+    magic_flat_list: bool,
+    flat_abilities: bool,
+    window_cursors: &CursorMemory,
 ) -> Option<InputMode> {
     let label = kuluu_render::hud::quick_action::entry_label(state.has_target, state.cursor);
     let target_ent = target_id.and_then(|id| entities.iter().find(|e| e.id == id));
-    match resolve_quick_action(label, target_ent) {
+    match resolve_quick_action(label, target_ent, magic_flat_list, flat_abilities) {
         QuickActionDispatch::Command(cmd) => {
             if let Err(e) = cmd_tx.try_send(cmd) {
                 push_system_chat_line(scene_state, format!("[quick] dispatch dropped: {e}"));
@@ -1776,7 +2318,7 @@ fn confirm_quick_action_at_cursor(
             Some(InputMode::World)
         }
         QuickActionDispatch::OpenMenu(kind) => {
-            let mut stack = MenuStack::root();
+            let mut stack = MenuStack::open_main_menu(window_cursors);
             stack.push(kind);
             Some(InputMode::Menu(stack))
         }
@@ -1808,7 +2350,8 @@ pub fn mouse_nav_dispatch_system(
     target: Res<Target>,
     mut scene_state: ResMut<SceneState>,
     mut menu_writers: MenuConfirmWriters,
-    dynamic_menu: Res<kuluu_render::hud::menu::DynamicMenu>,
+    mut dynamic_menu: ResMut<kuluu_render::hud::menu::DynamicMenu>,
+    command_surface: Res<crate::view_native::command_surface::CommandSurface>,
     mut check_target: ResMut<kuluu_render::hud::check_view::CheckTarget>,
     mut trade_state: ResMut<kuluu_render::hud::trade::TradeState>,
     mut lock_on: ResMut<kuluu_render::LockOn>,
@@ -1831,15 +2374,16 @@ pub fn mouse_nav_dispatch_system(
                 &cmd_tx.0,
                 &mut keybinds_state,
                 &mut menu_writers.graphics,
-                &mut menu_writers.status_profile_open,
                 &mut menu_writers.hud_panels,
                 &mut menu_writers.net_status,
                 &mut menu_writers.audio_mute,
                 &mut menu_writers.vana_clock,
                 &mut menu_writers.vana_clock_visible,
-                &dynamic_menu,
+                &mut dynamic_menu,
                 current_target,
                 self_pos,
+                &command_surface,
+                &mut menu_writers.item_screen_container,
             ) {
                 *mode = next;
             }
@@ -1859,7 +2403,11 @@ pub fn mouse_nav_dispatch_system(
             }
             cursor.cursor = ev.choice;
             if let Some(container) = confirm_dialog_choice(ev.choice, &mut scene_state, &cmd_tx.0) {
-                *mode = open_items_on_bag(container, &mut menu_writers.item_screen_container);
+                *mode = open_items_on_bag(
+                    container,
+                    &mut menu_writers.item_screen_container,
+                    &dynamic_menu.window_cursors,
+                );
             }
         }
     }
@@ -1877,6 +2425,9 @@ pub fn mouse_nav_dispatch_system(
                 current_target,
                 &entities,
                 &cmd_tx.0,
+                menu_writers.graphics.magic_flat_list,
+                menu_writers.graphics.abilities_flat_list,
+                &dynamic_menu.window_cursors,
             ) {
                 *mode = next;
             }
@@ -1912,6 +2463,8 @@ pub fn mouse_nav_dispatch_system(
                 &mut check_target,
                 &mut trade_state,
                 &mut lock_on,
+                menu_writers.graphics.magic_flat_list,
+                &dynamic_menu.window_cursors,
             ) {
                 *mode = next;
             }
@@ -1953,6 +2506,7 @@ fn handle_dialog_key(
     scene_state: &mut SceneState,
     cmd_tx: &Sender<AgentCommand>,
     item_bag: &mut kuluu_render::hud::item_screen::ItemScreenContainer,
+    window_cursors: &CursorMemory,
 ) -> Option<InputMode> {
     // Free-text frame (delivery-box recipient prompt): edit a line buffer and
     // answer with TextInput; characters must not fall through to nav bindings.
@@ -2040,7 +2594,7 @@ fn handle_dialog_key(
         if let Some(container) =
             confirm_dialog_choice(cursor.cursor.min(max_index), scene_state, cmd_tx)
         {
-            return Some(open_items_on_bag(container, item_bag));
+            return Some(open_items_on_bag(container, item_bag, window_cursors));
         }
         return None;
     }
@@ -2181,9 +2735,15 @@ enum QuickActionDispatch {
     OpenMenu(MenuKind),
 }
 
+/// `magic_flat_list` is the Retail+ gate on kuluu's one-step spell list; retail's
+/// Magic entry opens the mgcmenu picker first (vault main_menu.md §21).
+/// `flat_abilities` is the same pattern for Abilities and its abimenu picker
+/// (vault main_menu.md §23).
 fn resolve_quick_action(
     label: &str,
     target: Option<&kuluu_snapshot::Entity>,
+    magic_flat_list: bool,
+    flat_abilities: bool,
 ) -> QuickActionDispatch {
     match label {
         "Check" => match target {
@@ -2213,8 +2773,10 @@ fn resolve_quick_action(
             None => QuickActionDispatch::SystemMessage("[quick] Talk: no target".into()),
         },
 
-        "Magic" => QuickActionDispatch::OpenMenu(MenuKind::Magic),
-        "Abilities" => QuickActionDispatch::OpenMenu(MenuKind::Abilities),
+        "Magic" if magic_flat_list => QuickActionDispatch::OpenMenu(MenuKind::Magic),
+        "Magic" => QuickActionDispatch::OpenMenu(MenuKind::MagicGroups),
+        "Abilities" if flat_abilities => QuickActionDispatch::OpenMenu(MenuKind::Abilities),
+        "Abilities" => QuickActionDispatch::OpenMenu(MenuKind::AbilitiesGroups),
         "Items" => QuickActionDispatch::OpenMenu(MenuKind::Items),
 
         other => QuickActionDispatch::NotImplemented(other.to_string()),
@@ -2229,6 +2791,9 @@ fn handle_quick_action_key(
     target_id: Option<u32>,
     entities: &[kuluu_snapshot::Entity],
     cmd_tx: &Sender<AgentCommand>,
+    magic_flat_list: bool,
+    flat_abilities: bool,
+    window_cursors: &CursorMemory,
 ) -> Option<InputMode> {
     let entry_count = kuluu_render::hud::quick_action::entry_count(state.has_target);
     if bindings.matches_logical(Action::NavUp, key) {
@@ -2245,7 +2810,16 @@ fn handle_quick_action_key(
         return None;
     }
     if bindings.matches_logical(Action::NavConfirm, key) {
-        return confirm_quick_action_at_cursor(state, scene_state, target_id, entities, cmd_tx);
+        return confirm_quick_action_at_cursor(
+            state,
+            scene_state,
+            target_id,
+            entities,
+            cmd_tx,
+            magic_flat_list,
+            flat_abilities,
+            window_cursors,
+        );
     }
     if bindings.matches_logical(Action::NavCancel, key) {
         return Some(InputMode::World);
@@ -2634,7 +3208,7 @@ mod quick_action_tests {
     #[test]
     fn check_dispatches_check_target_with_basic_kind() {
         let ent = target_ent(0x1234, 7);
-        let result = resolve_quick_action("Check", Some(&ent));
+        let result = resolve_quick_action("Check", Some(&ent), false, false);
         match result {
             QuickActionDispatch::Command(AgentCommand::CheckTarget {
                 target_id,
@@ -2651,7 +3225,7 @@ mod quick_action_tests {
 
     #[test]
     fn check_with_no_target_returns_system_message() {
-        let result = resolve_quick_action("Check", None);
+        let result = resolve_quick_action("Check", None, false, false);
         match result {
             QuickActionDispatch::SystemMessage(msg) => {
                 assert!(msg.to_lowercase().contains("no target"));
@@ -2663,24 +3237,37 @@ mod quick_action_tests {
     #[test]
     fn unwired_entry_stays_not_implemented() {
         let ent = target_ent(1, 1);
-        let result = resolve_quick_action("Macros", Some(&ent));
+        let result = resolve_quick_action("Macros", Some(&ent), false, false);
         assert_eq!(result, QuickActionDispatch::NotImplemented("Macros".into()),);
     }
 
     #[test]
     fn contextual_action_categories_open_their_menu() {
+        // The Magic and Abilities entries land on retail's mgcmenu/abimenu
+        // pickers unless the Retail+ flat lists are on (vault main_menu.md §21,
+        // §23).
         for (label, expected) in [
-            ("Magic", MenuKind::Magic),
-            ("Abilities", MenuKind::Abilities),
+            ("Magic", MenuKind::MagicGroups),
+            ("Abilities", MenuKind::AbilitiesGroups),
             ("Items", MenuKind::Items),
         ] {
-            let result = resolve_quick_action(label, None);
+            let result = resolve_quick_action(label, None, false, false);
             assert_eq!(
                 result,
                 QuickActionDispatch::OpenMenu(expected),
                 "{label} should open {expected:?}",
             );
         }
+        assert_eq!(
+            resolve_quick_action("Magic", None, true, false),
+            QuickActionDispatch::OpenMenu(MenuKind::Magic),
+            "flat toggle moves the Magic entry to kuluu's one-step list",
+        );
+        assert_eq!(
+            resolve_quick_action("Abilities", None, false, true),
+            QuickActionDispatch::OpenMenu(MenuKind::Abilities),
+            "flat-abilities toggle moves the Abilities entry to kuluu's one-step list",
+        );
     }
 }
 
@@ -2786,7 +3373,8 @@ mod dialog_esc_gate_tests {
             &mut cursor,
             &mut scene_state,
             &cmd_tx,
-            &mut item_bag
+            &mut item_bag,
+            &Default::default()
         )
         .is_none());
 
@@ -2818,7 +3406,8 @@ mod dialog_esc_gate_tests {
             &mut cursor,
             &mut scene_state,
             &cmd_tx,
-            &mut item_bag
+            &mut item_bag,
+            &Default::default()
         )
         .is_none());
 
@@ -2893,7 +3482,6 @@ mod cs_input_lock_tests {
         app.insert_resource(kuluu_render::minimap::MinimapView::default());
         app.insert_resource(kuluu_render::minimap::MinimapState::default());
         app.insert_resource(kuluu_render::combat_stance::RestStance::default());
-        app.insert_resource(kuluu_render::hud::status_panel::StatusProfileOpen::default());
         app.insert_resource(kuluu_render::hud::item_detail::SortOptions::default());
         app.insert_resource(kuluu_render::hud::item_detail::ItemMenuFocus::default());
         app.insert_resource(kuluu_render::hud::item_screen::ItemScreenContainer::default());
@@ -3321,6 +3909,7 @@ mod sub_target_pick_tests {
             &mut scene,
             &entities,
             &cmd_tx,
+            false,
         );
         assert!(
             next.is_none(),
@@ -3345,6 +3934,47 @@ mod sub_target_pick_tests {
             "the sent candidate must arm the answer wait"
         );
         assert!(st.pending_since.is_some());
+    }
+
+    /// Retail's equipment handler equips on every select case - no toggle-off branch in its
+    /// command-event jump table (FFXiMain.dll retail-2026-09 RVA 0x1322B0 / 0x132608, vault
+    /// main_menu.md §20) - so re-selecting the item already worn must dispatch a plain equip,
+    /// not LSB's slotID-0 unequip sentinel (vendor/server/src/map/utils/charutils.cpp EquipItem).
+    /// The sentinel goes out only with the Retail+ "Reselect Unequip" toggle on.
+    #[test]
+    fn equip_reselect_sends_plain_equip_unless_the_toggle_is_on() {
+        use kuluu_render::hud::menu::DynamicMenuAction;
+
+        const SLOT: usize = 2;
+        const WORN_ITEM: u16 = 7;
+        for (toggle, want_slot_id) in [(false, 9u8), (true, 0u8)] {
+            let mut scene = SceneState::default();
+            scene.snapshot.equipped[SLOT] = Some(WORN_ITEM);
+            let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel::<AgentCommand>(4);
+            dispatch_dynamic_menu_action(
+                DynamicMenuAction::EquipItem {
+                    container: 0,
+                    container_index: 9,
+                    equip_slot: SLOT as u8,
+                    item_no: WORN_ITEM,
+                },
+                None,
+                Default::default(),
+                &[],
+                &cmd_tx,
+                &mut scene,
+                toggle,
+            );
+            let sent = cmd_rx
+                .try_recv()
+                .expect("an equip select must always send an update");
+            assert!(
+                matches!(sent, AgentCommand::Equip { container: 0, container_index, .. }
+                    if container_index == want_slot_id),
+                "toggle={toggle}: {} expected slot id {want_slot_id}: {sent:?}",
+                if toggle { "on" } else { "off (retail default)" }
+            );
+        }
     }
 
     /// The candidate sits inside the sub-target range, beyond the engage
@@ -3377,6 +4007,7 @@ mod sub_target_pick_tests {
             &mut scene,
             &entities,
             &cmd_tx,
+            false,
         );
         assert!(
             next.is_none(),
@@ -3499,6 +4130,7 @@ mod sub_target_pick_tests {
             &mut scene,
             &entities,
             &cmd_tx,
+            false,
         );
         assert!(
             st.pending_switch.is_some(),
@@ -3511,6 +4143,7 @@ mod sub_target_pick_tests {
             &mut scene,
             &entities,
             &cmd_tx,
+            false,
         );
         assert_eq!(
             st.pending_switch, None,
@@ -3609,5 +4242,183 @@ mod sub_target_pick_tests {
             matches!(*app.world().resource::<InputMode>(), InputMode::World),
             "a dead main target must close the switch-target picker"
         );
+    }
+}
+
+/// The run side of the mcrmenu family (bead kuluu-o9qt7.19.4): queued steps go
+/// out one per frame through the typed-line seam — retail feeds a used keytop's
+/// lines into the chat pipeline sequentially (vault main_menu.md §41/§56).
+#[cfg(test)]
+mod macro_run_drain_tests {
+    use super::*;
+
+    #[test]
+    fn queued_steps_submit_one_per_frame_in_order() {
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel::<AgentCommand>(8);
+        let mut app = cs_input_lock_tests::gate_app(cmd_tx);
+        app.insert_resource(InputMode::World);
+        app.world_mut()
+            .resource_mut::<SceneState>()
+            .queue_macro_steps(vec!["one".to_string(), "two".to_string()]);
+
+        app.update();
+        assert_eq!(
+            cmd_rx.try_recv().expect("first step must submit"),
+            AgentCommand::Chat {
+                kind: 0,
+                text: "one".to_string()
+            },
+            "the first queued step is a say, as if typed"
+        );
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "only one step may submit per frame (sequential law)"
+        );
+
+        app.update();
+        assert_eq!(
+            cmd_rx.try_recv().expect("second step must submit"),
+            AgentCommand::Chat {
+                kind: 0,
+                text: "two".to_string()
+            }
+        );
+        app.update();
+        assert!(cmd_rx.try_recv().is_err(), "a finished run stays quiet");
+    }
+
+    #[test]
+    fn a_running_macro_leaves_the_open_window_undisturbed() {
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel::<AgentCommand>(8);
+        let mut app = cs_input_lock_tests::gate_app(cmd_tx);
+        // gate_app opens Menu(Map): the drain must not touch it while steps fly.
+        app.world_mut()
+            .resource_mut::<SceneState>()
+            .queue_macro_steps(vec!["help me".to_string()]);
+
+        app.update();
+        assert!(matches!(
+            *app.world().resource::<InputMode>(),
+            InputMode::Menu(_)
+        ));
+        assert_eq!(
+            cmd_rx
+                .try_recv()
+                .expect("step must submit while a menu is up"),
+            AgentCommand::Chat {
+                kind: 0,
+                text: "help me".to_string()
+            }
+        );
+    }
+}
+
+/// RMB = Esc wiring (owner ruling, no capture): the right-button system emits one tap of the bound
+/// cancel key onto `text_input_system`'s synthetic channel over window surfaces - the same seam the pad's buttons fire through,
+/// whose handlers already close these windows - and stays silent where World, Chat, or Arrange owns RMB.
+#[cfg(test)]
+mod right_button_cancel_tests {
+    use super::*;
+    use crate::view_native::gamepad_input;
+
+    fn tap_app(mode: InputMode, trade_open: bool) -> App {
+        let mut app = App::new();
+        app.add_message::<bevy::input::mouse::MouseButtonInput>()
+            .add_message::<gamepad_input::PadKeyEvent>()
+            .init_resource::<kuluu_render::MousePointer>()
+            .insert_resource(Bindings::default())
+            .init_resource::<kuluu_render::hud::trade::TradeState>()
+            .insert_resource(mode);
+        app.world_mut()
+            .resource_mut::<kuluu_render::hud::trade::TradeState>()
+            .open = trade_open;
+        app.world_mut().spawn(PrimaryWindow);
+        app.add_systems(Update, right_button_cancel_system);
+        app
+    }
+
+    fn taps(app: &mut App) -> Vec<gamepad_input::PadKeyEvent> {
+        app.world_mut()
+            .resource_mut::<Messages<gamepad_input::PadKeyEvent>>()
+            .drain()
+            .collect()
+    }
+
+    fn write_button(app: &mut App, state: ButtonState) {
+        app.world_mut()
+            .resource_mut::<Messages<bevy::input::mouse::MouseButtonInput>>()
+            .write(bevy::input::mouse::MouseButtonInput {
+                button: bevy::input::mouse::MouseButton::Right,
+                state,
+                window: Entity::PLACEHOLDER,
+            });
+    }
+
+    fn click_right(app: &mut App) {
+        write_button(app, ButtonState::Pressed);
+        app.update();
+        write_button(app, ButtonState::Released);
+        app.update();
+    }
+
+    #[test]
+    fn a_right_click_over_a_window_taps_the_bound_cancel_key() {
+        let mut app = tap_app(InputMode::Check, false);
+        click_right(&mut app);
+
+        let expected = Bindings::default()
+            .get(Action::NavCancel)
+            .expect("cancel is bound");
+        let taps = taps(&mut app);
+        assert_eq!(taps.len(), 2, "one tap: press and release together");
+        assert_eq!(taps[0].0.key_code, expected.key);
+        assert_eq!(taps[0].0.state, ButtonState::Pressed);
+        assert_eq!(taps[1].0.state, ButtonState::Released);
+    }
+
+    #[test]
+    fn an_engaged_hold_is_a_drag_never_a_cancel() {
+        let mut app = tap_app(InputMode::Check, false);
+        write_button(&mut app, ButtonState::Pressed);
+        app.update(); // armed as the press lands
+
+        // `collect_mouse_system` engages the drag flag while the button stays held.
+        app.world_mut()
+            .resource_mut::<kuluu_render::MousePointer>()
+            .right_dragged = true;
+        app.update(); // the hold is spent as camera/rotation
+
+        write_button(&mut app, ButtonState::Released);
+        app.update();
+        assert!(taps(&mut app).is_empty(), "a drag release must not cancel");
+    }
+
+    #[test]
+    fn world_cancels_only_an_open_trade() {
+        let mut idle = tap_app(InputMode::World, false);
+        click_right(&mut idle);
+        assert!(
+            taps(&mut idle).is_empty(),
+            "at rest the button feeds camera"
+        );
+
+        let mut trading = tap_app(InputMode::World, true);
+        click_right(&mut trading);
+        assert_eq!(
+            taps(&mut trading).len(),
+            2,
+            "a trade rides World mode and the click closes it like Esc"
+        );
+    }
+
+    #[test]
+    fn chat_and_arrange_never_get_the_cancel_tap() {
+        let mut chat = tap_app(InputMode::Chat(ChatBuffer::empty()), false);
+        click_right(&mut chat);
+        assert!(taps(&mut chat).is_empty());
+
+        let mut arrange = tap_app(InputMode::Arrange, false);
+        click_right(&mut arrange);
+        assert!(taps(&mut arrange).is_empty());
     }
 }

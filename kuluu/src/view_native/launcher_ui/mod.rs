@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex};
 use crate::launcher_store::{AuthFlavorKind, ServerProfile};
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
-use kuluu_session::auth_client::{AuthClient, AuthFlavor};
+use kuluu_session::auth_client::AuthClient;
 use kuluu_session::lobby_client::LobbyClient;
 use tokio::runtime::Handle as RtHandle;
 
@@ -33,11 +33,7 @@ use crate::launcher::{Defaults, Selection};
 use super::AppPhase;
 
 pub(crate) fn apply_server_profile(commands: &mut Commands, profile: &ServerProfile) {
-    let flavor = match profile.flavor {
-        AuthFlavorKind::Json => AuthFlavor::Json,
-        AuthFlavorKind::Binary => AuthFlavor::Binary,
-        AuthFlavorKind::PlayOnline => AuthFlavor::PlayOnline,
-    };
+    let flavor = profile.flavor.auth_flavor();
     let auth = Arc::new(AuthClient::with_flavor_and_version(
         profile.host.clone(),
         profile.auth_port,
@@ -378,6 +374,7 @@ pub(crate) struct ServerEditForm {
     #[allow(dead_code)]
     pub focus: ServerEditField,
     pub editing_index: Option<usize>,
+    pub error: String,
 }
 
 impl Default for ServerEditForm {
@@ -413,7 +410,20 @@ impl ServerEditForm {
             show_advanced,
             focus: ServerEditField::default(),
             editing_index: None,
+            error: String::new(),
         }
+    }
+
+    pub fn select_flavor(&mut self, flavor: AuthFlavorKind) {
+        if self.flavor == flavor {
+            return;
+        }
+        self.flavor = flavor;
+        self.xiloader_version = match flavor {
+            AuthFlavorKind::Binary => crate::launcher_store::LEGACY_LSB_XILOADER_VERSION.into(),
+            _ => String::new(),
+        };
+        self.error.clear();
     }
 }
 
@@ -642,6 +652,7 @@ pub(crate) fn register(
     lobby: Arc<LobbyClient>,
     defaults: Defaults,
     runtime: RtHandle,
+    models: bool,
 ) {
     let mut form = LoginForm::default();
     if let Some(u) = defaults.user {
@@ -692,9 +703,8 @@ pub(crate) fn register(
             std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port))
         });
         let queue = key_msgs.clone();
-        let knobs = super::animtest_knobs();
         runtime.spawn(async move {
-            super::key_drive::serve_key_drive(addr, queue, knobs).await;
+            super::key_drive::serve_key_drive(addr, queue, None).await;
         });
     }
 
@@ -935,8 +945,9 @@ pub(crate) fn register(
                 .before(char_list::redraw_char_list_system)
                 .before(char_preview::refresh_preview_on_cursor_change),
             char_list::redraw_char_list_system,
-            char_preview::refresh_preview_on_cursor_change,
-            char_preview::poll_pending_preview,
+            // `-cpu-mode`: menus only, so no actor DAT is read for a preview.
+            char_preview::refresh_preview_on_cursor_change.run_if(move || models),
+            char_preview::poll_pending_preview.run_if(move || models),
         )
             .run_if(in_state(LauncherState::CharList)),
     );
@@ -984,7 +995,7 @@ pub(crate) fn register(
         login::error_keyboard_system.run_if(in_state(LauncherState::LoginError)),
     );
 
-    char_create_preview::register(app);
+    char_create_preview::register(app, models);
 
     updater::register(app);
 
@@ -1115,12 +1126,6 @@ pub(crate) fn register(
 }
 
 fn spawn_launcher_camera(mut commands: Commands) {
-    spawn_launcher_camera_core(&mut commands);
-}
-
-// The AnimationTest box unloads the launcher camera while open and re-spawns it on close;
-// this is the shared one-line core so both sides build an identical camera.
-pub(crate) fn spawn_launcher_camera_core(commands: &mut Commands) {
     commands.spawn((Camera2d, LauncherCamera));
 }
 
@@ -1427,6 +1432,11 @@ mod tests {
 
     fn screen_app() -> App {
         let mut app = App::new();
+        app.add_plugins((
+            MinimalPlugins,
+            bevy::asset::AssetPlugin::default(),
+            bevy::scene::ScenePlugin,
+        ));
         app.insert_resource(ServerInfo {
             server: "127.0.0.1".into(),
             profile_name: None,

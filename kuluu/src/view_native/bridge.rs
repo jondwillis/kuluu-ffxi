@@ -26,7 +26,10 @@ const TRANSLATE_MIN_PERIOD: Duration = Duration::from_millis(8);
 
 enum TranslatedFrame {
     Snapshot(Box<wire::SceneSnapshot>),
-    Delta(wire::SceneDelta),
+    /// Boxed like the snapshot arm: `SceneDelta` keeps growing additively and
+    /// inline it pushes this enum past clippy's large_enum_variant budget (the
+    /// trade window field, bead kuluu-o9qt7.9, crossed exactly that line).
+    Delta(Box<wire::SceneDelta>),
 }
 
 struct ReadyFrame {
@@ -131,7 +134,7 @@ fn translate_frame(
                 delta.self_pos = guard.self_position().map(position_to_wire);
             }
             delta.entities_removed.extend(removals);
-            (TranslatedFrame::Delta(delta), entity_count)
+            (TranslatedFrame::Delta(Box::new(delta)), entity_count)
         }
     };
 
@@ -237,7 +240,7 @@ impl SceneSource for NativeSource {
                 Some(snap)
             }
             TranslatedFrame::Delta(delta) => {
-                self.pending_delta = Some(delta);
+                self.pending_delta = Some(*delta);
                 None
             }
         }
@@ -422,6 +425,8 @@ mod tests {
             next_use_vana_ts: None,
             use_delay_end_vana_ts: None,
             ready: None,
+
+            extdata: None,
         });
         s.inventory.containers.insert(0, inv0);
         s.equipment[0] = Some(EquippedRef {

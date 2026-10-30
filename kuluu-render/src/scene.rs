@@ -236,6 +236,19 @@ pub fn mount_actor_rider(world_id: u32) -> Option<u32> {
     (world_id & MOUNT_ACTOR_ID_BIT != 0).then_some(world_id & !MOUNT_ACTOR_ID_BIT)
 }
 
+/// Actors the client makes for placed Mog House furniture (NPC-look pieces and mannequins), one id per seat:
+/// above every LSB unique_no and clear of [`MOUNT_ACTOR_ID_BIT`]. The snapshot never carries them, so the
+/// entity sync leaves them to the furniture module.
+pub const FURNITURE_ACTOR_IDS: std::ops::Range<u32> = 0x6000_0000..0x6001_0000;
+
+pub fn furniture_actor_id(seat: usize) -> u32 {
+    FURNITURE_ACTOR_IDS.start + seat as u32
+}
+
+pub fn is_furniture_actor_id(world_id: u32) -> bool {
+    FURNITURE_ACTOR_IDS.contains(&world_id)
+}
+
 pub fn setup_world(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
@@ -346,6 +359,7 @@ pub struct EntitySyncQueries<'w, 's> {
     vis: Query<'w, 's, &'static mut Visibility, (With<WorldEntity>, Without<IsSelf>)>,
     self_tagged: Query<'w, 's, Has<IsSelf>, With<WorldEntity>>,
     mounted: Query<'w, 's, Has<crate::components::MountedRider>, With<WorldEntity>>,
+    departing: Query<'w, 's, &'static crate::components::MountDeparting>,
 }
 
 #[derive(SystemParam)]
@@ -568,6 +582,33 @@ pub fn sync_entities_system(
                 commands
                     .entity(rider_e)
                     .remove::<crate::components::MountedRider>();
+                // The wire forgets the mount entirely at a dismount, but retail keeps it
+                // long enough to play its authored get-off gallop (`coff` on the mount's own
+                // model - buck, two gallop loops; census cited on `MountDeparting`). Hand the
+                // entity over to `drive_mount_departure_system` instead of letting this
+                // frame's sweep reap it.
+                let mid = mount_actor_id(wire.id);
+                if let Some(&mount_e) = tracked.by_id.get(&mid) {
+                    if queries.departing.get(mount_e).is_err() {
+                        commands
+                            .entity(mount_e)
+                            .insert(crate::components::MountDeparting {
+                                started: false,
+                                elapsed_frames: 0,
+                                done: false,
+                            });
+                        seen.insert(mid);
+                        // Every get-off is one INFO line from wire edge to sweep (the two
+                        // transitions in `drive_mount_departure_system` are the other halves),
+                        // so "the chocobo just stands there" reports name which leg stalled.
+                        tracing::info!(
+                            target: "kuluu_render::scene",
+                            mount_id = wire.id,
+                            rider_id = %rider_e,
+                            "mount departed the wire; handing the actor to its get-off"
+                        );
+                    }
+                }
             }
             continue;
         }
@@ -579,6 +620,15 @@ pub fn sync_entities_system(
         let id = mount_actor_id(wire.id);
         seen.insert(id);
         if tracked.by_id.contains_key(&id) {
+            // A rider who climbed back on mid-gallop cancels the departure state; a running
+            // one-shot pose clears itself when its authored windows run out.
+            if let Some(&mount_e) = tracked.by_id.get(&id) {
+                if queries.departing.get(mount_e).is_ok() {
+                    commands
+                        .entity(mount_e)
+                        .remove::<crate::components::MountDeparting>();
+                }
+            }
             continue;
         }
         let rider_tf = queries.xform.get(rider_e).copied().unwrap_or_default();
@@ -601,9 +651,18 @@ pub fn sync_entities_system(
         .by_id
         .keys()
         .copied()
-        .filter(|id| !seen.contains(id))
+        .filter(|id| !seen.contains(id) && !is_furniture_actor_id(*id))
         .collect();
     for id in stale {
+        // A mount still playing its get-off gallop (or waiting for its model to load so it
+        // can) waits out the sweep with its tracking entry intact; `done` hands it back.
+        if tracked
+            .by_id
+            .get(&id)
+            .is_some_and(|bevy_e| queries.departing.get(*bevy_e).is_ok_and(|dep| !dep.done))
+        {
+            continue;
+        }
         if let Some(bevy_e) = tracked.by_id.remove(&id) {
             commands.entity(bevy_e).try_despawn();
         }
@@ -671,11 +730,18 @@ pub fn apply_invis_flag_system(
 pub fn pin_mount_actors_system(
     tracked: Res<TrackedEntities>,
     mut q_xform: Query<&mut Transform, With<WorldEntity>>,
+    departing: Query<(), With<crate::components::MountDeparting>>,
 ) {
     for (&id, &bevy_e) in tracked.by_id.iter() {
         let Some(rider_id) = mount_actor_rider(id) else {
             continue;
         };
+        // A departing mount stands where it stopped being ridden and plays its authored
+        // get-off gallop there; pinning it back onto the now-foot rider would glue the
+        // animation to the player's feet.
+        if departing.contains(bevy_e) {
+            continue;
+        }
         let Some(&rider_e) = tracked.by_id.get(&rider_id) else {
             continue;
         };
@@ -684,6 +750,110 @@ pub fn pin_mount_actors_system(
         };
         if let Ok(mut t) = q_xform.get_mut(bevy_e) {
             *t = rider_tf;
+        }
+    }
+}
+
+/// How long a departing mount waits for its model to load before the sweep reaps it
+/// unread (5 s of 60 Hz frames) - and the hard ceiling that hands any stuck departure back.
+/// Gates `drive_mount_departure_system`'s clock, which is where it is read.
+#[cfg(not(target_arch = "wasm32"))]
+const MOUNT_DEPARTURE_MAX_FRAMES: u32 = 300;
+
+/// Drive one authored get-off gallop per departing mount: enqueue `coff` from the mount's own
+/// model onto the scheduler spine (the same ActiveScheduler + Motion-stage dispatch every other
+/// routine runs on - buck `ch1?`, then `run?` with its authored two loops; census cited on
+/// [`crate::components::MountDeparting`], law in research/xim poc/game/event/ActorDismountEvent.kt),
+/// and hand the entity back to the sweep once the scheduler has no entry left. Retail also fades
+/// it over its last 12 frames (the ActorFadeOnCaster stage) - kuluu draws no per-actor fade, so
+/// it pops; recorded in lieu of an invented ramp.
+///
+/// Non-wasm only: the get-off plays off a live `FfxiRenderActor` model, and that module (and
+/// `scheduler_runtime::enqueue_routine`) is not compiled into the browser viewer at all.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn drive_mount_departure_system(
+    mut commands: Commands,
+    mut q_dep: Query<(Entity, &WorldEntity, &mut crate::components::MountDeparting)>,
+    actors: Query<&crate::ffxi_actor_render::FfxiRenderActor>,
+    scheds: Query<&crate::scheduler_runtime::ActiveSchedulers>,
+) {
+    for (bevy_e, we, mut dep) in q_dep.iter_mut() {
+        if dep.done {
+            continue;
+        }
+        dep.elapsed_frames += 1;
+        let Some(actor) = actors.iter().find(|a| a.world_id == we.id) else {
+            if dep.elapsed_frames > MOUNT_DEPARTURE_MAX_FRAMES {
+                tracing::warn!(
+                    target: "kuluu_render::scene",
+                    mount_id = we.id,
+                    elapsed_frames = dep.elapsed_frames,
+                    "departing mount's model never loaded; the sweep takes it back unread"
+                );
+                dep.done = true;
+            }
+            continue;
+        };
+        if !dep.started {
+            // Enqueue the mount's own get-off timeline. A loaded model without the routine has
+            // nothing to play: end it now rather than after the grace.
+            let lookup =
+                crate::scheduler_runtime::RoutineLookup::new().with_actor(actor.routines());
+            match crate::scheduler_runtime::ActiveScheduler::from_routine(
+                &lookup,
+                &ffxi_actor::actor_state::DISMOUNT_ROUTINE,
+            ) {
+                Some(active) => {
+                    // The same component set the special-pose arm gives a wire entity: the
+                    // Motion-stage dispatch resolves clip assets and a (self) target off these.
+                    tracing::info!(
+                        target: "kuluu_render::scene",
+                        mount_id = we.id,
+                        stages = active.stages.len(),
+                        end_frame = active.end_frame(),
+                        "departing mount's get-off routine enqueued"
+                    );
+                    crate::scheduler_runtime::enqueue_routine(
+                        &mut commands,
+                        bevy_e,
+                        active.with_target(Some(bevy_e)),
+                    );
+                    commands
+                        .entity(bevy_e)
+                        .try_insert_if_new(actor.action_assets().clone());
+                    dep.started = true;
+                }
+                None => {
+                    tracing::info!(
+                        target: "kuluu_render::scene",
+                        mount_id = we.id,
+                        "departing mount's model carries no get-off routine; ending now"
+                    );
+                    dep.done = true;
+                }
+            }
+            continue;
+        }
+        // Done when nothing runs the get-off any more: its stages (and their post-finish
+        // linger) have played out, which is where retail despawns the mount. Absent counts as
+        // finished - `tick_active_schedulers` strips the component with the last entry's TTL,
+        // so requiring the query to succeed would strand the entity behind its own sweep
+        // protection forever (the reported "stationary chocobo next to the rider"). The frame
+        // cap covers a scheduler wedged mid-routine, capping it from the started edge too.
+        let get_off_over = match scheds.get(bevy_e) {
+            Ok(s) => !s.is_running(ffxi_actor::actor_state::DISMOUNT_ROUTINE),
+            Err(_) => true,
+        };
+        if get_off_over || dep.elapsed_frames > MOUNT_DEPARTURE_MAX_FRAMES {
+            tracing::info!(
+                target: "kuluu_render::scene",
+                mount_id = we.id,
+                elapsed_frames = dep.elapsed_frames,
+                scheds_present = scheds.get(bevy_e).is_ok(),
+                capped = !get_off_over,
+                "departing mount's get-off ran out; the sweep takes it back"
+            );
+            dep.done = true;
         }
     }
 }
@@ -862,22 +1032,103 @@ pub fn ensure_self_render_pos_system(
     }
 }
 
+/// The self avatar's drawn height rides a visual follower toward the lerped
+/// physics Y with the same two-stage law the camera rig cascade uses (ease one
+/// half once per rendered update, then chase nought-point-two-five per movement
+/// tick - the same constants the chase rig cascade carries, cited from
+/// `FFXiMain.dll retail-2026-10` sites 0x1001F50F/0x1001F5D3; see
+/// kuluu/src/view_native/camera_collision.rs).
+/// Why this exists: physics commits a stair riser in one tick (record law - rises up to the
+/// follow word are accepted whole, collision record "Step up"), so without a drawn-side follower
+/// every tread arrives as a full-height pop: the avatar sawtooths, the camera pivots against that
+/// sawtooth, and walking stairs jackhammers the screen instead of sloping up it. Retail's own drawn
+/// feed is eased upstream (the mover commits through the state block its probe measurements feed,
+/// collision record "Terrain height and gravity, per frame"), while its committed/wired numbers stay
+/// stepped - this follower reproduces that separation at kuluu's render seam.
+/// The follower is kuluu-authored placement: physics, wire reports, and every collision query keep
+/// using the exact logical feet. It never moves XZ; it snaps-seeds on warps and bounds its lag to
+/// [`SELF_VISUAL_Y_MAX_LAG_YAMLS`], so a long fall cannot float the avatar further above its logical
+/// feet than that budget.
+const SELF_VISUAL_Y_EASE_ALPHA: f32 = 0.5;
+const SELF_VISUAL_Y_SPRING_ALPHA: f32 = 0.25;
+/// Movement-tick measure for the spring substeps - shared basis with the rig cascade.
+const SELF_VISUAL_Y_TICK_SECS: f32 = 1.0 / 60.0;
+/// Most the drawn height may trail its logical one (yalm). Riser-sized commits (the shipped stair
+/// class measures half a yalm, `kuluu-render/tests/mzb_shipped_step_classes.rs`) stay inside the
+/// budget and get the full slope; falls and landings self-limit to this float.
+const SELF_VISUAL_Y_MAX_LAG_YAMLS: f32 = 1.0;
+/// Spring substeps a single rendered frame may simulate, bounding catch-up after a pause or hitch -
+/// the same guard the rig cascade carries.
+const SELF_VISUAL_Y_MAX_SUBSTEPS: usize = 8;
+
+/// Render-seam state for the drawn-height follower (public because
+/// [`interpolate_self_transform_system`] carries it as a `Local`; its fields stay private).
+#[derive(Default)]
+pub struct SelfVisualY {
+    seeded: bool,
+    eased: f32,
+    sprung: f32,
+    carry_ticks: f32,
+}
+
+impl SelfVisualY {
+    /// One rendered update toward `target_y` (the overstep-lerped physics height).
+    fn advance(&mut self, target_y: f32, dt_secs: f32) -> f32 {
+        if !self.seeded || (target_y - self.sprung).abs() > SELF_VISUAL_Y_MAX_LAG_YAMLS * 4.0 {
+            // First frame and warps ride exact; a jump beyond four lag budgets cannot be a slope.
+            self.seeded = true;
+            self.eased = target_y;
+            self.sprung = target_y;
+            self.carry_ticks = 0.0;
+            return target_y;
+        }
+        self.eased += (target_y - self.eased) * SELF_VISUAL_Y_EASE_ALPHA;
+        // Fractional share, same fix the chase cascade carries: at any framerate above the tick rate
+        // an integer substep count fires spring on some frames and none on their neighbours, which is
+        // felt as the drawn body (and every nameplate hung off it) shivering along a flat run at full
+        // speed - USER 2026-10-28, "nameplates jitter on a flat surface while running". Whole tick
+        // counts are unchanged.
+        let elapsed = (self.carry_ticks + dt_secs / SELF_VISUAL_Y_TICK_SECS)
+            .clamp(0.0, SELF_VISUAL_Y_MAX_SUBSTEPS as f32);
+        let share = 1.0 - (1.0 - SELF_VISUAL_Y_SPRING_ALPHA).powf(elapsed);
+        self.sprung += (self.eased - self.sprung) * share;
+        self.carry_ticks = 0.0;
+        // Lag budget: never let the drawn height float further above (or sink below) its logical one
+        // than the cap, so falls track at physics rate past the first frames.
+        if (self.sprung - target_y).abs() > SELF_VISUAL_Y_MAX_LAG_YAMLS {
+            self.sprung =
+                target_y + SELF_VISUAL_Y_MAX_LAG_YAMLS * (target_y - self.sprung).signum();
+            self.eased = self.eased.clamp(target_y - 2.0, target_y + 2.0);
+        }
+        if (self.sprung - target_y).abs() < 1e-4 {
+            // Settled: no asymptotic crawl left to accumulate.
+            self.sprung = target_y;
+            self.eased = target_y;
+        }
+        self.sprung
+    }
+}
+
 /// Runs every rendered frame in `RunFixedMainLoopSystems::AfterFixedMainLoop`.
 /// Lerps the visual Transform between the last two authoritative render
 /// positions (produced by `apply_self_prediction_system` at 60Hz) using the
-/// fixed-timestep overstep fraction. This decouples the visible character
-/// motion from the fixed-tick cadence so the chase camera, which reads
-/// Transform every render frame, does not see stair-step Y jitter as the
-/// display frame rate races ahead of FixedUpdate.
+/// fixed-timestep overstep fraction, then rides the drawn height through the
+/// [`SelfVisualY`] follower - XZ stays exact, only Y is followed. This decouples
+/// the visible character motion from the fixed-tick cadence and slopes stair
+/// risers into view instead of popping them at the logical commit.
 pub fn interpolate_self_transform_system(
     fixed_time: Res<Time<Fixed>>,
+    time: Res<Time>,
+    mut visual_y: Local<SelfVisualY>,
     mut q: Query<(&mut Transform, &PrevRenderPos, &CurrRenderPos), With<IsSelf>>,
 ) {
     let Ok((mut t, prev, curr)) = q.single_mut() else {
         return;
     };
     let alpha = fixed_time.overstep_fraction();
-    t.translation = prev.0.lerp(curr.0, alpha);
+    let lerped = prev.0.lerp(curr.0, alpha);
+    let y = visual_y.advance(lerped.y, time.delta_secs());
+    t.translation = Vec3::new(lerped.x, y, lerped.z);
 }
 
 #[derive(Resource, Default, Debug, Clone)]
@@ -947,6 +1198,132 @@ pub fn process_entity_look_changes(q_changed: Query<(&WorldEntity, &LookComp), C
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Drive the follower at a fixed render dt until it settles or `frames` elapse; return every
+    /// produced drawn height, first to last.
+    fn drive(mut vis: SelfVisualY, targets: &[f32], dt: f32) -> (SelfVisualY, Vec<f32>) {
+        let mut out = Vec::with_capacity(targets.len());
+        for &t in targets {
+            let y = vis.advance(t, dt);
+            out.push(y);
+        }
+        (vis, out)
+    }
+
+    #[test]
+    fn a_riser_commit_reaches_drawn_height_sloped_not_whole() {
+        // The regression this fixes: physics commits a half-yalm riser in one tick (the shipped stair
+        // class), and the pre-follower transform took the full 0.5 yalm in a single rendered frame -
+        // the avatar sawtoothed and the camera jackhammered. Drawn height must arrive as a slope.
+        let dt = 1.0 / 60.0;
+        let (mut vis, flat) = drive(SelfVisualY::default(), &[0.0; 8], dt);
+        assert!(flat.iter().all(|&y| y == 0.0), "warm-up drifted: {flat:?}");
+        // One commit of +0.5 yalm, then hold (a walker standing on the new tread).
+        let targets = vec![0.5; 35];
+        let mut prev_y = 0.0;
+        let mut max_step = 0.0f32;
+        for t in &targets {
+            let y = vis.advance(*t, dt);
+            max_step = max_step.max(y - prev_y);
+            assert!(
+                y >= prev_y - 1e-6,
+                "drawn height dipped mid-climb: {y} < {prev_y}"
+            );
+            prev_y = y;
+        }
+        assert!(
+            max_step <= SELF_VISUAL_Y_MAX_LAG_YAMLS * 0.4,
+            "a single rendered frame carried {max_step} yalm - riser popped, not sloped"
+        );
+        // Settles onto the tread (never overshoots above it) within a few tenths of a second.
+        assert!(
+            (prev_y - 0.5).abs() < 1e-3,
+            "drawn height never reached the tread: {prev_y}"
+        );
+    }
+
+    /// The follower is frame-rate honest: one second of wall clock over a riser commit lands on the
+    /// same drawn height whether it is rendered at 30, 60 or 144 Hz, and no frame in the middle of the
+    /// climb stands still while most of the riser is still to go. The former integer substep count did
+    /// exactly that above 60 Hz - which is how a plate hanging off the drawn body came to shiver along a
+    /// flat run (USER 2026-10-28: "nameplates jitter on a flat surface while running").
+    #[test]
+    fn visual_y_follower_is_frame_rate_honest_across_refresh_rates() {
+        let mut ends = Vec::new();
+        for fps in [30.0f32, 60.0, 144.0] {
+            let dt = 1.0 / fps;
+            let mut vis = SelfVisualY::default();
+            assert_eq!(vis.advance(0.0, dt), 0.0);
+            let mut prev = 0.0f32;
+            let mut stalled_while_climbing = 0usize;
+            let mut climbing_frames = 0usize;
+            for _ in 0..(fps as usize) {
+                let y = vis.advance(0.5, dt);
+                if 0.5 - prev > 0.25 * 0.5 && y <= prev + 1e-9 {
+                    stalled_while_climbing += 1;
+                }
+                climbing_frames += 1;
+                assert!(
+                    y >= prev - 1e-6,
+                    "drawn height dipped mid-climb at {fps} fps"
+                );
+                prev = y;
+            }
+            println!(
+                "DIAG visual_y {fps:>5.0} fps after 1 s: drawn {:.9}, stalled frames while climbing {stalled_while_climbing}/{climbing_frames}",
+                prev
+            );
+            assert_eq!(
+                stalled_while_climbing, 0,
+                "{fps} fps follower stood still on {stalled_while_climbing} of {climbing_frames} frames mid-riser"
+            );
+            ends.push(prev);
+        }
+        let spread = ends
+            .iter()
+            .fold(0.0f32, |acc, v| acc.max((v - ends[0]).abs()));
+        println!("DIAG visual_y endpoint spread across 30/60/144 fps: {spread:.3e}");
+        assert!(
+            spread < 1e-2,
+            "refresh rates disagree about the drawn height: {ends:?}"
+        );
+    }
+
+    #[test]
+    fn visual_y_lag_stays_bounded_during_a_long_fall() {
+        // A fall commits -1.04 yalm per movement tick (the recorded fall step at the 0.8 rescale).
+        // The follower may slope the first frames but must then track: the drawn height never floats
+        // more than the lag budget above its logical one.
+        let dt = 1.0 / 60.0;
+        let mut vis = SelfVisualY::default();
+        vis.advance(0.0, dt);
+        for i in 1..=90 {
+            let target = -(i as f32) * 1.04;
+            let y = vis.advance(target, dt);
+            assert!(
+                (y - target).abs() <= SELF_VISUAL_Y_MAX_LAG_YAMLS + 1e-5,
+                "tick {i}: drawn {y} left logical {target} by more than the lag budget"
+            );
+        }
+    }
+
+    #[test]
+    fn a_warp_seeds_exact_and_risers_still_slope_afterwards() {
+        let dt = 1.0 / 60.0;
+        let mut vis = SelfVisualY::default();
+        assert_eq!(vis.advance(0.0, dt), 0.0);
+        assert_eq!(
+            vis.advance(40.0, dt),
+            40.0,
+            "a warp beyond four lag budgets must ride exact"
+        );
+        let mut prev_y = 40.0;
+        for _ in 0..25 {
+            let y = vis.advance(40.5, dt);
+            assert!(y - prev_y <= SELF_VISUAL_Y_MAX_LAG_YAMLS * 0.4);
+            prev_y = y;
+        }
+    }
 
     #[test]
     fn entity_sync_preserves_first_person_self_visibility() {
@@ -1021,6 +1398,28 @@ mod tests {
             assert_ne!(mount, rider);
             assert_eq!(mount_actor_rider(mount), Some(rider));
         }
+    }
+
+    #[test]
+    fn furniture_actor_ids_stay_clear_of_server_and_mount_ids() {
+        const SERVER_ID_TYPE_SHIFT: u32 = 28;
+        const SERVER_ID_ZONE_SHIFT: u32 = 12;
+        const SERVER_ID_MAX_TYPE: u32 = 4;
+        const SERVER_ID_MAX_ZONE: u32 = 0xFFFF;
+        const SERVER_ID_MAX_TARGID: u32 = 0xFFF;
+        let max_server_id = (SERVER_ID_MAX_TYPE << SERVER_ID_TYPE_SHIFT)
+            | (SERVER_ID_MAX_ZONE << SERVER_ID_ZONE_SHIFT)
+            | SERVER_ID_MAX_TARGID;
+        assert!(FURNITURE_ACTOR_IDS.start > max_server_id);
+        assert!(!is_furniture_actor_id(max_server_id));
+        let last_seat = 2 * ffxi_dat::furniture::SEATS_PER_SHELF;
+        for seat in [0, last_seat] {
+            let id = furniture_actor_id(seat);
+            assert!(is_furniture_actor_id(id));
+            assert_eq!(mount_actor_rider(id), None);
+        }
+        let mounted = mount_actor_id(furniture_actor_id(0));
+        assert!(!is_furniture_actor_id(mounted));
     }
 
     fn dummy_materials() -> EntityMaterials {
@@ -1540,5 +1939,153 @@ mod tests {
             char_flags: Default::default(),
             monstrosity: false,
         }
+    }
+
+    /// The reported "stationary chocobo next to the rider": `tick_active_schedulers` strips
+    /// `(ActiveSchedulers, ActionAssets, ActionTarget)` with the last entry's TTL, and the old
+    /// done-test demanded that query succeed - a retired get-off therefore stranded the entity
+    // behind its own sweep protection forever. Absence now counts as finished.
+    #[test]
+    fn a_departing_mount_is_handed_back_when_its_get_off_retired() {
+        let mut app = App::new();
+        app.add_message::<crate::scheduler_runtime::SchedulerStageEvent>();
+        app.add_message::<crate::scheduler_runtime::CutsceneMotionDone>();
+        app.init_resource::<Time>();
+        app.add_systems(
+            Update,
+            (
+                crate::scheduler_runtime::tick_active_schedulers,
+                drive_mount_departure_system,
+            )
+                .chain(),
+        );
+
+        let sched = ffxi_dat::scheduler::Scheduler {
+            name: *b"coff",
+            stages: Vec::new(),
+        };
+        let mut active = crate::scheduler_runtime::ActiveScheduler::from_scheduler(&sched);
+        // Past the authored end and the post-finish TTL: the very next tick retires the
+        // entry and strips the component with it.
+        active.elapsed = 60.0;
+
+        let mount_id = mount_actor_id(7);
+        let mount = app
+            .world_mut()
+            .spawn((
+                crate::components::InGameEntity,
+                WorldEntity {
+                    id: mount_id,
+                    act_index: 12,
+                    kind: EntityKind::Pet,
+                },
+                Transform::default(),
+                crate::ffxi_actor_render::render_actor_stub(mount_id),
+                crate::components::MountDeparting {
+                    started: true,
+                    elapsed_frames: 30,
+                    done: false,
+                },
+                crate::scheduler_runtime::ActiveSchedulers::one(active),
+            ))
+            .id();
+
+        // One update lets the tick retire the entry; the commands stripping the component
+        // apply before `drive_mount_departure_system` runs behind it.
+        app.update();
+        assert!(
+            !app.world()
+                .entity(mount)
+                .contains::<crate::scheduler_runtime::ActiveSchedulers>(),
+            "the retired get-off strips its scheduler component",
+        );
+        let dep = app.world().get::<crate::components::MountDeparting>(mount).expect("departure marker survives the tick that retires the routine - the sweep exemption reads it");
+        assert!(dep.done, "a retired get-off must hand the departing mount back to the sweep (the stationary-chocobo bug)");
+    }
+
+    /// A get-off wedged mid-routine cannot outlive the frame cap either: with a running
+    /// `coff` entry still listed and the departure clock past the ceiling, the entity is
+    // released anyway.
+    #[test]
+    fn a_wedged_get_off_hits_the_departure_frame_cap() {
+        let mut app = App::new();
+        app.add_message::<crate::scheduler_runtime::SchedulerStageEvent>();
+        app.add_message::<crate::scheduler_runtime::CutsceneMotionDone>();
+        app.init_resource::<Time>();
+        app.add_systems(
+            Update,
+            (
+                crate::scheduler_runtime::tick_active_schedulers,
+                drive_mount_departure_system,
+            )
+                .chain(),
+        );
+
+        let sched = ffxi_dat::scheduler::Scheduler {
+            name: *b"coff",
+            // A stage authored far past the routine's start: `tick_active_schedulers` can
+            // never retire it, so only `MOUNT_DEPARTURE_MAX_FRAMES` can. Full payload per
+            // scheduler_runtime's own test constructor (an argument-less Unknown kind fires
+            // nothing on the way there).
+            stages: vec![ffxi_dat::scheduler::TimedStage {
+                frame: u32::MAX / 2,
+                stage: ffxi_dat::scheduler::SchedulerStage {
+                    animation_mode: None,
+                    hand: None,
+                    kind: ffxi_dat::scheduler::StageKind::Unknown,
+                    raw_type: 0,
+                    stage_words: ffxi_dat::scheduler::SYNTHESIZED_STAGE_WORDS,
+                    delay_frames: 0,
+                    duration_frames: 0,
+                    id: [0; 4],
+                    max_loops: 0,
+                    transition_in: 0,
+                    transition_out: 0,
+                    random_group: None,
+                    local_dir: ffxi_dat::scheduler::NO_LOCAL_DIR,
+                    model_transform: None,
+                    follow_points: None,
+                    screen_color: None,
+                    actor_fade: None,
+                    idle_transition_time: None,
+                    flinch_duration: None,
+                    model_visibility: None,
+                    actor_rotation: None,
+                    turn_toward_step_degrees: None,
+                    spell_effect: None,
+                    sound_range: None,
+                    control_flow: None,
+                },
+            }],
+        };
+        let active = crate::scheduler_runtime::ActiveScheduler::from_scheduler(&sched);
+
+        let mount_id = mount_actor_id(8);
+        let mount = app
+            .world_mut()
+            .spawn((
+                crate::components::InGameEntity,
+                WorldEntity {
+                    id: mount_id,
+                    act_index: 12,
+                    kind: EntityKind::Pet,
+                },
+                Transform::default(),
+                crate::ffxi_actor_render::render_actor_stub(mount_id),
+                crate::components::MountDeparting {
+                    started: true,
+                    elapsed_frames: MOUNT_DEPARTURE_MAX_FRAMES + 1,
+                    done: false,
+                },
+                crate::scheduler_runtime::ActiveSchedulers::one(active),
+            ))
+            .id();
+
+        app.update();
+        let dep = app
+            .world()
+            .get::<crate::components::MountDeparting>(mount)
+            .expect("entity survives to be capped, not swept blind");
+        assert!(dep.done, "the frame cap releases a wedged get-off");
     }
 }

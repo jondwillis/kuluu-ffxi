@@ -389,6 +389,12 @@ pub struct NetStats {
 /// See ffxi_proto::decode::CliStatus.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CharStatsRaw {
+    /// CLISTATUS exp_now/exp_next (s2c 0x061), fed to the `level` box under
+    /// the persona panel.
+    #[serde(default)]
+    pub exp_now: i16,
+    #[serde(default)]
+    pub exp_next: i16,
     pub hp_max: u32,
     pub mp_max: u32,
     pub bp_base: [u16; 7],
@@ -397,6 +403,48 @@ pub struct CharStatsRaw {
     pub defense: u16,
     pub resist: [i16; 8],
     pub ilvl: u8,
+    /// `su_lv` (s2c 0x061 CLISTATUS su_lv) — superior level.
+    #[serde(default)]
+    pub su_lv: u8,
+    /// bit 0 of s2c 0x061 `mastery_info.flags` — master-level play unlocked
+    /// (gates the Status window's Master Levels row together with a level-99 main
+    /// job; FFXiMain.dll retail-2026-09 `.text 0x148B20`).
+    #[serde(default)]
+    pub master_level_unlocked: bool,
+    /// s2c 0x061 packet +0x60 — the per-slot equip-block mask the fifth CanEquip test
+    /// intersects record slot masks against (FFXiMain.dll retail-2026-09 `.text 0xFD350`,
+    /// stored to game state `+0x40DF0` at `.text 0xF0982`; refusal at `.text 0x132111`).
+    #[serde(default)]
+    pub equip_slot_block: u32,
+    /// CLISTATUS `mjob_no` and the Unity fields `unity_info.Faction` / `unity_info.Points` /
+    /// `unity_points1` / `unity_points2` (vendor/server/src/map/packets/s2c/0x061_clistatus.h).
+    #[serde(default)]
+    pub mjob_no: u8,
+    #[serde(default)]
+    pub unity_faction: u8,
+    #[serde(default)]
+    pub unity_points: u32,
+    #[serde(default)]
+    pub unity_points1: u16,
+    #[serde(default)]
+    pub unity_points2: u16,
+    /// CLISTATUS `mjob_lv`.
+    #[serde(default)]
+    pub mjob_lv: u8,
+    /// CLISTATUS `designation` (title id), `rank`/`rankbar` (conquest rank and its bar),
+    /// `BindZoneNo` (home-point zone) and `nation` — the allegiance block of the Status Profile
+    /// window, all from the same packet.
+    #[serde(default)]
+    pub title_id: u16,
+    #[serde(default)]
+    pub conquest_rank: u16,
+    #[serde(default)]
+    pub conquest_rank_bar: u16,
+    #[serde(default)]
+    pub home_point_zone: u16,
+    /// 0 San d'Oria, 1 Bastok, 2 Windurst.
+    #[serde(default)]
+    pub nation: u8,
 }
 
 /// s2c 0x00A myroom cluster; present only while inside a Mog House. `model`
@@ -407,6 +455,14 @@ pub struct MyRoomInfo {
     pub model: u16,
     pub sub_map: u8,
     pub exit_bit: u8,
+    /// Client-owned "the door is open to visitors" byte. Retail reads/writes game-state
+    /// `+0x40C40` (getter FFXiMain.dll retail-2026-09 `.text 0xF96E0`, sole writer `.text 0xF9740`
+    /// from the s2c 0x067 entity update); LSB implements neither MYROOM_IS Kind and ships no 0x067,
+    /// so this client keeps the byte. Every fresh myroom cluster rebuilds it as closed, which is
+    /// exactly LSB's stated reset law (zoning / floor change)
+    /// (vendor/server/src/map/packets/c2s/0x0cb_myroom_is.cpp).
+    #[serde(default)]
+    pub door_open: bool,
 }
 
 /// s2c 0x01B JOB_INFO; `job_levels` is indexed by JOBTYPE and `unlocked` bit 0
@@ -419,6 +475,14 @@ pub struct JobInfoState {
     pub unlocked: u32,
     pub sub_job_unlocked: bool,
     pub job_levels: [u8; ffxi_proto::decode::JobInfo::MAX_JOBTYPE],
+    /// The packet tail past the dancer block: the ranks behind the Status Profile window's
+    /// `Mastery Rank:` row and `Mentor:` marker, plus the thumbs-up permission bit.
+    #[serde(default)]
+    pub can_thumbs_up_mentor: bool,
+    #[serde(default)]
+    pub mentor_rank: u8,
+    #[serde(default)]
+    pub mastery_rank: u8,
 }
 
 impl From<ffxi_proto::decode::JobInfo> for JobInfoState {
@@ -429,6 +493,9 @@ impl From<ffxi_proto::decode::JobInfo> for JobInfoState {
             unlocked: j.unlocked,
             sub_job_unlocked: j.sub_job_unlocked,
             job_levels: j.job_levels,
+            can_thumbs_up_mentor: j.can_thumbs_up_mentor,
+            mentor_rank: j.mentor_rank,
+            mastery_rank: j.mastery_rank,
         }
     }
 }
@@ -468,6 +535,14 @@ pub struct SessionState {
     pub pending_entity_removals: HashSet<u32>,
 
     pub party: Vec<PartyMember>,
+
+    /// An incoming party/alliance invite (s2c 0x0DC GROUP_SOLICIT_REQ) not yet
+    /// answered with c2s GROUP_SOLICIT_RES (0x074). The Party-row helper in the
+    /// retail client reads exactly this pending state to open `prtyjoin` (YES/NO)
+    /// instead of a roster window — FFXiMain.dll retail-2026-09 RVA 0x2016E0,
+    /// vault main_menu.md section 24.
+    #[serde(default)]
+    pub party_invite: Option<PartyInvite>,
 
     /// Monotonically increasing counter, bumped on every `ZoneChanged`. The
     /// renderer's party-frame content key includes this so a zone transition
@@ -531,11 +606,135 @@ pub struct SessionState {
     #[serde(default)]
     pub death_homepoint_secs: Option<u32>,
 
+    /// Newest 0x00A LOGIN `PlayTime` and its arrival instant (retail's pair —
+    /// see [`PlayTimeBase`]). Not cleared on a zone change: retail keeps the last
+    /// value it was given, and every zone-in replaces it anyway.
+    #[serde(default)]
+    pub play_time_base: Option<PlayTimeBase>,
+
+    /// The newest s2c 0x062 CLISTATUS2 skill block — the only source for the Status
+    /// window's Combat/Magic/Craft rows and for enabling those rows at all.
+    #[serde(default)]
+    pub char_skills: Option<kuluu_snapshot::CharSkills>,
+
+    /// The newest s2c 0x063 MISCDATA **Merits** record — gates the Status Merit Points row and
+    /// feeds its readout (bead kuluu-o9qt7.43; retail's store law at FFXiMain.dll retail-2026-09
+    /// .data 0x485826/0x48582A + flag bit1, dispatcher `.text 0x99270`).
+    #[serde(default)]
+    pub merits: Option<kuluu_snapshot::MisdataMerits>,
+
+    /// The Unity ranking tables (s2c 0x063 type 7) and the s2c 0x110 request mark
+    /// (.agents/skills/retail-observe/references/2026-10-15-unity-and-fp-windows.md).
+    #[serde(default)]
+    pub unity: kuluu_snapshot::UnityState,
+
+    /// The last s2c 0x08E alter ego points block; `None` until one arrives this session.
+    #[serde(default)]
+    pub alter_ego_points: Option<kuluu_snapshot::AlterEgoPoints>,
+
+    /// An s2c 0x119 has arrived this session (the Status data is ready); never cleared.
+    #[serde(default)]
+    pub status_data_ready: bool,
+
+    /// s2c 0x00A `LoginState` and `IsMonstrosity` at the last zone-in
+    /// (vendor/server/src/map/packets/s2c/0x00a_login.h).
+    #[serde(default)]
+    pub login_state: u32,
+    #[serde(default)]
+    pub login_is_monstrosity: bool,
+
+    /// The merits s2c 0x08C stored, keyed by merit index, the job point type state s2c 0x08D
+    /// stored by type id, whether any s2c 0x08D arrived this session, and the last s2c 0x063
+    /// JobPoints record (.agents/skills/retail-observe/references/2026-10-15-merit-and-job-point-windows.md).
+    #[serde(default)]
+    pub merit_entries: std::collections::BTreeMap<u16, kuluu_snapshot::MeritEntry>,
+    #[serde(default)]
+    pub job_point_types: std::collections::BTreeMap<u16, kuluu_snapshot::JobPointType>,
+    #[serde(default)]
+    pub job_points_received: bool,
+    #[serde(default)]
+    pub job_points: Option<kuluu_snapshot::JobPointsRecord>,
+
+    /// The last s2c 0x063 MISCDATA subtype Homepoints record — retail stores its 64-byte mask
+    /// block at .data FFXiMain.dll retail-2026-09 0x4858C4 and raises the received flag there
+    /// (dispatcher `.text 0x99270`, arm `.text 0x99330`; vault main_menu.md §59 addendum 37).
+    #[serde(default)]
+    pub homepoints: Option<kuluu_snapshot::HomepointMasks>,
+
     /// Server-offered alternative to returning home while dead (s2c 0x0F9,
     /// vendor/server/src/map/packets/s2c/0x0f9_res.cpp).
     /// `None` is the ordinary home-point-only menu.
     #[serde(default)]
     pub death_menu_offer: Option<ffxi_proto::decode::DeathMenuOffer>,
+
+    /// The live player trade (s2c 0x021/0x022/0x023/0x025 + our own send/open
+    /// transitions; vendor/server/src/map/items/transactions/player_trade.cpp,
+    /// vault main_menu.md §25). One at a time — LSB allows exactly one active
+    /// transaction per player.
+    #[serde(default)]
+    pub trade: Option<Box<kuluu_snapshot::TradeWindow>>,
+
+    /// Last completed player search (the `scresult` model singleton in retail;
+    /// vault main_menu.md §26). Held until the next query replaces it — retail
+    /// keeps the rows visible while you edit the form.
+    #[serde(default)]
+    pub search: Option<Box<kuluu_snapshot::SearchResults>>,
+
+    /// Both link-shell slots as s2c 0x0E0 last reported them (the `link5`/`lscswin` family's data;
+    /// vault main_menu.md §27). LSB pushes both slots at login and again after every
+    /// equip/unequip/create, so they are never unknown for long once we are in world.
+    #[serde(default)]
+    pub linkshells: kuluu_snapshot::LinkShells,
+
+    /// The last s2c 0x06F answer to our synthesis ask (vault main_menu.md §28).
+    #[serde(default)]
+    pub synth_result: Option<kuluu_snapshot::SynthOutcome>,
+    /// The last s2c 0x056 battery fold (vault main_menu.md §30).
+    pub missions: kuluu_snapshot::Missions,
+
+    /// Automaton record from the newest s2c 0x044 EXTENDED_JOB PUP frame — the
+    /// pupequip Equipment-row variant's whole data source (vault main_menu.md
+    /// §39; vendor/server/src/map/utils/charutils.cpp SendExtendedJobPackets).
+    #[serde(default)]
+    pub automaton: Option<Box<kuluu_snapshot::AutomatonInfo>>,
+
+    /// Monstrosity record from the newest s2c 0x044 EXTENDED_JOB MON frame —
+    /// present exactly while in a monstrosity session, kuluu's stand for the
+    /// DLL Monstrosity predicate on the Equipment row (vault main_menu.md §39).
+    #[serde(default)]
+    pub monstrosity: Option<kuluu_snapshot::MonstrosityInfo>,
+
+    /// The client-local macro store behind the mcrmenu family — retail keeps no
+    /// server copy (vault main_menu.md §34 wire law) and kuluu's capacity comes
+    /// from the DAT grids: 2 blocks x 20 slots (vault main_menu.md §41). Filled
+    /// slots only; the editor that mutates this is still open-map on bead .19.1.
+    #[serde(default)]
+    pub macros: Vec<kuluu_snapshot::MacroSlot>,
+
+    /// The player's arranged emote display order (bead kuluu-o9qt7.34) — the
+    /// client-local `emote_order.json` blob for this character, loaded at world
+    /// entry and rewritten by the swap law when `abisortw` drives it. Never on
+    /// the wire (LSB ships no emote-order packet [V-negative]); retail reads its
+    /// own user file at fill time FFXiMain.dll retail-2026-09 `.text 0x2259C6`.
+    #[serde(default)]
+    pub emote_order: Vec<u8>,
+
+    /// Raw bodies of the last s2c 0x113/0x118 currency reports (bead kuluu-o9qt7.35) — kept
+    /// undecoded so the client getter law in `kuluu_render::hud::currency_law` reads them the
+    /// way FFXiMain.dll does (vault main_menu.md §59 addendum 27). Nothing is cached beyond
+    /// these: every Currencies-window open re-sends the header-only c2s request, and each
+    /// reply replaces its block wholesale (`.text 0x99640`/`.text 0x99660` one-shot fold).
+    #[serde(default)]
+    pub currencies_1: Option<Vec<u8>>,
+    #[serde(default)]
+    pub currencies_2: Option<Vec<u8>>,
+
+    /// The four SAVE_CONF bitfield bytes from the newest s2c 0x0B4 CONFIG
+    /// (vendor/server/src/common/mmo.h; vault main_menu.md §42). LSB echoes a
+    /// fresh copy after every c2s CONFIG, so optimistic kuluu toggles reconcile
+    /// without extra bookkeeping.
+    #[serde(default)]
+    pub config_confdata: Option<[u8; 4]>,
 
     #[serde(default)]
     pub current_weather: Option<u16>,
@@ -601,6 +800,14 @@ pub struct SessionState {
 
     #[serde(default)]
     pub myroom: Option<MyRoomInfo>,
+
+    /// Which Mog House arrangement mode this client is in — the analogue of the myroom manager's own mode
+    /// word (+0x1C) that the retail mode switch reads back (FFXiMain.dll retail-2026-09 `.text 0x1D34FA`).
+    /// Values are the `MODE_*` constants of [`crate::myroom_layout`]; 0 means nothing is being arranged.
+    /// The session actor owns the decision and mirrors every accepted change through
+    /// [`AgentEvent::MyroomModeChanged`], so this fold copy cannot drift from it.
+    #[serde(default)]
+    pub myroom_mode: u8,
 
     /// `SubMapNumber` the server reported in 0x00A LOGIN
     /// (`PChar->loc.boundary`): which sub-area interior the character is
@@ -936,6 +1143,34 @@ pub struct EquippedRef {
 
 fn default_equipment() -> [Option<EquippedRef>; EQUIPMENT_SLOTS] {
     [None; EQUIPMENT_SLOTS]
+}
+
+/// Whole milliseconds in a second — the divisor retail's `/playtime` sum uses.
+pub const MS_PER_SECOND: u64 = 1_000;
+
+/// The play-time pair retail keeps for the character: the `PlayTime` seconds the
+/// server last reported, and when that report arrived. Retail stores exactly this
+/// pair — the packet's u32 plus a clock stamp fetched immediately after it
+/// (FFXiMain.dll retail-2026-09 RVA 0xFB3EE reads `[packet+0xA0]` into
+/// `[state+0x2d67c]`, then `.text 0xFB3FA` stores the `call 0x1039E0` clock next to it)
+/// and sums base + elapsed at `/playtime` (handler RVA 0x7CAB0).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct PlayTimeBase {
+    /// `PlayTime` — seconds counted by the server as of that zone-in.
+    pub base_secs: u32,
+
+    /// [`process_monotonic_ms`] reading at the moment that 0x00A arrived.
+    pub arrival_ms: u64,
+}
+
+impl PlayTimeBase {
+    /// Base plus whole seconds elapsed since arrival, exactly as retail sums it
+    /// (FFXiMain.dll retail-2026-09 RVA 0x7CAB0 calls the clock helper
+    /// `.text 0xFC770` and adds the stored base).
+    pub fn seconds_at(&self, now_ms: u64) -> u64 {
+        let elapsed = now_ms.saturating_sub(self.arrival_ms) / MS_PER_SECOND;
+        u64::from(self.base_secs).saturating_add(elapsed)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -1275,6 +1510,14 @@ pub struct ItemSlot {
     pub use_delay_end_vana_ts: Option<u32>,
     #[serde(default)]
     pub ready: Option<bool>,
+
+    /// The record's 24-byte Attr, verbatim as s2c 0x020 carried it — retail keeps the whole thing on
+    /// its inventory record (the record is 44 bytes with Attr at `+0x10`, FFXiMain.dll retail-2026-09
+    /// `.text 0xEC630`) because several unrelated subsystems read different parts of it: charged
+    /// items above, and the Mog House furniture layer/pose bytes
+    /// (see [`crate::myroom_furniture`]). `None` when no Attr record has been seen for this slot yet.
+    #[serde(default)]
+    pub extdata: Option<[u8; 24]>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1518,6 +1761,19 @@ pub struct NameExtractionMiss {
 
 const NAME_MISSES_CAP: usize = 64;
 
+/// Pending invite carried from s2c 0x0DC
+/// (vendor/server/src/map/packets/s2c/0x0dc_group_solicit_req.h) to the snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartyInvite {
+    /// Inviter's char id (`UniqueNo`).
+    pub char_id: u32,
+    /// Inviter's display name (`sName`).
+    pub name: String,
+    /// Kind == PartyKind::Alliance (5) rather than Party (0).
+    #[serde(default)]
+    pub alliance: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PartyMember {
     pub id: u32,
@@ -1571,6 +1827,14 @@ impl SessionState {
     /// we are on it, and it is the field every observer sees too.
     pub fn self_mounted(&self) -> bool {
         ffxi_proto::decode::animation::is_mounted(self.self_server_status)
+    }
+
+    /// Play time to report now: the stored base plus seconds elapsed since that
+    /// 0x00A arrived, or 0 while no LOGIN has carried `PlayTime`.
+    pub fn play_time_seconds(&self) -> u64 {
+        self.play_time_base
+            .map(|b| b.seconds_at(process_monotonic_ms()))
+            .unwrap_or(0)
     }
 
     pub fn self_position(&self) -> Option<Position> {
@@ -1634,6 +1898,19 @@ impl SessionState {
                 self.char_id = Some(*char_id);
                 self.character = Some(character.clone());
                 self.zone_id = Some(*zone_id);
+                true
+            }
+            // The client-local macro store (bead kuluu-o9qt7.19.2): nothing on
+            // the wire ever carries macros (vault main_menu.md §41), so this is
+            // the only way they enter folded state.
+            AgentEvent::MacrosLoaded { slots } => {
+                self.macros = slots.clone();
+                true
+            }
+            // The emote display order enters the same way (bead kuluu-o9qt7.34):
+            // loaded at world entry or echoed after a commit, wholesale.
+            AgentEvent::EmoteOrderLoaded { ids } => {
+                self.emote_order = ids.clone();
                 true
             }
             AgentEvent::StageChanged { stage } => {
@@ -2020,6 +2297,145 @@ impl SessionState {
                 }
                 before != self.party
             }
+            AgentEvent::PartySolicitReceived {
+                char_id,
+                name,
+                alliance,
+            } => {
+                // s2c 0x0DC: retail parks the invite on static party state and
+                // (re)opens `prtyjoin` when its Party-row helper runs; we stamp
+                // it here so the snapshot carries it the same way `party` does.
+                let next = Some(PartyInvite {
+                    char_id: *char_id,
+                    name: name.clone(),
+                    alliance: *alliance,
+                });
+                let changed = self.party_invite != next;
+                self.party_invite = next;
+                changed
+            }
+            AgentEvent::PartySolicitWithdrawn => {
+                // s2c 0x0DE GROUP_SOLICIT_NO: drop the pending invite (the retail
+                // helper's `alarm`-close pairing, vault main_menu.md section 24).
+                let had = self.party_invite.is_some();
+                self.party_invite = None;
+                had
+            }
+            AgentEvent::TradeIncoming { char_id } => {
+                // s2c 0x021: we are the invited side. Retail answers through its
+                // own trade window's rows (vault main_menu.md section 25); ours
+                // opens with answer rows via incoming_pending.
+                let fresh = kuluu_snapshot::TradeWindow {
+                    partner_id: *char_id,
+                    incoming_pending: true,
+                    active: false,
+                    my_slots: Vec::new(),
+                    partner_slots: Vec::new(),
+                    my_confirmed: false,
+                    partner_confirmed: false,
+                };
+                let next = Some(Box::new(fresh));
+                let changed = self.trade != next;
+                self.trade = next;
+                changed
+            }
+            AgentEvent::TradeOutgoingOpened { char_id } => {
+                // Our own TRADE_REQ went out: retail opens its windows on send
+                // (helper 0x13FE70's success path, vault main_menu.md section 25).
+                if self
+                    .trade
+                    .as_ref()
+                    .is_some_and(|w| w.partner_id == *char_id && !w.incoming_pending)
+                {
+                    return false;
+                }
+                self.trade = Some(Box::new(kuluu_snapshot::TradeWindow::outgoing(*char_id)));
+                true
+            }
+            AgentEvent::TradeRes { kind } => {
+                // s2c 0x022: Start opens both windows once the target accepted;
+                // every terminal kind (Cancell/End/Err*) closes ours — LSB keeps
+                // at most one transaction per player, so no partner-matching is
+                // needed to clear it safely.
+                use ffxi_proto::decode::TradeResKind as K;
+                match kind {
+                    // Start means the transaction exists now, whichever phase our
+                    // window was in (invited-and-accepted, or our own request).
+                    K::Start => match self.trade.as_mut() {
+                        Some(w) => {
+                            let already = w.active && !w.incoming_pending;
+                            w.incoming_pending = false;
+                            w.active = true;
+                            !already
+                        }
+                        None => {
+                            // A Start with no window — the 0x21/0x32 race we never
+                            // saw: open active against the packet's sender.
+                            self.trade = Some(Box::new(kuluu_snapshot::TradeWindow {
+                                partner_id: 0,
+                                incoming_pending: false,
+                                active: true,
+                                my_slots: Vec::new(),
+                                partner_slots: Vec::new(),
+                                my_confirmed: false,
+                                partner_confirmed: false,
+                            }));
+                            true
+                        }
+                    },
+                    _ => {
+                        let had = self.trade.is_some();
+                        self.trade = None;
+                        had
+                    }
+                }
+            }
+            AgentEvent::TradeMySlotSet { trade_index, offer } => {
+                // s2c 0x025 echo of our staging. Any slot mutation also un-confirms
+                // both sides (player_trade.cpp setSlot clears `accepted` for both).
+                let Some(w) = self.trade.as_mut() else {
+                    // With no transaction open the views describe a partner we
+                    // already walked away from — drop them (LSB allows exactly
+                    // one PlayerTradeTransaction per player).
+                    return false;
+                };
+                if apply_trade_slot(&mut w.my_slots, *trade_index, *offer) {
+                    // Any slot mutation un-confirms BOTH sides
+                    // (player_trade.cpp setSlot clears `accepted`).
+                    w.my_confirmed = false;
+                    w.partner_confirmed = false;
+                    true
+                } else {
+                    false
+                }
+            }
+            AgentEvent::TradePartnerSlotSet { trade_index, offer } => {
+                let Some(w) = self.trade.as_mut() else {
+                    return false;
+                };
+                if apply_trade_slot(&mut w.partner_slots, *trade_index, *offer) {
+                    // Partner-side views un-confirm us too — the offer changed
+                    // under our feet (player_trade.cpp pushSlotView → both
+                    // `accepted=false`, vault main_menu.md section 25).
+                    w.my_confirmed = false;
+                    w.partner_confirmed = false;
+                    true
+                } else {
+                    false
+                }
+            }
+            AgentEvent::TradeMadeLocally => {
+                // Retail stamps its confirm state at Make-send time (select id 9
+                // sets the window's state word to 4 before any echo, vault
+                // main_menu.md section 25); the commit comes as RES End/Cancell.
+                if let Some(w) = self.trade.as_mut() {
+                    if !w.my_confirmed {
+                        w.my_confirmed = true;
+                        return true;
+                    }
+                }
+                false
+            }
             AgentEvent::PartyMemberUpdated { member } => {
                 if let Some(existing) = self.party.iter_mut().find(|m| m.id == member.id) {
                     let preserved_name = if member.name.is_some() {
@@ -2168,15 +2584,24 @@ impl SessionState {
                             // equip delay (vendor/server/src/map/utils/charutils.cpp
                             // SendInventory); a same-id update without charge
                             // info keeps the timers it cannot restate.
-                            let keep_charges = slot.charges_remaining.is_none()
+                            // The same rule covers the raw Attr: retail's furniture law reads layer
+                            // and pose straight out of it (FFXiMain.dll retail-2026-09 `.text 0x1CCFD1`),
+                            // so dropping it on an ITEM_LIST re-fold would empty the object table.
+                            let kept_extdata =
+                                slot.extdata.is_none() && existing.item_no == slot.item_no;
+                            let kept_charges = slot.charges_remaining.is_none()
                                 && existing.item_no == slot.item_no;
-                            let kept = keep_charges.then_some((
+                            let kept = kept_charges.then_some((
                                 existing.charges_remaining,
                                 existing.next_use_vana_ts,
                                 existing.use_delay_end_vana_ts,
                                 existing.ready,
                             ));
+                            let previous_extdata = existing.extdata;
                             *existing = slot.clone();
+                            if kept_extdata {
+                                existing.extdata = previous_extdata;
+                            }
                             if let Some((charges, next_use, delay_end, ready)) = kept {
                                 existing.charges_remaining = charges;
                                 existing.next_use_vana_ts = next_use;
@@ -2470,6 +2895,11 @@ impl SessionState {
             | AgentEvent::CutsceneCue { .. }
             | AgentEvent::MapOpen { .. }
             | AgentEvent::MapMarkerPlaced { .. }
+            | AgentEvent::EventSoundChannelsSet { .. }
+            | AgentEvent::EventSoundChannelsChange { .. }
+            | AgentEvent::EventMapPropsState { .. }
+            | AgentEvent::MapReloadRequested { .. }
+            | AgentEvent::ActorRenderFlagChanged { .. }
             | AgentEvent::MapClosed => false,
             AgentEvent::CutsceneEnded => {
                 let changed = self.cs_mount_armed;
@@ -2504,8 +2934,11 @@ impl SessionState {
                 changed
             }
             AgentEvent::AbilityRecastsUpdated { recasts } => {
-                let changed = self.ability_recasts != *recasts;
+                // Any s2c 0x119 readies the Status data for the session
+                // (.agents/skills/retail-observe/references/2026-10-15-unity-and-fp-windows.md).
+                let changed = self.ability_recasts != *recasts || !self.status_data_ready;
                 self.ability_recasts = recasts.clone();
+                self.status_data_ready = true;
                 changed
             }
             AgentEvent::JobInfoUpdated { info } => {
@@ -2545,6 +2978,97 @@ impl SessionState {
                 if seconds_until_homepoint.is_none() {
                     self.death_menu_offer = None;
                 }
+                changed
+            }
+            AgentEvent::PlayTimeSynced { seconds } => {
+                let arrival_ms = process_monotonic_ms();
+                let changed = self.play_time_base.map(|b| b.base_secs) != Some(*seconds);
+                self.play_time_base = Some(PlayTimeBase {
+                    base_secs: *seconds,
+                    arrival_ms,
+                });
+                changed
+            }
+            AgentEvent::CurrenciesLoaded { mode, body } => {
+                // Wire discriminants: 0 = report 1 (s2c 0x113), 1 = report 2 (s2c 0x118) —
+                // the typed view lives in `CurrencyMode::from_wire` on the render side. Each
+                // arrival replaces its block wholesale; an unknown discriminant drops the
+                // packet like any unexpected reply would (the request path never sends one).
+                let slot = match mode {
+                    0 => &mut self.currencies_1,
+                    1 => &mut self.currencies_2,
+                    _ => return false,
+                };
+                let changed = slot.as_deref() != Some(body.as_slice());
+                *slot = Some(body.clone());
+                changed
+            }
+            AgentEvent::CharSkillsUpdated { skills } => {
+                let changed = self.char_skills != Some(*skills);
+                self.char_skills = Some(*skills);
+                changed
+            }
+            AgentEvent::MeritsUpdated { merits } => {
+                // Each MISCDATA Merits record replaces the last, mirroring retail's dispatcher
+                // storing over 0x485826/0x48582A on every arrival (FFXiMain.dll retail-2026-09
+                // `.text 0x99290`).
+                let changed = self.merits != Some(*merits);
+                self.merits = Some(*merits);
+                changed
+            }
+            AgentEvent::AlterEgoPointsUpdated { points } => {
+                let changed = self.alter_ego_points != Some(*points);
+                self.alter_ego_points = Some(*points);
+                changed
+            }
+            AgentEvent::UnityRankingChunk {
+                result_set,
+                data_type,
+                concord_values,
+            } => fold_unity_ranking_chunk(&mut self.unity, *result_set, *data_type, concord_values),
+            AgentEvent::UnityRankingRequested { result_set } => {
+                let Some(set) = self
+                    .unity
+                    .rankings
+                    .get_mut(unity_result_set_index(*result_set))
+                else {
+                    return false;
+                };
+                std::mem::replace(&mut set.complete, false)
+            }
+            AgentEvent::UnityQuestUpdated { .. } => {
+                !std::mem::replace(&mut self.unity.quest_armed, true)
+            }
+            AgentEvent::UnityQuestRequested => {
+                std::mem::replace(&mut self.unity.quest_armed, false)
+            }
+            AgentEvent::LoginStateSynced {
+                login_state,
+                is_monstrosity,
+            } => {
+                let changed = self.login_state != *login_state
+                    || self.login_is_monstrosity != *is_monstrosity;
+                self.login_state = *login_state;
+                self.login_is_monstrosity = *is_monstrosity;
+                changed
+            }
+            AgentEvent::MeritsListed { entries } => {
+                fold_merit_entries(&mut self.merit_entries, entries)
+            }
+            AgentEvent::JobPointsListed { entries } => {
+                let stored = fold_job_point_entries(&mut self.job_point_types, entries);
+                !std::mem::replace(&mut self.job_points_received, true) || stored
+            }
+            AgentEvent::JobPointsRecordUpdated { record } => {
+                let changed = self.job_points != Some(*record);
+                self.job_points = Some(*record);
+                changed
+            }
+            AgentEvent::HomepointsUpdated { masks } => {
+                // Each Homepoints record replaces the last: retail's arm rep-movsds over the whole
+                // 64-byte store on every arrival (`.text FFXiMain.dll retail-2026-09 0x99330`).
+                let changed = self.homepoints != Some(*masks);
+                self.homepoints = Some(*masks);
                 changed
             }
             AgentEvent::DeathMenuUpdated { offer } => {
@@ -2696,6 +3220,120 @@ impl SessionState {
                 self.auction.busy = None;
                 changed
             }
+            AgentEvent::PlayerSearchCompleted { total, players } => {
+                // Whole-set replacement, like the set_search delta law: retail's
+                // scresult model is rebuilt from a new query's frames.
+                let next = Some(Box::new(kuluu_snapshot::SearchResults {
+                    total: *total,
+                    players: players.clone(),
+                }));
+                let changed = self.search != next;
+                self.search = next;
+                changed
+            }
+
+            AgentEvent::LinkShellSlotChanged {
+                linkshell_slot,
+                category,
+                item_index,
+            } => {
+                // One s2c 0x0E0 describes one slot; the pair is rebuilt whole so the delta stays a
+                // last-writer-wins `set_linkshells` (vault main_menu.md §27).
+                let Some(slot) = linkshell_slot_for(*linkshell_slot) else {
+                    return false;
+                };
+                let mut next = self.linkshells;
+                let empty = *category == 0 && *item_index == 0;
+                let value = if empty {
+                    kuluu_snapshot::LinkShellSlot::EMPTY
+                } else {
+                    kuluu_snapshot::LinkShellSlot {
+                        category: *category,
+                        item_index: *item_index,
+                    }
+                };
+                match slot {
+                    1 => next.one = value,
+                    _ => next.two = value,
+                }
+                let changed = next != self.linkshells;
+                if changed {
+                    self.linkshells = next;
+                }
+                changed
+            }
+            AgentEvent::MyroomModeChanged { previous: _, next } => {
+                if self.myroom_mode == *next {
+                    return false;
+                }
+                self.myroom_mode = *next;
+                true
+            }
+            AgentEvent::SynthCompleted { outcome } => {
+                // Each answer replaces the last whole (s2c 0x06F is one-shot feedback).
+                let changed = self.synth_result.as_ref() != Some(outcome);
+                if changed {
+                    self.synth_result = Some(outcome.clone());
+                }
+                changed
+            }
+            AgentEvent::MissionInfoUpdated { info } => {
+                // Each main-port frame replaces the mission log whole (vault main_menu.md §30).
+                let changed = self.missions.info.as_ref() != Some(info);
+                if changed {
+                    self.missions.info = Some(*info);
+                }
+                changed
+            }
+            AgentEvent::AutomatonUpdated { automaton } => {
+                // One s2c 0x044 PUP frame replaces the automaton record whole
+                // (vault main_menu.md §39).
+                let next = Some(Box::new(automaton.clone()));
+                let changed = self.automaton != next;
+                if changed {
+                    self.automaton = next;
+                }
+                changed
+            }
+            AgentEvent::ConfigUpdated { confdata } => {
+                // The server restates the whole SAVE_CONF prefix, so the newest
+                // frame replaces it wholesale (vault main_menu.md §42).
+                let changed = self.config_confdata != Some(*confdata);
+                if changed {
+                    self.config_confdata = Some(*confdata);
+                }
+                changed
+            }
+            AgentEvent::MonstrosityUpdated { monstrosity } => {
+                // One s2c 0x044 MON frame replaces the record whole (vault
+                // main_menu.md §39).
+                let changed = self.monstrosity.as_ref() != Some(monstrosity);
+                if changed {
+                    self.monstrosity = Some(*monstrosity);
+                }
+                changed
+            }
+            AgentEvent::MissionTvrUpdated { tvr } => {
+                let changed = self.missions.tvr != *tvr;
+                if changed {
+                    self.missions.tvr = *tvr;
+                }
+                changed
+            }
+            AgentEvent::MissionLogUpdated { entry } => {
+                // One entry per Port, last frame wins (vault main_menu.md §30).
+                match self.missions.logs.iter_mut().find(|e| e.port == entry.port) {
+                    Some(existing) if *existing == *entry => false,
+                    Some(existing) => {
+                        *existing = *entry;
+                        true
+                    }
+                    None => {
+                        self.missions.logs.push(*entry);
+                        true
+                    }
+                }
+            }
             AgentEvent::AuctionSellQuote { quote, .. } => {
                 let changed = self.auction.fee_quote != *quote;
                 self.auction.fee_quote = *quote;
@@ -2768,6 +3406,141 @@ pub struct KnockbackHit {
     pub target_id: u32,
     pub level: u8,
 }
+
+/// Land one slot view at its TradeIndex position (the positional law of vault
+/// main_menu.md §25: list index = TradeIndex 0..=8, slot 0 is gil).
+fn apply_trade_slot(
+    slots: &mut Vec<Option<kuluu_snapshot::TradeOffer>>,
+    trade_index: u8,
+    offer: Option<kuluu_snapshot::TradeOffer>,
+) -> bool {
+    let idx = trade_index as usize;
+    if idx >= ffxi_proto::decode::TRADE_SLOT_COUNT {
+        return false;
+    }
+    while slots.len() <= idx {
+        slots.push(None);
+    }
+    if slots[idx] == offer {
+        return false;
+    }
+    slots[idx] = offer;
+    true
+}
+
+/// Any nonzero `resultSet` is result set 1
+/// (.agents/skills/retail-observe/references/2026-10-15-unity-and-fp-windows.md).
+pub fn unity_result_set_index(result_set: u8) -> usize {
+    usize::from(result_set != 0)
+}
+
+/// One s2c 0x08C `merit_t` as sent (vendor/server/src/map/packets/s2c/0x08c_merit.h).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeritWire {
+    pub index: u16,
+    pub next: u8,
+    pub count: u8,
+}
+
+/// One s2c 0x08D `jobpoint_t` as sent (vendor/server/src/map/packets/s2c/0x08d_job_points.h).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobPointWire {
+    pub index: u8,
+    pub job_no: u16,
+    pub next: u16,
+    pub level: u8,
+}
+
+/// The s2c 0x08C wire id bit that turns an entry into a delete; the wire id halved is the merit
+/// index (.agents/skills/retail-observe/references/2026-10-15-merit-and-job-point-windows.md).
+pub const MERIT_WIRE_DELETE_BIT: u16 = 1;
+const MERIT_WIRE_INDEX_SHIFT: u32 = 1;
+
+/// The merit index of an s2c 0x08C wire id.
+pub fn merit_index_of_wire_id(wire_id: u16) -> u16 {
+    wire_id >> MERIT_WIRE_INDEX_SHIFT
+}
+
+/// Stores s2c 0x08C entries by merit index: an entry whose wire id has bit 0 set deletes its
+/// merit, any other inserts or replaces it.
+pub fn fold_merit_entries(
+    store: &mut std::collections::BTreeMap<u16, kuluu_snapshot::MeritEntry>,
+    entries: &[MeritWire],
+) -> bool {
+    let mut changed = false;
+    for entry in entries {
+        let index = merit_index_of_wire_id(entry.index);
+        if entry.index & MERIT_WIRE_DELETE_BIT != 0 {
+            changed |= store.remove(&index).is_some();
+            continue;
+        }
+        let stored = kuluu_snapshot::MeritEntry {
+            next: entry.next,
+            count: entry.count,
+        };
+        changed |= store.insert(index, stored) != Some(stored);
+    }
+    changed
+}
+
+/// Stores s2c 0x08D entries by type id (`job_no * 32 + index`), skipping an entry whose first
+/// u16 is 0 or whose job is past the JobPoints record's jobs.
+pub fn fold_job_point_entries(
+    store: &mut std::collections::BTreeMap<u16, kuluu_snapshot::JobPointType>,
+    entries: &[JobPointWire],
+) -> bool {
+    let mut changed = false;
+    for entry in entries {
+        let type_id = entry.job_no * ffxi_proto::decode::JobPointWireEntry::TYPES_PER_JOB
+            + u16::from(entry.index);
+        if type_id == 0 || usize::from(entry.job_no) >= kuluu_snapshot::JOB_POINT_JOBS {
+            continue;
+        }
+        let stored = kuluu_snapshot::JobPointType {
+            level: entry.level,
+            next: entry.next,
+        };
+        changed |= store.insert(type_id, stored) != Some(stored);
+    }
+    changed
+}
+
+const _: () = assert!(
+    kuluu_snapshot::JOB_POINT_JOBS == ffxi_proto::decode::MiscdataJobPoints::JOBS,
+    "the snapshot's JobPoints jobs follow the decoder's"
+);
+
+/// Stores one s2c 0x063 Unity chunk into its result set: chunk 1 carries the members, chunk 2
+/// the points, and the last chunk completes the set
+/// (.agents/skills/retail-observe/references/2026-10-15-unity-and-fp-windows.md).
+pub fn fold_unity_ranking_chunk(
+    unity: &mut kuluu_snapshot::UnityState,
+    result_set: u8,
+    data_type: u8,
+    concord_values: &[u32; kuluu_snapshot::UNITY_CONCORDS],
+) -> bool {
+    use ffxi_proto::decode::MiscdataUnity;
+    let Some(set) = unity.rankings.get_mut(unity_result_set_index(result_set)) else {
+        return false;
+    };
+    let before = *set;
+    match data_type {
+        MiscdataUnity::DATA_TYPE_MEMBERS => set.members = *concord_values,
+        MiscdataUnity::DATA_TYPE_POINTS => set.points = *concord_values,
+        MiscdataUnity::LAST_CHUNK => set.complete = true,
+        _ => {}
+    }
+    *set != before
+}
+
+const _: () = assert!(
+    kuluu_snapshot::UNITY_CONCORDS == ffxi_proto::decode::UNITY_CONCORD_COUNT,
+    "the snapshot's Concord count follows the decoder's"
+);
+const _: () = assert!(
+    kuluu_snapshot::ALTER_EGO_UPGRADE_SLOTS == ffxi_proto::decode::AlterEgoPoints::UPGRADE_SLOTS,
+    "the snapshot's alter ego upgrade slots follow the decoder's"
+);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -3039,6 +3812,53 @@ pub enum AgentEvent {
         members: Vec<ffxi_proto::decode::GroupTblEntry>,
     },
 
+    /// s2c 0x0DC GROUP_SOLICIT_REQ: an incoming party/alliance invite awaiting
+    /// the c2s 0x074 answer (vendor/server/src/map/packets/s2c/
+    /// 0x0dc_group_solicit_req.h).
+    PartySolicitReceived {
+        char_id: u32,
+        name: String,
+        alliance: bool,
+    },
+
+    /// s2c 0x0DE GROUP_SOLICIT_NO: the pending invite is withdrawn/expired.
+    PartySolicitWithdrawn,
+
+    /// s2c 0x021 ITEM_TRADE_REQ: `char_id` asked to trade with us; answer rows
+    /// open until c2s 0x033 goes out (vendor/server/src/map/packets/s2c/
+    /// 0x021_item_trade_req.h).
+    TradeIncoming {
+        char_id: u32,
+    },
+
+    /// Our own c2s TRADE_REQ was accepted by the transport: open the window in
+    /// its outgoing state (retail opens on send, vault main_menu.md section 25).
+    TradeOutgoingOpened {
+        char_id: u32,
+    },
+
+    /// s2c 0x022 ITEM_TRADE_RES kind (Start/Cancell/Make/…/End):
+    /// vendor/server/src/map/packets/s2c/0x022_item_trade_res.h.
+    TradeRes {
+        kind: ffxi_proto::decode::TradeResKind,
+    },
+
+    /// s2c 0x025 ITEM_TRADE_MYLIST slot view; `offer` is None for the empty-slot
+    /// push (sentinel ItemNo with quantity 0, per 0x025_item_trade_mylist.cpp).
+    TradeMySlotSet {
+        trade_index: u8,
+        offer: Option<kuluu_snapshot::TradeOffer>,
+    },
+
+    /// s2c 0x023 ITEM_TRADE_LIST slot view of the partner's side.
+    TradePartnerSlotSet {
+        trade_index: u8,
+        offer: Option<kuluu_snapshot::TradeOffer>,
+    },
+
+    /// Our Make went out on the wire — mark us confirmed while the commit lands.
+    TradeMadeLocally,
+
     LowHp {
         pct: u8,
     },
@@ -3148,6 +3968,103 @@ pub enum AgentEvent {
         seconds_until_homepoint: Option<u32>,
     },
 
+    /// s2c 0x00A LOGIN `PlayTime` — cumulative seconds as the server counted them
+    /// at this zone-in (vendor/server/src/map/packets/s2c/0x00a_login.cpp
+    /// GP_SERV_COMMAND_LOGIN::GP_SERV_COMMAND_LOGIN PlayTime). Retail re-reports it every
+    /// zone-in and adds its own elapsed clock on top when `/playtime` runs
+    /// (FFXiMain.dll retail-2026-09 handler RVA 0x7CAB0).
+    PlayTimeSynced {
+        seconds: u32,
+    },
+
+    /// s2c 0x062 GP_SERV_COMMAND_CLISTATUS2 — the whole skill block (combat/magic/
+    /// craft rows of the Status window, and the only source that can enable those
+    /// three rows: FFXiMain.dll retail-2026-09 `.text 0x148B50` opens them disabled).
+    CharSkillsUpdated {
+        skills: kuluu_snapshot::CharSkills,
+    },
+
+    /// s2c 0x063 GP_SERV_COMMAND_MISCDATA subtype **Merits** (bead kuluu-o9qt7.43): gates and
+    /// fills the Status window's Merit Points row — retail stores its two dwords at .data
+    /// FFXiMain.dll retail-2026-09 0x485826/0x48582A and raises the received flag (.text
+    /// dispatcher `0x99270`, case arm `.text 0x99290`; vault main_menu.md §59 addendum 36).
+    MeritsUpdated {
+        merits: kuluu_snapshot::MisdataMerits,
+    },
+
+    /// s2c 0x08E alter ego points: balance, upgrade levels and costs
+    /// (vendor/server/src/map/packets/s2c/0x08e_alter_ego_points.h).
+    AlterEgoPointsUpdated {
+        points: kuluu_snapshot::AlterEgoPoints,
+    },
+
+    /// One s2c 0x063 MISCDATA Unity chunk, decoded by LSB's layout
+    /// (vendor/server/src/map/packets/s2c/0x063_miscdata_unity.h): `concord_values` holds
+    /// `members[11]` / `points[11]` for chunks 1 / 2 and zeros otherwise.
+    UnityRankingChunk {
+        result_set: u8,
+        data_type: u8,
+        concord_values: [u32; kuluu_snapshot::UNITY_CONCORDS],
+    },
+
+    /// A c2s 0x116 went out for `result_set`, clearing that set's complete mark
+    /// (.agents/skills/retail-observe/references/2026-10-15-unity-and-fp-windows.md).
+    UnityRankingRequested {
+        result_set: u8,
+    },
+
+    /// s2c 0x110 GP_SERV_COMMAND_UNITY (vendor/server/src/map/packets/s2c/0x110_unity.h); it arms
+    /// the next c2s 0x117.
+    UnityQuestUpdated {
+        sparks: u32,
+        deeds: u16,
+        plaudits: u16,
+    },
+
+    /// A c2s 0x117 went out, clearing the s2c 0x110 mark.
+    UnityQuestRequested,
+
+    /// s2c 0x00A `LoginState` / `IsMonstrosity`, emitted after the zone-in's `ZoneChanged`
+    /// (vendor/server/src/map/packets/s2c/0x00a_login.h).
+    LoginStateSynced {
+        login_state: u32,
+        is_monstrosity: bool,
+    },
+
+    /// s2c 0x08C GP_SERV_COMMAND_MERIT: its counted entries as sent
+    /// (vendor/server/src/map/packets/s2c/0x08c_merit.h).
+    MeritsListed {
+        entries: Vec<MeritWire>,
+    },
+
+    /// s2c 0x08D GP_SERV_COMMAND_JOB_POINTS: all 64 entries as sent
+    /// (vendor/server/src/map/packets/s2c/0x08d_job_points.h).
+    JobPointsListed {
+        entries: Vec<JobPointWire>,
+    },
+
+    /// One s2c 0x063 MISCDATA JobPoints record
+    /// (vendor/server/src/map/packets/s2c/0x063_miscdata_job_points.h).
+    JobPointsRecordUpdated {
+        record: kuluu_snapshot::JobPointsRecord,
+    },
+
+    /// One s2c 0x063 MISCDATA Homepoints record — the fast-travel access masks (bead
+    /// kuluu-o9qt7.45; retail dispatcher `.text FFXiMain.dll retail-2026-09 0x99270`, arm
+    /// `.text 0x99330`; vault main_menu.md §59 addendum 37).
+    HomepointsUpdated {
+        masks: kuluu_snapshot::HomepointMasks,
+    },
+
+    /// s2c 0x113/0x118 currency reports (bead kuluu-o9qt7.35), raw body as received — the
+    /// mode selects which report family (`kuluu_render::hud::currency_law::CurrencyMode`) and
+    /// each arrival replaces its block wholesale, mirroring retail's one-shot reply handler
+    /// (FFXiMain.dll retail-2026-09 `.text 0x99640`/`.text 0x99660`).
+    CurrenciesLoaded {
+        mode: u8,
+        body: Vec<u8>,
+    },
+
     /// s2c 0x0F9 `GP_SERV_COMMAND_RES`
     /// (vendor/server/src/map/packets/s2c/0x0f9_res.cpp): `None` restores the
     /// default home-point-only menu; `Some` offers Raise/Reraise or Tractor.
@@ -3179,6 +4096,50 @@ pub enum AgentEvent {
     /// Event script 0x8A CLOSE_MAP (research/XiEvents/OpCodes/0x008A.md):
     /// close the Map screen.
     MapClosed,
+
+    /// Event scripts 0x69 SETSOUNDVOLUME: drive the masked retail sound channels
+    /// to exactly full (`enabled`) or exactly silence at once — no ramp.
+    /// kuluu folds retail's four mixer arms plus its global multiplier slot into
+    /// two buses (`.agents/skills/retail-observe/references/
+    /// 2026-10-28-event-opcode-no-skip-pass.md`).
+    EventSoundChannelsSet {
+        mask: u8,
+        enabled: bool,
+    },
+
+    /// Event script 0x6A CHANGESOUNDVOLUME: the masked channels ease to
+    /// `volume_thousandths`/1000 — retail's scale constant is exactly 1/1000.
+    EventSoundChannelsChange {
+        mask: u8,
+        volume_thousandths: i32,
+    },
+
+    /// Event script 0x8D OPEN_MAP_PROPS: the prop-label layer state of a zone's
+    /// map window, both raw work operands (retail passes them to its shared
+    /// window helper as select/value). kuluu has no prop-label layer yet, so the
+    /// state is carried and stored only (record delta).
+    EventMapPropsState {
+        select: i32,
+        value: i32,
+    },
+
+    /// Event scripts 0x34/0x35 MAPLOAD/MAPLOAD_KEEP, third pass: retail tears
+    /// the map-window data down and re-opens it for the id its first work
+    /// operand names (record delta; kuluu's only observable branch).
+    MapReloadRequested {
+        map_id: u16,
+    },
+
+    /// Event scripts 0x92/0x94 flag-word bits and 0x81 visual-half byte: one
+    /// per-actor render-flag write, `bit` the index from the image offsets
+    /// (`.agents/skills/retail-observe/references/2026-10-28-event-opcode-no-skip-pass.md`).
+    /// Published only — no source names these bits' visual role yet, so nothing
+    /// applies them.
+    ActorRenderFlagChanged {
+        actor: CutsceneActor,
+        bit: u32,
+        value: bool,
+    },
 
     LevelUp {
         player_id: u32,
@@ -3382,6 +4343,75 @@ pub enum AgentEvent {
         message: String,
     },
 
+    /// Player-search answer: every CSearchListPacket of one query merged in
+    /// arrival order; `total` is the server-declared overall count (the last
+    /// frame's [0x0E], vault main_menu.md §26).
+    PlayerSearchCompleted {
+        total: u16,
+        players: Vec<kuluu_snapshot::SearchPlayer>,
+    },
+
+    /// s2c 0x0E0 GP_SERV_COMMAND_GROUP_COMLINK: the pearl equipped in `linkshell_slot` (1 or 2) now
+    /// lives at `category`/`item_index`; zeros mean the slot is empty — LSB leaves both fields zero
+    /// when `equipLocation(SLOT_LINK1/SLOT_LINK2)` has no entry. Vault main_menu.md §27.
+    LinkShellSlotChanged {
+        linkshell_slot: u8,
+        category: u8,
+        item_index: u8,
+    },
+
+    /// The client's Mog House arrangement mode changed — emitted by the session actor after its own
+    /// gate chain accepted an [`AgentCommand::MyroomMode`], and when a zone-in drops a mode that was
+    /// in force (retail keeps the mode in the myroom manager alone; no wire carries it —
+    /// FFXiMain.dll retail-2026-09 `.text 0x1D34FA`). Values are the `MODE_*` constants of
+    /// [`crate::myroom_layout`](crate::myroom_layout).
+    MyroomModeChanged {
+        previous: u8,
+        next: u8,
+    },
+
+    /// s2c 0x06F GP_SERV_COMMAND_COMBINE_ANS: the answer to our last synthesis
+    /// ask replaces whatever we held (vault main_menu.md §28).
+    SynthCompleted {
+        outcome: kuluu_snapshot::SynthOutcome,
+    },
+
+    /// s2c 0x056 port 0xFFFF main frame replaces the mission log whole (vault
+    /// main_menu.md §30).
+    MissionInfoUpdated {
+        info: kuluu_snapshot::MissionInfo,
+    },
+
+    /// One s2c 0x044 EXTENDED_JOB PUP frame replaces the automaton record whole
+    /// (vendor/server/src/map/packets/s2c/0x044_extended_job_pup.h; vault
+    /// main_menu.md §39).
+    AutomatonUpdated {
+        automaton: kuluu_snapshot::AutomatonInfo,
+    },
+
+    /// The s2c 0x0B4 CONFIG answer restates the four SAVE_CONF bitfield bytes
+    /// whole (vendor/server/src/common/mmo.h; vault main_menu.md §42).
+    ConfigUpdated {
+        confdata: [u8; 4],
+    },
+
+    /// One s2c 0x044 EXTENDED_JOB MON frame replaces the monstrosity record
+    /// whole (vault main_menu.md §39).
+    MonstrosityUpdated {
+        monstrosity: kuluu_snapshot::MonstrosityInfo,
+    },
+
+    /// s2c 0x056 port 0xFFFE `Expansion_TVR` (vault main_menu.md section 30).
+    MissionTvrUpdated {
+        tvr: u32,
+    },
+
+    /// One OTHER-port frame replaces that port's log whole (vault main_menu.md
+    /// section 30); unseen ports append in arrival order.
+    MissionLogUpdated {
+        entry: kuluu_snapshot::MissionLogEntry,
+    },
+
     /// s2c AskCommit: the listing-fee quote (`quote: None` on rejection, with
     /// the LSB message code in `result` — 197 from auctionutils SellingItems).
     AuctionSellQuote {
@@ -3427,6 +4457,19 @@ pub enum AgentEvent {
         ok: bool,
         result: u8,
     },
+
+    /// Wholesale replacement of the client-local macro list (loaded at world
+    /// entry from `macro_store`, or after a commit) — no wire origin, see
+    /// vendor/server packet index [V-negative] and vault main_menu.md §41.
+    MacrosLoaded {
+        slots: Vec<kuluu_snapshot::MacroSlot>,
+    },
+
+    /// Wholesale replacement of this character's emote display order (bead
+    /// kuluu-o9qt7.34) — world entry load or commit echo; never a wire origin.
+    EmoteOrderLoaded {
+        ids: Vec<u8>,
+    },
 }
 
 pub const GROUND_CORRECTION_XY_EPSILON_YALMS: f32 = 0.05;
@@ -3458,6 +4501,76 @@ pub fn apply_ground_height_correction(
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum AgentCommand {
+    /// Answer to the pending party invite (`prtyjoin` YES/NO in retail,
+    /// FFXiMain.dll retail-2026-09 RVA 0x2016E0 opens it; vault main_menu.md
+    /// section 24). Sends c2s GROUP_SOLICIT_RES (vendor/server/src/map/packets/
+    /// c2s/0x074_group_solicit_res.h: Res { Decline = 0, Accept = 1 }).
+    PartyInviteRespond {
+        accept: bool,
+    },
+
+    /// Ask `char_id` to trade — c2s 0x032 TRADE_REQ (UniqueNo + the target's
+    /// wire ActIndex, both read off the snapshot entity by the caller). The
+    /// server pushes the target s2c 0x021; nothing changes for us until they
+    /// answer.
+    TradeRequest {
+        char_id: u32,
+        act_index: u16,
+    },
+
+    /// Answer an incoming trade request (c2s 0x033 TRADE_RES Kind Start/Cancell).
+    TradeRespond {
+        accept: bool,
+    },
+
+    /// Stage one bag slot into our offer (c2s 0x034 TRADE_LIST): qty ItemNum,
+    /// `item_no` must match the bag slot's contents (player_trade.cpp setSlot).
+    TradeStage {
+        trade_index: u8,
+        item_no: u16,
+        qty: u32,
+        bag_slot: u8,
+    },
+
+    /// Offer gil — TRADE_LIST on slot 0 with the GIL sentinel item id (LSB's
+    /// `GilSlot = 0`, validate() rejects it elsewhere).
+    TradeSetGil {
+        qty: u32,
+    },
+
+    /// Clear one of our offer slots: TRADE_LIST with ItemNum 0 (setSlot takes
+    /// that as the release path).
+    TradeClearSlot {
+        trade_index: u8,
+    },
+
+    /// Confirm our side (c2s 0x033 Kind Make); the commit resolves when both
+    /// sides made and the server sends RES End to each.
+    TradeConfirm,
+
+    /// Walk away (c2s 0x033 Kind Cancell).
+    TradeCancel,
+
+    /// Run a `searchma` query against the search server: one TCP_SEARCH (or
+    /// TCP_SEARCH_ALL) request whose TLV blob is built from these filters
+    /// (vendor/server/src/search/search_handler.cpp _HandleSearchRequest; vault
+    /// main_menu.md §26). The merged result frames come back as
+    /// [`AgentEvent::PlayerSearchCompleted`].
+    PlayerSearch {
+        filters: Vec<ffxi_proto::search::SearchFilter>,
+        #[serde(default)]
+        all_pages: bool,
+    },
+
+    /// Ask one synthesis (c2s 0x096 COMBINE_ASK): the crystal's item id plus its bag slot, and
+    /// the ingredient (item id, bag slot) pairs already in the recipe row's own order — that
+    /// positional order is what the server keys on (`resolveRecipe`, vault main_menu.md §28).
+    Synthesize {
+        crystal_id: u16,
+        crystal_slot: u8,
+        ingredients: Vec<ffxi_proto::synth::SynthIngredient>,
+    },
+
     Move {
         x: f32,
         y: f32,
@@ -3505,9 +4618,195 @@ pub enum AgentCommand {
         sub_job: Option<u8>,
     },
 
+    /// One select on myroom's door row (select id 6 of handler FFXiMain.dll retail-2026-09
+    /// `.text 0x145460`, arm @`.text 0x14556C`). The arm branches on the client-side door byte at
+    /// game-state `+0x40C40` (predicate `.text 0xF96E0`): closed door -> MYROOM_IS{Kind=Open,
+    /// Param2=Unk1(0)}, open door -> MYROOM_IS{Kind=Close, Param2=Unk2(1)} - the Kind and PARAM2
+    /// values in vendor/server/src/map/packets/c2s/0x0cb_myroom_is.h. kuluu answers that same branch
+    /// from [`MyRoomInfo::door_open`] and flips it optimistically: LSB implements neither Kind
+    /// (`process()` is literally "Not implemented" twice in
+    /// vendor/server/src/map/packets/c2s/0x0cb_myroom_is.cpp) and ships no s2c 0x067, so no wire
+    /// could ever disagree with the client's own byte. Which rows the update slot greys while the
+    /// door is open (Layout / Remodel) lives in kuluu-render's `menu_row_disabled`.
+    MogHouseDoorSelect,
+
+    /// One confirmed `roomlist` style row: c2s 0x0CB MYROOM_IS Kind=Remodel with
+    /// Param2 = `style` (615 Sandorian / 616 Bastokan / 617 Windurstian / 618 Mog
+    /// Patio — GP_CLI_COMMAND_MYROOM_IS_PARAM2). Retail's sender (.text FFXiMain.dll
+    /// retail-2026-09 0x1D6AD0) pairs it with Param1 = byte[roomlist obj+0x50]; LSB never
+    /// reads that field — validate() checks only Kind/Param2 and process() acts on Param2
+    /// alone (vendor/server/src/map/packets/c2s/0x0cb_myroom_is.cpp) — so kuluu sends
+    /// Param1=0. A confirmed style change answers MsgStd::SuccessfulRemodel, and when the
+    /// model actually changes while on MH2F (mhflag&0x40) LSB forces a same-zone rezone,
+    /// which kuluu's generic zone-change path already follows (vault main_menu.md §59
+    /// addendum 20/21; bead kuluu-o9qt7.13.5).
+    MogHouseRemodel {
+        style: u16,
+    },
+
+    /// One furniture placement/move inside a Mog House: c2s 0x0FA MYROOM_LAYOUT, built by sender
+    /// helper FFXiMain.dll retail-2026-09 `.text 0xF0CC0` (see [`crate::session::codec::
+    /// MyroomLayoutRequest`] for what each byte means and for the ranges LSB validates). Nothing is
+    /// updated optimistically: a placement that survives validation comes straight back as s2c 0x020
+    /// ITEM_ATTR, which is the only thing kuluu treats as furniture state
+    /// ([`crate::myroom_furniture`]; the client's own handler for the 0x0FA echo at `.text 0xF0C70` is
+    /// `mov al, 1; ret`).
+    MyroomLayout {
+        item_no: u16,
+        slot: u8,
+        container: u8,
+        floor: u8,
+        col: i8,
+        level: i8,
+        row: i8,
+        rotation: i8,
+    },
+
+    /// The closing beat of layout mode: the same 0x0FA packet with every field zero
+    /// (FFXiMain.dll retail-2026-09 `.text 0xF0C80`), sent when leaving layout mode for normal mode so
+    /// LSB re-runs `UpdateMoghancement` (vendor/server/src/map/packets/c2s/
+    /// 0x0fa_myroom_layout.cpp, `if (this->MyroomItemNo == 0)`).
+    MyroomLayoutDone,
+
+    /// Take one placed piece back onto the Mog House shelf: c2s 0x0FB MYROOM_BANKIN, sender helper
+    /// FFXiMain.dll retail-2026-09 `.text 0xF0D40`. What else goes with it is server law, not a guess:
+    /// LSB clears Installed and the whole pose, empties a flowerpot it was holding
+    /// (`CItemFlowerpot::cleanPot`) and unlocks a mannequin's outfit — each of those arrivals is its own
+    /// ITEM_ATTR/ITEM_LIST record, so kuluu assumes nothing locally (the client likewise only queues the
+    /// request; when it removes a surface it marks whatever sat on it dirty too,
+    /// `.text 0x1CE0F0`). vendor/server/src/map/packets/c2s/0x0fb_myroom_bankin.cpp.
+    MyroomBankin {
+        item_no: u16,
+        slot: u8,
+        container: u8,
+    },
+
+    /// Sow a seed / feed a plant: c2s 0x0FC MYROOM_PLANT_ADD, sender helper FFXiMain.dll retail-2026-09
+    /// `.text 0xF0DA0` (vendor/server/src/map/packets/c2s/0x0fc_myroom_plant_add.h).
+    MyroomPlantAdd {
+        plant_item_no: u16,
+        add_item_no: u16,
+        plant_slot: u8,
+        add_slot: u8,
+        plant_container: u8,
+        add_container: u8,
+    },
+
+    /// Examine a growing plant: c2s 0x0FD MYROOM_PLANT_CHECK, sender helper FFXiMain.dll retail-2026-09
+    /// `.text 0xF0E10`.
+    MyroomPlantCheck {
+        plant_item_no: u16,
+        plant_slot: u8,
+        plant_container: u8,
+    },
+
+    /// Harvest a plant. `cancel = true` is the header's `CancellFlg = 1`, which retail sends when the
+    /// player backs out of the harvest prompt (call site FFXiMain.dll retail-2026-09 `.text 0x206951`);
+    /// a real harvest passes 0 (`.text 0x2069B1`).
+    MyroomPlantCrop {
+        plant_item_no: u16,
+        plant_slot: u8,
+        plant_container: u8,
+        cancel: bool,
+    },
+
+    /// Stop drying/harvesting a plant: c2s 0x0FF MYROOM_PLANT_STOP, sender helper FFXiMain.dll
+    /// retail-2026-09 `.text 0xF0ED0`.
+    MyroomPlantStop {
+        plant_item_no: u16,
+        plant_slot: u8,
+        plant_container: u8,
+    },
+
+    /// Enter or leave one of the Mog House arrangement modes: the mode switch FFXiMain.dll retail-2026-09
+    /// `.text 0x1D3380(mode, slot, container)` with no particular piece asked for (retail spells that as a
+    /// slot of -1 at `.text 0x7E78D`/`.text 0x7E999`). 0 returns to normal play, 1 is `/layout`, 2 is
+    /// `/garden`; the refusal law, the windows it closes and the wire beat it may owe all come from
+    /// [`crate::myroom_layout`] [V].
+    MyroomMode {
+        mode: u8,
+    },
+
     /// Client-local open of the same menu s2c 0x02E OPENMOGMENU triggers
     /// (vendor/server/src/map/packets/s2c/0x02e_openmogmenu.h).
     OpenMogMenu,
+
+    /// Commit the character's whole macro set: persisted to the client-local
+    /// store file and folded into state together, so runtime and user file can
+    /// never disagree (bead kuluu-o9qt7.19.2; retail keeps macros in its own
+    /// per-user files, vault main_menu.md §41/§53).
+    CommitMacros {
+        slots: Vec<kuluu_snapshot::MacroSlot>,
+    },
+
+    /// Rewrite the character's emote display order as a whole: persisted to the
+    /// client-local store and folded into state together, exactly like
+    /// `CommitMacros` (bead kuluu-o9qt7.34; retail's user-file law from
+    /// FFXiMain.dll retail-2026-09 `.text 0x2259C6`, no wire).
+    CommitEmoteOrder {
+        ids: Vec<u8>,
+    },
+
+    /// Send the header-only currency report request for one Currencies window — c2s 0x10F or
+    /// 0x115 by `mode` wire discriminant (0/1, `CurrencyMode::as_wire`; answers arrive as s2c
+    /// 0x113/0x118). Retail issues one per window open and caches nothing (FFXiMain.dll
+    /// retail-2026-09 `.text 0xFD520`/`.text 0xFD550`; vendor/server/src/map/packets/c2s/
+    /// 0x10f_currencies_1.cpp answers straight back — bead kuluu-o9qt7.35).
+    RequestCurrencies {
+        mode: u8,
+    },
+
+    /// c2s 0x116 GP_CLI_COMMAND_UNITY_MENU `Kind = result_set`
+    /// (vendor/server/src/map/packets/c2s/0x116_unity_menu.h); LSB answers with s2c 0x110 and both
+    /// ranking sets. The `ut_menu` window sends it once per set whose table completed since the
+    /// last request (.agents/skills/retail-observe/references/2026-10-15-unity-and-fp-windows.md).
+    RequestUnityRanking {
+        result_set: u8,
+    },
+
+    /// c2s 0x117 GP_CLI_COMMAND_UNITY_QUEST `Kind = 0`
+    /// (vendor/server/src/map/packets/c2s/0x117_unity_quest.h), sent when a ranking list opens
+    /// after an s2c 0x110.
+    RequestUnityQuest,
+
+    /// c2s 0x118 GP_CLI_COMMAND_UNITY_TOGGLE `Mode`
+    /// (vendor/server/src/map/packets/c2s/0x118_unity_toggle.h): 1 joins Unity chat, 0 leaves it.
+    SetUnityChat {
+        mode: u8,
+    },
+
+    /// The header-only c2s 0x0C2 alter ego points request, sent when the alter ego point windows
+    /// open before any s2c 0x08E (.agents/skills/retail-observe/references/2026-10-15-unity-and-fp-windows.md).
+    RequestAlterEgoPoints,
+
+    /// c2s 0x0C1 GP_CLI_COMMAND_ALTER_EGO_POINTS `CategoryIndex = upgrade_id`
+    /// (vendor/server/src/map/packets/c2s/0x0c1_alter_ego_points.h).
+    UpgradeAlterEgo {
+        upgrade_id: u16,
+    },
+
+    /// c2s 0x0BE GP_CLI_COMMAND_MERITS ChangeMode (vendor/server/src/map/packets/c2s/0x0be_merits.h):
+    /// `limit_points` false asks for EXP mode, true for Limit Points mode.
+    SetMeritMode {
+        limit_points: bool,
+    },
+
+    /// c2s 0x0BE GP_CLI_COMMAND_MERITS EditMode: raise (`raise`) or lower merit `index` (the wire
+    /// id halved).
+    EditMerit {
+        index: u16,
+        raise: bool,
+    },
+
+    /// c2s 0x0BF GP_CLI_COMMAND_JOB_POINTS_SPEND on job point type `type_id`
+    /// (vendor/server/src/map/packets/c2s/0x0bf_job_points_spend.h).
+    SpendJobPoint {
+        type_id: u16,
+    },
+
+    /// The header-only c2s 0x0C0 GP_CLI_COMMAND_JOB_POINTS_REQ
+    /// (vendor/server/src/map/packets/c2s/0x0c0_job_points_req.h).
+    RequestJobPoints,
 
     /// Cast lots on a treasure-pool slot — c2s 0x041 TROPHY_ENTRY. The server
     /// rolls the value, so there is nothing to send but the slot.
@@ -3699,6 +4998,28 @@ pub enum AgentCommand {
         equip_slot: u8,
     },
 
+    /// Wear one's whole equipment set: c2s 0x051 (`equipset::equipset_set_body` packs the populated entries;
+    /// the server runs every equip call, so appearance updates arrive back as normal equipment updates - the
+    /// client applies nothing locally, `.agents/skills/retail-observe/references/2026-10-25-equip-set-apply.md`).
+    /// `entries` is the set record's contents half in order.
+    EquipSetWear {
+        entries: [ffxi_proto::equipset::EquipSetEntry; ffxi_proto::equipset::EQUIPSET_ENTRIES],
+    },
+
+    /// Lock one's style to an equipment set: c2s 0x053 Mode = Set. Entries past the feet position are dropped
+    /// by the encoder, whichever arm hands them over.
+    StyleLockSet {
+        entries: [ffxi_proto::equipset::EquipSetEntry; ffxi_proto::equipset::EQUIPSET_ENTRIES],
+    },
+
+    /// Report one edit to a set's contents: c2s 0x052, the edited `position` (LSB bounds it 0..15), the entry
+    /// just placed or removed, and the whole list as now stored. Nothing is worn by this packet.
+    EquipSetCheck {
+        position: u8,
+        change: ffxi_proto::equipset::EquipSetEntry,
+        contents: [ffxi_proto::equipset::EquipSetEntry; ffxi_proto::equipset::EQUIPSET_ENTRIES],
+    },
+
     /// Ask the server to consolidate same-id partial stacks in a container
     /// (retail's inventory "Sort"). `container` is the LSB CONTAINER_ID
     /// (LOC_INVENTORY = 0). See GP_CLI_COMMAND_ITEM_STACK (0x03A).
@@ -3790,6 +5111,54 @@ pub enum AgentCommand {
     OpenBazaar {
         target_id: u32,
         target_index: u16,
+    },
+
+    /// Raise our own stall's price menu (c2s 0x10B with AllListClearFlg 0): LSB
+    /// sets `isSettingBazaarPrices` and drops our customer list, so buyers leave the
+    /// stall we are about to reprice
+    /// (vendor/server/src/map/packets/c2s/0x10b_bazaar_close.cpp).
+    BazaarPricesEnter,
+
+    /// Price one LOC_INVENTORY slot of our own stall (c2s 0x10A). LSB clamps the
+    /// range to 0..=BAZAAR_PRICE_MAX, rejects currency and busy items outright, and
+    /// answers ITEM_ATTR + ITEM_SAME for that slot
+    /// (vendor/server/src/map/packets/c2s/0x10a_bazaar_itemset.cpp).
+    BazaarPriceSet {
+        slot: u8,
+        price: u32,
+    },
+
+    /// Leave the price menu (c2s 0x109): LSB clears `isSettingBazaarPrices` and sets
+    /// UPDATE_HP, which is what republishes us as a stall with bazaar flag set
+    /// (vendor/server/src/map/packets/c2s/0x109_bazaar_open.cpp).
+    BazaarPricesDone,
+
+    /// Publish the message buyers read when they check our stall (c2s 0x0DE). LSB stores it
+    /// verbatim in `char_stats.bazaar_message`, answers nothing, and only ever shows it back to
+    /// us as s2c 0x0CA INSPECT_MESSAGE when somebody checks us
+    /// (vendor/server/src/map/packets/c2s/0x0de_inspect_message.cpp).
+    BazaarComment {
+        text: String,
+    },
+
+    /// Flip one server-visible option flag (c2s 0x0DC GP_CLI_COMMAND_CONFIG;
+    /// vendor/server/src/map/packets/c2s/0x0dc_config.cpp). No optimistic fold:
+    /// LSB always answers with a fresh s2c 0x0B4 CONFIG (vault main_menu.md
+    /// §42), and that echo reconciles the snapshot.
+    SetConfigFlag {
+        flag: ffxi_proto::config::ConfigBit,
+        on: bool,
+    },
+
+    /// Announce one flip of the `conf12wi` store-0xBF pair (c2s **0x088**, body
+    /// law FFXiMain.dll retail-2026-09 RVA 0xE5520; vault main_menu.md §59
+    /// addendum 16). The mode byte is already the law-derived transition value —
+    /// the helper's Monstrosity bail (.text 0x1A8036) and its >0x2328 ms guard
+    /// (.text 0x1A7D05) run in the menu seam before this is sent. vendor/server
+    /// carries no handler for c2s 0x088 (packets/c2s/ has no file for the id),
+    /// so LSB drops the frame and nothing folds back from it.
+    AnnounceConfigBfPair {
+        mode: u8,
     },
 
     /// Buy `quantity` of the browsed bazaar's row `index` (c2s 0x106). The
@@ -4367,3 +5736,12 @@ pub const INSTANT_ACTION_LOCK_MS: u32 = 1000;
 
 #[cfg(test)]
 mod tests;
+
+/// `LinkshellNum`/`LinkshellId` values LSB accepts in this family (`GP_CLI_COMMAND_GROUP_COMLINK_*_LINKSHELLID`).
+fn linkshell_slot_for(id: u8) -> Option<u8> {
+    match id {
+        ffxi_proto::linkshell::LINKSHELL_1 => Some(1),
+        ffxi_proto::linkshell::LINKSHELL_2 => Some(2),
+        _ => None,
+    }
+}

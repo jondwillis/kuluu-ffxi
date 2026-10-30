@@ -75,6 +75,14 @@ pub enum Command<'a> {
 }
 
 impl Command<'_> {
+    pub fn response_len(self, result: u8) -> usize {
+        if matches!(self, Self::Login) && result == RESULT_LOGIN_OK {
+            RESPONSE_LEN
+        } else {
+            RESPONSE_MIN_LEN
+        }
+    }
+
     fn code(&self) -> u8 {
         match self {
             Command::Login => CMD_LOGIN,

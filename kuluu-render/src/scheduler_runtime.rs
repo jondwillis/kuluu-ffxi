@@ -418,6 +418,31 @@ impl ActiveSchedulers {
         self.routines.push(active);
     }
 
+    /// Test-only view for driving entries' clocks directly (the tick system owns the
+    /// component otherwise).
+    #[cfg(test)]
+    pub fn routines_mut(&mut self) -> &mut Vec<ActiveScheduler> {
+        &mut self.routines
+    }
+
+    /// Whether an entry with this routine name is still running (stages or post-finish linger).
+    pub fn is_running(&self, name: [u8; 4]) -> bool {
+        self.routines.iter().any(|r| r.name == name)
+    }
+
+    /// True while a running entry is the rider's get-off (`coff`) inside its own MovementLock
+    /// interval - the routine embeds it for every PC action-animation block (census cited on
+    /// [`ffxi_actor::actor_state::DISMOUNT_ROUTINE`], file 38603: [0,180) over hop-down and land).
+    /// The general law that players are never movement-locked by a routine
+    /// ([`ActiveScheduler::movement_locks_at`]'s record) covers casts and ranged aims; the
+    /// get-off is the deliberate in-file exception, so this stays keyed to the routine name.
+    pub fn dismount_settled(&self) -> bool {
+        self.routines.iter().any(|r| {
+            r.name == ffxi_actor::actor_state::DISMOUNT_ROUTINE
+                && r.movement_locks_at(r.current_frame())
+        })
+    }
+
     /// True while any entry's AnimationLock interval covers its own current frame - the refcount>0
     /// test itself (ActionTimer1 reached 2 and 3 when a hit reaction overlapped a swing).
     pub fn is_locked_now(&self) -> bool {
@@ -623,7 +648,7 @@ pub struct MmbSpriteMesh {
     pub indices: Vec<u32>,
     // Stage 0's D argument per `positions` entry, raw D3DCOLOR byte/255 — DoD3mDraw runs its
     // tables against the un-doubled upload colour (unlike the D3m path, whose /128 normalise
-    // folds stage 0's MODULATE2X in), so ffxi_particle.wgsl's MMB tables expect this scale.
+    // folds stage 0's MODULATE2X in), so ffxi_particle.wesl's MMB tables expect this scale.
     pub colors: Vec<[f32; 4]>,
 
     pub texture_name: String,
@@ -1812,6 +1837,26 @@ fn start_cutscene_camera_tasks(
                     };
                     match crate::cutscene_camera::eid_model_point(locator, baked, render) {
                         Some(point) => {
+                            // One line per route naming which branch resolved the locator and
+                            // where the frozen seed lands: attached-route framing complaints are
+                            // answerable from the console alone (which actor state the zero-interp
+                            // freeze captured), as the first-frame eye/target lines are.
+                            tracing::debug!(
+                                target: "kuluu_render::scheduler_runtime",
+                                routine = %fourcc(active.name()),
+                                camera = %String::from_utf8_lossy(&stage.stage.id),
+                                locator,
+                                model_point = ?point,
+                                branch = if render.is_some() { "skeleton" } else { "height-fraction" },
+                                from_snapshot = q_self.get(actor).is_ok(),
+                                attach_xform_translation = ?attach_xform.translation,
+                                seed_translation = ?crate::cutscene_camera::attach_matrix(
+                                    &attach_xform, point,
+                                )
+                                .col(3)
+                                .truncate(),
+                                "attached cutscene camera route seeded"
+                            );
                             attach = Some(crate::cutscene_camera::AttachStart {
                                 actor,
                                 locator,
@@ -1847,6 +1892,10 @@ fn start_cutscene_camera_tasks(
                 ),
             }
         }
+        // An attached route's angle is decided by the body it rides, so its parameters log at
+        // INFO: one line per start lets a live "the cutscene camera frames the wrong side" be
+        // answered from the console without attaching a debugger.
+        let attached = attach.as_ref().map(|a| (a.actor, a.locator, a.interp));
         let task = crate::cutscene_camera::CutsceneCameraTask::start(
             cam,
             total_frames,
@@ -1854,14 +1903,27 @@ fn start_cutscene_camera_tasks(
             default_chase,
             attach,
         );
-        tracing::debug!(
-            target: "kuluu_render::scheduler_runtime",
-            routine = %fourcc(active.name()),
-            camera = %String::from_utf8_lossy(&stage.stage.id),
-            total_frames,
-            attached = attach.is_some(),
-            "cutscene camera route started"
-        );
+        match attached {
+            Some((caster_entity, locator, interp)) => tracing::info!(
+                target: "kuluu_render::scheduler_runtime",
+                routine = %fourcc(active.name()),
+                camera = %String::from_utf8_lossy(&stage.stage.id),
+                total_frames,
+                attached = true,
+                caster = %caster_entity,
+                locator,
+                interp = interp as f64,
+                "cutscene camera route started"
+            ),
+            None => tracing::debug!(
+                target: "kuluu_render::scheduler_runtime",
+                routine = %fourcc(active.name()),
+                camera = %String::from_utf8_lossy(&stage.stage.id),
+                total_frames,
+                attached = false,
+                "cutscene camera route started"
+            ),
+        }
         tasks.start(task);
     }
 }
@@ -3879,6 +3941,14 @@ pub fn release_cutscene_actors(
     // Release every cutscene-hidden model so it reappears on its last server-authored
     // visibility (scene.rs apply_invis_flag_system owns Visibility from the next frame
     // once the marker is gone).
+    if !q_hidden.is_empty() {
+        tracing::info!(
+            target: "kuluu_render::scheduler_runtime",
+            hidden_entities = q_hidden.iter().count(),
+            hidden_ids = ?state.hidden,
+            "cutscene ended; releasing its hidden actors"
+        );
+    }
     for e in q_hidden.iter() {
         commands.entity(e).remove::<CutsceneHidden>();
     }
@@ -10649,7 +10719,7 @@ mod tests {
                     center: Vec3::ZERO,
                     half_extent: Vec2::ONE,
                     haze_offset: 0.02,
-                    started_at: std::time::Instant::now(),
+                    started_at: bevy::platform::time::Instant::now(),
                     duration_secs: 1.0,
                     envelope: None,
                     follow: None,

@@ -1,4 +1,5 @@
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use bevy::platform::time::Instant;
+use web_time::{SystemTime, UNIX_EPOCH};
 
 use bevy::prelude::*;
 use kuluu_snapshot::ViewerEvent;
@@ -390,8 +391,6 @@ mod tests {
 
     #[test]
     fn one_vana_day_advances_the_monthday() {
-        // vendor/server/scripts/globals/chocobo_raising.lua xi.chocoboRaising.dayLength — one Vana'diel
-        // day is 3456 Earth seconds.
         assert_eq!(EARTH_SECS_PER_VANA_DAY, 3456);
         let date = VanaDate::from_earth_unix(EARTH_EPOCH_UNIX + EARTH_SECS_PER_VANA_DAY);
         assert_eq!((date.day, date.month, date.year), (2, 1, VANA_BASE_YEAR));
@@ -400,8 +399,6 @@ mod tests {
 
     #[test]
     fn one_vana_week_wraps_the_weekday() {
-        // vendor/server/scripts/globals/chocobo_raising.lua xi.chocoboRaising.dayLength — one Vana'diel
-        // week is 27648 Earth seconds (8 days).
         let week_secs = VANA_DAYS_PER_WEEK * EARTH_SECS_PER_VANA_DAY;
         assert_eq!(week_secs, 27_648);
         assert_eq!(

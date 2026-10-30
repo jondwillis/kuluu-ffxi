@@ -146,6 +146,7 @@ fn zone_change_sets_and_clears_myroom() {
         model: 257,
         sub_map: 0,
         exit_bit: 1,
+        door_open: false,
     };
     s.apply_event(&AgentEvent::ZoneChanged {
         from: None,
@@ -190,6 +191,9 @@ fn job_info_and_2f_unlock_fold() {
         unlocked: 0b1011,
         sub_job_unlocked: true,
         job_levels,
+        can_thumbs_up_mentor: true,
+        mentor_rank: 2,
+        mastery_rank: 1,
     };
     s.apply_event(&AgentEvent::JobInfoUpdated { info });
     assert_eq!(s.job_info, Some(info));
@@ -1556,6 +1560,8 @@ fn inventory_fold_slot_changed_inserts_then_updates_then_removes() {
         next_use_vana_ts: None,
         use_delay_end_vana_ts: None,
         ready: None,
+
+        extdata: None,
     };
 
     s.apply_event(&AgentEvent::InventoryUpdated {
@@ -1597,6 +1603,8 @@ fn inventory_fold_item_list_after_item_attr_keeps_charge_state() {
         next_use_vana_ts: Some(1_000),
         use_delay_end_vana_ts: Some(5_030),
         ready: Some(false),
+
+        extdata: None,
     };
     s.apply_event(&AgentEvent::InventoryUpdated {
         container: 0,
@@ -1663,6 +1671,8 @@ fn inventory_fold_no_select_covers_a_use_until_its_recast_lands() {
         next_use_vana_ts: Some(0),
         use_delay_end_vana_ts: Some(0),
         ready: Some(true),
+
+        extdata: None,
     };
     let fold = |s: &mut SessionState, slot: ItemSlot| {
         s.apply_event(&AgentEvent::InventoryUpdated {
@@ -1742,6 +1752,8 @@ fn inventory_fold_quantity_changed_updates_existing_slot_only() {
                 next_use_vana_ts: None,
                 use_delay_end_vana_ts: None,
                 ready: None,
+
+                extdata: None,
             },
         },
     });
@@ -2412,6 +2424,163 @@ fn apply_event_dedupes_identical_self_position() {
     assert!(!s.apply_event(&AgentEvent::PositionChanged { pos }));
 }
 
+#[test]
+fn party_solicit_lands_and_clears_on_the_state_field() {
+    // s2c 0x0DC arrives → pending invite on the state (the snapshot carries it
+    // to the Party row's helper law — FFXiMain.dll retail-2026-09 RVA 0x2016E0,
+    // vault main_menu.md section 24); s2c 0x0DE clears it.
+    let mut state = SessionState::default();
+    assert!(state.party_invite.is_none());
+    assert!(state.apply_event(&AgentEvent::PartySolicitReceived {
+        char_id: 0x00A1_0002,
+        name: "Pruneo".into(),
+        alliance: false,
+    }));
+    let invite = state.party_invite.clone().unwrap();
+    assert_eq!(
+        (invite.char_id, invite.name.as_str(), invite.alliance),
+        (0x00A1_0002, "Pruneo", false)
+    );
+
+    // Re-stamping the same invite is not a change.
+    assert!(!state.apply_event(&AgentEvent::PartySolicitReceived {
+        char_id: 0x00A1_0002,
+        name: "Pruneo".into(),
+        alliance: false,
+    }));
+
+    assert!(state.apply_event(&AgentEvent::PartySolicitWithdrawn));
+    assert!(state.party_invite.is_none());
+    // With nothing pending, withdrawing changes nothing.
+    assert!(!state.apply_event(&AgentEvent::PartySolicitWithdrawn));
+}
+
+/// The trade fold's phase law (vendor/server/src/map/items/transactions/
+/// player_trade.cpp; vault main_menu.md §25): an invite opens the pending
+/// answer window, RES{Start} makes it live, slot views re-stamp and ANY change
+/// un-confirms both sides, Make marks us confirmed locally, and a terminal RES
+/// clears the transaction — duplicate pushes of either kind change nothing.
+#[test]
+fn trade_phases_fold_into_the_state_field() {
+    use ffxi_proto::decode::{TradeResKind as K, TRADE_GIL_ITEM_NO};
+    use kuluu_snapshot::TradeOffer;
+
+    let mut state = SessionState::default();
+    assert!(state.trade.is_none());
+    // With no transaction open even our own echo pushes change nothing (LSB's
+    // one-transaction rule).
+    assert!(!state.apply_event(&AgentEvent::TradeMySlotSet {
+        trade_index: 0,
+        offer: None,
+    }));
+
+    // s2c 0x021 → the answer window (retail opens its gift pair likewise).
+    assert!(state.apply_event(&AgentEvent::TradeIncoming { char_id: 42 }));
+    let opened = state.trade.clone().unwrap();
+    assert_eq!(
+        (opened.partner_id, opened.incoming_pending, opened.active),
+        (42, true, false)
+    );
+    // Re-stamping the same invite is not a change.
+    assert!(!state.apply_event(&AgentEvent::TradeIncoming { char_id: 42 }));
+
+    // RES{Start} — the answer landed and LSB opened the transaction for both
+    // sides, so our window goes live.
+    assert!(state.apply_event(&AgentEvent::TradeRes { kind: K::Start }));
+    let live = state.trade.clone().unwrap();
+    assert!(!live.incoming_pending && live.active);
+
+    // Gil staged in slot 0 (s2c 0x025 echo) and Make confirmed locally… an
+    // identical re-push neither changes the slot nor clears that stamp.
+    let gil = TradeOffer {
+        item_no: TRADE_GIL_ITEM_NO,
+        qty: 10,
+    };
+    assert!(state.apply_event(&AgentEvent::TradeMySlotSet {
+        trade_index: 0,
+        offer: Some(gil),
+    }));
+    assert!(state.apply_event(&AgentEvent::TradeMadeLocally));
+    assert!(!state.apply_event(&AgentEvent::TradeMySlotSet {
+        trade_index: 0,
+        offer: Some(gil),
+    }));
+    assert!(state.trade.as_deref().is_some_and(|w| w.my_confirmed));
+
+    // A partner-side view (s2c 0x023) mutates the deal and un-confirms us.
+    let theirs = TradeOffer {
+        item_no: 4112,
+        qty: 1,
+    };
+    assert!(state.apply_event(&AgentEvent::TradePartnerSlotSet {
+        trade_index: 7,
+        offer: Some(theirs),
+    }));
+    assert!(state
+        .trade
+        .as_deref()
+        .is_some_and(|w| !w.my_confirmed && w.partner_slots.len() == 8));
+
+    // A terminal RES clears the transaction; further terminals change nothing.
+    assert!(state.apply_event(&AgentEvent::TradeRes { kind: K::End }));
+    assert!(state.trade.is_none());
+    assert!(!state.apply_event(&AgentEvent::TradeRes { kind: K::Cancell }));
+}
+
+/// The client-local macro store law (bead kuluu-o9qt7.19.2, vault
+/// main_menu.md §41): MacrosLoaded replaces the folded list wholesale — a
+/// later commit that dropped slots must not linger beside the old ones.
+#[test]
+fn macros_loaded_replaces_wholesale() {
+    use kuluu_snapshot::MacroSlot;
+    let mut state = SessionState::default();
+    let first = vec![
+        MacroSlot {
+            block: 0,
+            index: 1,
+            text: "/ra".to_string(),
+        },
+        MacroSlot {
+            block: 1,
+            index: 2,
+            text: "/heal".to_string(),
+        },
+    ];
+    assert!(state.apply_event(&AgentEvent::MacrosLoaded {
+        slots: first.clone()
+    }));
+    assert_eq!(state.macros, first);
+    let second = vec![MacroSlot {
+        block: 0,
+        index: 1,
+        text: "/reraise".to_string(),
+    }];
+    assert!(state.apply_event(&AgentEvent::MacrosLoaded {
+        slots: second.clone()
+    }));
+    assert_eq!(state.macros, second);
+}
+
+/// The emote display order folds wholesale too (bead kuluu-o9qt7.34): retail's
+/// fill law re-reads the whole blob at open (FFXiMain.dll retail-2026-09
+/// `.text 0x225960` resets state words), so a later load must replace — never
+/// merge — what kuluu folded before.
+#[test]
+fn emote_order_loaded_replaces_wholesale() {
+    let mut state = SessionState::default();
+    assert_eq!(
+        state.emote_order,
+        Vec::<u8>::new(),
+        "never-arranged default"
+    );
+    assert!(state.apply_event(&AgentEvent::EmoteOrderLoaded {
+        ids: vec![6, 4, 12]
+    }));
+    assert_eq!(state.emote_order, vec![6, 4, 12]);
+    assert!(state.apply_event(&AgentEvent::EmoteOrderLoaded { ids: vec![9] }));
+    assert_eq!(state.emote_order, vec![9]);
+}
+
 /// AgentCommand is an EXTENSION SURFACE: its serde tags ("cmd"/"type",
 /// snake_case variant names) are the agent-socket/MCP wire contract, so it
 /// evolves additive-only. This match is exhaustive on purpose — adding,
@@ -2424,6 +2593,8 @@ fn apply_event_dedupes_identical_self_position() {
 #[allow(clippy::unneeded_struct_pattern)]
 fn _agentcommand_is_additive_only(x: &AgentCommand) {
     match x {
+        AgentCommand::Synthesize { .. } => (),
+        AgentCommand::PlayerSearch { .. } => (),
         AgentCommand::Move { .. } => (),
         AgentCommand::StopMove { .. } => (),
         AgentCommand::GroundCorrection { .. } => (),
@@ -2432,6 +2603,33 @@ fn _agentcommand_is_additive_only(x: &AgentCommand) {
         AgentCommand::MogHouseExit { .. } => (),
         AgentCommand::ChangeJob { .. } => (),
         AgentCommand::OpenMogMenu { .. } => (),
+        // myroom's door row + roomlist remodel, c2s 0x0CB MYROOM_IS (beads
+        // kuluu-o9qt7.13.5/.6).
+        AgentCommand::MogHouseDoorSelect { .. } => (),
+        AgentCommand::MogHouseRemodel { .. } => (),
+        // The Mog House furniture/plant request family, c2s 0x0FA..0x0FF (bead kuluu-o9qt7.38).
+        AgentCommand::MyroomLayout { .. } => (),
+        AgentCommand::MyroomLayoutDone { .. } => (),
+        AgentCommand::MyroomBankin { .. } => (),
+        AgentCommand::MyroomPlantAdd { .. } => (),
+        AgentCommand::MyroomPlantCheck { .. } => (),
+        AgentCommand::MyroomPlantCrop { .. } => (),
+        AgentCommand::MyroomPlantStop { .. } => (),
+        // The arrangement mode request the session actor gates and applies (bead kuluu-o9qt7.39).
+        AgentCommand::MyroomMode { .. } => (),
+        AgentCommand::CommitMacros { .. } => (),
+        AgentCommand::CommitEmoteOrder { .. } => (),
+        // Header-only currency report requests (bead kuluu-o9qt7.35).
+        AgentCommand::RequestCurrencies { .. } => (),
+        AgentCommand::RequestUnityRanking { .. } => (),
+        AgentCommand::RequestUnityQuest { .. } => (),
+        AgentCommand::SetUnityChat { .. } => (),
+        AgentCommand::RequestAlterEgoPoints { .. } => (),
+        AgentCommand::UpgradeAlterEgo { .. } => (),
+        AgentCommand::SetMeritMode { .. } => (),
+        AgentCommand::EditMerit { .. } => (),
+        AgentCommand::SpendJobPoint { .. } => (),
+        AgentCommand::RequestJobPoints => (),
         AgentCommand::TreasureLot { .. } => (),
         AgentCommand::TreasurePass { .. } => (),
         AgentCommand::MarkKeyItemsSeen { .. } => (),
@@ -2442,6 +2640,16 @@ fn _agentcommand_is_additive_only(x: &AgentCommand) {
         AgentCommand::EndEventBack { .. } => (),
         AgentCommand::EndEventChoice { .. } => (),
         AgentCommand::CustomMenuRespond { .. } => (),
+        AgentCommand::PartyInviteRespond { .. } => (),
+        // The player-trade command family (bead kuluu-o9qt7.9, vault
+        // main_menu.md §25): names are the agent-socket wire contract.
+        AgentCommand::TradeRequest { .. } => (),
+        AgentCommand::TradeRespond { .. } => (),
+        AgentCommand::TradeStage { .. } => (),
+        AgentCommand::TradeSetGil { .. } => (),
+        AgentCommand::TradeClearSlot { .. } => (),
+        AgentCommand::TradeConfirm { .. } => (),
+        AgentCommand::TradeCancel { .. } => (),
         AgentCommand::Disconnect { .. } => (),
         AgentCommand::ReqLogout { .. } => (),
         AgentCommand::Snapshot { .. } => (),
@@ -2462,6 +2670,10 @@ fn _agentcommand_is_additive_only(x: &AgentCommand) {
         AgentCommand::Cancel { .. } => (),
         AgentCommand::UseItem { .. } => (),
         AgentCommand::Equip { .. } => (),
+        // The set arms: c2s 0x051/0x053/0x052 (`.agents/skills/retail-observe/references/2026-10-25-equip-set-apply.md`).
+        AgentCommand::EquipSetWear { .. } => (),
+        AgentCommand::StyleLockSet { .. } => (),
+        AgentCommand::EquipSetCheck { .. } => (),
         AgentCommand::StackInventory { .. } => (),
         AgentCommand::DeliveryBox { .. } => (),
         AgentCommand::DeliveryTake { .. } => (),
@@ -2475,8 +2687,16 @@ fn _agentcommand_is_additive_only(x: &AgentCommand) {
         AgentCommand::CloseShop { .. } => (),
         AgentCommand::CheckTarget { .. } => (),
         AgentCommand::OpenBazaar { .. } => (),
+        AgentCommand::SetConfigFlag { .. } => (),
+        AgentCommand::AnnounceConfigBfPair { .. } => (),
         AgentCommand::BuyBazaarItem { .. } => (),
         AgentCommand::CloseBazaar { .. } => (),
+        // Our own stall's price menu and comment field, c2s 0x109/0x10A/0x10B plus
+        // 0x0DE INSPECT_MESSAGE (owner captures 2026-10-24).
+        AgentCommand::BazaarPricesEnter => (),
+        AgentCommand::BazaarPriceSet { .. } => (),
+        AgentCommand::BazaarPricesDone => (),
+        AgentCommand::BazaarComment { .. } => (),
         AgentCommand::Heal { .. } => (),
         AgentCommand::Fish { .. } => (),
         AgentCommand::FishingInput { .. } => (),
@@ -2492,6 +2712,128 @@ fn _agentcommand_is_additive_only(x: &AgentCommand) {
         AgentCommand::AhSalesStatus { .. } => (),
         AgentCommand::AhCancelSale { .. } => (),
     }
+}
+
+/// Retail keeps only the server's `PlayTime` base plus a stamp of when it
+/// arrived and adds elapsed seconds at `/playtime` (FFXiMain.dll retail-2026-09
+/// RVA 0x7CAB0, store pair `.text 0xFB3EE`/`.text 0xFB3FA`), so a session zoned in
+/// some time ago has to report more than the raw base.
+#[test]
+fn play_time_sync_stores_the_base_pair_and_adds_elapsed_since_arrival() {
+    const BASE_SECS: u32 = 3 * 86_400 + 4 * 3600 + 5 * 60;
+    const ELAPSED_WHOLE_SECS: u64 = 90;
+
+    let mut state = SessionState::default();
+    assert_eq!(state.play_time_seconds(), 0);
+
+    assert!(state.apply_event(&AgentEvent::PlayTimeSynced { seconds: BASE_SECS }));
+    let base = state.play_time_base.expect("LOGIN stores the pair");
+    assert_eq!(base.base_secs, BASE_SECS);
+    assert_eq!(base.seconds_at(base.arrival_ms), u64::from(BASE_SECS));
+    assert_eq!(
+        base.seconds_at(base.arrival_ms + MS_PER_SECOND * ELAPSED_WHOLE_SECS + (MS_PER_SECOND - 1)),
+        u64::from(BASE_SECS) + ELAPSED_WHOLE_SECS,
+        "the elapsed term divides down to whole seconds like retail's"
+    );
+
+    assert!(
+        !state.apply_event(&AgentEvent::PlayTimeSynced { seconds: BASE_SECS }),
+        "an identical base is not a snapshot change"
+    );
+
+    let reported = state.play_time_seconds();
+    assert!(
+        reported >= u64::from(BASE_SECS),
+        "the wire number never drops below the server's base, got {reported}"
+    );
+}
+
+/// The 0x062 block is what un-greys the Status window's Combat/Magic/Craft rows,
+/// so it must survive both folds: onto the state and into the snapshot the renderer
+/// reads (FFXiMain.dll retail-2026-09 `.text 0x148B50` opens those three disabled;
+/// only content in this table enables them).
+#[test]
+fn char_skills_update_folds_onto_state_and_snapshot() {
+    let mut skills = [0u16; kuluu_snapshot::CharSkills::SKILL_COUNT];
+    const HAND_TO_HAND: u16 = 301;
+    skills[1] = HAND_TO_HAND;
+    let block = kuluu_snapshot::CharSkills {
+        command_recast: [7; kuluu_snapshot::CharSkills::COMMAND_RECAST_COUNT],
+        skills,
+    };
+
+    let mut state = SessionState::default();
+    assert!(state.apply_event(&AgentEvent::CharSkillsUpdated { skills: block }));
+    assert_eq!(state.char_skills, Some(block));
+    assert!(
+        !state.apply_event(&AgentEvent::CharSkillsUpdated { skills: block }),
+        "an identical block is not a snapshot change"
+    );
+
+    let snap = crate::wire_translate::state_to_snapshot(&state);
+    let projected = snap.char_skills.expect("snapshot carries the block");
+    assert_eq!(projected.skills[1], HAND_TO_HAND);
+    assert_eq!(projected.command_recast, block.command_recast);
+}
+
+/// s2c 0x063 MISCDATA Merits folds replace one another and ride the snapshot (bead
+/// kuluu-o9qt7.43) — retail's dispatcher re-stores 0x485826/0x48582A on every arrival
+/// (.text FFXiMain.dll retail-2026-09 `0x99290`).
+#[test]
+fn merits_record_folds_replace_and_project() {
+    let mut state = SessionState::default();
+    assert!(state.merits.is_none());
+    let m = kuluu_snapshot::MisdataMerits {
+        limit_points: 7,
+        merit_points: 4,
+        blu_bonus: 1,
+        can_use_merit_mode: true,
+        xp_capped_or_merit_mode: false,
+        merit_mode_enabled: true,
+        max_merit_points: 56,
+    };
+    assert!(state.apply_event(&AgentEvent::MeritsUpdated { merits: m }));
+    assert_eq!(state.merits, Some(m));
+    assert!(
+        !state.apply_event(&AgentEvent::MeritsUpdated { merits: m }),
+        "an identical record is not a snapshot change"
+    );
+    let snap = crate::wire_translate::state_to_snapshot(&state);
+    assert_eq!(snap.merits, Some(m));
+}
+
+/// s2c 0x063 MISCDATA Homepoints folds replace one another and ride the snapshot (bead
+/// kuluu-o9qt7.45) — retail rep-movsds over the whole mask store on every arrival
+/// (.text FFXiMain.dll retail-2026-09 `0x99330`).
+#[test]
+fn homepoints_record_folds_replace_and_project() {
+    let mut state = SessionState::default();
+    assert!(state.homepoints.is_none());
+    let masks = kuluu_snapshot::HomepointMasks {
+        home_point: [1, 2, 4, 8],
+        survival_guide: [0x10, 0x20, 0x40, 0x80],
+        waypoint: [0xFFFF_FFFF, 0, 0, 0],
+        telepoint: 0xDEAD_BEEF,
+        atmos: 0xCAFE_BABE,
+        eschan_portal: 0xF00D_D00D,
+    };
+    assert!(state.apply_event(&AgentEvent::HomepointsUpdated { masks }));
+    assert_eq!(state.homepoints, Some(masks));
+    assert!(
+        !state.apply_event(&AgentEvent::HomepointsUpdated { masks }),
+        "an identical record is not a snapshot change"
+    );
+    let next = kuluu_snapshot::HomepointMasks {
+        telepoint: 1,
+        ..masks
+    };
+    assert!(
+        state.apply_event(&AgentEvent::HomepointsUpdated { masks: next }),
+        "a fresh record replaces the last, not a merge"
+    );
+    assert_eq!(state.homepoints, Some(next));
+    let snap = crate::wire_translate::state_to_snapshot(&state);
+    assert_eq!(snap.homepoints, Some(next));
 }
 
 #[test]
@@ -2560,6 +2902,199 @@ fn ground_height_correction_is_same_column_and_height_only() {
     assert_eq!(position.speed_base, 5);
 }
 
+#[test]
+fn linkshell_slot_events_fold_the_pair_and_ignore_unknown_slots() {
+    // s2c 0x0E0 law (vault main_menu.md §27): one packet describes one slot, LSB pushes both at
+    // login, and a zeroed pair means "nothing equipped in that slot".
+    let mut state = SessionState::default();
+    assert!(!state.linkshells.one.is_occupied());
+
+    assert!(state.apply_event(&AgentEvent::LinkShellSlotChanged {
+        linkshell_slot: 1,
+        category: 0,
+        item_index: 12,
+    }));
+    assert_eq!(state.linkshells.one.item_index, 12);
+
+    // The second login push reports slot 2; the first slot must survive it.
+    assert!(state.apply_event(&AgentEvent::LinkShellSlotChanged {
+        linkshell_slot: 2,
+        category: 1,
+        item_index: 3,
+    }));
+    assert_eq!(state.linkshells.one.item_index, 12);
+    assert_eq!(
+        state.linkshells.two,
+        kuluu_snapshot::LinkShellSlot {
+            category: 1,
+            item_index: 3
+        }
+    );
+
+    // Repeating the same report changes nothing.
+    assert!(!state.apply_event(&AgentEvent::LinkShellSlotChanged {
+        linkshell_slot: 2,
+        category: 1,
+        item_index: 3,
+    }));
+
+    // Unequip arrives as zeros; slot ids outside LSB's LinkshellId 1/2 are ignored.
+    assert!(state.apply_event(&AgentEvent::LinkShellSlotChanged {
+        linkshell_slot: 2,
+        category: 0,
+        item_index: 0,
+    }));
+    assert!(!state.linkshells.two.is_occupied());
+    assert!(!state.apply_event(&AgentEvent::LinkShellSlotChanged {
+        linkshell_slot: 3,
+        category: 0,
+        item_index: 9,
+    }));
+}
+
+#[test]
+fn myroom_mode_changes_fold_from_the_actor_mirror() {
+    // The arrangement mode has no wire (retail keeps it in the myroom manager's own word), so the
+    // session actor's accepted transitions are the only thing that may move this field (bead
+    // kuluu-o9qt7.39; FFXiMain.dll retail-2026-09 `.text 0x1D34FA`).
+    let mut state = SessionState::default();
+    assert_eq!(state.myroom_mode, crate::myroom_layout::MODE_NORMAL);
+
+    assert!(state.apply_event(&AgentEvent::MyroomModeChanged {
+        previous: crate::myroom_layout::MODE_NORMAL,
+        next: crate::myroom_layout::MODE_LAYOUT,
+    }));
+    assert_eq!(state.myroom_mode, crate::myroom_layout::MODE_LAYOUT);
+
+    // A replayed change reports no mutation.
+    assert!(!state.apply_event(&AgentEvent::MyroomModeChanged {
+        previous: crate::myroom_layout::MODE_NORMAL,
+        next: crate::myroom_layout::MODE_LAYOUT,
+    }));
+}
+
+#[test]
+fn synth_answers_replace_the_last_outcome_whole() {
+    // s2c 0x06F is one-shot feedback (vault main_menu.md §28): every answer
+    // replaces whatever we held, and a duplicate answer changes nothing.
+    let mut state = SessionState::default();
+    assert!(state.synth_result.is_none());
+
+    let success = kuluu_snapshot::SynthOutcome {
+        result: ffxi_proto::synth::result::SUCCESS,
+        grade: 0,
+        count: 33,
+        item_no: 17319,
+        broken_items: vec![705],
+    };
+    assert!(state.apply_event(&AgentEvent::SynthCompleted {
+        outcome: success.clone()
+    }));
+    assert_eq!(state.synth_result.as_ref(), Some(&success));
+
+    // A later failure replaces the success whole — no merge, no queue.
+    let failed = kuluu_snapshot::SynthOutcome {
+        result: ffxi_proto::synth::result::FAILED,
+        grade: 0,
+        count: 0,
+        item_no: 0,
+        broken_items: vec![],
+    };
+    assert!(state.apply_event(&AgentEvent::SynthCompleted {
+        outcome: failed.clone()
+    }));
+    assert_eq!(state.synth_result.as_ref(), Some(&failed));
+
+    assert!(!state.apply_event(&AgentEvent::SynthCompleted { outcome: failed }));
+}
+
+#[test]
+fn mission_battery_folds_whole_per_port() {
+    // s2c 0x056 (vault main_menu.md §30): login pushes the battery; every frame
+    // replaces its own port whole and changes nothing else.
+    let mut state = SessionState::default();
+    assert!(state.missions.info.is_none());
+
+    let info = kuluu_snapshot::MissionInfo {
+        nation: 1,
+        nation_mission: 5,
+        rotz: 0,
+        cop: 0,
+        cop2: 0,
+        addon_acp: 0,
+        addon_amk: 0,
+        addon_asa: 0,
+        tales_beginning: 0x3F,
+        soa: 0,
+        rov: 0,
+    };
+    assert!(state.apply_event(&AgentEvent::MissionInfoUpdated { info }));
+    assert_eq!(state.missions.info, Some(info));
+    assert!(!state.apply_event(&AgentEvent::MissionInfoUpdated { info }));
+
+    let entry = kuluu_snapshot::MissionLogEntry {
+        port: 0xD0,
+        data: [1, 2, 3, 4, 5, 6, 7, 8],
+    };
+    assert!(state.apply_event(&AgentEvent::MissionLogUpdated { entry }));
+    let updated = kuluu_snapshot::MissionLogEntry {
+        port: 0xD0,
+        data: [9; 8],
+    };
+    assert!(state.apply_event(&AgentEvent::MissionLogUpdated { entry: updated }));
+    assert_eq!(state.missions.logs.len(), 1);
+    assert_eq!(state.missions.logs[0], updated);
+
+    assert!(state.apply_event(&AgentEvent::MissionTvrUpdated { tvr: 7 }));
+    assert_eq!(state.missions.tvr, 7);
+}
+
+/// The s2c 0x0B4 CONFIG fold (vault main_menu.md §42): each frame restates the
+/// SAVE_CONF prefix whole; only an actual byte change reports as changed.
+#[test]
+fn config_confdata_folds_whole() {
+    let mut state = SessionState::default();
+    assert!(state.config_confdata.is_none());
+    assert!(state.apply_event(&AgentEvent::ConfigUpdated {
+        confdata: [0x01, 0, 0, 0]
+    }));
+    assert_eq!(state.config_confdata, Some([0x01, 0, 0, 0]));
+    assert!(!state.apply_event(&AgentEvent::ConfigUpdated {
+        confdata: [0x01, 0, 0, 0]
+    }));
+    assert!(state.apply_event(&AgentEvent::ConfigUpdated {
+        confdata: [0x03, 0x40, 0, 0x20]
+    }));
+}
+
+/// The s2c 0x044 folds (vault main_menu.md §39): one PUP frame lands the whole
+/// automaton record and repeats are no-ops; same law for MON.
+#[test]
+fn extended_job_frames_fold_whole() {
+    let mut state = crate::state::SessionState::default();
+    let automaton = kuluu_snapshot::AutomatonInfo {
+        is_sub_job: false,
+        head: 2, // AutomatonHead::Valoredge (vendor/server/src/map/enums/automaton.h)
+        frame: 0x21,
+        attachments: [0; 12],
+        unlocked_heads: 0x3F,
+        unlocked_frames: 0x0F,
+    };
+    assert!(state.apply_event(&AgentEvent::AutomatonUpdated {
+        automaton: automaton.clone()
+    }));
+    assert_eq!(state.automaton, Some(Box::new(automaton.clone())));
+    assert!(!state.apply_event(&AgentEvent::AutomatonUpdated { automaton }));
+
+    let monstrosity = kuluu_snapshot::MonstrosityInfo {
+        species: 71,
+        equipped_instincts: [0; 12],
+    };
+    assert!(state.apply_event(&AgentEvent::MonstrosityUpdated { monstrosity }));
+    assert_eq!(state.monstrosity, Some(monstrosity));
+    assert!(!state.apply_event(&AgentEvent::MonstrosityUpdated { monstrosity }));
+}
+
 /// AgentEvent is an EXTENSION SURFACE: its serde tags ("cmd"/"type",
 /// snake_case variant names) are the agent-socket/MCP wire contract, so it
 /// evolves additive-only. This match is exhaustive on purpose — adding,
@@ -2572,7 +3107,20 @@ fn ground_height_correction_is_same_column_and_height_only() {
 #[allow(clippy::unneeded_struct_pattern)]
 fn _agentevent_is_additive_only(x: &AgentEvent) {
     match x {
+        AgentEvent::MissionInfoUpdated { .. } => (),
+        AgentEvent::MissionTvrUpdated { .. } => (),
+        AgentEvent::MissionLogUpdated { .. } => (),
+        AgentEvent::SynthCompleted { .. } => (),
+        AgentEvent::PlayerSearchCompleted { .. } => (),
+        AgentEvent::LinkShellSlotChanged { .. } => (),
+        AgentEvent::AutomatonUpdated { .. } => (),
+        AgentEvent::ConfigUpdated { .. } => (),
+        AgentEvent::MonstrosityUpdated { .. } => (),
         AgentEvent::Connected { .. } => (),
+        AgentEvent::MacrosLoaded { .. } => (),
+        AgentEvent::EmoteOrderLoaded { .. } => (),
+        // Raw currency report folds (bead kuluu-o9qt7.35).
+        AgentEvent::CurrenciesLoaded { .. } => (),
         AgentEvent::StageChanged { .. } => (),
         AgentEvent::ZoneChanged { .. } => (),
         AgentEvent::SubAreaSynced { .. } => (),
@@ -2618,6 +3166,16 @@ fn _agentevent_is_additive_only(x: &AgentEvent) {
         AgentEvent::NetStats { .. } => (),
         AgentEvent::PartyMemberUpdated { .. } => (),
         AgentEvent::PartyTableReset { .. } => (),
+        AgentEvent::PartySolicitReceived { .. } => (),
+        AgentEvent::PartySolicitWithdrawn => (),
+        // The player-trade fold family (bead kuluu-o9qt7.9, vault
+        // main_menu.md §25).
+        AgentEvent::TradeIncoming { .. } => (),
+        AgentEvent::TradeOutgoingOpened { .. } => (),
+        AgentEvent::TradeRes { .. } => (),
+        AgentEvent::TradeMySlotSet { .. } => (),
+        AgentEvent::TradePartnerSlotSet { .. } => (),
+        AgentEvent::TradeMadeLocally => (),
         AgentEvent::LowHp { .. } => (),
         AgentEvent::PartyMemberLowHp { .. } => (),
         AgentEvent::EngagedBy { .. } => (),
@@ -2641,6 +3199,20 @@ fn _agentevent_is_additive_only(x: &AgentEvent) {
         AgentEvent::HumanReleased { .. } => (),
         AgentEvent::MusicChanged { .. } => (),
         AgentEvent::DeathTimerUpdated { .. } => (),
+        AgentEvent::PlayTimeSynced { .. } => (),
+        AgentEvent::CharSkillsUpdated { .. } => (),
+        AgentEvent::MeritsUpdated { .. } => (),
+        AgentEvent::AlterEgoPointsUpdated { .. } => (),
+        AgentEvent::UnityRankingChunk { .. } => (),
+        AgentEvent::UnityRankingRequested { .. } => (),
+        AgentEvent::UnityQuestUpdated { .. } => (),
+        AgentEvent::UnityQuestRequested { .. } => (),
+        AgentEvent::LoginStateSynced { .. } => (),
+        AgentEvent::MeritsListed { .. } => (),
+        AgentEvent::JobPointsListed { .. } => (),
+        AgentEvent::JobPointsRecordUpdated { .. } => (),
+        // Raw homepoint mask fold (bead kuluu-o9qt7.45).
+        AgentEvent::HomepointsUpdated { .. } => (),
         AgentEvent::DeathMenuUpdated { .. } => (),
         AgentEvent::MusicVolumeChanged { .. } => (),
         AgentEvent::LevelUp { .. } => (),
@@ -2683,6 +3255,13 @@ fn _agentevent_is_additive_only(x: &AgentEvent) {
         AgentEvent::MapOpen { .. } => (),
         AgentEvent::MapMarkerPlaced { .. } => (),
         AgentEvent::MapClosed => (),
+        AgentEvent::EventSoundChannelsSet { .. } => (),
+        AgentEvent::EventSoundChannelsChange { .. } => (),
+        AgentEvent::EventMapPropsState { .. } => (),
+        AgentEvent::MapReloadRequested { .. } => (),
+        AgentEvent::ActorRenderFlagChanged { .. } => (),
+        // The actor-mirrored arrangement mode (bead kuluu-o9qt7.39).
+        AgentEvent::MyroomModeChanged { .. } => (),
     }
 }
 
@@ -2872,4 +3451,442 @@ fn legacy_clock_hold_event_uses_hour_only_defaults() {
             }
         }
     ));
+}
+
+/// The raw Attr is part of the record, and it survives a fold that restates no Attr — but only for
+/// the item it was stamped with.
+#[test]
+fn item_attr_stamps_the_raw_attr_and_a_bare_fold_keeps_it_for_the_same_item() {
+    // FFXiMain.dll retail-2026-09 `.text 0xEC630` copies the whole 24-byte Attr into the inventory
+    // record, and the Mog House furniture law reads its layer/pose bytes out of that copy
+    // (`.text 0x1CCFD1`). A later s2c 0x01F-shaped fold carries no Attr at all; losing it here would
+    // empty the room.
+    let attr = [
+        0x00, 0x41, 0x00, 0x00, 0x00, 0x00, 0xf8, 0x02, 0x06, 0x03, 0xaa, 0xbb, 0xcc, 0xdd, 0xee,
+        0xff, 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80,
+    ];
+    let mut s = SessionState::default();
+
+    let placed = ItemSlot {
+        index: 7,
+        item_no: 100,
+        quantity: 1,
+        locked: false,
+        unselectable: false,
+        price: 0,
+        charges_remaining: None,
+        next_use_vana_ts: None,
+        use_delay_end_vana_ts: None,
+        ready: None,
+        extdata: Some(attr),
+    };
+    s.apply_event(&AgentEvent::InventoryUpdated {
+        container: crate::myroom_furniture::CONTAINER_MOGSAFE,
+        update: InventoryUpdate::SlotChanged { slot: placed },
+    });
+    let shelf = crate::myroom_furniture::CONTAINER_MOGSAFE;
+    assert_eq!(
+        s.inventory.containers[&shelf].slots[0].extdata,
+        Some(attr),
+        "the Attr arrives verbatim on the record"
+    );
+
+    // Same item, no Attr restated: kept.
+    let mut bare = ItemSlot {
+        index: 7,
+        item_no: 100,
+        quantity: 1,
+        locked: true,
+        unselectable: false,
+        price: 0,
+        charges_remaining: None,
+        next_use_vana_ts: None,
+        use_delay_end_vana_ts: None,
+        ready: None,
+        extdata: None,
+    };
+    s.apply_event(&AgentEvent::InventoryUpdated {
+        container: shelf,
+        update: InventoryUpdate::SlotChanged { slot: bare.clone() },
+    });
+    let slots = &s.inventory.containers[&shelf].slots;
+    assert_eq!(slots.len(), 1);
+    assert!(slots[0].locked, "the fold's own fields still apply");
+    assert_eq!(slots[0].extdata, Some(attr));
+
+    // Another item in the same seat: its Attr is unknown until s2c 0x020 says otherwise — a stale
+    // pose from the previous occupant would place furniture the server never put there.
+    bare.item_no = 4112;
+    bare.locked = false;
+    s.apply_event(&AgentEvent::InventoryUpdated {
+        container: shelf,
+        update: InventoryUpdate::SlotChanged { slot: bare },
+    });
+    let slots = &s.inventory.containers[&shelf].slots;
+    assert_eq!(slots[0].item_no, 4112);
+    assert_eq!(slots[0].extdata, None);
+}
+
+/// The law applied to the state's two Mog House shelves: what a player placed, and only what they
+/// placed on the floor they are standing on.
+#[test]
+fn mog_house_shelf_records_rebuild_the_furniture_table() {
+    use crate::myroom_furniture::{
+        furniture_index, rebuild_furniture_objects, StaticItemKinds, CONTAINER_MOGSAFE2,
+    };
+    let installed = |layer: u8, col: i8, level: i8, row: i8| {
+        let mut e = [0u8; 24];
+        e[1] = layer | 0x40;
+        e[6] = col as u8;
+        e[7] = level as u8;
+        e[8] = row as u8;
+        e
+    };
+    let mut s = SessionState::default();
+    for (container, slot, item_no, extdata) in [
+        (
+            crate::myroom_furniture::CONTAINER_MOGSAFE,
+            3u8,
+            100u16,
+            installed(0, 5, 2, -9),
+        ),
+        // Same shelf, other floor: exists but is not drawn from here.
+        (
+            crate::myroom_furniture::CONTAINER_MOGSAFE,
+            4u8,
+            100u16,
+            installed(1, 6, 0, 0),
+        ),
+        // Stored on the shelf rather than placed in the room.
+        (
+            crate::myroom_furniture::CONTAINER_MOGSAFE,
+            5u8,
+            200u16,
+            [0u8; 24],
+        ),
+        // A flowerpot on the second shelf.
+        (CONTAINER_MOGSAFE2, 2u8, 300u16, installed(0, -7, 1, 4)),
+    ] {
+        s.apply_event(&AgentEvent::InventoryUpdated {
+            container,
+            update: InventoryUpdate::SlotChanged {
+                slot: ItemSlot {
+                    index: slot,
+                    item_no,
+                    quantity: 1,
+                    locked: false,
+                    unselectable: false,
+                    price: 0,
+                    charges_remaining: None,
+                    next_use_vana_ts: None,
+                    use_delay_end_vana_ts: None,
+                    ready: None,
+                    extdata: Some(extdata),
+                },
+            },
+        });
+    }
+
+    let kinds = StaticItemKinds(vec![(100, 10), (200, 10), (300, 12)]);
+    let shelf_records = |s: &SessionState| {
+        s.inventory
+            .containers
+            .iter()
+            .filter(|(id, _)| crate::myroom_furniture::is_mog_house_shelf(**id))
+            .flat_map(|(id, c)| {
+                c.slots
+                    .iter()
+                    .map(move |slot| (*id, slot.index, slot.item_no, slot.extdata))
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let downstairs = rebuild_furniture_objects(shelf_records(&s), 0, &kinds);
+    assert_eq!(
+        downstairs
+            .iter()
+            .map(|o| (o.container, o.slot, o.item_no, o.col))
+            .collect::<Vec<_>>(),
+        vec![
+            (crate::myroom_furniture::CONTAINER_MOGSAFE, 3, 100, 5),
+            (CONTAINER_MOGSAFE2, 2, 300, -7),
+        ],
+    );
+    assert_eq!(downstairs[1].index, furniture_index(CONTAINER_MOGSAFE2, 2));
+
+    // The other two pose bytes ride along untouched: byte 7 is LSB's stacking level and byte 8 its
+    // row (vendor/server/src/map/items/item_furnishing.cpp getLevel/getRow).
+    assert_eq!(
+        (downstairs[0].level, downstairs[0].row),
+        (2, -9),
+        "shelf records keep Attr bytes 7 and 8 verbatim"
+    );
+
+    // Standing upstairs flips which records survive; the login packet's sub-map byte is what moved.
+    s.myroom = Some(MyRoomInfo {
+        model: 0x1FF,
+        sub_map: 2,
+        exit_bit: 0,
+        door_open: false,
+    });
+    let upstairs_floor = crate::myroom_furniture::current_furniture_floor(
+        s.myroom.map(|m| m.sub_map).unwrap_or_default(),
+    );
+    assert_eq!(upstairs_floor, 1);
+    let upstairs = rebuild_furniture_objects(shelf_records(&s), upstairs_floor, &kinds);
+    assert_eq!(
+        upstairs
+            .iter()
+            .map(|o| (o.container, o.slot))
+            .collect::<Vec<_>>(),
+        vec![(crate::myroom_furniture::CONTAINER_MOGSAFE, 4)],
+    );
+}
+
+/// The Unity ranking fold (.agents/skills/retail-observe/references/2026-10-15-unity-and-fp-windows.md):
+/// chunks 1 and 2 fill members and points of their set (any nonzero result set is set 1), the last
+/// chunk marks the set complete, and a sent c2s 0x116 clears that mark; s2c 0x110 arms c2s 0x117
+/// and the sent 0x117 disarms it. Every arrival rides the snapshot.
+#[test]
+fn unity_ranking_chunks_complete_sets_and_requests_clear_the_marks() {
+    use ffxi_proto::decode::MiscdataUnity;
+    use kuluu_snapshot::UNITY_CONCORDS;
+    let members = [3u32; UNITY_CONCORDS];
+    let points = [900u32; UNITY_CONCORDS];
+    let mut state = SessionState::default();
+    assert!(state.apply_event(&AgentEvent::UnityRankingChunk {
+        result_set: 2,
+        data_type: MiscdataUnity::DATA_TYPE_MEMBERS,
+        concord_values: members,
+    }));
+    assert!(state.apply_event(&AgentEvent::UnityRankingChunk {
+        result_set: 1,
+        data_type: MiscdataUnity::DATA_TYPE_POINTS,
+        concord_values: points,
+    }));
+    assert_eq!(state.unity.rankings[1].members, members, "nonzero is set 1");
+    assert_eq!(state.unity.rankings[1].points, points);
+    assert!(!state.unity.rankings[1].complete);
+    assert_eq!(state.unity.rankings[0], Default::default());
+
+    assert!(state.apply_event(&AgentEvent::UnityRankingChunk {
+        result_set: 1,
+        data_type: MiscdataUnity::LAST_CHUNK,
+        concord_values: [0; UNITY_CONCORDS],
+    }));
+    assert!(state.unity.rankings[1].complete);
+    assert_eq!(
+        state.unity.rankings[1].points, points,
+        "the last chunk carries no values to overwrite"
+    );
+    assert!(
+        crate::wire_translate::state_to_snapshot(&state)
+            .unity
+            .rankings[1]
+            .complete,
+        "rides the snapshot"
+    );
+
+    assert!(!state.apply_event(&AgentEvent::UnityRankingRequested { result_set: 0 }));
+    assert!(state.apply_event(&AgentEvent::UnityRankingRequested { result_set: 1 }));
+    assert!(!state.unity.rankings[1].complete);
+
+    assert!(state.apply_event(&AgentEvent::UnityQuestUpdated {
+        sparks: 0,
+        deeds: 0,
+        plaudits: 0,
+    }));
+    assert!(state.unity.quest_armed);
+    assert!(state.apply_event(&AgentEvent::UnityQuestRequested));
+    assert!(!state.unity.quest_armed);
+}
+
+/// s2c 0x08E replaces the alter ego point block, the first s2c 0x119 readies the Status data for
+/// good, and zone-in's login state lands as sent; none of it is cleared by a zone change.
+#[test]
+fn alter_ego_points_status_ready_and_login_state_fold() {
+    let mut state = SessionState::default();
+    let block = kuluu_snapshot::AlterEgoPoints {
+        points: 640,
+        upgrades: [1; kuluu_snapshot::ALTER_EGO_UPGRADE_SLOTS],
+        costs: [2; kuluu_snapshot::ALTER_EGO_UPGRADE_SLOTS],
+    };
+    assert!(state.apply_event(&AgentEvent::AlterEgoPointsUpdated { points: block }));
+    assert!(!state.apply_event(&AgentEvent::AlterEgoPointsUpdated { points: block }));
+    assert_eq!(state.alter_ego_points, Some(block));
+
+    assert!(!state.status_data_ready);
+    assert!(state.apply_event(&AgentEvent::AbilityRecastsUpdated {
+        recasts: Vec::new()
+    }));
+    assert!(
+        state.status_data_ready,
+        "an empty 0x119 still readies Status"
+    );
+    assert!(!state.apply_event(&AgentEvent::AbilityRecastsUpdated {
+        recasts: Vec::new()
+    }));
+
+    assert!(state.apply_event(&AgentEvent::LoginStateSynced {
+        login_state: 5,
+        is_monstrosity: true,
+    }));
+    state.apply_event(&AgentEvent::ZoneChanged {
+        from: Some(100),
+        to: 101,
+        myroom: None,
+        mog_zone_flag: false,
+    });
+    let snap = crate::wire_translate::state_to_snapshot(&state);
+    assert_eq!(snap.alter_ego_points, Some(block));
+    assert!(snap.status_data_ready);
+    assert_eq!(snap.login_state, 5);
+    assert!(snap.login_is_monstrosity);
+}
+
+/// s2c 0x08C entries are stored by merit index with bit 0 of the wire id ignored: an entry with
+/// bit 0 set deletes its merit, any other inserts or replaces it
+/// (.agents/skills/retail-observe/references/2026-10-15-merit-and-job-point-windows.md).
+#[test]
+fn merit_entries_fold_by_index_and_odd_ids_delete() {
+    use crate::state::{merit_index_of_wire_id, MeritWire, MERIT_WIRE_DELETE_BIT};
+    use kuluu_snapshot::MeritEntry;
+    const HP_WIRE_ID: u16 = 0x40;
+    const MP_WIRE_ID: u16 = 0x42;
+    let hp = merit_index_of_wire_id(HP_WIRE_ID);
+    let mp = merit_index_of_wire_id(MP_WIRE_ID);
+    let wire = |index: u16, next: u8, count: u8| MeritWire { index, next, count };
+
+    let mut state = SessionState::default();
+    assert!(state.apply_event(&AgentEvent::MeritsListed {
+        entries: vec![wire(HP_WIRE_ID, 3, 1), wire(MP_WIRE_ID, 1, 0)],
+    }));
+    assert_eq!(
+        state.merit_entries.get(&hp),
+        Some(&MeritEntry { next: 3, count: 1 })
+    );
+    assert_eq!(state.merit_entries.len(), 2);
+    assert!(
+        !state.apply_event(&AgentEvent::MeritsListed {
+            entries: vec![wire(HP_WIRE_ID, 3, 1)],
+        }),
+        "the same entry again changes nothing"
+    );
+
+    assert!(state.apply_event(&AgentEvent::MeritsListed {
+        entries: vec![wire(HP_WIRE_ID, 4, 2)],
+    }));
+    assert_eq!(state.merit_entries[&hp], MeritEntry { next: 4, count: 2 });
+
+    assert!(state.apply_event(&AgentEvent::MeritsListed {
+        entries: vec![wire(MP_WIRE_ID | MERIT_WIRE_DELETE_BIT, 9, 9)],
+    }));
+    assert!(!state.merit_entries.contains_key(&mp), "an odd id deletes");
+    assert!(!state.apply_event(&AgentEvent::MeritsListed {
+        entries: vec![wire(MP_WIRE_ID | MERIT_WIRE_DELETE_BIT, 0, 0)],
+    }));
+    let snap = crate::wire_translate::state_to_snapshot(&state);
+    assert_eq!(snap.merit_entries, state.merit_entries);
+}
+
+/// s2c 0x08D stores level and next by type id, skips an empty first word or a job past 23, and
+/// marks the job point data received even when it stores nothing; the 0x063 JobPoints record
+/// replaces the last one.
+#[test]
+fn job_point_entries_and_record_fold() {
+    use crate::state::JobPointWire;
+    use kuluu_snapshot::{JobPointType, JobPointsJob, JobPointsRecord, JOB_POINT_JOBS};
+    const RDM: u16 = 5;
+    let wire = |job_no: u16, index: u8, next: u16, level: u8| JobPointWire {
+        index,
+        job_no,
+        next,
+        level,
+    };
+    let rdm_type = RDM * ffxi_proto::decode::JobPointWireEntry::TYPES_PER_JOB + 2;
+
+    let mut state = SessionState::default();
+    assert!(state.apply_event(&AgentEvent::JobPointsListed {
+        entries: vec![wire(0, 0, 7, 7)],
+    }));
+    assert!(
+        state.job_points_received,
+        "an all-empty packet still counts"
+    );
+    assert!(state.job_point_types.is_empty());
+
+    let past_last_job = u16::try_from(JOB_POINT_JOBS).unwrap();
+    assert!(state.apply_event(&AgentEvent::JobPointsListed {
+        entries: vec![wire(RDM, 2, 300, 4), wire(past_last_job, 1, 1, 1)],
+    }));
+    assert_eq!(
+        state.job_point_types.get(&rdm_type),
+        Some(&JobPointType {
+            level: 4,
+            next: 300
+        })
+    );
+    assert_eq!(state.job_point_types.len(), 1, "job 24 is skipped");
+    assert!(!state.apply_event(&AgentEvent::JobPointsListed {
+        entries: vec![wire(RDM, 2, 300, 4)],
+    }));
+
+    let mut record = JobPointsRecord {
+        access: 1,
+        ..Default::default()
+    };
+    record.jobs[usize::from(RDM)] = JobPointsJob {
+        capacity_points: 100,
+        current_jp: 12,
+        total_jp_spent: 40,
+    };
+    assert!(state.apply_event(&AgentEvent::JobPointsRecordUpdated { record }));
+    assert!(!state.apply_event(&AgentEvent::JobPointsRecordUpdated { record }));
+    let snap = crate::wire_translate::state_to_snapshot(&state);
+    assert_eq!(snap.job_points, Some(record));
+    assert!(snap.job_points_received);
+    assert_eq!(snap.job_point_types, state.job_point_types);
+}
+
+/// The 0x061 main job level crosses into the snapshot for the merit and job point gates.
+#[test]
+fn char_stats_carry_the_main_job_level_to_the_snapshot() {
+    let mut state = SessionState::default();
+    state.apply_event(&AgentEvent::CharStatsUpdated {
+        stats: CharStatsRaw {
+            mjob_lv: 96,
+            ..Default::default()
+        },
+    });
+    let stats = crate::wire_translate::state_to_snapshot(&state).stats;
+    assert_eq!(stats.map(|s| s.mjob_lv), Some(96));
+}
+
+/// The 0x061 Unity fields and main job cross into the snapshot's stat block unchanged.
+#[test]
+fn char_stats_carry_unity_fields_and_main_job_to_the_snapshot() {
+    let mut state = SessionState::default();
+    state.apply_event(&AgentEvent::CharStatsUpdated {
+        stats: CharStatsRaw {
+            mjob_no: 23,
+            unity_faction: 4,
+            unity_points: 12_345,
+            unity_points1: 6,
+            unity_points2: 9,
+            ..Default::default()
+        },
+    });
+    let stats = crate::wire_translate::state_to_snapshot(&state)
+        .stats
+        .expect("stats");
+    assert_eq!(
+        (
+            stats.mjob_no,
+            stats.unity_faction,
+            stats.unity_points,
+            stats.unity_points1,
+            stats.unity_points2
+        ),
+        (23, 4, 12_345, 6, 9)
+    );
 }

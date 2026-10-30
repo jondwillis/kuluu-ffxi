@@ -1,4 +1,7 @@
+use bevy::picking::events::PointerPress;
+use bevy::picking::hover::Hovered;
 use bevy::prelude::*;
+use bevy::ui_widgets::Button;
 
 use crate::hud::item_dat_root::{ItemDatRoot, ItemIconCache};
 use crate::hud::item_detail::{self, ItemMenuFocus, SortOptionId, SortOptions, SORT_OPTIONS};
@@ -74,14 +77,22 @@ pub const BAG_DISPLAY_ORDER: &[u8] = {
     ]
 };
 
-/// Whether `id` is browsable right now. Mirrors LSB's 0x029 validContainers
+/// Whether the server sized `id` above zero: s2c 0x01C's capacity is a
+/// grant, and its zero value is LSB's disable sentinel (a lapsed Mog Locker
+/// lease keeps every other bag sized —
+/// vendor/server/src/map/packets/s2c/0x01c_item_max.cpp). A granted bag stays
+/// listed and browsable even where it cannot be used.
+pub fn container_granted(snap: &kuluu_snapshot::SceneSnapshot, id: u8) -> bool {
+    snap.container(id).is_some_and(|v| v.capacity > 0)
+}
+
+/// Whether `id` is interactable right now. Mirrors LSB's 0x029 validContainers
 /// (vendor/server/src/map/packets/c2s/0x029_item_move.cpp): Safe/Safe 2F/
 /// Storage/Locker only inside your own Mog House, everything else whenever the
 /// server granted it capacity. Temporary items are server-managed (never a
 /// move destination) but stay viewable.
 pub fn container_accessible(snap: &kuluu_snapshot::SceneSnapshot, id: u8) -> bool {
     use ffxi_proto::map::container as c;
-    let granted = snap.container(id).is_some_and(|v| v.capacity > 0);
     let mh_only = matches!(
         id,
         c::LOC_MOGSAFE | c::LOC_MOGSAFE2 | c::LOC_STORAGE | c::LOC_MOGLOCKER
@@ -92,7 +103,7 @@ pub fn container_accessible(snap: &kuluu_snapshot::SceneSnapshot, id: u8) -> boo
     // alone over-offers it, and a server with the setting off refuses what
     // this predicate still offers.
     let flag_ok = id != c::LOC_MOGSAFE2 || snap.mh_2f_unlocked == Some(true);
-    granted && flag_ok && (!mh_only || snap.myroom.is_some())
+    container_granted(snap, id) && flag_ok && (!mh_only || snap.myroom.is_some())
 }
 
 /// Short bag names for the tab strip; the header still shows the full
@@ -122,8 +133,25 @@ pub fn tab_label(id: u8) -> &'static str {
     }
 }
 
-/// The bags the window can flip through, in display order.
-pub fn accessible_containers(snap: &kuluu_snapshot::SceneSnapshot) -> Vec<u8> {
+/// The bags the window can flip through in display order: every bag the
+/// server granted plus the inventory. A granted-but-blocked bag (Safe or
+/// Storage while standing outside the Mog House) lists its items greyed and
+/// read-only — contents of every container are already on disk state because
+/// `charutils::SendInventory` streams them all, so availability gates only
+/// actions, never browsing.
+pub fn browsable_containers(snap: &kuluu_snapshot::SceneSnapshot) -> Vec<u8> {
+    BAG_DISPLAY_ORDER
+        .iter()
+        .copied()
+        .filter(|&id| {
+            id == ffxi_proto::map::container::LOC_INVENTORY || container_granted(snap, id)
+        })
+        .collect()
+}
+
+/// The bags a move may target: display-order bags that answer to the
+/// interact gate right now (LSB's 0x029 `validContainers`).
+pub fn openable_containers(snap: &kuluu_snapshot::SceneSnapshot) -> Vec<u8> {
     BAG_DISPLAY_ORDER
         .iter()
         .copied()
@@ -135,16 +163,16 @@ pub fn accessible_containers(snap: &kuluu_snapshot::SceneSnapshot) -> Vec<u8> {
 
 /// Retail's "Select active window" key (Numpad + on the full keyboard) inside
 /// the Items window: each press steps focus along the window's panes — every
-/// accessible bag in display order, then the Options box, then back to the
-/// first bag. Returns the newly shown bag id when the bag changed (the caller
-/// resets the list cursor).
+/// granted bag in display order, then the Options box, then back to the first
+/// bag. Blocked bags ride the cycle as greyed read-only pages. Returns the
+/// newly shown bag id when the bag changed (the caller resets the list cursor).
 pub fn select_active_window(
     snap: &kuluu_snapshot::SceneSnapshot,
     active: &mut ItemScreenContainer,
     focus: &mut ItemMenuFocus,
     sort: &SortOptions,
 ) -> Option<u8> {
-    let bags = accessible_containers(snap);
+    let bags = browsable_containers(snap);
     if focus.sort_focused() {
         focus.exit_sort();
         let first = *bags.first()?;
@@ -247,7 +275,7 @@ pub(crate) struct ItemScrollThumb;
 pub(crate) struct BagTabRow;
 
 /// One tab in the strip; the index is a position into
-/// `accessible_containers`, not a container id.
+/// `browsable_containers`, not a container id.
 #[derive(Component, Clone, Copy)]
 pub(crate) struct BagTab(usize);
 
@@ -322,7 +350,7 @@ pub(crate) fn list_rows(
     sort: &SortOptions,
 ) -> Vec<DynamicMenuRow> {
     match mode {
-        ItemScreenMode::Inventory => menu::inventory_rows(snap, bag, sort.auto),
+        ItemScreenMode::Inventory => menu::inventory_rows(snap, bag, sort),
         ItemScreenMode::Usable => menu::usable_item_rows(snap),
     }
 }
@@ -434,6 +462,7 @@ fn spawn_bag_tabs(col: &mut ChildSpawnerCommands) {
                 .spawn((
                     BagTab(i),
                     Button,
+                    Hovered::default(),
                     Node {
                         padding: UiRect::axes(Val::Px(6.0), Val::Px(2.0)),
                         display: Display::None,
@@ -473,6 +502,7 @@ fn spawn_list_box(col: &mut ChildSpawnerCommands, placeholder: Handle<Image>) {
                 list.spawn((
                     ItemListRow(i),
                     Button,
+                    Hovered::default(),
                     Node {
                         display: Display::None,
                         ..list_view::row_node()
@@ -530,6 +560,7 @@ fn spawn_options_box(root: &mut ChildSpawnerCommands) {
             p.spawn((
                 ItemText(ItemRole::OptionsRow(i)),
                 Button,
+                Hovered::default(),
                 Text::new(""),
                 text_font(12.0),
                 TextColor(theme::TEXT),
@@ -664,15 +695,21 @@ pub(crate) fn update_item_screen(
 
     let snap = &state.snapshot;
 
-    // Leaving the Mog House (or losing a bag) snaps the view back to the
-    // inventory rather than showing a bag the server would reject.
+    // Losing the server's grant snaps the view back to the inventory. Leaving
+    // the Mog House does not: a granted-but-blocked bag stays open as a greyed
+    // read-only page (its contents are streamed regardless of location), and
+    // only its actions obey LSB's 0x029 `validContainers` gate.
     if active_bag.0 != ffxi_proto::map::container::LOC_INVENTORY
-        && !container_accessible(snap, active_bag.0)
+        && !container_granted(snap, active_bag.0)
     {
         active_bag.0 = ffxi_proto::map::container::LOC_INVENTORY;
     }
 
     let rows = list_rows(snap, screen_mode, active_bag.0, &sort);
+    // The whole page dims when the bag cannot be used here; its rows also
+    // refuse select at the confirm seam beside `confirm_menu_at_cursor`.
+    let view_only =
+        screen_mode == ItemScreenMode::Inventory && !container_accessible(snap, active_bag.0);
     let total = rows.len();
     let cursor = items_cursor(&mode);
     viewport.follow(cursor, total);
@@ -721,6 +758,7 @@ pub(crate) fn update_item_screen(
             &sort_label,
             &focus,
             &unusable,
+            view_only,
         );
         set_display(&mut node, value.visible);
         if value.visible && **text != value.text {
@@ -772,7 +810,13 @@ pub(crate) fn update_item_scrollbar(
     };
     let total = list_rows(&state.snapshot, screen_mode, active_bag.0, &sort).len();
     if let (Ok(mut track), Ok(mut thumb)) = (track_q.single_mut(), thumb_q.single_mut()) {
-        list_view::apply_scrollbar(&mut track, &mut thumb, viewport.start, total);
+        list_view::apply_scrollbar(
+            &mut track,
+            &mut thumb,
+            viewport.start,
+            total,
+            list_view::LIST_ROWS,
+        );
     }
 }
 
@@ -810,6 +854,7 @@ fn role_value(
     sort_label: &str,
     focus: &ItemMenuFocus,
     unusable: &[bool],
+    view_only: bool,
 ) -> RoleValue {
     let total = rows.len();
     match role {
@@ -827,6 +872,10 @@ fn role_value(
                     let is_cursor = list_idx == cursor;
                     let color = if is_cursor {
                         theme::CURSOR
+                    } else if view_only {
+                        // The grey of a bag that cannot be used from here — same
+                        // dim as a disabled menu row.
+                        theme::TEXT_DISABLED
                     } else if unusable.get(list_idx) == Some(&true) {
                         theme::MUTED
                     } else {
@@ -883,7 +932,7 @@ pub(crate) fn item_row_mouse_hover_system(
     sort: Res<SortOptions>,
     active_bag: Res<ItemScreenContainer>,
     mut focus: ResMut<ItemMenuFocus>,
-    rows: Query<(&Interaction, &ItemListRow), Changed<Interaction>>,
+    rows: Query<(&Hovered, &ItemListRow), Changed<Hovered>>,
 ) {
     let Some(screen_mode) = item_screen_mode(&mode) else {
         return;
@@ -900,7 +949,7 @@ pub(crate) fn item_row_mouse_hover_system(
         return;
     };
     for (interaction, row) in &rows {
-        if !matches!(interaction, Interaction::Hovered | Interaction::Pressed) {
+        if !interaction.0 {
             continue;
         }
         let list_idx = start + row.0;
@@ -921,9 +970,12 @@ pub(crate) fn item_row_mouse_click_system(
     state: Res<SceneState>,
     sort: Res<SortOptions>,
     active_bag: Res<ItemScreenContainer>,
-    rows: Query<(&Interaction, &ItemListRow), Changed<Interaction>>,
+    rows: Query<&ItemListRow>,
     mut out: MessageWriter<MenuRowActivated>,
+    mut presses: MessageReader<PointerPress>,
+    parents: Query<&ChildOf>,
 ) {
+    let pressed_rows = super::primary_pressed_rows(&mut presses, &rows, &parents);
     let Some(screen_mode) = item_screen_mode(&mode) else {
         return;
     };
@@ -932,10 +984,7 @@ pub(crate) fn item_row_mouse_click_system(
     }
     let total = list_rows(&state.snapshot, screen_mode, active_bag.0, &sort).len();
     let start = viewport.start;
-    for (interaction, row) in &rows {
-        if *interaction != Interaction::Pressed {
-            continue;
-        }
+    for row in pressed_rows {
         let list_idx = start + row.0;
         if list_idx < total {
             out.write(MenuRowActivated { slot: list_idx });
@@ -943,9 +992,10 @@ pub(crate) fn item_row_mouse_click_system(
     }
 }
 
-/// Drives the tab strip: one tab per accessible bag in display order, active
-/// bag highlighted. Split from `update_item_screen` so the tab queries stay
-/// disjoint from the window's text/icon queries.
+/// Drives the tab strip: one tab per granted bag in display order, active bag
+/// highlighted, bags blocked at this location dimmed. Split from
+/// `update_item_screen` so the tab queries stay disjoint from the window's
+/// text/icon queries.
 pub(crate) fn update_bag_tabs(
     mode: Res<InputMode>,
     state: Res<SceneState>,
@@ -960,7 +1010,7 @@ pub(crate) fn update_bag_tabs(
     // Bag tabs belong to the full inventory browser; the action-ring Usable list
     // is a flat cross-container list with no bags to flip.
     let inventory = item_screen_mode(&mode) == Some(ItemScreenMode::Inventory);
-    let bags = accessible_containers(&state.snapshot);
+    let bags = browsable_containers(&state.snapshot);
     let strip_visible = inventory && bags.len() > 1;
     if let Ok(mut node) = strip_q.single_mut() {
         set_display(&mut node, strip_visible);
@@ -988,7 +1038,9 @@ pub(crate) fn update_bag_tabs(
         if **text != want {
             **text = want.to_string();
         }
-        let want_color = if id == active_bag.0 {
+        let want_color = if !container_accessible(&state.snapshot, id) {
+            theme::TEXT_DISABLED
+        } else if id == active_bag.0 {
             theme::TITLE
         } else {
             theme::MUTED
@@ -1005,16 +1057,16 @@ pub(crate) fn bag_tab_mouse_system(
     mut mode: ResMut<InputMode>,
     state: Res<SceneState>,
     mut active_bag: ResMut<ItemScreenContainer>,
-    tabs: Query<(&Interaction, &BagTab), Changed<Interaction>>,
+    tabs: Query<&BagTab>,
+    mut presses: MessageReader<PointerPress>,
+    parents: Query<&ChildOf>,
 ) {
+    let pressed_rows = super::primary_pressed_rows(&mut presses, &tabs, &parents);
     if !items_open(&mode) {
         return;
     }
-    for (interaction, tab) in &tabs {
-        if *interaction != Interaction::Pressed {
-            continue;
-        }
-        let bags = accessible_containers(&state.snapshot);
+    for tab in pressed_rows {
+        let bags = browsable_containers(&state.snapshot);
         let Some(&id) = bags.get(tab.0) else {
             continue;
         };
@@ -1036,8 +1088,12 @@ pub(crate) fn sort_option_mouse_system(
     mut focus: ResMut<ItemMenuFocus>,
     mut active_bag: ResMut<ItemScreenContainer>,
     mut sort_req: MessageWriter<item_detail::InventorySortRequested>,
-    rows: Query<(&Interaction, &ItemText), Changed<Interaction>>,
+    rows: Query<(&Hovered, &ItemText), Changed<Hovered>>,
+    targets: Query<&ItemText>,
+    mut presses: MessageReader<PointerPress>,
+    parents: Query<&ChildOf>,
 ) {
+    let pressed_rows = super::primary_pressed_rows(&mut presses, &targets, &parents);
     if !items_open(&mode) || submenu_open(&mode) {
         return;
     }
@@ -1048,27 +1104,30 @@ pub(crate) fn sort_option_mouse_system(
         let Some(&id) = SORT_OPTIONS.get(i) else {
             continue;
         };
-        match interaction {
-            Interaction::Hovered => {
-                focus.enter_sort(id);
-            }
-            Interaction::Pressed => {
-                focus.enter_sort(id);
-                if id == SortOptionId::RecycleBin {
-                    if open_recycle_bin(&state.snapshot, &mut active_bag, &mut focus) {
-                        if let InputMode::Menu(stack) = &mut *mode {
-                            if let Some(level) = stack.current_mut() {
-                                level.cursor = 0;
-                            }
-                        }
+        if interaction.0 {
+            focus.enter_sort(id);
+        }
+    }
+    for tag in pressed_rows {
+        let ItemRole::OptionsRow(i) = tag.0 else {
+            continue;
+        };
+        let Some(&id) = SORT_OPTIONS.get(i) else {
+            continue;
+        };
+        focus.enter_sort(id);
+        if id == SortOptionId::RecycleBin {
+            if open_recycle_bin(&state.snapshot, &mut active_bag, &mut focus) {
+                if let InputMode::Menu(stack) = &mut *mode {
+                    if let Some(level) = stack.current_mut() {
+                        level.cursor = 0;
                     }
-                } else if item_detail::apply_sort_option(&mut sort, id) {
-                    sort_req.write(item_detail::InventorySortRequested {
-                        container: ffxi_proto::map::container::LOC_INVENTORY,
-                    });
                 }
             }
-            Interaction::None => {}
+        } else if item_detail::apply_sort_option(&mut sort, id) {
+            sort_req.write(item_detail::InventorySortRequested {
+                container: ffxi_proto::map::container::LOC_INVENTORY,
+            });
         }
     }
 }
@@ -1193,7 +1252,10 @@ mod tests {
         ]);
         let mut active = ItemScreenContainer(c::LOC_INVENTORY);
         let mut focus = ItemMenuFocus::default();
-        let sort = SortOptions { auto: true };
+        let sort = SortOptions {
+            auto: true,
+            ..SortOptions::default()
+        };
         assert_eq!(
             select_active_window(&snap, &mut active, &mut focus, &sort),
             Some(c::LOC_MOGCASE)
@@ -1223,7 +1285,10 @@ mod tests {
         let snap = snapshot_with_bags(&[(c::LOC_INVENTORY, 30)]);
         let mut active = ItemScreenContainer(c::LOC_INVENTORY);
         let mut focus = ItemMenuFocus::default();
-        let sort = SortOptions { auto: false };
+        let sort = SortOptions {
+            auto: false,
+            ..SortOptions::default()
+        };
         assert_eq!(
             select_active_window(&snap, &mut active, &mut focus, &sort),
             None
@@ -1243,6 +1308,56 @@ mod tests {
         for &id in BAG_DISPLAY_ORDER {
             assert_ne!(tab_label(id), "?", "container {id} missing a tab label");
         }
+    }
+
+    /// s2c 0x01C capacity is a grant: a bag blocked at this location by LSB's
+    /// validContainers law stays in the tab strip and the keyboard cycle as a
+    /// greyed read-only page. Only the openable set — move destinations —
+    /// obeys the zone rule.
+    #[test]
+    fn a_blocked_but_granted_bag_stays_browsable_grey() {
+        use ffxi_proto::map::container as c;
+        let snap = snapshot_with_bags(&[(c::LOC_INVENTORY, 30), (c::LOC_MOGSAFE, 50)]);
+        assert!(
+            container_granted(&snap, c::LOC_MOGSAFE),
+            "capacity above zero is a grant"
+        );
+        assert!(
+            !container_accessible(&snap, c::LOC_MOGSAFE),
+            "the safe cannot be used standing outside the Mog House"
+        );
+        assert_eq!(
+            browsable_containers(&snap),
+            vec![c::LOC_INVENTORY, c::LOC_MOGSAFE],
+            "the greyed page rides the strip"
+        );
+        assert_eq!(openable_containers(&snap), vec![c::LOC_INVENTORY]);
+
+        let mut active = ItemScreenContainer(c::LOC_INVENTORY);
+        let mut focus = ItemMenuFocus::default();
+        let sort = SortOptions {
+            auto: true,
+            ..SortOptions::default()
+        };
+        assert_eq!(
+            select_active_window(&snap, &mut active, &mut focus, &sort),
+            Some(c::LOC_MOGSAFE),
+            "the cycle walks into the greyed page rather than past it"
+        );
+    }
+
+    /// The zero-capacity sentinel (a lapsed Mog Locker lease) is not a grant:
+    /// the bag answers to neither set, even inside the house.
+    #[test]
+    fn zero_capacity_is_no_grant_to_browse_or_open() {
+        use ffxi_proto::map::container as c;
+        let snap = snapshot_with_bags(&[(c::LOC_INVENTORY, 30), (c::LOC_MOGLOCKER, 0)]);
+        assert!(!container_granted(&snap, c::LOC_MOGLOCKER));
+        assert!(
+            !browsable_containers(&snap).contains(&c::LOC_MOGLOCKER),
+            "a bag the server disabled is not a page"
+        );
+        assert!(!openable_containers(&snap).contains(&c::LOC_MOGLOCKER));
     }
 
     #[test]

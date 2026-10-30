@@ -1,5 +1,5 @@
-use bevy::ecs::spawn::Spawn;
-use bevy::feathers::controls::{button_bundle, ButtonBundleProps, ButtonVariant};
+use bevy::feathers::controls::{ButtonVariant, FeathersButton};
+use bevy::feathers::font_styles::InheritableFont;
 use bevy::feathers::theme::ThemedText;
 use bevy::input::keyboard::{Key, KeyboardInput};
 use bevy::input::ButtonState;
@@ -61,14 +61,17 @@ pub(super) fn spawn_ui(
                 ));
 
                 panel.spawn(row()).with_children(|r| {
-                    r.spawn(button_bundle(
-                        ButtonBundleProps {
-                            variant: ButtonVariant::Primary,
-                            ..default()
-                        },
-                        DefaultFocusTarget,
-                        Spawn((Text::new("Change"), ThemedText)),
-                    ))
+                    r.spawn_empty().apply_scene(bsn! {
+                        @FeathersButton {
+                            @variant: ButtonVariant::Primary,
+                            @caption: bsn! {
+                                Text::new("Change")
+                                ThemedText
+                            },
+                        }
+                        Node { flex_grow: 1.0 }
+                        InheritableFont { font: {Handle::<Font>::default()} }
+                    }).insert(DefaultFocusTarget)
                     .observe(
                         |_ev: On<Activate>,
                          mut form: ResMut<ChangePasswordForm>,
@@ -77,11 +80,16 @@ pub(super) fn spawn_ui(
                         },
                     );
 
-                    r.spawn(button_bundle(
-                        ButtonBundleProps::default(),
-                        (),
-                        Spawn((Text::new("Cancel"), ThemedText)),
-                    ))
+                    r.spawn_empty().apply_scene(bsn! {
+                        @FeathersButton {
+                            @caption: bsn! {
+                                Text::new("Cancel")
+                                ThemedText
+                            },
+                        }
+                        Node { flex_grow: 1.0 }
+                        InheritableFont { font: {Handle::<Font>::default()} }
+                    })
                     .observe(
                         |_ev: On<Activate>,
                          mut form: ResMut<ChangePasswordForm>,

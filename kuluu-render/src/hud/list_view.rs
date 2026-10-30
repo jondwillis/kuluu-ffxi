@@ -20,7 +20,7 @@ pub const ROW_HEIGHT_PX: f32 = ROW_ICON_PX;
 
 const ROW_GAP_PX: f32 = 5.0;
 
-const SCROLLBAR_WIDTH_PX: f32 = 4.0;
+pub const SCROLLBAR_WIDTH_PX: f32 = 4.0;
 
 /// First visible row of a list. Retail scrolls one row when the cursor leaves
 /// the page and shifts the page along with the cursor on Left/Right, so the
@@ -188,13 +188,26 @@ pub fn spawn_scrollbar(parent: &mut ChildSpawnerCommands, track: impl Bundle, th
 
 /// Where the thumb sits and how much of the list the page covers, as fractions
 /// of the track. `None` for a list that fits on one page and so has no bar.
-pub fn thumb_geometry(start: usize, total: usize) -> Option<(f32, f32)> {
-    (total > LIST_ROWS).then(|| (start as f32 / total as f32, LIST_ROWS as f32 / total as f32))
+/// The Currencies pages run their own page height through `visible_rows`; item
+/// and bazaar lists pass [`LIST_ROWS`] (ur/57).
+pub fn thumb_geometry(start: usize, total: usize, visible_rows: usize) -> Option<(f32, f32)> {
+    (total > visible_rows).then(|| {
+        (
+            start as f32 / total as f32,
+            visible_rows as f32 / total as f32,
+        )
+    })
 }
 
 /// Drive a scrollbar spawned by [`spawn_scrollbar`] from the page it reports.
-pub fn apply_scrollbar(track: &mut Node, thumb: &mut Node, start: usize, total: usize) {
-    let Some((top, height)) = thumb_geometry(start, total) else {
+pub fn apply_scrollbar(
+    track: &mut Node,
+    thumb: &mut Node,
+    start: usize,
+    total: usize,
+    visible_rows: usize,
+) {
+    let Some((top, height)) = thumb_geometry(start, total, visible_rows) else {
         if track.display != Display::None {
             track.display = Display::None;
         }
@@ -238,10 +251,10 @@ mod tests {
 
     #[test]
     fn a_list_that_fits_draws_no_scrollbar() {
-        assert_eq!(thumb_geometry(0, LIST_ROWS), None);
-        let (top, height) = thumb_geometry(0, LIST_ROWS * 2).expect("scrollable");
+        assert_eq!(thumb_geometry(0, LIST_ROWS, LIST_ROWS), None);
+        let (top, height) = thumb_geometry(0, LIST_ROWS * 2, LIST_ROWS).expect("scrollable");
         assert_eq!((top, height), (0.0, 0.5));
-        let (top, _) = thumb_geometry(LIST_ROWS, LIST_ROWS * 2).expect("scrollable");
+        let (top, _) = thumb_geometry(LIST_ROWS, LIST_ROWS * 2, LIST_ROWS).expect("scrollable");
         assert_eq!(top, 0.5, "the thumb sits where the page does");
     }
 

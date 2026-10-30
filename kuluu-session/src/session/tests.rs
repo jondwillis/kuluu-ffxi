@@ -114,6 +114,15 @@ fn sub_packet_events_with_names(
     body: &[u8],
     names: &ffxi_dat::autotranslate_names::InstalledNames,
 ) -> Vec<AgentEvent> {
+    sub_packet_events_with_mog(opcode, body, names, &mut SelfMogState::default())
+}
+
+fn sub_packet_events_with_mog(
+    opcode: u16,
+    body: &[u8],
+    names: &ffxi_dat::autotranslate_names::InstalledNames,
+    mog: &mut SelfMogState,
+) -> Vec<AgentEvent> {
     let (tx, mut rx) = broadcast::channel(64);
     handle_sub_packet(
         &framing::SubPacket {
@@ -142,7 +151,7 @@ fn sub_packet_events_with_names(
         &mut MesBasicResolver::new(None),
         &mut treasure::TreasurePool::default(),
         &mut false,
-        &mut SelfMogState::default(),
+        mog,
         &mut ShopSession::default(),
         None,
     );
@@ -151,6 +160,33 @@ fn sub_packet_events_with_names(
         out.push(ev);
     }
     out
+}
+
+/// A zone-in drops any arrangement mode, and the fold has to hear it: otherwise the snapshot keeps
+/// reporting layout mode in the next zone.
+#[test]
+fn a_zone_in_that_drops_layout_mode_mirrors_the_change() {
+    use crate::myroom_layout::{MODE_LAYOUT, MODE_NORMAL};
+    use ffxi_proto::decode::ServerLogin;
+    let body = vec![0u8; ServerLogin::PLAY_TIME_OFFSET + 4];
+    let names = ffxi_dat::autotranslate_names::InstalledNames::default();
+    let mut mog = SelfMogState {
+        layout_mode: MODE_LAYOUT,
+        ..SelfMogState::default()
+    };
+    let events = sub_packet_events_with_mog(ffxi_proto::map::s2c::LOGIN, &body, &names, &mut mog);
+    assert_eq!(mog.layout_mode, MODE_NORMAL);
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AgentEvent::MyroomModeChanged {
+            previous: MODE_LAYOUT,
+            next: MODE_NORMAL
+        }
+    )));
+    let events = sub_packet_events_with_mog(ffxi_proto::map::s2c::LOGIN, &body, &names, &mut mog);
+    assert!(!events
+        .iter()
+        .any(|e| matches!(e, AgentEvent::MyroomModeChanged { .. })));
 }
 
 #[test]
@@ -427,6 +463,194 @@ fn login_emits_the_homepoint_timer_after_the_zone_change_only_while_ko() {
     );
 }
 
+/// `/playtime` and the Status panel read 0m forever if the fold never hears the
+/// server's `PlayTime` base. Retail takes it from packet +0xA0 (body 0x9C —
+/// FFXiMain.dll retail-2026-09 `.text 0xFB3EE`) on every zone-in, so the LOGIN arm
+/// must publish it.
+#[test]
+fn login_publishes_the_play_time_base() {
+    const PLAY_SECS: u32 = 86_400 + 7_200;
+    use ffxi_proto::decode::ServerLogin;
+
+    let mut body = vec![0u8; ServerLogin::PLAY_TIME_OFFSET + 4];
+    body[ServerLogin::PLAY_TIME_OFFSET..ServerLogin::PLAY_TIME_OFFSET + 4]
+        .copy_from_slice(&PLAY_SECS.to_le_bytes());
+
+    let events = sub_packet_events(ffxi_proto::map::s2c::LOGIN, &body);
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::PlayTimeSynced { seconds } if *seconds == PLAY_SECS)),
+        "LOGIN must publish its PlayTime base, got {events:?}"
+    );
+}
+
+/// s2c 0x062 is the only writer of the client's skill table (FFXiMain.dll
+/// retail-2026-09 RVA 0x4856A4), so the Status window's Combat/Magic/Craft rows —
+/// and the enabling of those three rows, which open greyed — depend on the fold
+/// keeping every word. Ids index `skill_base` directly; nothing is filtered here,
+/// because each family hides different sentinels at draw time.
+#[test]
+fn clistatus2_folds_the_whole_skill_block() {
+    use ffxi_proto::decode::CharSkillLevels;
+
+    const HAND_TO_HAND: u16 = 301;
+    const CRAFT_HIDDEN_WORD: u16 = CharSkillLevels::CRAFT_HIDDEN;
+    let mut body = vec![
+        0u8;
+        CharSkillLevels::SKILL_BASE_OFFSET
+            + CharSkillLevels::SKILL_COUNT * std::mem::size_of::<u16>()
+    ];
+    for (id, word) in [
+        (1usize, HAND_TO_HAND),
+        (48, CRAFT_HIDDEN_WORD),
+        (
+            *CharSkillLevels::MAGIC_SKILL_RANGE.start(),
+            CharSkillLevels::SKILL_HIDDEN,
+        ),
+    ] {
+        body[CharSkillLevels::SKILL_BASE_OFFSET + id * 2
+            ..CharSkillLevels::SKILL_BASE_OFFSET + id * 2 + 2]
+            .copy_from_slice(&word.to_le_bytes());
+    }
+
+    let events = sub_packet_events(ffxi_proto::map::s2c::CLISTATUS2, &body);
+    let folded = events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::CharSkillsUpdated { skills } => Some(*skills),
+            _ => None,
+        })
+        .expect("0x062 publishes the skill block");
+    assert_eq!(folded.skills[1], HAND_TO_HAND);
+    assert_eq!(folded.skills[48], CRAFT_HIDDEN_WORD);
+
+    // A short body is dropped with the shared decode-warning gate, never folded as
+    // a partial table that would grey the rows for the rest of the session.
+    let short = vec![0u8; body.len() - 2];
+    assert!(
+        !sub_packet_events(ffxi_proto::map::s2c::CLISTATUS2, &short)
+            .iter()
+            .any(|e| matches!(e, AgentEvent::CharSkillsUpdated { .. })),
+        "a truncated 0x062 must not fold"
+    );
+}
+
+/// s2c 0x061's equip-block dword (body +0x5C) folds through SessionState and out to the
+/// snapshot, where the equip legality check reads it as the fifth test — the same dword
+/// FFXiMain.dll retail-2026-09 copies into game state at `.text 0xF0982` and hands back
+/// through `.text 0xFD350`, refused against by `.text 0x132111` (bead kuluu-o9qt7.3.4.1).
+#[test]
+fn clistatus_carries_the_equip_block_dword_to_the_snapshot() {
+    const BLOCK: u32 = 0x0000_0B00;
+    let mut body = vec![0u8; 0x63];
+    body[0x5C..0x60].copy_from_slice(&BLOCK.to_le_bytes());
+
+    let events = sub_packet_events(ffxi_proto::map::s2c::CLISTATUS, &body);
+    let stats = events.iter().find_map(|e| match e {
+        AgentEvent::CharStatsUpdated { stats } => Some(*stats),
+        _ => None,
+    });
+    assert_eq!(
+        stats.map(|s| s.equip_slot_block),
+        Some(BLOCK),
+        "0x061 +0x5C publishes the equip-block dword"
+    );
+
+    let mut state = crate::state::SessionState::default();
+    for event in &events {
+        state.apply_event(event);
+    }
+    assert_eq!(state.char_stats.map(|s| s.equip_slot_block), Some(BLOCK));
+    let snapshot = crate::wire_translate::state_to_snapshot(&state);
+    assert_eq!(
+        snapshot.stats.map(|s| s.equip_slot_block),
+        Some(BLOCK),
+        "the mask reaches the snapshot for the equip gate's fifth test"
+    );
+}
+
+/// s2c 0x113/0x118 currency reports fold as RAW blocks with the mode discriminant picking the
+/// family (one-shot reply law, FFXiMain.dll retail-2026-09 `.text 0x99640`/`.text 0x99660`; bead
+/// kuluu-o9qt7.35) — bytes through unchanged so the render-side getter table reads them like the
+/// client does.
+#[test]
+fn currency_reports_fold_raw_wholesale_per_mode() {
+    use ffxi_proto::map::s2c;
+
+    let mut body1 = vec![0u8; 0xF6];
+    body1[0x0..0x4].copy_from_slice(&7_777i32.to_le_bytes()); // packet +4: first conquest dword
+    let events = sub_packet_events(s2c::CURRENCIES_1, &body1);
+    let folded = events.iter().find_map(|e| match e {
+        AgentEvent::CurrenciesLoaded { mode, body } => Some((*mode, body.clone())),
+        _ => None,
+    });
+    assert_eq!(
+        folded,
+        Some((0u8, body1.clone())),
+        "report 1 folds raw with mode 0"
+    );
+
+    let body2 = vec![0xA5u8; 0x9C];
+    let events = sub_packet_events(s2c::CURRENCIES_2, &body2);
+    assert!(
+        matches!(
+            events.iter().find_map(|e| match e {
+                AgentEvent::CurrenciesLoaded { mode, body } => Some((*mode, body.len())),
+                _ => None,
+            }),
+            Some((1, len)) if len == 0x9C
+        ),
+        "report 2 folds raw with mode 1"
+    );
+
+    // A truncated report never folds (neighbouring-0x062 law): a partial block would render as
+    // invented currency values.
+    let short = vec![0u8; 0xF5];
+    assert!(
+        !sub_packet_events(s2c::CURRENCIES_1, &short)
+            .iter()
+            .any(|e| matches!(e, AgentEvent::CurrenciesLoaded { .. })),
+        "a truncated report must not fold"
+    );
+
+    // The fold replaces its block wholesale (second arrival overwrites the first).
+    let mut s = crate::state::SessionState::default();
+    assert!(s.apply_event(&AgentEvent::CurrenciesLoaded {
+        mode: 0,
+        body: body1.clone(),
+    }));
+    let other = vec![0x5Au8; 0xF6];
+    assert!(s.apply_event(&AgentEvent::CurrenciesLoaded {
+        mode: 0,
+        body: other.clone(),
+    }));
+    assert_eq!(s.currencies_1.as_deref(), Some(other.as_slice()));
+    // Same-bytes arrival reports "unchanged" rather than dirtying the snapshot twice.
+    assert!(!s.apply_event(&AgentEvent::CurrenciesLoaded {
+        mode: 0,
+        body: other,
+    }));
+}
+
+/// c2s 0x10F/0x115 currency requests are header-only (4 bytes, 1 word) exactly like the emote-
+/// list request — LSB's structs declare no fields and retail commits bare headers per window open
+/// (FFXiMain.dll retail-2026-09 `.text 0xFD520`/`.text 0xFD550`; bead kuluu-o9qt7.35).
+#[test]
+fn currency_requests_are_header_only() {
+    for (mode_two, want_id) in [
+        (false, ffxi_proto::map::c2s::CURRENCIES_1),
+        (true, ffxi_proto::map::c2s::CURRENCIES_2),
+    ] {
+        let buf = build_subpacket_currencies(0x1234, mode_two);
+        assert_eq!(buf.len(), 4);
+        let id_and_size = u16::from_le_bytes([buf[0], buf[1]]);
+        assert_eq!(id_and_size & framing::SUBPACKET_OPCODE_MASK, want_id);
+        assert_eq!(id_and_size >> 9, 1, "size_words");
+        assert_eq!(u16::from_le_bytes([buf[2], buf[3]]), 0x1234, "sync");
+    }
+}
+
 /// A 0x051 body whose GrapIDTbl does not decode must go through
 /// [`warn_decode_err`] like every sibling arm — dropped silently, a wrong
 /// body-offset assumption looks exactly like "self kept the launcher seed"
@@ -601,6 +825,190 @@ fn myroom_job_packet_layout_matches_lsb_struct() {
     assert_eq!(&keep[4..6], &[0, 0], "None → 0 = keep current job");
 }
 
+/// Pins the c2s 0x0CB GP_CLI_COMMAND_MYROOM_IS layout — both the LSB struct
+/// (vendor/server/src/map/packets/c2s/0x0cb_myroom_is.h) and the byte writes of the
+/// DLL's sole sender helper FFXiMain.dll retail-2026-09 .text 0xF0A40, which stores
+/// Kind→[+4], Param1→[+5] and u16 Param2→[+6] then commits exactly 8 bytes.
+#[test]
+fn myroom_is_packet_layout_matches_lsb_struct() {
+    // GP_CLI_COMMAND_MYROOM_IS_KIND::Remodel and _PARAM2::SandorianStyle — verbatim
+    // from vendor/server/src/map/packets/c2s/0x0cb_myroom_is.h.
+    const KIND_REMODEL: u8 = 5;
+    const SANDORIAN_STYLE: u16 = 615;
+    let buf = build_subpacket_myroom_is(0xF00D, KIND_REMODEL, 4, SANDORIAN_STYLE);
+    assert_eq!(buf.len(), 8, "4 hdr + Kind + Param1 + Param2 u16");
+    let id_and_size = u16::from_le_bytes([buf[0], buf[1]]);
+    assert_eq!(
+        id_and_size & framing::SUBPACKET_OPCODE_MASK,
+        ffxi_proto::map::c2s::MYROOM_IS,
+        "opcode MYROOM_IS"
+    );
+    assert_eq!(id_and_size >> 9, 2, "size_words");
+    assert_eq!(u16::from_le_bytes([buf[2], buf[3]]), 0xF00D, "sync");
+    assert_eq!(buf[4], KIND_REMODEL, "Kind");
+    assert_eq!(buf[5], 4, "Param1 (roomlist object slot)");
+    assert_eq!(
+        u16::from_le_bytes([buf[6], buf[7]]),
+        615,
+        "Param2 little-endian (SandorianStyle)"
+    );
+
+    // Both halves of the door row: which one a select sends follows the client's own door byte.
+    assert_eq!(
+        moghouse_door_packet(false),
+        (1, 0),
+        "shut house -> Kind=Open, Unk1"
+    );
+    assert_eq!(
+        moghouse_door_packet(true),
+        (2, 1),
+        "open house -> Kind=Close, Unk2"
+    );
+    let door = build_subpacket_myroom_is(0, MYROOM_IS_KIND_OPEN, 0, MYROOM_IS_PARAM_DOOR_OPEN);
+    assert_eq!(&door[4..8], &[1, 0, 0, 0], "door select = Open,0,Unk1 LE");
+}
+
+/// Pins the whole Mog House furniture/plant family, c2s 0x0FA..0x0FF. Two authorities have to agree on
+/// every byte here: LSB's structs (vendor/server/src/map/packets/c2s/0x0{fa,fb,fc,fd,fe,ff}_myroom_*.h)
+/// and the byte writes of retail's seven sender helpers (.text FFXiMain.dll retail-2026-09 0xF0CC0
+/// Layout, 0xF0C80 all-zero Layout, 0xF0D40 Bankin, 0xF0DA0 PlantAdd, 0xF0E10 PlantCheck, 0xF0E70
+/// PlantCrop, 0xF0ED0 PlantStop), each of which commits through FC4D0 with the sizes asserted below.
+#[test]
+fn myroom_layout_and_plant_packets_match_lsb_structs() {
+    let layout = codec::MyroomLayoutRequest {
+        item_no: 0x1234,
+        slot: 7,
+        container: crate::myroom_furniture::CONTAINER_MOGSAFE2,
+        floor: 1,
+        col: -3,
+        level: 9,
+        row: -20,
+        rotation: -2,
+    };
+
+    // c2s 0x0FA — the only one of the family with a pose, and the widest at 0x10 bytes.
+    let buf = build_subpacket_myroom_layout(0xF00D, &layout);
+    assert_eq!(
+        buf.len(),
+        16,
+        "4 hdr + item/index/category/floor/x/y/z/v + 3 pad"
+    );
+    let id_and_size = u16::from_le_bytes([buf[0], buf[1]]);
+    assert_eq!(
+        id_and_size & framing::SUBPACKET_OPCODE_MASK,
+        ffxi_proto::map::c2s::MYROOM_LAYOUT,
+        "opcode MYROOM_LAYOUT"
+    );
+    assert_eq!(id_and_size >> 9, 3, "size_words = 12 body bytes / 4");
+    assert_eq!(u16::from_le_bytes([buf[2], buf[3]]), 0xF00D, "sync");
+    assert_eq!(
+        u16::from_le_bytes([buf[4], buf[5]]),
+        0x1234,
+        "MyroomItemNo LE"
+    );
+    assert_eq!(buf[6], 7, "MyroomItemIndex");
+    assert_eq!(buf[7], 9, "MyroomCategory (LOC_MOGSAFE2)");
+    assert_eq!(buf[8], 1, "MyroomFloorFlg");
+    assert_eq!(
+        [buf[9], buf[10], buf[11], buf[12]],
+        [(-3i8) as u8, 9, (-20i8) as u8, (-2i8) as u8],
+        "x/y/z/v keep the signed bytes the Attr carried"
+    );
+    assert_eq!(&buf[13..16], &[0, 0, 0], "padding00");
+
+    // The closing variant: same opcode and size, nothing but zeros below the header (.text 0xF0C80),
+    // which is exactly what LSB's `MyroomItemNo == 0` branch keys on.
+    let done = build_subpacket_myroom_layout_done(0x00AA);
+    assert_eq!(done.len(), 16, "same 0x10-byte packet");
+    assert_eq!(
+        u16::from_le_bytes([done[0], done[1]]) & framing::SUBPACKET_OPCODE_MASK,
+        ffxi_proto::map::c2s::MYROOM_LAYOUT,
+        "the layout-finished beat reuses opcode 0x0FA"
+    );
+    assert_eq!(&done[4..], &[0u8; 12], "every field zeroed");
+
+    // c2s 0x0FB / 0x0FD / 0x0FF are the same 8-byte address triple.
+    for (opcode, buf) in [
+        (
+            ffxi_proto::map::c2s::MYROOM_BANKIN,
+            build_subpacket_myroom_bankin(1, 0xBEEF, 3, 1),
+        ),
+        (
+            ffxi_proto::map::c2s::MYROOM_PLANT_CHECK,
+            build_subpacket_myroom_plant_check(1, 0xBEEF, 3, 1),
+        ),
+        (
+            ffxi_proto::map::c2s::MYROOM_PLANT_STOP,
+            build_subpacket_myroom_plant_stop(1, 0xBEEF, 3, 1),
+        ),
+    ] {
+        assert_eq!(
+            buf.len(),
+            8,
+            "opcode {opcode:#x} is header + item/index/category"
+        );
+        let word = u16::from_le_bytes([buf[0], buf[1]]);
+        assert_eq!(
+            word & framing::SUBPACKET_OPCODE_MASK,
+            opcode,
+            "opcode {opcode:#x}"
+        );
+        assert_eq!(word >> 9, 2, "size_words for {opcode:#x}");
+        assert_eq!(
+            u16::from_le_bytes([buf[4], buf[5]]),
+            0xBEEF,
+            "{opcode:#x} item id LE"
+        );
+        assert_eq!((buf[6], buf[7]), (3, 1), "{opcode:#x} index then category");
+    }
+
+    // c2s 0x0FC — two ids as words first, then the four address bytes.
+    let add = build_subpacket_myroom_plant_add(1, 0x1111, 0x2222, 4, 5, 9, 0);
+    assert_eq!(
+        add.len(),
+        12,
+        "header + two ids + index/index + category/category"
+    );
+    assert_eq!(
+        u16::from_le_bytes([add[0], add[1]]) & framing::SUBPACKET_OPCODE_MASK,
+        ffxi_proto::map::c2s::MYROOM_PLANT_ADD
+    );
+    assert_eq!(
+        u16::from_le_bytes([add[4], add[5]]),
+        0x1111,
+        "MyroomPlantItemNo"
+    );
+    assert_eq!(
+        u16::from_le_bytes([add[6], add[7]]),
+        0x2222,
+        "MyroomAddItemNo"
+    );
+    assert_eq!((add[8], add[9]), (4, 5), "plant index then add index");
+    assert_eq!(
+        (add[10], add[11]),
+        (9, 0),
+        "plant category then add category"
+    );
+
+    // c2s 0x0FE — the address triple plus CancellFlg at +8; retail passes 1 only on the cancel path.
+    for (cancel, want) in [(false, 0u8), (true, 1)] {
+        let crop = build_subpacket_myroom_plant_crop(1, 0x3333, 6, 9, cancel);
+        assert_eq!(crop.len(), 12, "header + triple + flag + pad");
+        assert_eq!(
+            u16::from_le_bytes([crop[0], crop[1]]) & framing::SUBPACKET_OPCODE_MASK,
+            ffxi_proto::map::c2s::MYROOM_PLANT_CROP
+        );
+        assert_eq!(
+            u16::from_le_bytes([crop[4], crop[5]]),
+            0x3333,
+            "MyroomPlantItemNo"
+        );
+        assert_eq!((crop[6], crop[7]), (6, 9), "index then category");
+        assert_eq!(crop[8], want, "CancellFlg");
+        assert_eq!(&crop[9..12], &[0, 0, 0], "padding00");
+    }
+}
+
 /// Pins the c2s 0x05D GP_CLI_COMMAND_MOTION layout
 /// (vendor/server/src/map/packets/c2s/0x05d_motion.h): Mode at byte 11,
 /// BEFORE Param — the s2c 0x05A layout puts Mode after Param, so a
@@ -718,6 +1126,7 @@ fn door_menu_picks_encode_zmrq_maprect_pairs() {
         model: 257,
         sub_map: 0,
         exit_bit: 1,
+        door_open: false,
     };
     for (row, want_bit, want_mode) in [(HOME_ROW, 1u8, 0u8), (MOG_GARDEN_ROW, 0, 127)] {
         let mut menu = LocalMenuSession::new();
@@ -1447,7 +1856,7 @@ fn tnw(mes_num: u16, num: [i32; 4], name: &str) -> ZoneMessage {
 
 #[test]
 fn talknumwork_resolves_key_item_marker_from_zone_text() {
-    // Key item 1 = Zeruhn Report (vendor/server/scripts/enum/key_item.lua).
+    // Key item 1 = Zeruhn Report (vendor/server/data/enums/key_item.yaml).
     let line = zone_message_chat_line(
         &tnw(6438 | decode::MESNUM_HIDE_NAME_FLAG, [1, 0, 0, 0], ""),
         Some("Obtained key item: {KeyItem:0}.".to_string()),
@@ -1472,7 +1881,7 @@ fn test_dat_root() -> Option<ffxi_dat::DatRoot> {
 /// Full 0x02A chat composition against the retail DAT: the zone string's
 /// inline key-item tag must decode to `{KeyItem:0}` and resolve through
 /// `num[0]` (pre-fix this line rendered "Obtained key item: {Auto:128}3\u{FFFD}.").
-/// Key item 1 = Zeruhn Report (vendor/server/scripts/enum/key_item.lua).
+/// Key item 1 = Zeruhn Report (vendor/server/data/enums/key_item.yaml).
 /// Self-skips without game files.
 #[test]
 fn talknumwork_composes_real_keyitem_line_from_zone_dat() {
@@ -3589,6 +3998,44 @@ fn miscdata_status_icons_truncated_returns_none() {
     assert!(decode_miscdata_status_icons(&data).is_none());
 }
 
+/// s2c 0x063 MISCDATA Merits wire law (bead kuluu-o9qt7.43), pinned against LSB
+/// `GP_SERV_COMMAND_MISCDATA::MERITS` (vendor/server/src/map/packets/s2c/0x063_miscdata_merits.h):
+/// body {type u16=2, unknown u16, limitPoints u16, word {points 7b, blu 6b,
+/// can-use 1b@13, xp-capped 1b@14, mode-enabled 1b@15}, maxMeritPoints u8}.
+#[test]
+fn miscdata_merits_decodes_the_lsb_record_and_rejects_other_kinds() {
+    let mut data = vec![0u8; 9];
+    data[0..2].copy_from_slice(&0x0002u16.to_le_bytes());
+    data[4..6].copy_from_slice(&12u16.to_le_bytes()); // limitPoints
+    data[6..8].copy_from_slice(&0xFFFFu16.to_le_bytes()); // every flag at max
+    data[8] = 98; // maxMeritPoints
+    let m = decode_miscdata_merits(&data).expect("merits record");
+    assert_eq!(
+        m,
+        kuluu_snapshot::MisdataMerits {
+            limit_points: 12,
+            merit_points: 0x7F,
+            blu_bonus: 0x3F,
+            can_use_merit_mode: true,
+            xp_capped_or_merit_mode: true,
+            merit_mode_enabled: true,
+            max_merit_points: 98,
+        }
+    );
+
+    // Only bit 13 lifts can-use; neighbours must not bleed into it.
+    data[6..8].copy_from_slice(&(1u16 << 14).to_le_bytes());
+    let m = decode_miscdata_merits(&data).expect("merits record");
+    assert!(!m.can_use_merit_mode, "bit 14 is the xp-capped neighbour");
+    assert!(m.xp_capped_or_merit_mode);
+
+    // Wrong subtype and truncation drop the record — retail's dispatcher only routes
+    // subtype==2 into this store (FFXiMain.dll retail-2026-09 `.text 0x99270`).
+    data[0] = 5;
+    assert!(decode_miscdata_merits(&data).is_none());
+    assert!(decode_miscdata_merits(&data[..8]).is_none());
+}
+
 #[test]
 fn shop_list_decodes_rows_and_skips_zero_padding() {
     let mut data = vec![0u8; 4 + 12 * 3];
@@ -4792,6 +5239,11 @@ async fn bootstrap_scenario(scenario: BootstrapReply) {
             None,
             &mut command_rx,
             &events,
+            // No macro store in these fixtures (bead kuluu-o9qt7.19.2).
+            None,
+            "",
+            // …and no emote-order store either (bead kuluu-o9qt7.34).
+            None,
             None,
         ),
     )
@@ -4944,6 +5396,11 @@ async fn enterzone_in_gameok_reply() {
             None,
             &mut command_rx,
             &events,
+            // No macro store in these fixtures (bead kuluu-o9qt7.19.2).
+            None,
+            "",
+            // …and no emote-order store either (bead kuluu-o9qt7.34).
+            None,
             None,
         ),
     )
@@ -5272,4 +5729,324 @@ fn battle2_knockbacks_are_none_without_a_level() {
     w.write(0, 1);
     w.write(0, 1);
     assert!(super::decode_battle2_knockbacks(&w.into_bytes()).is_none());
+}
+
+/// One built Unity / alter ego point c2s: (opcode, body bytes after the 4-byte header).
+fn unity_fp_c2s(buf: &[u8]) -> (u16, &[u8]) {
+    let word = u16::from_le_bytes([buf[0], buf[1]]);
+    assert_eq!(
+        framing::subpacket_size_bytes(word),
+        buf.len(),
+        "the header's size words cover the whole packet"
+    );
+    assert_eq!(u16::from_le_bytes([buf[2], buf[3]]), 0x4321, "sync");
+    (
+        word & framing::SUBPACKET_OPCODE_MASK,
+        &buf[framing::SUBPACKET_WORD_BYTES..],
+    )
+}
+
+/// The record's packet bodies and sizes: 0x116 / 0x117 / 0x118 / 0x0C1 are 8 bytes, 0x0C2 is the
+/// bare 4-byte header (.agents/skills/retail-observe/references/2026-10-15-unity-and-fp-windows.md),
+/// each laid out as its LSB `GP_CLI_PACKET` (vendor/server/src/map/packets/c2s/0x116_unity_menu.h,
+/// 0x117_unity_quest.h, 0x118_unity_toggle.h, 0x0c1_alter_ego_points.h).
+#[test]
+fn unity_and_alter_ego_point_requests_build_the_lsb_bodies() {
+    use ffxi_proto::map::{c2s, c2s_unnamed, unity_toggle_mode};
+    const SYNC: u16 = 0x4321;
+    const HP_UPGRADE: u16 = 8;
+
+    let menu = build_subpacket_unity_menu(SYNC, 1);
+    assert_eq!(menu.len(), 8);
+    assert_eq!(
+        unity_fp_c2s(&menu),
+        (c2s::UNITY_MENU, &1u32.to_le_bytes()[..])
+    );
+
+    let quest = build_subpacket_unity_quest(SYNC);
+    assert_eq!(quest.len(), 8);
+    assert_eq!(unity_fp_c2s(&quest), (c2s::UNITY_QUEST, &[0u8; 4][..]));
+
+    let toggle = build_subpacket_unity_toggle(SYNC, unity_toggle_mode::ACTIVE);
+    assert_eq!(toggle.len(), 8);
+    assert_eq!(
+        unity_fp_c2s(&toggle),
+        (c2s::UNITY_TOGGLE, &[unity_toggle_mode::ACTIVE, 0, 0, 0][..])
+    );
+
+    let spend = build_subpacket_alter_ego_points(SYNC, HP_UPGRADE);
+    assert_eq!(spend.len(), 8);
+    assert_eq!(
+        unity_fp_c2s(&spend),
+        (c2s::ALTER_EGO_POINTS, &[8u8, 0, 0, 0][..])
+    );
+
+    let request = build_subpacket_alter_ego_points_request(SYNC);
+    assert_eq!(request.len(), framing::SUBPACKET_WORD_BYTES);
+    assert_eq!(
+        unity_fp_c2s(&request),
+        (c2s_unnamed::ALTER_EGO_POINTS_REQUEST, &[][..])
+    );
+}
+
+#[test]
+fn alter_ego_points_and_unity_quest_packets_become_events() {
+    use ffxi_proto::decode::{AlterEgoPoints, UnityQuest};
+    use ffxi_proto::map::s2c;
+    const HP_UPGRADE: usize = 8;
+
+    let mut body = vec![0u8; ffxi_proto::s2c_layout::alter_ego_points::SIZE];
+    body[..2].copy_from_slice(&300u16.to_le_bytes());
+    body[ffxi_proto::s2c_layout::alter_ego_points::UPGRADES + HP_UPGRADE] = 4;
+    let events = sub_packet_events(s2c::ALTER_EGO_POINTS, &body);
+    let decoded = AlterEgoPoints::decode(&body).unwrap();
+    assert!(matches!(
+        events.as_slice(),
+        [AgentEvent::AlterEgoPointsUpdated { points }]
+            if points.points == 300
+                && points.upgrades == decoded.upgrades
+                && points.costs == decoded.costs
+    ));
+
+    let mut quest = vec![0u8; ffxi_proto::s2c_layout::unity::SIZE];
+    quest[..4].copy_from_slice(&77u32.to_le_bytes());
+    let events = sub_packet_events(s2c::UNITY, &quest);
+    let decoded = UnityQuest::decode(&quest).unwrap();
+    assert!(matches!(
+        events.as_slice(),
+        [AgentEvent::UnityQuestUpdated { sparks, .. }] if *sparks == decoded.sparks
+    ));
+}
+
+/// A type-7 MISCDATA record routes to the Unity fold, decoded by LSB's MEMBERS layout; the
+/// status-icon and merits arms never see it.
+#[test]
+fn miscdata_unity_chunks_become_ranking_events() {
+    use ffxi_proto::decode::{MiscdataUnity, MISCDATA_TYPE_UNITY, UNITY_CONCORD_COUNT};
+    use ffxi_proto::s2c_layout::miscdata_unity_members as lsb;
+    let mut body = vec![0u8; lsb::SIZE];
+    body[..2].copy_from_slice(&MISCDATA_TYPE_UNITY.to_le_bytes());
+    body[lsb::RESULT_SET] = 1;
+    body[lsb::DATA_TYPE] = MiscdataUnity::DATA_TYPE_MEMBERS;
+    for concord in 0..UNITY_CONCORD_COUNT {
+        let o = lsb::MEMBERS + 4 * concord;
+        body[o..o + 4].copy_from_slice(&(concord as u32 + 100).to_le_bytes());
+    }
+    let events = sub_packet_events(ffxi_proto::map::s2c::MISCDATA, &body);
+    let [AgentEvent::UnityRankingChunk {
+        result_set,
+        data_type,
+        concord_values,
+    }] = events.as_slice()
+    else {
+        panic!("one Unity chunk event, got {events:?}");
+    };
+    assert_eq!(
+        (*result_set, *data_type),
+        (1, MiscdataUnity::DATA_TYPE_MEMBERS)
+    );
+    assert_eq!(concord_values[0], 100, "Concord 1 = LSB members[0]");
+    assert_eq!(concord_values[UNITY_CONCORD_COUNT - 1], 110);
+}
+
+/// Zone-in hands the folded state the raw `LoginState` and `IsMonstrosity` the alter ego point
+/// refusal reads, right after the `ZoneChanged` that opens the zone.
+#[test]
+fn login_emits_login_state_after_zone_changed() {
+    use ffxi_proto::decode::{ServerLogin, ServerLoginMyroom};
+    const LSB_MONSTROSITY_WORD: u16 = 0x1F;
+    const JOBEXIT: u32 = 4;
+    let mut body = vec![0u8; ffxi_proto::s2c_layout::login::SIZE];
+    body[ffxi_proto::s2c_layout::login::LOGIN_STATE
+        ..ffxi_proto::s2c_layout::login::LOGIN_STATE + 4]
+        .copy_from_slice(&JOBEXIT.to_le_bytes());
+    body[ServerLogin::IS_MONSTROSITY_OFFSET..ServerLogin::IS_MONSTROSITY_OFFSET + 2]
+        .copy_from_slice(&LSB_MONSTROSITY_WORD.to_le_bytes());
+    assert_ne!(JOBEXIT, ServerLoginMyroom::LOGIN_STATE_MYROOM);
+    let events = sub_packet_events(ffxi_proto::map::s2c::LOGIN, &body);
+    let zone = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::ZoneChanged { .. }))
+        .expect("zone change");
+    let synced = events
+        .iter()
+        .position(|e| {
+            matches!(
+                e,
+                AgentEvent::LoginStateSynced {
+                    login_state: JOBEXIT,
+                    is_monstrosity: true
+                }
+            )
+        })
+        .expect("login state synced");
+    assert!(synced > zone, "after ZoneChanged");
+}
+
+/// The record's c2s bodies: 0x0BE is 12 bytes {Kind, Param1, Param2 u16, Param3 0} with
+/// ChangeMode {2, 0 EXP / 1 Limit Points, 0} and EditMode {3, 1 raise / 0 lower, merit index};
+/// 0x0BF is 8 bytes {Index = type id, padding 0}; 0x0C0 is the bare header
+/// (.agents/skills/retail-observe/references/2026-10-15-merit-and-job-point-windows.md), each laid
+/// out as its LSB `GP_CLI_PACKET` (vendor/server/src/map/packets/c2s/0x0be_merits.h,
+/// 0x0bf_job_points_spend.h, 0x0c0_job_points_req.h).
+#[test]
+fn merit_and_job_point_commands_build_the_record_bodies() {
+    use ffxi_proto::map::c2s;
+    use ffxi_proto::map::merits_wire::{kind, param1};
+    const SYNC: u16 = 0x4321;
+    const MERIT_INDEX: u16 = 0x0123;
+    const TYPE_ID: u16 = 0x00A2;
+    let payload = |command: AgentCommand| merit_command_payload(&command, SYNC).expect("merit");
+    let [index_lo, index_hi] = MERIT_INDEX.to_le_bytes();
+
+    let cases = [
+        (
+            AgentCommand::SetMeritMode {
+                limit_points: false,
+            },
+            [kind::CHANGE_MODE, param1::LOWER, 0, 0],
+        ),
+        (
+            AgentCommand::SetMeritMode { limit_points: true },
+            [kind::CHANGE_MODE, param1::RAISE, 0, 0],
+        ),
+        (
+            AgentCommand::EditMerit {
+                index: MERIT_INDEX,
+                raise: true,
+            },
+            [kind::EDIT_MODE, param1::RAISE, index_lo, index_hi],
+        ),
+        (
+            AgentCommand::EditMerit {
+                index: MERIT_INDEX,
+                raise: false,
+            },
+            [kind::EDIT_MODE, param1::LOWER, index_lo, index_hi],
+        ),
+    ];
+    for (command, head) in cases {
+        let buf = payload(command.clone());
+        let (opcode, body) = unity_fp_c2s(&buf);
+        assert_eq!(opcode, c2s::MERITS, "{command:?}");
+        assert_eq!(&body[..4], &head[..], "{command:?}");
+        assert_eq!(&body[4..], &[0u8; 4][..], "Param3 is 0");
+    }
+
+    let spend = payload(AgentCommand::SpendJobPoint { type_id: TYPE_ID });
+    assert_eq!(spend.len(), 8);
+    let [type_lo, type_hi] = TYPE_ID.to_le_bytes();
+    assert_eq!(
+        unity_fp_c2s(&spend),
+        (c2s::JOB_POINTS_SPEND, &[type_lo, type_hi, 0, 0][..])
+    );
+
+    let request = payload(AgentCommand::RequestJobPoints);
+    assert_eq!(request.len(), framing::SUBPACKET_WORD_BYTES);
+    assert_eq!(unity_fp_c2s(&request), (c2s::JOB_POINTS_REQ, &[][..]));
+
+    assert!(merit_command_payload(&AgentCommand::RequestUnityQuest, SYNC).is_none());
+}
+
+/// s2c 0x08C, 0x08D and the 0x063 JobPoints record reach the folds as sent, laid out by LSB.
+#[test]
+fn merit_and_job_point_packets_become_events() {
+    use crate::state::{JobPointWire, MeritWire};
+    use ffxi_proto::decode::{MeritList, MISCDATA_TYPE_JOB_POINTS};
+    use ffxi_proto::map::s2c;
+    use ffxi_proto::s2c_layout::{
+        job_points as points_lsb, merit_entry as merit_lsb, miscdata_job_points as record_lsb,
+    };
+    const DELETED_WIRE_ID: u16 = 0x41;
+    const RDM: u16 = 5;
+    const TYPE_SLOT: u16 = 2;
+    const LEVEL: u16 = 4;
+    const NEXT: u16 = 300;
+
+    let mut merits = vec![0u8; MeritList::MERITS_OFFSET + 2 * merit_lsb::SIZE];
+    merits[MeritList::MERIT_COUNT_OFFSET..MeritList::MERIT_COUNT_OFFSET + 2]
+        .copy_from_slice(&1u16.to_le_bytes());
+    let first = MeritList::MERITS_OFFSET;
+    merits[first + merit_lsb::INDEX..first + merit_lsb::INDEX + 2]
+        .copy_from_slice(&DELETED_WIRE_ID.to_le_bytes());
+    merits[first + merit_lsb::NEXT] = 2;
+    merits[first + merit_lsb::COUNT] = 1;
+    let events = sub_packet_events(s2c::MERIT, &merits);
+    assert!(
+        matches!(
+            events.as_slice(),
+            [AgentEvent::MeritsListed { entries }] if entries == &[MeritWire {
+                index: DELETED_WIRE_ID,
+                next: 2,
+                count: 1,
+            }]
+        ),
+        "{events:?}"
+    );
+
+    let mut points = vec![0u8; points_lsb::SIZE];
+    let first_word = (RDM << points_lsb::POINTS_JOB_NO_SHIFT) | TYPE_SLOT;
+    let second_word = (LEVEL << points_lsb::POINTS_LEVEL_SHIFT) | NEXT;
+    points[points_lsb::POINTS_JOB_NO..points_lsb::POINTS_JOB_NO + 2]
+        .copy_from_slice(&first_word.to_le_bytes());
+    points[points_lsb::POINTS_LEVEL..points_lsb::POINTS_LEVEL + 2]
+        .copy_from_slice(&second_word.to_le_bytes());
+    let events = sub_packet_events(s2c::JOB_POINTS, &points);
+    let [AgentEvent::JobPointsListed { entries }] = events.as_slice() else {
+        panic!("one job point event, got {events:?}");
+    };
+    assert_eq!(entries.len(), points_lsb::POINTS_COUNT);
+    assert_eq!(
+        entries[0],
+        JobPointWire {
+            index: TYPE_SLOT as u8,
+            job_no: RDM,
+            next: NEXT,
+            level: LEVEL as u8,
+        }
+    );
+
+    let mut record = vec![0u8; record_lsb::SIZE];
+    record[record_lsb::TYPE..record_lsb::TYPE + 2]
+        .copy_from_slice(&MISCDATA_TYPE_JOB_POINTS.to_le_bytes());
+    record[record_lsb::ACCESS] = 1;
+    let rdm_jp = record_lsb::JOBS_CURRENT_JP + usize::from(RDM) * record_lsb::JOBS_STRIDE;
+    record[rdm_jp..rdm_jp + 2].copy_from_slice(&12u16.to_le_bytes());
+    let events = sub_packet_events(s2c::MISCDATA, &record);
+    assert!(
+        matches!(
+            events.as_slice(),
+            [AgentEvent::JobPointsRecordUpdated { record }]
+                if record.access == 1 && record.jobs[usize::from(RDM)].current_jp == 12
+        ),
+        "{events:?}"
+    );
+}
+
+/// s2c 0x063 MISCDATA subtype Homepoints reaches the fold as sent, laid out by LSB
+/// `GP_SERV_COMMAND_MISCDATA::HOMEPOINTS` (vendor/server/src/map/packets/s2c/
+/// 0x063_miscdata_homepoints.h) — bead kuluu-o9qt7.45.
+#[test]
+fn miscdata_homepoints_packet_becomes_masks_event() {
+    use ffxi_proto::decode::MISCDATA_TYPE_HOMEPOINTS;
+    use ffxi_proto::map::s2c;
+    use ffxi_proto::s2c_layout::miscdata_homepoints as lsb;
+
+    let mut record = vec![0u8; lsb::SIZE];
+    record[lsb::TYPE..lsb::TYPE + 2].copy_from_slice(&MISCDATA_TYPE_HOMEPOINTS.to_le_bytes());
+    record[lsb::HOME_POINT..lsb::HOME_POINT + 4].copy_from_slice(&0x0102_0304u32.to_le_bytes());
+    let guide_word = lsb::SURVIVAL_GUIDE + lsb::SURVIVAL_GUIDE_STRIDE;
+    record[guide_word..guide_word + 4].copy_from_slice(&0x8000_0000u32.to_le_bytes());
+    record[lsb::TELEPOINT..lsb::TELEPOINT + 4].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
+    let events = sub_packet_events(s2c::MISCDATA, &record);
+    assert!(
+        matches!(
+            events.as_slice(),
+            [AgentEvent::HomepointsUpdated { masks }]
+                if masks.home_point[0] == 0x0102_0304
+                    && masks.survival_guide[1] == 0x8000_0000
+                    && masks.telepoint == 0xDEAD_BEEF
+        ),
+        "{events:?}"
+    );
 }

@@ -1,0 +1,37 @@
+services:
+  retail-connect:
+    image: &server-image ghcr.io/landsandboat/server@sha256:3177d4f6aeffc68968a8c2405a8ccfc57068940444840f16a1d91aeb8c5d31db
+    platform: linux/amd64
+    command: /server/xi_connect
+    environment:
+      XI_NETWORK_SQL_HOST: ${LSB_SQL_HOST:-database}
+      XI_NETWORK_SQL_DATABASE: ${LSB_SQL_DATABASE:-xidb}
+      XI_NETWORK_SQL_LOGIN: ${LSB_SQL_LOGIN:-xiadmin}
+      XI_NETWORK_SQL_PASSWORD: ${LSB_SQL_PASSWORD:?Set the local database password}
+      XI_NETWORK_ZMQ_IP: ${LSB_WORLD_HOST:-world}
+      XI_NETWORK_LOGIN_AUTH_PORT: 57432
+      XI_NETWORK_SEARCH_PORT: 57002
+      XI_LOGIN_VER_LOCK: ${LSB_VER_LOCK:-2}
+    ports:
+      - 127.0.0.1:57432:57432
+      - 127.0.0.1:57003:54001
+      - 127.0.0.1:57433:54230
+    networks: [lsb]
+  retail-profile:
+    image: *server-image
+    platform: linux/amd64
+    command: /server/xi_profile
+    environment:
+      SQL_HOST: ${LSB_SQL_HOST:-database}
+      SQL_DATABASE: ${LSB_SQL_DATABASE:-xidb}
+      SQL_LOGIN: ${LSB_SQL_LOGIN:-xiadmin}
+      SQL_PASSWORD: ${LSB_SQL_PASSWORD:?Set the local database password}
+      ZMQ_IP: ${LSB_WORLD_HOST:-world}
+    ports:
+      - 127.0.0.1:51220:51220
+      - 127.0.0.1:51240:51240
+    networks: [lsb]
+networks:
+  lsb:
+    external: true
+    name: ${LSB_NETWORK:?Set the existing LSB Docker network}

@@ -1,3 +1,5 @@
+use bevy::picking::hover::Hovered;
+use bevy::picking::{events::PointerState, pointer::PointerButton};
 use bevy::prelude::*;
 #[cfg(not(target_arch = "wasm32"))]
 use bevy::window::{CursorGrabMode, CursorOptions};
@@ -62,9 +64,34 @@ fn entity_hover_writer_system(hovered: Res<HoveredEntity>, mut req: ResMut<Curso
     }
 }
 
-fn ui_hover_writer_system(interactions: Query<&Interaction>, mut req: ResMut<CursorRequests>) {
-    for i in &interactions {
-        if matches!(i, Interaction::Hovered | Interaction::Pressed) {
+pub fn primary_pointer_is_held(
+    entity: Entity,
+    pointers: &PointerState,
+    parents: &Query<&ChildOf>,
+) -> bool {
+    pointers.pointer_buttons.iter().any(|((_, button), state)| {
+        *button == PointerButton::Primary
+            && state.pressing.keys().any(|pressed| {
+                *pressed == entity
+                    || parents
+                        .iter_ancestors(*pressed)
+                        .any(|parent| parent == entity)
+            })
+    })
+}
+
+fn ui_hover_writer_system(
+    interactions: Query<(Entity, &Hovered)>,
+    pointers: Option<Res<PointerState>>,
+    parents: Query<&ChildOf>,
+    mut req: ResMut<CursorRequests>,
+) {
+    for (entity, hovered) in &interactions {
+        if hovered.0
+            || pointers
+                .as_ref()
+                .is_some_and(|pointers| primary_pointer_is_held(entity, pointers, &parents))
+        {
             req.hand = true;
             return;
         }

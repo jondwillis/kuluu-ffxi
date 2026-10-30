@@ -47,6 +47,16 @@ Route LSB-boundary changes to [lsb-mirror-check](../lsb-mirror-check/SKILL.md), 
 
 Assess readiness against changed behavior and stated claims. Disclose relevant pre-existing gaps without requiring unrelated fixes. Tooling that only forwards existing inputs needs evidence of event routing and activation; it needs media when it changes visible behavior or claims an observed outcome.
 
+For compatibility fixes, require successful operation against the advertised server, device, or protocol version.
+Require evidence for the reported failure and affected behavior that must continue to work.
+Compare each required case with its actual configuration and observed result.
+An incompatible server's rejection cannot establish support for a compatible server.
+For example, current LSB rejection of Binary `1.1.5` cannot verify successful legacy LSB authentication.
+Tests and local TLS fixtures can supplement that live check.
+They cannot replace it.
+Missing decisive evidence prevents a merge-ready recommendation, even when other checks pass.
+State that gap separately from introduced code defects.
+
 PRs that change pixels or visible interaction require reviewer-accessible media in the body: screenshots for static appearance, video for motion, timing, camera, transitions or interaction. Prefer matched before/after conditions. Captions identify the tested commit, install/client profile, scene, reproduction steps and relevant clock/weather/settings. Inspect the media itself; black, stale, unrelated frames, local-only paths, logs and green CI do not prove visual correctness.
 
 Use [verify](../verify/SKILL.md) for runtime collection. Match proof to the claim: a synthetic effect demo can establish rendering and orientation, but does not establish server dispatch or retail timing. An original combined-branch capture does not verify an extracted stack. Refresh affected evidence after relevant changes, or explain why it still applies. When collection or publication is unavailable, name the exact gap and keep the affected claim unverified; do not recommend merge while material correctness or project-fit questions remain unresolved.

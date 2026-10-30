@@ -1550,6 +1550,7 @@ fn zoneline_trigger_inert_inside_mog_house() {
             model: 257,
             sub_map: 0,
             exit_bit: 1,
+            door_open: false,
         }),
         mog_zone_flag: false,
     });
@@ -1594,6 +1595,7 @@ fn nav_is_inert_inside_mog_house() {
             model: 257,
             sub_map: 0,
             exit_bit: 1,
+            door_open: false,
         }),
         mog_zone_flag: false,
     });
@@ -1756,6 +1758,8 @@ fn inv_slot(container: u8, index: u8, item_no: u16) -> AgentEvent {
                 next_use_vana_ts: None,
                 use_delay_end_vana_ts: None,
                 ready: None,
+
+                extdata: None,
             },
         },
     }

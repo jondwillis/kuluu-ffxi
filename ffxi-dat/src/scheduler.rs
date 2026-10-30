@@ -192,6 +192,12 @@ pub const MODEL_TRANSFORM_SUBCHUNK_SLOTS: u32 =
 
 pub const NO_STAGE_ID: [u8; 4] = [0; 4];
 
+/// The display-colour and flash-colour full-screen registers, each the same task
+/// class as the fade stage tagged by its own raw type (Scheduler stages section:
+/// `.agents/skills/retail-observe/references/2026-10-28-event-opcode-no-skip-pass.md`).
+pub const DISPLAY_COLOR_DRIVE_OPCODE: u8 = 0x51;
+pub const FLASH_COLOR_DRIVE_OPCODE: u8 = 0x72;
+
 /// The MODULATE2X argument that leaves the scene untinted. research/XIClient
 /// `GameManager::RenderSomething` composites the persistent screen colour with
 /// `D3DTOP_MODULATE2X`, whose identity is 0x80 — which is why the authored
@@ -387,9 +393,11 @@ pub struct SchedulerStage {
     pub model_transform: Option<ModelTransform>,
     pub follow_points: Option<FollowPoints>,
 
-    // `Some` exactly for `ScreenColorDrive`: research/XIClient HandleTag0x0F reads
-    // destination{Red,Green,Blue,Alpha} out of the dword the generic decoder takes `id` from,
-    // so `id` is `NO_STAGE_ID` there for the same reason as a model transform.
+    // `Some` exactly for the three full-screen colour-drive kinds: research/XIClient
+    // HandleTag0x0F reads destination{Red,Green,Blue,Alpha} out of the dword the generic
+    // decoder takes `id` from (and retail's display/flash tasks copy their payload bytes
+    // the same way), so `id` is `NO_STAGE_ID` there for the same reason as a model
+    // transform.
     pub screen_color: Option<ScreenColor>,
 
     // `Some` exactly for the two actor-fade kinds, whose +8 dword is an RGBA destination rather
@@ -485,6 +493,16 @@ pub enum StageKind {
     /// `duration_frames`, then latch there (`ScreenColorDriveTask`'s destructor
     /// snaps the field to the destination). The screen fade is one of these.
     ScreenColorDrive,
+
+    /// Raw stage 0x51: a second full-screen colour register (the display one),
+    /// its own destination in [`SchedulerStage::screen_color`] — retail allocates
+    /// it and [`Self::FlashColorDrive`] the same task class, tagged by stage type
+    /// (`.agents/skills/retail-observe/references/2026-10-28-event-opcode-no-skip-pass.md`).
+    DisplayColorDrive,
+
+    /// Raw stage 0x72: the flash-colour register, same task class as
+    /// [`Self::DisplayColorDrive`].
+    FlashColorDrive,
 
     SoundOnTarget,
 
@@ -745,6 +763,11 @@ impl StageKind {
             0x0C if length_words * 4 >= MODEL_TRANSFORM_PAYLOAD_LEN => Self::ModelTranslation,
             0x0D if length_words * 4 >= MODEL_TRANSFORM_PAYLOAD_LEN => Self::ModelRotation,
             0x0F => Self::ScreenColorDrive,
+            // The display and flash registers share 0x0F's task class, differing
+            // only in the stage-type tag stored on the instance; both carry their
+            // destination RGB(A) in the payload dword (same record).
+            DISPLAY_COLOR_DRIVE_OPCODE => Self::DisplayColorDrive,
+            FLASH_COLOR_DRIVE_OPCODE => Self::FlashColorDrive,
             0x27 if length_words * 4 >= FOLLOW_POINTS_PAYLOAD_LEN => Self::FollowPoints,
             // research/xim EffectRoutineParser.kt parseSection2 — StopParticleGeneratorRoutine, id =
             // the generator DatId to stop (ROM/0/0.DAT `stbk` stops the cast aura's gn10..gn13).
@@ -971,7 +994,14 @@ impl Scheduler {
                     ]
                 });
                 let screen_color = payload
-                    .filter(|_| kind == StageKind::ScreenColorDrive)
+                    .filter(|_| {
+                        matches!(
+                            kind,
+                            StageKind::ScreenColorDrive
+                                | StageKind::DisplayColorDrive
+                                | StageKind::FlashColorDrive
+                        )
+                    })
                     .map(|rgba| ScreenColor { rgba });
                 // research/xim EffectRoutineParser.kt parseSection2 - the +8 dword of these
                 // kinds is a colour or a transition time, not a DatId.
@@ -2611,6 +2641,38 @@ mod tests {
             stage.id, NO_STAGE_ID,
             "the destination bytes must not be readable as a DatId"
         );
+    }
+
+    /// The display (raw 0x51) and flash (raw 0x72) registers take their payload
+    /// dword as the destination exactly like the fade stage, and do not consume it
+    /// as a DatId (`.agents/skills/retail-observe/references/2026-10-28-event-opcode-no-skip-pass.md`).
+    #[test]
+    fn display_and_flash_colour_drives_take_the_payload_dword_as_destination() {
+        for (opcode, kind, name, destination) in [
+            (
+                DISPLAY_COLOR_DRIVE_OPCODE,
+                StageKind::DisplayColorDrive,
+                *b"fdol",
+                [0xFF, 0xFF, 0xFF, SCREEN_COLOR_UNIT],
+            ),
+            (
+                FLASH_COLOR_DRIVE_OPCODE,
+                StageKind::FlashColorDrive,
+                *b"whi0",
+                [0x00, 0x00, 0x00, SCREEN_COLOR_UNIT],
+            ),
+        ] {
+            let mut body = vec![0u8; SCHEDULER_HEADER_LEN];
+            body.extend(timed_stage_bytes(opcode, SCREEN_COLOR_STAGE_WORDS, 60, 60));
+            body.extend_from_slice(&destination);
+
+            let s = Scheduler::parse(name, &body).unwrap();
+            let stage = s.stages[0].stage;
+            assert_eq!(stage.kind, kind);
+            assert_eq!(stage.duration_frames, 60);
+            assert_eq!(stage.screen_color, Some(ScreenColor { rgba: destination }));
+            assert_eq!(stage.id, NO_STAGE_ID, "the payload dword is not a DatId");
+        }
     }
 
     #[test]

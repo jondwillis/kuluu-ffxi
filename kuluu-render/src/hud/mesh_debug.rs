@@ -1,4 +1,4 @@
-use bevy::picking::events::{Move, Out, Over, Pointer};
+use bevy::picking::events::{PointerMove, PointerOut, PointerOver};
 use bevy::picking::pointer::PointerId;
 use bevy::prelude::*;
 
@@ -49,14 +49,14 @@ pub fn spawn_mesh_debug_hud(mut commands: Commands) {
 }
 
 pub fn update_hover_state(
-    mut over_events: MessageReader<Pointer<Over>>,
-    mut out_events: MessageReader<Pointer<Out>>,
-    mut move_events: MessageReader<Pointer<Move>>,
+    mut over_events: MessageReader<PointerOver>,
+    mut out_events: MessageReader<PointerOut>,
+    mut move_events: MessageReader<PointerMove>,
     debug_info_q: Query<&MmbDebugInfo>,
     mut hover: ResMut<MeshHoverDebug>,
 ) {
     for ev in out_events.read() {
-        if ev.pointer_id != PointerId::Mouse {
+        if ev.pointer.id != PointerId::Mouse {
             continue;
         }
 
@@ -72,7 +72,7 @@ pub fn update_hover_state(
         }
     }
     for ev in over_events.read() {
-        if ev.pointer_id != PointerId::Mouse {
+        if ev.pointer.id != PointerId::Mouse {
             continue;
         }
         if let Ok(info) = debug_info_q.get(ev.entity) {
@@ -82,7 +82,7 @@ pub fn update_hover_state(
     }
 
     for ev in move_events.read() {
-        if ev.pointer_id != PointerId::Mouse {
+        if ev.pointer.id != PointerId::Mouse {
             continue;
         }
         if debug_info_q.contains(ev.entity) {

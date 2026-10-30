@@ -163,7 +163,7 @@ pub(super) struct JobLaneBar(pub Lane);
 /// Every string this panel updates, keyed by where it belongs. One component
 /// for all of them keeps the refresh to a single `Text` query; four separate
 /// ones cannot be made pairwise disjoint and Bevy rejects the system.
-#[derive(Component)]
+#[derive(Component, Clone)]
 pub(super) enum JobText {
     Headline(Lane),
     Detail(Lane),

@@ -1,6 +1,6 @@
 use bevy::app::AppExit;
 use bevy::prelude::*;
-use bevy::render::view::screenshot::{save_to_disk, Capturing, Screenshot};
+use bevy::render::view::screenshot::Capturing;
 use ffxi_actor::skeleton_instance::MountAttach;
 use kuluu_render::ffxi_actor_render::{
     advance_actor_pose_standalone, chocobo_seat_local, inputs_for_pose, load_mount_race, load_npc,
@@ -11,6 +11,9 @@ use kuluu_render::skinned_ffxi_material::{
     FfxiMaterialPlugin, FfxiSkinRegistry, FfxiSkinnedMaterial, FfxiSkinnedMaterialCache,
 };
 use std::env;
+
+#[path = "support/capture_preview.rs"]
+mod capture_preview;
 
 #[derive(Clone)]
 enum Subject {
@@ -79,15 +82,13 @@ fn main() {
     let params = parse_params(&args);
 
     App::new()
+        .insert_resource(bevy::winit::WinitSettings::continuous())
         .insert_resource(params)
         .init_resource::<FrameCount>()
         .init_resource::<Shot>()
         .insert_resource(ClearColor(Color::srgb(0.10, 0.10, 0.13)))
         .add_plugins(DefaultPlugins.set(WindowPlugin {
-            primary_window: Some(Window {
-                resolution: (900u32, 1100u32).into(),
-                ..default()
-            }),
+            primary_window: Some(capture_preview::window((900, 1100))),
             ..default()
         }))
         .add_plugins(FfxiMaterialPlugin)
@@ -265,9 +266,15 @@ fn setup_scene(
         | bevy::render::render_resource::TextureUsages::RENDER_ATTACHMENT;
     let target = images.add(target);
     commands.insert_resource(CapTarget(target.clone()));
+    capture_preview::spawn(
+        &mut commands,
+        target.clone(),
+        UVec2::new(size.width, size.height),
+    );
 
     commands.spawn((
         Camera3d::default(),
+        bevy::camera::ShadowLodOrigin,
         bevy::camera::RenderTarget::Image(target.into()),
         Transform::from_xyz(d * 0.45, look_y + d * 0.25, d)
             .looking_at(Vec3::new(0.0, look_y, 0.0), Vec3::Y),
@@ -565,9 +572,7 @@ fn capture(
             .any(|a| a.last_frame >= params.target_frame - 0.5);
 
     if !shot.0 && fc.0 >= params.cap && near_target {
-        commands
-            .spawn(Screenshot::image(target.0.clone()))
-            .observe(save_to_disk(params.out.clone()));
+        capture_preview::capture(&mut commands, target.0.clone(), &params.out);
         shot.0 = true;
         let joints = q_actor
             .iter()
@@ -590,9 +595,7 @@ fn capture(
     }
 
     if !shot.0 && fc.0 >= params.cap + (FRAME_RATE as u32) * 20 {
-        commands
-            .spawn(Screenshot::image(target.0.clone()))
-            .observe(save_to_disk(params.out.clone()));
+        capture_preview::capture(&mut commands, target.0.clone(), &params.out);
         shot.0 = true;
     }
 }

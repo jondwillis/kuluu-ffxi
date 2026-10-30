@@ -70,14 +70,14 @@ use bevy::render::renderer::{RenderContext, RenderDevice, RenderQueue, ViewQuery
 use bevy::render::{
     render_asset::RenderAssets,
     texture::GpuImage,
-    view::{ExtractedView, Msaa, ViewDepthTexture, ViewTarget},
+    view::{ExtractedView, Msaa, ViewDepthStencilTexture, ViewTarget},
     Extract, Render, RenderApp, RenderStartup, RenderSystems,
 };
 
 use crate::camera::OperatorCamera;
 use crate::nameplate_billboard::NameplateBillboard;
 
-/// Per-plate uniform. Byte layout must match nameplate_final.wgsl `PlateUniform`:
+/// Per-plate uniform. Byte layout must match nameplate_final.wesl `PlateUniform`:
 /// model mat4 @ 0 (64 B), fade alpha f32 @ 64, padded to [`PLATE_UNIFORM_SIZE`].
 #[derive(ShaderType, Clone, Copy)]
 pub struct PlateUniform {
@@ -100,10 +100,10 @@ pub struct ViewUniform {
 /// Shader asset path. The file is embedded by the `embedded_asset!` call in
 /// `NameplateFinalPassPlugin::build` (nameplate_final_pass.rs), so the path is
 /// fixed to that embedded copy.
-const NAMEPLATE_SHADER_PATH: &str = "embedded://kuluu_render/nameplate_final.wgsl";
+const NAMEPLATE_SHADER_PATH: &str = "embedded://kuluu_render/nameplate_final.wesl";
 
 const PLATE_UNIFORM_SIZE: u32 = 80;
-/// Byte layout of the view uniform (see nameplate_final.wgsl `ViewUniform`):
+/// Byte layout of the view uniform (see nameplate_final.wesl `ViewUniform`):
 /// clip matrix @ 0, near f32 @ 64, subrect_scale vec2 @ 72. The buffer has to be
 /// at least encase's `min_size()` for ViewUniform — Mat4(64) + f32 + vec2 (align 8,
 /// padded to offset 72) rounded up to the 16-byte struct alignment = 80; binding a
@@ -124,7 +124,7 @@ const PLATE_VERTEX_DATA: [[f32; 5]; 4] = [
 const PLATE_INDEX_DATA: [u32; 6] = [0, 1, 2, 0, 2, 3];
 
 /// One bind-group entry set per plate: uniform @0 (this plate), view uniform @1
-/// (shared buffer), texture @2 + sampler @3 — matches nameplate_final.wgsl. The
+/// (shared buffer), texture @2 + sampler @3 — matches nameplate_final.wesl. The
 /// view uniform is VERTEX_FRAGMENT: the vertex stage reads clip_from_world and
 /// the MSAA manual-depth-test path in the fragment stage reads .near to turn
 /// stored reversed-Z depth into a view distance — the layout has to cover every
@@ -149,7 +149,7 @@ fn plate_bgl_descriptor() -> BindGroupLayoutDescriptor {
 /// tick (one bind group, rebuilt per frame while MSAA is on). The single-sample variant
 /// leaves this slot unbound and tests the attached depth buffer in hardware instead.
 /// The entry is multi-sample scene depth, read with per-sample textureLoad in the
-/// fragment shader (see nameplate_final.wgsl). textureLoad needs no sampler, so this
+/// fragment shader (see nameplate_final.wesl). textureLoad needs no sampler, so this
 /// group is a lone texture binding, paired with bevy's own prepass BGL entry for the
 /// same buffer. (One-element tuple keeps the same `sequential` constructor the rest
 /// of the file uses.)
@@ -348,6 +348,7 @@ fn plate_pipeline_descriptor(
         },
         immediate_size: 0,
         vertex: VertexState {
+            constants: Default::default(),
             shader: shader.clone(),
             shader_defs: shader_defs.clone(),
             entry_point: Some("vs".into()),
@@ -386,6 +387,7 @@ fn plate_pipeline_descriptor(
             alpha_to_coverage_enabled: false,
         },
         fragment: Some(FragmentState {
+            constants: Default::default(),
             shader: shader.clone(),
             shader_defs,
             entry_point: Some("fs".into()),
@@ -799,7 +801,7 @@ fn plate_bind_group(
 }
 
 /// [model mat4 (64 B)][fade alpha f32 @ 64][zero pad to 80] — the exact layout
-/// nameplate_final.wgsl's PlateUniform reads. Factored out so a unit test pins it.
+/// nameplate_final.wesl's PlateUniform reads. Factored out so a unit test pins it.
 fn plate_uniform_bytes(model: &Mat4, fade_alpha: f32) -> [u8; PLATE_UNIFORM_SIZE as usize] {
     let mut bytes = [0u8; PLATE_UNIFORM_SIZE as usize];
     for (i, c) in model.to_cols_array().iter().enumerate() {
@@ -810,7 +812,7 @@ fn plate_uniform_bytes(model: &Mat4, fade_alpha: f32) -> [u8; PLATE_UNIFORM_SIZE
 }
 
 /// [clip mat4 (64 B)][near f32 @ 64][subrect_scale vec2 @ 72] — the exact
-/// layout nameplate_final.wgsl's ViewUniform reads. Factored out so a unit test pins it.
+/// layout nameplate_final.wesl's ViewUniform reads. Factored out so a unit test pins it.
 fn view_uniform_bytes(
     clip: Mat4,
     near: f32,
@@ -850,7 +852,7 @@ fn queue_write(queue: &RenderQueue, buffer: &Buffer, offset: u64, data: &[u8]) {
 /// ATTACHED when the view itself is single-sample — with MSAA on, the
 /// multi-sample depth buffer cannot sit beside a 1-sample color attachment in
 /// one pass; that variant instead compiles the fragment's per-sample
-/// textureLoad test against the same buffer (see nameplate_final.wgsl). Under
+/// textureLoad test against the same buffer (see nameplate_final.wesl). Under
 /// an upscaler (DLSS sets MainPassResolutionOverride) neither of those is
 /// sound: this pass runs post-upscale at full res while the depth buffer only
 /// holds valid geometry in its render-res sub-rect (bevy sizes the TEXTURE
@@ -922,7 +924,7 @@ fn draw_nameplate_final_pass(
         &ExtractedView,
         Option<&MainPassResolutionOverride>,
         &ViewTarget,
-        &ViewDepthTexture,
+        &ViewDepthStencilTexture,
         Option<&Msaa>,
     )>,
     data: Res<NameplateFinalPassData>,
@@ -934,6 +936,9 @@ fn draw_nameplate_final_pass(
     mut pipe_state: Local<Option<((TextureFormat, PlateDepthMode, u32), CachedRenderPipelineId)>>,
 ) {
     let (ev, resolution_override, target, depth, msaa) = view.into_inner();
+    let Some(depth_view) = depth.attachment.depth_stencil_views().depth_only_view() else {
+        return;
+    };
 
     let Some(operator_cam) = data.operator_cam else {
         return;
@@ -970,7 +975,7 @@ fn draw_nameplate_final_pass(
     let near = ev.clip_from_view.col(3).z;
     let subrect_scale = match resolution_override {
         Some(ovr) => {
-            let ext = depth.texture.size();
+            let ext = depth.texture().size();
             Vec2::new(
                 ovr.0.x as f32 / ext.width.max(1) as f32,
                 ovr.0.y as f32 / ext.height.max(1) as f32,
@@ -1050,7 +1055,7 @@ fn draw_nameplate_final_pass(
             Some(device.create_bind_group(
                 "nameplate_final_pass_depth_binding",
                 &bgl,
-                &BindGroupEntries::sequential((depth.view(),)),
+                &BindGroupEntries::sequential((depth_view,)),
             ))
         }
     };
@@ -1112,7 +1117,7 @@ pub struct NameplateFinalPassPlugin;
 
 impl Plugin for NameplateFinalPassPlugin {
     fn build(&self, app: &mut App) {
-        embedded_asset!(app, "nameplate_final.wgsl");
+        embedded_asset!(app, "nameplate_final.wesl");
 
         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
             render_app
@@ -1223,7 +1228,7 @@ mod tests {
     }
 
     /// View uniform packing: clip @ 0, near @ 64, subrect scale @ 72 — the exact
-    /// layout nameplate_final.wgsl's ViewUniform reads (total stays 80).
+    /// layout nameplate_final.wesl's ViewUniform reads (total stays 80).
     #[test]
     fn view_uniform_bytes_pack_clip_near_scale() {
         let m = Mat4::from_translation(Vec3::new(1.0, 2.0, 3.0));
@@ -1238,7 +1243,7 @@ mod tests {
     }
 
     /// Uniform packing: mat4 at byte 0, alpha at byte 64, rest zero — the exact
-    /// layout nameplate_final.wgsl's PlateUniform reads.
+    /// layout nameplate_final.wesl's PlateUniform reads.
     #[test]
     fn plate_uniform_bytes_pack_model_then_alpha() {
         let m = Mat4::from_scale_rotation_translation(

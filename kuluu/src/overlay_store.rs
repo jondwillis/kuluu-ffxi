@@ -13,7 +13,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use bevy::prelude::*;
+use bevy::prelude::Resource;
 use serde::{Deserialize, Serialize};
 
 pub const OVERLAY_FILE_VERSION: u32 = 1;

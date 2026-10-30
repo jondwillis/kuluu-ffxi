@@ -14,8 +14,11 @@
 //! parented over a ware list and a per-side confirm box modelled here.
 
 use bevy::input::mouse::MouseWheel;
+use bevy::picking::events::PointerPress;
+use bevy::picking::hover::Hovered;
 use bevy::prelude::*;
 use bevy::ui::RelativeCursorPosition;
+use bevy::ui_widgets::Button;
 use kuluu_snapshot::{SceneSnapshot, ShopItem, ShopSale};
 
 use crate::hud::bazaar_view::{group_digits, item_name};
@@ -24,6 +27,7 @@ use crate::hud::digit_spinner::{self, DigitSpinner, SpinnerSlot, SpinnerUnit};
 use crate::hud::item_dat_root::{ItemDatRoot, ItemIconCache};
 use crate::hud::item_ui::{self, framed_box, set_icon, text_font, theme, transparent_placeholder};
 use crate::hud::list_view::{self, row_color, ListViewport, LIST_ROWS, ROW_ICON_PX};
+use crate::input_mode::ConfirmDefault;
 use crate::snapshot::SceneState;
 
 /// `ShopNo` in c2s 0x083 SHOP_BUY. The retail client never sets it and the
@@ -151,10 +155,12 @@ pub struct ShopScreenState {
     /// lands. Cleared when the snapshot's shop finally goes away.
     pub dismissed: bool,
 
-    /// Which row the confirm box's Yes/No cursor sits on. Retail's comparable
-    /// transaction confirm - the AH fee dialog - opens on Yes
-    /// (.agents/skills/retail-observe/references/auction-house.md, sell flow).
+    /// Which row the confirm box's Yes/No cursor sits on.
     pub confirm_yes: bool,
+
+    /// The Buy/Sell picker's cursor when the shop last closed this session: `shopmain` reopens on
+    /// it (.agents/skills/retail-observe/references/2026-10-15-menu-docking-and-flags.md).
+    pub remembered_menu_cursor: usize,
 }
 
 impl Default for ShopScreenState {
@@ -170,16 +176,16 @@ impl Default for ShopScreenState {
             pending_buy: None,
             pending_sell: None,
             dismissed: false,
-            confirm_yes: CONFIRM_DEFAULT_YES,
+            confirm_yes: SHOP_CONFIRM_DEFAULT.is_yes(),
+            remembered_menu_cursor: 0,
         }
     }
 }
 
-/// The confirm box opens on Yes. Retail's nearest observed equivalent, the
-/// Auction House fee dialog, does the same; the No default this repo uses
-/// elsewhere is for destructive prompts (Drop, Log Out), not for a transaction
-/// the player walked three menus to reach.
-pub const CONFIRM_DEFAULT_YES: bool = true;
+/// The priced buy and sell confirms (`shopbuy` / `shopsell`) ride the shared Yes/No routine and
+/// ask for its No default
+/// (.agents/skills/retail-observe/references/2026-10-15-menu-docking-and-flags.md).
+pub const SHOP_CONFIRM_DEFAULT: ConfirmDefault = ConfirmDefault::No;
 
 /// A purchase the player has sized but not yet confirmed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -197,14 +203,29 @@ impl ShopScreenState {
         Self::default()
     }
 
+    /// Everything but the session's picker memory goes back to a fresh shop.
     pub fn reset(&mut self) {
+        let remembered = self.remembered_menu_cursor;
         *self = Self::default();
+        self.remembered_menu_cursor = remembered;
+    }
+
+    /// The window opens with the Buy/Sell picker on its remembered row.
+    pub fn open(&mut self) {
+        self.reset();
+        self.menu_cursor = self.remembered_menu_cursor.min(ShopMode::ROWS.len() - 1);
+    }
+
+    /// The window closes and the picker leaves its row behind.
+    pub fn close(&mut self) {
+        self.remembered_menu_cursor = self.menu_cursor;
+        self.reset();
     }
 
     /// Give up the window without forgetting that we did. Everything else
     /// resets; [`Self::dismissed`] stays set until the snapshot catches up.
     pub fn dismiss(&mut self) {
-        self.reset();
+        self.close();
         self.dismissed = true;
     }
 
@@ -292,7 +313,7 @@ impl ShopScreenState {
     /// Open the priced yes/no step with the cursor on its default row.
     pub fn enter_confirm(&mut self) {
         self.focus = ShopFocus::Confirm;
-        self.confirm_yes = CONFIRM_DEFAULT_YES;
+        self.confirm_yes = SHOP_CONFIRM_DEFAULT.is_yes();
     }
 
     /// Keep the cursor inside a list the server or the player's bag shrank.
@@ -540,6 +561,7 @@ pub(crate) fn spawn_shop_panel(mut commands: Commands, mut images: ResMut<Assets
                                         slot: i,
                                     },
                                     Button,
+                                    Hovered::default(),
                                     list_view::row_node(),
                                 ))
                                 .with_children(|row| {
@@ -597,6 +619,7 @@ pub(crate) fn spawn_shop_panel(mut commands: Commands, mut images: ResMut<Assets
                         dock.spawn((
                             ShopText(ShopTextRole::MenuRow(i)),
                             Button,
+                            Hovered::default(),
                             ShopHotRow {
                                 region: ShopRegion::Menu,
                                 slot: i,
@@ -638,6 +661,7 @@ pub(crate) fn spawn_shop_panel(mut commands: Commands, mut images: ResMut<Assets
                         g.spawn((
                             ShopText(ShopTextRole::ConfirmChoice(yes)),
                             Button,
+                            Hovered::default(),
                             ShopHotRow {
                                 region: ShopRegion::Confirm,
                                 slot,
@@ -884,7 +908,13 @@ pub(crate) fn update_shop_scrollbar(
     }
     let total = rows_for(screen.mode, &state.snapshot).len();
     if let (Ok(mut track), Ok(mut thumb)) = (track_q.single_mut(), thumb_q.single_mut()) {
-        list_view::apply_scrollbar(&mut track, &mut thumb, screen.viewport.start, total);
+        list_view::apply_scrollbar(
+            &mut track,
+            &mut thumb,
+            screen.viewport.start,
+            total,
+            list_view::LIST_ROWS,
+        );
     }
 }
 
@@ -913,7 +943,7 @@ pub(crate) fn record_shop_appraisals(state: Res<SceneState>, mut screen: ResMut<
 pub(crate) fn shop_mouse_hover_system(
     state: Res<SceneState>,
     mut screen: ResMut<ShopScreenState>,
-    hot: Query<(&Interaction, &ShopHotRow), Changed<Interaction>>,
+    hot: Query<(&Hovered, &ShopHotRow), Changed<Hovered>>,
 ) {
     if !shop_open(&state, &screen) {
         return;
@@ -921,7 +951,7 @@ pub(crate) fn shop_mouse_hover_system(
     let len = rows_for(screen.mode, &state.snapshot).len();
     let start = screen.viewport.start;
     for (interaction, row) in &hot {
-        if !matches!(interaction, Interaction::Hovered | Interaction::Pressed) {
+        if !interaction.0 {
             continue;
         }
         match (row.region, screen.focus) {
@@ -948,14 +978,17 @@ pub const CONFIRM_YES_SLOT: usize = 0;
 pub(crate) fn shop_mouse_click_system(
     state: Res<SceneState>,
     screen: Res<ShopScreenState>,
-    hot: Query<(&Interaction, &ShopHotRow), Changed<Interaction>>,
+    hot: Query<&ShopHotRow>,
     mut out: MessageWriter<ShopRowActivated>,
+    mut presses: MessageReader<PointerPress>,
+    parents: Query<&ChildOf>,
 ) {
+    let pressed_rows = super::primary_pressed_rows(&mut presses, &hot, &parents);
     if !shop_open(&state, &screen) {
         return;
     }
-    for (interaction, row) in &hot {
-        if *interaction == Interaction::Pressed {
+    for row in pressed_rows {
+        {
             out.write(ShopRowActivated {
                 region: row.region,
                 slot: row.slot,
@@ -1111,6 +1144,7 @@ mod tests {
             next_use_vana_ts: None,
             use_delay_end_vana_ts: None,
             ready: None,
+            extdata: None,
         }
     }
 
@@ -1259,6 +1293,30 @@ mod tests {
         assert_eq!(s.menu_mode(), ShopMode::Sell);
         s.enter_list();
         assert_eq!(s.mode, ShopMode::Sell);
+    }
+
+    /// `shopmain` remembers its row for the session and the ware list `shop` opens on item 1
+    /// (.agents/skills/retail-observe/references/2026-10-15-menu-docking-and-flags.md).
+    #[test]
+    fn the_picker_reopens_on_its_row_and_the_list_on_item_one() {
+        let mut s = ShopScreenState::default();
+        s.open();
+        s.move_menu_cursor(1);
+        s.enter_list();
+        s.move_cursor(1, 3);
+        s.close();
+        s.open();
+        assert_eq!(s.menu_mode(), ShopMode::Sell, "the picker kept its row");
+        s.enter_list();
+        assert_eq!(s.cursor, 0, "the ware list opens on item 1");
+        s.dismiss();
+        s.reset();
+        s.open();
+        assert_eq!(
+            s.menu_mode(),
+            ShopMode::Sell,
+            "a dismissed shop remembers too, and a reset forgets nothing"
+        );
     }
 
     #[test]
@@ -1550,11 +1608,10 @@ mod tests {
         assert!(line.ends_with("for 120 gil?"), "{line}");
     }
 
-    /// The question needs a visible answer. Retail's comparable transaction
-    /// confirm (the AH fee dialog) opens on Yes
-    /// (.agents/skills/retail-observe/references/auction-house.md).
+    /// The buy and sell confirms open on No like the other shared Yes/No prompts
+    /// (.agents/skills/retail-observe/references/2026-10-15-menu-docking-and-flags.md).
     #[test]
-    fn the_confirm_box_offers_yes_and_no_with_the_cursor_on_yes() {
+    fn the_confirm_box_offers_yes_and_no_with_the_cursor_on_no() {
         let mut s = ShopScreenState::opened();
         let row = ShopRow {
             index: 0,
@@ -1564,21 +1621,21 @@ mod tests {
         };
         s.stage_buy(&row, 1);
         assert_eq!(s.focus, ShopFocus::Confirm);
-        assert!(s.confirm_yes);
-        assert_eq!(confirm_choices(s.confirm_yes), "> Yes\n  No");
-
-        s.confirm_yes = false;
+        assert!(!s.confirm_yes);
         assert_eq!(confirm_choices(s.confirm_yes), "  Yes\n> No");
+
+        s.confirm_yes = true;
+        assert_eq!(confirm_choices(s.confirm_yes), "> Yes\n  No");
     }
 
     #[test]
     fn re_entering_the_confirm_step_re_arms_the_default() {
         let mut s = ShopScreenState::opened();
-        s.confirm_yes = false;
+        s.confirm_yes = true;
         s.enter_confirm();
         assert!(
-            s.confirm_yes,
-            "a declined prompt does not poison the next one"
+            !s.confirm_yes,
+            "an answered prompt does not carry its row into the next one"
         );
     }
 

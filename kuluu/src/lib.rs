@@ -9,6 +9,8 @@ pub mod steam_shortcut;
 #[cfg(feature = "native-window")]
 pub mod audio_store;
 #[cfg(feature = "native-window")]
+pub mod config_options_store;
+#[cfg(feature = "native-window")]
 pub mod graphics_store;
 #[cfg(feature = "native-window")]
 pub mod keybinds_store;

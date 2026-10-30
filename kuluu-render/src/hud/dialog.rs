@@ -1,4 +1,7 @@
+use bevy::picking::events::PointerPress;
+use bevy::picking::hover::Hovered;
 use bevy::prelude::*;
+use bevy::ui_widgets::Button;
 use kuluu_snapshot::DialogState;
 
 use crate::hud::item_dat_root::{ItemDatRoot, ItemIconCache};
@@ -154,6 +157,7 @@ pub fn spawn_dialog_panel(mut commands: Commands, mut images: ResMut<Assets<Imag
                     col.spawn((
                         DialogChoiceButton { choice },
                         Button,
+                        Hovered::default(),
                         Node {
                             width: Val::Percent(100.0),
                             padding: UiRect::axes(Val::Px(4.0), Val::Px(1.0)),
@@ -415,15 +419,13 @@ pub fn update_dialog_options_system(
 
 pub fn dialog_mouse_hover_system(
     mut mode: ResMut<InputMode>,
-    q: Query<(&Interaction, &DialogChoiceButton), Changed<Interaction>>,
+    q: Query<(&Hovered, &DialogChoiceButton), Changed<Hovered>>,
 ) {
     let InputMode::Dialog(cursor) = &mut *mode else {
         return;
     };
     for (interaction, btn) in &q {
-        if matches!(interaction, Interaction::Hovered | Interaction::Pressed)
-            && cursor.cursor != btn.choice
-        {
+        if interaction.0 && cursor.cursor != btn.choice {
             cursor.cursor = btn.choice;
         }
     }
@@ -431,14 +433,17 @@ pub fn dialog_mouse_hover_system(
 
 pub fn dialog_mouse_click_system(
     mode: Res<InputMode>,
-    q: Query<(&Interaction, &DialogChoiceButton), Changed<Interaction>>,
+    q: Query<&DialogChoiceButton>,
     mut out: MessageWriter<DialogChoiceActivated>,
+    mut presses: MessageReader<PointerPress>,
+    parents: Query<&ChildOf>,
 ) {
+    let pressed_rows = super::primary_pressed_rows(&mut presses, &q, &parents);
     if !matches!(*mode, InputMode::Dialog(_)) {
         return;
     }
-    for (interaction, btn) in &q {
-        if *interaction == Interaction::Pressed {
+    for btn in pressed_rows {
+        {
             out.write(DialogChoiceActivated { choice: btn.choice });
         }
     }

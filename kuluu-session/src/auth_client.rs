@@ -1,11 +1,11 @@
-use std::sync::Arc;
+use std::{future::Future, sync::Arc, time::Duration};
 
 use anyhow::{anyhow, bail, Context, Result};
 use rustls_pki_types::ServerName;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
 };
 use tokio_rustls::TlsConnector;
@@ -89,6 +89,10 @@ impl std::str::FromStr for AuthFlavor {
 }
 
 const AUTH_BUFFER_SIZE: usize = 4096;
+// A complete-request limit also bounds servers that send one byte at a time.
+const AUTH_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const AUTH_RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
+const LEGACY_AUTH_HINT: &str = "The server returned a binary authentication response. The server may require Legacy LSB. Confirm the server type and loader version with the server operator. Changing the loader version does not change the connection protocol.";
 
 const XILOADER_VERSION_ENV: &str = "FFXI_XILOADER_VERSION";
 
@@ -149,17 +153,96 @@ fn resolve_binary_version_from(
 }
 
 fn parse_version_triple(s: &str) -> Option<[u8; 3]> {
+    let mut parts = s.trim().split('.');
     let mut out = [0u8; 3];
-    let mut count = 0;
-    for (i, part) in s.trim().split('.').enumerate().take(3) {
-        out[i] = part.parse::<u8>().ok()?;
-        count += 1;
+    for value in &mut out {
+        let part = parts.next()?;
+        if part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        *value = part.parse().ok()?;
     }
-    if count == 3 {
-        Some(out)
-    } else {
-        None
+    parts.next().is_none().then_some(out)
+}
+
+pub fn validate_loader_version(flavor: AuthFlavor, value: &str) -> Result<()> {
+    if value.trim().is_empty() || flavor == AuthFlavor::PlayOnline {
+        return Ok(());
     }
+    match flavor {
+        AuthFlavor::Binary if auth_binary::version_field(value).is_none() => {
+            bail!("Use a loader version such as 1.1.5, with one digit per number.");
+        }
+        AuthFlavor::Json if parse_version_triple(value).is_none() => {
+            bail!("Use three loader version numbers from 0 to 255, separated by periods.");
+        }
+        _ => Ok(()),
+    }
+}
+
+async fn auth_timeout<T>(
+    limit: Duration,
+    operation: &str,
+    future: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    tokio::time::timeout(limit, future).await.with_context(|| {
+        format!(
+            "Authentication {operation} timed out after {} seconds.",
+            limit.as_secs()
+        )
+    })?
+}
+
+// vendor/server/src/login/auth_session.cpp auth_session::read_func
+async fn read_json_response(stream: &mut (impl AsyncRead + Unpin)) -> Result<Value> {
+    let mut buf = vec![0u8; AUTH_BUFFER_SIZE];
+    let mut total = 0usize;
+    loop {
+        match stream.read(&mut buf[total..]).await {
+            Ok(0) => break,
+            Ok(n) => {
+                total += n;
+                if matches!(buf[0], LOGIN_ERROR | LOGIN_ERROR_VERSION_UNSUPPORTED) {
+                    return Err(AuthRejected(LEGACY_AUTH_HINT.into()).into());
+                }
+                if let Ok(value) =
+                    serde_json::from_slice::<Value>(trim_trailing_zero(&buf[..total]))
+                {
+                    return Ok(value);
+                }
+                if total == buf.len() {
+                    bail!("Authentication response exceeded {AUTH_BUFFER_SIZE} bytes.");
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    serde_json::from_slice(trim_trailing_zero(&buf[..total]))
+        .context("Authentication server returned an incomplete or invalid JSON response.")
+}
+
+// vendor/server/src/login/auth_session.cpp auth_session::read_func
+async fn read_binary_response(
+    stream: &mut (impl AsyncRead + Unpin),
+    command: BinCommand<'_>,
+) -> Result<Vec<u8>> {
+    let mut buf = vec![0u8; auth_binary::RESPONSE_LEN];
+    let mut total = 0;
+    let mut expected = auth_binary::RESPONSE_MIN_LEN;
+    while total < expected {
+        match stream.read(&mut buf[total..expected]).await {
+            Ok(0) => break,
+            Ok(n) => {
+                total += n;
+                expected = command.response_len(buf[0]);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    buf.truncate(total);
+    Ok(buf)
 }
 
 /// What the lobby is opened with. LSB's auth server mints `session_hash`
@@ -404,43 +487,27 @@ impl AuthClient {
         })
     }
 
+    async fn connect(&self) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
+        auth_timeout(AUTH_CONNECT_TIMEOUT, "connection", async {
+            let connector = TlsConnector::from(self.config.clone());
+            let server_name = ServerName::try_from(self.host.clone())
+                .map_err(|_| anyhow!("invalid server name: {}", self.host))?;
+            let tcp = TcpStream::connect((self.host.as_str(), self.port))
+                .await
+                .with_context(|| format!("TCP connect to {}:{}", self.host, self.port))?;
+            Ok(connector.connect(server_name, tcp).await?)
+        })
+        .await
+    }
+
     async fn exchange(&self, payload: &Value) -> Result<Value> {
-        let connector = TlsConnector::from(self.config.clone());
-        let server_name = ServerName::try_from(self.host.clone())
-            .map_err(|_| anyhow!("invalid server name: {}", self.host))?;
-        let tcp = TcpStream::connect((self.host.as_str(), self.port))
-            .await
-            .with_context(|| format!("TCP connect to {}:{}", self.host, self.port))?;
-        let mut tls = connector.connect(server_name, tcp).await?;
-
-        let body = payload.to_string();
-        tls.write_all(body.as_bytes()).await?;
-
-        tls.flush().await?;
-
-        let mut buf = vec![0u8; AUTH_BUFFER_SIZE];
-        let mut total = 0usize;
-
-        loop {
-            match tls.read(&mut buf[total..]).await {
-                Ok(0) => break,
-                Ok(n) => {
-                    total += n;
-                    if let Ok(v) = serde_json::from_slice::<Value>(&buf[..total]) {
-                        return Ok(v);
-                    }
-                    if total == buf.len() {
-                        bail!("auth response exceeded {AUTH_BUFFER_SIZE} bytes");
-                    }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                Err(e) => return Err(e.into()),
-            }
-        }
-
-        let trimmed = trim_trailing_zero(&buf[..total]);
-        serde_json::from_slice(trimmed)
-            .with_context(|| format!("auth server reply was not valid JSON: {trimmed:?}"))
+        let mut tls = self.connect().await?;
+        auth_timeout(AUTH_RESPONSE_TIMEOUT, "response", async {
+            tls.write_all(payload.to_string().as_bytes()).await?;
+            tls.flush().await?;
+            read_json_response(&mut tls).await
+        })
+        .await
     }
 
     async fn login_binary(&self, username: &str, password: &str) -> Result<AuthSession> {
@@ -448,7 +515,7 @@ impl AuthClient {
         let payload = builder
             .build(username, password, BinCommand::Login)
             .map_err(|e| anyhow!("build binary login payload: {e}"))?;
-        let reply = self.exchange_binary(&payload).await?;
+        let reply = self.exchange_binary(&payload, BinCommand::Login).await?;
         let (account_id, session_hash) = auth_binary::parse_response(&reply, builder.version)
             .map_err(|e| match e {
                 BinaryAuthError::LoginFailed
@@ -476,7 +543,7 @@ impl AuthClient {
         let payload = builder
             .build(username, password, BinCommand::Create)
             .map_err(|e| anyhow!("build binary create payload: {e}"))?;
-        let reply = self.exchange_binary(&payload).await?;
+        let reply = self.exchange_binary(&payload, BinCommand::Create).await?;
         match auth_binary::parse_create_response(&reply) {
             Ok(()) => Ok(()),
             Err(auth_binary::BinaryAuthError::CreateTaken) => Ok(()),
@@ -484,37 +551,27 @@ impl AuthClient {
         }
     }
 
-    async fn exchange_binary(&self, payload: &[u8; auth_binary::PAYLOAD_LEN]) -> Result<Vec<u8>> {
-        let connector = TlsConnector::from(self.config.clone());
-        let server_name = ServerName::try_from(self.host.clone())
-            .map_err(|_| anyhow!("invalid server name: {}", self.host))?;
-        let tcp = TcpStream::connect((self.host.as_str(), self.port))
-            .await
-            .with_context(|| format!("TCP connect to {}:{}", self.host, self.port))?;
-        let mut tls = connector.connect(server_name, tcp).await?;
-        if std::env::var_os("FFXI_AUTH_TRACE").is_some() {
-            eprintln!("[auth-trace] TX {} bytes:", payload.len());
-            eprintln!("{}", hex_dump(payload));
-        }
-        tls.write_all(payload).await?;
-        tls.flush().await?;
-
-        let mut buf = vec![0u8; auth_binary::RESPONSE_LEN];
-        let mut total = 0;
-        while total < buf.len() {
-            match tls.read(&mut buf[total..]).await {
-                Ok(0) => break,
-                Ok(n) => total += n,
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                Err(e) => return Err(e.into()),
+    async fn exchange_binary(
+        &self,
+        payload: &[u8; auth_binary::PAYLOAD_LEN],
+        command: BinCommand<'_>,
+    ) -> Result<Vec<u8>> {
+        let mut tls = self.connect().await?;
+        auth_timeout(AUTH_RESPONSE_TIMEOUT, "response", async {
+            if std::env::var_os("FFXI_AUTH_TRACE").is_some() {
+                eprintln!("[auth-trace] TX {} bytes:", payload.len());
+                eprintln!("{}", hex_dump(payload));
             }
-        }
-        buf.truncate(total);
-        if std::env::var_os("FFXI_AUTH_TRACE").is_some() {
-            eprintln!("[auth-trace] RX {} bytes:", buf.len());
-            eprintln!("{}", hex_dump(&buf));
-        }
-        Ok(buf)
+            tls.write_all(payload).await?;
+            tls.flush().await?;
+            let reply = read_binary_response(&mut tls, command).await?;
+            if std::env::var_os("FFXI_AUTH_TRACE").is_some() {
+                eprintln!("[auth-trace] RX {} bytes:", reply.len());
+                eprintln!("{}", hex_dump(&reply));
+            }
+            Ok(reply)
+        })
+        .await
     }
 }
 
@@ -554,7 +611,159 @@ mod tests {
     use super::*;
 
     // vendor/server/src/login/auth_session.h SupportedXiloaderVersion
-    const LSB_SUPPORTED_XILOADER_VERSION: [u8; 3] = [2, 1, 0];
+    const LSB_SUPPORTED_XILOADER_VERSION: [u8; 3] = [2, 2, 0];
+
+    const TEST_RESPONSE_LIMIT: Duration = Duration::from_secs(1);
+    const TEST_STALL_LIMIT: Duration = Duration::from_millis(20);
+
+    #[tokio::test]
+    async fn binary_rejections_return_while_the_server_keeps_the_connection_open() {
+        for result in [
+            auth_binary::RESULT_LOGIN_FAIL,
+            auth_binary::RESULT_VERSION_MISMATCH,
+            auth_binary::RESULT_ALREADY_LOGGED_IN,
+        ] {
+            let (mut client, mut server) = tokio::io::duplex(AUTH_BUFFER_SIZE);
+            server.write_all(&[result]).await.unwrap();
+            let reply = auth_timeout(
+                TEST_RESPONSE_LIMIT,
+                "test",
+                read_binary_response(&mut client, BinCommand::Login),
+            )
+            .await
+            .unwrap();
+            assert_eq!(reply, vec![result]);
+            assert!(auth_binary::parse_response(&reply, auth_binary::DEFAULT_VERSION).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn binary_create_success_returns_without_waiting_for_a_session() {
+        let (mut client, mut server) = tokio::io::duplex(AUTH_BUFFER_SIZE);
+        server
+            .write_all(&[auth_binary::RESULT_CREATE_OK])
+            .await
+            .unwrap();
+        let reply = auth_timeout(
+            TEST_RESPONSE_LIMIT,
+            "test",
+            read_binary_response(&mut client, BinCommand::Create),
+        )
+        .await
+        .unwrap();
+        auth_binary::parse_create_response(&reply).unwrap();
+    }
+
+    #[tokio::test]
+    async fn binary_success_collects_fragmented_account_and_session_data() {
+        let mut expected = vec![0; auth_binary::RESPONSE_LEN];
+        expected[0] = auth_binary::RESULT_LOGIN_OK;
+        let (mut client, mut server) = tokio::io::duplex(auth_binary::RESPONSE_MIN_LEN);
+        let bytes = expected.clone();
+        let writer = tokio::spawn(async move {
+            for byte in bytes {
+                server.write_all(&[byte]).await.unwrap();
+            }
+            server
+        });
+        let reply = auth_timeout(
+            TEST_RESPONSE_LIMIT,
+            "test",
+            read_binary_response(&mut client, BinCommand::Login),
+        )
+        .await
+        .unwrap();
+        let _open_server = writer.await.unwrap();
+        assert_eq!(reply, expected);
+        auth_binary::parse_response(&reply, auth_binary::DEFAULT_VERSION).unwrap();
+    }
+
+    #[tokio::test]
+    async fn truncated_binary_success_is_not_accepted() {
+        let (mut client, mut server) = tokio::io::duplex(AUTH_BUFFER_SIZE);
+        server
+            .write_all(&[auth_binary::RESULT_LOGIN_OK])
+            .await
+            .unwrap();
+        drop(server);
+        let reply = read_binary_response(&mut client, BinCommand::Login)
+            .await
+            .unwrap();
+        assert!(matches!(
+            auth_binary::parse_response(&reply, auth_binary::DEFAULT_VERSION),
+            Err(BinaryAuthError::TruncatedSuccess(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn json_mode_reports_binary_rejection_without_waiting_for_close() {
+        for result in [LOGIN_ERROR, LOGIN_ERROR_VERSION_UNSUPPORTED] {
+            let (mut client, mut server) = tokio::io::duplex(AUTH_BUFFER_SIZE);
+            server.write_all(&[result]).await.unwrap();
+            let error = auth_timeout(TEST_RESPONSE_LIMIT, "test", read_json_response(&mut client))
+                .await
+                .unwrap_err();
+            assert!(is_auth_rejected(&error));
+            assert_eq!(error.to_string(), LEGACY_AUTH_HINT);
+        }
+    }
+
+    #[tokio::test]
+    async fn json_response_can_arrive_one_byte_at_a_time() {
+        let response = json!({"result": LOGIN_ERROR});
+        let bytes = response.to_string().into_bytes();
+        let (mut client, mut server) = tokio::io::duplex(auth_binary::RESPONSE_MIN_LEN);
+        let writer = tokio::spawn(async move {
+            for byte in bytes {
+                server.write_all(&[byte]).await.unwrap();
+            }
+            server
+        });
+        let reply = auth_timeout(TEST_RESPONSE_LIMIT, "test", read_json_response(&mut client))
+            .await
+            .unwrap();
+        let _open_server = writer.await.unwrap();
+        assert_eq!(reply, response);
+    }
+
+    #[tokio::test]
+    async fn silent_and_partial_responses_hit_the_response_limit() {
+        let (mut client, mut server) = tokio::io::duplex(AUTH_BUFFER_SIZE);
+        let error = auth_timeout(
+            TEST_STALL_LIMIT,
+            "response",
+            read_json_response(&mut client),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("timed out"));
+        server
+            .write_all(&[auth_binary::RESULT_LOGIN_OK])
+            .await
+            .unwrap();
+        let error = auth_timeout(
+            TEST_STALL_LIMIT,
+            "response",
+            read_binary_response(&mut client, BinCommand::Login),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("timed out"));
+    }
+
+    #[test]
+    fn loader_validation_rejects_extra_components_and_invalid_numbers() {
+        for value in ["1.1.5.9", "+1.1.5", "256.1.5", "1..5", "1.1"] {
+            assert!(
+                validate_loader_version(AuthFlavor::Json, value).is_err(),
+                "{value}"
+            );
+        }
+        assert!(validate_loader_version(AuthFlavor::Binary, "10.1.5").is_err());
+        assert!(validate_loader_version(AuthFlavor::Binary, " 1.1.5 ").is_ok());
+        assert!(validate_loader_version(AuthFlavor::Json, "255.10.0").is_ok());
+        assert!(validate_loader_version(AuthFlavor::Json, "").is_ok());
+    }
 
     #[test]
     fn default_version_matches_lsb_supported_xiloader() {

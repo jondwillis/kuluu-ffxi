@@ -40,6 +40,8 @@ pub struct TalkNumWork {
 impl TalkNumWork {
     pub(crate) const NUM_COUNT: usize = 4;
     pub const NAME_LEN: usize = 32;
+    // vendor/server/src/map/packets/s2c/0x02a_talknumwork.cpp GP_SERV_COMMAND_TALKNUMWORK
+    pub const SHORT_SIZE: usize = 28;
     pub const SIZE: usize = 4 + Self::NUM_COUNT * 4 + 2 + 2 + 1 + 1 + Self::NAME_LEN;
     /// Added to MesNum when the sender is a PC and ShowName is false — the
     /// dialog index is the low 15 bits.
@@ -47,13 +49,17 @@ impl TalkNumWork {
     pub const MESNUM_HIDE_NAME_FLAG: u16 = super::MESNUM_HIDE_NAME_FLAG;
 
     pub fn decode(body: &[u8]) -> Result<Self, DecodeError> {
-        if body.len() < Self::SIZE {
+        if body.len() < Self::SIZE && body.len() != Self::SHORT_SIZE {
             return Err(DecodeError::Truncated(Self::SIZE, body.len()));
         }
         let mut num = [0i32; Self::NUM_COUNT];
         for (i, n) in num.iter_mut().enumerate() {
             let o = 4 + i * 4;
             *n = i32::from_le_bytes([body[o], body[o + 1], body[o + 2], body[o + 3]]);
+        }
+        let mut name = [0; Self::NAME_LEN];
+        if body.len() >= Self::SIZE {
+            name.copy_from_slice(&body[26..26 + Self::NAME_LEN]);
         }
         Ok(Self {
             unique_no: u32::from_le_bytes(body[0..4].try_into().unwrap()),
@@ -62,7 +68,7 @@ impl TalkNumWork {
             mes_num: u16::from_le_bytes([body[22], body[23]]),
             kind: body[24],
             flag: body[25],
-            name: body[26..26 + Self::NAME_LEN].try_into().unwrap(),
+            name,
         })
     }
 
@@ -400,6 +406,21 @@ mod talk_num_work_tests {
         assert_eq!(t.kind, 3);
         assert_eq!(t.flag, 1);
         assert_eq!(t.speaker_name().as_deref(), Some("Trion"));
+    }
+
+    #[test]
+    fn decodes_short_typed_message_without_a_name() {
+        let mut short = body();
+        short.truncate(TalkNumWork::SHORT_SIZE);
+        short[26..].fill(0);
+        let decoded = TalkNumWork::decode(&short).unwrap();
+        let full = TalkNumWork::decode(&body()).unwrap();
+        assert_eq!(decoded.num, full.num);
+        assert_eq!(decoded.mes_num, full.mes_num);
+        assert_eq!(decoded.kind, full.kind);
+        assert_eq!(decoded.speaker_name(), None);
+        short.pop();
+        assert!(TalkNumWork::decode(&short).is_err());
     }
 
     #[test]

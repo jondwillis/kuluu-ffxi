@@ -1,26 +1,16 @@
-#[cfg(feature = "debug-animation_room")]
-pub mod animation_test_scene;
-
-/// This build's animation-room drive surface, for the key-drive knob query. None means the room is
-/// not compiled in — the listener answers that explicitly rather than leaving a driver guessing.
-#[cfg(feature = "debug-animation_room")]
-pub fn animtest_knobs() -> Option<serde_json::Value> {
-    Some(animation_test_scene::knob_report())
-}
-
-#[cfg(not(feature = "debug-animation_room"))]
-pub fn animtest_knobs() -> Option<serde_json::Value> {
-    None
-}
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 
 mod app_icon;
 pub mod auto_target;
+mod backdrop_preload;
 pub mod bridge;
 pub mod camera_collision;
+mod camera_trace;
 pub mod collision_bvh;
 pub mod command_surface;
 pub mod cutscene_motion_done;
 pub mod debug_heights;
+pub mod dev_diagnostics;
 pub mod engage;
 pub mod entity_list_hud;
 pub mod exit_watchdog;
@@ -29,13 +19,8 @@ pub mod input;
 pub mod key_drive;
 pub mod key_items;
 pub mod launcher_backdrop;
-// 0.19 deprecated the feathers `*_bundle` spawn fns in favor of BSN scenes;
-// the launcher screens migrate to BSN in kuluu-dnr5, so tolerate the shims
-// until then.
-#[allow(deprecated)]
 pub mod launcher_ui;
 pub mod locked_camera;
-#[allow(deprecated)]
 pub mod model_viewer;
 pub mod nameplate_occlude;
 pub mod navmesh_overlay;
@@ -48,7 +33,6 @@ pub mod sun_occlusion;
 pub mod target_list_hud;
 pub mod text_input;
 pub mod walker;
-#[allow(deprecated)]
 pub mod widgets;
 pub mod zone_transition;
 
@@ -84,9 +68,9 @@ use self::launcher_ui::{LoginErrorMsg, PendingConnect};
 
 fn drive_feathers_cursor(
     style: Res<CursorStyle>,
-    mut default_cursor: ResMut<bevy::feathers::cursor::DefaultCursor>,
+    mut default_cursor: ResMut<bevy::picking::cursor::DefaultCursor>,
 ) {
-    let want = bevy::feathers::cursor::EntityCursor::System(system_cursor_icon(*style));
+    let want = bevy::picking::cursor::EntityCursor::System(system_cursor_icon(*style));
     if default_cursor.0 != want {
         default_cursor.0 = want;
     }
@@ -337,6 +321,9 @@ pub struct NativeRunArgs {
 
     /// Start muted (`play --mute`).
     pub mute: bool,
+
+    /// `-cpu-mode`: the launcher screens stream no zone behind them.
+    pub cpu_mode: bool,
 }
 
 /// Builds and runs the native app.
@@ -369,6 +356,7 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
         relay_listen,
         unfocused,
         mute,
+        cpu_mode,
         #[cfg(unix)]
         agent_listen,
         dat_root,
@@ -456,10 +444,6 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
     app.add_plugins(plugin_group);
     app_icon::install(&mut app);
     app.add_plugins(walker::WalkerPlugin);
-    app.add_systems(
-        Update,
-        walker::debug::sync_field_debug_enabled.run_if(in_state(AppPhase::InGame)),
-    );
 
     // Persisted audio settings: /debug Sound off (or /sound off) writes to
     // audio.json alongside graphics.json; restarts read it back here. CLI
@@ -489,7 +473,7 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
     // submit). Default to the CPU mesh-batching path (Bevy 0.18-style) on macOS;
     // FFXI_GPU_PREPROCESS=1 opts back in. Two prongs are required to force the CPU path:
     // (1) insert before dependent plugins' finish() bake their CPU-vs-GPU choice
-    //     (vendor/bevy_pbr render/mesh.rs reads it in finish), and
+    //     (the mesh renderer reads it in finish), and
     // (2) re-assert in RenderStartup because bevy_render's BatchingPlugin re-creates the
     //     resource there via init_gpu_resource.
     if cfg!(target_os = "macos") && std::env::var_os("FFXI_GPU_PREPROCESS").is_none() {
@@ -548,7 +532,9 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
                 stamp_render_graph_done
                     .after(RenderSystems::Render)
                     .before(RenderSystems::Cleanup),
-                stamp_render_total.in_set(RenderSystems::PostCleanup),
+                stamp_render_total
+                    .in_set(RenderSystems::PostCleanup)
+                    .after(RenderSystems::Cleanup),
             ),
         );
     }
@@ -617,7 +603,7 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
         app.insert_resource(launcher_ui::CliOverridesPresent);
     }
 
-    launcher_ui::register(&mut app, &server, auth, lobby, defaults, runtime);
+    launcher_ui::register(&mut app, &server, auth, lobby, defaults, runtime, !cpu_mode);
 
     app.add_systems(OnEnter(AppPhase::Connecting), bridge_connecting);
 
@@ -643,6 +629,13 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
     add_hud_spawners(&mut app, OnEnter(AppPhase::InGame));
     app.init_resource::<perf_hud::PerfMonitor>();
     app.init_resource::<perf_hud::AssetChurn>();
+    app.add_plugins((
+        bevy::diagnostic::SystemInformationDiagnosticsPlugin,
+        bevy::render::diagnostic::MeshAllocatorDiagnosticPlugin,
+        bevy::render::diagnostic::RenderAssetDiagnosticPlugin::<
+            bevy::render::texture::GpuImage,
+        >::new(" images"),
+    ));
     // Ungated: fires ~15s in regardless of app phase so the dump can't be
     // silently skipped if InGame is late (or never) entered.
     app.add_systems(Update, perf_hud::dump_render_diagnostics);
@@ -677,6 +670,7 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
         (
             perf_hud::update_perf_monitor,
             perf_hud::update_perf_graph,
+            dev_diagnostics::update_summary,
             target_list_hud::update_target_list_hud,
             entity_list_hud::update_entity_list_hud,
         )
@@ -691,6 +685,14 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
             entity_list_hud::apply_entity_list_visibility,
             entity_list_hud::entity_list_wheel_system,
         )
+            .run_if(in_state(AppPhase::InGame)),
+    );
+    app.add_systems(
+        PreUpdate,
+        perf_hud::scroll_perf_panel
+            .after(bevy::ui::UiSystems::Focus)
+            .after(kuluu_render::mouse::collect_mouse_system)
+            .before(kuluu_render::mouse::wheel_zoom_accumulate_system)
             .run_if(in_state(AppPhase::InGame)),
     );
     app.add_systems(
@@ -738,17 +740,18 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
     });
     app.insert_resource(crate::marker_store::load_or_default());
 
-    // The room's systems and resources must stay out of a default build entirely: an unregistered
-    // plugin is inert, but registering it puts tester state into every session.
-    #[cfg(feature = "debug-animation_room")]
-    app.add_plugins(animation_test_scene::AnimationTestScenePlugin);
+    // Every Config-page choice lives in one client-side option table, and retail keeps that
+    // table across logout through its `cnf.dat` user file (vault main_menu.md §59 addendum 47).
+    app.insert_resource(crate::config_options_store::load_or_default());
 
     app.add_plugins((
         ViewerCorePlugin::<NativeSource>::default(),
         HudPlugin,
         MousePlugin,
         navmesh_overlay::NavmeshOverlayPlugin,
-        launcher_backdrop::LauncherBackdropPlugin,
+        launcher_backdrop::LauncherBackdropPlugin {
+            background: !cpu_mode,
+        },
         zone_transition::ZoneTransitionOverlayPlugin,
     ))
     .insert_resource(ZoneNameResolver::new(kuluu_nav::zone_name))
@@ -815,9 +818,13 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
             text_input::shop_mode_sync_system,
             text_input::shop_mouse_activate_system,
             input::handle_input_system,
+            // The right button's synthesized Esc must sit in the queue ahead of the surface it cancels.
+            text_input::right_button_cancel_system,
             text_input::text_input_system,
             text_input::auto_enter_cs_system,
             text_input::mouse_nav_dispatch_system,
+            // ur/76: the mission log's caption-band arrows step members; own system, own widgets.
+            text_input::mission_log_arrow_press_system,
             input::dispatch_target_change_system,
             input::engage_locks_target_system,
             input::sync_target_lock_system,
@@ -828,6 +835,19 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
         )
             .chain()
             .after(kuluu_render::chase_camera_system)
+            // A window docks in the frame it opens, not one frame later at its record y.
+            .before(kuluu_render::hud::dock::dock_windows_system)
+            .run_if(in_state(AppPhase::InGame)),
+    );
+
+    // Registered on its own: the group above stands at bevy's `.chain()` arity
+    // ceiling, so a new sync system cannot join it. It still runs before the key
+    // handler, which is what makes `Set Prices` take the frame cleanly.
+    app.add_systems(
+        Update,
+        text_input::bazaar_price_mode_sync_system
+            .after(text_input::bazaar_mode_sync_system)
+            .before(input::handle_input_system)
             .run_if(in_state(AppPhase::InGame)),
     );
 
@@ -855,6 +875,15 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
         Update,
         input::reset_interaction_flags_on_zone_change.run_if(in_state(AppPhase::InGame)),
     );
+    app.add_systems(
+        Update,
+        (
+            text_input::unity_chat_send_system,
+            text_input::arrange_request_send_system,
+        )
+            .after(text_input::text_input_system)
+            .run_if(in_state(AppPhase::InGame)),
+    );
 
     app.add_systems(
         Update,
@@ -864,6 +893,10 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
     );
 
     app.add_systems(Update, crate::graphics_store::persist_graphics_on_change);
+    app.add_systems(
+        Update,
+        crate::config_options_store::persist_config_options_on_change,
+    );
     app.add_systems(Update, crate::audio_store::persist_audio_on_change);
     app.add_systems(Update, crate::marker_store::sync_markers);
 
@@ -911,6 +944,13 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
         PostUpdate,
         nameplate_occlude::occlude_nameplates_system
             .after(camera_collision::resolve_camera)
+            .run_if(in_state(AppPhase::InGame)),
+    );
+
+    app.add_systems(
+        Last,
+        camera_trace::report
+            .run_if(camera_trace::enabled)
             .run_if(in_state(AppPhase::InGame)),
     );
 
@@ -1015,9 +1055,11 @@ fn discard_distortion_on_zone_change(
 
 fn despawn_ingame_entities(
     mut commands: Commands,
-    (q, mut shop): (
+    (q, mut shop, mut perf, mut churn): (
         Query<Entity, With<InGameEntity>>,
         ResMut<kuluu_render::hud::shop::ShopScreenState>,
+        ResMut<perf_hud::PerfMonitor>,
+        ResMut<perf_hud::AssetChurn>,
     ),
     mut scene: ResMut<SceneState>,
     mut events: ResMut<EventLog>,
@@ -1060,6 +1102,8 @@ fn despawn_ingame_entities(
     }
 
     shop.reset();
+    *perf = default();
+    *churn = default();
     tracked.by_id.clear();
     // Whole-resource reset, not a field-by-field clear: the parallel per-triangle
     // arrays and `cell_index` must go together, or a stale cell index will hand
@@ -1149,7 +1193,7 @@ fn drain_mzb_load_state(
     mzb_in_flight.tasks.clear();
     zone_geom_cache.entries.clear();
 
-    zone_collision_bvh.0 = None;
+    zone_collision_bvh.invalidate();
     if dropped_tasks > 0 || dropped_cache > 0 {
         tracing::info!(
             dropped_tasks,
@@ -1493,6 +1537,8 @@ mod zone_teardown_tests {
         world.init_resource::<kuluu_render::ffxi_actor_render::SelfKnockback>();
         world.init_resource::<kuluu_render::scheduler_runtime::PendingKnockbacks>();
         world.init_resource::<kuluu_render::hud::shop::ShopScreenState>();
+        world.init_resource::<super::perf_hud::PerfMonitor>();
+        world.init_resource::<super::perf_hud::AssetChurn>();
         world.init_resource::<super::EventLog>();
         world.init_resource::<super::TrackedEntities>();
         world.init_resource::<super::MzbCollisionGeometry>();

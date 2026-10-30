@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 pub mod mcp_client;
+mod port_reservation;
 
 use std::time::Duration;
 
@@ -74,7 +75,7 @@ const TOMBSTONE_TTL_SECS: u32 = LSB_MAX_TIME_LASTUPDATE_SECS + FIXTURE_SESSION_B
 // Local UDP port range the live tests pin `FFXI_MAP_LOCAL_PORT` into: high
 // enough to stay clear of the server's ports (map 53230 / view 54001 /
 // data 54230 / auth 54231) and the OS's low ephemeral allocations, wide
-// enough that two runs don't land on the same port.
+// enough to reserve recent fixture endpoints across processes.
 const LOCAL_PORT_BASE: u16 = 49_000;
 const LOCAL_PORT_SPAN: u32 = 10_000;
 
@@ -91,36 +92,19 @@ fn fixture_login_pattern() -> String {
     format!("^{FIXTURE_ACCOUNT_PREFIX}[0-9a-f]{{{FIXTURE_SUFFIX_HEX_DIGITS}}}$")
 }
 
-/// Pin a unique local UDP port for this live-test run so the map client's
-/// socket avoids reusing a port that is still resident on the map server. The
-/// server matches sessions by source IP:port and keeps a session for 60 s
-/// after the client's last packet (vendor/server/settings/default/map.lua
-/// MAX_TIME_LASTUPDATE, vendor/server/src/map/map_session_container.cpp
-/// MapSessionContainer::cleanupSessions); an ephemeral bind reuses the
-/// just-freed port, so a back-to-back live test gets matched to the previous
-/// run's session and its 0x00A is rejected with "Player ID mismatch"
-/// (vendor/server/src/map/packets/c2s/0x00a_login.cpp). A random high port
-/// avoids that. Windows may exclude random sub-ranges of the port space from
-/// user binds (Hyper-V/WinNAT; `netsh int ipv4 show excludedportrange
-/// protocol=udp`), so each candidate is probe-bound before it is pinned.
-/// Sets FFXI_MAP_LOCAL_PORT, which MapClient::connect reads.
+// vendor/server/src/map/map_networking.cpp MapNetworking::recv_parse;
+// vendor/server/src/map/map_session_container.cpp MapSessionContainer::cleanupSessions.
 pub fn pin_unique_local_port() {
-    let nanos = std::time::SystemTime::now()
+    let directory = std::env::temp_dir().join("kuluu-live-udp-v1");
+    std::fs::create_dir_all(&directory).expect("create fixture port directory");
+    let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
-    for offset in 0..LOCAL_PORT_SPAN {
-        let port = LOCAL_PORT_BASE + ((nanos + offset) % LOCAL_PORT_SPAN) as u16;
-        if std::net::UdpSocket::bind(("0.0.0.0", port)).is_ok() {
-            std::env::set_var("FFXI_MAP_LOCAL_PORT", port.to_string());
-            eprintln!("[live] pinned local UDP port {port}");
-            return;
-        }
-    }
-    panic!(
-        "no bindable local UDP port in {LOCAL_PORT_BASE}..={}",
-        LOCAL_PORT_BASE + LOCAL_PORT_SPAN as u16
-    );
+        .expect("fixture clock precedes Unix epoch");
+    let seed = (now.as_nanos() % u128::from(LOCAL_PORT_SPAN)) as u32;
+    let port = port_reservation::reserve(&directory, seed, now.as_secs())
+        .expect("reserve a fixture UDP endpoint");
+    std::env::set_var("FFXI_MAP_LOCAL_PORT", port.to_string());
+    eprintln!("[live] reserved local UDP port {port}");
 }
 
 pub struct EphemeralChar {

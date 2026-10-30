@@ -43,9 +43,10 @@ client build. Reuse sufficient evidence rather than repeating an investigation.
 - **Exact computation, predicates or format bits:** inspect the relevant retail
   binary/DAT and trace the caller, branch and data provenance. XIClient is the
   preferred community map into that code; its names and comments are not proof.
-  Read [binary inspection](references/binary-inspection.md) when this route is
-  needed. A screenshot can establish the output without uniquely identifying
-  the algorithm; a DAT value alone does not establish how the client uses it.
+  Look it up in `research\xi-on-anything\generated\all` per
+  [vendor/rea/INSTALL.md](../../../vendor/rea/INSTALL.md). A screenshot can
+  establish the output without uniquely identifying the algorithm; a DAT value
+  alone does not establish how the client uses it.
 - **Server-owned wire values or transitions:** use
   [lsb-mirror-check](../lsb-mirror-check/SKILL.md). LSB defines what our server
   sends; it does not establish how retail renders or interprets every field.

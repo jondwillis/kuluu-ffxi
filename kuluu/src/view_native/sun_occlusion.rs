@@ -176,7 +176,7 @@ pub fn update_sun_occlusion_system(
                     actor_sun_occluder(&gt.affine(), aabb, origin, sun_dir, reach)
                 })
                 .collect();
-            sun_visibility_target(zone_bvh.0.as_ref(), &actors, origin, sun_dir, reach)
+            sun_visibility_target(zone_bvh.tree(), &actors, origin, sun_dir, reach)
         }
         _ => 1.0,
     };

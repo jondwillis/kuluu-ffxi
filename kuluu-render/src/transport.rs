@@ -117,6 +117,7 @@ fn load_transport_models(
                     slot: 0,
                     sub_area_link: 0,
                     voyage_backdrop: false,
+                    static_model: None,
                 });
             }
             commands

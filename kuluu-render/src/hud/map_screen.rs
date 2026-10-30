@@ -145,6 +145,11 @@ pub struct MapScreenState {
     pub viewed: Option<(u16, u8)>,
     /// Active text-entry buffer while naming a new marker.
     pub marker_entry: Option<String>,
+    /// Event script 0x8D OPEN_MAP_PROPS asked this window to hold its prop-label
+    /// layer at (`select`, `value`), the raw work-operand pair; stored from the
+    /// wire, drawn by nothing yet - kuluu has no prop labels
+    /// (`.agents/skills/retail-observe/references/2026-10-28-event-opcode-no-skip-pass.md`).
+    pub event_props_layer: Option<(i32, i32)>,
     /// Map zoom radius in yalms. `None` = fit the whole zone (the default, so
     /// the Map opens showing the full map, not a close crop); `Some(r)` = a
     /// player-centered window of half-span `r`. Independent of the minimap zoom.
@@ -898,6 +903,25 @@ pub(crate) fn spawn_map_screen(mut commands: Commands, mut images: ResMut<Assets
         });
 }
 
+/// The Change Map list is the `maplist` window: its record frame gives its x and width and the
+/// dock law its y (.agents/skills/retail-observe/references/2026-10-15-menu-docking-and-flags.md).
+fn dock_map_list(
+    want: &mut Node,
+    config_rows: Option<&crate::hud::menu::ConfigDatRows>,
+    dock: Option<&crate::hud::dock::DockBoard>,
+    height: f32,
+) {
+    use crate::hud::dock::MAP_LIST_WINDOW;
+    if let Some(frame) = config_rows.and_then(|rows| rows.record_frame(MAP_LIST_WINDOW)) {
+        crate::hud::menu::place_at_record_frame(want, &frame);
+    }
+    if let Some((board, placement)) =
+        dock.and_then(|board| Some((board, board.placement(MAP_LIST_WINDOW)?)))
+    {
+        crate::hud::dock::place_docked(want, placement, height, board.surface_height);
+    }
+}
+
 /// Reset the submode to the command submenu on the rising edge of the Map
 /// screen opening, so a fresh open always lands on Markers/Wide Scan/Change Map
 /// rather than whatever submode the previous session left behind.
@@ -1368,7 +1392,12 @@ pub(crate) fn update_map_panel(
     map_markers: Res<MapMarkers>,
     catalog: Res<ChangeMapCatalog>,
     resolver: Option<Res<ZoneNameResolver>>,
-    mut panel_root_q: Query<&mut Node, (With<MapPanelRoot>, Without<MapPanelRow>)>,
+    config_rows: Option<Res<crate::hud::menu::ConfigDatRows>>,
+    dock: Option<Res<crate::hud::dock::DockBoard>>,
+    mut panel_root_q: Query<
+        (&mut Node, &bevy::ui::ComputedNode),
+        (With<MapPanelRoot>, Without<MapPanelRow>),
+    >,
     mut title_q: Query<
         &mut Text,
         (
@@ -1398,30 +1427,32 @@ pub(crate) fn update_map_panel(
     >,
 ) {
     let open = map_open(&mode);
-    if let Ok(mut node) = panel_root_q.single_mut() {
-        let want = if open { Display::Flex } else { Display::None };
-        if node.display != want {
-            node.display = want;
-        }
-        let (left, right) = if map_state.mode == MapSubMode::WideScan {
+    if let Ok((mut node, computed)) = panel_root_q.single_mut() {
+        let mut want = node.clone();
+        want.display = if open { Display::Flex } else { Display::None };
+        (want.left, want.right) = if map_state.mode == MapSubMode::WideScan {
             (Val::Px(PANEL_LEFT_PX), Val::Auto)
         } else {
             (Val::Auto, Val::Px(PANEL_RIGHT_PX))
         };
-        if node.left != left {
-            node.left = left;
-        }
-        if node.right != right {
-            node.right = right;
-        }
-        let height = if map_state.mode == MapSubMode::Command {
+        want.top = Val::Px(PANEL_TOP_PX);
+        want.bottom = Val::Auto;
+        want.margin = UiRect::ZERO;
+        want.width = Val::Px(PANEL_WIDTH_PX);
+        want.height = if map_state.mode == MapSubMode::Command {
             Val::Auto
         } else {
             Val::Percent(PANEL_LIST_HEIGHT_PCT)
         };
-        if node.height != height {
-            node.height = height;
+        if map_state.mode == MapSubMode::ChangeMap {
+            dock_map_list(
+                &mut want,
+                config_rows.as_deref(),
+                dock.as_deref(),
+                crate::hud::dock::drawn_height(computed),
+            );
         }
+        node.set_if_neq(want);
     }
     if !open {
         return;
@@ -2027,6 +2058,65 @@ mod tests {
             assert_eq!(panel_display(app.world_mut()), Display::None);
             let dot = placed_dot_node(app.world_mut());
             assert_eq!(dot.display, Display::None, "placed dots hide with the map");
+        }
+
+        /// The Change Map list is the `maplist` window: record x and width, docked above the chat
+        /// log; the command submenu keeps kuluu's own spot.
+        #[test]
+        fn the_change_map_list_docks_above_the_chat_log() {
+            use crate::hud::dock::{dock_windows_system, DockBoard, DOCK_GAP, MAP_LIST_WINDOW};
+            use crate::hud::menu::ConfigDatRows;
+            const LIST_X: i16 = 200;
+            const LIST_Y: i16 = 40;
+            const LIST_WIDTH: i16 = 160;
+            const LOG_TOP: f32 = 380.0;
+            const LOG_HEIGHT: f32 = 120.0;
+            let mut app = app_with_map();
+            app.init_resource::<DockBoard>()
+                .init_resource::<ConfigDatRows>();
+            app.world_mut()
+                .resource_mut::<ConfigDatRows>()
+                .frames
+                .insert(MAP_LIST_WINDOW.into(), (LIST_X, LIST_Y, LIST_WIDTH));
+            app.world_mut().spawn((
+                crate::hud::chat_panel::ChatPanelGroup,
+                Node::default(),
+                bevy::ui::ComputedNode {
+                    size: Vec2::new(PANEL_WIDTH_PX, LOG_HEIGHT),
+                    inverse_scale_factor: 1.0,
+                    ..default()
+                },
+                bevy::ui::UiGlobalTransform::from_xy(0.0, LOG_TOP + LOG_HEIGHT / 2.0),
+            ));
+            app.world_mut().insert_resource(map_mode());
+            let draw = |app: &mut App, mode: MapSubMode| -> Node {
+                app.world_mut().resource_mut::<MapScreenState>().mode = mode;
+                app.world_mut()
+                    .run_system_once(dock_windows_system)
+                    .unwrap();
+                app.world_mut().run_system_once(update_map_panel).unwrap();
+                app.world_mut()
+                    .query_filtered::<&Node, (With<MapPanelRoot>, Without<MapPanelRow>)>()
+                    .single(app.world())
+                    .expect("panel root")
+                    .clone()
+            };
+
+            let list = draw(&mut app, MapSubMode::ChangeMap);
+            assert_eq!(
+                (list.left, list.width),
+                (Val::Px(f32::from(LIST_X)), Val::Px(f32::from(LIST_WIDTH)))
+            );
+            assert_eq!(
+                (list.top, list.bottom),
+                (Val::Px(LOG_TOP - DOCK_GAP), Val::Auto)
+            );
+
+            let command = draw(&mut app, MapSubMode::Command);
+            assert_eq!(
+                (command.right, command.top),
+                (Val::Px(PANEL_RIGHT_PX), Val::Px(PANEL_TOP_PX))
+            );
         }
     }
 }

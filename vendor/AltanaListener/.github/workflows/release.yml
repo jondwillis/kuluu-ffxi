@@ -1,0 +1,36 @@
+name: Build and Release
+
+# This tells GitHub to ONLY run this factory when you push a "tag" starting with "v" (like v1.0.0)
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+    permissions:
+      contents: write # Required to allow GitHub to create the Release page
+
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    - name: Setup .NET 8.0
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: '8.0.x'
+
+    - name: Publish Application
+      # Compiles the app in Release mode and pushes everything to a folder named "publish_output"
+      run: dotnet publish AltanaListener/AltanaListener.csproj -c Release -o publish_output
+
+    - name: Zip the Release
+      # Uses built-in Windows PowerShell to zip the published files
+      run: Compress-Archive -Path publish_output\* -DestinationPath AltanaListener_Windows.zip
+
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@v2
+      with:
+        files: AltanaListener_Windows.zip
+        generate_release_notes: true

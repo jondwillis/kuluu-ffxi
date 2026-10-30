@@ -16,8 +16,10 @@ pub static SURFACE_W: AtomicU32 = AtomicU32::new(0);
 pub static SURFACE_H: AtomicU32 = AtomicU32::new(0);
 
 /// RENDER-WORLD system: records the primary window's extracted surface size.
-pub fn record_surface_size(windows: Res<bevy::render::view::ExtractedWindows>) {
-    if let Some(w) = windows.primary.and_then(|e| windows.windows.get(&e)) {
+pub fn record_surface_size(
+    windows: Query<&bevy::render::view::ExtractedWindow, With<bevy::window::PrimaryWindow>>,
+) {
+    if let Ok(w) = windows.single() {
         SURFACE_W.store(w.physical_width, Ordering::Relaxed);
         SURFACE_H.store(w.physical_height, Ordering::Relaxed);
     }

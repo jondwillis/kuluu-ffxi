@@ -79,7 +79,6 @@ pub async fn run(
         initial_state: InitialState {
             auth: session,
             handoff,
-            key3,
         },
     })
 }

@@ -20,6 +20,19 @@ pub struct InGameEntity;
 #[derive(Component, Debug, Clone, Copy)]
 pub struct MountedRider;
 
+/// A mount whose rider just got off, kept alive at its last pinned spot while it plays the
+/// authored get-off gallop (`coff` on its own model: buck, two gallop loops, then the retail
+/// ActorFadeOnCaster slot) - the routine is in every chocobo race config (census 2026-10-29:
+/// `dat-routine-stages` over file 55295), and research/xim poc/game/event/ActorDismountEvent.kt
+/// plays exactly that on the mount when a rider leaves. `done` lets the scene sweep reap the
+/// entity once the routine has run out.
+#[derive(Component, Debug, Clone, Copy)]
+pub struct MountDeparting {
+    pub started: bool,
+    pub elapsed_frames: u32,
+    pub done: bool,
+}
+
 #[derive(Component, Debug, Clone, Copy)]
 pub struct Nameplate {
     pub entity_id: u32,

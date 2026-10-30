@@ -301,6 +301,26 @@ pub const KNOWN_CLIENTS: &[KnownClient] = &[
         retail: true,
         offhand_model_rule: Some(OffhandModelRule::Retail2026),
     },
+    // SE's own patch client carried the retail-2026 line forward here: `patch.txt`
+    // holds 63,479 entries and FFXiMain.dll links with TimeDateStamp 0x6AC37846
+    // (2026-10-05 UTC). Code did move — `.text` grew by 0x40 and the entry stub
+    // dropped by 0x40 — so an address anchored on retail-2026-09 has to be re-found
+    // before it is read out of this image. `offhand_model_rule` is inherited from
+    // that row rather than re-derived here.
+    KnownClient {
+        name: "retail-2026-10",
+        ffximain_sha256: "042884888eea4fadac183e520f2ae9f8c4fa267860e685048e1880efd358e872",
+        unpacked_text: Some(UnpackedText {
+            sha256: "cf50a24a748458ea57a876958cd0e0c1bfe94dbb70efbd686ac8dc0ae1f35e8d",
+            virtual_size: 0x0032_762E,
+            pol1_stub_rva: 0x00BE_4A10,
+        }),
+        patch_version: None,
+        ledger: LedgerExpectation::Present(ContentLedger::PatchTxt),
+        item_layout: ItemBlockLayout::Retail2026,
+        retail: true,
+        offhand_model_rule: Some(OffhandModelRule::Retail2026),
+    },
     // Square Enix retail PlayOnline install (polboot.exe + patch.txt, no
     // patch.cfg stamp): the developer's Phoenix bundle, measured in place.
     KnownClient {

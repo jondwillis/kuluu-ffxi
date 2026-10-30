@@ -31,14 +31,14 @@ def root_for(path):
 
 
 def surface(path):
-    if path.suffix not in (".rs", ".wgsl"):
+    if path.suffix not in (".rs", ".wgsl", ".wesl"):
         return None
     if any(part in ("tests", "test", "vendor", "research", "target", ".git") for part in path.parts):
         return None
     name = path.as_posix()
     if name.startswith(("ffxi-audio/", "kuluu-render/src/audio")):
         return "audio"
-    if path.suffix == ".wgsl" or name.startswith((
+    if path.suffix in (".wgsl", ".wesl") or name.startswith((
         "kuluu-render/", "kuluu/src/view_native/", "kuluu-viewer-wasm/", "ffxi-actor/",
     )):
         return "visual"

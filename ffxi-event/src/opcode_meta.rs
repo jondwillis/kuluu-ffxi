@@ -1381,12 +1381,27 @@ pub fn sub_size(op: u8, sub: u8) -> Option<u8> {
             _ => None,
         },
         // 0x00C2.md: sub 1 writes a party mask (4), sub 2 a validity flag (6),
-        // anything else advances 2.
+        // anything else advances 2. Read to the last instruction against this
+        // build (`f_100bbf80`): default selector's `add exec, 2` sits at
+        // @100bbfa3, so the generic skip needs no arm.
         OP_MOGHOUSE_VISIT => Some(match sub {
             1 => 4,
             2 => 6,
             _ => 2,
         }),
+        // The work-slot float triple (`f_100bb9c0`): selector zero converts the
+        // singleton object's dword fields +80/+84/+88 into integers and stores
+        // them into work slots two/four/six, selector one does the same with the
+        // triple at +68/+72/+76; both tails add exactly eight (@100bba60). Every
+        // other selector returns through the pops-only exit @100bba68 without
+        // touching exec — retail spins there, so no width is encoded and the arm
+        // halts (before it the generic size skip walked eight over those cases).
+        // The singleton object's role stays unnamed in this record; only its
+        // dword fields are read.
+        OP_WORK_SLOT_TRIPLE_READ_AF => match sub {
+            0 | 1 => Some(8),
+            _ => None,
+        },
         // 0x007E.md: the mount/dismount opcode, whose width is its case. Cases
         // 3 and 6 are wider because they carry the chocobo's CustomProperties;
         // 7 carries a mount id. Retail computes width 0 for any other case and
@@ -1403,6 +1418,11 @@ pub fn sub_size(op: u8, sub: u8) -> Option<u8> {
         // advances 2 only once the player entity has finished loading; this VM
         // models no load state, so it takes the loaded path.
         OP_LOOKSET => match sub {
+            // Sub 0x16 (width twenty-two) and 0x17 (four) exist in retail
+            // and are recorded with their widths; encoding them here flips a
+            // stop into an advance inside existing corpus-driven tests and
+            // must land together with those fixtures — see the record's B6
+            // section, ledger pass of 2026-10-29.
             0x00..=0x0A | 0x0C | 0x0F | 0x11 => Some(4),
             0x0B => Some(20),
             0x0D => Some(14),
@@ -1419,9 +1439,18 @@ pub fn sub_size(op: u8, sub: u8) -> Option<u8> {
             1 => Some(2),
             _ => None,
         },
-        // 0x0075.md: case 0 opens an indoor sub-region (4), case 1 polls (2),
-        // case 2 is `ExecPointer -= 6` then `+= 8` on the sub-region change
-        // succeeding — net +2.
+        // Handler `f_100b8660` (`add word [state+0x256], N` sites are the
+        // whole advance story: its fetch helper never moves exec). The gate
+        // yields with no advance while the window singleton reports any
+        // window open — kuluu opens none, so it never fires. Case 0 hands the
+        // resolved operand word to that singleton's present routine and
+        // advances four; case 1 runs nothing at all and advances two (just
+        // op+sub); case 2 sends a c2s request carrying the previous
+        // instruction's last word, advancing net two when the send succeeds
+        // and spinning on the yield byte when it fails — kuluu's width-two
+        // advance stands in for the successful send. Any other sub leaves
+        // exec untouched (`.agents/skills/retail-observe/references/
+        // 2026-10-28-event-opcode-no-skip-pass.md`).
         OP_LOADROOM => match sub {
             0 => Some(4),
             1 | 2 => Some(2),
@@ -1443,6 +1472,15 @@ pub fn sub_size(op: u8, sub: u8) -> Option<u8> {
             5 => Some(7),
             6 => Some(6),
             _ => None,
+        },
+        // `f_100b73f0` (opcode parity ledger pass 2026-10-29): selector byte
+        // @+1 decides the width — cases 0/1 latch a flags-word bit and advance
+        // 4, case 2 hands off through the singleton with an actor operand and
+        // advances 6, and retail's own default arm adds 2 (it does NOT spin).
+        OP_FLAGWORD_SELECTOR => match sub {
+            0 | 1 => Some(4),
+            2 => Some(6),
+            _ => Some(2),
         },
         // 0x00D4.md: cases 0 and 2 each run the 0x24 query helper (+1, then
         // the helper's +7) and case 1 is a flat +8; case 3 is +6; cases 4/5
@@ -1586,22 +1624,32 @@ pub fn sub_size(op: u8, sub: u8) -> Option<u8> {
             4 => Some(8),
             _ => None,
         },
-        // 0x00B7.md: the event-entity work/name family. Case 0 writes a work
-        // slot behind a two-actor lookup and advances 10 whether or not the
-        // lookup resolves; cases 1-4 advance 8 on every path. Retail spins on
-        // any other sub, so no width is encoded for it.
-        OP_B7 => match sub {
+        // The mover-bridge writer (`f_100afee0`, read to its last instruction
+        // 2026-10-29 late): the selector byte at +1 maps through the handler's
+        // own jump table @100b0108 onto five bodies; every path inside each
+        // case — gate failures included — advances uniformly, ten for selector
+        // zero (its `add word [exec], 0xa` tails @100aff5c) and eight for
+        // selectors one..four (`add word [exec], 8` @100affbb/…/@100b00f8).
+        // Selectors above four jump to the shared epilogue that pops without
+        // touching exec — retail spins there, so no width is encoded.
+        OP_MOVER_BRIDGE_B7 => match sub {
             0x00 => Some(10),
             0x01..=0x04 => Some(8),
             _ => None,
         },
-        // 0x00D8.md: the EventDir writes. Case 0 copies the entity's last
-        // position and case 4 writes all three components (12); cases 1-3
-        // write one component each (8); an unlisted sub falls through to the
-        // trailing +6. The actor-lookup failure path also advances 6, so the
-        // success-path widths are the faithful choice, the same divergence the
-        // 0x7A case-2 arm takes.
-        OP_D8 => match sub {
+        // The staged-block writer (`f_100bc060`, read to its last instruction
+        // 2026-10-29 late): selector byte maps through jump table @100bc24c.
+        // Selector zero copies four consecutive fields raw off the resolved
+        // record (advance six, `mov ebx, 6` set at entry); selectors one..three
+        // fetch one stream word each and store it scaled into three consecutive
+        // fields of the same block (advance eight, @100bc144/@100bc180);
+        // selector four chains all three (advance twelve, `mov ebx, 0xc`
+        // @100bc21c). Selectors above four — and every unresolved-actor gate
+        // failure — land on the shared tail with the advance register still
+        // loaded six (@100bc23d), so unknown selectors step six here exactly as
+        // retail's fall-through does; a gate failure inside a live case advances
+        // six where kuluu steps that case's width (record posture).
+        OP_EVENT_DIR_WRITER_D8 => match sub {
             0x00 => Some(6),
             0x01..=0x03 => Some(8),
             0x04 => Some(12),
@@ -1613,6 +1661,18 @@ pub fn sub_size(op: u8, sub: u8) -> Option<u8> {
         OP_SMOVE => match sub {
             0 => Some(10),
             1 => Some(2),
+            _ => None,
+        },
+        // The registry-lookup op (`f_100bbd80`, read to its last instruction
+        // 2026-10-29 late): exactly three selectors ever advance — zero fetches a
+        // dword field of one global registry (width eight), thirty-two and
+        // sixty-four fetch from registries with three-dword entries (width ten).
+        // Every other selector within the handler's own ceiling (sixty-four
+        // entries) jumps to a pops-only exit that never touches exec, as does
+        // anything above the ceiling — retail spins on both, kuluu halts.
+        0xBF => match sub {
+            0x00 => Some(8),
+            0x20 | 0x40 => Some(10),
             _ => None,
         },
         // 0x00AE.md: the weather / name-color / entity-link family. Every case
@@ -1681,6 +1741,9 @@ pub(crate) const OP_EVENTPOSSET: u8 = 0x47;
 pub(crate) const OP_LOADROOM: u8 = 0x75;
 pub(crate) const OP_ITEMINFO: u8 = 0xCC;
 pub(crate) const OP_ENTITYSPEED: u8 = 0x59;
+// The selector op `f_100b73f0`; its retail name is unknown, so the constant
+// says what it demonstrably is (opcode parity ledger pass 2026-10-29).
+pub(crate) const OP_FLAGWORD_SELECTOR: u8 = 0x60;
 pub(crate) const OP_MOVE: u8 = 0x1F;
 pub(crate) const OP_CODE_MOVE2: u8 = 0x5A;
 pub(crate) const OP_WINDOW: u8 = 0xB4;
@@ -1691,8 +1754,10 @@ pub(crate) const OP_NAMESET: u8 = 0xB5;
 pub(crate) const OP_SUBSCHED: u8 = 0x5F;
 pub(crate) const OP_STRINGOPS: u8 = 0x9D;
 const OP_AE: u8 = 0xAE;
-const OP_B7: u8 = 0xB7;
-const OP_D8: u8 = 0xD8;
+pub(crate) const OP_MOVER_BRIDGE_B7: u8 = 0xB7;
+pub(crate) const OP_EVENT_DIR_WRITER_D8: u8 = 0xD8;
+pub(crate) const OP_WORK_SLOT_TRIPLE_READ_AF: u8 = 0xAF;
+pub(crate) const OP_STAGED_SLOT_LOADER_C3: u8 = 0xC3;
 const OP_SMOVE: u8 = 0x31;
 pub(crate) const OP_STATUSSET: u8 = 0xAC;
 pub(crate) const OP_MAP_QUERY: u8 = 0xD4;
